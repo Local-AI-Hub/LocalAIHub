@@ -4,7 +4,7 @@ function NavButton({ active, label, count, onClick }) {
   return (
     <button className={`sidebar-tab ${active ? 'sidebar-tab-active' : ''}`} onClick={onClick} type="button">
       <span>{label}</span>
-      <span className="sidebar-count">{count}</span>
+      {count === null || count === undefined ? null : <span className="sidebar-count">{count}</span>}
     </button>
   );
 }
@@ -68,4 +68,3 @@ export default function Sidebar({
     </aside>
   );
 }
-

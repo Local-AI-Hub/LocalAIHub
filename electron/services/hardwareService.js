@@ -1,3 +1,4 @@
+const path = require('path');
 const si = require('systeminformation');
 
 const { runCommand } = require('./commandService');
@@ -12,6 +13,60 @@ function normalizeMb(value) {
   }
 
   return Math.round(value);
+}
+
+function normalizeDriveRoot(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  const driveMatch = raw.match(/^[A-Za-z]:/);
+  if (driveMatch) {
+    return `${driveMatch[0]}\\`;
+  }
+
+  return raw.replace(/[\\/]+$/, '');
+}
+
+function buildDiskSnapshot(entries = []) {
+  const disks = [];
+  const seen = new Set();
+
+  for (const entry of entries || []) {
+    const mount = normalizeDriveRoot(entry.mount || entry.fs || entry.drive || '');
+    if (!mount) {
+      continue;
+    }
+
+    const key = mount.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    const sizeBytes = Number(entry.size || 0);
+    const usedBytes = Number(entry.used || 0);
+    const freeBytes = Math.max(0, sizeBytes - usedBytes);
+    disks.push({
+      mount,
+      sizeBytes,
+      usedBytes,
+      freeBytes,
+      usePercent: sizeBytes > 0 ? Math.round((usedBytes / sizeBytes) * 1000) / 10 : null,
+    });
+  }
+
+  return disks.sort((left, right) => left.mount.localeCompare(right.mount));
+}
+
+function findDiskForPath(disks = [], targetPath) {
+  const driveRoot = normalizeDriveRoot(path.parse(path.resolve(String(targetPath || ''))).root);
+  if (!driveRoot) {
+    return null;
+  }
+
+  return disks.find((disk) => normalizeDriveRoot(disk.mount).toLowerCase() === driveRoot.toLowerCase()) || null;
 }
 
 function pickPrimaryGpu(controllers) {
@@ -112,7 +167,12 @@ async function getNvidiaRuntimeDetails() {
   };
 }
 
-function buildHardwareSnapshot(gpu, memory, nvidia) {
+async function detectStorageSnapshot() {
+  const entries = await si.fsSize().catch(() => []);
+  return buildDiskSnapshot(entries);
+}
+
+function buildHardwareSnapshot(gpu, memory, nvidia, disks) {
   const fallbackGpuModel = nvidia?.gpuModel || 'Unknown GPU';
   const fallbackVendor = nvidia?.gpuVendor || 'Unknown vendor';
   const vramMb = nvidia?.vramMb || normalizeMb(gpu?.vram || gpu?.memoryTotal);
@@ -130,6 +190,7 @@ function buildHardwareSnapshot(gpu, memory, nvidia) {
     nvidiaDriverVersion: nvidia?.nvidiaDriverVersion || null,
     nvidiaCudaVersion: nvidia?.nvidiaCudaVersion || null,
     nvidiaSmiAvailable: Boolean(nvidia?.nvidiaSmiAvailable),
+    disks,
   };
 }
 
@@ -156,9 +217,17 @@ function resolveControllerVramUsed(gpu, vramTotalMb) {
 }
 
 async function detectHardwareSnapshot() {
-  const [graphics, memory, nvidia] = await Promise.all([si.graphics(), si.mem(), getNvidiaRuntimeDetails()]);
+  const [graphics, memory, nvidia, disks] = await Promise.all([si.graphics(), si.mem(), getNvidiaRuntimeDetails(), detectStorageSnapshot()]);
   const gpu = pickPrimaryGpu(graphics.controllers);
-  return buildHardwareSnapshot(gpu, memory, nvidia);
+  return buildHardwareSnapshot(gpu, memory, nvidia, disks);
+}
+
+async function getDiskSnapshotForPath(targetPath) {
+  const disks = await detectStorageSnapshot();
+  return {
+    disks,
+    disk: findDiskForPath(disks, targetPath),
+  };
 }
 
 async function getLiveResourceUsage() {
@@ -183,7 +252,12 @@ async function getLiveResourceUsage() {
 }
 
 module.exports = {
+  buildDiskSnapshot,
   detectHardwareSnapshot,
+  detectStorageSnapshot,
+  findDiskForPath,
+  getDiskSnapshotForPath,
   getLiveResourceUsage,
   getNvidiaRuntimeDetails,
+  normalizeDriveRoot,
 };

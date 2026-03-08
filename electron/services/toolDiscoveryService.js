@@ -1,12 +1,34 @@
 const path = require('path');
 const fs = require('fs-extra');
 
-const { readConfig, updateConfig } = require('./configService');
+const { getAppPaths, readConfig, updateConfig } = require('./configService');
 const { runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
-const { buildExternalLaunchProfile, getToolDefinitions, initializeToolRegistry } = require('./toolRegistry');
+const {
+  buildExternalLaunchProfile,
+  buildManagedLaunchProfile,
+  getToolDefinitions,
+  initializeToolRegistry,
+} = require('./toolRegistry');
 
 const DISCOVERY_TTL_MS = 60000;
+const DRIVE_LETTERS = 'CDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+const COMMON_LIBRARY_ROOTS = [
+  '',
+  'Apps',
+  'Applications',
+  'Programs',
+  'Tools',
+  'AI',
+  'AI Tools',
+  'Portable',
+  'LocalAI',
+  path.join('SteamLibrary', 'steamapps', 'common'),
+  path.join('Steam', 'steamapps', 'common'),
+  'Games',
+  path.join('Games', 'SteamLibrary', 'steamapps', 'common'),
+];
+
 let discoveryCache = {
   timestamp: 0,
   tools: null,
@@ -21,10 +43,53 @@ function expandDetectionPath(template) {
   return String(template || '').replace(/%([^%]+)%/g, (_match, name) => getEnvValueInsensitive(name) || '');
 }
 
+function normalizePathKey(targetPath) {
+  try {
+    return path.resolve(String(targetPath || '')).replace(/[\\/]+$/, '').toLowerCase();
+  } catch {
+    return String(targetPath || '').trim().toLowerCase();
+  }
+}
+
+function uniquePaths(paths = []) {
+  const seen = new Set();
+  const results = [];
+
+  for (const entry of paths) {
+    const normalized = normalizePathKey(entry);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+
+    seen.add(normalized);
+    results.push(entry);
+  }
+
+  return results;
+}
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function fileExists(targetPath) {
   try {
     const stats = await fs.stat(targetPath);
     return stats.isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function directoryExists(targetPath) {
+  try {
+    const stats = await fs.stat(targetPath);
+    return stats.isDirectory();
   } catch {
     return false;
   }
@@ -55,6 +120,22 @@ async function findExecutableOnPath(executableName, logger) {
   return null;
 }
 
+async function resolveFilesystemCandidate(candidatePath, metadata = {}) {
+  const expandedPath = expandDetectionPath(candidatePath);
+  if (!expandedPath || !(await pathExists(expandedPath))) {
+    return null;
+  }
+
+  const stats = await fs.stat(expandedPath);
+  return {
+    detectedPath: expandedPath,
+    displayPath: expandedPath,
+    fromPath: false,
+    installDir: stats.isDirectory() ? expandedPath : path.dirname(expandedPath),
+    reason: metadata.reason || 'filesystem',
+  };
+}
+
 async function resolveDetectionPath(detectionPath, logger) {
   if (String(detectionPath || '').startsWith('PATH:')) {
     const executable = detectionPath.slice(5).trim();
@@ -68,24 +149,85 @@ async function resolveDetectionPath(detectionPath, logger) {
       installDir: path.dirname(resolved),
       displayPath: resolved,
       fromPath: true,
+      reason: 'manifest-path',
     };
   }
 
-  const expandedPath = expandDetectionPath(detectionPath);
-  if (!expandedPath || !(await fs.pathExists(expandedPath))) {
-    return null;
-  }
-
-  const stats = await fs.stat(expandedPath);
-  return {
-    detectedPath: expandedPath,
-    installDir: stats.isDirectory() ? expandedPath : path.dirname(expandedPath),
-    displayPath: expandedPath,
-    fromPath: false,
-  };
+  return resolveFilesystemCandidate(detectionPath, {
+    reason: 'manifest-path',
+  });
 }
 
-async function discoverInstallLocation(manifest, logger) {
+function getTrackedPathCandidates(existingTool, manifest) {
+  const appPaths = getAppPaths();
+  const candidates = [
+    existingTool?.detectedPath,
+    existingTool?.displayPath,
+    existingTool?.installDir,
+    existingTool?.appDir,
+    existingTool?.launchProfile?.executable,
+    existingTool?.launchProfile?.command,
+    existingTool?.launchProfile?.pythonPath,
+    path.join(appPaths.toolsRoot, manifest.id),
+    path.join(appPaths.toolsRoot, manifest.id, 'app'),
+    ...appPaths.legacyRoots.flatMap((legacyRoot) => [
+      path.join(legacyRoot, 'tools', manifest.id),
+      path.join(legacyRoot, 'tools', manifest.id, 'app'),
+    ]),
+  ];
+
+  return uniquePaths(candidates.filter(Boolean));
+}
+
+async function getDriveRoots() {
+  const discovered = [];
+
+  for (const letter of DRIVE_LETTERS) {
+    const driveRoot = `${letter}:\\`;
+    if (await directoryExists(driveRoot)) {
+      discovered.push(driveRoot);
+    }
+  }
+
+  const systemDrive = getEnvValueInsensitive('SystemDrive');
+  if (systemDrive) {
+    discovered.push(systemDrive.endsWith('\\') ? systemDrive : `${systemDrive}\\`);
+  }
+
+  return uniquePaths(discovered);
+}
+
+async function buildCommonSearchRoots() {
+  const appPaths = getAppPaths();
+  const userProfile = getEnvValueInsensitive('USERPROFILE');
+  const oneDrive = getEnvValueInsensitive('OneDrive');
+  const envRoots = [
+    getEnvValueInsensitive('LOCALAPPDATA'),
+    path.join(getEnvValueInsensitive('LOCALAPPDATA') || '', 'Programs'),
+    getEnvValueInsensitive('APPDATA'),
+    getEnvValueInsensitive('PROGRAMFILES'),
+    getEnvValueInsensitive('ProgramFiles(x86)'),
+    getEnvValueInsensitive('PROGRAMDATA'),
+    userProfile,
+    path.join(userProfile || '', 'Documents'),
+    path.join(userProfile || '', 'Downloads'),
+    path.join(userProfile || '', 'Desktop'),
+    oneDrive,
+    path.join(oneDrive || '', 'Documents'),
+    path.join(oneDrive || '', 'Desktop'),
+    getEnvValueInsensitive('PUBLIC'),
+    path.join(getEnvValueInsensitive('PUBLIC') || '', 'Documents'),
+    appPaths.toolsRoot,
+    ...appPaths.legacyRoots.map((legacyRoot) => path.join(legacyRoot, 'tools')),
+  ].filter(Boolean);
+
+  const driveRoots = await getDriveRoots();
+  const driveLibraries = driveRoots.flatMap((driveRoot) => COMMON_LIBRARY_ROOTS.map((relativeRoot) => path.join(driveRoot, relativeRoot)));
+
+  return uniquePaths([...envRoots, ...driveLibraries]);
+}
+
+async function discoverFromManifestPaths(manifest, logger) {
   for (const detectionPath of manifest.detectionPaths || []) {
     const resolved = await resolveDetectionPath(detectionPath, logger);
     if (resolved) {
@@ -100,17 +242,103 @@ async function discoverInstallLocation(manifest, logger) {
   return null;
 }
 
-async function discoverExternalTool(manifest, existingTool, logger) {
-  const detected = await discoverInstallLocation(manifest, logger);
-  if (!detected) {
-    return null;
+async function discoverFromTrackedPaths(manifest, existingTool, logger) {
+  for (const candidatePath of getTrackedPathCandidates(existingTool, manifest)) {
+    const resolved = await resolveFilesystemCandidate(candidatePath, {
+      reason: 'tracked-path',
+    });
+
+    if (resolved) {
+      await logger.info('Tool installation detected from a previously saved path.', {
+        toolId: manifest.id,
+        detectedPath: resolved.detectedPath,
+      });
+      return resolved;
+    }
   }
 
+  return null;
+}
+
+async function discoverFromPathExecutables(manifest, logger) {
+  const executables = uniquePaths([
+    ...(manifest.discovery?.pathExecutables || []),
+    ...(manifest.installInstructions?.externalExecutableCandidates || [])
+      .map((entry) => path.basename(entry))
+      .filter((entry) => entry && entry !== '.'),
+  ]);
+
+  for (const executable of executables) {
+    if (!executable || /[\\/]/.test(executable)) {
+      continue;
+    }
+
+    const resolved = await findExecutableOnPath(executable, logger);
+    if (resolved) {
+      return {
+        detectedPath: resolved,
+        installDir: path.dirname(resolved),
+        displayPath: resolved,
+        fromPath: true,
+        reason: 'path-executable',
+      };
+    }
+  }
+
+  return null;
+}
+
+async function discoverFromCommonRoots(manifest, logger) {
+  const folderNames = uniquePaths(manifest.discovery?.folderNames || []);
+  const markerPaths = uniquePaths(manifest.discovery?.markerPaths || []);
+  const searchRoots = await buildCommonSearchRoots();
+
+  for (const root of searchRoots) {
+    for (const folderName of folderNames) {
+      for (const markerPath of markerPaths) {
+        const candidate = path.join(root, folderName, markerPath);
+        const resolved = await resolveFilesystemCandidate(candidate, {
+          reason: 'common-root-scan',
+        });
+        if (!resolved) {
+          continue;
+        }
+
+        await logger.info('Tool installation detected from common search folders.', {
+          toolId: manifest.id,
+          detectedPath: resolved.detectedPath,
+        });
+        return resolved;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function discoverInstallLocation(manifest, existingTool, logger) {
+  const discoverySteps = [
+    () => discoverFromTrackedPaths(manifest, existingTool, logger),
+    () => discoverFromManifestPaths(manifest, logger),
+    () => discoverFromPathExecutables(manifest, logger),
+    () => discoverFromCommonRoots(manifest, logger),
+  ];
+
+  for (const discoverStep of discoverySteps) {
+    const resolved = await discoverStep();
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function buildExternalToolState(manifest, existingTool, detected) {
   const launchProfile = buildExternalLaunchProfile(manifest, detected.installDir, detected.fromPath ? detected.detectedPath : null);
   const launchSupported = launchProfile.kind !== 'folder';
 
   return {
-    ...existingTool,
     id: manifest.id,
     name: manifest.name,
     description: manifest.description,
@@ -131,18 +359,14 @@ async function discoverExternalTool(manifest, existingTool, logger) {
     healthUrl: manifest.healthUrl,
     processNames: manifest.processNames || existingTool?.processNames || [],
     detectedAt: new Date().toISOString(),
-    installedAt: existingTool?.installedAt || new Date().toISOString(),
-    status: existingTool?.status || 'stopped',
+    installedAt: existingTool?.installedAt || existingTool?.detectedAt || new Date().toISOString(),
+    status: existingTool?.status === 'error' ? 'stopped' : existingTool?.status || 'stopped',
+    lastError: null,
     lastRepairMessage: null,
     venvDir: null,
     configTargets: manifest.installInstructions.configTargets,
-    executablePath:
-      launchProfile.kind === 'binary'
-        ? launchProfile.executable
-        : detected.fromPath
-          ? detected.detectedPath
-          : existingTool?.executablePath || null,
-    snapshots: existingTool?.snapshots || [],
+    executablePath: launchProfile.kind === 'binary' ? launchProfile.executable : detected.fromPath ? detected.detectedPath : null,
+    snapshots: [],
   };
 }
 
@@ -152,18 +376,89 @@ async function managedToolIsPresent(tool) {
   }
 
   if (tool.launchProfile?.kind === 'binary' && tool.launchProfile?.executable) {
-    return fs.pathExists(tool.launchProfile.executable);
+    return fileExists(tool.launchProfile.executable);
   }
 
   if ((tool.launchProfile?.kind === 'python-script' || tool.launchProfile?.kind === 'python-module') && tool.launchProfile?.pythonPath) {
-    return fs.pathExists(tool.launchProfile.pythonPath);
+    return fileExists(tool.launchProfile.pythonPath);
   }
 
   if (tool.installDir) {
-    return fs.pathExists(tool.installDir);
+    return directoryExists(tool.installDir);
   }
 
   return false;
+}
+
+function buildManagedToolState(existingTool, manifest, installDir = existingTool.installDir) {
+  const resolvedInstallDir = path.basename(installDir || '') === 'app' ? path.dirname(installDir) : installDir;
+  const appDir = path.basename(installDir || '') === 'app' ? installDir : path.join(resolvedInstallDir || '', 'app');
+  const venvDir = manifest.installInstructions.runtime === 'python'
+    ? path.join(resolvedInstallDir || '', manifest.installInstructions.venvFolder || '.venv')
+    : null;
+
+  const nextState = {
+    ...existingTool,
+    id: manifest.id,
+    name: manifest.name,
+    description: manifest.description,
+    icon: manifest.icon,
+    category: manifest.category,
+    interfaceMode: manifest.interfaceMode,
+    type: manifest.installInstructions.runtime,
+    source: 'managed',
+    managedByLocalAIHub: true,
+    installDir: resolvedInstallDir,
+    appDir,
+    venvDir,
+    launchUrl: manifest.launchUrl,
+    healthUrl: manifest.healthUrl,
+    processNames: manifest.processNames || existingTool?.processNames || [],
+    configTargets: manifest.installInstructions.configTargets,
+    displayPath: resolvedInstallDir,
+  };
+
+  nextState.launchProfile = buildManagedLaunchProfile(nextState, manifest);
+  nextState.executablePath = nextState.launchProfile?.kind === 'binary' ? nextState.launchProfile.executable : nextState.executablePath || null;
+  return nextState;
+}
+
+async function discoverManagedRelocation(existingTool, manifest, logger) {
+  const candidates = uniquePaths([
+    existingTool?.installDir,
+    existingTool?.appDir,
+    path.join(getAppPaths().toolsRoot, manifest.id),
+    path.join(getAppPaths().toolsRoot, manifest.id, 'app'),
+    ...getAppPaths().legacyRoots.flatMap((legacyRoot) => [
+      path.join(legacyRoot, 'tools', manifest.id),
+      path.join(legacyRoot, 'tools', manifest.id, 'app'),
+    ]),
+  ].filter(Boolean));
+
+  for (const candidate of candidates) {
+    const nextState = buildManagedToolState(existingTool, manifest, candidate);
+    if (!(await managedToolIsPresent(nextState))) {
+      continue;
+    }
+
+    await logger.info('Managed tool files were relocated and have been reattached.', {
+      toolId: manifest.id,
+      installDir: nextState.installDir,
+    });
+    return nextState;
+  }
+
+  return null;
+}
+
+function buildMissingManagedToolState(existingTool, manifest) {
+  const nextState = buildManagedToolState(existingTool, manifest, existingTool.installDir);
+  return {
+    ...nextState,
+    status: 'error',
+    lastRepairMessage: existingTool?.lastRepairMessage || null,
+    lastError: `${manifest.name}'s saved install folder is missing. Local AI Hub rescanned this PC but could not find another copy yet. Run Repair or reinstall it.`,
+  };
 }
 
 async function performDiscoveryScan() {
@@ -177,20 +472,36 @@ async function performDiscoveryScan() {
     const existingTool = config.tools[manifest.id];
 
     if (existingTool?.source === 'managed') {
-      nextTools[manifest.id] = existingTool;
-      const present = await managedToolIsPresent(existingTool);
-      if (!present) {
-        await logger.warn('Local AI Hub-managed tool is configured but its files are missing.', {
-          toolId: manifest.id,
-          installDir: existingTool.installDir,
-        });
+      const refreshedManagedTool = buildManagedToolState(existingTool, manifest, existingTool.installDir);
+      if (await managedToolIsPresent(refreshedManagedTool)) {
+        nextTools[manifest.id] = refreshedManagedTool;
+        continue;
       }
+
+      await logger.warn('Local AI Hub-managed tool is configured but its files are missing. Starting a rescan.', {
+        toolId: manifest.id,
+        installDir: existingTool.installDir,
+      });
+
+      const relocatedManagedTool = await discoverManagedRelocation(existingTool, manifest, logger);
+      if (relocatedManagedTool) {
+        nextTools[manifest.id] = relocatedManagedTool;
+        continue;
+      }
+
+      const discoveredExternalTool = await discoverInstallLocation(manifest, existingTool, logger);
+      if (discoveredExternalTool) {
+        nextTools[manifest.id] = buildExternalToolState(manifest, existingTool, discoveredExternalTool);
+        continue;
+      }
+
+      nextTools[manifest.id] = buildMissingManagedToolState(existingTool, manifest);
       continue;
     }
 
-    const discovered = await discoverExternalTool(manifest, existingTool, logger);
+    const discovered = await discoverInstallLocation(manifest, existingTool, logger);
     if (discovered) {
-      nextTools[manifest.id] = discovered;
+      nextTools[manifest.id] = buildExternalToolState(manifest, existingTool, discovered);
     }
   }
 

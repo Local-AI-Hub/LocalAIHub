@@ -10,6 +10,7 @@ import { evaluateCompatibility, toolSearchText } from './lib/tool-ui';
 
 const EMPTY_STATE = {
   appDataPath: '',
+  downloadedModelCount: 0,
   firstLaunch: false,
   hardware: null,
   logsPath: '',
@@ -82,7 +83,7 @@ export default function App() {
 
   const toolMap = useMemo(() => Object.fromEntries(tools.map((tool) => [tool.id, tool])), [tools]);
   const ollamaTool = toolMap.ollama || null;
-  const modelManagerCount = tools.filter((tool) => ['ollama', 'comfyui', 'automatic1111'].includes(tool.id)).length;
+  const modelManagerCount = Number(appState.downloadedModelCount || 0);
 
   const storeCategories = useMemo(() => {
     const values = [...new Set((appState.manifests || []).map((manifest) => manifest.category).filter(Boolean))];

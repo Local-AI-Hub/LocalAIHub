@@ -40,6 +40,9 @@ function sleep(ms) {
 function normalizeProcessNames(processNames = []) {
   return [...new Set((processNames || []).map((name) => path.basename(String(name || '')).trim()).filter(Boolean))];
 }
+function isBareCommand(command) {
+  return Boolean(command) && !path.isAbsolute(command) && !/[\/]/.test(command);
+}
 
 function getToolInterfaceMode(toolState) {
   return toolState?.interfaceMode || 'external-browser';
@@ -334,7 +337,7 @@ function attachRuntimeHandlers(toolState, runtimeState, runtimeOptions = {}) {
 }
 
 async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}) {
-  if (!(await fs.pathExists(launchProfile.pythonPath))) {
+  if (!isBareCommand(launchProfile.pythonPath) && !(await fs.pathExists(launchProfile.pythonPath))) {
     throw new Error(`${toolState.name} is missing its Python launcher. Run Repair or reinstall it.`);
   }
 
@@ -587,5 +590,6 @@ module.exports = {
   resolveToolStatus,
   stopTool,
 };
+
 
 

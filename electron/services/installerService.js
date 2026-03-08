@@ -3,11 +3,14 @@ const fs = require('fs-extra');
 const { open } = require('node:fs/promises');
 const extract = require('extract-zip');
 
+const { version: APP_VERSION } = require('../../package.json');
+
 const { getAppPaths, humanizeError, upsertTool } = require('./configService');
 const { resolvePythonCommand, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { detectPythonRequirement, describePythonRequirement } = require('./pythonRequirementService');
 const { ensureManagedPythonRuntime } = require('./pythonRuntimeService');
+const { syncDiscoveredTools } = require('./toolDiscoveryService');
 const { buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
 
 const DOWNLOAD_TIMEOUT_MS = 30000;
@@ -15,6 +18,9 @@ const MIN_CACHE_BYTES = 1024;
 
 function getToolRuntime(manifest) {
   return manifest.installInstructions.runtime;
+}
+function isBareCommand(token) {
+  return Boolean(token) && !path.isAbsolute(token) && !/[\/]/.test(token);
 }
 
 function reportProgress(callback, payload) {
@@ -44,7 +50,7 @@ async function fetchWithTimeout(url, logger) {
     return await fetch(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'LocalAIHub/0.2.0',
+        'User-Agent': `LocalAIHub/${APP_VERSION}`,
       },
     });
   } catch (error) {
@@ -373,6 +379,30 @@ async function resolveManagedPythonRuntime(appDir, manifest, logger, onProgress,
   };
 }
 
+async function toolIsAvailable(toolState) {
+  if (!toolState) {
+    return false;
+  }
+
+  if (toolState.launchProfile?.kind === 'binary' && toolState.launchProfile?.executable) {
+    return fs.pathExists(toolState.launchProfile.executable);
+  }
+
+  if ((toolState.launchProfile?.kind === 'python-script' || toolState.launchProfile?.kind === 'python-module') && toolState.launchProfile?.pythonPath) {
+    if (isBareCommand(toolState.launchProfile.pythonPath)) {
+      return toolState.installDir ? fs.pathExists(toolState.installDir) : true;
+    }
+
+    return fs.pathExists(toolState.launchProfile.pythonPath);
+  }
+
+  if (toolState.launchProfile?.kind === 'batch' && toolState.launchProfile?.command) {
+    return fs.pathExists(toolState.launchProfile.command);
+  }
+
+  return toolState.installDir ? fs.pathExists(toolState.installDir) : false;
+}
+
 function createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, pythonResolution) {
   const runtime = pythonResolution?.runtime || null;
   const requirement = pythonResolution?.requirement || null;
@@ -415,6 +445,7 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
 }
 
 async function installTool(toolId, options = {}) {
+  await initializeToolRegistry();
   const manifest = getToolManifest(toolId);
   if (!manifest) {
     throw new Error('Local AI Hub does not recognize that tool.');
@@ -426,6 +457,29 @@ async function installTool(toolId, options = {}) {
   });
 
   try {
+    const discoveredTools = await syncDiscoveredTools({ force: true });
+    const existingTool = discoveredTools[toolId];
+    if (await toolIsAvailable(existingTool)) {
+      const existingPath = existingTool.displayPath || existingTool.installDir;
+      const installActionMessage =
+        existingTool.source === 'managed'
+          ? `${manifest.name} is already installed inside Local AI Hub.`
+          : existingPath
+            ? `${manifest.name} is already on this PC. Local AI Hub will use the existing install at ${existingPath}.`
+            : `${manifest.name} is already on this PC. Local AI Hub will use the existing install it detected.`;
+
+      await logger.info('Install request reused an existing tool installation.', {
+        existingPath,
+        source: existingTool.source,
+      });
+
+      return {
+        ...existingTool,
+        installActionMessage,
+        reusedExistingInstall: true,
+      };
+    }
+
     const { downloadsRoot, toolsRoot } = getAppPaths();
     const installDir = path.join(toolsRoot, manifest.id);
     const appDir = path.join(installDir, 'app');
@@ -671,4 +725,7 @@ module.exports = {
   installTool,
   repairToolInstallation,
 };
+
+
+
 

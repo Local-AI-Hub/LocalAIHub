@@ -2,6 +2,8 @@ const path = require('path');
 const fs = require('fs-extra');
 const { open } = require('node:fs/promises');
 
+const { version: APP_VERSION } = require('../../package.json');
+
 const { ensureStorage, getAppPaths } = require('./configService');
 const { inspectPythonExecutable, runCommand } = require('./commandService');
 const { isCompatibleRuntime, requirementToLabel } = require('./pythonRequirementService');
@@ -74,7 +76,7 @@ async function fetchWithTimeout(url, logger) {
     return await fetch(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'LocalAIHub/0.2.0',
+        'User-Agent': `LocalAIHub/${APP_VERSION}`,
       },
     });
   } catch (error) {

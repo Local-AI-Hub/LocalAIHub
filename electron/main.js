@@ -20,6 +20,7 @@ const {
 } = require('./services/configService');
 const {
   browseRemoteModels,
+  countDownloadedModels,
   deleteModel,
   downloadModel,
   listDownloadedModels,
@@ -104,7 +105,7 @@ async function buildAppState(options = {}) {
   const config = await readConfig();
   let hardware = config.hardware;
 
-  if (!hardware) {
+  if (!hardware || !Array.isArray(hardware.disks) || hardware.disks.length === 0) {
     hardware = await detectHardwareSnapshot();
     await saveHardwareDetection(hardware);
   }
@@ -128,9 +129,17 @@ async function buildAppState(options = {}) {
         };
       }),
   );
+  const downloadedModelCount = (
+    await Promise.all(
+      tools
+        .filter((tool) => supportsModelManager(tool))
+        .map((tool) => countDownloadedModels(tool).catch(() => 0)),
+    )
+  ).reduce((total, count) => total + count, 0);
 
   return {
     appDataPath: paths.root,
+    downloadedModelCount,
     firstLaunch: !latestConfig.firstLaunchCompleted,
     hardware,
     logsPath: paths.logsRoot,
@@ -343,7 +352,9 @@ function registerIpcHandlers() {
       });
       invalidateDiscoveryCache();
       return {
-        message: `${tool.name} was installed successfully.`,
+        message:
+          tool.installActionMessage ||
+          (tool.reusedExistingInstall ? `${tool.name} is already ready to use.` : `${tool.name} was installed successfully.`),
         state: await buildAppState({ forceDiscovery: true }),
       };
     }, 'Local AI Hub could not install that tool.'),
@@ -560,3 +571,6 @@ app.on('activate', () => {
 
   showWindow();
 });
+
+
+

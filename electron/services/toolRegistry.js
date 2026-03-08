@@ -6,6 +6,62 @@ const { getLoadedToolManifest, loadToolManifest } = require('./manifestService')
 let cachedToolDefinitions = null;
 let cachedToolManifestKey = '';
 
+const DEFAULT_EXTERNAL_CANDIDATES = {
+  comfyui: {
+    externalBatchCandidates: ['run_nvidia_gpu.bat', 'run_cpu.bat', '..\\run_nvidia_gpu.bat', '..\\run_cpu.bat'],
+    externalPythonCandidates: [
+      'python_embeded\\python.exe',
+      'python_embedded\\python.exe',
+      '..\\python_embeded\\python.exe',
+      '..\\python_embedded\\python.exe',
+      '.venv\\Scripts\\python.exe',
+      'venv\\Scripts\\python.exe',
+    ],
+  },
+  automatic1111: {
+    externalBatchCandidates: ['webui-user.bat', 'webui.bat'],
+  },
+  invokeai: {
+    externalExecutableCandidates: [
+      '.venv\\Scripts\\invokeai-web.exe',
+      'venv\\Scripts\\invokeai-web.exe',
+      'Scripts\\invokeai-web.exe',
+      'invokeai-web.exe',
+      'invokeai.exe',
+    ],
+  },
+  ollama: {
+    externalExecutableCandidates: ['ollama.exe'],
+  },
+};
+
+const DEFAULT_DISCOVERY = {
+  comfyui: {
+    folderNames: ['ComfyUI', 'comfyui', 'ComfyUI-master', 'ComfyUI_windows_portable', 'ComfyUI_portable'],
+    markerPaths: ['main.py', 'ComfyUI\\main.py', 'run_nvidia_gpu.bat', 'run_cpu.bat'],
+    pathExecutables: [],
+  },
+  ollama: {
+    folderNames: ['Ollama', 'ollama'],
+    markerPaths: ['ollama.exe'],
+    pathExecutables: ['ollama.exe'],
+  },
+  automatic1111: {
+    folderNames: ['stable-diffusion-webui', 'stable-diffusion-webui-master', 'automatic1111', 'AUTOMATIC1111', 'sd-webui'],
+    markerPaths: ['webui.py', 'webui-user.bat', 'webui.bat'],
+    pathExecutables: [],
+  },
+  invokeai: {
+    folderNames: ['InvokeAI', 'invokeai', 'InvokeAI-main'],
+    markerPaths: ['invokeai-web.exe', 'invokeai.exe', 'pyproject.toml'],
+    pathExecutables: ['invokeai-web.exe', 'invokeai.exe'],
+  },
+};
+
+function mergeUnique(values = []) {
+  return [...new Set((values || []).filter(Boolean))];
+}
+
 function tokenizeCommand(command) {
   const matches = String(command || '').match(/"[^"]*"|'[^']*'|[^\s]+/g) || [];
   return matches.map((token) => token.replace(/^['"]|['"]$/g, ''));
@@ -83,8 +139,30 @@ function deriveProcessNames(tool) {
   return [...names];
 }
 
+function buildDiscoveryDefaults(tool) {
+  const defaults = DEFAULT_DISCOVERY[tool.id] || {
+    folderNames: [tool.name, tool.id],
+    markerPaths: [],
+    pathExecutables: [],
+  };
+
+  const manifestCommands = [tool.launchCommand, tool.externalLaunchCommand]
+    .filter(Boolean)
+    .map((command) => tokenizeCommand(command)[0])
+    .filter((entry) => /\.(exe|cmd|bat)$/i.test(entry || ''))
+    .map((entry) => path.basename(entry));
+
+  return {
+    folderNames: mergeUnique(defaults.folderNames),
+    markerPaths: mergeUnique(defaults.markerPaths),
+    pathExecutables: mergeUnique([...defaults.pathExecutables, ...manifestCommands]),
+  };
+}
+
 function normalizeToolDefinition(tool) {
   const installInstructions = tool.installInstructions || {};
+  const defaultExternalCandidates = DEFAULT_EXTERNAL_CANDIDATES[tool.id] || {};
+  const discoveryDefaults = buildDiscoveryDefaults(tool);
   const launchUrl = buildLaunchUrl(tool);
 
   return {
@@ -104,15 +182,29 @@ function normalizeToolDefinition(tool) {
       configTargets: installInstructions.configTargets || [],
       pythonRequirementDetection: installInstructions.pythonRequirementDetection || [],
       pipInstalls: installInstructions.pipInstalls || [],
-      externalPythonCandidates: installInstructions.externalPythonCandidates || [],
-      externalExecutableCandidates: installInstructions.externalExecutableCandidates || [],
-      externalBatchCandidates: installInstructions.externalBatchCandidates || [],
+      externalPythonCandidates: mergeUnique([
+        ...(defaultExternalCandidates.externalPythonCandidates || []),
+        ...(installInstructions.externalPythonCandidates || []),
+      ]),
+      externalExecutableCandidates: mergeUnique([
+        ...(defaultExternalCandidates.externalExecutableCandidates || []),
+        ...(installInstructions.externalExecutableCandidates || []),
+      ]),
+      externalBatchCandidates: mergeUnique([
+        ...(defaultExternalCandidates.externalBatchCandidates || []),
+        ...(installInstructions.externalBatchCandidates || []),
+      ]),
       compatibility: installInstructions.compatibility || null,
     },
     launchCommand: tool.launchCommand,
     externalLaunchCommand: tool.externalLaunchCommand || tool.launchCommand,
     defaultPort: tool.defaultPort || null,
     detectionPaths: tool.detectionPaths || [],
+    discovery: {
+      folderNames: mergeUnique([...(tool.discovery?.folderNames || []), ...discoveryDefaults.folderNames]),
+      markerPaths: mergeUnique([...(tool.discovery?.markerPaths || []), ...discoveryDefaults.markerPaths]),
+      pathExecutables: mergeUnique([...(tool.discovery?.pathExecutables || []), ...discoveryDefaults.pathExecutables]),
+    },
     launchUrl,
     healthUrl: buildHealthUrl(tool, launchUrl),
     processNames: tool.processNames || deriveProcessNames(tool),
@@ -164,13 +256,17 @@ function firstExistingRelativePath(basePath, relativePaths = []) {
   return relativePaths.find((relativePath) => fs.existsSync(path.join(basePath, relativePath))) || null;
 }
 
-function resolveCommandPath(token, baseDir, explicitPath = null) {
+function resolveCommandPath(token, baseDir, explicitPath = null, options = {}) {
   if (explicitPath) {
     return explicitPath;
   }
 
   if (!token) {
     return null;
+  }
+
+  if (options.allowBareCommandLookup && !path.isAbsolute(token) && !/[\\/]/.test(token)) {
+    return token;
   }
 
   if (path.isAbsolute(token)) {
@@ -201,7 +297,12 @@ function buildLaunchProfileFromCommand(command, context = {}) {
 
   const head = tokens[0].toLowerCase();
   if (head === 'python' || head === 'py' || head.endsWith('python.exe')) {
-    const pythonPath = context.pythonPath || resolveCommandPath(tokens[0], context.baseDir);
+    const pythonPath =
+      context.pythonPath ||
+      resolveCommandPath(tokens[0], context.baseDir, null, {
+        allowBareCommandLookup: Boolean(context.allowBarePythonCommand),
+      });
+
     if (!tokens[1]) {
       return null;
     }
@@ -297,6 +398,14 @@ function buildExternalLaunchProfile(manifest, installDir, detectedPath = null) {
   const directProfile = buildLaunchProfileFromCommand(launchCommand, baseContext);
   if (directProfile?.kind !== 'python-script' && directProfile?.kind !== 'python-module') {
     return directProfile;
+  }
+
+  const pathAwareProfile = buildLaunchProfileFromCommand(launchCommand, {
+    ...baseContext,
+    allowBarePythonCommand: true,
+  });
+  if (pathAwareProfile) {
+    return pathAwareProfile;
   }
 
   return createFolderOnlyProfile(installDir);

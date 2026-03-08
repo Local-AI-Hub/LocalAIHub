@@ -13,6 +13,36 @@ const SOURCE_OPTIONS = {
   ],
 };
 
+const MODEL_TYPE_OPTIONS = [
+  { id: 'all', label: 'All types' },
+  { id: 'checkpoint', label: 'Checkpoint' },
+  { id: 'lora', label: 'LoRA' },
+  { id: 'vae', label: 'VAE' },
+  { id: 'embedding', label: 'Embedding' },
+  { id: 'controlnet', label: 'ControlNet' },
+  { id: 'hypernetwork', label: 'Hypernetwork' },
+  { id: 'gguf', label: 'GGUF' },
+];
+
+const SORT_OPTIONS = [
+  { id: 'most-downloaded', label: 'Most downloaded' },
+  { id: 'newest', label: 'Newest' },
+  { id: 'highest-rated', label: 'Highest rated' },
+];
+
+const TASK_OPTIONS = [
+  { id: 'all', label: 'All tasks' },
+  { id: 'image-generation', label: 'Image generation' },
+  { id: 'image-to-image', label: 'Image-to-image' },
+  { id: 'text-generation', label: 'Text generation' },
+];
+
+const EMPTY_PAGINATION = {
+  hasMore: false,
+  nextCursor: null,
+  nextPage: null,
+};
+
 function matchingLocalModel(remoteItem, localModels) {
   const remoteKeys = [remoteItem?.fileName, remoteItem?.name]
     .map((value) => String(value || '').toLowerCase())
@@ -26,25 +56,81 @@ function matchingLocalModel(remoteItem, localModels) {
   });
 }
 
-function ModelCard({ item, downloadProgress, localMatch, onDelete, onDownload }) {
-  const imageMarkup = item.previewUrl ? (
-    <img alt={item.name} className="h-full w-full object-cover" src={item.previewUrl} />
-  ) : (
+function mergeRemoteItems(currentItems, nextItems) {
+  const merged = [...currentItems];
+  const knownIds = new Set(currentItems.map((item) => item.id));
+
+  for (const item of nextItems) {
+    if (knownIds.has(item.id)) {
+      continue;
+    }
+
+    knownIds.add(item.id);
+    merged.push(item);
+  }
+
+  return merged;
+}
+
+function badgeClass(tone) {
+  if (tone === 'good') {
+    return 'border-emerald-400/25 bg-emerald-400/10 text-emerald-100';
+  }
+
+  if (tone === 'warn') {
+    return 'border-amber-400/25 bg-amber-400/10 text-amber-100';
+  }
+
+  if (tone === 'danger') {
+    return 'border-rose-400/25 bg-rose-400/10 text-rose-100';
+  }
+
+  return 'border-white/10 bg-white/5 text-slate-300';
+}
+
+function PreviewFallback({ source }) {
+  return (
     <div className="flex h-full w-full items-center justify-center bg-slate-950/50 text-sm font-semibold uppercase tracking-[0.22em] text-slate-500">
-      {item.source === 'ollama' ? 'OLL' : item.source === 'civitai' ? 'CV' : 'HF'}
+      {source === 'ollama' ? 'OLL' : source === 'civitai' ? 'CV' : 'HF'}
     </div>
   );
+}
+
+function ModelPreview({ item }) {
+  const [imageFailed, setImageFailed] = useState(false);
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [item.previewUrl]);
+
+  if (!item.previewUrl || imageFailed) {
+    return <PreviewFallback source={item.source} />;
+  }
 
   return (
+    <img
+      alt={item.name}
+      className="h-full w-full object-cover"
+      onError={() => setImageFailed(true)}
+      src={item.previewUrl}
+    />
+  );
+}
+
+function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, onDownload }) {
+  return (
     <article className="rounded-[28px] border border-white/10 bg-slate-950/35 p-4">
-      <div className="overflow-hidden rounded-[22px] border border-white/10 bg-white/5 aspect-[16/9]">{imageMarkup}</div>
+      <div className="overflow-hidden rounded-[22px] border border-white/10 bg-white/5 aspect-[16/9]">
+        <ModelPreview item={item} />
+      </div>
       <div className="mt-4 flex flex-wrap items-center gap-2">
         <h4 className="text-lg font-semibold text-white">{item.name}</h4>
         <span className="status-pill border-white/10 bg-white/5 text-slate-300">{item.modelType}</span>
+        {item.hardwareFit ? <span className={`status-pill ${badgeClass(item.hardwareFit.tone)}`}>{item.hardwareFit.label}</span> : null}
         {localMatch ? <span className="status-pill border-emerald-400/20 bg-emerald-400/10 text-emerald-100">Downloaded</span> : null}
       </div>
       <p className="mt-3 line-clamp-3 text-sm leading-6 text-slate-300">{item.description}</p>
-      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
           <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Source</p>
           <p className="mt-2 text-sm font-medium text-white">{item.source}</p>
@@ -52,6 +138,20 @@ function ModelCard({ item, downloadProgress, localMatch, onDelete, onDownload })
         <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
           <p className="text-xs uppercase tracking-[0.2em] text-slate-500">File size</p>
           <p className="mt-2 text-sm font-medium text-white">{item.sizeBytes ? formatBytes(item.sizeBytes) : item.sizeLabel || 'Unknown'}</p>
+        </div>
+        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Hardware fit</p>
+          <p className="mt-2 text-sm font-medium text-white">{item.hardwareFit?.label || 'Unknown'}</p>
+          <p className="mt-2 text-xs leading-5 text-slate-400">{item.hardwareFit?.message || 'No GPU fit estimate yet.'}</p>
+        </div>
+        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Disk headroom</p>
+          <p className="mt-2 text-sm font-medium text-white">
+            {item.diskWarning?.tone === 'danger' ? 'Low space' : item.diskWarning?.tone === 'warn' ? 'Watch space' : 'Looks safe'}
+          </p>
+          <p className="mt-2 text-xs leading-5 text-slate-400">
+            {item.diskWarning?.message || 'This download should leave enough free space on the target drive.'}
+          </p>
         </div>
       </div>
       {downloadProgress ? (
@@ -70,8 +170,8 @@ function ModelCard({ item, downloadProgress, localMatch, onDelete, onDownload })
       ) : null}
       <div className="mt-4 flex flex-wrap gap-3">
         {localMatch ? (
-          <button className="ghost-button" onClick={() => onDelete(localMatch)} type="button">
-            Delete
+          <button className="ghost-button" disabled={deleteBusy} onClick={() => onDelete(localMatch, item)} type="button">
+            {deleteBusy ? 'Deleting...' : 'Delete'}
           </button>
         ) : (
           <button className="primary-button" onClick={() => onDownload(item)} type="button">
@@ -93,15 +193,23 @@ export default function ModelManager({ tools, onToast }) {
   const [selectedSource, setSelectedSource] = useState(modelTools[0]?.id === 'ollama' ? 'ollama' : 'huggingface');
   const [search, setSearch] = useState('');
   const [browseLoading, setBrowseLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [localLoading, setLocalLoading] = useState(false);
   const [remoteItems, setRemoteItems] = useState([]);
   const [localModels, setLocalModels] = useState([]);
   const [settings, setSettings] = useState({ civitaiApiKey: '' });
   const [civitaiApiKeyDraft, setCivitaiApiKeyDraft] = useState('');
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
+  const [pagination, setPagination] = useState(EMPTY_PAGINATION);
+  const [modelType, setModelType] = useState('all');
+  const [sort, setSort] = useState('most-downloaded');
+  const [taskType, setTaskType] = useState('image-generation');
+  const [deleteBusyId, setDeleteBusyId] = useState(null);
 
   const selectedTool = modelTools.find((tool) => tool.id === selectedToolId) || null;
   const sourceOptions = SOURCE_OPTIONS[selectedTool?.id || 'ollama'] || [{ id: 'ollama', label: 'Ollama Library' }];
+  const taskOptionsVisible = selectedSource === 'huggingface' && selectedToolId !== 'ollama';
+  const filterOptionsVisible = selectedToolId !== 'ollama';
 
   async function loadSettings() {
     const result = await window.localAIHub.getModelSettings();
@@ -128,33 +236,66 @@ export default function ModelManager({ tools, onToast }) {
     setLocalLoading(false);
   }
 
-  async function browse(toolId = selectedToolId, source = selectedSource, query = search) {
+  async function browse(options = {}) {
+    const toolId = options.toolId || selectedToolId;
+    const source = options.source || selectedSource;
+    const append = Boolean(options.append);
+    const query = options.query !== undefined ? options.query : search;
+
     if (!toolId) {
       setRemoteItems([]);
       setLocalModels([]);
+      setPagination(EMPTY_PAGINATION);
       return;
     }
 
-    setBrowseLoading(true);
+    if (append) {
+      setLoadingMore(true);
+    } else {
+      setBrowseLoading(true);
+    }
+
     const result = await window.localAIHub.browseModels({
+      cursor: options.cursor || null,
+      modelType,
+      page: options.page || 1,
       query,
+      sort,
       source,
+      taskType: taskOptionsVisible ? taskType : 'all',
       toolId,
     });
 
     if (!result?.ok) {
       onToast(result?.message || 'Local AI Hub could not load remote models right now.', 'error');
       setBrowseLoading(false);
+      setLoadingMore(false);
       return;
     }
 
-    setRemoteItems(result.data?.items || []);
+    const nextItems = result.data?.items || [];
+    setRemoteItems((current) => (append ? mergeRemoteItems(current, nextItems) : nextItems));
     setLocalModels(result.data?.localModels || []);
+    setPagination(result.data?.pagination || EMPTY_PAGINATION);
     if (result.data?.settings) {
       setSettings(result.data.settings);
       setCivitaiApiKeyDraft(result.data.settings.civitaiApiKey || '');
     }
+
     setBrowseLoading(false);
+    setLoadingMore(false);
+  }
+
+  async function handleLoadMore() {
+    if (!pagination.hasMore) {
+      return;
+    }
+
+    await browse({
+      append: true,
+      cursor: pagination.nextCursor,
+      page: pagination.nextPage || 1,
+    });
   }
 
   useEffect(() => {
@@ -191,6 +332,7 @@ export default function ModelManager({ tools, onToast }) {
     if (!selectedToolId) {
       setRemoteItems([]);
       setLocalModels([]);
+      setPagination(EMPTY_PAGINATION);
       return;
     }
 
@@ -201,8 +343,9 @@ export default function ModelManager({ tools, onToast }) {
       return;
     }
 
-    browse(selectedToolId, selectedSource, search);
-  }, [selectedToolId, selectedSource]);
+    setPagination(EMPTY_PAGINATION);
+    browse({ page: 1, cursor: null });
+  }, [selectedToolId, selectedSource, modelType, sort, taskType]);
 
   async function handleDownload(item) {
     const result = await window.localAIHub.downloadModel({
@@ -217,23 +360,37 @@ export default function ModelManager({ tools, onToast }) {
 
     onToast(result.data?.message || `${item.name} was downloaded.`, 'success');
     setLocalModels(result.data?.localModels || []);
-    browse(selectedToolId, selectedSource, search);
+    browse({ page: 1, cursor: null });
   }
 
-  async function handleDelete(model) {
+  async function handleDelete(model, remoteItem = null) {
+    const displayName = remoteItem?.name || model?.name || model?.fileName || 'this model';
+    const toolName = selectedTool?.name || 'this tool';
+    const deleteMessage =
+      selectedToolId === 'ollama'
+        ? `Delete ${displayName} from ${toolName}? Local AI Hub will run ollama rm and remove the local model.`
+        : `Delete ${displayName} from ${toolName}? This removes the downloaded model file from your PC.`;
+
+    if (!window.confirm(deleteMessage)) {
+      return;
+    }
+
+    setDeleteBusyId(model.id);
     const result = await window.localAIHub.deleteModel({
       ...model,
       toolId: selectedToolId,
     });
 
     if (!result?.ok) {
+      setDeleteBusyId(null);
       onToast(result?.message || 'Local AI Hub could not delete that model.', 'error');
       return;
     }
 
-    onToast(result.data?.message || `${model.name} was deleted.`, 'success');
+    onToast(result.data?.message || `${displayName} was deleted.`, 'success');
     setLocalModels(result.data?.localModels || []);
-    browse(selectedToolId, selectedSource, search);
+    setDeleteBusyId(null);
+    browse({ page: 1, cursor: null });
   }
 
   async function handleSaveCivitaiKey() {
@@ -268,9 +425,9 @@ export default function ModelManager({ tools, onToast }) {
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Model Manager</p>
-            <h3 className="mt-3 text-3xl font-semibold text-white">Browse, download, and clean up local models</h3>
+            <h3 className="mt-3 text-3xl font-semibold text-white">Browse live model catalogs with local fit checks</h3>
             <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
-              Pull Ollama models, or send checkpoints, LoRAs, and VAEs directly into ComfyUI and Automatic1111 without leaving the app.
+              Search full Hugging Face and CivitAI catalogs, page through results, check the real file size first, and compare each model to your GPU memory and disk headroom before downloading.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -288,19 +445,44 @@ export default function ModelManager({ tools, onToast }) {
                 </option>
               ))}
             </select>
+            {filterOptionsVisible ? (
+              <select className="store-input min-w-[180px]" onChange={(event) => setModelType(event.target.value)} value={modelType}>
+                {MODEL_TYPE_OPTIONS.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+            {taskOptionsVisible ? (
+              <select className="store-input min-w-[190px]" onChange={(event) => setTaskType(event.target.value)} value={taskType}>
+                {TASK_OPTIONS.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+            <select className="store-input min-w-[190px]" onChange={(event) => setSort(event.target.value)} value={sort}>
+              {SORT_OPTIONS.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
             <input
               className="store-input min-w-[260px]"
               onChange={(event) => setSearch(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter') {
-                  browse();
+                  browse({ page: 1, cursor: null, query: event.currentTarget.value });
                 }
               }}
               placeholder={selectedToolId === 'ollama' ? 'Search Ollama models' : 'Search remote models'}
               type="search"
               value={search}
             />
-            <button className="primary-button" disabled={browseLoading} onClick={() => browse()} type="button">
+            <button className="primary-button" disabled={browseLoading} onClick={() => browse({ page: 1, cursor: null })} type="button">
               {browseLoading ? 'Loading...' : 'Search'}
             </button>
           </div>
@@ -335,7 +517,7 @@ export default function ModelManager({ tools, onToast }) {
           <div className="flex items-center justify-between gap-3">
             <div>
               <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Downloaded</p>
-              <h4 className="mt-2 text-xl font-semibold text-white">Local model files</h4>
+              <h4 className="mt-2 text-xl font-semibold text-white">Downloaded models</h4>
             </div>
             <button className="ghost-button" disabled={localLoading} onClick={() => loadLocalModels()} type="button">
               {localLoading ? 'Refreshing...' : 'Refresh'}
@@ -351,8 +533,13 @@ export default function ModelManager({ tools, onToast }) {
                   </div>
                   <p className="mt-2 break-all text-xs leading-6 text-slate-400">{model.fileName}</p>
                   <p className="mt-2 text-sm text-slate-300">{model.sizeBytes ? formatBytes(model.sizeBytes) : 'Unknown size'}</p>
-                  <button className="ghost-button mt-3 w-full justify-center" onClick={() => handleDelete(model)} type="button">
-                    Delete
+                  <button
+                    className="ghost-button mt-3 w-full justify-center"
+                    disabled={deleteBusyId === model.id}
+                    onClick={() => handleDelete(model)}
+                    type="button"
+                  >
+                    {deleteBusyId === model.id ? 'Deleting...' : 'Delete'}
                   </button>
                 </div>
               ))
@@ -365,12 +552,12 @@ export default function ModelManager({ tools, onToast }) {
         </aside>
 
         <div className="panel p-5">
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Remote catalog</p>
               <h4 className="mt-2 text-xl font-semibold text-white">Available models</h4>
             </div>
-            <p className="text-sm text-slate-400">{remoteItems.length} results</p>
+            <p className="text-sm text-slate-400">{remoteItems.length} loaded</p>
           </div>
 
           <div className="mt-5 grid gap-4 2xl:grid-cols-2">
@@ -380,6 +567,7 @@ export default function ModelManager({ tools, onToast }) {
                 return (
                   <ModelCard
                     key={item.id}
+                    deleteBusy={deleteBusyId === localMatch?.id}
                     downloadProgress={downloadProgressMap[item.id]}
                     item={item}
                     localMatch={localMatch}
@@ -390,12 +578,18 @@ export default function ModelManager({ tools, onToast }) {
               })
             ) : (
               <div className="rounded-[28px] border border-dashed border-white/15 bg-white/5 p-10 text-center text-slate-400 2xl:col-span-2">
-                {browseLoading
-                  ? 'Loading remote models...'
-                  : 'No models matched this search. Try another query or source.'}
+                {browseLoading ? 'Loading remote models...' : 'No models matched this search. Try another query or filter.'}
               </div>
             )}
           </div>
+
+          {pagination.hasMore ? (
+            <div className="mt-5 flex justify-center">
+              <button className="ghost-button" disabled={loadingMore} onClick={handleLoadMore} type="button">
+                {loadingMore ? 'Loading more...' : 'Load more'}
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
     </section>
