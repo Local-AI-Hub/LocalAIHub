@@ -4,10 +4,17 @@ const { open } = require('node:fs/promises');
 
 const { version: APP_VERSION } = require('../../package.json');
 const { ensureStorage, humanizeError, readConfig, saveHardwareDetection } = require('./configService');
+const {
+  migrateLegacyModelManagerSecrets,
+  readModelManagerSecrets,
+  stripModelManagerSecrets,
+  writeModelManagerSecrets,
+} = require('./credentialService');
 const { runCommand } = require('./commandService');
 const { detectHardwareSnapshot, detectStorageSnapshot, findDiskForPath } = require('./hardwareService');
 const { createLogger } = require('./logService');
 const { listOllamaModels } = require('./ollamaService');
+const { assertLoopbackUrl, assertSecureRemoteUrl } = require('./pathSafetyService');
 
 const APP_USER_AGENT = `LocalAIHub/${APP_VERSION}`;
 const MODEL_SETTINGS_FILE = 'model-manager.settings.json';
@@ -238,6 +245,7 @@ function getCatalogRequirements(browseOptions) {
 function buildModelSettingsDefaults() {
   return {
     civitaiApiKey: '',
+    hasCivitaiApiKey: false,
   };
 }
 
@@ -246,39 +254,77 @@ async function getModelSettingsPath() {
   return path.join(root, MODEL_SETTINGS_FILE);
 }
 
-async function readModelSettings() {
+async function readPublicModelSettingsFile() {
   const settingsPath = await getModelSettingsPath();
   if (!(await fs.pathExists(settingsPath))) {
-    return buildModelSettingsDefaults();
+    return {};
   }
 
   try {
     const settings = await fs.readJson(settingsPath);
-    return {
-      ...buildModelSettingsDefaults(),
-      ...(settings || {}),
-    };
+    return stripModelManagerSecrets(settings || {});
   } catch {
-    return buildModelSettingsDefaults();
+    return {};
   }
 }
 
-async function writeModelSettings(settings) {
+async function writePublicModelSettingsFile(settings) {
   const settingsPath = await getModelSettingsPath();
   const nextSettings = {
-    ...buildModelSettingsDefaults(),
-    ...(settings || {}),
+    ...stripModelManagerSecrets(settings || {}),
   };
   await fs.writeJson(settingsPath, nextSettings, { spaces: 2 });
   return nextSettings;
 }
 
+async function readModelSettingsInternal() {
+  const fileSettings = await readPublicModelSettingsFile();
+  const migratedLegacySecret = await migrateLegacyModelManagerSecrets(fileSettings).catch(() => false);
+
+  if (migratedLegacySecret) {
+    await writePublicModelSettingsFile(fileSettings);
+  }
+
+  const secrets = await readModelManagerSecrets();
+  return {
+    ...buildModelSettingsDefaults(),
+    ...stripModelManagerSecrets(fileSettings),
+    civitaiApiKey: secrets.civitaiApiKey || '',
+    hasCivitaiApiKey: Boolean(secrets.hasCivitaiApiKey),
+  };
+}
+
+async function readModelSettings() {
+  const settings = await readModelSettingsInternal();
+  return {
+    ...stripModelManagerSecrets(settings),
+    civitaiApiKey: '',
+    hasCivitaiApiKey: Boolean(settings.hasCivitaiApiKey),
+  };
+}
+
 async function saveModelManagerSettings(patch) {
-  const current = await readModelSettings();
-  return writeModelSettings({
-    ...current,
-    ...(patch || {}),
+  const currentPublicSettings = await readPublicModelSettingsFile();
+  const nextPatch = patch || {};
+
+  if (Object.prototype.hasOwnProperty.call(nextPatch, 'civitaiApiKey')) {
+    await writeModelManagerSecrets({
+      civitaiApiKey: nextPatch.civitaiApiKey,
+    });
+  }
+
+  const nextSettings = await writePublicModelSettingsFile({
+    ...currentPublicSettings,
+    ...stripModelManagerSecrets(nextPatch),
   });
+  const secrets = await readModelManagerSecrets();
+
+  return {
+    ...buildModelSettingsDefaults(),
+    ...nextSettings,
+    civitaiApiKey: '',
+    hasCivitaiApiKey: Boolean(secrets.hasCivitaiApiKey),
+  };
 }
 
 function getOllamaModelsRoot() {
@@ -1302,7 +1348,12 @@ async function browseRemoteModels(tool, options = {}) {
     throw new Error('Local AI Hub can only browse models for Ollama, ComfyUI, Forge, Automatic1111, and LM Studio.');
   }
 
-  const settings = await readModelSettings();
+  const settings = await readModelSettingsInternal();
+  const publicSettings = {
+    ...stripModelManagerSecrets(settings),
+    civitaiApiKey: '',
+    hasCivitaiApiKey: Boolean(settings.hasCivitaiApiKey),
+  };
   const localModels = await listDownloadedModels(tool).catch(() => []);
   const downloadedLookup = buildDownloadedLookup(localModels);
   const hardwareContext = await loadHardwareContext();
@@ -1313,7 +1364,7 @@ async function browseRemoteModels(tool, options = {}) {
       items: result.items,
       localModels,
       pagination: result.pagination,
-      settings,
+      settings: publicSettings,
     };
   }
 
@@ -1323,7 +1374,7 @@ async function browseRemoteModels(tool, options = {}) {
       items: result.items,
       localModels,
       pagination: result.pagination,
-      settings,
+      settings: publicSettings,
     };
   }
 
@@ -1332,7 +1383,7 @@ async function browseRemoteModels(tool, options = {}) {
     items: result.items,
     localModels,
     pagination: result.pagination,
-    settings,
+    settings: publicSettings,
   };
 }
 
@@ -1420,7 +1471,8 @@ function emitProgress(onProgress, payload) {
 }
 
 async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) {
-  const response = await fetch(downloadUrl, {
+  const safeDownloadUrl = assertSecureRemoteUrl(downloadUrl, 'model download URL');
+  const response = await fetch(safeDownloadUrl, {
     headers: options.headers || {},
   });
 
@@ -1488,13 +1540,14 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   });
 
   const targetDirectory = getTargetDirectory(tool, payload.modelType, payload);
+  const downloadUrl = assertSecureRemoteUrl(payload.downloadUrl, 'model download URL');
   if (!targetDirectory) {
     throw new Error(`Local AI Hub could not determine where ${tool.name} stores ${payload.modelType} files.`);
   }
 
   const fileName = path.basename(payload.fileName || payload.name || 'model.safetensors');
   const destinationPath = path.join(targetDirectory, fileName);
-  const settings = await readModelSettings();
+  const settings = await readModelSettingsInternal();
   const headers = payload.source === 'civitai' ? buildCivitaiHeaders(settings) : { 'User-Agent': APP_USER_AGENT };
 
   if (await fs.pathExists(destinationPath)) {
@@ -1512,7 +1565,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       await logger.info('Downloading model file.', {
-        downloadUrl: payload.downloadUrl,
+        downloadUrl,
         destinationPath,
         attempt,
       });
@@ -1525,7 +1578,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
         totalBytes: payload.sizeBytes || 0,
       });
 
-      const result = await streamDownloadToFile(payload.downloadUrl, destinationPath, {
+      const result = await streamDownloadToFile(downloadUrl, destinationPath, {
         downloadId: payload.id,
         expectedBytes: payload.sizeBytes,
         headers,
@@ -1570,7 +1623,8 @@ async function pullOllamaModel(tool, payload, options = {}) {
     modelId: payload.id,
   });
 
-  const response = await fetch(new URL('/api/pull', `${tool.launchUrl.replace(/\/$/, '')}/`).toString(), {
+  const launchUrl = assertLoopbackUrl(tool.launchUrl, 'Ollama API URL');
+  const response = await fetch(new URL('/api/pull', `${launchUrl.replace(/\/$/, '')}/`).toString(), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -1694,7 +1748,8 @@ async function deleteModel(tool, payload) {
         errorMessage: modelName + ' could not be removed from Ollama.',
       });
     } catch (error) {
-      const response = await fetch(new URL('/api/delete', (tool.launchUrl || '').replace(/\/$/, '') + '/').toString(), {
+      const launchUrl = assertLoopbackUrl(tool.launchUrl, 'Ollama API URL');
+      const response = await fetch(new URL('/api/delete', launchUrl.replace(/\/$/, '') + '/').toString(), {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',
@@ -1736,6 +1791,16 @@ module.exports = {
   saveModelManagerSettings,
   supportsModelManager,
 };
+
+
+
+
+
+
+
+
+
+
 
 
 

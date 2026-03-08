@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const { getAppPaths, readConfig, updateConfig } = require('./configService');
+const { resolveManagedToolPaths } = require('./pathSafetyService');
 const { runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const {
@@ -458,6 +459,26 @@ function buildExternalToolState(manifest, existingTool, detected) {
   };
 }
 
+
+function getAllowedManagedInstallDirs(manifest) {
+  const currentManagedPaths = resolveManagedToolPaths(
+    manifest.id,
+    manifest.installInstructions.venvFolder || '.venv',
+  );
+  return uniquePaths([
+    currentManagedPaths.installDir,
+    ...getAppPaths().legacyRoots.map((legacyRoot) => path.join(legacyRoot, 'tools', manifest.id)),
+  ]);
+}
+
+function resolveSafeManagedInstallDir(manifest, installDir) {
+  const normalizedInstallDir = path.basename(installDir || '') === 'app' ? path.dirname(installDir) : installDir;
+  const safeCandidate = getAllowedManagedInstallDirs(manifest).find(
+    (candidate) => normalizePathKey(candidate) === normalizePathKey(normalizedInstallDir),
+  );
+
+  return safeCandidate || resolveManagedToolPaths(manifest.id, manifest.installInstructions.venvFolder || '.venv').installDir;
+}
 async function managedToolIsPresent(tool) {
   if (!tool || tool.source !== 'managed') {
     return false;
@@ -479,8 +500,8 @@ async function managedToolIsPresent(tool) {
 }
 
 function buildManagedToolState(existingTool, manifest, installDir = existingTool.installDir) {
-  const resolvedInstallDir = path.basename(installDir || '') === 'app' ? path.dirname(installDir) : installDir;
-  const appDir = path.basename(installDir || '') === 'app' ? installDir : path.join(resolvedInstallDir || '', 'app');
+  const resolvedInstallDir = resolveSafeManagedInstallDir(manifest, installDir);
+  const appDir = path.join(resolvedInstallDir || '', 'app');
   const venvDir = manifest.installInstructions.runtime === 'python'
     ? path.join(resolvedInstallDir || '', manifest.installInstructions.venvFolder || '.venv')
     : null;
@@ -630,6 +651,8 @@ module.exports = {
   invalidateDiscoveryCache,
   syncDiscoveredTools,
 };
+
+
 
 
 

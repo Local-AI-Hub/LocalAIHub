@@ -2,6 +2,8 @@ const path = require('path');
 const fs = require('fs-extra');
 const { app } = require('electron');
 
+const { sanitizeUserMessage } = require('./redactionService');
+
 const CONFIG_VERSION = 2;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
 const LEGACY_APP_DATA_DIR_NAMES = ['NestAI'];
@@ -362,13 +364,7 @@ function humanizeError(error, fallback = 'Something went wrong. Please try again
     return fallback;
   }
 
-  const rawMessage = String(error.message || error).trim();
-  if (!rawMessage) {
-    return fallback;
-  }
-
-  const firstLine = rawMessage.split(/\r?\n/).find(Boolean) || fallback;
-  return firstLine.replace(/^Error:\s*/i, '');
+  return sanitizeUserMessage(error.message || error, fallback);
 }
 
 module.exports = {
@@ -386,3 +382,4 @@ module.exports = {
   upsertTool,
   writeConfig,
 };
+

@@ -16,3 +16,8 @@ AppData/
 .env
 .env.*
 .cache/
+*.local.json
+*.secrets.json
+*.credentials.json
+*.private.pem
+*.private.key

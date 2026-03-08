@@ -6,12 +6,14 @@ const extract = require('extract-zip');
 const { version: APP_VERSION } = require('../../package.json');
 
 const { getAppPaths, humanizeError, upsertTool } = require('./configService');
+const { verifyDownloadedFileIntegrity } = require('./downloadIntegrityService');
 const { resolvePythonCommand, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { detectPythonRequirement, describePythonRequirement } = require('./pythonRequirementService');
 const { ensureManagedPythonRuntime } = require('./pythonRuntimeService');
 const { syncDiscoveredTools } = require('./toolDiscoveryService');
 const { buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
+const { assertPathInside, assertSecureRemoteUrl, resolveManagedToolPaths } = require('./pathSafetyService');
 
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const MIN_CACHE_BYTES = 1024;
@@ -20,9 +22,84 @@ function getToolRuntime(manifest) {
   return manifest.installInstructions.runtime;
 }
 function isBareCommand(token) {
-  return Boolean(token) && !path.isAbsolute(token) && !/[\/]/.test(token);
+  return Boolean(token) && !path.isAbsolute(token) && !/[\\/]/.test(token);
 }
 
+const SAFE_PIP_PACKAGE_PATTERN = /^[A-Za-z0-9._+\-[\],=<>!~]+$/;
+
+function assertSafePipInstallTarget(value) {
+  const target = String(value || '').trim();
+  if (!target || !SAFE_PIP_PACKAGE_PATTERN.test(target)) {
+    throw new Error('Local AI Hub refused to install an unsafe Python package target.');
+  }
+
+  return target;
+}
+
+function ensureManagedToolStatePaths(toolState) {
+  if (!toolState?.id) {
+    throw new Error('Local AI Hub could not validate the managed tool path.');
+  }
+
+  const managedPaths = resolveManagedToolPaths(toolState.id, path.basename(toolState.venvDir || '.venv'));
+  const installDir = assertPathInside(
+    managedPaths.toolsRoot,
+    toolState.installDir || managedPaths.installDir,
+    'Local AI Hub refused to use a managed install outside its tools folder.',
+  );
+  const appDir = assertPathInside(
+    installDir,
+    toolState.appDir || managedPaths.appDir,
+    'Local AI Hub refused to use a managed app folder outside the tool directory.',
+  );
+  const venvDir = toolState.venvDir
+    ? assertPathInside(
+        installDir,
+        toolState.venvDir,
+        'Local AI Hub refused to use a managed Python environment outside the tool directory.',
+      )
+    : null;
+
+  return {
+    ...toolState,
+    installDir,
+    appDir,
+    venvDir,
+  };
+}
+
+function buildManagedProcessEnv(toolState, extraEnv = {}, options = {}) {
+  const safeToolState = ensureManagedToolStatePaths(toolState);
+  const stateRoot = path.join(safeToolState.installDir, '.localaihub');
+  const cacheDir = path.join(stateRoot, 'cache');
+  const tempDir = path.join(stateRoot, 'tmp');
+  const pycacheDir = path.join(stateRoot, 'pycache');
+
+  return {
+    ...process.env,
+    ...extraEnv,
+    LOCALAIHUB_TOOL_ID: safeToolState.id,
+    LOCALAIHUB_TOOL_ROOT: safeToolState.installDir,
+    PIP_CACHE_DIR: cacheDir,
+    PIP_DISABLE_PIP_VERSION_CHECK: '1',
+    PYTHONNOUSERSITE: '1',
+    PYTHONPYCACHEPREFIX: pycacheDir,
+    TEMP: tempDir,
+    TMP: tempDir,
+    TMPDIR: tempDir,
+    XDG_CACHE_HOME: cacheDir,
+    ...(options.requireVirtualEnv ? { PIP_REQUIRE_VIRTUALENV: '1' } : {}),
+  };
+}
+
+async function verifyCachedDownload(manifest, archivePath, logger) {
+  try {
+    return await verifyDownloadedFileIntegrity(manifest.downloadUrl, archivePath, logger, `${manifest.name} installer`);
+  } catch (error) {
+    await fs.remove(archivePath).catch(() => null);
+    throw error;
+  }
+}
 function reportProgress(callback, payload) {
   if (typeof callback === 'function') {
     callback(payload);
@@ -87,6 +164,8 @@ async function hasUsableArchiveCache(archivePath, logger) {
 }
 
 async function downloadFile(url, destination, onProgress, logger, toolId) {
+  assertSecureRemoteUrl(url, 'installer download URL');
+
   await advanceStep(
     logger,
     onProgress,
@@ -232,6 +311,7 @@ async function extractArchiveWithRecovery(manifest, archivePath, targetDirectory
     await fs.remove(archivePath).catch(() => null);
 
     await downloadFile(manifest.downloadUrl, archivePath, onProgress, logger, toolId);
+    await verifyCachedDownload(manifest, archivePath, logger);
     await advanceStep(logger, onProgress, {
       toolId,
       percent: 50,
@@ -252,8 +332,18 @@ async function extractArchiveWithRecovery(manifest, archivePath, targetDirectory
 }
 
 async function installPythonDependencies(toolState, manifest, onProgress, logger, pythonRuntime) {
+  toolState = ensureManagedToolStatePaths(toolState);
   const python = pythonRuntime || (await resolvePythonCommand());
   const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  const stateRoot = path.join(toolState.installDir, '.localaihub');
+
+  await Promise.all([
+    fs.ensureDir(toolState.installDir),
+    fs.ensureDir(toolState.appDir),
+    fs.ensureDir(path.join(stateRoot, 'cache')),
+    fs.ensureDir(path.join(stateRoot, 'tmp')),
+    fs.ensureDir(path.join(stateRoot, 'pycache')),
+  ]);
 
   await advanceStep(
     logger,
@@ -273,11 +363,13 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
   if (python.pythonPath) {
     await runCommand(python.pythonPath, ['-m', 'venv', toolState.venvDir], {
       cwd: toolState.appDir,
+      env: buildManagedProcessEnv(toolState),
       errorMessage: 'Local AI Hub could not create the Python virtual environment.',
     });
   } else {
     await runCommand(python.launcher, [...python.launcherArgs, '-m', 'venv', toolState.venvDir], {
       cwd: toolState.appDir,
+      env: buildManagedProcessEnv(toolState),
       errorMessage: 'Local AI Hub could not create the Python virtual environment.',
     });
   }
@@ -295,6 +387,7 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
 
   await runCommand(pythonPath, ['-m', 'pip', 'install', '--upgrade', 'pip'], {
     cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
     errorMessage: 'Local AI Hub could not update pip in the tool environment.',
   });
 
@@ -310,7 +403,11 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
     let installTarget = instruction.value;
 
     if (instruction.kind === 'requirements') {
-      const requirementsPath = path.join(toolState.appDir, instruction.value);
+      const requirementsPath = assertPathInside(
+        toolState.appDir,
+        path.join(toolState.appDir, instruction.value),
+        'Local AI Hub refused to install dependencies from outside the tool folder.',
+      );
       if (!(await fs.pathExists(requirementsPath))) {
         await logger.warn('Skipping missing requirements file.', {
           requirementsPath,
@@ -319,8 +416,15 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
       }
       installTarget = requirementsPath;
       args = [...args, '-r', requirementsPath];
+    } else if (instruction.kind === 'path') {
+      installTarget = assertPathInside(
+        toolState.appDir,
+        path.resolve(toolState.appDir, instruction.value),
+        'Local AI Hub refused to install a Python package path outside the tool folder.',
+      );
+      args = [...args, installTarget];
     } else {
-      installTarget = path.resolve(toolState.appDir, instruction.value);
+      installTarget = assertSafePipInstallTarget(instruction.value);
       args = [...args, installTarget];
     }
 
@@ -340,6 +444,7 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
 
     await runCommand(pythonPath, args, {
       cwd: toolState.appDir,
+      env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
       errorMessage: `Local AI Hub could not install ${manifest.name} dependencies.`,
     });
 
@@ -441,23 +546,27 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
   if (toolState.launchProfile?.kind === 'binary') {
     toolState.executablePath = toolState.launchProfile.executable;
   }
-  return toolState;
+  return ensureManagedToolStatePaths(toolState);
 }
 function buildManagedPaths(manifest) {
-  const { downloadsRoot, toolsRoot } = getAppPaths();
-  const installDir = path.join(toolsRoot, manifest.id);
-  const appDir = path.join(installDir, 'app');
-  const venvDir = path.join(installDir, manifest.installInstructions.venvFolder || '.venv');
+  const { downloadsRoot } = getAppPaths();
+  const managedPaths = resolveManagedToolPaths(
+    manifest.id,
+    manifest.installInstructions.venvFolder || '.venv',
+  );
   const cacheFileName =
     manifest.installInstructions.downloadFileName ||
     manifest.installInstructions.archiveName ||
     deriveCacheFileName(manifest.downloadUrl, manifest.id);
+  const archivePath = assertPathInside(
+    downloadsRoot,
+    path.join(downloadsRoot, manifest.id, cacheFileName),
+    'Local AI Hub refused to use a download cache path outside the downloads folder.',
+  );
 
   return {
-    appDir,
-    archivePath: path.join(downloadsRoot, manifest.id, cacheFileName),
-    installDir,
-    venvDir,
+    ...managedPaths,
+    archivePath,
   };
 }
 
@@ -490,25 +599,37 @@ function resolveInstallerArgs(manifest, installDir, appDir) {
 }
 
 async function ensureCachedDownload(manifest, archivePath, logger, onProgress, toolId) {
+  assertSecureRemoteUrl(manifest.downloadUrl, `${manifest.name} download URL`);
+
   const hasCachedArchive = await hasUsableArchiveCache(archivePath, logger);
-  if (!hasCachedArchive) {
-    await downloadFile(manifest.downloadUrl, archivePath, onProgress, logger, toolId);
-    return;
+  if (hasCachedArchive) {
+    await advanceStep(
+      logger,
+      onProgress,
+      {
+        toolId,
+        percent: 45,
+        stage: 'downloading',
+        message: 'Using the cached installer package.',
+      },
+      {
+        archivePath,
+      },
+    );
+
+    try {
+      await verifyCachedDownload(manifest, archivePath, logger);
+      return;
+    } catch (error) {
+      await logger.warn('Cached installer verification failed. Downloading a fresh copy.', {
+        archivePath,
+        error,
+      });
+    }
   }
 
-  await advanceStep(
-    logger,
-    onProgress,
-    {
-      toolId,
-      percent: 45,
-      stage: 'downloading',
-      message: 'Using the cached installer package.',
-    },
-    {
-      archivePath,
-    },
-  );
+  await downloadFile(manifest.downloadUrl, archivePath, onProgress, logger, toolId);
+  await verifyCachedDownload(manifest, archivePath, logger);
 }
 
 async function installSingleFileTool(manifest, options, logger) {
@@ -517,7 +638,11 @@ async function installSingleFileTool(manifest, options, logger) {
     manifest.installInstructions.downloadFileName ||
     path.basename(archivePath) ||
     `${manifest.id}.exe`;
-  const destinationPath = path.join(appDir, downloadFileName);
+  const destinationPath = assertPathInside(
+    appDir,
+    path.join(appDir, downloadFileName),
+    'Local AI Hub refused to copy a launcher outside the managed app folder.',
+  );
 
   await logger.info('Single-file install requested.', {
     archivePath,
@@ -554,7 +679,7 @@ async function installSingleFileTool(manifest, options, logger) {
     message: `${manifest.name} is ready.`,
   });
 
-  return toolState;
+  return ensureManagedToolStatePaths(toolState);
 }
 
 async function installExecutableInstallerTool(manifest, options, logger) {
@@ -602,7 +727,7 @@ async function installExecutableInstallerTool(manifest, options, logger) {
     message: `${manifest.name} is ready.`,
   });
 
-  return toolState;
+  return ensureManagedToolStatePaths(toolState);
 }
 
 async function installTool(toolId, options = {}) {
@@ -653,13 +778,13 @@ async function installTool(toolId, options = {}) {
     if (installKind === 'single-file') {
       const toolState = await installSingleFileTool(manifest, options, logger);
       await logger.info('Single-file install completed successfully.');
-      return toolState;
+      return ensureManagedToolStatePaths(toolState);
     }
 
     if (installKind === 'installer-exe') {
       const toolState = await installExecutableInstallerTool(manifest, options, logger);
       await logger.info('Installer-based install completed successfully.');
-      return toolState;
+      return ensureManagedToolStatePaths(toolState);
     }
 
     const { appDir, venvDir } = buildManagedPaths(manifest);
@@ -731,7 +856,7 @@ async function installTool(toolId, options = {}) {
     });
     await logger.info('Install completed successfully.');
 
-    return toolState;
+    return ensureManagedToolStatePaths(toolState);
   } catch (error) {
     await logger.error('Install failed.', {
       error,
@@ -774,9 +899,10 @@ async function repairToolInstallation(toolState, options = {}) {
   });
 
   try {
-    if (!toolState.downloadCachePath || !(await fs.pathExists(toolState.downloadCachePath))) {
-      throw new Error('Local AI Hub could not find the cached installer files. Reinstall the tool instead.');
-    }
+    toolState = ensureManagedToolStatePaths(toolState);
+    const managedPaths = buildManagedPaths(manifest);
+    toolState.downloadCachePath = managedPaths.archivePath;
+    await ensureCachedDownload(manifest, toolState.downloadCachePath, logger, options.onProgress, toolState.id);
 
     await logger.info('Repair requested.', {
       installDir: toolState.installDir,
@@ -789,9 +915,13 @@ async function repairToolInstallation(toolState, options = {}) {
 
     if (installKind === 'single-file') {
       const managedPaths = buildManagedPaths(manifest);
-      const destinationPath = path.join(
+      const destinationPath = assertPathInside(
         managedPaths.appDir,
-        manifest.installInstructions.downloadFileName || path.basename(toolState.downloadCachePath),
+        path.join(
+          managedPaths.appDir,
+          manifest.installInstructions.downloadFileName || path.basename(toolState.downloadCachePath),
+        ),
+        'Local AI Hub refused to restore a launcher outside the managed app folder.',
       );
 
       await advanceStep(logger, options.onProgress, {
@@ -912,6 +1042,23 @@ module.exports = {
   installTool,
   repairToolInstallation,
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

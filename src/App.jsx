@@ -16,6 +16,7 @@ const EMPTY_STATE = {
   hardware: null,
   logsPath: '',
   manifests: [],
+  manifestStatus: null,
   resources: null,
   tools: [],
 };
@@ -430,6 +431,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!appState.manifestStatus?.warning) {
+      dismissToast('manifest-status');
+      return;
+    }
+
+    pushToast(appState.manifestStatus.warning, 'error', {
+      id: 'manifest-status',
+      persistent: true,
+      tag: 'manifest-status',
+    });
+  }, [appState.manifestStatus?.warning]);
+  useEffect(() => {
     if (!ollamaTool) {
       setOllamaChatOpen(false);
       setOllamaModels([]);
@@ -635,3 +648,4 @@ export default function App() {
     </div>
   );
 }
+

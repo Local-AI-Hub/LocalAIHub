@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const { getLoadedToolManifest, loadToolManifest } = require('./manifestService');
+const { assertSafeCommandString, assertSecureRemoteUrl, sanitizeManifestId } = require('./pathSafetyService');
 
 let cachedToolDefinitions = null;
 let cachedToolManifestKey = '';
@@ -213,18 +214,26 @@ function buildDiscoveryDefaults(tool) {
 }
 
 function normalizeToolDefinition(tool) {
+  const toolId = sanitizeManifestId(tool.id);
   const installInstructions = tool.installInstructions || {};
-  const defaultExternalCandidates = DEFAULT_EXTERNAL_CANDIDATES[tool.id] || {};
-  const discoveryDefaults = buildDiscoveryDefaults(tool);
+  const defaultExternalCandidates = DEFAULT_EXTERNAL_CANDIDATES[toolId] || {};
+  const discoveryDefaults = buildDiscoveryDefaults({
+    ...tool,
+    id: toolId,
+  });
   const launchUrl = buildLaunchUrl(tool);
+  const launchCommand = assertSafeCommandString(tool.launchCommand, `${toolId} launch command`);
+  const externalLaunchCommand = tool.externalLaunchCommand
+    ? assertSafeCommandString(tool.externalLaunchCommand, `${toolId} external launch command`)
+    : launchCommand;
 
   return {
-    id: tool.id,
+    id: toolId,
     name: tool.name,
     description: tool.description,
     icon: tool.icon || tool.name.slice(0, 2).toUpperCase(),
     category: tool.category || 'General',
-    downloadUrl: tool.downloadUrl,
+    downloadUrl: assertSecureRemoteUrl(tool.downloadUrl, `${toolId} download URL`),
     interfaceMode: tool.interfaceMode || 'external-browser',
     launchEnv: tool.launchEnv || {},
     externalLaunchEnv: tool.externalLaunchEnv || tool.launchEnv || {},
@@ -253,8 +262,8 @@ function normalizeToolDefinition(tool) {
       ]),
       compatibility: installInstructions.compatibility || null,
     },
-    launchCommand: tool.launchCommand,
-    externalLaunchCommand: tool.externalLaunchCommand || tool.launchCommand,
+    launchCommand,
+    externalLaunchCommand,
     defaultPort: tool.defaultPort || null,
     detectionPaths: tool.detectionPaths || [],
     discovery: {
@@ -265,7 +274,11 @@ function normalizeToolDefinition(tool) {
     },
     launchUrl,
     healthUrl: buildHealthUrl(tool, launchUrl),
-    processNames: tool.processNames || deriveProcessNames(tool),
+    processNames: tool.processNames || deriveProcessNames({
+      ...tool,
+      externalLaunchCommand,
+      launchCommand,
+    }),
   };
 }
 
@@ -504,3 +517,6 @@ module.exports = {
   initializeToolRegistry,
   tokenizeCommand,
 };
+
+
+

@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const { ensureStorage, getAppPaths } = require('./configService');
+const { redactSensitiveText } = require('./redactionService');
 
 function currentDateStamp() {
   return new Date().toISOString().slice(0, 10);
@@ -26,6 +27,10 @@ function normalizeContextValue(value) {
     return Object.fromEntries(
       Object.entries(value).map(([key, entry]) => [key, normalizeContextValue(entry)]),
     );
+  }
+
+  if (typeof value === 'string') {
+    return redactSensitiveText(value);
   }
 
   return value;
@@ -81,3 +86,4 @@ module.exports = {
   createLogger,
   getLogFilePath,
 };
+

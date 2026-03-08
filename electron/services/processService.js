@@ -8,6 +8,7 @@ const { humanizeError, upsertTool } = require('./configService');
 const { killProcessTree, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { attemptAutomaticLaunchRecovery } = require('./runtimeRecoveryService');
+const { assertLoopbackUrl, assertPathInside } = require('./pathSafetyService');
 
 const runtimes = new Map();
 const OPEN_TIMEOUT_MS = 30000;
@@ -41,9 +42,147 @@ function normalizeProcessNames(processNames = []) {
   return [...new Set((processNames || []).map((name) => path.basename(String(name || '')).trim()).filter(Boolean))];
 }
 function isBareCommand(command) {
-  return Boolean(command) && !path.isAbsolute(command) && !/[\/]/.test(command);
+  return Boolean(command) && !path.isAbsolute(command) && !/[\\/]/.test(command);
 }
 
+function getManagedToolRoot(toolState) {
+  if (!toolState || !(toolState.managedByLocalAIHub || toolState.source === 'managed')) {
+    return null;
+  }
+
+  const basePath = String(toolState.installDir || toolState.appDir || '').trim();
+  return basePath ? path.resolve(basePath) : null;
+}
+
+function ensureManagedRuntimePath(toolState, candidatePath, label) {
+  if (!candidatePath) {
+    return candidatePath;
+  }
+
+  const managedRoot = getManagedToolRoot(toolState);
+  if (!managedRoot) {
+    return candidatePath;
+  }
+
+  return assertPathInside(
+    managedRoot,
+    candidatePath,
+    `Local AI Hub refused to use a ${label} outside the managed tool folder.`,
+  );
+}
+
+async function buildLaunchRuntimeEnv(toolState, extraEnv = {}) {
+  const managedRoot = getManagedToolRoot(toolState);
+  if (!managedRoot) {
+    return {
+      ...process.env,
+      ...extraEnv,
+    };
+  }
+
+  const stateRoot = path.join(managedRoot, '.localaihub');
+  const cacheDir = path.join(stateRoot, 'cache');
+  const tempDir = path.join(stateRoot, 'tmp');
+  const pycacheDir = path.join(stateRoot, 'pycache');
+  const hfCacheDir = path.join(cacheDir, 'huggingface');
+  const transformersCacheDir = path.join(cacheDir, 'transformers');
+
+  await Promise.all([
+    fs.ensureDir(cacheDir),
+    fs.ensureDir(tempDir),
+    fs.ensureDir(pycacheDir),
+    fs.ensureDir(hfCacheDir),
+    fs.ensureDir(transformersCacheDir),
+  ]);
+
+  return {
+    ...process.env,
+    ...extraEnv,
+    LOCALAIHUB_TOOL_ID: toolState.id,
+    LOCALAIHUB_TOOL_ROOT: managedRoot,
+    NESTAI_TOOL_ID: toolState.id,
+    PIP_CACHE_DIR: cacheDir,
+    PIP_DISABLE_PIP_VERSION_CHECK: '1',
+    PYTHONNOUSERSITE: '1',
+    PYTHONPYCACHEPREFIX: pycacheDir,
+    TEMP: tempDir,
+    TMP: tempDir,
+    TMPDIR: tempDir,
+    XDG_CACHE_HOME: cacheDir,
+    HF_HOME: hfCacheDir,
+    TRANSFORMERS_CACHE: transformersCacheDir,
+  };
+}
+
+function resolveLaunchProfile(toolState, launchProfile) {
+  if (!launchProfile) {
+    return null;
+  }
+
+  const workingDir = launchProfile.workingDir
+    ? ensureManagedRuntimePath(toolState, launchProfile.workingDir, 'working folder')
+    : toolState.appDir || toolState.installDir || process.cwd();
+
+  if (launchProfile.kind === 'python-script' || launchProfile.kind === 'python-module') {
+    const pythonPath = isBareCommand(launchProfile.pythonPath)
+      ? launchProfile.pythonPath
+      : ensureManagedRuntimePath(toolState, launchProfile.pythonPath, 'Python launcher');
+    const resolvedTarget =
+      launchProfile.kind === 'python-script'
+        ? ensureManagedRuntimePath(
+            toolState,
+            path.isAbsolute(launchProfile.target)
+              ? launchProfile.target
+              : path.resolve(workingDir, launchProfile.target),
+            'Python script',
+          )
+        : launchProfile.target;
+
+    return {
+      ...launchProfile,
+      pythonPath,
+      target: resolvedTarget,
+      workingDir,
+    };
+  }
+
+  if (launchProfile.kind === 'binary') {
+    const executable = ensureManagedRuntimePath(toolState, launchProfile.executable, 'launcher executable');
+    return {
+      ...launchProfile,
+      executable,
+      workingDir: workingDir || path.dirname(executable),
+    };
+  }
+
+  if (launchProfile.kind === 'batch') {
+    const command = ensureManagedRuntimePath(toolState, launchProfile.command, 'launcher script');
+    return {
+      ...launchProfile,
+      command,
+      workingDir: workingDir || path.dirname(command),
+    };
+  }
+
+  if (launchProfile.kind === 'folder') {
+    return {
+      ...launchProfile,
+      path: ensureManagedRuntimePath(toolState, launchProfile.path || toolState.installDir, 'tool folder'),
+    };
+  }
+
+  if (launchProfile.kind === 'embedded') {
+    return {
+      ...launchProfile,
+      workingDir,
+    };
+  }
+
+  return {
+    ...launchProfile,
+    workingDir,
+  };
+}
 function getToolInterfaceMode(toolState) {
   return toolState?.interfaceMode || 'external-browser';
 }
@@ -130,7 +269,8 @@ async function probeUrl(url) {
   }
 
   try {
-    const response = await fetch(url, {
+    const safeUrl = assertLoopbackUrl(url, 'tool URL');
+    const response = await fetch(safeUrl, {
       method: 'GET',
     });
     return Boolean(response);
@@ -201,8 +341,12 @@ async function openToolInterface(toolState) {
     return;
   }
 
-  await waitForToolReady(toolState, OPEN_TIMEOUT_MS);
-  await shell.openExternal(toolState.launchUrl).catch(() => null);
+  const launchUrl = assertLoopbackUrl(toolState.launchUrl, 'tool URL');
+  await waitForToolReady({
+    ...toolState,
+    launchUrl,
+  }, OPEN_TIMEOUT_MS);
+  await shell.openExternal(launchUrl).catch(() => null);
 }
 
 function appendRuntimeOutput(runtimeState, key, chunk) {
@@ -341,7 +485,8 @@ function attachRuntimeHandlers(toolState, runtimeState, runtimeOptions = {}) {
 }
 
 async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}) {
-  if (!isBareCommand(launchProfile.pythonPath) && !(await fs.pathExists(launchProfile.pythonPath))) {
+  const safeLaunchProfile = resolveLaunchProfile(toolState, launchProfile);
+  if (!isBareCommand(safeLaunchProfile.pythonPath) && !(await fs.pathExists(safeLaunchProfile.pythonPath))) {
     throw new Error(`${toolState.name} is missing its Python launcher. Run Repair or reinstall it.`);
   }
 
@@ -350,20 +495,18 @@ async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}
     throw new Error('Local AI Hub is missing its Python launcher helper. Reinstall the app to restore it.');
   }
 
+  const runtimeEnv = await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {});
   const shellInstance = new PythonShell(path.basename(helperScript), {
-    pythonPath: launchProfile.pythonPath,
+    pythonPath: safeLaunchProfile.pythonPath,
     scriptPath: path.dirname(helperScript),
     pythonOptions: ['-u'],
     args: [
-      launchProfile.workingDir,
-      launchProfile.kind === 'python-module' ? 'module' : 'script',
-      launchProfile.target,
-      ...(launchProfile.args || []),
+      safeLaunchProfile.workingDir,
+      safeLaunchProfile.kind === 'python-module' ? 'module' : 'script',
+      safeLaunchProfile.target,
+      ...(safeLaunchProfile.args || []),
     ],
-    env: {
-      ...process.env,
-      NESTAI_TOOL_ID: toolState.id,
-    },
+    env: runtimeEnv,
   });
 
   if (!shellInstance.childProcess) {
@@ -384,17 +527,15 @@ async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}
 }
 
 async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}) {
-  if (!(await fs.pathExists(launchProfile.executable))) {
+  const safeLaunchProfile = resolveLaunchProfile(toolState, launchProfile);
+  if (!(await fs.pathExists(safeLaunchProfile.executable))) {
     throw new Error(`${toolState.name} is missing its launcher executable. Run Repair or reinstall it.`);
   }
 
-  const child = spawn(launchProfile.executable, launchProfile.args || [], {
-    cwd: launchProfile.workingDir || path.dirname(launchProfile.executable),
+  const child = spawn(safeLaunchProfile.executable, safeLaunchProfile.args || [], {
+    cwd: safeLaunchProfile.workingDir || path.dirname(safeLaunchProfile.executable),
     windowsHide: true,
-    env: {
-      ...process.env,
-      ...(launchProfile.env || {}),
-    },
+    env: await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {}),
   });
 
   const runtimeState = rememberRuntime(toolState.id, {
@@ -410,17 +551,15 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
 }
 
 async function launchBatchProfile(toolState, launchProfile, runtimeOptions = {}) {
-  if (!(await fs.pathExists(launchProfile.command))) {
+  const safeLaunchProfile = resolveLaunchProfile(toolState, launchProfile);
+  if (!(await fs.pathExists(safeLaunchProfile.command))) {
     throw new Error(`${toolState.name} is missing its launcher script. Open the tool folder to inspect it.`);
   }
 
-  const child = spawn('cmd.exe', ['/c', launchProfile.command, ...(launchProfile.args || [])], {
-    cwd: launchProfile.workingDir || path.dirname(launchProfile.command),
+  const child = spawn('cmd.exe', ['/c', safeLaunchProfile.command, ...(safeLaunchProfile.args || [])], {
+    cwd: safeLaunchProfile.workingDir || path.dirname(safeLaunchProfile.command),
     windowsHide: true,
-    env: {
-      ...process.env,
-      ...(launchProfile.env || {}),
-    },
+    env: await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {}),
   });
 
   const runtimeState = rememberRuntime(toolState.id, {
@@ -480,9 +619,10 @@ async function launchTool(toolState, options = {}) {
     };
   }
 
-  const launchProfile = toolState.launchProfile;
+  const launchProfile = resolveLaunchProfile(toolState, toolState.launchProfile);
   if (!launchProfile) {
     throw new Error(`${toolState.name} does not have a launch profile yet.`);
+  }
 
   if (launchProfile.kind === 'embedded') {
     await upsertTool({
@@ -496,7 +636,6 @@ async function launchTool(toolState, options = {}) {
       status: 'running',
       lastError: null,
     };
-  }
   }
 
   if (launchProfile.kind === 'folder') {
@@ -614,6 +753,12 @@ module.exports = {
   resolveToolStatus,
   stopTool,
 };
+
+
+
+
+
+
 
 
 

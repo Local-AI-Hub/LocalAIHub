@@ -241,7 +241,7 @@ export default function ModelManager({ tools, onToast }) {
   const [localLoading, setLocalLoading] = useState(false);
   const [remoteItems, setRemoteItems] = useState([]);
   const [localModels, setLocalModels] = useState([]);
-  const [settings, setSettings] = useState({ civitaiApiKey: '' });
+  const [settings, setSettings] = useState({ civitaiApiKey: '', hasCivitaiApiKey: false });
   const [civitaiApiKeyDraft, setCivitaiApiKeyDraft] = useState('');
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
   const [pagination, setPagination] = useState(EMPTY_PAGINATION);
@@ -269,8 +269,8 @@ export default function ModelManager({ tools, onToast }) {
   async function loadSettings() {
     const result = await window.localAIHub.getModelSettings();
     if (result?.ok) {
-      setSettings(result.data || { civitaiApiKey: '' });
-      setCivitaiApiKeyDraft(result.data?.civitaiApiKey || '');
+      setSettings(result.data || { civitaiApiKey: '', hasCivitaiApiKey: false });
+      setCivitaiApiKeyDraft('');
     }
   }
 
@@ -334,7 +334,7 @@ export default function ModelManager({ tools, onToast }) {
     setPagination(result.data?.pagination || EMPTY_PAGINATION);
     if (result.data?.settings) {
       setSettings(result.data.settings);
-      setCivitaiApiKeyDraft(result.data.settings.civitaiApiKey || '');
+      setCivitaiApiKeyDraft('');
     }
 
     setBrowseLoading(false);
@@ -447,9 +447,15 @@ export default function ModelManager({ tools, onToast }) {
     browse({ page: 1, cursor: null });
   }
 
-  async function handleSaveCivitaiKey() {
+  async function handleSaveCivitaiKey(clearExisting = false) {
+    const trimmedKey = civitaiApiKeyDraft.trim();
+    if (!clearExisting && !trimmedKey) {
+      onToast('Paste a CivitAI API key first, or use Clear key to remove the saved one.', 'error');
+      return;
+    }
+
     const result = await window.localAIHub.saveModelSettings({
-      civitaiApiKey: civitaiApiKeyDraft.trim(),
+      civitaiApiKey: clearExisting ? '' : trimmedKey,
     });
 
     if (!result?.ok) {
@@ -457,8 +463,9 @@ export default function ModelManager({ tools, onToast }) {
       return;
     }
 
-    setSettings(result.data?.settings || { civitaiApiKey: civitaiApiKeyDraft.trim() });
-    onToast(result.data?.message || 'CivitAI API key saved.', 'success');
+    setSettings(result.data?.settings || { civitaiApiKey: '', hasCivitaiApiKey: !clearExisting && Boolean(trimmedKey) });
+    setCivitaiApiKeyDraft('');
+    onToast(result.data?.message || (clearExisting ? 'CivitAI API key removed.' : 'CivitAI API key saved.'), 'success');
   }
 
   if (!modelTools.length) {
@@ -550,18 +557,24 @@ export default function ModelManager({ tools, onToast }) {
                 <input
                   className="store-input mt-3"
                   onChange={(event) => setCivitaiApiKeyDraft(event.target.value)}
-                  placeholder="Paste your CivitAI API key"
+                  placeholder={settings.hasCivitaiApiKey ? 'Saved in Windows Credential Manager. Paste a new key to replace it.' : 'Paste your CivitAI API key'}
                   type="password"
                   value={civitaiApiKeyDraft}
                 />
               </div>
-              <button className="ghost-button" onClick={handleSaveCivitaiKey} type="button">
+              <button className="ghost-button" onClick={() => handleSaveCivitaiKey()} type="button">
                 Save key
               </button>
+              {settings.hasCivitaiApiKey ? (
+                <button className="ghost-button" onClick={() => handleSaveCivitaiKey(true)} type="button">
+                  Clear key
+                </button>
+              ) : null}
             </div>
-            <p className="mt-3 text-sm leading-6 text-slate-400">
-              Stored locally in AppData and reused for future CivitAI downloads. Public browsing still works without a key.
-            </p>
+            <div className="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-400">
+              <p className="leading-6">Stored in Windows Credential Manager on this PC and reused for future CivitAI downloads. Public browsing still works without a key.</p>
+              {settings.hasCivitaiApiKey ? <span className="status-pill border-emerald-400/20 bg-emerald-400/10 text-emerald-100">Saved</span> : null}
+            </div>
           </div>
         ) : null}
       </div>
@@ -649,3 +662,5 @@ export default function ModelManager({ tools, onToast }) {
     </section>
   );
 }
+
+

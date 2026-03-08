@@ -42,6 +42,7 @@ const {
 } = require('./services/processService');
 const { listSnapshots, restoreSnapshot, saveSnapshot } = require('./services/snapshotService');
 const { getToolCatalog, getToolManifest, initializeToolRegistry } = require('./services/toolRegistry');
+const { getManifestStatus } = require('./services/manifestService');
 const { transcribeWithWhisper } = require('./services/whisperService');
 const { configureAutoUpdates, restartToInstallUpdate } = require('./services/updateService');
 
@@ -146,6 +147,7 @@ async function buildAppState(options = {}) {
     hardware,
     logsPath: paths.logsRoot,
     manifests: getToolCatalog(),
+    manifestStatus: getManifestStatus(),
     resources: await getLiveResourceUsage(),
     tools,
   };
@@ -436,7 +438,7 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const settings = await saveModelManagerSettings(payload || {});
       return {
-        message: 'Model Manager settings were saved locally.',
+        message: 'Model Manager settings were saved on this PC. Sensitive keys are stored in Windows Credential Manager.',
         settings,
       };
     }, 'Local AI Hub could not save the Model Manager settings.'),
@@ -601,6 +603,8 @@ app.on('activate', () => {
 
   showWindow();
 });
+
+
 
 
 

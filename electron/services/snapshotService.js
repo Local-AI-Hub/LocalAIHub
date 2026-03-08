@@ -4,6 +4,7 @@ const archiver = require('archiver');
 const extract = require('extract-zip');
 
 const { getAppPaths } = require('./configService');
+const { assertPathInside } = require('./pathSafetyService');
 
 function createSnapshotFileName() {
   return `${new Date().toISOString().replace(/[:.]/g, '-')}.zip`;
@@ -47,7 +48,11 @@ async function saveSnapshot(toolState) {
 
   const snapshotDir = path.join(getAppPaths().snapshotsRoot, toolState.id);
   await fs.ensureDir(snapshotDir);
-  const snapshotPath = path.join(snapshotDir, createSnapshotFileName());
+  const snapshotPath = assertPathInside(
+    snapshotDir,
+    path.join(snapshotDir, createSnapshotFileName()),
+    'Local AI Hub refused to create a snapshot outside the snapshots folder.',
+  );
 
   const output = fs.createWriteStream(snapshotPath);
   const archive = archiver('zip', { zlib: { level: 9 } });
@@ -65,7 +70,11 @@ async function saveSnapshot(toolState) {
   }
 
   for (const relativeTarget of toolState.configTargets || []) {
-    const absoluteTarget = path.join(toolState.appDir, relativeTarget);
+    const absoluteTarget = assertPathInside(
+      toolState.appDir,
+      path.join(toolState.appDir, relativeTarget),
+      'Local AI Hub refused to snapshot a config path outside the tool folder.',
+    );
     await archiveEntryIfPresent(archive, absoluteTarget, relativeTarget);
   }
 
@@ -81,34 +90,58 @@ async function saveSnapshot(toolState) {
 
 async function restoreSnapshot(toolState, snapshotFileName) {
   const snapshotDir = path.join(getAppPaths().snapshotsRoot, toolState.id);
-  const snapshotPath = path.join(snapshotDir, snapshotFileName);
+  const snapshotPath = assertPathInside(
+    snapshotDir,
+    path.join(snapshotDir, path.basename(snapshotFileName || '')),
+    'Local AI Hub refused to restore a snapshot outside the snapshots folder.',
+  );
   if (!(await fs.pathExists(snapshotPath))) {
     throw new Error('Local AI Hub could not find that snapshot file.');
   }
 
-  const restoreTemp = path.join(snapshotDir, '__restore');
+  const restoreTemp = assertPathInside(
+    snapshotDir,
+    path.join(snapshotDir, '__restore'),
+    'Local AI Hub refused to use a restore folder outside the snapshots directory.',
+  );
   await fs.remove(restoreTemp);
   await fs.ensureDir(restoreTemp);
-  await extract(snapshotPath, { dir: restoreTemp });
 
-  if (toolState.venvDir && (await fs.pathExists(path.join(restoreTemp, '.venv')))) {
-    await fs.remove(toolState.venvDir);
-    await fs.copy(path.join(restoreTemp, '.venv'), toolState.venvDir, { overwrite: true });
-  }
+  try {
+    await extract(snapshotPath, { dir: restoreTemp });
 
-  for (const relativeTarget of toolState.configTargets || []) {
-    const restoreSource = path.join(restoreTemp, relativeTarget);
-    const restoreDestination = path.join(toolState.appDir, relativeTarget);
-    if (!(await fs.pathExists(restoreSource))) {
-      continue;
+    if (toolState.venvDir && (await fs.pathExists(path.join(restoreTemp, '.venv')))) {
+      const safeVenvDir = assertPathInside(
+        toolState.installDir,
+        toolState.venvDir,
+        'Local AI Hub refused to restore a virtual environment outside the managed tool folder.',
+      );
+      await fs.remove(safeVenvDir);
+      await fs.copy(path.join(restoreTemp, '.venv'), safeVenvDir, { overwrite: true });
     }
 
-    await fs.remove(restoreDestination);
-    await fs.ensureDir(path.dirname(restoreDestination));
-    await fs.copy(restoreSource, restoreDestination, { overwrite: true });
-  }
+    for (const relativeTarget of toolState.configTargets || []) {
+      const restoreSource = assertPathInside(
+        restoreTemp,
+        path.join(restoreTemp, relativeTarget),
+        'Local AI Hub refused to restore config files from outside the snapshot archive.',
+      );
+      const restoreDestination = assertPathInside(
+        toolState.appDir,
+        path.join(toolState.appDir, relativeTarget),
+        'Local AI Hub refused to restore a config path outside the tool folder.',
+      );
+      if (!(await fs.pathExists(restoreSource))) {
+        continue;
+      }
 
-  await fs.remove(restoreTemp);
+      await fs.remove(restoreDestination);
+      await fs.ensureDir(path.dirname(restoreDestination));
+      await fs.copy(restoreSource, restoreDestination, { overwrite: true });
+    }
+  } finally {
+    await fs.remove(restoreTemp);
+  }
 }
 
 module.exports = {
