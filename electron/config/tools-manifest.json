@@ -12,12 +12,21 @@
       "archiveName": "ComfyUI-master.zip",
       "installSummary": "Downloads the latest ComfyUI source and builds a dedicated Local AI Hub Python environment.",
       "venvFolder": ".venv",
-      "configTargets": ["extra_model_paths.yaml", "user"],
+      "configTargets": [
+        "extra_model_paths.yaml",
+        "user"
+      ],
       "pythonRequirementDetection": [
-        { "kind": "pyproject", "file": "pyproject.toml" }
+        {
+          "kind": "pyproject",
+          "file": "pyproject.toml"
+        }
       ],
       "pipInstalls": [
-        { "kind": "requirements", "value": "requirements.txt" }
+        {
+          "kind": "requirements",
+          "value": "requirements.txt"
+        }
       ],
       "externalPythonCandidates": [
         "python_embeded\\python.exe",
@@ -26,7 +35,10 @@
         "venv\\Scripts\\python.exe"
       ],
       "externalExecutableCandidates": [],
-      "externalBatchCandidates": ["run_nvidia_gpu.bat", "run_cpu.bat"],
+      "externalBatchCandidates": [
+        "run_nvidia_gpu.bat",
+        "run_cpu.bat"
+      ],
       "compatibility": {
         "minimumVramMb": 4096,
         "recommendedVramMb": 8192,
@@ -59,7 +71,9 @@
       "archiveName": "ollama-windows-amd64.zip",
       "installSummary": "Downloads the standalone Windows Ollama bundle into Local AI Hub's managed tools folder.",
       "configTargets": [],
-      "externalExecutableCandidates": ["ollama.exe"],
+      "externalExecutableCandidates": [
+        "ollama.exe"
+      ],
       "compatibility": {
         "minimumVramMb": 0,
         "recommendedVramMb": 6144,
@@ -90,19 +104,31 @@
       "archiveName": "stable-diffusion-webui-master.zip",
       "installSummary": "Downloads the Automatic1111 source tree, builds a local environment, and installs its pinned Python dependencies.",
       "venvFolder": ".venv",
-      "configTargets": ["config.json", "ui-config.json", "styles.csv"],
+      "configTargets": [
+        "config.json",
+        "ui-config.json",
+        "styles.csv"
+      ],
       "pythonRequirementDetection": [
-        { "kind": "automatic1111-launch-utils", "file": "modules\\launch_utils.py" }
+        {
+          "kind": "automatic1111-launch-utils",
+          "file": "modules\\launch_utils.py"
+        }
       ],
       "pipInstalls": [
-        { "kind": "requirements", "value": "requirements_versions.txt" }
+        {
+          "kind": "requirements",
+          "value": "requirements_versions.txt"
+        }
       ],
       "externalPythonCandidates": [
         "venv\\Scripts\\python.exe",
         ".venv\\Scripts\\python.exe"
       ],
       "externalExecutableCandidates": [],
-      "externalBatchCandidates": ["webui.bat"],
+      "externalBatchCandidates": [
+        "webui.bat"
+      ],
       "compatibility": {
         "minimumVramMb": 6144,
         "recommendedVramMb": 8192,
@@ -135,13 +161,25 @@
       "archiveName": "InvokeAI-main.zip",
       "installSummary": "Downloads InvokeAI, installs its Python package locally, and keeps the runtime inside Local AI Hub.",
       "venvFolder": ".venv",
-      "configTargets": ["invokeai.yaml", ".invokeai"],
+      "configTargets": [
+        "invokeai.yaml",
+        ".invokeai"
+      ],
       "pythonRequirementDetection": [
-        { "kind": "pyproject", "file": "pyproject.toml" }
+        {
+          "kind": "pyproject",
+          "file": "pyproject.toml"
+        }
       ],
       "pipInstalls": [
-        { "kind": "requirements", "value": "requirements.txt" },
-        { "kind": "path", "value": "." }
+        {
+          "kind": "requirements",
+          "value": "requirements.txt"
+        },
+        {
+          "kind": "path",
+          "value": "."
+        }
       ],
       "externalPythonCandidates": [
         ".venv\\Scripts\\python.exe",
@@ -172,6 +210,240 @@
       "%USERPROFILE%\\InvokeAI\\pyproject.toml",
       "%LOCALAPPDATA%\\InvokeAI\\pyproject.toml",
       "%APPDATA%\\InvokeAI\\pyproject.toml"
+    ]
+  },
+  {
+    "id": "forge",
+    "name": "Stable Diffusion WebUI Forge",
+    "description": "A faster, lower-VRAM fork of Automatic1111 that keeps the familiar WebUI workflow.",
+    "icon": "FG",
+    "category": "Image generation",
+    "downloadUrl": "https://github.com/lllyasviel/stable-diffusion-webui-forge/archive/refs/heads/main.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "stable-diffusion-webui-forge-main.zip",
+      "installSummary": "Downloads Forge, creates a managed Python environment, and prepares its lower-VRAM WebUI workflow.",
+      "venvFolder": ".venv",
+      "configTargets": [
+        "config.json",
+        "ui-config.json",
+        "styles.csv"
+      ],
+      "pythonRequirementDetection": [
+        {
+          "kind": "automatic1111-launch-utils",
+          "file": "modules\\launch_utils.py"
+        }
+      ],
+      "pipInstalls": [
+        {
+          "kind": "requirements",
+          "value": "requirements_versions.txt"
+        }
+      ],
+      "externalPythonCandidates": [
+        "venv\\Scripts\\python.exe",
+        ".venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": [
+        "webui-user.bat",
+        "webui.bat",
+        "run.bat"
+      ],
+      "compatibility": {
+        "minimumVramMb": 4096,
+        "recommendedVramMb": 8192,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python webui.py --listen --api --port {port}",
+    "externalLaunchCommand": "webui-user.bat --listen --api --port {port}",
+    "defaultPort": 7860,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\stable-diffusion-webui-forge\\webui.py",
+      "%USERPROFILE%\\Documents\\stable-diffusion-webui-forge\\webui.py",
+      "%USERPROFILE%\\Downloads\\stable-diffusion-webui-forge\\webui.py",
+      "%LOCALAPPDATA%\\stable-diffusion-webui-forge\\webui.py",
+      "%APPDATA%\\stable-diffusion-webui-forge\\webui.py"
+    ]
+  },
+  {
+    "id": "lmstudio",
+    "name": "LM Studio",
+    "description": "Desktop app for browsing, loading, and chatting with local GGUF language models.",
+    "icon": "LM",
+    "category": "LLM tools",
+    "interfaceMode": "desktop-app",
+    "downloadUrl": "https://lmstudio.ai/download/latest/win32/x64",
+    "installInstructions": {
+      "kind": "installer-exe",
+      "runtime": "binary",
+      "downloadFileName": "LM-Studio-Setup.exe",
+      "installSummary": "Downloads the latest LM Studio Windows installer and runs it into a Local AI Hub-managed folder.",
+      "installerArgs": [
+        "/S",
+        "/D={appDir}"
+      ],
+      "configTargets": [],
+      "externalExecutableCandidates": [
+        "LM Studio.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 6144,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "\"LM Studio.exe\"",
+    "detectionPaths": [
+      "%LOCALAPPDATA%\\Programs\\LM Studio\\LM Studio.exe",
+      "%PROGRAMFILES%\\LM Studio\\LM Studio.exe",
+      "%ProgramFiles(x86)%\\LM Studio\\LM Studio.exe",
+      "%APPDATA%\\LM Studio\\LM Studio.exe"
+    ]
+  },
+  {
+    "id": "openwebui",
+    "name": "Open WebUI",
+    "description": "ChatGPT-style frontend for Ollama and other local providers. Ollama should be installed and running first for the best experience.",
+    "icon": "OW",
+    "category": "Interfaces",
+    "downloadUrl": "https://github.com/open-webui/open-webui/archive/refs/heads/main.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "open-webui-main.zip",
+      "installSummary": "Downloads Open WebUI, creates a managed Python environment, and installs the web interface locally.",
+      "venvFolder": ".venv",
+      "configTargets": [
+        "data"
+      ],
+      "pythonRequirementDetection": [
+        {
+          "kind": "pyproject",
+          "file": "pyproject.toml"
+        }
+      ],
+      "pipInstalls": [
+        {
+          "kind": "package",
+          "value": "open-webui"
+        }
+      ],
+      "externalPythonCandidates": [
+        "Scripts\\python.exe",
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [
+        "open-webui.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 0,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "python -m open_webui serve --host 127.0.0.1 --port {port}",
+    "externalLaunchCommand": "python -m open_webui serve --host 127.0.0.1 --port {port}",
+    "defaultPort": 3000,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "PATH:open-webui.exe",
+      "%USERPROFILE%\\open-webui\\pyproject.toml",
+      "%LOCALAPPDATA%\\open-webui\\pyproject.toml",
+      "%APPDATA%\\open-webui\\pyproject.toml"
+    ]
+  },
+  {
+    "id": "whisper",
+    "name": "Whisper (faster-whisper)",
+    "description": "Local audio transcription powered by faster-whisper, with a built-in Local AI Hub transcription panel.",
+    "icon": "WS",
+    "category": "Audio / Speech",
+    "interfaceMode": "embedded-whisper",
+    "downloadUrl": "https://github.com/SYSTRAN/faster-whisper/archive/refs/heads/master.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "faster-whisper-master.zip",
+      "installSummary": "Downloads the faster-whisper source, creates a managed Python environment, and prepares the built-in transcription workflow.",
+      "venvFolder": ".venv",
+      "configTargets": [
+        "models"
+      ],
+      "pythonRequirementDetection": [
+        {
+          "kind": "pyproject",
+          "file": "pyproject.toml"
+        }
+      ],
+      "pipInstalls": [
+        {
+          "kind": "package",
+          "value": "faster-whisper"
+        }
+      ],
+      "externalPythonCandidates": [
+        "Scripts\\python.exe",
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 4096,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "embedded://whisper",
+    "detectionPaths": [
+      "%USERPROFILE%\\faster-whisper\\pyproject.toml",
+      "%LOCALAPPDATA%\\faster-whisper\\pyproject.toml",
+      "%APPDATA%\\faster-whisper\\pyproject.toml"
+    ]
+  },
+  {
+    "id": "koboldcpp",
+    "name": "KoboldCpp",
+    "description": "Popular local LLM runner especially well suited for creative writing, roleplay, and storytelling workflows.",
+    "icon": "KB",
+    "category": "LLM tools",
+    "downloadUrl": "https://github.com/LostRuins/koboldcpp/releases/latest/download/koboldcpp.exe",
+    "installInstructions": {
+      "kind": "single-file",
+      "runtime": "binary",
+      "downloadFileName": "koboldcpp.exe",
+      "installSummary": "Downloads the latest KoboldCpp Windows binary into Local AI Hub for quick local LLM hosting.",
+      "configTargets": [],
+      "externalExecutableCandidates": [
+        "koboldcpp.exe",
+        "koboldcpp_nocuda.exe",
+        "koboldcpp_oldpc.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 4096,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "koboldcpp.exe --host 127.0.0.1 --port {port}",
+    "defaultPort": 5001,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "PATH:koboldcpp.exe",
+      "%USERPROFILE%\\koboldcpp\\koboldcpp.exe",
+      "%USERPROFILE%\\Downloads\\koboldcpp.exe",
+      "%LOCALAPPDATA%\\koboldcpp\\koboldcpp.exe",
+      "%APPDATA%\\koboldcpp\\koboldcpp.exe"
     ]
   }
 ]
