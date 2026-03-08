@@ -21,7 +21,7 @@ const CIVITAI_MODELS_URL = 'https://civitai.com/api/v1/models';
 const MODEL_FILE_PATTERN = /\.(safetensors|ckpt|pt|pth|bin|gguf)$/i;
 const IMAGE_FILE_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
 const README_FILE_PATTERN = /(?:^|\/)README\.md$/i;
-const MODEL_MANAGER_TOOL_IDS = new Set(['ollama', 'comfyui', 'automatic1111']);
+const MODEL_MANAGER_TOOL_IDS = new Set(['ollama', 'comfyui', 'automatic1111', 'forge', 'lmstudio']);
 const HUGGING_FACE_FILE_SIZE_CACHE = new Map();
 const HUGGING_FACE_PREVIEW_CACHE = new Map();
 const HF_SORT_MAP = {
@@ -34,23 +34,68 @@ const CIVITAI_SORT_MAP = {
   newest: 'Newest',
   'highest-rated': 'Highest Rated',
 };
-const HF_TASK_MAP = {
-  'image-generation': 'text-to-image',
-  'image-to-image': 'image-to-image',
-  'text-generation': 'text-generation',
-  'text-to-image': 'text-to-image',
+const VIDEO_TASK_TYPES = new Set(['video-generation', 'image-to-video']);
+const HIGH_VRAM_VIDEO_REQUIREMENTS = {
+  minimumVramMb: 16 * 1024,
+  warningLabel: 'High VRAM Required',
+  warningMessage: 'Video generation models usually need 16 GB or more of VRAM.',
 };
-const CIVITAI_TYPE_MAP = {
-  checkpoint: ['Checkpoint'],
-  lora: ['LORA'],
-  vae: ['VAE'],
-  embedding: ['TextualInversion'],
-  controlnet: ['Controlnet'],
-  hypernetwork: ['Hypernetwork'],
+const HUGGING_FACE_TASK_PROFILES = {
+  all: { pipelineTags: [], searchTerms: [], seedModelIds: [] },
+  'image-generation': { pipelineTags: ['text-to-image'], searchTerms: [], seedModelIds: [] },
+  'image-to-image': { pipelineTags: ['image-to-image'], searchTerms: [], seedModelIds: [] },
+  'text-generation': { pipelineTags: ['text-generation'], searchTerms: [], seedModelIds: [] },
+  'video-generation': {
+    pipelineTags: ['text-to-video'],
+    searchTerms: ['video generation'],
+    seedModelIds: [
+      'Wan-AI/Wan2.1-T2V-14B-Diffusers',
+      'THUDM/CogVideoX-5b',
+      'genmo/mochi-1-preview',
+      'Lightricks/LTX-Video',
+    ],
+    catalogRequirements: HIGH_VRAM_VIDEO_REQUIREMENTS,
+  },
+  'image-to-video': {
+    pipelineTags: ['image-to-video'],
+    searchTerms: ['image to video'],
+    seedModelIds: [
+      'Wan-AI/Wan2.1-I2V-14B-480P-Diffusers',
+      'THUDM/CogVideoX-5b-I2V',
+      'Lightricks/LTX-Video',
+    ],
+    catalogRequirements: HIGH_VRAM_VIDEO_REQUIREMENTS,
+  },
+  'audio-speech': {
+    pipelineTags: ['text-to-audio', 'automatic-speech-recognition', 'text-to-speech'],
+    searchTerms: ['musicgen'],
+    seedModelIds: ['facebook/musicgen-large', 'suno/bark', 'facebook/audiocraft-large'],
+  },
+};
+const MODEL_TYPE_PROFILES = {
+  all: { civitaiTypes: [], hfPipelineTags: [], searchTerms: [] },
+  checkpoint: { civitaiTypes: ['Checkpoint'], hfPipelineTags: ['text-to-image'], searchTerms: [] },
+  lora: { civitaiTypes: ['LORA'], hfPipelineTags: ['text-to-image'], searchTerms: ['lora'] },
+  vae: { civitaiTypes: ['VAE'], hfPipelineTags: ['text-to-image'], searchTerms: ['vae'] },
+  embedding: { civitaiTypes: ['TextualInversion'], hfPipelineTags: ['text-to-image'], searchTerms: ['embedding'] },
+  controlnet: { civitaiTypes: ['Controlnet'], hfPipelineTags: ['image-to-image'], searchTerms: ['controlnet'] },
+  hypernetwork: { civitaiTypes: ['Hypernetwork'], hfPipelineTags: ['text-to-image'], searchTerms: ['hypernetwork'] },
+  upscaler: { civitaiTypes: ['Upscaler'], hfPipelineTags: ['image-to-image'], searchTerms: ['realesrgan'] },
+  gguf: { civitaiTypes: [], hfPipelineTags: ['text-generation'], searchTerms: ['gguf'] },
+  'audio-speech': {
+    civitaiTypes: [],
+    hfPipelineTags: ['text-to-audio', 'automatic-speech-recognition', 'text-to-speech'],
+    searchTerms: ['musicgen'],
+  },
+  inpainting: { civitaiTypes: ['Checkpoint'], hfPipelineTags: ['image-to-image'], searchTerms: ['inpainting'] },
 };
 
 function supportsModelManager(tool) {
   return MODEL_MANAGER_TOOL_IDS.has(tool?.id);
+}
+
+function mergeUniqueStrings(values = []) {
+  return [...new Set((values || []).filter(Boolean))];
 }
 
 function toFileSizeBytes(sizeValue) {
@@ -95,6 +140,18 @@ function normalizeModelType(value) {
     return 'GGUF';
   }
 
+  if (normalized.includes('upscaler') || normalized.includes('esrgan') || normalized.includes('realesrgan')) {
+    return 'Upscaler';
+  }
+
+  if (normalized.includes('audio') || normalized.includes('speech') || normalized.includes('musicgen') || normalized.includes('bark')) {
+    return 'Audio / Speech';
+  }
+
+  if (normalized.includes('inpaint')) {
+    return 'Inpainting';
+  }
+
   if (normalized.includes('lora') || normalized.includes('locon')) {
     return 'LoRA';
   }
@@ -123,6 +180,24 @@ function normalizeModelTypeFilter(value) {
   return normalized || 'all';
 }
 
+function normalizeTaskTypeFilter(value) {
+  const normalized = String(value || 'all').trim().toLowerCase();
+  const aliasMap = {
+    'text-to-image': 'image-generation',
+    'text-to-video': 'video-generation',
+    'text-to-audio': 'audio-speech',
+  };
+  return aliasMap[normalized] || normalized || 'all';
+}
+
+function getTaskProfile(taskType) {
+  return HUGGING_FACE_TASK_PROFILES[normalizeTaskTypeFilter(taskType)] || HUGGING_FACE_TASK_PROFILES.all;
+}
+
+function getModelTypeProfile(modelType) {
+  return MODEL_TYPE_PROFILES[normalizeModelTypeFilter(modelType)] || MODEL_TYPE_PROFILES.all;
+}
+
 function matchesSelectedModelType(modelType, selectedType) {
   if (!selectedType || selectedType === 'all') {
     return true;
@@ -138,6 +213,26 @@ function stripHtml(value) {
     .replace(/&amp;/gi, '&')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function getEffectiveHuggingFacePipelineTags(browseOptions) {
+  const taskProfile = getTaskProfile(browseOptions.taskType);
+  const modelTypeProfile = getModelTypeProfile(browseOptions.modelType);
+  return mergeUniqueStrings([...(taskProfile.pipelineTags || []), ...(modelTypeProfile.hfPipelineTags || [])]);
+}
+
+function getDerivedSearchTerms(browseOptions) {
+  const taskProfile = getTaskProfile(browseOptions.taskType);
+  const modelTypeProfile = getModelTypeProfile(browseOptions.modelType);
+  const userQuery = String(browseOptions.query || '').trim();
+  return mergeUniqueStrings([userQuery, ...(modelTypeProfile.searchTerms || []), ...(taskProfile.searchTerms || [])]);
+}
+
+function getCatalogRequirements(browseOptions) {
+  const taskProfile = getTaskProfile(browseOptions.taskType);
+  const modelTypeProfile = getModelTypeProfile(browseOptions.modelType);
+  const requirements = { ...(taskProfile.catalogRequirements || {}), ...(modelTypeProfile.catalogRequirements || {}) };
+  return Object.keys(requirements).length ? requirements : null;
 }
 
 function buildModelSettingsDefaults() {
@@ -194,6 +289,10 @@ function getOllamaModelsRoot() {
   return path.join(process.env.USERPROFILE || '', '.ollama', 'models');
 }
 
+function getLmStudioModelsRoot() {
+  return path.join(process.env.USERPROFILE || '', '.lmstudio', 'models');
+}
+
 function normalizeBrowseOptions(options = {}, tool) {
   const sort = String(options.sort || 'most-downloaded').trim().toLowerCase();
   return {
@@ -204,7 +303,7 @@ function normalizeBrowseOptions(options = {}, tool) {
     query: String(options.query || '').trim(),
     sort: HF_SORT_MAP[sort] || CIVITAI_SORT_MAP[sort] ? sort : 'most-downloaded',
     source: String(options.source || (tool?.id === 'ollama' ? 'ollama' : 'huggingface')).trim(),
-    taskType: String(options.taskType || (tool?.id === 'ollama' ? 'all' : 'image-generation')).trim() || 'all',
+    taskType: normalizeTaskTypeFilter(options.taskType || (tool?.id === 'ollama' ? 'all' : 'image-generation')),
   };
 }
 
@@ -251,8 +350,18 @@ function buildDiskWarning(sizeBytes, disk) {
   };
 }
 
-function buildHardwareFit(sizeBytes, hardware) {
+function buildHardwareFit(sizeBytes, hardware, requirements = null) {
   const vramMb = Number(hardware?.vramMb || 0);
+  const minimumVramMb = Number(requirements?.minimumVramMb || 0);
+
+  if (minimumVramMb > 0 && vramMb > 0 && vramMb < minimumVramMb) {
+    return {
+      label: 'Too Large',
+      tone: 'danger',
+      message: requirements?.warningMessage || 'This model needs more GPU memory than Local AI Hub detected on this PC.',
+    };
+  }
+
   if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || vramMb <= 0) {
     return {
       label: 'Unknown',
@@ -286,13 +395,14 @@ function buildHardwareFit(sizeBytes, hardware) {
 }
 
 function attachHardwareHints(item, tool, hardwareContext) {
-  const targetDirectory = getTargetDirectory(tool, item.modelType);
+  const targetDirectory = getTargetDirectory(tool, item.modelType, item);
   const disk = findDiskForPath(hardwareContext.disks, targetDirectory || tool.installDir || tool.appDir || getOllamaModelsRoot());
+  const requirements = item.catalogRequirements || null;
   return {
     ...item,
     diskWarning: buildDiskWarning(item.sizeBytes, disk),
     downloadTarget: targetDirectory,
-    hardwareFit: buildHardwareFit(item.sizeBytes, hardwareContext.hardware),
+    hardwareFit: buildHardwareFit(item.sizeBytes, hardwareContext.hardware, requirements),
     targetDisk: disk
       ? {
           freeBytes: disk.freeBytes,
@@ -306,7 +416,7 @@ function attachHardwareHints(item, tool, hardwareContext) {
 function getToolModelDirectories(tool) {
   const appDir = tool?.appDir || tool?.installDir || '';
 
-  if (tool?.id !== 'ollama' && !appDir) {
+  if (!appDir && !['ollama', 'lmstudio'].includes(tool?.id)) {
     return {};
   }
 
@@ -319,10 +429,13 @@ function getToolModelDirectories(tool) {
       ControlNet: path.join(appDir, 'models', 'controlnet'),
       Hypernetwork: path.join(appDir, 'models', 'hypernetworks'),
       GGUF: path.join(appDir, 'models', 'gguf'),
+      Upscaler: path.join(appDir, 'models', 'upscale_models'),
+      'Audio / Speech': path.join(appDir, 'models', 'audio'),
+      Inpainting: path.join(appDir, 'models', 'checkpoints'),
     };
   }
 
-  if (tool?.id === 'automatic1111') {
+  if (tool?.id === 'automatic1111' || tool?.id === 'forge') {
     return {
       Checkpoint: path.join(appDir, 'models', 'Stable-diffusion'),
       LoRA: path.join(appDir, 'models', 'Lora'),
@@ -331,6 +444,15 @@ function getToolModelDirectories(tool) {
       ControlNet: path.join(appDir, 'models', 'ControlNet'),
       Hypernetwork: path.join(appDir, 'models', 'hypernetworks'),
       GGUF: path.join(appDir, 'models', 'GGUF'),
+      Upscaler: path.join(appDir, 'models', 'ESRGAN'),
+      'Audio / Speech': path.join(appDir, 'models', 'Audio'),
+      Inpainting: path.join(appDir, 'models', 'Stable-diffusion'),
+    };
+  }
+
+  if (tool?.id === 'lmstudio') {
+    return {
+      GGUF: getLmStudioModelsRoot(),
     };
   }
 
@@ -343,15 +465,28 @@ function getToolModelDirectories(tool) {
   return {};
 }
 
-function getTargetDirectory(tool, modelType) {
+function getTargetDirectory(tool, modelType, item = null) {
   const directories = getToolModelDirectories(tool);
-  return directories[normalizeModelType(modelType)] || directories.Checkpoint || directories.Model || null;
+  const normalizedType = normalizeModelType(modelType);
+
+  if (tool?.id === 'lmstudio') {
+    const modelName = String(item?.name || '').trim();
+    const [owner, repo] = modelName.split('/');
+    if (owner && repo) {
+      return path.join(getLmStudioModelsRoot(), owner, repo);
+    }
+  }
+
+  return directories[normalizedType] || directories.Checkpoint || directories.Model || null;
 }
 
 function isSafeChildPath(parentPath, candidatePath) {
   const normalizedParent = path.resolve(parentPath || '');
   const normalizedCandidate = path.resolve(candidatePath || '');
   return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+}
+function normalizePathForId(value) {
+  return String(value || '').replace(/[\\/]+/g, ':');
 }
 
 async function listLocalFileModels(tool) {
@@ -363,21 +498,21 @@ async function listLocalFileModels(tool) {
       continue;
     }
 
-    const entries = await fs.readdir(directory, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || !MODEL_FILE_PATTERN.test(entry.name)) {
+    const files = await walkDirectoryFiles(directory);
+    for (const fullPath of files) {
+      if (!MODEL_FILE_PATTERN.test(path.basename(fullPath))) {
         continue;
       }
 
-      const fullPath = path.join(directory, entry.name);
       const stats = await fs.stat(fullPath);
       localModels.push({
-        id: `${tool.id}:${modelType}:${entry.name}`,
+        id: tool.id + ':' + modelType + ':' + normalizePathForId(path.relative(directory, fullPath)),
         downloaded: true,
-        fileName: entry.name,
+        fileName: path.basename(fullPath),
         modelType,
-        name: path.parse(entry.name).name,
+        name: path.parse(path.basename(fullPath)).name,
         path: fullPath,
+        relativePath: path.relative(directory, fullPath),
         sizeBytes: stats.size,
         source: 'local',
         toolId: tool.id,
@@ -862,18 +997,51 @@ async function resolveHuggingFacePreview(detail, logger) {
   return previewUrl;
 }
 
+function mergeUniqueDetailsById(details = []) {
+  const unique = new Map();
+  for (const detail of details.filter(Boolean)) {
+    if (!unique.has(detail.id)) {
+      unique.set(detail.id, detail);
+    }
+  }
+  return [...unique.values()];
+}
+
+async function fetchHuggingFaceSeedDetails(browseOptions, logger) {
+  if (browseOptions.cursor || browseOptions.query) {
+    return [];
+  }
+
+  const seedModelIds = getTaskProfile(browseOptions.taskType).seedModelIds || [];
+  if (!seedModelIds.length) {
+    return [];
+  }
+
+  return fetchHuggingFaceDetails(
+    seedModelIds.map((id) => ({
+      id,
+      gated: false,
+      private: false,
+    })),
+    logger,
+  );
+}
+
 async function fetchHuggingFacePage(tool, browseOptions, logger) {
   const searchUrl = new URL(HUGGING_FACE_SEARCH_URL);
+  const pipelineTags = getEffectiveHuggingFacePipelineTags(browseOptions);
+  const derivedSearchTerms = getDerivedSearchTerms(browseOptions);
+  const derivedSearchQuery = derivedSearchTerms.find(Boolean) || '';
+
   searchUrl.searchParams.set('limit', String(browseOptions.limit));
   searchUrl.searchParams.set('sort', HF_SORT_MAP[browseOptions.sort] || HF_SORT_MAP['most-downloaded']);
   searchUrl.searchParams.set('direction', '-1');
-  if (browseOptions.query) {
-    searchUrl.searchParams.set('search', browseOptions.query);
+  if (derivedSearchQuery) {
+    searchUrl.searchParams.set('search', derivedSearchQuery);
   }
 
-  const pipelineTag = HF_TASK_MAP[browseOptions.taskType];
-  if (pipelineTag) {
-    searchUrl.searchParams.set('pipeline_tag', pipelineTag);
+  if (pipelineTags[0]) {
+    searchUrl.searchParams.set('pipeline_tag', pipelineTags[0]);
   }
 
   if (browseOptions.cursor) {
@@ -881,7 +1049,9 @@ async function fetchHuggingFacePage(tool, browseOptions, logger) {
   }
 
   await logger.info('Searching Hugging Face models.', {
-    query: browseOptions.query || '',
+    modelType: browseOptions.modelType,
+    pipelineTag: pipelineTags[0] || null,
+    query: derivedSearchQuery,
     sort: browseOptions.sort,
     taskType: browseOptions.taskType,
     toolId: tool.id,
@@ -901,12 +1071,15 @@ async function fetchHuggingFacePage(tool, browseOptions, logger) {
 
 async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, hardwareContext, logger) {
   const items = [];
+  const catalogRequirements = getCatalogRequirements(browseOptions);
   let rawCursor = browseOptions.cursor;
   let nextCursor = null;
 
   for (let scanCount = 0; scanCount < 3 && items.length < browseOptions.limit; scanCount += 1) {
     const page = await fetchHuggingFacePage(tool, { ...browseOptions, cursor: rawCursor }, logger);
-    const details = await fetchHuggingFaceDetails(page.results, logger);
+    const pageDetails = await fetchHuggingFaceDetails(page.results, logger);
+    const seedDetails = scanCount === 0 && !rawCursor ? await fetchHuggingFaceSeedDetails(browseOptions, logger) : [];
+    const details = mergeUniqueDetailsById([...seedDetails, ...pageDetails]);
     const resolvedItems = await Promise.all(
       details.map(async (detail) => {
         const file = await resolveHuggingFaceDownloadFile(detail, browseOptions.modelType, logger);
@@ -919,10 +1092,12 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
           {
             id: 'huggingface:' + detail.id + ':' + fileName,
             author: detail.author || null,
+            catalogRequirements,
             description: buildHuggingFaceDescription(detail),
             downloaded: downloadedLookup.has(fileName.toLowerCase()) || downloadedLookup.has(detail.id.toLowerCase()),
             downloadUrl: buildHuggingFaceResolveUrl(detail.id, file.rfilename),
             fileName,
+            highVramWarning: catalogRequirements,
             modelType: file.modelType,
             name: detail.id,
             previewUrl: await resolveHuggingFacePreview(detail, logger),
@@ -1021,26 +1196,49 @@ function normalizeCivitaiNextPage(metadata, currentPage) {
 }
 
 async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settings, hardwareContext, logger) {
+  const selectedModelType = normalizeModelTypeFilter(browseOptions.modelType);
+  const selectedTaskType = normalizeTaskTypeFilter(browseOptions.taskType);
+  const modelTypeProfile = getModelTypeProfile(selectedModelType);
+  const derivedSearchTerms = getDerivedSearchTerms(browseOptions);
+  const derivedSearchQuery = derivedSearchTerms.find(Boolean) || '';
+  const catalogRequirements = getCatalogRequirements(browseOptions);
+
+  if (selectedModelType === 'gguf' || selectedModelType === 'audio-speech' || selectedTaskType === 'audio-speech') {
+    return {
+      items: [],
+      pagination: {
+        hasMore: false,
+        nextCursor: null,
+        nextPage: null,
+      },
+    };
+  }
+
   const searchUrl = new URL(CIVITAI_MODELS_URL);
   searchUrl.searchParams.set('limit', String(browseOptions.limit));
   searchUrl.searchParams.set('page', String(browseOptions.page));
   searchUrl.searchParams.set('sort', CIVITAI_SORT_MAP[browseOptions.sort] || CIVITAI_SORT_MAP['most-downloaded']);
   searchUrl.searchParams.set('period', 'AllTime');
-  if (browseOptions.query) {
-    searchUrl.searchParams.set('query', browseOptions.query);
+  if (derivedSearchQuery) {
+    searchUrl.searchParams.set('query', derivedSearchQuery);
   }
 
-  const mappedTypes = CIVITAI_TYPE_MAP[browseOptions.modelType];
-  for (const type of mappedTypes || []) {
+  const mappedTypes = [...(modelTypeProfile.civitaiTypes || [])];
+  if (selectedTaskType === 'video-generation' || selectedTaskType === 'image-to-video') {
+    mappedTypes.push('MotionModule');
+  }
+  for (const type of mergeUniqueStrings(mappedTypes)) {
     searchUrl.searchParams.append('types', type);
   }
 
   await logger.info('Searching CivitAI models.', {
     modelType: browseOptions.modelType,
     page: browseOptions.page,
-    query: browseOptions.query || '',
+    query: derivedSearchQuery,
     sort: browseOptions.sort,
+    taskType: browseOptions.taskType,
     toolId: tool.id,
+    types: mergeUniqueStrings(mappedTypes),
   });
 
   const { payload } = await fetchJsonResponse(searchUrl, {
@@ -1058,14 +1256,16 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
       const previewImage = primary.version.images?.find((image) => image.type === 'image');
       return attachHardwareHints(
         {
-          id: `civitai:${model.id}:${primary.version.id}:${fileName}`,
+          id: 'civitai:' + model.id + ':' + primary.version.id + ':' + fileName,
           author: model.creator?.username || null,
+          catalogRequirements,
           description:
             stripHtml(model.description) ||
-            `CivitAI ${model.type || 'model'} by ${model.creator?.username || 'the community'}`,
+            'CivitAI ' + (model.type || 'model') + ' by ' + (model.creator?.username || 'the community'),
           downloaded: downloadedLookup.has(fileName.toLowerCase()) || downloadedLookup.has(model.name.toLowerCase()),
           downloadUrl: primary.file.downloadUrl || primary.version.downloadUrl,
           fileName,
+          highVramWarning: catalogRequirements,
           modelType: primary.file.normalizedType,
           name: model.name,
           previewUrl: previewImage?.url || null,
@@ -1099,7 +1299,7 @@ async function browseRemoteModels(tool, options = {}) {
   });
 
   if (!supportsModelManager(tool)) {
-    throw new Error('Local AI Hub can only browse models for Ollama, ComfyUI, and Automatic1111.');
+    throw new Error('Local AI Hub can only browse models for Ollama, ComfyUI, Forge, Automatic1111, and LM Studio.');
   }
 
   const settings = await readModelSettings();
@@ -1287,7 +1487,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
     modelId: payload.id,
   });
 
-  const targetDirectory = getTargetDirectory(tool, payload.modelType);
+  const targetDirectory = getTargetDirectory(tool, payload.modelType, payload);
   if (!targetDirectory) {
     throw new Error(`Local AI Hub could not determine where ${tool.name} stores ${payload.modelType} files.`);
   }
@@ -1515,7 +1715,7 @@ async function deleteModel(tool, payload) {
   }
 
   const resolvedPath = path.resolve(payload.path || '');
-  const targetDirectory = getTargetDirectory(tool, payload.modelType);
+  const targetDirectory = getTargetDirectory(tool, payload.modelType, payload);
   if (!resolvedPath || !targetDirectory || !isSafeChildPath(targetDirectory, resolvedPath)) {
     throw new Error('Local AI Hub refused to delete a file outside the model folder.');
   }
@@ -1536,6 +1736,12 @@ module.exports = {
   saveModelManagerSettings,
   supportsModelManager,
 };
+
+
+
+
+
+
 
 
 

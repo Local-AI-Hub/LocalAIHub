@@ -2,6 +2,7 @@ const path = require('path');
 const {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   Menu,
   Notification,
@@ -41,6 +42,7 @@ const {
 } = require('./services/processService');
 const { listSnapshots, restoreSnapshot, saveSnapshot } = require('./services/snapshotService');
 const { getToolCatalog, getToolManifest, initializeToolRegistry } = require('./services/toolRegistry');
+const { transcribeWithWhisper } = require('./services/whisperService');
 const { configureAutoUpdates, restartToInstallUpdate } = require('./services/updateService');
 
 let mainWindow = null;
@@ -81,7 +83,7 @@ function sendUpdateReadyNotification() {
 }
 
 function openInternalToolInterface(tool) {
-  if (!tool || tool.interfaceMode !== 'embedded-chat' || !mainWindow || mainWindow.isDestroyed()) {
+  if (!tool || !String(tool.interfaceMode || '').startsWith('embedded-') || !mainWindow || mainWindow.isDestroyed()) {
     return;
   }
 
@@ -377,8 +379,10 @@ function registerIpcHandlers() {
       openInternalToolInterface(nextTool);
       return {
         message:
-          nextTool.interfaceMode === 'embedded-chat'
-            ? `${nextTool.name} is starting. Local AI Hub opened its chat view.`
+          String(nextTool.interfaceMode || '').startsWith('embedded-')
+            ? nextTool.interfaceMode === 'embedded-whisper'
+              ? `${nextTool.name} is ready. Local AI Hub opened its transcription view.`
+              : `${nextTool.name} is starting. Local AI Hub opened its chat view.`
             : `${nextTool.name} is starting.`,
         state: nextState,
       };
@@ -487,6 +491,32 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not delete that model.'),
   );
 
+  ipcMain.handle('whisper:pick-audio-file', () =>
+    withPlainEnglishErrors(async () => {
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: 'Choose an audio file',
+        properties: ['openFile'],
+        filters: [
+          { name: 'Audio files', extensions: ['mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac', 'wma', 'mp4', 'mkv', 'webm'] },
+          { name: 'All files', extensions: ['*'] },
+        ],
+      });
+
+      return {
+        canceled: Boolean(result.canceled),
+        filePath: result.filePaths?.[0] || '',
+      };
+    }, 'Local AI Hub could not open the audio picker.'),
+  );
+
+  ipcMain.handle('whisper:transcribe', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = toolLookup('whisper', state.tools);
+      return transcribeWithWhisper(tool, payload);
+    }, 'Local AI Hub could not transcribe that audio file.'),
+  );
+
   ipcMain.handle('ollama:list-models', () =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -571,6 +601,7 @@ app.on('activate', () => {
 
   showWindow();
 });
+
 
 
 

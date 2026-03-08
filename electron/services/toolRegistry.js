@@ -21,6 +21,10 @@ const DEFAULT_EXTERNAL_CANDIDATES = {
   automatic1111: {
     externalBatchCandidates: ['webui-user.bat', 'webui.bat'],
   },
+  forge: {
+    externalBatchCandidates: ['webui-user.bat', 'webui.bat', 'run.bat'],
+    externalPythonCandidates: ['venv\\Scripts\\python.exe', '.venv\\Scripts\\python.exe'],
+  },
   invokeai: {
     externalExecutableCandidates: [
       '.venv\\Scripts\\invokeai-web.exe',
@@ -33,6 +37,19 @@ const DEFAULT_EXTERNAL_CANDIDATES = {
   ollama: {
     externalExecutableCandidates: ['ollama.exe'],
   },
+  lmstudio: {
+    externalExecutableCandidates: ['LM Studio.exe'],
+  },
+  openwebui: {
+    externalExecutableCandidates: ['open-webui.exe'],
+    externalPythonCandidates: ['Scripts\\python.exe', '.venv\\Scripts\\python.exe', 'venv\\Scripts\\python.exe'],
+  },
+  whisper: {
+    externalPythonCandidates: ['Scripts\\python.exe', '.venv\\Scripts\\python.exe', 'venv\\Scripts\\python.exe'],
+  },
+  koboldcpp: {
+    externalExecutableCandidates: ['koboldcpp.exe', 'koboldcpp_nocuda.exe', 'koboldcpp_oldpc.exe'],
+  },
 };
 
 const DEFAULT_DISCOVERY = {
@@ -40,21 +57,55 @@ const DEFAULT_DISCOVERY = {
     folderNames: ['ComfyUI', 'comfyui', 'ComfyUI-master', 'ComfyUI_windows_portable', 'ComfyUI_portable'],
     markerPaths: ['main.py', 'ComfyUI\\main.py', 'run_nvidia_gpu.bat', 'run_cpu.bat'],
     pathExecutables: [],
+    pythonModules: [],
   },
   ollama: {
     folderNames: ['Ollama', 'ollama'],
     markerPaths: ['ollama.exe'],
     pathExecutables: ['ollama.exe'],
+    pythonModules: [],
   },
   automatic1111: {
     folderNames: ['stable-diffusion-webui', 'stable-diffusion-webui-master', 'automatic1111', 'AUTOMATIC1111', 'sd-webui'],
     markerPaths: ['webui.py', 'webui-user.bat', 'webui.bat'],
     pathExecutables: [],
+    pythonModules: [],
+  },
+  forge: {
+    folderNames: ['stable-diffusion-webui-forge', 'stable-diffusion-webui-forge-master', 'webui_forge_cu121_torch231', 'webui_forge_cu124_torch24'],
+    markerPaths: ['modules_forge\\shared.py', 'webui-user.bat', 'webui.py', 'run.bat'],
+    pathExecutables: [],
+    pythonModules: [],
   },
   invokeai: {
     folderNames: ['InvokeAI', 'invokeai', 'InvokeAI-main'],
     markerPaths: ['invokeai-web.exe', 'invokeai.exe', 'pyproject.toml'],
     pathExecutables: ['invokeai-web.exe', 'invokeai.exe'],
+    pythonModules: [],
+  },
+  lmstudio: {
+    folderNames: ['LM Studio', 'LMStudio', 'lm-studio'],
+    markerPaths: ['LM Studio.exe'],
+    pathExecutables: ['LM Studio.exe'],
+    pythonModules: [],
+  },
+  openwebui: {
+    folderNames: ['Open WebUI', 'open-webui', 'open_webui'],
+    markerPaths: ['open-webui.exe', 'open_webui\\__init__.py', 'pyproject.toml'],
+    pathExecutables: ['open-webui.exe'],
+    pythonModules: ['open_webui'],
+  },
+  whisper: {
+    folderNames: ['faster-whisper', 'faster_whisper', 'Whisper'],
+    markerPaths: ['faster_whisper\\__init__.py', 'pyproject.toml'],
+    pathExecutables: [],
+    pythonModules: ['faster_whisper'],
+  },
+  koboldcpp: {
+    folderNames: ['koboldcpp', 'KoboldCpp', 'KoboldAI'],
+    markerPaths: ['koboldcpp.exe', 'koboldcpp_nocuda.exe', 'koboldcpp_oldpc.exe'],
+    pathExecutables: ['koboldcpp.exe', 'koboldcpp_nocuda.exe', 'koboldcpp_oldpc.exe'],
+    pythonModules: [],
   },
 };
 
@@ -124,7 +175,7 @@ function deriveProcessNames(tool) {
 
   for (const command of candidates) {
     const firstToken = tokenizeCommand(command)[0];
-    if (!firstToken) {
+    if (!firstToken || firstToken.startsWith('embedded://')) {
       continue;
     }
 
@@ -144,6 +195,7 @@ function buildDiscoveryDefaults(tool) {
     folderNames: [tool.name, tool.id],
     markerPaths: [],
     pathExecutables: [],
+    pythonModules: [],
   };
 
   const manifestCommands = [tool.launchCommand, tool.externalLaunchCommand]
@@ -156,6 +208,7 @@ function buildDiscoveryDefaults(tool) {
     folderNames: mergeUnique(defaults.folderNames),
     markerPaths: mergeUnique(defaults.markerPaths),
     pathExecutables: mergeUnique([...defaults.pathExecutables, ...manifestCommands]),
+    pythonModules: mergeUnique(defaults.pythonModules),
   };
 }
 
@@ -173,15 +226,19 @@ function normalizeToolDefinition(tool) {
     category: tool.category || 'General',
     downloadUrl: tool.downloadUrl,
     interfaceMode: tool.interfaceMode || 'external-browser',
+    launchEnv: tool.launchEnv || {},
+    externalLaunchEnv: tool.externalLaunchEnv || tool.launchEnv || {},
     installInstructions: {
       kind: installInstructions.kind || 'zip',
       runtime: installInstructions.runtime || 'binary',
       archiveName: deriveArchiveName(tool.downloadUrl, installInstructions.archiveName),
+      downloadFileName: installInstructions.downloadFileName || null,
       installSummary: installInstructions.installSummary || 'Downloads and configures this tool inside Local AI Hub.',
       venvFolder: installInstructions.venvFolder || '.venv',
       configTargets: installInstructions.configTargets || [],
       pythonRequirementDetection: installInstructions.pythonRequirementDetection || [],
       pipInstalls: installInstructions.pipInstalls || [],
+      installerArgs: installInstructions.installerArgs || [],
       externalPythonCandidates: mergeUnique([
         ...(defaultExternalCandidates.externalPythonCandidates || []),
         ...(installInstructions.externalPythonCandidates || []),
@@ -204,6 +261,7 @@ function normalizeToolDefinition(tool) {
       folderNames: mergeUnique([...(tool.discovery?.folderNames || []), ...discoveryDefaults.folderNames]),
       markerPaths: mergeUnique([...(tool.discovery?.markerPaths || []), ...discoveryDefaults.markerPaths]),
       pathExecutables: mergeUnique([...(tool.discovery?.pathExecutables || []), ...discoveryDefaults.pathExecutables]),
+      pythonModules: mergeUnique([...(tool.discovery?.pythonModules || []), ...discoveryDefaults.pythonModules]),
     },
     launchUrl,
     healthUrl: buildHealthUrl(tool, launchUrl),
@@ -295,6 +353,16 @@ function buildLaunchProfileFromCommand(command, context = {}) {
     return null;
   }
 
+  if (tokens[0].startsWith('embedded://')) {
+    return {
+      kind: 'embedded',
+      target: tokens[0].slice('embedded://'.length),
+      pythonPath: context.pythonPath || null,
+      workingDir: context.workingDir || context.baseDir,
+      env: context.env || {},
+    };
+  }
+
   const head = tokens[0].toLowerCase();
   if (head === 'python' || head === 'py' || head.endsWith('python.exe')) {
     const pythonPath =
@@ -314,6 +382,7 @@ function buildLaunchProfileFromCommand(command, context = {}) {
         workingDir: context.workingDir || context.baseDir,
         target: tokens[2],
         args: tokens.slice(3),
+        env: context.env || {},
       };
     }
 
@@ -323,6 +392,7 @@ function buildLaunchProfileFromCommand(command, context = {}) {
       workingDir: context.workingDir || context.baseDir,
       target: tokens[1],
       args: tokens.slice(2),
+      env: context.env || {},
     };
   }
 
@@ -332,6 +402,7 @@ function buildLaunchProfileFromCommand(command, context = {}) {
       command: resolveCommandPath(tokens[0], context.baseDir, context.executablePath),
       workingDir: context.workingDir || context.baseDir,
       args: tokens.slice(1),
+      env: context.env || {},
     };
   }
 
@@ -341,6 +412,7 @@ function buildLaunchProfileFromCommand(command, context = {}) {
     executable,
     workingDir: context.workingDir || path.dirname(executable),
     args: tokens.slice(1),
+    env: context.env || {},
   };
 }
 
@@ -355,6 +427,7 @@ function buildManagedLaunchProfile(toolState, manifest) {
     workingDir: toolState.appDir,
     pythonPath,
     port: manifest.defaultPort,
+    env: manifest.launchEnv || {},
   });
 }
 
@@ -365,14 +438,17 @@ function buildExternalLaunchProfile(manifest, installDir, detectedPath = null) {
     baseDir: installDir,
     workingDir: installDir,
     port: manifest.defaultPort,
+    env: manifest.externalLaunchEnv || manifest.launchEnv || {},
   };
+  const detectedPythonPath = detectedPath && /python(?:\.exe)?$/i.test(path.basename(detectedPath)) ? detectedPath : null;
 
   if (/^(python|py)(\s|$)/i.test(launchCommand)) {
     const pythonRelative = firstExistingRelativePath(installDir, installInstructions.externalPythonCandidates);
-    if (pythonRelative) {
+    const pythonPath = detectedPythonPath || (pythonRelative ? path.join(installDir, pythonRelative) : null);
+    if (pythonPath) {
       return buildLaunchProfileFromCommand(launchCommand, {
         ...baseContext,
-        pythonPath: path.join(installDir, pythonRelative),
+        pythonPath,
       });
     }
   }
@@ -388,6 +464,7 @@ function buildExternalLaunchProfile(manifest, installDir, detectedPath = null) {
     const profile = buildLaunchProfileFromCommand(launchCommand, {
       ...baseContext,
       executablePath,
+      pythonPath: detectedPythonPath,
     });
 
     if (profile) {
@@ -395,7 +472,10 @@ function buildExternalLaunchProfile(manifest, installDir, detectedPath = null) {
     }
   }
 
-  const directProfile = buildLaunchProfileFromCommand(launchCommand, baseContext);
+  const directProfile = buildLaunchProfileFromCommand(launchCommand, {
+    ...baseContext,
+    pythonPath: detectedPythonPath,
+  });
   if (directProfile?.kind !== 'python-script' && directProfile?.kind !== 'python-module') {
     return directProfile;
   }
@@ -403,6 +483,7 @@ function buildExternalLaunchProfile(manifest, installDir, detectedPath = null) {
   const pathAwareProfile = buildLaunchProfileFromCommand(launchCommand, {
     ...baseContext,
     allowBarePythonCommand: true,
+    pythonPath: detectedPythonPath,
   });
   if (pathAwareProfile) {
     return pathAwareProfile;

@@ -3,6 +3,7 @@ import HardwareGate from './components/HardwareGate';
 import LibraryCard from './components/LibraryCard';
 import ModelManager from './components/ModelManager';
 import OllamaChatPanel from './components/OllamaChatPanel';
+import WhisperPanel from './components/WhisperPanel';
 import ResourceStrip from './components/ResourceStrip';
 import Sidebar from './components/Sidebar';
 import StoreCard from './components/StoreCard';
@@ -66,6 +67,13 @@ export default function App() {
   const [ollamaNotice, setOllamaNotice] = useState('');
   const [ollamaModelsLoading, setOllamaModelsLoading] = useState(false);
   const [ollamaChatBusy, setOllamaChatBusy] = useState(false);
+  const [whisperPanelOpen, setWhisperPanelOpen] = useState(false);
+  const [whisperBusy, setWhisperBusy] = useState(false);
+  const [whisperFilePath, setWhisperFilePath] = useState('');
+  const [whisperModelName, setWhisperModelName] = useState('base');
+  const [whisperTranscript, setWhisperTranscript] = useState('');
+  const [whisperSegments, setWhisperSegments] = useState([]);
+  const [whisperNotice, setWhisperNotice] = useState('');
 
   const manifestMap = useMemo(
     () => Object.fromEntries((appState.manifests || []).map((manifest) => [manifest.id, manifest])),
@@ -83,6 +91,7 @@ export default function App() {
 
   const toolMap = useMemo(() => Object.fromEntries(tools.map((tool) => [tool.id, tool])), [tools]);
   const ollamaTool = toolMap.ollama || null;
+  const whisperTool = toolMap.whisper || null;
   const modelManagerCount = Number(appState.downloadedModelCount || 0);
 
   const storeCategories = useMemo(() => {
@@ -162,22 +171,29 @@ export default function App() {
   }
 
   function openEmbeddedToolUi(toolId) {
-    if (toolId !== 'ollama') {
+    setActiveTab('library');
+
+    if (toolId === 'ollama') {
+      setWhisperPanelOpen(false);
+      setOllamaChatOpen(true);
+      setOllamaMessages((current) =>
+        current.length
+          ? current
+          : [
+              {
+                role: 'assistant',
+                content: 'Ollama is ready. Choose a local model and start chatting.',
+              },
+            ],
+      );
       return;
     }
 
-    setActiveTab('library');
-    setOllamaChatOpen(true);
-    setOllamaMessages((current) =>
-      current.length
-        ? current
-        : [
-            {
-              role: 'assistant',
-              content: 'Ollama is ready. Choose a local model and start chatting.',
-            },
-          ],
-    );
+    if (toolId === 'whisper') {
+      setOllamaChatOpen(false);
+      setWhisperPanelOpen(true);
+      setWhisperNotice((current) => current || 'Choose an audio file and start transcription.');
+    }
   }
 
   async function loadOllamaModels(options = {}) {
@@ -203,7 +219,7 @@ export default function App() {
     const models = result.data?.models || [];
     setOllamaModels(models);
     setOllamaSelectedModel((current) =>
-      current && models.some((model) => model.name === current) ? current : models[0]?.name || ''
+      current && models.some((model) => model.name === current) ? current : models[0]?.name || '',
     );
     setOllamaNotice(
       models.length
@@ -255,6 +271,48 @@ export default function App() {
     setOllamaChatBusy(false);
   }
 
+  async function chooseWhisperAudioFile() {
+    const result = await window.localAIHub.pickWhisperAudioFile();
+    if (!result?.ok) {
+      pushToast(result?.message || 'Local AI Hub could not open the audio picker.', 'error');
+      return;
+    }
+
+    if (!result.data?.canceled && result.data?.filePath) {
+      setWhisperFilePath(result.data.filePath);
+      setWhisperNotice(`Ready to transcribe ${result.data.filePath.split(/[\\/]/).pop()}.`);
+    }
+  }
+
+  async function transcribeWhisperAudio() {
+    if (!whisperFilePath) {
+      pushToast('Choose an audio file before starting transcription.', 'error');
+      return;
+    }
+
+    setWhisperBusy(true);
+    const result = await window.localAIHub.transcribeWithWhisper({
+      audioPath: whisperFilePath,
+      model: whisperModelName,
+    });
+
+    if (!result?.ok) {
+      pushToast(result?.message || 'Local AI Hub could not transcribe that audio file.', 'error');
+      setWhisperBusy(false);
+      return;
+    }
+
+    setWhisperTranscript(result.data?.text || '');
+    setWhisperSegments(result.data?.segments || []);
+    setWhisperNotice(
+      result.data?.language
+        ? `Transcription finished. Detected language: ${result.data.language}.`
+        : 'Transcription finished.',
+    );
+    pushToast('Whisper finished transcribing the selected file.', 'success');
+    setWhisperBusy(false);
+  }
+
   function applyStateResponse(result) {
     if (!result?.ok) {
       throw new Error(result?.message || 'Local AI Hub could not complete that action.');
@@ -290,21 +348,24 @@ export default function App() {
   }
 
   async function runAction(key, operation) {
+    const toolId = toolIdFromActionKey(key);
     markBusy(key, true);
     try {
       const result = await operation();
       applyStateResponse(result);
 
-      const toolId = toolIdFromActionKey(key);
-      if (key.startsWith('launch:') && toolId === 'ollama') {
+      if (key.startsWith('launch:') && ['ollama', 'whisper'].includes(toolId)) {
         openEmbeddedToolUi(toolId);
       }
 
       if (key.startsWith('stop:') && toolId === 'ollama') {
         setOllamaNotice('Ollama stopped. Launch it again to continue chatting.');
       }
+
+      if (key.startsWith('stop:') && toolId === 'whisper') {
+        setWhisperNotice('Whisper stopped. Launch it again to continue transcribing.');
+      }
     } catch (error) {
-      const toolId = toolIdFromActionKey(key);
       if (key.startsWith('install:') || key.startsWith('repair:')) {
         clearProgress(toolId);
       }
@@ -381,6 +442,27 @@ export default function App() {
     }
   }, [ollamaChatOpen, ollamaTool?.status]);
 
+  useEffect(() => {
+    if (!whisperTool) {
+      setWhisperPanelOpen(false);
+      setWhisperFilePath('');
+      setWhisperTranscript('');
+      setWhisperSegments([]);
+      return;
+    }
+
+    if (!whisperPanelOpen) {
+      return;
+    }
+
+    if (whisperTool.status === 'running') {
+      setWhisperNotice((current) => current || 'Choose an audio file and start transcription.');
+      return;
+    }
+
+    setWhisperNotice('Launch Whisper to enable the built-in transcription tools.');
+  }, [whisperPanelOpen, whisperTool?.status]);
+
   if (isLoading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-shell text-white">
@@ -440,6 +522,24 @@ export default function App() {
                   onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
                   selectedModel={ollamaSelectedModel}
                   tool={ollamaTool}
+                />
+              ) : null}
+
+              {whisperTool && whisperPanelOpen ? (
+                <WhisperPanel
+                  busy={busyMap['launch:whisper'] || busyMap['stop:whisper'] || whisperBusy}
+                  filePath={whisperFilePath}
+                  modelName={whisperModelName}
+                  notice={whisperNotice}
+                  onChangeModel={setWhisperModelName}
+                  onChooseFile={chooseWhisperAudioFile}
+                  onHide={() => setWhisperPanelOpen(false)}
+                  onLaunch={(toolId) => runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId))}
+                  onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
+                  onTranscribe={transcribeWhisperAudio}
+                  segments={whisperSegments}
+                  tool={whisperTool}
+                  transcript={whisperTranscript}
                 />
               ) : null}
 

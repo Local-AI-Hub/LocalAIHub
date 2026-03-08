@@ -120,6 +120,84 @@ async function findExecutableOnPath(executableName, logger) {
   return null;
 }
 
+function parsePythonProbeResult(stdout) {
+  const payload = String(stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse()
+    .find((line) => line.startsWith('{'));
+
+  if (!payload) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+async function probePythonModule(moduleName, launcher, launcherArgs = [], logger) {
+  const probeSnippet = [
+    'import importlib.util, json, sys',
+    `module_name = ${JSON.stringify(moduleName)}` ,
+    'spec = importlib.util.find_spec(module_name)',
+    'print(json.dumps({"found": bool(spec), "python": sys.executable}))',
+  ].join('; ');
+
+  const result = await runCommand(launcher, [...launcherArgs, '-c', probeSnippet], {
+    allowFailure: true,
+  });
+
+  if (result.code !== 0) {
+    return null;
+  }
+
+  const payload = parsePythonProbeResult(result.stdout);
+  if (!payload?.found || !payload.python) {
+    return null;
+  }
+
+  await logger.info('A Python module probe found an existing tool install.', {
+    moduleName,
+    pythonPath: payload.python,
+  });
+
+  return {
+    detectedPath: payload.python,
+    displayPath: `${payload.python} (${moduleName})`,
+    fromPath: true,
+    installDir: path.dirname(path.dirname(payload.python)),
+    pythonPath: payload.python,
+    reason: 'python-module',
+  };
+}
+
+async function discoverFromPythonModules(manifest, logger) {
+  const pythonModules = manifest.discovery?.pythonModules || [];
+  if (!pythonModules.length) {
+    return null;
+  }
+
+  const launchers = [
+    { command: 'py', args: ['-3'] },
+    { command: 'python', args: [] },
+  ];
+
+  for (const moduleName of pythonModules) {
+    for (const launcher of launchers) {
+      const resolved = await probePythonModule(moduleName, launcher.command, launcher.args, logger);
+      if (resolved) {
+        return resolved;
+      }
+    }
+  }
+
+  return null;
+}
+
 async function resolveFilesystemCandidate(candidatePath, metadata = {}) {
   const expandedPath = expandDetectionPath(candidatePath);
   if (!expandedPath || !(await pathExists(expandedPath))) {
@@ -168,6 +246,7 @@ function getTrackedPathCandidates(existingTool, manifest) {
     existingTool?.launchProfile?.executable,
     existingTool?.launchProfile?.command,
     existingTool?.launchProfile?.pythonPath,
+    existingTool?.externalPythonPath,
     path.join(appPaths.toolsRoot, manifest.id),
     path.join(appPaths.toolsRoot, manifest.id, 'app'),
     ...appPaths.legacyRoots.flatMap((legacyRoot) => [
@@ -321,6 +400,7 @@ async function discoverInstallLocation(manifest, existingTool, logger) {
     () => discoverFromTrackedPaths(manifest, existingTool, logger),
     () => discoverFromManifestPaths(manifest, logger),
     () => discoverFromPathExecutables(manifest, logger),
+    () => discoverFromPythonModules(manifest, logger),
     () => discoverFromCommonRoots(manifest, logger),
   ];
 
@@ -335,8 +415,15 @@ async function discoverInstallLocation(manifest, existingTool, logger) {
 }
 
 function buildExternalToolState(manifest, existingTool, detected) {
-  const launchProfile = buildExternalLaunchProfile(manifest, detected.installDir, detected.fromPath ? detected.detectedPath : null);
+  const launchProfile = buildExternalLaunchProfile(manifest, detected.installDir, detected.detectedPath || null);
   const launchSupported = launchProfile.kind !== 'folder';
+  const externalPythonPath = detected.pythonPath || launchProfile?.pythonPath || existingTool?.externalPythonPath || null;
+  const externalExecutablePath =
+    launchProfile.kind === 'binary'
+      ? launchProfile.executable
+      : launchProfile.kind === 'batch'
+        ? launchProfile.command
+        : existingTool?.externalExecutablePath || null;
 
   return {
     id: manifest.id,
@@ -352,7 +439,8 @@ function buildExternalToolState(manifest, existingTool, detected) {
     appDir: detected.installDir,
     detectedPath: detected.detectedPath,
     displayPath: detected.displayPath,
-    externalExecutablePath: detected.fromPath ? detected.detectedPath : null,
+    externalExecutablePath,
+    externalPythonPath,
     launchProfile,
     launchSupported,
     launchUrl: manifest.launchUrl,
@@ -542,3 +630,8 @@ module.exports = {
   invalidateDiscoveryCache,
   syncDiscoveredTools,
 };
+
+
+
+
+

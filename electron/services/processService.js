@@ -184,6 +184,10 @@ async function isToolActive(toolState) {
     return true;
   }
 
+  if (toolState.launchProfile?.kind === 'embedded') {
+    return toolState.status === 'running';
+  }
+
   if (await probeUrl(toolState.healthUrl || toolState.launchUrl)) {
     return true;
   }
@@ -387,7 +391,10 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
   const child = spawn(launchProfile.executable, launchProfile.args || [], {
     cwd: launchProfile.workingDir || path.dirname(launchProfile.executable),
     windowsHide: true,
-    env: process.env,
+    env: {
+      ...process.env,
+      ...(launchProfile.env || {}),
+    },
   });
 
   const runtimeState = rememberRuntime(toolState.id, {
@@ -410,7 +417,10 @@ async function launchBatchProfile(toolState, launchProfile, runtimeOptions = {})
   const child = spawn('cmd.exe', ['/c', launchProfile.command, ...(launchProfile.args || [])], {
     cwd: launchProfile.workingDir || path.dirname(launchProfile.command),
     windowsHide: true,
-    env: process.env,
+    env: {
+      ...process.env,
+      ...(launchProfile.env || {}),
+    },
   });
 
   const runtimeState = rememberRuntime(toolState.id, {
@@ -473,6 +483,20 @@ async function launchTool(toolState, options = {}) {
   const launchProfile = toolState.launchProfile;
   if (!launchProfile) {
     throw new Error(`${toolState.name} does not have a launch profile yet.`);
+
+  if (launchProfile.kind === 'embedded') {
+    await upsertTool({
+      id: toolState.id,
+      status: 'running',
+      lastError: null,
+    });
+
+    return {
+      ...toolState,
+      status: 'running',
+      lastError: null,
+    };
+  }
   }
 
   if (launchProfile.kind === 'folder') {
@@ -590,6 +614,9 @@ module.exports = {
   resolveToolStatus,
   stopTool,
 };
+
+
+
 
 
 

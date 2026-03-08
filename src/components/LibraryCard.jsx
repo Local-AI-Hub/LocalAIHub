@@ -1,5 +1,17 @@
 import { formatTimestamp, formatUsage, progressWidth, statusClass } from '../lib/formatters';
 
+function embeddedActionLabel(tool) {
+  if (tool?.interfaceMode === 'embedded-whisper') {
+    return 'Open transcription';
+  }
+
+  if (tool?.interfaceMode === 'embedded-chat') {
+    return 'Open chat';
+  }
+
+  return 'Open workspace';
+}
+
 function PrimaryAction({ tool, busyMap, onLaunch, onStop }) {
   if (tool.status === 'running') {
     return (
@@ -66,9 +78,9 @@ export default function LibraryCard({
 
         <div className="flex flex-wrap items-center gap-3">
           <PrimaryAction busyMap={busyMap} onLaunch={onLaunch} onStop={onStop} tool={tool} />
-          {tool.interfaceMode === 'embedded-chat' ? (
+          {String(tool.interfaceMode || '').startsWith('embedded-') ? (
             <button className="ghost-button" onClick={() => onOpenInterface(tool.id)} type="button">
-              Open chat
+              {embeddedActionLabel(tool)}
             </button>
           ) : null}
           <button className="ghost-button" onClick={() => onToggleSettings(tool.id)} type="button">

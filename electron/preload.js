@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('localAIHub', {
   saveModelSettings: (payload) => invoke('models:save-settings', payload),
   saveSnapshot: (toolId) => invoke('snapshots:save', toolId),
   stopTool: (toolId) => invoke('tools:stop', toolId),
+  pickWhisperAudioFile: () => invoke('whisper:pick-audio-file'),
+  transcribeWithWhisper: (payload) => invoke('whisper:transcribe', payload),
   onInstallProgress: (handler) => {
     const listener = (_event, payload) => handler(payload);
     ipcRenderer.on('tools:install-progress', listener);
@@ -47,3 +49,4 @@ contextBridge.exposeInMainWorld('localAIHub', {
     return () => ipcRenderer.removeListener('app:update-ready', listener);
   },
 });
+

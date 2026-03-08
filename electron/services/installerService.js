@@ -443,6 +443,167 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
   }
   return toolState;
 }
+function buildManagedPaths(manifest) {
+  const { downloadsRoot, toolsRoot } = getAppPaths();
+  const installDir = path.join(toolsRoot, manifest.id);
+  const appDir = path.join(installDir, 'app');
+  const venvDir = path.join(installDir, manifest.installInstructions.venvFolder || '.venv');
+  const cacheFileName =
+    manifest.installInstructions.downloadFileName ||
+    manifest.installInstructions.archiveName ||
+    deriveCacheFileName(manifest.downloadUrl, manifest.id);
+
+  return {
+    appDir,
+    archivePath: path.join(downloadsRoot, manifest.id, cacheFileName),
+    installDir,
+    venvDir,
+  };
+}
+
+function deriveCacheFileName(downloadUrl, toolId) {
+  try {
+    const parsed = new URL(downloadUrl);
+    const baseName = path.basename(parsed.pathname) || `${toolId}.bin`;
+    return baseName.includes('.') ? baseName : `${toolId}.bin`;
+  } catch {
+    return `${toolId}.bin`;
+  }
+}
+
+function replaceInstallerTemplate(value, replacements) {
+  return String(value || '').replace(/\{([^}]+)\}/g, (_match, key) => {
+    const resolvedValue = replacements[key];
+    return resolvedValue === undefined || resolvedValue === null ? '' : String(resolvedValue);
+  });
+}
+
+function resolveInstallerArgs(manifest, installDir, appDir) {
+  return (manifest.installInstructions.installerArgs || [])
+    .map((value) =>
+      replaceInstallerTemplate(value, {
+        appDir,
+        installDir,
+      }),
+    )
+    .filter(Boolean);
+}
+
+async function ensureCachedDownload(manifest, archivePath, logger, onProgress, toolId) {
+  const hasCachedArchive = await hasUsableArchiveCache(archivePath, logger);
+  if (!hasCachedArchive) {
+    await downloadFile(manifest.downloadUrl, archivePath, onProgress, logger, toolId);
+    return;
+  }
+
+  await advanceStep(
+    logger,
+    onProgress,
+    {
+      toolId,
+      percent: 45,
+      stage: 'downloading',
+      message: 'Using the cached installer package.',
+    },
+    {
+      archivePath,
+    },
+  );
+}
+
+async function installSingleFileTool(manifest, options, logger) {
+  const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest);
+  const downloadFileName =
+    manifest.installInstructions.downloadFileName ||
+    path.basename(archivePath) ||
+    `${manifest.id}.exe`;
+  const destinationPath = path.join(appDir, downloadFileName);
+
+  await logger.info('Single-file install requested.', {
+    archivePath,
+    destinationPath,
+    installDir,
+  });
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 5,
+    stage: 'preparing',
+    message: `Preparing ${manifest.name}.`,
+  });
+
+  await fs.ensureDir(appDir);
+  await ensureCachedDownload(manifest, archivePath, logger, options.onProgress, manifest.id);
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 68,
+    stage: 'extracting',
+    message: `Copying ${manifest.name} into Local AI Hub.`,
+  });
+
+  await fs.copy(archivePath, destinationPath, { overwrite: true });
+
+  const toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
+  await upsertTool(toolState);
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 100,
+    stage: 'complete',
+    message: `${manifest.name} is ready.`,
+  });
+
+  return toolState;
+}
+
+async function installExecutableInstallerTool(manifest, options, logger) {
+  const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest);
+
+  await logger.info('Installer executable requested.', {
+    archivePath,
+    installDir,
+  });
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 5,
+    stage: 'preparing',
+    message: `Preparing ${manifest.name}.`,
+  });
+
+  await fs.ensureDir(installDir);
+  await fs.ensureDir(appDir);
+  await ensureCachedDownload(manifest, archivePath, logger, options.onProgress, manifest.id);
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 72,
+    stage: 'installing',
+    message: `Running the official ${manifest.name} installer.`,
+  });
+
+  await runCommand(archivePath, resolveInstallerArgs(manifest, installDir, appDir), {
+    cwd: path.dirname(archivePath),
+    errorMessage: `Local AI Hub could not run the ${manifest.name} installer.`,
+  });
+
+  const toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
+  if (!(await toolIsAvailable(toolState))) {
+    throw new Error(`${manifest.name} finished installing, but Local AI Hub could not find its launcher files afterward.`);
+  }
+
+  await upsertTool(toolState);
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 100,
+    stage: 'complete',
+    message: `${manifest.name} is ready.`,
+  });
+
+  return toolState;
+}
 
 async function installTool(toolId, options = {}) {
   await initializeToolRegistry();
@@ -480,17 +641,28 @@ async function installTool(toolId, options = {}) {
       };
     }
 
-    const { downloadsRoot, toolsRoot } = getAppPaths();
-    const installDir = path.join(toolsRoot, manifest.id);
-    const appDir = path.join(installDir, 'app');
-    const venvDir = path.join(installDir, manifest.installInstructions.venvFolder || '.venv');
-    const archivePath = path.join(downloadsRoot, manifest.id, manifest.installInstructions.archiveName);
+    const { archivePath, installDir } = buildManagedPaths(manifest);
 
     await logger.info('Install requested.', {
       installDir,
       archivePath,
       logsPath: await logger.getFilePath(),
     });
+
+    const installKind = manifest.installInstructions.kind || 'zip';
+    if (installKind === 'single-file') {
+      const toolState = await installSingleFileTool(manifest, options, logger);
+      await logger.info('Single-file install completed successfully.');
+      return toolState;
+    }
+
+    if (installKind === 'installer-exe') {
+      const toolState = await installExecutableInstallerTool(manifest, options, logger);
+      await logger.info('Installer-based install completed successfully.');
+      return toolState;
+    }
+
+    const { appDir, venvDir } = buildManagedPaths(manifest);
 
     await advanceStep(logger, options.onProgress, {
       toolId,
@@ -500,25 +672,7 @@ async function installTool(toolId, options = {}) {
     });
 
     await fs.ensureDir(installDir);
-
-    const hasCachedArchive = await hasUsableArchiveCache(archivePath, logger);
-    if (!hasCachedArchive) {
-      await downloadFile(manifest.downloadUrl, archivePath, options.onProgress, logger, toolId);
-    } else {
-      await advanceStep(
-        logger,
-        options.onProgress,
-        {
-          toolId,
-          percent: 45,
-          stage: 'downloading',
-          message: 'Using the cached installer package.',
-        },
-        {
-          archivePath,
-        },
-      );
-    }
+    await ensureCachedDownload(manifest, archivePath, logger, options.onProgress, toolId);
 
     await advanceStep(logger, options.onProgress, {
       toolId,
@@ -629,16 +783,48 @@ async function repairToolInstallation(toolState, options = {}) {
       archivePath: toolState.downloadCachePath,
     });
 
-    await advanceStep(logger, options.onProgress, {
-      toolId: toolState.id,
-      percent: 25,
-      stage: 'repairing',
-      message: 'Restoring the tool files from the cached installer.',
-    });
-    await extractArchive(toolState.downloadCachePath, toolState.appDir, logger);
-
-    const repairNotes = ['restored the application files from the local cache'];
+    const installKind = manifest.installInstructions.kind || 'zip';
+    const repairNotes = [];
     let runtimeChanged = false;
+
+    if (installKind === 'single-file') {
+      const managedPaths = buildManagedPaths(manifest);
+      const destinationPath = path.join(
+        managedPaths.appDir,
+        manifest.installInstructions.downloadFileName || path.basename(toolState.downloadCachePath),
+      );
+
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 25,
+        stage: 'repairing',
+        message: 'Restoring the tool launcher from the cached installer.',
+      });
+      await fs.ensureDir(managedPaths.appDir);
+      await fs.copy(toolState.downloadCachePath, destinationPath, { overwrite: true });
+      repairNotes.push('restored the launcher file from the local cache');
+    } else if (installKind === 'installer-exe') {
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 25,
+        stage: 'repairing',
+        message: `Running the ${manifest.name} installer again.`,
+      });
+      await runCommand(toolState.downloadCachePath, resolveInstallerArgs(manifest, toolState.installDir, toolState.appDir), {
+        cwd: path.dirname(toolState.downloadCachePath),
+        errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
+      });
+      repairNotes.push('reran the official installer from the local cache');
+    } else {
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 25,
+        stage: 'repairing',
+        message: 'Restoring the tool files from the cached installer.',
+      });
+      await extractArchive(toolState.downloadCachePath, toolState.appDir, logger);
+      repairNotes.push('restored the application files from the local cache');
+    }
 
     if (getToolRuntime(manifest) === 'python') {
       await removePythonCaches(toolState.appDir);
@@ -654,39 +840,40 @@ async function repairToolInstallation(toolState, options = {}) {
       );
 
       runtimeChanged = toolState.managedPythonVersion !== pythonResolution.runtime.versionString;
-      if (runtimeChanged && toolState.venvDir) {
+      if (toolState.venvDir) {
         await fs.remove(toolState.venvDir).catch(() => null);
-        repairNotes.push(`switched the environment to Python ${pythonResolution.runtime.versionString}`);
       }
 
-      if (runtimeChanged || !(await fs.pathExists(toolState.venvDir))) {
-        await advanceStep(logger, options.onProgress, {
-          toolId: toolState.id,
-          percent: 55,
-          stage: 'repairing',
-          message: 'Rebuilding the tool environment.',
-        });
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 55,
+        stage: 'repairing',
+        message: 'Rebuilding the tool environment.',
+      });
 
-        const rebuiltState = createManagedToolState(
-          manifest,
-          toolState.installDir,
-          toolState.appDir,
-          toolState.venvDir,
-          toolState.downloadCachePath,
-          pythonResolution,
-        );
+      const rebuiltState = createManagedToolState(
+        manifest,
+        toolState.installDir,
+        toolState.appDir,
+        toolState.venvDir,
+        toolState.downloadCachePath,
+        pythonResolution,
+      );
 
-        await installPythonDependencies(
-          rebuiltState,
-          manifest,
-          options.onProgress,
-          logger,
-          pythonResolution.runtime,
-        );
+      await installPythonDependencies(
+        rebuiltState,
+        manifest,
+        options.onProgress,
+        logger,
+        pythonResolution.runtime,
+      );
 
-        Object.assign(toolState, rebuiltState);
-        repairNotes.push('recreated the virtual environment');
-      }
+      Object.assign(toolState, rebuiltState);
+      repairNotes.push(
+        runtimeChanged
+          ? `recreated the virtual environment with Python ${pythonResolution.runtime.versionString}`
+          : 'recreated the virtual environment',
+      );
     }
 
     const updatedState = {
@@ -725,6 +912,15 @@ module.exports = {
   installTool,
   repairToolInstallation,
 };
+
+
+
+
+
+
+
+
+
 
 
 
