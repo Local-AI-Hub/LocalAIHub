@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NestAI</title>
+    <script>
+      window.__NESTAI_RENDERER_READY = false;
+      window.setTimeout(() => {
+        if (window.__NESTAI_RENDERER_READY) {
+          return;
+        }
+
+        const fallback = document.getElementById('nestai-fallback');
+        if (fallback) {
+          fallback.style.display = 'flex';
+        }
+      }, 3500);
+    </script>
+  </head>
+  <body class="bg-shell">
+    <div
+      id="nestai-fallback"
+      style="display:none;min-height:100vh;align-items:center;justify-content:center;background:#0a111d;color:#e7edf7;font-family:'Segoe UI Variable','Segoe UI',sans-serif;padding:24px;"
+    >
+      <div style="max-width:680px;border:1px solid rgba(255,255,255,0.12);border-radius:24px;background:rgba(18,29,49,0.92);padding:32px;box-shadow:0 24px 80px rgba(0,0,0,0.28);">
+        <h1 style="margin:0 0 12px;font-size:28px;">NestAI could not load its interface.</h1>
+        <p style="margin:0;color:#cbd5e1;line-height:1.7;">
+          Close the app and reopen it. If this keeps happening, reinstall NestAI with the latest installer.
+        </p>
+      </div>
+    </div>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

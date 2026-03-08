@@ -1,0 +1,177 @@
+[
+  {
+    "id": "comfyui",
+    "name": "ComfyUI",
+    "description": "Node-based Stable Diffusion workflows with a lightweight graph UI.",
+    "icon": "CF",
+    "category": "Image generation",
+    "downloadUrl": "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "ComfyUI-master.zip",
+      "installSummary": "Downloads the latest ComfyUI source and builds a dedicated NestAI Python environment.",
+      "venvFolder": ".venv",
+      "configTargets": ["extra_model_paths.yaml", "user"],
+      "pythonRequirementDetection": [
+        { "kind": "pyproject", "file": "pyproject.toml" }
+      ],
+      "pipInstalls": [
+        { "kind": "requirements", "value": "requirements.txt" }
+      ],
+      "externalPythonCandidates": [
+        "python_embeded\\python.exe",
+        "python_embedded\\python.exe",
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": ["run_nvidia_gpu.bat", "run_cpu.bat"],
+      "compatibility": {
+        "minimumVramMb": 4096,
+        "recommendedVramMb": 8192,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python main.py --listen 127.0.0.1 --port {port}",
+    "defaultPort": 8188,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\ComfyUI\\main.py",
+      "%USERPROFILE%\\Documents\\ComfyUI\\main.py",
+      "%USERPROFILE%\\Downloads\\ComfyUI\\main.py",
+      "%LOCALAPPDATA%\\ComfyUI\\main.py",
+      "%APPDATA%\\ComfyUI\\main.py"
+    ]
+  },
+  {
+    "id": "ollama",
+    "name": "Ollama",
+    "description": "Local LLM runtime with a built-in API for chat, embeddings, and tools.",
+    "icon": "OL",
+    "category": "Model runtime",
+    "interfaceMode": "embedded-chat",
+    "downloadUrl": "https://github.com/ollama/ollama/releases/latest/download/ollama-windows-amd64.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "binary",
+      "archiveName": "ollama-windows-amd64.zip",
+      "installSummary": "Downloads the standalone Windows Ollama bundle into NestAI's managed tools folder.",
+      "configTargets": [],
+      "externalExecutableCandidates": ["ollama.exe"],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 6144,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "ollama.exe serve",
+    "defaultPort": 11434,
+    "healthCheckPath": "/api/tags",
+    "detectionPaths": [
+      "PATH:ollama.exe",
+      "%LOCALAPPDATA%\\Programs\\Ollama\\ollama.exe",
+      "%PROGRAMFILES%\\Ollama\\ollama.exe",
+      "%ProgramFiles(x86)%\\Ollama\\ollama.exe"
+    ]
+  },
+  {
+    "id": "automatic1111",
+    "name": "Automatic1111",
+    "description": "The classic Stable Diffusion WebUI with extensions and model management.",
+    "icon": "A1",
+    "category": "Image generation",
+    "downloadUrl": "https://github.com/AUTOMATIC1111/stable-diffusion-webui/archive/refs/heads/master.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "stable-diffusion-webui-master.zip",
+      "installSummary": "Downloads the Automatic1111 source tree, builds a local environment, and installs its pinned Python dependencies.",
+      "venvFolder": ".venv",
+      "configTargets": ["config.json", "ui-config.json", "styles.csv"],
+      "pythonRequirementDetection": [
+        { "kind": "automatic1111-launch-utils", "file": "modules\\launch_utils.py" }
+      ],
+      "pipInstalls": [
+        { "kind": "requirements", "value": "requirements_versions.txt" }
+      ],
+      "externalPythonCandidates": [
+        "venv\\Scripts\\python.exe",
+        ".venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": ["webui.bat"],
+      "compatibility": {
+        "minimumVramMb": 6144,
+        "recommendedVramMb": 8192,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python webui.py --listen --api --port {port}",
+    "externalLaunchCommand": "webui.bat --listen --api --port {port}",
+    "defaultPort": 7860,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\stable-diffusion-webui\\webui.py",
+      "%USERPROFILE%\\Documents\\stable-diffusion-webui\\webui.py",
+      "%USERPROFILE%\\Downloads\\stable-diffusion-webui\\webui.py",
+      "%LOCALAPPDATA%\\stable-diffusion-webui\\webui.py",
+      "%APPDATA%\\stable-diffusion-webui\\webui.py"
+    ]
+  },
+  {
+    "id": "invokeai",
+    "name": "InvokeAI",
+    "description": "A guided image generation stack with queueing, boards, and a polished web UI.",
+    "icon": "IV",
+    "category": "Image generation",
+    "downloadUrl": "https://github.com/invoke-ai/InvokeAI/archive/refs/heads/main.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "InvokeAI-main.zip",
+      "installSummary": "Downloads InvokeAI, installs its Python package locally, and keeps the runtime inside NestAI.",
+      "venvFolder": ".venv",
+      "configTargets": ["invokeai.yaml", ".invokeai"],
+      "pythonRequirementDetection": [
+        { "kind": "pyproject", "file": "pyproject.toml" }
+      ],
+      "pipInstalls": [
+        { "kind": "requirements", "value": "requirements.txt" },
+        { "kind": "path", "value": "." }
+      ],
+      "externalPythonCandidates": [
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [
+        ".venv\\Scripts\\invokeai-web.exe",
+        "venv\\Scripts\\invokeai-web.exe",
+        "invokeai-web.exe",
+        "invokeai.exe"
+      ],
+      "externalBatchCandidates": [],
+      "compatibility": {
+        "minimumVramMb": 6144,
+        "recommendedVramMb": 8192,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python -m invokeai.app.run_app --host 127.0.0.1 --port {port}",
+    "externalLaunchCommand": "invokeai-web.exe --host 127.0.0.1 --port {port}",
+    "defaultPort": 9090,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "PATH:invokeai-web.exe",
+      "PATH:invokeai.exe",
+      "%USERPROFILE%\\InvokeAI\\invokeai-web.exe",
+      "%USERPROFILE%\\InvokeAI\\pyproject.toml",
+      "%LOCALAPPDATA%\\InvokeAI\\pyproject.toml",
+      "%APPDATA%\\InvokeAI\\pyproject.toml"
+    ]
+  }
+]

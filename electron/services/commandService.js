@@ -1,0 +1,152 @@
+const { spawn } = require('child_process');
+
+const PYTHON_METADATA_SNIPPET =
+  'import json, platform, sys; print(json.dumps({"executable": sys.executable, "version": list(sys.version_info[:3]), "versionString": platform.python_version()}))';
+
+function firstNonEmptyLine(value) {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+}
+
+function compareVersions(left = [], right = []) {
+  for (let index = 0; index < Math.max(left.length, right.length, 3); index += 1) {
+    const leftPart = left[index] || 0;
+    const rightPart = right[index] || 0;
+
+    if (leftPart > rightPart) {
+      return 1;
+    }
+
+    if (leftPart < rightPart) {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+function formatVersion(version) {
+  if (Array.isArray(version)) {
+    return version.join('.');
+  }
+
+  return String(version || 'unknown');
+}
+
+function runCommand(command, args = [], options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      env: {
+        ...process.env,
+        ...(options.env || {}),
+      },
+      windowsHide: true,
+      shell: Boolean(options.shell),
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on('error', (error) => {
+      reject(error);
+    });
+
+    child.on('close', (code) => {
+      if (code === 0 || options.allowFailure) {
+        resolve({ code, stdout, stderr });
+        return;
+      }
+
+      const failure = new Error(options.errorMessage || firstNonEmptyLine(stderr) || `${command} failed.`);
+      failure.code = code;
+      failure.stdout = stdout;
+      failure.stderr = stderr;
+      reject(failure);
+    });
+  });
+}
+
+function parsePythonMetadata(stdout) {
+  const lastLine = String(stdout || '')
+    .trim()
+    .split(/\r?\n/)
+    .reverse()
+    .find(Boolean);
+
+  if (!lastLine) {
+    throw new Error('NestAI could not read the Python version.');
+  }
+
+  const metadata = JSON.parse(lastLine);
+  return {
+    executable: metadata.executable,
+    version: metadata.version,
+    versionString: metadata.versionString || formatVersion(metadata.version),
+  };
+}
+
+async function probePython(launcher, launcherArgs = []) {
+  const result = await runCommand(launcher, [...launcherArgs, '-c', PYTHON_METADATA_SNIPPET]);
+  const metadata = parsePythonMetadata(result.stdout);
+  return {
+    launcher,
+    launcherArgs,
+    executable: metadata.executable,
+    version: metadata.version,
+    versionString: metadata.versionString,
+  };
+}
+
+async function inspectPythonCommand() {
+  try {
+    return await probePython('py', ['-3']);
+  } catch {
+    try {
+      return await probePython('python', []);
+    } catch {
+      throw new Error('Python 3 was not found. Install a compatible Python version, then try again.');
+    }
+  }
+}
+
+async function inspectPythonExecutable(executablePath) {
+  const result = await runCommand(executablePath, ['-c', PYTHON_METADATA_SNIPPET], {
+    errorMessage: 'NestAI could not inspect the managed Python runtime.',
+  });
+  return parsePythonMetadata(result.stdout);
+}
+
+async function resolvePythonCommand() {
+  return inspectPythonCommand();
+}
+
+async function killProcessTree(pid) {
+  if (!pid) {
+    return;
+  }
+
+  await runCommand('taskkill', ['/pid', String(pid), '/t', '/f'], {
+    allowFailure: true,
+  });
+}
+
+module.exports = {
+  compareVersions,
+  formatVersion,
+  inspectPythonCommand,
+  inspectPythonExecutable,
+  killProcessTree,
+  resolvePythonCommand,
+  runCommand,
+};
