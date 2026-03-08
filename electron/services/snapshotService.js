@@ -42,7 +42,7 @@ async function archiveEntryIfPresent(archive, absolutePath, name) {
 
 async function saveSnapshot(toolState) {
   if (!toolState) {
-    throw new Error('NestAI could not find that installed tool.');
+    throw new Error('Local AI Hub could not find that installed tool.');
   }
 
   const snapshotDir = path.join(getAppPaths().snapshotsRoot, toolState.id);
@@ -83,7 +83,7 @@ async function restoreSnapshot(toolState, snapshotFileName) {
   const snapshotDir = path.join(getAppPaths().snapshotsRoot, toolState.id);
   const snapshotPath = path.join(snapshotDir, snapshotFileName);
   if (!(await fs.pathExists(snapshotPath))) {
-    throw new Error('NestAI could not find that snapshot file.');
+    throw new Error('Local AI Hub could not find that snapshot file.');
   }
 
   const restoreTemp = path.join(snapshotDir, '__restore');

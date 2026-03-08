@@ -91,10 +91,10 @@ function findLastMeaningfulLine(stderrText) {
 function summarizeUnknownFailure(toolState, stderrText) {
   const lastLine = findLastMeaningfulLine(stderrText);
   if (!lastLine) {
-    return `${toolState.name} stopped before it finished starting. NestAI could not match the error automatically. Open the logs folder for the full details.`;
+    return `${toolState.name} stopped before it finished starting. Local AI Hub could not match the error automatically. Open the logs folder for the full details.`;
   }
 
-  return `${toolState.name} stopped before it finished starting. NestAI could not match the error automatically. The tool reported: ${lastLine}. Open the logs folder for the full details.`;
+  return `${toolState.name} stopped before it finished starting. Local AI Hub could not match the error automatically. The tool reported: ${lastLine}. Open the logs folder for the full details.`;
 }
 
 function diagnoseLaunchFailure(toolState, stderrText, hardware) {
@@ -108,7 +108,7 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       id: 'torch-cpu-build',
       action: 'repair-pytorch-cuda',
       summary: `${toolState.name} is using a CPU-only PyTorch build instead of an NVIDIA CUDA build.`,
-      repairingMessage: `NestAI found a CPU-only PyTorch build and is reinstalling the NVIDIA build for ${gpuModel}.`,
+      repairingMessage: `Local AI Hub found a CPU-only PyTorch build and is reinstalling the NVIDIA build for ${gpuModel}.`,
     };
   }
 
@@ -120,7 +120,7 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       summary: hardware?.nvidiaSmiAvailable
         ? `${toolState.name} could not use the NVIDIA driver from inside its Python environment.`
         : `${toolState.name} could not find an NVIDIA driver on this PC.`,
-      repairingMessage: `NestAI is reinstalling PyTorch for the NVIDIA driver it detected on this machine.`,
+      repairingMessage: `Local AI Hub is reinstalling PyTorch for the NVIDIA driver it detected on this machine.`,
     };
   }
 
@@ -130,7 +130,7 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       id: 'missing-torch',
       action: 'repair-pytorch-cuda',
       summary: `${toolState.name} is missing PyTorch in its Python environment.`,
-      repairingMessage: `NestAI is reinstalling PyTorch with the correct CUDA build for ${gpuModel}.`,
+      repairingMessage: `Local AI Hub is reinstalling PyTorch with the correct CUDA build for ${gpuModel}.`,
     };
   }
 
@@ -140,7 +140,7 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       id: 'torch-dll-mismatch',
       action: 'repair-pytorch-cuda',
       summary: `${toolState.name} has a broken PyTorch CUDA runtime in its Python environment.`,
-      repairingMessage: `NestAI is reinstalling PyTorch and CUDA support for ${gpuModel}.`,
+      repairingMessage: `Local AI Hub is reinstalling PyTorch and CUDA support for ${gpuModel}.`,
     };
   }
 
@@ -151,7 +151,7 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       id: 'missing-python-module',
       action: 'repair-python-environment',
       summary: `${toolState.name} is missing the Python package "${missingModule[1]}".`,
-      repairingMessage: `NestAI is rebuilding ${toolState.name}'s Python environment automatically.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment automatically.`,
     };
   }
 
@@ -230,7 +230,7 @@ async function reinstallPyTorchBuild(toolState, build, logger) {
     ],
     {
       cwd: toolState.appDir,
-      errorMessage: `NestAI could not reinstall PyTorch with ${build.label}.`,
+      errorMessage: `Local AI Hub could not reinstall PyTorch with ${build.label}.`,
     },
   );
 
@@ -256,7 +256,7 @@ async function verifyPyTorchBuild(toolState, build, logger) {
 
   const result = await runCommand(pythonPath, ['-c', verificationSnippet], {
     cwd: toolState.appDir,
-    errorMessage: 'NestAI could not verify the PyTorch runtime after reinstalling it.',
+    errorMessage: 'Local AI Hub could not verify the PyTorch runtime after reinstalling it.',
   });
 
   const payload = String(result.stdout || '')
@@ -267,7 +267,7 @@ async function verifyPyTorchBuild(toolState, build, logger) {
     .find((line) => line.startsWith('{'));
 
   if (!payload) {
-    throw new Error('NestAI could not read the PyTorch verification result.');
+    throw new Error('Local AI Hub could not read the PyTorch verification result.');
   }
 
   const verification = JSON.parse(payload);
@@ -282,7 +282,7 @@ async function verifyPyTorchBuild(toolState, build, logger) {
 async function repairPyTorchCuda(toolState, logger, hardware) {
   const candidates = selectPyTorchRepairCandidates(hardware);
   if (candidates.length === 0) {
-    throw new Error('NestAI could not match this PC to a supported NVIDIA PyTorch CUDA build from pytorch.org.');
+    throw new Error('Local AI Hub could not match this PC to a supported NVIDIA PyTorch CUDA build from pytorch.org.');
   }
 
   let lastError = null;
@@ -295,7 +295,7 @@ async function repairPyTorchCuda(toolState, logger, hardware) {
       await reinstallPyTorchBuild(toolState, build, logger);
       const verification = await verifyPyTorchBuild(toolState, build, logger);
       return {
-        repairMessage: `NestAI reinstalled PyTorch with ${build.label} for ${hardware.gpuModel}.`,
+        repairMessage: `Local AI Hub reinstalled PyTorch with ${build.label} for ${hardware.gpuModel}.`,
         verification,
       };
     } catch (error) {
@@ -307,7 +307,7 @@ async function repairPyTorchCuda(toolState, logger, hardware) {
     }
   }
 
-  throw lastError || new Error('NestAI could not repair the PyTorch CUDA runtime.');
+  throw lastError || new Error('Local AI Hub could not repair the PyTorch CUDA runtime.');
 }
 
 async function waitForToolReady(toolState) {
@@ -365,7 +365,7 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
       return {
         handled: true,
         recovered: false,
-        userMessage: `${toolState.name} failed to start, but NestAI only applies automatic Python and CUDA repairs to tools it installed itself. Open the logs folder for the full error.`,
+        userMessage: `${toolState.name} failed to start, but Local AI Hub only applies automatic Python and CUDA repairs to tools it installed itself. Open the logs folder for the full error.`,
       };
     }
 
@@ -397,7 +397,7 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
     const refreshedTool = config.tools[toolState.id] || toolState;
     await upsertTool({
       id: toolState.id,
-      lastRepairMessage: `${repairMessage} NestAI is retrying the launch now.`,
+      lastRepairMessage: `${repairMessage} Local AI Hub is retrying the launch now.`,
       lastError: null,
       status: 'stopped',
     });
@@ -441,7 +441,7 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
       userMessage: successMessage,
     };
   } catch (error) {
-    const message = humanizeError(error, `${toolState.name} still could not start after NestAI tried to repair it.`);
+    const message = humanizeError(error, `${toolState.name} still could not start after Local AI Hub tried to repair it.`);
     await logger.error('Automatic launch recovery failed.', {
       error,
       stderr: stderrText,

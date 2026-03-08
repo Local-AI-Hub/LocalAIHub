@@ -1,13 +1,13 @@
 {
-  "name": "nestai",
-  "version": "0.1.0",
+  "name": "local-ai-hub",
+  "version": "0.2.0",
   "description": "Windows desktop manager for local AI tools",
-  "author": "NestAI",
+  "author": "Local AI Hub",
   "private": true,
   "main": "electron/main.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Local-AI-Hub/NestAI.git"
+    "url": "https://github.com/Local-AI-Hub/LocalAIHub.git"
   },
   "scripts": {
     "dev": "concurrently -k \"npm:dev:ui\" \"npm:dev:electron\"",
@@ -40,8 +40,8 @@
     "wait-on": "^8.0.1"
   },
   "build": {
-    "appId": "com.nestai.desktop",
-    "productName": "NestAI",
+    "appId": "com.localaihub.desktop",
+    "productName": "Local AI Hub",
     "asar": true,
     "directories": {
       "output": "release"
@@ -57,7 +57,7 @@
       {
         "provider": "github",
         "owner": "Local-AI-Hub",
-        "repo": "NestAI",
+        "repo": "LocalAIHub",
         "releaseType": "release"
       }
     ],
@@ -66,7 +66,7 @@
       "target": [
         "nsis"
       ],
-      "artifactName": "${productName}-Setup-${version}.${ext}",
+      "artifactName": "LocalAIHub-Setup-${version}.${ext}",
       "icon": "build/icon.ico"
     },
     "nsis": {

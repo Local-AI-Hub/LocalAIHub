@@ -19,7 +19,7 @@ function parseSpecifier(specifier) {
     .map((clause) => {
       const match = clause.match(/^(<=|>=|==|!=|~=|<|>)\s*([0-9][0-9A-Za-z_.-]*)$/);
       if (!match) {
-        throw new Error(`NestAI could not read the Python version rule \"${clause}\".`);
+        throw new Error(`Local AI Hub could not read the Python version rule \"${clause}\".`);
       }
 
       return {
@@ -90,7 +90,7 @@ function describePythonRequirement(requirement) {
 function detectPyprojectRequirement(content, strategy) {
   const match = content.match(/requires-python\s*=\s*["']([^"']+)["']/i);
   if (!match) {
-    throw new Error('NestAI could not find a requires-python entry in the tool metadata.');
+    throw new Error('Local AI Hub could not find a requires-python entry in the tool metadata.');
   }
 
   return {
@@ -103,7 +103,7 @@ function detectPyprojectRequirement(content, strategy) {
 function detectAutomatic1111Requirement(content, strategy) {
   const minorsMatch = content.match(/supported_minors\s*=\s*\[([^\]]+)\]/);
   if (!minorsMatch) {
-    throw new Error('NestAI could not find Automatic1111\'s supported Python minors.');
+    throw new Error('Local AI Hub could not find Automatic1111\'s supported Python minors.');
   }
 
   const supportedMinors = minorsMatch[1]
@@ -112,7 +112,7 @@ function detectAutomatic1111Requirement(content, strategy) {
     .filter((value) => Number.isFinite(value));
 
   if (supportedMinors.length === 0) {
-    throw new Error('NestAI could not read Automatic1111\'s supported Python minors.');
+    throw new Error('Local AI Hub could not read Automatic1111\'s supported Python minors.');
   }
 
   return {
@@ -138,7 +138,7 @@ async function readRequirementFromStrategy(appDir, strategy) {
     return detectAutomatic1111Requirement(content, strategy);
   }
 
-  throw new Error(`NestAI does not know how to inspect the Python rules from ${strategy.file}.`);
+  throw new Error(`Local AI Hub does not know how to inspect the Python rules from ${strategy.file}.`);
 }
 
 async function detectPythonRequirement(appDir, manifest, logger) {
@@ -157,7 +157,7 @@ async function detectPythonRequirement(appDir, manifest, logger) {
   }
 
   throw new Error(
-    `NestAI could not determine which Python version ${manifest.name} needs from its downloaded files.`,
+    `Local AI Hub could not determine which Python version ${manifest.name} needs from its downloaded files.`,
   );
 }
 

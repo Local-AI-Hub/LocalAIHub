@@ -2,11 +2,7 @@ import { formatMemory } from '../lib/formatters';
 
 function NavButton({ active, label, count, onClick }) {
   return (
-    <button
-      className={`sidebar-tab ${active ? 'sidebar-tab-active' : ''}`}
-      onClick={onClick}
-      type="button"
-    >
+    <button className={`sidebar-tab ${active ? 'sidebar-tab-active' : ''}`} onClick={onClick} type="button">
       <span>{label}</span>
       <span className="sidebar-count">{count}</span>
     </button>
@@ -17,6 +13,7 @@ export default function Sidebar({
   activeTab,
   hardware,
   installedCount,
+  modelManagerCount,
   storeCount,
   onChangeTab,
   onOpenLogs,
@@ -31,18 +28,19 @@ export default function Sidebar({
               NA
             </div>
             <div>
-              <p className="text-xs uppercase tracking-[0.28em] text-slate-500">NestAI</p>
+              <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Local AI Hub</p>
               <h1 className="mt-1 text-2xl font-semibold text-white">Steam for local AI</h1>
             </div>
           </div>
           <p className="mt-4 text-sm leading-6 text-slate-300">
-            Keep installs, launches, repair, and snapshots in one Windows-native control center.
+            Keep installs, launches, repair, snapshots, and models in one Windows-native control center.
           </p>
         </div>
 
         <div className="mt-6 space-y-3">
           <NavButton active={activeTab === 'library'} count={installedCount} label="Library" onClick={() => onChangeTab('library')} />
           <NavButton active={activeTab === 'store'} count={storeCount} label="Store" onClick={() => onChangeTab('store')} />
+          <NavButton active={activeTab === 'models'} count={modelManagerCount} label="Model Manager" onClick={() => onChangeTab('models')} />
         </div>
       </div>
 
@@ -60,7 +58,7 @@ export default function Sidebar({
               <p className="mt-2 text-sm font-medium text-white">{formatMemory(hardware?.systemRamMb)}</p>
             </div>
           </div>
-          <p className="mt-4 text-sm leading-6 text-slate-400">{hardware?.compatibilityMessage || 'NestAI is building a local hardware profile.'}</p>
+          <p className="mt-4 text-sm leading-6 text-slate-400">{hardware?.compatibilityMessage || 'Local AI Hub is building a local hardware profile.'}</p>
         </div>
 
         <button className="ghost-button w-full justify-center" disabled={logsBusy} onClick={onOpenLogs} type="button">
@@ -70,3 +68,4 @@ export default function Sidebar({
     </aside>
   );
 }
+

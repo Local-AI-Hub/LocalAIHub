@@ -44,12 +44,12 @@ async function fetchWithTimeout(url, logger) {
     return await fetch(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'NestAI/0.1.0',
+        'User-Agent': 'LocalAIHub/0.2.0',
       },
     });
   } catch (error) {
     if (error.name === 'AbortError') {
-      throw new Error('NestAI could not reach the download server. Check your internet connection and try again.');
+      throw new Error('Local AI Hub could not reach the download server. Check your internet connection and try again.');
     }
 
     throw error;
@@ -95,7 +95,7 @@ async function downloadFile(url, destination, onProgress, logger, toolId) {
 
   const response = await fetchWithTimeout(url, logger);
   if (!response.ok || !response.body) {
-    throw new Error('NestAI could not download the installer package.');
+    throw new Error('Local AI Hub could not download the installer package.');
   }
 
   await fs.ensureDir(path.dirname(destination));
@@ -240,7 +240,7 @@ async function extractArchiveWithRecovery(manifest, archivePath, targetDirectory
         archivePath,
         error: retryError,
       });
-      throw new Error('NestAI could not unpack the installer package. The cached download was replaced, so try Install again.');
+      throw new Error('Local AI Hub could not unpack the installer package. The cached download was replaced, so try Install again.');
     }
   }
 }
@@ -267,12 +267,12 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
   if (python.pythonPath) {
     await runCommand(python.pythonPath, ['-m', 'venv', toolState.venvDir], {
       cwd: toolState.appDir,
-      errorMessage: 'NestAI could not create the Python virtual environment.',
+      errorMessage: 'Local AI Hub could not create the Python virtual environment.',
     });
   } else {
     await runCommand(python.launcher, [...python.launcherArgs, '-m', 'venv', toolState.venvDir], {
       cwd: toolState.appDir,
-      errorMessage: 'NestAI could not create the Python virtual environment.',
+      errorMessage: 'Local AI Hub could not create the Python virtual environment.',
     });
   }
 
@@ -289,7 +289,7 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
 
   await runCommand(pythonPath, ['-m', 'pip', 'install', '--upgrade', 'pip'], {
     cwd: toolState.appDir,
-    errorMessage: 'NestAI could not update pip in the tool environment.',
+    errorMessage: 'Local AI Hub could not update pip in the tool environment.',
   });
 
   await logger.info('pip was upgraded inside the tool environment.', {
@@ -334,7 +334,7 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
 
     await runCommand(pythonPath, args, {
       cwd: toolState.appDir,
-      errorMessage: `NestAI could not install ${manifest.name} dependencies.`,
+      errorMessage: `Local AI Hub could not install ${manifest.name} dependencies.`,
     });
 
     await logger.info('Dependency installation step finished.', {
@@ -384,7 +384,7 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
     category: manifest.category,
     type: getToolRuntime(manifest),
     source: 'managed',
-    managedByNestAI: true,
+    managedByLocalAIHub: true,
     installDir,
     appDir,
     venvDir: getToolRuntime(manifest) === 'python' ? venvDir : null,
@@ -417,7 +417,7 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
 async function installTool(toolId, options = {}) {
   const manifest = getToolManifest(toolId);
   if (!manifest) {
-    throw new Error('NestAI does not recognize that tool.');
+    throw new Error('Local AI Hub does not recognize that tool.');
   }
 
   const logger = createLogger('installer', {
@@ -506,7 +506,7 @@ async function installTool(toolId, options = {}) {
       toolId,
       percent: 98,
       stage: 'finalizing',
-      message: `${manifest.name} is being registered in NestAI.`,
+      message: `${manifest.name} is being registered in Local AI Hub.`,
     });
 
     await upsertTool(toolState);
@@ -527,7 +527,7 @@ async function installTool(toolId, options = {}) {
   } catch (error) {
     await logger.error('Install failed.', {
       error,
-      readableMessage: humanizeError(error, `NestAI could not install ${manifest.name}.`),
+      readableMessage: humanizeError(error, `Local AI Hub could not install ${manifest.name}.`),
     });
     throw error;
   }
@@ -556,7 +556,7 @@ async function removePythonCaches(directory) {
 async function repairToolInstallation(toolState, options = {}) {
   const manifest = getToolManifest(toolState.id);
   if (!manifest) {
-    throw new Error('NestAI could not find the tool definition for repair.');
+    throw new Error('Local AI Hub could not find the tool definition for repair.');
   }
 
   const logger = createLogger('installer', {
@@ -567,7 +567,7 @@ async function repairToolInstallation(toolState, options = {}) {
 
   try {
     if (!toolState.downloadCachePath || !(await fs.pathExists(toolState.downloadCachePath))) {
-      throw new Error('NestAI could not find the cached installer files. Reinstall the tool instead.');
+      throw new Error('Local AI Hub could not find the cached installer files. Reinstall the tool instead.');
     }
 
     await logger.info('Repair requested.', {
@@ -638,9 +638,9 @@ async function repairToolInstallation(toolState, options = {}) {
     const updatedState = {
       ...toolState,
       source: 'managed',
-      managedByNestAI: true,
+      managedByLocalAIHub: true,
       lastError: null,
-      lastRepairMessage: `NestAI repaired ${manifest.name}: ${repairNotes.join(', ')}.`,
+      lastRepairMessage: `Local AI Hub repaired ${manifest.name}: ${repairNotes.join(', ')}.`,
       status: 'stopped',
     };
 
@@ -661,7 +661,7 @@ async function repairToolInstallation(toolState, options = {}) {
   } catch (error) {
     await logger.error('Repair failed.', {
       error,
-      readableMessage: humanizeError(error, `NestAI could not repair ${manifest.name}.`),
+      readableMessage: humanizeError(error, `Local AI Hub could not repair ${manifest.name}.`),
     });
     throw error;
   }

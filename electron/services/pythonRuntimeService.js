@@ -55,7 +55,7 @@ function selectManagedRuntime(requirement) {
   const compatible = PYTHON_RUNTIME_CATALOG.filter((runtime) => isCompatibleRuntime(runtime, requirement));
   if (compatible.length === 0) {
     throw new Error(
-      `NestAI could not find a managed Python runtime that matches ${requirementToLabel(requirement)}.`,
+      `Local AI Hub could not find a managed Python runtime that matches ${requirementToLabel(requirement)}.`,
     );
   }
 
@@ -74,12 +74,12 @@ async function fetchWithTimeout(url, logger) {
     return await fetch(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'NestAI/0.1.0',
+        'User-Agent': 'LocalAIHub/0.2.0',
       },
     });
   } catch (error) {
     if (error.name === 'AbortError') {
-      throw new Error('NestAI could not reach python.org to download the required runtime.');
+      throw new Error('Local AI Hub could not reach python.org to download the required runtime.');
     }
 
     throw error;
@@ -122,7 +122,7 @@ async function downloadPythonInstaller(runtime, installerPath, logger, onProgres
 
   const response = await fetchWithTimeout(runtime.installerUrl, logger);
   if (!response.ok || !response.body) {
-    throw new Error('NestAI could not download the required Python runtime from python.org.');
+    throw new Error('Local AI Hub could not download the required Python runtime from python.org.');
   }
 
   await fs.ensureDir(path.dirname(installerPath));
@@ -217,7 +217,7 @@ async function verifyManagedRuntime(runtime, installDir, logger) {
       pythonPath,
     };
   } catch (error) {
-    await logger.warn('Managed Python runtime inspection failed. NestAI will reinstall it.', {
+    await logger.warn('Managed Python runtime inspection failed. Local AI Hub will reinstall it.', {
       installDir,
       error,
     });
@@ -230,7 +230,7 @@ async function installManagedRuntime(runtime, installDir, installerPath, logger,
     toolId,
     percent: 61,
     stage: 'runtime',
-    message: `Installing Python ${runtime.versionString} into NestAI.`,
+    message: `Installing Python ${runtime.versionString} into Local AI Hub.`,
   }, {
     installDir,
     installerPath,
@@ -255,12 +255,12 @@ async function installManagedRuntime(runtime, installDir, installerPath, logger,
   ];
 
   await runCommand(installerPath, args, {
-    errorMessage: 'NestAI could not install the required Python runtime.',
+    errorMessage: 'Local AI Hub could not install the required Python runtime.',
   });
 
   const verified = await verifyManagedRuntime(runtime, installDir, logger);
   if (!verified) {
-    throw new Error('NestAI installed Python, but the managed runtime did not pass verification.');
+    throw new Error('Local AI Hub installed Python, but the managed runtime did not pass verification.');
   }
 
   await logger.info('Managed Python runtime installation completed.', {
@@ -295,7 +295,7 @@ async function ensureManagedPythonRuntime(requirement, options) {
       toolId: options.toolId,
       percent: 64,
       stage: 'runtime',
-      message: `Using NestAI-managed Python ${runtime.versionString}.`,
+      message: `Using Local AI Hub-managed Python ${runtime.versionString}.`,
     });
     return existing;
   }

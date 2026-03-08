@@ -50,7 +50,7 @@ export default function LibraryCard({
             <div className="mt-5 grid gap-3 md:grid-cols-3">
               <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Install source</p>
-                <p className="mt-2 text-sm font-medium text-white">{tool.source === 'managed' ? 'NestAI managed' : 'Detected on this PC'}</p>
+                <p className="mt-2 text-sm font-medium text-white">{tool.source === 'managed' ? 'Local AI Hub managed' : 'Detected on this PC'}</p>
               </div>
               <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Current VRAM load</p>
@@ -162,7 +162,7 @@ export default function LibraryCard({
                 <p className="text-sm leading-6 text-slate-400">
                   {canSnapshot
                     ? 'No snapshots saved for this tool yet.'
-                    : 'Snapshots and automated repair are only available for NestAI-managed installs.'}
+                    : 'Snapshots and automated repair are only available for Local AI Hub-managed installs.'}
                 </p>
               )}
             </div>

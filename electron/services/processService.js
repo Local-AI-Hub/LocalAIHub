@@ -293,7 +293,7 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
   let message = recoveryResult?.userMessage;
   if (!message && launchState.successMarkerSeen) {
     const target = toolState.launchUrl || `http://127.0.0.1:${toolState.defaultPort}`;
-    message = `${toolState.name} reported ${target}, but NestAI could not keep it reachable after the launch process exited. Open the logs folder for the full launch output.`;
+    message = `${toolState.name} reported ${target}, but Local AI Hub could not keep it reachable after the launch process exited. Open the logs folder for the full launch output.`;
   }
 
   if (!message) {
@@ -340,7 +340,7 @@ async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}
 
   const helperScript = getHelperScriptPath();
   if (!(await fs.pathExists(helperScript))) {
-    throw new Error('NestAI is missing its Python launcher helper. Reinstall the app to restore it.');
+    throw new Error('Local AI Hub is missing its Python launcher helper. Reinstall the app to restore it.');
   }
 
   const shellInstance = new PythonShell(path.basename(helperScript), {
@@ -436,7 +436,7 @@ async function resolveToolStatus(toolState) {
 
 async function launchTool(toolState, options = {}) {
   if (!toolState) {
-    throw new Error('NestAI could not find that tool in its installed list.');
+    throw new Error('Local AI Hub could not find that tool in its installed list.');
   }
 
   const runtime = runtimes.get(toolState.id);
@@ -485,7 +485,7 @@ async function launchTool(toolState, options = {}) {
     } else if (launchProfile.kind === 'batch') {
       await launchBatchProfile(toolState, launchProfile, options);
     } else {
-      throw new Error(`NestAI does not know how to launch ${toolState.name}.`);
+      throw new Error(`Local AI Hub does not know how to launch ${toolState.name}.`);
     }
 
     await upsertTool({
@@ -554,7 +554,7 @@ async function stopTool(toolState) {
 
   if (await probeUrl(toolState.healthUrl || toolState.launchUrl)) {
     throw new Error(
-      `NestAI cannot safely stop ${toolState.name} because it did not start this process itself. Close it from its own window or service manager.`,
+      `Local AI Hub cannot safely stop ${toolState.name} because it did not start this process itself. Close it from its own window or service manager.`,
     );
   }
 

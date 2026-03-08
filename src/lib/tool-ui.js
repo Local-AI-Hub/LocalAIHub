@@ -6,7 +6,7 @@ export function evaluateCompatibility(manifest, hardware) {
     return {
       label: 'Hardware unknown',
       tone: 'neutral',
-      message: 'NestAI has not finished reading this machine yet.',
+      message: 'Local AI Hub has not finished reading this machine yet.',
     };
   }
 
@@ -37,7 +37,7 @@ export function evaluateCompatibility(manifest, hardware) {
     return {
       label: 'Limited',
       tone: 'warn',
-      message: 'NestAI can install it, but you will need conservative settings.',
+      message: 'Local AI Hub can install it, but you will need conservative settings.',
     };
   }
 

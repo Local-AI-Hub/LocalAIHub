@@ -63,7 +63,7 @@ export default function ToolCard({
                   : 'border-accent/40 bg-accent/10 text-accent'
               }`}
             >
-              {tool.source === 'managed' ? 'NestAI install' : 'System install'}
+              {tool.source === 'managed' ? 'Local AI Hub install' : 'System install'}
             </span>
           </div>
           <p className="mt-3 text-sm text-slate-400">
@@ -164,7 +164,7 @@ export default function ToolCard({
         </div>
       ) : (
         <div className="mt-6 rounded-2xl border border-white/10 bg-slate-950/25 p-4 text-sm leading-6 text-slate-300">
-          NestAI detected this tool on your system and can launch it, but snapshots and automated repair are only available for tools installed inside NestAI.
+          Local AI Hub detected this tool on your system and can launch it, but snapshots and automated repair are only available for tools installed inside Local AI Hub.
         </div>
       )}
     </article>

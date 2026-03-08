@@ -85,7 +85,7 @@ function parsePythonMetadata(stdout) {
     .find(Boolean);
 
   if (!lastLine) {
-    throw new Error('NestAI could not read the Python version.');
+    throw new Error('Local AI Hub could not read the Python version.');
   }
 
   const metadata = JSON.parse(lastLine);
@@ -122,7 +122,7 @@ async function inspectPythonCommand() {
 
 async function inspectPythonExecutable(executablePath) {
   const result = await runCommand(executablePath, ['-c', PYTHON_METADATA_SNIPPET], {
-    errorMessage: 'NestAI could not inspect the managed Python runtime.',
+    errorMessage: 'Local AI Hub could not inspect the managed Python runtime.',
   });
   return parsePythonMetadata(result.stdout);
 }

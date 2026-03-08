@@ -11,7 +11,7 @@ export default function HardwareGate({ hardware, onContinue, busy }) {
                 First launch check
               </span>
               <h1 className="text-4xl font-semibold tracking-tight text-white">
-                NestAI inspected this machine before installing anything.
+                Local AI Hub inspected this machine before installing anything.
               </h1>
               <p className="max-w-2xl text-base leading-7 text-slate-300">
                 The app stores this hardware profile locally in your AppData folder so future sessions can make safer recommendations.

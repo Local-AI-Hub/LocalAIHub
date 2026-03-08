@@ -53,10 +53,10 @@ function buildCompatibilityMessage(gpuModel, vramMb, systemRamMb) {
   }
 
   if (ramGb < 16) {
-    return 'Your system is below the recommended GPU and RAM range. NestAI can still help, but expect CPU-only fallbacks and slower setup steps.';
+    return 'Your system is below the recommended GPU and RAM range. Local AI Hub can still help, but expect CPU-only fallbacks and slower setup steps.';
   }
 
-  return `Your ${gpuModel} is below the recommended GPU range. NestAI can still manage the tools, but most workloads will need conservative settings.`;
+  return `Your ${gpuModel} is below the recommended GPU range. Local AI Hub can still manage the tools, but most workloads will need conservative settings.`;
 }
 
 function parseNvidiaQueryLine(line) {
@@ -115,7 +115,7 @@ async function getNvidiaRuntimeDetails() {
 function buildHardwareSnapshot(gpu, memory, nvidia) {
   const fallbackGpuModel = nvidia?.gpuModel || 'Unknown GPU';
   const fallbackVendor = nvidia?.gpuVendor || 'Unknown vendor';
-  const vramMb = normalizeMb(gpu?.vram || gpu?.memoryTotal) || nvidia?.vramMb || 0;
+  const vramMb = nvidia?.vramMb || normalizeMb(gpu?.vram || gpu?.memoryTotal);
   const systemRamMb = Math.round((memory.total || 0) / 1024 / 1024);
   const gpuModel = gpu?.model || fallbackGpuModel;
   const gpuVendor = gpu?.vendor || fallbackVendor;
@@ -133,6 +133,28 @@ function buildHardwareSnapshot(gpu, memory, nvidia) {
   };
 }
 
+function resolveControllerVramTotal(gpu, nvidia) {
+  return nvidia?.vramMb || normalizeMb(gpu?.vram || gpu?.memoryTotal);
+}
+
+function resolveControllerVramUsed(gpu, vramTotalMb) {
+  const memoryUsed = Number(gpu?.memoryUsed);
+  if (Number.isFinite(memoryUsed) && memoryUsed >= 0) {
+    return normalizeMb(memoryUsed);
+  }
+
+  const utilizationMemory = Number(gpu?.utilizationMemory);
+  if (Number.isFinite(utilizationMemory) && utilizationMemory >= 0) {
+    if (utilizationMemory <= 100 && vramTotalMb > 0) {
+      return Math.min(vramTotalMb, Math.round((utilizationMemory / 100) * vramTotalMb));
+    }
+
+    return normalizeMb(utilizationMemory);
+  }
+
+  return null;
+}
+
 async function detectHardwareSnapshot() {
   const [graphics, memory, nvidia] = await Promise.all([si.graphics(), si.mem(), getNvidiaRuntimeDetails()]);
   const gpu = pickPrimaryGpu(graphics.controllers);
@@ -142,19 +164,19 @@ async function detectHardwareSnapshot() {
 async function getLiveResourceUsage() {
   const [graphics, memory, nvidia] = await Promise.all([si.graphics(), si.mem(), getNvidiaRuntimeDetails()]);
   const gpu = pickPrimaryGpu(graphics.controllers);
-  const vramTotalMb = normalizeMb(gpu.vram || gpu.memoryTotal) || nvidia?.vramMb || 0;
-  const rawUsed = gpu.memoryUsed || gpu.utilizationMemory || 0;
-  const vramUsedMb =
-    Number.isFinite(rawUsed) && rawUsed > 0
-      ? normalizeMb(rawUsed > 100 && rawUsed < 1000 ? rawUsed * 1024 : rawUsed)
-      : nvidia?.vramUsedMb || null;
+  const vramTotalMb = resolveControllerVramTotal(gpu, nvidia);
+  const controllerVramUsedMb = resolveControllerVramUsed(gpu, vramTotalMb);
+  const vramUsedMb = Number.isFinite(nvidia?.vramUsedMb)
+    ? nvidia.vramUsedMb
+    : controllerVramUsedMb;
 
   return {
     gpuName: gpu.model || nvidia?.gpuModel || 'Unknown GPU',
     ramUsedMb: Math.round((memory.active || memory.used || 0) / 1024 / 1024),
     ramTotalMb: Math.round((memory.total || 0) / 1024 / 1024),
-    vramUsedMb,
+    vramUsedMb: Number.isFinite(vramUsedMb) ? vramUsedMb : null,
     vramTotalMb,
+    vramSource: Number.isFinite(nvidia?.vramUsedMb) ? 'nvidia-smi' : controllerVramUsedMb !== null ? 'systeminformation' : 'unknown',
     nvidiaDriverVersion: nvidia?.nvidiaDriverVersion || null,
     nvidiaCudaVersion: nvidia?.nvidiaCudaVersion || null,
   };

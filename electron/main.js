@@ -18,11 +18,26 @@ const {
   readConfig,
   saveHardwareDetection,
 } = require('./services/configService');
+const {
+  browseRemoteModels,
+  deleteModel,
+  downloadModel,
+  listDownloadedModels,
+  readModelSettings,
+  saveModelManagerSettings,
+  supportsModelManager,
+} = require('./services/modelService');
 const { invalidateDiscoveryCache, syncDiscoveredTools } = require('./services/toolDiscoveryService');
 const { detectHardwareSnapshot, getLiveResourceUsage } = require('./services/hardwareService');
 const { installTool, repairToolInstallation } = require('./services/installerService');
 const { listOllamaModels, chatWithOllama } = require('./services/ollamaService');
-const { launchTool, stopTool, disposeAllRuntimes, resolveToolStatus } = require('./services/processService');
+const {
+  disposeAllRuntimes,
+  isToolActive,
+  launchTool,
+  stopTool,
+  resolveToolStatus,
+} = require('./services/processService');
 const { listSnapshots, restoreSnapshot, saveSnapshot } = require('./services/snapshotService');
 const { getToolCatalog, getToolManifest, initializeToolRegistry } = require('./services/toolRegistry');
 const { configureAutoUpdates, restartToInstallUpdate } = require('./services/updateService');
@@ -51,7 +66,7 @@ function createTrayIcon() {
 
 function getStopMessage(tool) {
   if (tool?.interfaceMode === 'external-browser' && tool?.launchUrl) {
-    return `${tool.name} stopped — you can close the browser tab.`;
+    return `${tool.name} stopped. You can close the browser tab.`;
   }
 
   return `${tool?.name || 'The tool'} was stopped.`;
@@ -59,9 +74,9 @@ function getStopMessage(tool) {
 
 function sendUpdateReadyNotification() {
   mainWindow?.webContents.send('app:update-ready', {
-    message: 'An update is ready. Restart NestAI to install.',
+    message: 'An update is ready. Restart Local AI Hub to install.',
   });
-  notify('NestAI update ready', 'An update is ready. Restart NestAI to install.').catch(() => null);
+  notify('Local AI Hub update ready', 'An update is ready. Restart Local AI Hub to install.').catch(() => null);
 }
 
 function openInternalToolInterface(tool) {
@@ -78,11 +93,12 @@ function openInternalToolInterface(tool) {
 
 async function maybeNotifyStoppedTool(tool) {
   if (tool?.interfaceMode === 'external-browser' && tool?.launchUrl) {
-    await notify('NestAI', getStopMessage(tool));
+    await notify('Local AI Hub', getStopMessage(tool));
   }
 }
 
 async function buildAppState(options = {}) {
+  await initializeToolRegistry({ refreshRemote: Boolean(options.refreshManifest) });
   await syncDiscoveredTools({ force: Boolean(options.forceDiscovery) });
 
   const config = await readConfig();
@@ -163,7 +179,7 @@ async function updateTrayMenu() {
       : [{ label: 'No tools installed yet', enabled: false }];
 
   const menu = Menu.buildFromTemplate([
-    { label: 'Open NestAI', click: showWindow },
+    { label: 'Open Local AI Hub', click: showWindow },
     { type: 'separator' },
     ...toolItems,
     { type: 'separator' },
@@ -176,7 +192,7 @@ async function updateTrayMenu() {
     },
   ]);
 
-  tray.setToolTip('NestAI');
+  tray.setToolTip('Local AI Hub');
   tray.setContextMenu(menu);
 }
 
@@ -233,10 +249,22 @@ function sendInstallProgress(payload) {
   mainWindow?.webContents.send('tools:install-progress', payload);
 }
 
+function sendModelProgress(payload) {
+  mainWindow?.webContents.send('models:download-progress', payload);
+}
+
 function toolLookup(toolId, tools) {
   const tool = tools.find((item) => item.id === toolId);
   if (!tool) {
-    throw new Error('NestAI could not find that installed tool.');
+    throw new Error('Local AI Hub could not find that installed tool.');
+  }
+  return tool;
+}
+
+function modelToolLookup(toolId, tools) {
+  const tool = toolLookup(toolId, tools);
+  if (!supportsModelManager(tool)) {
+    throw new Error(`${tool.name} does not support the Model Manager yet.`);
   }
   return tool;
 }
@@ -254,20 +282,35 @@ async function withPlainEnglishErrors(handler, fallbackMessage) {
   }
 }
 
+async function ensureOllamaReadyForModels(tool) {
+  if (tool?.id !== 'ollama') {
+    return tool;
+  }
+
+  if (!(await isToolActive(tool))) {
+    await launchTool(tool, {
+      skipOpenInterface: true,
+    });
+  }
+
+  const state = await buildAppState();
+  return modelToolLookup('ollama', state.tools);
+}
+
 function registerIpcHandlers() {
   ipcMain.handle('app:bootstrap', () =>
-    withPlainEnglishErrors(() => buildAppState({ forceDiscovery: true }), 'NestAI could not load the app state.'),
+    withPlainEnglishErrors(() => buildAppState({ forceDiscovery: true, refreshManifest: true }), 'Local AI Hub could not load the app state.'),
   );
 
   ipcMain.handle('app:refresh', () =>
-    withPlainEnglishErrors(buildAppState, 'NestAI could not refresh the dashboard.'),
+    withPlainEnglishErrors(buildAppState, 'Local AI Hub could not refresh the dashboard.'),
   );
 
   ipcMain.handle('app:complete-first-launch', () =>
     withPlainEnglishErrors(async () => {
       await markFirstLaunchComplete();
       return buildAppState();
-    }, 'NestAI could not save the first-launch state.'),
+    }, 'Local AI Hub could not save the first-launch state.'),
   );
 
   ipcMain.handle('app:open-logs-folder', () =>
@@ -275,9 +318,22 @@ function registerIpcHandlers() {
       const { logsRoot } = await ensureStorage();
       await shell.openPath(logsRoot);
       return {
-        message: 'NestAI logs folder is open.',
+        message: 'Local AI Hub logs folder is open.',
       };
-    }, 'NestAI could not open the logs folder.'),
+    }, 'Local AI Hub could not open the logs folder.'),
+  );
+
+  ipcMain.handle('app:restart-to-update', () =>
+    withPlainEnglishErrors(async () => {
+      const restarting = restartToInstallUpdate();
+      if (!restarting) {
+        throw new Error('Local AI Hub does not have a downloaded update ready yet.');
+      }
+
+      return {
+        message: 'Local AI Hub is restarting to install the update.',
+      };
+    }, 'Local AI Hub could not restart to install the update.'),
   );
 
   ipcMain.handle('tools:install', (_event, toolId) =>
@@ -290,7 +346,7 @@ function registerIpcHandlers() {
         message: `${tool.name} was installed successfully.`,
         state: await buildAppState({ forceDiscovery: true }),
       };
-    }, 'NestAI could not install that tool.'),
+    }, 'Local AI Hub could not install that tool.'),
   );
 
   ipcMain.handle('tools:launch', (_event, toolId) =>
@@ -311,11 +367,11 @@ function registerIpcHandlers() {
       return {
         message:
           nextTool.interfaceMode === 'embedded-chat'
-            ? `${nextTool.name} is starting. NestAI opened its chat view.`
+            ? `${nextTool.name} is starting. Local AI Hub opened its chat view.`
             : `${nextTool.name} is starting.`,
         state: nextState,
       };
-    }, 'NestAI could not start that tool.'),
+    }, 'Local AI Hub could not start that tool.'),
   );
 
   ipcMain.handle('tools:stop', (_event, toolId) =>
@@ -328,7 +384,7 @@ function registerIpcHandlers() {
         message: getStopMessage(tool),
         state: await buildAppState(),
       };
-    }, 'NestAI could not stop that tool.'),
+    }, 'Local AI Hub could not stop that tool.'),
   );
 
   ipcMain.handle('tools:repair', (_event, toolId) =>
@@ -343,7 +399,7 @@ function registerIpcHandlers() {
         message: repairedTool.lastRepairMessage,
         state: await buildAppState({ forceDiscovery: true }),
       };
-    }, 'NestAI could not repair that tool.'),
+    }, 'Local AI Hub could not repair that tool.'),
   );
 
   ipcMain.handle('tools:open-folder', (_event, toolId) =>
@@ -354,27 +410,92 @@ function registerIpcHandlers() {
       return {
         message: `${tool.name}'s folder is open.`,
       };
-    }, 'NestAI could not open that folder.'),
+    }, 'Local AI Hub could not open that folder.'),
+  );
+
+  ipcMain.handle('models:get-settings', () =>
+    withPlainEnglishErrors(() => readModelSettings(), 'Local AI Hub could not load the Model Manager settings.'),
+  );
+
+  ipcMain.handle('models:save-settings', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const settings = await saveModelManagerSettings(payload || {});
+      return {
+        message: 'Model Manager settings were saved locally.',
+        settings,
+      };
+    }, 'Local AI Hub could not save the Model Manager settings.'),
+  );
+
+  ipcMain.handle('models:browse', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = modelToolLookup(payload.toolId, state.tools);
+      const activeTool = tool.id === 'ollama' ? await ensureOllamaReadyForModels(tool) : tool;
+      return browseRemoteModels(activeTool, payload);
+    }, 'Local AI Hub could not load remote models right now.'),
+  );
+
+  ipcMain.handle('models:list-local', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = modelToolLookup(payload.toolId, state.tools);
+      const activeTool = tool.id === 'ollama' ? await ensureOllamaReadyForModels(tool) : tool;
+      return listDownloadedModels(activeTool);
+    }, 'Local AI Hub could not load the downloaded models for that tool.'),
+  );
+
+  ipcMain.handle('models:download', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = modelToolLookup(payload.toolId, state.tools);
+      const activeTool = tool.id === 'ollama' ? await ensureOllamaReadyForModels(tool) : tool;
+      const result = await downloadModel(activeTool, payload, {
+        onProgress: (progress) => sendModelProgress({
+          toolId: payload.toolId,
+          ...progress,
+        }),
+      });
+      return {
+        message: result.message,
+        localModels: await listDownloadedModels(activeTool),
+      };
+    }, 'Local AI Hub could not download that model.'),
+  );
+
+  ipcMain.handle('models:delete', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = modelToolLookup(payload.toolId, state.tools);
+      const activeTool = tool.id === 'ollama' ? await ensureOllamaReadyForModels(tool) : tool;
+      const result = await deleteModel(activeTool, payload);
+      return {
+        message: result.message,
+        localModels: await listDownloadedModels(activeTool),
+      };
+    }, 'Local AI Hub could not delete that model.'),
   );
 
   ipcMain.handle('ollama:list-models', () =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup('ollama', state.tools);
-      return listOllamaModels(tool);
-    }, 'NestAI could not load your local Ollama models.'),
+      const activeTool = await ensureOllamaReadyForModels(tool);
+      return listOllamaModels(activeTool);
+    }, 'Local AI Hub could not load your local Ollama models.'),
   );
 
   ipcMain.handle('ollama:chat', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup('ollama', state.tools);
-      return chatWithOllama(tool, payload);
-    }, 'NestAI could not send that message to Ollama.'),
+      const activeTool = await ensureOllamaReadyForModels(tool);
+      return chatWithOllama(activeTool, payload);
+    }, 'Local AI Hub could not send that message to Ollama.'),
   );
 
   ipcMain.handle('snapshots:list', (_event, toolId) =>
-    withPlainEnglishErrors(async () => listSnapshots(toolId), 'NestAI could not load snapshots.'),
+    withPlainEnglishErrors(async () => listSnapshots(toolId), 'Local AI Hub could not load snapshots.'),
   );
 
   ipcMain.handle('snapshots:save', (_event, toolId) =>
@@ -382,15 +503,15 @@ function registerIpcHandlers() {
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
       if (tool.source !== 'managed') {
-        throw new Error('NestAI snapshots are only available for tools it manages itself.');
+        throw new Error('Local AI Hub snapshots are only available for tools it manages itself.');
       }
       const snapshot = await saveSnapshot(tool);
-      await notify('NestAI snapshot saved', `${tool.name} snapshot ${snapshot.fileName} is ready.`);
+      await notify('Local AI Hub snapshot saved', `${tool.name} snapshot ${snapshot.fileName} is ready.`);
       return {
         message: `${tool.name} snapshot saved to ${snapshot.fileName}.`,
         state: await buildAppState(),
       };
-    }, 'NestAI could not save that snapshot.'),
+    }, 'Local AI Hub could not save that snapshot.'),
   );
 
   ipcMain.handle('snapshots:restore', (_event, payload) =>
@@ -398,14 +519,14 @@ function registerIpcHandlers() {
       const state = await buildAppState();
       const tool = toolLookup(payload.toolId, state.tools);
       if (tool.source !== 'managed') {
-        throw new Error('NestAI can only restore snapshots for tools it installed itself.');
+        throw new Error('Local AI Hub can only restore snapshots for tools it installed itself.');
       }
       await restoreSnapshot(tool, payload.snapshotFileName);
       return {
         message: `${tool.name} was restored from ${payload.snapshotFileName}.`,
         state: await buildAppState(),
       };
-    }, 'NestAI could not restore that snapshot.'),
+    }, 'Local AI Hub could not restore that snapshot.'),
   );
 }
 
@@ -414,6 +535,8 @@ app.whenReady().then(async () => {
   tray = new Tray(createTrayIcon());
   tray.on('click', showWindow);
   registerIpcHandlers();
+  configureAutoUpdates({ onUpdateReady: sendUpdateReadyNotification });
+  await initializeToolRegistry({ refreshRemote: true });
   await updateTrayMenu();
 });
 
@@ -437,6 +560,3 @@ app.on('activate', () => {
 
   showWindow();
 });
-
-
-

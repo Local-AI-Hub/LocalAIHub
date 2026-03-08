@@ -30,9 +30,9 @@ export default function OllamaChatPanel({
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Ollama chat</p>
-          <h3 className="mt-3 text-3xl font-semibold tracking-tight text-white">Chat with your local models inside NestAI</h3>
+          <h3 className="mt-3 text-3xl font-semibold tracking-tight text-white">Chat with your local models inside Local AI Hub</h3>
           <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
-            NestAI talks directly to Ollama on <span className="font-medium text-white">{tool?.launchUrl || 'http://127.0.0.1:11434'}</span>.
+            Local AI Hub talks directly to Ollama on <span className="font-medium text-white">{tool?.launchUrl || 'http://127.0.0.1:11434'}</span>.
             Choose a local model, send a prompt, and keep the conversation inside the app.
           </p>
         </div>

@@ -59,7 +59,7 @@ export default function InstallerGrid({
           </h2>
         </div>
         <p className="max-w-xl text-sm leading-6 text-slate-400">
-          NestAI checks for existing installs first, then falls back to its own managed install path only when the tool is not already present.
+          Local AI Hub checks for existing installs first, then falls back to its own managed install path only when the tool is not already present.
         </p>
       </div>
 
@@ -91,7 +91,7 @@ export default function InstallerGrid({
                     >
                       {toolState
                         ? toolState.source === 'managed'
-                          ? 'Managed by NestAI'
+                          ? 'Managed by Local AI Hub'
                           : 'Detected on system'
                         : 'Available'}
                     </span>

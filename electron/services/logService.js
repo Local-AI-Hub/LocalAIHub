@@ -55,7 +55,7 @@ async function appendLog(scope, level, message, context = {}) {
   try {
     await fs.appendFile(filePath, line, 'utf8');
   } catch (error) {
-    console.error('NestAI could not write a log line.', error);
+    console.error('Local AI Hub could not write a log line.', error);
   }
 
   return filePath;

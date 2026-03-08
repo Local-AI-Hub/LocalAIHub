@@ -99,7 +99,7 @@ function normalizeToolDefinition(tool) {
       kind: installInstructions.kind || 'zip',
       runtime: installInstructions.runtime || 'binary',
       archiveName: deriveArchiveName(tool.downloadUrl, installInstructions.archiveName),
-      installSummary: installInstructions.installSummary || 'Downloads and configures this tool inside NestAI.',
+      installSummary: installInstructions.installSummary || 'Downloads and configures this tool inside Local AI Hub.',
       venvFolder: installInstructions.venvFolder || '.venv',
       configTargets: installInstructions.configTargets || [],
       pythonRequirementDetection: installInstructions.pythonRequirementDetection || [],

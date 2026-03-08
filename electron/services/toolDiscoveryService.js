@@ -119,7 +119,7 @@ async function discoverExternalTool(manifest, existingTool, logger) {
     interfaceMode: manifest.interfaceMode,
     type: manifest.installInstructions.runtime,
     source: 'external',
-    managedByNestAI: false,
+    managedByLocalAIHub: false,
     installDir: detected.installDir,
     appDir: detected.installDir,
     detectedPath: detected.detectedPath,
@@ -180,7 +180,7 @@ async function performDiscoveryScan() {
       nextTools[manifest.id] = existingTool;
       const present = await managedToolIsPresent(existingTool);
       if (!present) {
-        await logger.warn('NestAI-managed tool is configured but its files are missing.', {
+        await logger.warn('Local AI Hub-managed tool is configured but its files are missing.', {
           toolId: manifest.id,
           installDir: existingTool.installDir,
         });

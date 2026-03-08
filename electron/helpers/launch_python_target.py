@@ -5,7 +5,7 @@ import sys
 
 def main():
     if len(sys.argv) < 4:
-        raise RuntimeError('NestAI could not determine which Python target to launch.')
+        raise RuntimeError('Local AI Hub could not determine which Python target to launch.')
 
     working_directory = sys.argv[1]
     launch_mode = sys.argv[2]

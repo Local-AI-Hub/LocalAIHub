@@ -10,7 +10,7 @@
       "kind": "zip",
       "runtime": "python",
       "archiveName": "ComfyUI-master.zip",
-      "installSummary": "Downloads the latest ComfyUI source and builds a dedicated NestAI Python environment.",
+      "installSummary": "Downloads the latest ComfyUI source and builds a dedicated Local AI Hub Python environment.",
       "venvFolder": ".venv",
       "configTargets": ["extra_model_paths.yaml", "user"],
       "pythonRequirementDetection": [
@@ -57,7 +57,7 @@
       "kind": "zip",
       "runtime": "binary",
       "archiveName": "ollama-windows-amd64.zip",
-      "installSummary": "Downloads the standalone Windows Ollama bundle into NestAI's managed tools folder.",
+      "installSummary": "Downloads the standalone Windows Ollama bundle into Local AI Hub's managed tools folder.",
       "configTargets": [],
       "externalExecutableCandidates": ["ollama.exe"],
       "compatibility": {
@@ -133,7 +133,7 @@
       "kind": "zip",
       "runtime": "python",
       "archiveName": "InvokeAI-main.zip",
-      "installSummary": "Downloads InvokeAI, installs its Python package locally, and keeps the runtime inside NestAI.",
+      "installSummary": "Downloads InvokeAI, installs its Python package locally, and keeps the runtime inside Local AI Hub.",
       "venvFolder": ".venv",
       "configTargets": ["invokeai.yaml", ".invokeai"],
       "pythonRequirementDetection": [

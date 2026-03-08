@@ -5,7 +5,7 @@ const { app } = require('electron');
 const { ensureStorage } = require('./configService');
 const { createLogger } = require('./logService');
 
-const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/Local-AI-Hub/NestAI/main/electron/config/tools-manifest.json';
+const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/Local-AI-Hub/LocalAIHub/main/electron/config/tools-manifest.json';
 
 let loadedManifest = null;
 let refreshPromise = null;
@@ -21,7 +21,7 @@ async function getManifestCachePath() {
 
 function normalizeManifest(rawManifest) {
   if (!Array.isArray(rawManifest)) {
-    throw new Error('NestAI received an invalid tool manifest payload.');
+    throw new Error('Local AI Hub received an invalid tool manifest payload.');
   }
 
   return rawManifest;
@@ -54,7 +54,7 @@ async function fetchRemoteManifest(logger) {
   const response = await fetch(REMOTE_MANIFEST_URL, {
     headers: {
       'Cache-Control': 'no-cache',
-      'User-Agent': `NestAI/${app.getVersion()}`,
+      'User-Agent': `LocalAIHub/${app.getVersion()}`,
     },
   });
 
