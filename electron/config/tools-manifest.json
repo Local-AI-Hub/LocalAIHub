@@ -506,6 +506,81 @@
     "startupTimeoutMs": 180000
   },
   {
+    "id": "facefusion",
+    "name": "FaceFusion",
+    "description": "A local face swap and face enhancement tool with a large community. It lets you handle face swapping and enhancement on your own machine with no data leaving your PC, and a mid to high end GPU is recommended for the best experience.",
+    "icon": "FF",
+    "category": "Image tools",
+    "downloadUrl": "https://github.com/facefusion/facefusion/archive/refs/heads/master.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "facefusion-master.zip",
+      "installSummary": "Downloads FaceFusion from GitHub, creates a managed Python environment, and runs the official FaceFusion setup locally inside Local AI Hub.",
+      "venvFolder": ".venv",
+      "configTargets": [
+        "facefusion.ini",
+        ".assets"
+      ],
+      "pythonRequirementDetection": [
+        {
+          "kind": "pyproject",
+          "file": "pyproject.toml"
+        }
+      ],
+      "pipInstalls": [
+        {
+          "kind": "python-script",
+          "value": "install.py",
+          "args": [
+            "--onnxruntime",
+            "default"
+          ],
+          "message": "Running the official FaceFusion setup script."
+        }
+      ],
+      "externalPythonCandidates": [
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe",
+        "Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": [],
+      "compatibility": {
+        "minimumVramMb": 8192,
+        "recommendedVramMb": 12288,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python facefusion.py run",
+    "externalLaunchCommand": "python facefusion.py run",
+    "defaultPort": 7860,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\facefusion\\facefusion.py",
+      "%USERPROFILE%\\Documents\\facefusion\\facefusion.py",
+      "%USERPROFILE%\\Downloads\\facefusion\\facefusion.py",
+      "%LOCALAPPDATA%\\facefusion\\facefusion.py",
+      "%APPDATA%\\facefusion\\facefusion.py"
+    ],
+    "discovery": {
+      "folderNames": [
+        "facefusion",
+        "FaceFusion",
+        "facefusion-master"
+      ],
+      "markerPaths": [
+        "facefusion.py",
+        "install.py",
+        "facefusion\\__init__.py"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    },
+    "startupTimeoutMs": 180000
+  },
+  {
     "id": "gpt4all",
     "name": "GPT4All",
     "description": "A beginner-friendly local LLM runner with a built-in GUI and one of the most accessible local LLM tools for non-technical users.",

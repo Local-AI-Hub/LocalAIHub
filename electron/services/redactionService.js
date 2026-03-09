@@ -1,5 +1,7 @@
 const WINDOWS_PATH_PATTERN = /\b[a-zA-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*/g;
 const TOKEN_PATTERNS = [
+  /\bsk-[A-Za-z0-9_*.-]{10,}\b/g,
+  /\bAIza[0-9A-Za-z\-_*]{20,}\b/g,
   /\bghp_[A-Za-z0-9]{20,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
   /\bBearer\s+[A-Za-z0-9._\-+/=]{12,}\b/gi,
@@ -50,3 +52,6 @@ module.exports = {
   redactSensitiveText,
   sanitizeUserMessage,
 };
+
+
+

@@ -10,7 +10,7 @@ function MetricCard({ label, value, detail, accent }) {
   );
 }
 
-export default function ResourceStrip({ resources, installedCount, runningCount, activeTab, storage }) {
+export default function ResourceStrip({ resources, installedCount, runningCount, activeTab, storage, updateCount = 0 }) {
   const activeLabel =
     activeTab === 'library'
       ? 'Library'
@@ -18,7 +18,9 @@ export default function ResourceStrip({ resources, installedCount, runningCount,
         ? 'Store'
         : activeTab === 'models'
           ? 'Model Manager'
-          : 'Settings';
+          : activeTab === 'statistics'
+            ? 'Statistics'
+            : 'Settings';
   const heading =
     activeTab === 'library'
       ? 'Your local AI shelf'
@@ -26,15 +28,19 @@ export default function ResourceStrip({ resources, installedCount, runningCount,
         ? 'Browse installable local AI tools'
         : activeTab === 'models'
           ? 'Manage the models behind your tools'
-          : 'Control storage, cleanup, and migrations';
+          : activeTab === 'statistics'
+            ? 'See what Local AI Hub is using on this PC'
+            : 'Control storage, cleanup, and connections';
   const summary =
     activeTab === 'library'
-      ? 'Launch, stop, snapshot, and repair the tools already on this machine.'
+      ? 'Launch, stop, snapshot, repair, and update the tools already on this machine.'
       : activeTab === 'store'
         ? 'Pick a tool, check whether this hardware is a good fit, and let Local AI Hub handle the setup locally.'
         : activeTab === 'models'
           ? 'Search remote catalogs, download models into the right folders, and remove what you no longer need.'
-          : 'Choose a storage drive, migrate older installs off C:, and safely remove duplicate or failed Local AI Hub leftovers.';
+          : activeTab === 'statistics'
+            ? 'Review launch counts, disk growth, live VRAM history, and how much space Local AI Hub is using locally.'
+            : 'Choose a storage drive, manage cloud API keys, migrate older installs off C:, and safely remove leftover files.';
   const diskDetail = resources?.diskMount
     ? `Storage drive ${resources.diskMount}`
     : storage?.managedRoot
@@ -60,10 +66,10 @@ export default function ResourceStrip({ resources, installedCount, runningCount,
           value={formatUsage(resources?.vramUsedMb, resources?.vramTotalMb)}
         />
         <MetricCard
-          accent={Number(resources?.diskUsePercent) >= 90 ? 'text-amber-200' : 'text-cyan-200'}
-          detail={diskDetail}
-          label="Disk"
-          value={formatDiskAvailability(resources?.diskFreeBytes, resources?.diskTotalBytes)}
+          accent={updateCount > 0 ? 'text-amber-200' : Number(resources?.diskUsePercent) >= 90 ? 'text-amber-200' : 'text-cyan-200'}
+          detail={updateCount > 0 ? `${updateCount} update${updateCount === 1 ? '' : 's'} available` : diskDetail}
+          label={updateCount > 0 ? 'Updates' : 'Disk'}
+          value={updateCount > 0 ? String(updateCount) : formatDiskAvailability(resources?.diskFreeBytes, resources?.diskTotalBytes)}
         />
       </div>
     </section>

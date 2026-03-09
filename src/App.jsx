@@ -1,14 +1,19 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import AiderPanel from './components/AiderPanel';
+import CloudChatPanel from './components/CloudChatPanel';
+import ConnectionsPanel from './components/ConnectionsPanel';
 import HardwareGate from './components/HardwareGate';
 import LibraryCard from './components/LibraryCard';
 import ModelManager from './components/ModelManager';
 import OllamaChatPanel from './components/OllamaChatPanel';
-import WhisperPanel from './components/WhisperPanel';
+import ProviderCard from './components/ProviderCard';
 import ResourceStrip from './components/ResourceStrip';
 import SettingsPanel from './components/SettingsPanel';
 import Sidebar from './components/Sidebar';
+import StatisticsPanel from './components/StatisticsPanel';
 import StoreCard from './components/StoreCard';
+import ToolUpdatesPanel from './components/ToolUpdatesPanel';
+import WhisperPanel from './components/WhisperPanel';
 import { formatBytes } from './lib/formatters';
 import { evaluateCompatibility, toolSearchText } from './lib/tool-ui';
 
@@ -23,12 +28,20 @@ const EMPTY_STATE = {
   managedDataPath: '',
   manifests: [],
   manifestStatus: null,
+  providerManifestStatus: null,
+  providers: [],
   resources: null,
   storage: null,
+  toolUpdates: {
+    availableCount: 0,
+    entries: [],
+    lastCheckedAt: null,
+  },
   tools: [],
 };
 
 const CONSOLE_OUTPUT_LIMIT = 48000;
+const REFRESH_INTERVAL_MS = 5000;
 
 function trimConsoleOutput(value) {
   const text = String(value || '');
@@ -103,6 +116,8 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [busyMap, setBusyMap] = useState({});
   const [progressMap, setProgressMap] = useState({});
+  const [launchProgressMap, setLaunchProgressMap] = useState({});
+  const [updateProgressMap, setUpdateProgressMap] = useState({});
   const [toasts, setToasts] = useState([]);
   const [activeTab, setActiveTab] = useState('library');
   const [storeSearch, setStoreSearch] = useState('');
@@ -131,6 +146,20 @@ export default function App() {
   const [aiderNotice, setAiderNotice] = useState('');
   const [aiderOutput, setAiderOutput] = useState('');
   const [aiderProjectDir, setAiderProjectDir] = useState('');
+  const [statisticsData, setStatisticsData] = useState(null);
+  const [statisticsBusy, setStatisticsBusy] = useState(false);
+  const statisticsRefreshInFlightRef = useRef(false);
+  const statisticsQueuedRefreshRef = useRef(null);
+  const [cloudChatProviderId, setCloudChatProviderId] = useState('');
+  const [cloudModels, setCloudModels] = useState([]);
+  const [cloudSelectedModel, setCloudSelectedModel] = useState('');
+  const [cloudMessages, setCloudMessages] = useState([]);
+  const [cloudDraft, setCloudDraft] = useState('');
+  const [cloudNotice, setCloudNotice] = useState('');
+  const [cloudModelsLoading, setCloudModelsLoading] = useState(false);
+  const [cloudChatBusy, setCloudChatBusy] = useState(false);
+  const [providerKeyDrafts, setProviderKeyDrafts] = useState({});
+  const [toolUpdateToastCount, setToolUpdateToastCount] = useState(0);
 
   const manifestMap = useMemo(
     () => Object.fromEntries((appState.manifests || []).map((manifest) => [manifest.id, manifest])),
@@ -150,7 +179,25 @@ export default function App() {
   const ollamaTool = toolMap.ollama || null;
   const whisperTool = toolMap.whisper || null;
   const aiderTool = toolMap.aider || null;
+  const providers = useMemo(() => appState.providers || [], [appState.providers]);
+  const providerMap = useMemo(() => Object.fromEntries(providers.map((provider) => [provider.id, provider])), [providers]);
+  const connectedProviders = useMemo(() => providers.filter((provider) => provider.isConnected), [providers]);
+  const toolUpdateSummary = useMemo(
+    () =>
+      appState.toolUpdates || {
+        availableCount: 0,
+        entries: [],
+        lastCheckedAt: null,
+      },
+    [appState.toolUpdates],
+  );
+  const toolUpdateMap = useMemo(
+    () => Object.fromEntries((toolUpdateSummary.entries || []).map((entry) => [entry.toolId, entry])),
+    [toolUpdateSummary.entries],
+  );
+  const activeCloudProvider = cloudChatProviderId ? providerMap[cloudChatProviderId] || null : null;
   const modelManagerCount = Number(appState.downloadedModelCount || 0);
+  const libraryCount = tools.length + connectedProviders.length;
 
   const storeCategories = useMemo(() => {
     const values = [...new Set((appState.manifests || []).map((manifest) => manifest.category).filter(Boolean))];
@@ -194,6 +241,41 @@ export default function App() {
     });
   }
 
+  function clearLaunchProgress(toolId) {
+    if (!toolId) {
+      return;
+    }
+
+    setLaunchProgressMap((current) => {
+      const next = { ...current };
+      delete next[toolId];
+      return next;
+    });
+  }
+
+  function clearUpdateProgress(toolId) {
+    if (!toolId) {
+      return;
+    }
+
+    setUpdateProgressMap((current) => {
+      const next = { ...current };
+      delete next[toolId];
+      return next;
+    });
+  }
+
+  function resetCloudChat() {
+    setCloudChatProviderId('');
+    setCloudModels([]);
+    setCloudSelectedModel('');
+    setCloudMessages([]);
+    setCloudDraft('');
+    setCloudNotice('');
+    setCloudModelsLoading(false);
+    setCloudChatBusy(false);
+  }
+
   function toolIdFromActionKey(key) {
     if (!key || !key.includes(':')) {
       return null;
@@ -230,6 +312,7 @@ export default function App() {
 
   function openEmbeddedToolUi(toolId) {
     setActiveTab('library');
+    resetCloudChat();
 
     if (toolId === 'ollama') {
       setAiderPanelOpen(false);
@@ -417,7 +500,9 @@ export default function App() {
     }
 
     setAiderOutput('');
-    const launched = await runAction('launch:aider', () => window.localAIHub.launchTool({ toolId: 'aider', projectDir: aiderProjectDir }));
+    const launched = await runAction('launch:aider', () =>
+      window.localAIHub.launchTool({ toolId: 'aider', projectDir: aiderProjectDir }),
+    );
     if (!launched) {
       return;
     }
@@ -456,6 +541,217 @@ export default function App() {
     setAiderBusy(false);
   }
 
+  async function loadStatistics(options = {}) {
+    const manual = Boolean(options.manual);
+    const silent = Boolean(options.silent);
+
+    if (statisticsRefreshInFlightRef.current) {
+      if (manual) {
+        statisticsQueuedRefreshRef.current = {
+          manual: true,
+          silent,
+        };
+      }
+      return false;
+    }
+
+    statisticsRefreshInFlightRef.current = true;
+    if (manual) {
+      setStatisticsBusy(true);
+    }
+
+    try {
+      const result = await window.localAIHub.getStatistics();
+      if (!result?.ok) {
+        if (!silent) {
+          pushToast(result?.message || 'Local AI Hub could not load the statistics screen right now.', 'error');
+        }
+        return false;
+      }
+
+      setStatisticsData(result.data);
+      return true;
+    } catch (error) {
+      if (!silent) {
+        pushToast(error?.message || 'Local AI Hub could not load the statistics screen right now.', 'error');
+      }
+      return false;
+    } finally {
+      statisticsRefreshInFlightRef.current = false;
+      if (manual) {
+        setStatisticsBusy(false);
+      }
+
+      const queuedRefresh = statisticsQueuedRefreshRef.current;
+      if (queuedRefresh) {
+        statisticsQueuedRefreshRef.current = null;
+        window.setTimeout(() => {
+          loadStatistics(queuedRefresh);
+        }, 0);
+      }
+    }
+  }
+
+  function changeProviderDraft(providerId, value) {
+    setProviderKeyDrafts((current) => ({
+      ...current,
+      [providerId]: value,
+    }));
+  }
+
+  async function saveProviderKey(providerId) {
+    const apiKey = String(providerKeyDrafts[providerId] || '').trim();
+    if (!apiKey) {
+      pushToast('Paste an API key before saving this connection.', 'error');
+      return;
+    }
+
+    const saved = await runAction(`provider-save:${providerId}`, () =>
+      window.localAIHub.saveProviderKey({ providerId, apiKey }),
+    );
+    if (saved) {
+      setProviderKeyDrafts((current) => ({
+        ...current,
+        [providerId]: '',
+      }));
+    }
+  }
+
+  async function testProvider(providerId) {
+    markBusy(`provider-test:${providerId}`, true);
+    try {
+      const result = await window.localAIHub.testProviderConnection(providerId);
+      applyStateResponse(result);
+      if (cloudChatProviderId === providerId) {
+        await loadCloudModels({ providerId, silent: true });
+      }
+    } catch (error) {
+      pushToast(error.message || 'Local AI Hub could not test that cloud provider connection.', 'error');
+    } finally {
+      markBusy(`provider-test:${providerId}`, false);
+    }
+  }
+
+  async function disconnectProviderConnection(providerId) {
+    const disconnected = await runAction(`provider-disconnect:${providerId}`, () =>
+      window.localAIHub.disconnectProvider(providerId),
+    );
+    if (disconnected && cloudChatProviderId === providerId) {
+      resetCloudChat();
+    }
+  }
+
+  async function loadCloudModels(options = {}) {
+    const providerId = options.providerId || cloudChatProviderId;
+    if (!providerId) {
+      return;
+    }
+
+    markBusy(`provider-models:${providerId}`, true);
+    setCloudModelsLoading(true);
+    const result = await window.localAIHub.listProviderModels(providerId);
+
+    if (!result?.ok) {
+      const message = result?.message || 'Local AI Hub could not load models for that cloud provider.';
+      setCloudNotice(message);
+      setCloudModels([]);
+      setCloudSelectedModel('');
+      if (!options.silent) {
+        pushToast(message, 'error');
+      }
+      setCloudModelsLoading(false);
+      markBusy(`provider-models:${providerId}`, false);
+      return;
+    }
+
+    setCloudModels(result.data?.models || []);
+    setCloudSelectedModel(result.data?.selectedModel || result.data?.models?.[0]?.id || '');
+    setCloudNotice(`Connected to ${providerMap[providerId]?.name || 'this provider'}.`);
+    setCloudModelsLoading(false);
+    markBusy(`provider-models:${providerId}`, false);
+  }
+
+  async function openCloudProviderChat(providerId) {
+    setActiveTab('library');
+    setOllamaChatOpen(false);
+    setWhisperPanelOpen(false);
+    setAiderPanelOpen(false);
+    setCloudChatProviderId(providerId);
+    setCloudDraft('');
+    setCloudMessages([
+      {
+        role: 'assistant',
+        content: `This conversation is processed by ${providerMap[providerId]?.name || 'this provider'} and leaves your machine.`,
+      },
+    ]);
+    await loadCloudModels({ providerId, silent: false });
+  }
+
+  async function sendCloudMessage() {
+    const trimmedDraft = cloudDraft.trim();
+    if (!trimmedDraft || !cloudChatProviderId) {
+      return;
+    }
+
+    if (!cloudSelectedModel) {
+      pushToast('Choose a cloud model before sending a message.', 'error');
+      return;
+    }
+
+    const userMessage = {
+      role: 'user',
+      content: trimmedDraft,
+    };
+    const nextMessages = [...cloudMessages, userMessage];
+    setCloudMessages(nextMessages);
+    setCloudDraft('');
+    setCloudChatBusy(true);
+
+    const result = await window.localAIHub.chatWithProvider({
+      providerId: cloudChatProviderId,
+      model: cloudSelectedModel,
+      messages: nextMessages,
+    });
+
+    if (!result?.ok) {
+      const message = result?.message || 'Local AI Hub could not send that cloud provider message.';
+      pushToast(message, 'error');
+      setCloudMessages((current) => [...current, { role: 'assistant', content: message }]);
+      setCloudChatBusy(false);
+      return;
+    }
+
+    setCloudMessages((current) => [
+      ...current,
+      result.data?.message || { role: 'assistant', content: 'The provider returned an empty reply.' },
+    ]);
+    setCloudNotice(`Connected to ${providerMap[cloudChatProviderId]?.name || 'this provider'}.`);
+    setCloudChatBusy(false);
+  }
+
+  function patchToolState(payload) {
+    if (!payload?.toolId) {
+      return;
+    }
+
+    setAppState((current) => ({
+      ...current,
+      tools: (current.tools || []).map((tool) =>
+        tool.id === payload.toolId
+          ? {
+              ...tool,
+              ...(payload.status ? { status: payload.status } : {}),
+              ...(Object.prototype.hasOwnProperty.call(payload, 'lastError') ? { lastError: payload.lastError } : {}),
+            }
+          : tool,
+      ),
+    }));
+  }
+
+  async function updateLibraryTool(toolId) {
+    await runAction(`update:${toolId}`, () => window.localAIHub.updateTool({ toolId }));
+  }
+
   async function uninstallLibraryTool(tool) {
     if (!tool?.id) {
       return;
@@ -476,6 +772,7 @@ export default function App() {
 
     await runAction(`uninstall:${tool.id}`, () => window.localAIHub.uninstallTool(tool.id));
   }
+
   async function chooseStorageFolder() {
     markBusy('settings:pick-folder', true);
     try {
@@ -594,6 +891,7 @@ export default function App() {
       await previewCleanup({ silent: true });
     }
   }
+
   function applyStateResponse(result) {
     if (!result?.ok) {
       throw new Error(result?.message || 'Local AI Hub could not complete that action.');
@@ -641,13 +939,25 @@ export default function App() {
         clearProgress(toolId);
       }
 
+      if (key.startsWith('launch:')) {
+        clearLaunchProgress(toolId);
+      }
+
+      if (key.startsWith('update:')) {
+        clearUpdateProgress(toolId);
+      }
+
       const baseMessage = error.message || 'Local AI Hub could not complete that action.';
       const helpMessage =
-        (key.startsWith('install:') || key.startsWith('repair:')) && appState.logsPath
+        (key.startsWith('install:') || key.startsWith('repair:') || key.startsWith('update:')) && appState.logsPath
           ? `${baseMessage} Open the logs folder for the full installer log.`
           : baseMessage;
       pushToast(helpMessage, 'error');
     } finally {
+      if (key.startsWith('stop:') || key.startsWith('uninstall:')) {
+        clearLaunchProgress(toolId);
+      }
+
       if (key.startsWith('stop:') && toolId === 'ollama') {
         setOllamaNotice('Ollama stopped. Launch it again to continue chatting.');
       }
@@ -722,12 +1032,19 @@ export default function App() {
       removeOrphanedToolFolders = window.confirm(orphanMessage);
     }
 
-    await runAction(`repair:${tool.id}`, () => window.localAIHub.repairTool({ toolId: tool.id, removeOrphanedToolFolders }));
+    await runAction(`repair:${tool.id}`, () =>
+      window.localAIHub.repairTool({ toolId: tool.id, removeOrphanedToolFolders }),
+    );
   }
 
   useEffect(() => {
     loadState();
+
     const unsubscribeInstallProgress = window.localAIHub.onInstallProgress((progress) => {
+      if (!progress?.toolId) {
+        return;
+      }
+
       setProgressMap((current) => ({
         ...current,
         [progress.toolId]: progress,
@@ -744,12 +1061,78 @@ export default function App() {
       openEmbeddedToolUi(payload?.toolId);
     });
 
+    const unsubscribeLaunchProgress = window.localAIHub.onLaunchProgress((progress) => {
+      if (!progress?.toolId) {
+        return;
+      }
+
+      if (!progress.active) {
+        clearLaunchProgress(progress.toolId);
+        return;
+      }
+
+      setLaunchProgressMap((current) => ({
+        ...current,
+        [progress.toolId]: progress,
+      }));
+    });
+
     const unsubscribeRuntimeOutput = window.localAIHub.onRuntimeOutput((payload) => {
       if (payload?.toolId !== 'aider' || !payload.chunk) {
         return;
       }
 
       setAiderOutput((current) => trimConsoleOutput(`${current}${payload.chunk}`));
+    });
+
+    const unsubscribeToolState = window.localAIHub.onToolState((payload) => {
+      patchToolState(payload);
+    });
+
+    const unsubscribeUnexpectedStop = window.localAIHub.onUnexpectedStop((payload) => {
+      if (payload?.status || Object.prototype.hasOwnProperty.call(payload || {}, 'lastError')) {
+        patchToolState(payload);
+      }
+
+      if (!payload?.toolId) {
+        return;
+      }
+
+      pushToast(payload.message || `${payload.toolName || 'A tool'} stopped unexpectedly.`, 'error', {
+        tag: `unexpected-stop:${payload.toolId}`,
+        persistent: true,
+        actionLabel: payload.canRelaunch ? 'Relaunch' : 'Open Library',
+        onAction: () => {
+          setActiveTab('library');
+          if (payload.canRelaunch) {
+            runAction(`launch:${payload.toolId}`, () => window.localAIHub.launchTool(payload.toolId));
+          }
+        },
+      });
+    });
+
+    const unsubscribeToolUpdateSummary = window.localAIHub.onToolUpdateSummary((payload) => {
+      setAppState((current) => ({
+        ...current,
+        toolUpdates: payload || current.toolUpdates,
+      }));
+    });
+
+    const unsubscribeUpdateProgress = window.localAIHub.onUpdateProgress((progress) => {
+      if (!progress?.toolId) {
+        return;
+      }
+
+      setUpdateProgressMap((current) => ({
+        ...current,
+        [progress.toolId]: progress,
+      }));
+
+      if (progress.percent >= 100) {
+        window.setTimeout(() => {
+          clearUpdateProgress(progress.toolId);
+        }, 2000);
+      }
     });
 
     const unsubscribeUpdateReady = window.localAIHub.onUpdateReady((payload) => {
@@ -771,12 +1154,17 @@ export default function App() {
       if (result?.ok) {
         setAppState(result.data);
       }
-    }, 5000);
+    }, REFRESH_INTERVAL_MS);
 
     return () => {
       unsubscribeInstallProgress();
       unsubscribeOpenToolUi();
+      unsubscribeLaunchProgress();
       unsubscribeRuntimeOutput();
+      unsubscribeToolState();
+      unsubscribeUnexpectedStop();
+      unsubscribeToolUpdateSummary();
+      unsubscribeUpdateProgress();
       unsubscribeUpdateReady();
       window.clearInterval(intervalId);
     };
@@ -796,20 +1184,66 @@ export default function App() {
   }, [appState.manifestStatus?.warning]);
 
   useEffect(() => {
+    if (!appState.providerManifestStatus?.warning) {
+      dismissToast('provider-manifest-status');
+      return;
+    }
+
+    pushToast(appState.providerManifestStatus.warning, 'error', {
+      id: 'provider-manifest-status',
+      persistent: true,
+      tag: 'provider-manifest-status',
+    });
+  }, [appState.providerManifestStatus?.warning]);
+
+  useEffect(() => {
     const migration = appState.storage?.legacyMigration;
     if (!migration?.available || migration.dismissed) {
       dismissToast('legacy-migration');
       return;
     }
 
-    pushToast(`Local AI Hub found about ${formatBytes(migration.totalBytes)} in older managed files at ${migration.sourceRoot}. Open Settings to move them off your system drive.`, 'success', {
-      id: 'legacy-migration',
+    pushToast(
+      `Local AI Hub found about ${formatBytes(migration.totalBytes)} in older managed files at ${migration.sourceRoot}. Open Settings to move them off your system drive.`,
+      'success',
+      {
+        id: 'legacy-migration',
+        persistent: true,
+        tag: 'legacy-migration',
+        actionLabel: 'Open Settings',
+        onAction: () => setActiveTab('settings'),
+      },
+    );
+  }, [
+    appState.storage?.legacyMigration?.available,
+    appState.storage?.legacyMigration?.dismissed,
+    appState.storage?.legacyMigration?.sourceRoot,
+    appState.storage?.legacyMigration?.totalBytes,
+  ]);
+
+  useEffect(() => {
+    const updateCount = Number(toolUpdateSummary.availableCount || 0);
+    if (!updateCount) {
+      dismissToast('tool-updates');
+      if (toolUpdateToastCount !== 0) {
+        setToolUpdateToastCount(0);
+      }
+      return;
+    }
+
+    if (toolUpdateToastCount === updateCount) {
+      return;
+    }
+
+    setToolUpdateToastCount(updateCount);
+    pushToast(`Updates available for ${updateCount} ${pluralizeLabel(updateCount, 'tool')}.`, 'success', {
+      id: 'tool-updates',
       persistent: true,
-      tag: 'legacy-migration',
-      actionLabel: 'Open Settings',
-      onAction: () => setActiveTab('settings'),
+      tag: 'tool-updates',
+      actionLabel: 'View updates',
+      onAction: () => setActiveTab('library'),
     });
-  }, [appState.storage?.legacyMigration?.available, appState.storage?.legacyMigration?.dismissed, appState.storage?.legacyMigration?.sourceRoot, appState.storage?.legacyMigration?.totalBytes]);
+  }, [toolUpdateSummary.availableCount, toolUpdateToastCount]);
 
   useEffect(() => {
     if (!ollamaTool) {
@@ -861,7 +1295,9 @@ export default function App() {
     }
 
     if (aiderTool.status === 'running') {
-      setAiderNotice((current) => current || `Aider is running in ${aiderProjectDir || aiderTool.lastProjectDir || 'the selected project folder'}.`);
+      setAiderNotice((current) =>
+        current || `Aider is running in ${aiderProjectDir || aiderTool.lastProjectDir || 'the selected project folder'}.`,
+      );
       loadAiderRuntimeOutput({ silent: true });
       return;
     }
@@ -880,6 +1316,34 @@ export default function App() {
 
     previewCleanup({ silent: true });
   }, [activeTab, cleanupPreview]);
+
+  useEffect(() => {
+    if (activeTab !== 'statistics') {
+      return;
+    }
+
+    loadStatistics({ silent: true });
+    const intervalId = window.setInterval(() => {
+      loadStatistics({ silent: true });
+    }, REFRESH_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (!cloudChatProviderId) {
+      return;
+    }
+
+    if (activeCloudProvider?.isConnected) {
+      return;
+    }
+
+    resetCloudChat();
+  }, [cloudChatProviderId, activeCloudProvider?.isConnected]);
+
   if (isLoading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-shell text-white">
@@ -904,7 +1368,7 @@ export default function App() {
         <Sidebar
           activeTab={activeTab}
           hardware={appState.hardware}
-          installedCount={tools.length}
+          installedCount={libraryCount}
           logsBusy={busyMap['open-logs']}
           modelManagerCount={modelManagerCount}
           onChangeTab={setActiveTab}
@@ -915,14 +1379,35 @@ export default function App() {
         <main className="space-y-5">
           <ResourceStrip
             activeTab={activeTab}
-            installedCount={tools.length}
+            installedCount={libraryCount}
             resources={appState.resources}
             runningCount={runningCount}
             storage={appState.storage}
+            updateCount={toolUpdateSummary.availableCount || 0}
           />
 
           {activeTab === 'library' ? (
             <section className="space-y-4">
+              <ToolUpdatesPanel busyMap={busyMap} onUpdateTool={updateLibraryTool} summary={toolUpdateSummary} />
+
+              {activeCloudProvider ? (
+                <CloudChatPanel
+                  busy={busyMap[`provider-models:${cloudChatProviderId}`] || cloudChatBusy}
+                  draft={cloudDraft}
+                  messages={cloudMessages}
+                  models={cloudModels}
+                  modelsLoading={cloudModelsLoading}
+                  notice={cloudNotice}
+                  onChangeDraft={setCloudDraft}
+                  onChangeModel={setCloudSelectedModel}
+                  onHide={resetCloudChat}
+                  onRefreshModels={() => loadCloudModels()}
+                  onSend={sendCloudMessage}
+                  provider={activeCloudProvider}
+                  selectedModel={cloudSelectedModel}
+                />
+              ) : null}
+
               {ollamaTool && ollamaChatOpen ? (
                 <OllamaChatPanel
                   busy={busyMap['launch:ollama'] || busyMap['stop:ollama'] || ollamaChatBusy}
@@ -978,40 +1463,59 @@ export default function App() {
                 />
               ) : null}
 
-              {tools.length ? (
-                tools.map((tool) => (
-                  <LibraryCard
-                    key={tool.id}
-                    busyMap={busyMap}
-                    onLaunch={(toolId) => runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId))}
-                    onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
-                    onOpenInterface={openEmbeddedToolUi}
-                    onUninstall={uninstallLibraryTool}
-                    onRepair={() => repairLibraryTool(tool)}
-                    onRestoreSnapshot={(toolId, snapshotFileName) =>
-                      runAction(`restore:${toolId}`, () => window.localAIHub.restoreSnapshot({ toolId, snapshotFileName }))
-                    }
-                    onSaveSnapshot={(toolId) => runAction(`snapshot:${toolId}`, () => window.localAIHub.saveSnapshot(toolId))}
-                    onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
-                    onToggleSettings={(toolId) => setSettingsToolId((current) => (current === toolId ? null : toolId))}
-                    progress={progressMap[tool.id]}
-                    resources={appState.resources}
-                    settingsOpen={settingsToolId === tool.id}
-                    tool={tool}
-                  />
-                ))
-              ) : (
+              {connectedProviders.map((provider) => (
+                <ProviderCard
+                  key={provider.id}
+                  busyMap={busyMap}
+                  onOpenChat={openCloudProviderChat}
+                  onOpenSettings={() => setActiveTab('settings')}
+                  provider={provider}
+                />
+              ))}
+
+              {tools.map((tool) => (
+                <LibraryCard
+                  key={tool.id}
+                  busyMap={busyMap}
+                  launchProgress={launchProgressMap[tool.id]}
+                  onLaunch={(toolId) => runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId))}
+                  onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
+                  onOpenInterface={openEmbeddedToolUi}
+                  onRepair={() => repairLibraryTool(tool)}
+                  onRestoreSnapshot={(toolId, snapshotFileName) =>
+                    runAction(`restore:${toolId}`, () => window.localAIHub.restoreSnapshot({ toolId, snapshotFileName }))
+                  }
+                  onSaveSnapshot={(toolId) => runAction(`snapshot:${toolId}`, () => window.localAIHub.saveSnapshot(toolId))}
+                  onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
+                  onToggleSettings={(toolId) => setSettingsToolId((current) => (current === toolId ? null : toolId))}
+                  onUninstall={uninstallLibraryTool}
+                  onUpdate={updateLibraryTool}
+                  progress={progressMap[tool.id]}
+                  resources={appState.resources}
+                  settingsOpen={settingsToolId === tool.id}
+                  tool={tool}
+                  updateInfo={toolUpdateMap[tool.id]}
+                  updateProgress={updateProgressMap[tool.id]}
+                />
+              ))}
+
+              {!libraryCount ? (
                 <div className="panel p-10 text-center">
                   <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Library</p>
                   <h3 className="mt-3 text-3xl font-semibold text-white">Your shelf is empty.</h3>
                   <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-slate-300">
-                    Switch to Store to install a supported local AI tool or let Local AI Hub detect software already installed on this machine.
+                    Switch to Store to install a supported local AI tool, or open Settings to connect a supported cloud provider.
                   </p>
-                  <button className="primary-button mt-6" onClick={() => setActiveTab('store')} type="button">
-                    Open Store
-                  </button>
+                  <div className="mt-6 flex flex-wrap justify-center gap-3">
+                    <button className="primary-button" onClick={() => setActiveTab('store')} type="button">
+                      Open Store
+                    </button>
+                    <button className="ghost-button" onClick={() => setActiveTab('settings')} type="button">
+                      Open Settings
+                    </button>
+                  </div>
                 </div>
-              )}
+              ) : null}
             </section>
           ) : activeTab === 'store' ? (
             <section className="panel p-6">
@@ -1059,20 +1563,38 @@ export default function App() {
             </section>
           ) : activeTab === 'models' ? (
             <ModelManager onToast={pushToast} tools={tools} />
-          ) : (
-            <SettingsPanel
-              busyMap={busyMap}
-              cleanupPreview={cleanupPreview}
-              onChangeStorageDraft={setStorageDraft}
-              onChooseStorageFolder={chooseStorageFolder}
-              onDismissLegacyMigration={dismissLegacyMigration}
-              onMigrateLegacyStorage={migrateLegacyStorage}
-              onPreviewCleanup={() => previewCleanup()}
-              onRunCleanup={runCleanupNow}
-              onSaveStorageLocation={() => saveStorageLocation()}
-              storage={appState.storage}
-              storageDraft={storageDraft}
+          ) : activeTab === 'statistics' ? (
+            <StatisticsPanel
+              busy={statisticsBusy}
+              data={statisticsData || {}}
+              onOpenCleanup={() => setActiveTab('settings')}
+              onRefresh={() => loadStatistics({ manual: true })}
             />
+          ) : (
+            <section className="space-y-5">
+              <SettingsPanel
+                busyMap={busyMap}
+                cleanupPreview={cleanupPreview}
+                onChangeStorageDraft={setStorageDraft}
+                onChooseStorageFolder={chooseStorageFolder}
+                onDismissLegacyMigration={dismissLegacyMigration}
+                onMigrateLegacyStorage={migrateLegacyStorage}
+                onPreviewCleanup={() => previewCleanup()}
+                onRunCleanup={runCleanupNow}
+                onSaveStorageLocation={() => saveStorageLocation()}
+                storage={appState.storage}
+                storageDraft={storageDraft}
+              />
+              <ConnectionsPanel
+                busyMap={busyMap}
+                drafts={providerKeyDrafts}
+                onChangeDraft={changeProviderDraft}
+                onDisconnect={disconnectProviderConnection}
+                onSave={saveProviderKey}
+                onTest={testProvider}
+                providers={providers}
+              />
+            </section>
           )}
         </main>
       </div>
@@ -1085,13 +1607,3 @@ export default function App() {
     </div>
   );
 }
-
-
-
-
-
-
-
-
-
-

@@ -40,9 +40,49 @@ function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
   );
 }
 
+function ProgressNotice({ progress, showSpinner = false, accent = 'cyan' }) {
+  if (!progress) {
+    return null;
+  }
+
+  const hasPercent = Number.isFinite(progress.percent);
+  const toneClass =
+    accent === 'emerald'
+      ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-100'
+      : 'border-cyan-400/20 bg-cyan-400/10 text-cyan-50';
+  const barClass = accent === 'emerald' ? 'bg-emerald-300' : 'bg-cyan-300';
+
+  return (
+    <div className={`mt-5 rounded-3xl border p-4 text-sm ${toneClass}`}>
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex min-w-0 items-start gap-3">
+          {showSpinner ? (
+            <span className={`mt-0.5 h-4 w-4 shrink-0 rounded-full border-2 ${accent === 'emerald' ? 'border-emerald-100/25 border-t-emerald-100' : 'border-cyan-100/25 border-t-cyan-100'} animate-spin`} />
+          ) : null}
+          <div className="min-w-0">
+            <p>{progress.message}</p>
+            {progress.detail ? <p className="mt-2 text-xs leading-5 opacity-80">{progress.detail}</p> : null}
+          </div>
+        </div>
+        <span className="shrink-0">{hasPercent ? `${progress.percent}%` : 'Working...'}</span>
+      </div>
+      <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-950/35">
+        {hasPercent ? (
+          <div className={`h-full rounded-full transition-all ${barClass}`} style={{ width: progressWidth(progress.percent) }} />
+        ) : (
+          <div className={`h-full w-1/3 animate-pulse rounded-full ${barClass}/85`} />
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function LibraryCard({
   tool,
+  launchProgress,
   progress,
+  updateProgress,
+  updateInfo,
   busyMap,
   resources,
   settingsOpen,
@@ -55,10 +95,12 @@ export default function LibraryCard({
   onRestoreSnapshot,
   onOpenFolder,
   onUninstall,
+  onUpdate,
 }) {
   const runningUsage = tool.status === 'running' ? formatUsage(resources?.vramUsedMb, resources?.vramTotalMb) : 'Idle';
   const canRepair = tool.source === 'managed' || tool.installKind === 'installer-exe';
   const canSnapshot = tool.source === 'managed';
+  const hasUpdate = Boolean(updateInfo?.updateAvailable);
 
   return (
     <article className="library-card">
@@ -70,6 +112,7 @@ export default function LibraryCard({
               <h3 className="text-3xl font-semibold tracking-tight text-white">{tool.name}</h3>
               <span className={`status-pill ${statusClass(tool.status)}`}>{tool.status.charAt(0).toUpperCase() + tool.status.slice(1)}</span>
               <span className="status-pill border-white/10 bg-white/5 text-slate-300">{tool.category || 'Tool'}</span>
+              {hasUpdate ? <span className="status-pill border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Update available</span> : null}
             </div>
             <p className="mt-3 text-sm leading-6 text-slate-300">{tool.description}</p>
             <div className="mt-5 grid gap-3 md:grid-cols-3">
@@ -96,6 +139,11 @@ export default function LibraryCard({
               {embeddedActionLabel(tool)}
             </button>
           ) : null}
+          {hasUpdate ? (
+            <button className="ghost-button" disabled={busyMap[`update:${tool.id}`]} onClick={() => onUpdate(tool.id)} type="button">
+              {busyMap[`update:${tool.id}`] ? 'Updating...' : 'Update'}
+            </button>
+          ) : null}
           <button className="ghost-button" onClick={() => onToggleSettings(tool.id)} type="button">
             {settingsOpen ? 'Hide settings' : 'Settings'}
           </button>
@@ -110,17 +158,9 @@ export default function LibraryCard({
         </div>
       </div>
 
-      {progress ? (
-        <div className="mt-5 rounded-3xl border border-cyan-400/20 bg-cyan-400/10 p-4 text-sm text-cyan-50">
-          <div className="flex items-center justify-between gap-4">
-            <span>{progress.message}</span>
-            <span>{progress.percent}%</span>
-          </div>
-          <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-950/35">
-            <div className="h-full rounded-full bg-cyan-300 transition-all" style={{ width: progressWidth(progress.percent) }} />
-          </div>
-        </div>
-      ) : null}
+      <ProgressNotice progress={launchProgress} showSpinner />
+      <ProgressNotice progress={progress} />
+      <ProgressNotice accent="emerald" progress={updateProgress} showSpinner />
 
       {tool.lastError ? (
         <div className="mt-5 rounded-3xl border border-rose-400/25 bg-rose-400/10 p-4 text-sm text-rose-100">
@@ -138,6 +178,10 @@ export default function LibraryCard({
         </div>
       ) : null}
 
+      {tool.lastUpdateMessage && !tool.lastError ? (
+        <div className="mt-5 rounded-3xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-sm text-cyan-50">{tool.lastUpdateMessage}</div>
+      ) : null}
+
       {tool.lastRepairMessage && !tool.lastError ? (
         <div className="mt-5 rounded-3xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-sm text-emerald-100">
           {tool.lastRepairMessage}
@@ -153,12 +197,22 @@ export default function LibraryCard({
               <button className="ghost-button w-full justify-center" onClick={() => onOpenFolder(tool.id)} type="button">
                 Open folder
               </button>
+              {hasUpdate ? (
+                <button className="ghost-button w-full justify-center" disabled={busyMap[`update:${tool.id}`]} onClick={() => onUpdate(tool.id)} type="button">
+                  {busyMap[`update:${tool.id}`] ? 'Updating...' : `Update to ${updateInfo.availableVersion || 'latest'}`}
+                </button>
+              ) : null}
               {canRepair ? (
                 <button className="ghost-button w-full justify-center" disabled={busyMap[`repair:${tool.id}`]} onClick={() => onRepair(tool.id)} type="button">
                   {busyMap[`repair:${tool.id}`] ? 'Repairing...' : 'Repair install'}
                 </button>
               ) : null}
             </div>
+            {hasUpdate ? (
+              <div className="mt-5 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-3 text-sm text-cyan-50">
+                Installed {updateInfo.currentVersion || 'Unknown'} | Available {updateInfo.availableVersion || 'Unknown'}
+              </div>
+            ) : null}
           </div>
 
           <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">

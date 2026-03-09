@@ -1,0 +1,163 @@
+[
+  {
+    "name": "OpenAI (ChatGPT)",
+    "id": "openai",
+    "apiEndpoint": "https://api.openai.com/v1",
+    "authType": "bearer",
+    "modelsEndpoint": "/models",
+    "docsUrl": "https://platform.openai.com/docs/api-reference/models",
+    "configuration": {
+      "protocol": "openai-compatible",
+      "chatEndpoint": "/chat/completions",
+      "preferredModelPrefixes": [
+        "gpt-5",
+        "gpt-4.1",
+        "gpt-4o"
+      ],
+      "blockedModelPatterns": [
+        "embedding",
+        "audio",
+        "image",
+        "moderation",
+        "tts",
+        "transcription",
+        "whisper"
+      ],
+      "maxOutputTokens": 1024
+    }
+  },
+  {
+    "name": "Anthropic (Claude)",
+    "id": "anthropic",
+    "apiEndpoint": "https://api.anthropic.com/v1",
+    "authType": "x-api-key",
+    "modelsEndpoint": "/models",
+    "docsUrl": "https://docs.anthropic.com/en/api/models-list",
+    "configuration": {
+      "protocol": "anthropic",
+      "chatEndpoint": "/messages",
+      "preferredModelPrefixes": [
+        "claude-opus",
+        "claude-sonnet",
+        "claude-haiku"
+      ],
+      "maxOutputTokens": 1024,
+      "anthropicVersion": "2023-06-01"
+    }
+  },
+  {
+    "name": "Google (Gemini)",
+    "id": "google",
+    "apiEndpoint": "https://generativelanguage.googleapis.com/v1beta",
+    "authType": "x-goog-api-key",
+    "modelsEndpoint": "/models",
+    "docsUrl": "https://ai.google.dev/gemini-api/docs/models",
+    "configuration": {
+      "protocol": "google-gemini",
+      "preferredModelPrefixes": [
+        "models/gemini-2.5-flash",
+        "models/gemini-2.5-pro",
+        "models/gemini-2.0-flash"
+      ],
+      "blockedModelPatterns": [
+        "embedding",
+        "imagen",
+        "veo",
+        "aqa",
+        "tts"
+      ],
+      "maxOutputTokens": 1024
+    }
+  },
+  {
+    "name": "Mistral",
+    "id": "mistral",
+    "apiEndpoint": "https://api.mistral.ai/v1",
+    "authType": "bearer",
+    "modelsEndpoint": "/models",
+    "docsUrl": "https://docs.mistral.ai/api/",
+    "configuration": {
+      "protocol": "openai-compatible",
+      "chatEndpoint": "/chat/completions",
+      "preferredModelPrefixes": [
+        "mistral-medium",
+        "mistral-small",
+        "open-mixtral"
+      ],
+      "blockedModelPatterns": [
+        "embed",
+        "moderation"
+      ],
+      "maxOutputTokens": 1024
+    }
+  },
+  {
+    "name": "Groq",
+    "id": "groq",
+    "apiEndpoint": "https://api.groq.com/openai/v1",
+    "authType": "bearer",
+    "modelsEndpoint": "/models",
+    "docsUrl": "https://console.groq.com/docs/api-reference#models",
+    "configuration": {
+      "protocol": "openai-compatible",
+      "chatEndpoint": "/chat/completions",
+      "preferredModelPrefixes": [
+        "openai/gpt-oss",
+        "llama-3.3",
+        "llama-3.1"
+      ],
+      "blockedModelPatterns": [
+        "whisper",
+        "tts",
+        "playai",
+        "vision-preview"
+      ],
+      "maxOutputTokens": 1024
+    }
+  },
+  {
+    "name": "DeepSeek",
+    "id": "deepseek",
+    "apiEndpoint": "https://api.deepseek.com/v1",
+    "authType": "bearer",
+    "modelsEndpoint": "/models",
+    "docsUrl": "https://api-docs.deepseek.com/",
+    "configuration": {
+      "protocol": "openai-compatible",
+      "chatEndpoint": "/chat/completions",
+      "preferredModelPrefixes": [
+        "deepseek-chat",
+        "deepseek-reasoner"
+      ],
+      "blockedModelPatterns": [
+        "embedding",
+        "tts",
+        "audio"
+      ],
+      "maxOutputTokens": 1024
+    }
+  },
+  {
+    "name": "xAI (Grok)",
+    "id": "xai",
+    "apiEndpoint": "https://api.x.ai/v1",
+    "authType": "bearer",
+    "modelsEndpoint": "/models",
+    "docsUrl": "https://docs.x.ai/docs/api-reference/models",
+    "configuration": {
+      "protocol": "openai-compatible",
+      "chatEndpoint": "/chat/completions",
+      "preferredModelPrefixes": [
+        "grok-4",
+        "grok-3"
+      ],
+      "blockedModelPatterns": [
+        "vision",
+        "image",
+        "embedding",
+        "tts"
+      ],
+      "maxOutputTokens": 1024
+    }
+  }
+]

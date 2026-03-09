@@ -664,8 +664,13 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
   for (let index = 0; index < instructions.length; index += 1) {
     const instruction = instructions[index];
     const baseProgress = 78 + Math.round((index / Math.max(1, instructions.length)) * 14);
+    const baseEnv = buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true });
     let args = ['-m', 'pip', 'install'];
+    let command = pythonPath;
+    let errorMessage = `Local AI Hub could not install ${manifest.name} dependencies.`;
     let installTarget = instruction.value;
+    let message = `Installing ${manifest.name} dependencies.`;
+    let workingDir = toolState.appDir;
 
     if (instruction.kind === 'requirements') {
       const requirementsPath = assertPathInside(
@@ -688,6 +693,31 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
         'Local AI Hub refused to install a Python package path outside the tool folder.',
       );
       args = [...args, installTarget];
+    } else if (instruction.kind === 'python-script') {
+      const scriptPath = assertPathInside(
+        toolState.appDir,
+        path.resolve(toolState.appDir, instruction.value),
+        'Local AI Hub refused to run a setup script outside the tool folder.',
+      );
+      if (!(await fs.pathExists(scriptPath))) {
+        await logger.warn('Skipping missing Python setup script.', {
+          scriptPath,
+        });
+        continue;
+      }
+
+      const scriptArgs = Array.isArray(instruction.args) ? instruction.args.map((value) => String(value)) : [];
+      installTarget = scriptPath;
+      args = [scriptPath, ...scriptArgs];
+      message = instruction.message || `Running the ${manifest.name} setup script.`;
+      errorMessage = `Local AI Hub could not finish the ${manifest.name} setup script.`;
+      workingDir = instruction.workingDir
+        ? assertPathInside(
+            toolState.appDir,
+            path.resolve(toolState.appDir, instruction.workingDir),
+            'Local AI Hub refused to use a setup working folder outside the tool directory.',
+          )
+        : toolState.appDir;
     } else {
       installTarget = assertSafePipInstallTarget(instruction.value);
       args = [...args, installTarget];
@@ -700,17 +730,17 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
         toolId: toolState.id,
         percent: baseProgress,
         stage: 'dependencies',
-        message: `Installing ${manifest.name} dependencies.`,
+        message,
       },
       {
         installTarget,
       },
     );
 
-    await runCommand(pythonPath, args, {
-      cwd: toolState.appDir,
-      env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
-      errorMessage: `Local AI Hub could not install ${manifest.name} dependencies.`,
+    await runCommand(command, args, {
+      cwd: workingDir,
+      env: baseEnv,
+      errorMessage,
     });
 
     await logger.info('Dependency installation step finished.', {
@@ -1537,19 +1567,283 @@ async function uninstallTool(toolState) {
   }
 }
 
+async function extractArchiveToDirectory(archivePath, targetDirectory, logger) {
+  const extractionRoot = `${targetDirectory}__extract`;
+  await logger.info('Extracting update archive into a staging folder.', {
+    archivePath,
+    targetDirectory,
+  });
+
+  await fs.remove(extractionRoot).catch(() => null);
+  await fs.ensureDir(extractionRoot);
+
+  const extension = path.extname(archivePath).toLowerCase();
+  if (extension === '.7z') {
+    const sevenZipPath = app.isPackaged
+      ? path.join(process.resourcesPath, 'bin', '7za.exe')
+      : path.join(__dirname, '..', '..', 'node_modules', '7zip-bin', 'win', 'x64', '7za.exe');
+
+    if (!(await fs.pathExists(sevenZipPath))) {
+      throw new Error('Local AI Hub is missing its 7-Zip helper and could not unpack that update package.');
+    }
+
+    await runCommand(sevenZipPath, ['x', archivePath, '-y', `-o${extractionRoot}`], {
+      cwd: path.dirname(archivePath),
+      errorMessage: 'Local AI Hub could not unpack the update package.',
+    });
+  } else {
+    await extract(archivePath, { dir: extractionRoot });
+  }
+
+  const entries = await fs.readdir(extractionRoot).catch(() => []);
+  const firstEntryPath = entries.length === 1 ? path.join(extractionRoot, entries[0]) : null;
+  const hasSingleRoot = firstEntryPath && (await fs.stat(firstEntryPath)).isDirectory() && entries.length === 1;
+
+  await fs.remove(targetDirectory).catch(() => null);
+  if (hasSingleRoot) {
+    await fs.move(firstEntryPath, targetDirectory, { overwrite: true });
+    await fs.remove(extractionRoot).catch(() => null);
+    return targetDirectory;
+  }
+
+  await fs.move(extractionRoot, targetDirectory, { overwrite: true });
+  return targetDirectory;
+}
+
+async function mergeDirectoryContents(sourceDirectory, targetDirectory) {
+  await fs.ensureDir(targetDirectory);
+  const entries = await fs.readdir(sourceDirectory, { withFileTypes: true }).catch(() => []);
+
+  for (const entry of entries) {
+    const sourcePath = path.join(sourceDirectory, entry.name);
+    const targetPath = path.join(targetDirectory, entry.name);
+
+    if (entry.isDirectory()) {
+      await mergeDirectoryContents(sourcePath, targetPath);
+      continue;
+    }
+
+    await fs.ensureDir(path.dirname(targetPath));
+    await fs.copy(sourcePath, targetPath, { overwrite: true });
+  }
+}
+
+async function refreshAppDirectoryFromArchive(archivePath, targetDirectory, logger) {
+  const stagingDirectory = `${targetDirectory}__update`;
+  await extractArchiveToDirectory(archivePath, stagingDirectory, logger);
+  await mergeDirectoryContents(stagingDirectory, targetDirectory);
+  await fs.remove(stagingDirectory).catch(() => null);
+}
+
+async function updateToolInstallation(toolState, options = {}) {
+  await initializeToolRegistry();
+  const manifest = getToolManifest(toolState?.id);
+  if (!manifest) {
+    throw new Error('Local AI Hub could not find the tool definition for update.');
+  }
+
+  const logger = createLogger('installer', {
+    toolId: toolState.id,
+    toolName: manifest.name,
+    mode: 'update',
+  });
+
+  try {
+    const installKind = manifest.installInstructions.kind || 'zip';
+    const runtimeKind = getToolRuntime(manifest);
+    const managedPaths = buildManagedPaths(manifest);
+    const isManagedInstall = toolState.source === 'managed';
+    const safeToolState = isManagedInstall ? ensureManagedToolStatePaths(toolState) : { ...toolState };
+
+    if (!isManagedInstall && runtimeKind === 'python') {
+      throw new Error('Local AI Hub can update externally installed Python tools after they are reinstalled into Local AI Hub-managed storage.');
+    }
+
+    const downloadCachePath = safeToolState.downloadCachePath || managedPaths.archivePath;
+
+    await advanceStep(logger, options.onProgress, {
+      toolId: safeToolState.id,
+      percent: 6,
+      stage: 'preparing',
+      message: `Preparing the latest ${manifest.name} update.`,
+    });
+
+    if (installKind !== 'pip-package') {
+      await fs.remove(downloadCachePath).catch(() => null);
+      await ensureCachedDownload(manifest, downloadCachePath, logger, options.onProgress, safeToolState.id);
+    }
+
+    let updatedState = {
+      ...safeToolState,
+      downloadCachePath,
+    };
+
+    if (installKind === 'single-file') {
+      const downloadFileName = manifest.installInstructions.downloadFileName || path.basename(downloadCachePath) || `${manifest.id}.exe`;
+      const targetDirectory = safeToolState.appDir || safeToolState.installDir || managedPaths.appDir;
+      const destinationPath = path.join(targetDirectory, downloadFileName);
+
+      await advanceStep(logger, options.onProgress, {
+        toolId: safeToolState.id,
+        percent: 55,
+        stage: 'updating',
+        message: `Copying the latest ${manifest.name} build into place.`,
+      });
+
+      await fs.ensureDir(targetDirectory);
+      await fs.copy(downloadCachePath, destinationPath, { overwrite: true });
+      updatedState = {
+        ...updatedState,
+        appDir: targetDirectory,
+        executablePath: destinationPath,
+      };
+    } else if (installKind === 'installer-exe') {
+      const installDir = safeToolState.installDir || managedPaths.installDir;
+      const appDir = safeToolState.appDir || safeToolState.installDir || managedPaths.appDir;
+
+      await advanceStep(logger, options.onProgress, {
+        toolId: safeToolState.id,
+        percent: 55,
+        stage: 'updating',
+        message: `Running the latest ${manifest.name} installer.`,
+      });
+
+      await runCommand(downloadCachePath, resolveInstallerArgs(manifest, installDir, appDir), {
+        cwd: path.dirname(downloadCachePath),
+        errorMessage: `Local AI Hub could not run the ${manifest.name} updater.`,
+      });
+
+      if (!isManagedInstall) {
+        const discoveredTools = await syncDiscoveredTools({ force: true });
+        const refreshedTool = discoveredTools[safeToolState.id];
+        if (await toolIsAvailable(refreshedTool)) {
+          updatedState = {
+            ...safeToolState,
+            ...refreshedTool,
+            downloadCachePath,
+          };
+        }
+      }
+    } else if (installKind === 'pip-package') {
+      const pythonResolution = await resolveManagedPythonRuntime(
+        safeToolState.appDir || managedPaths.appDir,
+        manifest,
+        logger,
+        options.onProgress,
+        safeToolState.id,
+      );
+      updatedState = createManagedToolState(
+        manifest,
+        safeToolState.installDir || managedPaths.installDir,
+        safeToolState.appDir || managedPaths.appDir,
+        safeToolState.venvDir || managedPaths.venvDir,
+        downloadCachePath,
+        pythonResolution,
+      );
+      if (updatedState.venvDir) {
+        await fs.remove(updatedState.venvDir).catch(() => null);
+      }
+
+      await advanceStep(logger, options.onProgress, {
+        toolId: safeToolState.id,
+        percent: 48,
+        stage: 'updating',
+        message: `Refreshing ${manifest.name} inside its Python environment.`,
+      });
+
+      await installPythonDependencies(updatedState, manifest, options.onProgress, logger, pythonResolution.runtime);
+    } else {
+      const targetDirectory = safeToolState.appDir || safeToolState.installDir || managedPaths.appDir;
+      await advanceStep(logger, options.onProgress, {
+        toolId: safeToolState.id,
+        percent: 45,
+        stage: 'updating',
+        message: `Expanding the latest ${manifest.name} files.`,
+      });
+      await refreshAppDirectoryFromArchive(downloadCachePath, targetDirectory, logger);
+      updatedState = {
+        ...updatedState,
+        appDir: targetDirectory,
+      };
+
+      if (isManagedInstall && runtimeKind === 'python') {
+        const pythonResolution = await resolveManagedPythonRuntime(
+          targetDirectory,
+          manifest,
+          logger,
+          options.onProgress,
+          safeToolState.id,
+        );
+        updatedState = createManagedToolState(
+          manifest,
+          safeToolState.installDir || managedPaths.installDir,
+          targetDirectory,
+          safeToolState.venvDir || managedPaths.venvDir,
+          downloadCachePath,
+          pythonResolution,
+        );
+        if (updatedState.venvDir) {
+          await fs.remove(updatedState.venvDir).catch(() => null);
+        }
+        await installPythonDependencies(updatedState, manifest, options.onProgress, logger, pythonResolution.runtime);
+      }
+    }
+
+    if (isManagedInstall && runtimeKind !== 'python' && installKind !== 'pip-package') {
+      const refreshedManagedState = createManagedToolState(
+        manifest,
+        safeToolState.installDir || managedPaths.installDir,
+        updatedState.appDir || safeToolState.appDir || managedPaths.appDir,
+        safeToolState.venvDir || managedPaths.venvDir,
+        downloadCachePath,
+        null,
+      );
+      updatedState = {
+        ...refreshedManagedState,
+        ...updatedState,
+      };
+    }
+
+    updatedState = {
+      ...updatedState,
+      downloadCachePath,
+      lastError: null,
+      lastRepairMessage: null,
+      lastUpdateMessage: `Local AI Hub updated ${manifest.name}.`,
+      status: 'stopped',
+    };
+
+    if (isManagedInstall) {
+      updatedState = ensureManagedToolStatePaths({
+        ...updatedState,
+        source: 'managed',
+        managedByLocalAIHub: true,
+      });
+    }
+
+    await upsertTool(updatedState);
+
+    await advanceStep(logger, options.onProgress, {
+      toolId: safeToolState.id,
+      percent: 100,
+      stage: 'complete',
+      message: updatedState.lastUpdateMessage,
+    });
+
+    return updatedState;
+  } catch (error) {
+    await logger.error('Update failed.', {
+      error,
+      readableMessage: humanizeError(error, `Local AI Hub could not update ${manifest.name}.`),
+    });
+    throw error;
+  }
+}
 module.exports = {
   getToolInstallPreflight,
   inspectToolRepair,
   installTool,
   repairToolInstallation,
   uninstallTool,
+  updateToolInstallation,
 };
-
-
-
-
-
-
-
-
-

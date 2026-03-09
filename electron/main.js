@@ -33,7 +33,14 @@ const {
 } = require('./services/modelService');
 const { invalidateDiscoveryCache, syncDiscoveredTools } = require('./services/toolDiscoveryService');
 const { detectHardwareSnapshot, getLiveResourceUsage } = require('./services/hardwareService');
-const { getToolInstallPreflight, inspectToolRepair, installTool, repairToolInstallation, uninstallTool } = require('./services/installerService');
+const {
+  getToolInstallPreflight,
+  inspectToolRepair,
+  installTool,
+  repairToolInstallation,
+  uninstallTool,
+  updateToolInstallation,
+} = require('./services/installerService');
 const { listOllamaModels, chatWithOllama } = require('./services/ollamaService');
 const {
   disposeAllRuntimes,
@@ -50,14 +57,31 @@ const { inspectCleanupTargets, runCleanup } = require('./services/storageCleanup
 const { dismissManagedDataMigration, getStorageOverview, setManagedDataRoot } = require('./services/storageLocationService');
 const { getToolCatalog, getToolManifest, initializeToolRegistry } = require('./services/toolRegistry');
 const { getManifestStatus } = require('./services/manifestService');
+const { getProviderManifestStatus, initializeProviderRegistry } = require('./services/providerRegistry');
+const {
+  chatWithProvider,
+  disconnectProvider,
+  listProviderConnections,
+  listProviderModels,
+  saveProviderConnection,
+  testProviderConnection,
+} = require('./services/providerService');
+const { getStatisticsSnapshot, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
+const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./services/toolUpdateService');
 const { transcribeWithWhisper } = require('./services/whisperService');
 const { configureAutoUpdates, restartToInstallUpdate } = require('./services/updateService');
 
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
+const TOOL_HEALTH_CHECK_INTERVAL_MS = 10000;
+const STATISTICS_SAMPLE_INTERVAL_MS = 5000;
 
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
+let backgroundHealthInterval = null;
+let backgroundStatsInterval = null;
+let healthCheckBusy = false;
+let toolUpdateCheckPromise = null;
 
 function getRendererUrl() {
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -84,6 +108,21 @@ function getStopMessage(tool) {
   }
 
   return `${tool?.name || 'The tool'} was stopped.`;
+}
+
+async function notify(title, body, options = {}) {
+  if (!Notification.isSupported()) {
+    return null;
+  }
+
+  const notification = new Notification({
+    title,
+    body,
+    icon: getAppIconPath(),
+    ...options,
+  });
+  notification.show();
+  return notification;
 }
 
 function sendUpdateReadyNotification() {
@@ -113,6 +152,7 @@ async function maybeNotifyStoppedTool(tool) {
 
 async function launchToolFromExplicitUserAction(tool, options = {}) {
   await launchToolFromUserAction(tool, options);
+  await recordToolLaunch(tool).catch(() => null);
   const nextState = await buildAppState();
   const nextTool = toolLookup(tool.id, nextState.tools);
   openInternalToolInterface(nextTool);
@@ -124,6 +164,7 @@ async function launchToolFromExplicitUserAction(tool, options = {}) {
 
 async function buildAppState(options = {}) {
   await initializeToolRegistry({ refreshRemote: Boolean(options.refreshManifest) });
+  await initializeProviderRegistry();
   await syncDiscoveredTools({ force: Boolean(options.forceDiscovery) });
 
   const config = await readConfig();
@@ -152,6 +193,11 @@ async function buildAppState(options = {}) {
           ...mergedTool,
           status: await resolveToolStatus(mergedTool),
           snapshots: mergedTool.source === 'managed' ? await listSnapshots(mergedTool.id) : [],
+          updateSupported:
+            mergedTool.source === 'managed' ||
+            manifest.installInstructions?.kind === 'installer-exe' ||
+            manifest.installInstructions?.kind === 'single-file' ||
+            manifest.installInstructions?.runtime === 'binary',
         };
       }),
   );
@@ -174,8 +220,11 @@ async function buildAppState(options = {}) {
     managedDataPath: paths.managedRoot,
     manifests,
     manifestStatus: getManifestStatus(),
+    providerManifestStatus: getProviderManifestStatus(),
+    providers: await listProviderConnections(),
     resources: await getLiveResourceUsage(paths.managedRoot),
     storage,
+    toolUpdates: await getToolUpdateSnapshot(tools),
     tools,
   };
 }
@@ -265,7 +314,6 @@ function createWindow() {
     mainWindow.show();
   });
 
-
   mainWindow.on('minimize', (event) => {
     event.preventDefault();
     mainWindow.hide();
@@ -281,18 +329,28 @@ function createWindow() {
   });
 }
 
-async function notify(title, body) {
-  if (Notification.isSupported()) {
-    new Notification({ title, body }).show();
-  }
-}
-
 function sendInstallProgress(payload) {
   mainWindow?.webContents.send('tools:install-progress', payload);
 }
 
+function sendUpdateProgress(payload) {
+  mainWindow?.webContents.send('tools:update-progress', payload);
+}
+
 function sendModelProgress(payload) {
   mainWindow?.webContents.send('models:download-progress', payload);
+}
+
+function sendToolState(payload) {
+  mainWindow?.webContents.send('tools:tool-state', payload);
+}
+
+function sendUnexpectedStop(payload) {
+  mainWindow?.webContents.send('tools:unexpected-stop', payload);
+}
+
+function sendToolUpdateSummary(payload) {
+  mainWindow?.webContents.send('tools:update-summary', payload);
 }
 
 function toolLookup(toolId, tools) {
@@ -309,6 +367,143 @@ function modelToolLookup(toolId, tools) {
     throw new Error(`${tool.name} does not support the Model Manager yet.`);
   }
   return tool;
+}
+
+async function relaunchToolInBackground(toolId) {
+  const state = await buildAppState();
+  const tool = toolLookup(toolId, state.tools);
+  await launchToolFromExplicitUserAction(tool, {
+    skipOpenInterface: true,
+    launchContext: 'notification-relaunch',
+  });
+  await notify('Local AI Hub', `${tool.name} is relaunching in the background.`).catch(() => null);
+}
+
+async function showUnexpectedStopNotification(payload) {
+  if (!Notification.isSupported() || !payload?.toolId) {
+    return;
+  }
+
+  const notification = new Notification({
+    title: `${payload.toolName || 'A tool'} stopped`,
+    body: payload.canRelaunch ? `${payload.message} Click Relaunch to start it again.` : payload.message,
+    icon: getAppIconPath(),
+    actions: payload.canRelaunch ? [{ type: 'button', text: 'Relaunch' }] : [],
+    closeButtonText: 'Dismiss',
+  });
+
+  if (payload.canRelaunch) {
+    notification.on('action', (_event, index) => {
+      if (index === 0) {
+        relaunchToolInBackground(payload.toolId).catch(() => null);
+      }
+    });
+
+    notification.on('click', () => {
+      relaunchToolInBackground(payload.toolId).catch(() => null);
+    });
+  } else {
+    notification.on('click', showWindow);
+  }
+
+  notification.show();
+}
+
+async function checkRunningToolsHealth() {
+  if (healthCheckBusy || isQuitting) {
+    return;
+  }
+
+  healthCheckBusy = true;
+  try {
+    await initializeToolRegistry();
+    const config = await readConfig();
+    for (const storedTool of Object.values(config.tools || {})) {
+      if (storedTool.status !== 'running') {
+        continue;
+      }
+
+      const mergedTool = {
+        ...(getToolManifest(storedTool.id) || {}),
+        ...storedTool,
+      };
+      const active = await isToolActive(mergedTool).catch(() => false);
+      if (active) {
+        continue;
+      }
+
+      const message = `${mergedTool.name} stopped unexpectedly while it was running.`;
+      await upsertTool({
+        id: mergedTool.id,
+        status: 'error',
+        lastError: message,
+      });
+      const eventPayload = {
+        toolId: mergedTool.id,
+        toolName: mergedTool.name,
+        status: 'error',
+        lastError: message,
+        message,
+        canRelaunch: mergedTool.launchSupported !== false,
+      };
+      sendToolState(eventPayload);
+      sendUnexpectedStop(eventPayload);
+      await showUnexpectedStopNotification(eventPayload).catch(() => null);
+    }
+
+    await updateTrayMenu().catch(() => null);
+  } finally {
+    healthCheckBusy = false;
+  }
+}
+
+async function sampleRuntimeStatistics() {
+  if (isQuitting) {
+    return;
+  }
+
+  await initializeToolRegistry();
+  const config = await readConfig();
+  const runningTools = [];
+  for (const storedTool of Object.values(config.tools || {})) {
+    if (storedTool.status !== 'running') {
+      continue;
+    }
+
+    const mergedTool = {
+      ...(getToolManifest(storedTool.id) || {}),
+      ...storedTool,
+    };
+    if (await isToolActive(mergedTool).catch(() => false)) {
+      runningTools.push(mergedTool);
+    }
+  }
+
+  if (runningTools.length > 0) {
+    await recordVramSample(runningTools).catch(() => null);
+  }
+}
+
+async function runSilentToolUpdateCheck(tools = null) {
+  if (toolUpdateCheckPromise) {
+    return toolUpdateCheckPromise;
+  }
+
+  toolUpdateCheckPromise = (async () => {
+    const state = tools ? { tools } : await buildAppState();
+    await refreshInstalledToolUpdates(state.tools || []).catch(() => null);
+    const summary = await getToolUpdateSnapshot(state.tools || []);
+    if (summary.availableCount > 0) {
+      sendToolUpdateSummary(summary);
+    }
+    return summary;
+  })();
+
+  try {
+    return await toolUpdateCheckPromise;
+  } finally {
+    toolUpdateCheckPromise = null;
+  }
 }
 
 async function withPlainEnglishErrors(handler, fallbackMessage) {
@@ -368,9 +563,10 @@ function registerIpcHandlers() {
       const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const tool = await installTool(toolId, {
         lowDiskConfirmed: Boolean(payload?.lowDiskConfirmed),
-        onProgress: (payload) => sendInstallProgress(payload),
+        onProgress: (progressPayload) => sendInstallProgress(progressPayload),
       });
       invalidateDiscoveryCache();
+      await runSilentToolUpdateCheck([tool]).catch(() => null);
       return {
         message:
           tool.installActionMessage ||
@@ -449,13 +645,34 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not stop that tool.'),
   );
 
+  ipcMain.handle('tools:update', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const toolId = typeof payload === 'string' ? payload : payload?.toolId;
+      const state = await buildAppState();
+      const tool = toolLookup(toolId, state.tools);
+      if (tool.status === 'running') {
+        await stopTool(tool);
+      }
+
+      const updatedTool = await updateToolInstallation(tool, {
+        onProgress: (progressPayload) => sendUpdateProgress(progressPayload),
+      });
+      invalidateDiscoveryCache();
+      await runSilentToolUpdateCheck([updatedTool]).catch(() => null);
+      return {
+        message: updatedTool.lastUpdateMessage || `Local AI Hub updated ${tool.name}.`,
+        state: await buildAppState({ forceDiscovery: true }),
+      };
+    }, 'Local AI Hub could not update that tool.'),
+  );
+
   ipcMain.handle('tools:repair', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
       const repairedTool = await repairToolInstallation(tool, {
-        onProgress: (payload) => sendInstallProgress(payload),
+        onProgress: (progressPayload) => sendInstallProgress(progressPayload),
         removeOrphanedToolFolders: Boolean(payload?.removeOrphanedToolFolders),
       });
       invalidateDiscoveryCache();
@@ -548,6 +765,57 @@ function registerIpcHandlers() {
       };
     }, 'Local AI Hub could not remove those leftover files.'),
   );
+
+  ipcMain.handle('settings:get-statistics', () =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      return getStatisticsSnapshot(state.tools);
+    }, 'Local AI Hub could not load the statistics screen right now.'),
+  );
+
+  ipcMain.handle('providers:list', () =>
+    withPlainEnglishErrors(async () => listProviderConnections(), 'Local AI Hub could not load the cloud provider list.'),
+  );
+
+  ipcMain.handle('providers:save-key', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const provider = await saveProviderConnection(payload?.providerId, payload?.apiKey);
+      return {
+        message: `${provider.name} credentials were saved in Windows Credential Manager.`,
+        provider,
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not save that cloud provider key.'),
+  );
+
+  ipcMain.handle('providers:test', (_event, providerId) =>
+    withPlainEnglishErrors(async () => {
+      const result = await testProviderConnection(providerId);
+      return {
+        ...result,
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not test that cloud provider connection.'),
+  );
+
+  ipcMain.handle('providers:disconnect', (_event, providerId) =>
+    withPlainEnglishErrors(async () => {
+      const result = await disconnectProvider(providerId);
+      return {
+        message: `${result.providerName} was disconnected from this PC.`,
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not disconnect that cloud provider.'),
+  );
+
+  ipcMain.handle('providers:list-models', (_event, providerId) =>
+    withPlainEnglishErrors(async () => listProviderModels(providerId), 'Local AI Hub could not load models for that cloud provider.'),
+  );
+
+  ipcMain.handle('providers:chat', (_event, payload) =>
+    withPlainEnglishErrors(async () => chatWithProvider(payload?.providerId, payload), 'Local AI Hub could not send that cloud provider message.'),
+  );
+
   ipcMain.handle('tools:open-folder', (_event, toolId) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -603,6 +871,7 @@ function registerIpcHandlers() {
       };
     }, 'Local AI Hub could not save the Model Manager settings.'),
   );
+
   ipcMain.handle('models:browse', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -610,6 +879,7 @@ function registerIpcHandlers() {
       return browseRemoteModels(tool, payload);
     }, 'Local AI Hub could not load remote models right now.'),
   );
+
   ipcMain.handle('models:list-local', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -617,6 +887,7 @@ function registerIpcHandlers() {
       return listDownloadedModels(tool);
     }, 'Local AI Hub could not load the downloaded models for that tool.'),
   );
+
   ipcMain.handle('models:get-download-preflight', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -624,6 +895,7 @@ function registerIpcHandlers() {
       return getModelDownloadPreflight(tool, payload);
     }, 'Local AI Hub could not check disk space for that model download.'),
   );
+
   ipcMain.handle('models:download', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -640,6 +912,7 @@ function registerIpcHandlers() {
       };
     }, 'Local AI Hub could not download that model.'),
   );
+
   ipcMain.handle('models:delete', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -677,6 +950,7 @@ function registerIpcHandlers() {
       return transcribeWithWhisper(tool, payload);
     }, 'Local AI Hub could not transcribe that audio file.'),
   );
+
   ipcMain.handle('ollama:list-models', () =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -684,6 +958,7 @@ function registerIpcHandlers() {
       return listOllamaModels(tool);
     }, 'Local AI Hub could not load your local Ollama models.'),
   );
+
   ipcMain.handle('ollama:chat', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -732,6 +1007,24 @@ app.whenReady().then(async () => {
   app.setAppUserModelId(APP_USER_MODEL_ID);
   createWindow();
   setRuntimeEventSink((payload) => {
+    if (payload?.type === 'launch-progress') {
+      mainWindow?.webContents.send('tools:launch-progress', payload);
+      return;
+    }
+
+    if (payload?.type === 'tool-state') {
+      sendToolState(payload);
+      updateTrayMenu().catch(() => null);
+      return;
+    }
+
+    if (payload?.type === 'unexpected-stop') {
+      sendUnexpectedStop(payload);
+      showUnexpectedStopNotification(payload).catch(() => null);
+      updateTrayMenu().catch(() => null);
+      return;
+    }
+
     mainWindow?.webContents.send('tools:runtime-output', payload);
   });
   tray = new Tray(createTrayIcon());
@@ -739,11 +1032,26 @@ app.whenReady().then(async () => {
   registerIpcHandlers();
   configureAutoUpdates({ onUpdateReady: sendUpdateReadyNotification });
   await initializeToolRegistry({ refreshRemote: true });
+  await initializeProviderRegistry();
+  const initialState = await buildAppState({ forceDiscovery: true });
   await updateTrayMenu();
+  await runSilentToolUpdateCheck(initialState.tools).catch(() => null);
+  backgroundHealthInterval = setInterval(() => {
+    checkRunningToolsHealth().catch(() => null);
+  }, TOOL_HEALTH_CHECK_INTERVAL_MS);
+  backgroundStatsInterval = setInterval(() => {
+    sampleRuntimeStatistics().catch(() => null);
+  }, STATISTICS_SAMPLE_INTERVAL_MS);
 });
 
 app.on('before-quit', async () => {
   isQuitting = true;
+  if (backgroundHealthInterval) {
+    clearInterval(backgroundHealthInterval);
+  }
+  if (backgroundStatsInterval) {
+    clearInterval(backgroundStatsInterval);
+  }
   await disposeAllRuntimes();
 });
 
@@ -762,19 +1070,3 @@ app.on('activate', () => {
 
   showWindow();
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

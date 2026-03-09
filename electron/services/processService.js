@@ -15,6 +15,11 @@ const OPEN_TIMEOUT_MS = 30000;
 const SUCCESS_CONFIRM_TIMEOUT_MS = 15000;
 const OUTPUT_BUFFER_LIMIT = 64000;
 const OUTPUT_LOG_LIMIT = 1024 * 1024;
+const STARTUP_DOWNLOAD_ACTIVITY_GRACE_MS = 15 * 60 * 1000;
+const STARTUP_DOWNLOAD_CARRY_LIMIT = 256;
+const DOWNLOAD_KEYWORD_PATTERN = /\b(download(?:ing|ed)?|fetch(?:ing|ed)?|retriev(?:e|ing|ed)?|pull(?:ing|ed)?|sync(?:ing|ed)?|cache(?:ing|d)?|checkpoint|weights?)\b/i;
+const DOWNLOAD_SOURCE_PATTERN = /(https?:\/\/|huggingface|civitai|modelscope|\.safetensors\b|\.ckpt\b|\.pth\b|\.bin\b|\.onnx\b|\.gguf\b|\.pt\b)/i;
+const DOWNLOAD_PROGRESS_PATTERN = /(?:^|[\s|])(\d{1,3})%(?=\s|\||$)/g;
 let runtimeEventSink = null;
 
 function getHelperScriptPath() {
@@ -44,6 +49,29 @@ function emitRuntimeEvent(payload) {
   } catch {
     return;
   }
+}
+
+function emitToolState(toolId, patch = {}) {
+  if (!toolId) {
+    return;
+  }
+
+  emitRuntimeEvent({
+    type: 'tool-state',
+    toolId,
+    status: patch.status || 'stopped',
+    lastError: Object.prototype.hasOwnProperty.call(patch, 'lastError') ? patch.lastError : null,
+  });
+}
+
+function emitUnexpectedStop(toolState, message) {
+  emitRuntimeEvent({
+    type: 'unexpected-stop',
+    toolId: toolState?.id || '',
+    toolName: toolState?.name || 'This tool',
+    message,
+    canRelaunch: toolState?.launchSupported !== false,
+  });
 }
 
 function setRuntimeEventSink(listener) {
@@ -81,6 +109,24 @@ function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function buildStartupDownloadMessage(toolName) {
+  return `${toolName || 'This tool'} is downloading required files on first launch. This may take several minutes.`;
+}
+
+function createStartupDownloadState(toolState) {
+  return {
+    active: false,
+    detectedAt: 0,
+    detail: '',
+    lastActivityAt: 0,
+    lastSignature: '',
+    percent: null,
+    stderrCarry: '',
+    stdoutCarry: '',
+    toolName: toolState?.name || 'This tool',
+  };
 }
 
 function normalizeProcessNames(processNames = []) {
@@ -330,20 +376,28 @@ async function probeUrl(url) {
   }
 }
 
-async function waitForToolReady(toolState, timeoutMs = OPEN_TIMEOUT_MS) {
+async function waitForToolReady(toolState, timeoutMs = OPEN_TIMEOUT_MS, runtimeState = null) {
   if (!toolState?.launchUrl && !toolState?.healthUrl) {
     return false;
   }
 
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const baseDeadline = Date.now() + timeoutMs;
+  while (true) {
     if (await probeUrl(toolState.healthUrl || toolState.launchUrl)) {
       return true;
     }
+
+    const downloadDeadline =
+      runtimeState?.startupDownload?.active && Number(runtimeState.startupDownload.lastActivityAt) > 0
+        ? runtimeState.startupDownload.lastActivityAt + STARTUP_DOWNLOAD_ACTIVITY_GRACE_MS
+        : 0;
+    const effectiveDeadline = Math.max(baseDeadline, downloadDeadline);
+    if (Date.now() >= effectiveDeadline) {
+      return false;
+    }
+
     await sleep(1000);
   }
-
-  return false;
 }
 
 function getStartupTimeoutMs(toolState, fallbackMs = OPEN_TIMEOUT_MS) {
@@ -437,6 +491,147 @@ function trimBufferedOutput(value, limit) {
   return text.length > limit ? text.slice(-limit) : text;
 }
 
+function extractDownloadPercent(text) {
+  let match = null;
+  let latestPercent = null;
+
+  while ((match = DOWNLOAD_PROGRESS_PATTERN.exec(String(text || ''))) !== null) {
+    const percent = Number(match[1]);
+    if (Number.isFinite(percent) && percent >= 0 && percent <= 100) {
+      latestPercent = percent;
+    }
+  }
+
+  DOWNLOAD_PROGRESS_PATTERN.lastIndex = 0;
+  return latestPercent;
+}
+
+function extractDownloadItemLabel(text) {
+  const urlMatch = String(text || '').match(/https?:\/\/[^\s'"]+/i);
+  if (urlMatch?.[0]) {
+    try {
+      const parsed = new URL(urlMatch[0].replace(/[)\]}>,.;]+$/, ''));
+      const fileName = path.basename(parsed.pathname || '');
+      if (fileName) {
+        return fileName;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  const fileMatch = String(text || '').match(/[A-Za-z0-9._-]+\.(?:safetensors|ckpt|pth|bin|onnx|gguf|pt)\b/i);
+  return fileMatch?.[0] || null;
+}
+
+function compactOutputText(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+}
+
+function emitLaunchProgress(runtimeState) {
+  const state = runtimeState?.startupDownload;
+  if (!state) {
+    return;
+  }
+
+  const payload = {
+    type: 'launch-progress',
+    toolId: runtimeState.toolId,
+    active: Boolean(state.active),
+    detail: state.active ? state.detail || null : null,
+    message: buildStartupDownloadMessage(state.toolName),
+    percent: Number.isFinite(state.percent) ? state.percent : null,
+  };
+  const signature = JSON.stringify(payload);
+  if (state.lastSignature === signature) {
+    return;
+  }
+
+  state.lastSignature = signature;
+  emitRuntimeEvent(payload);
+}
+
+function clearLaunchProgress(runtimeState) {
+  if (!runtimeState?.startupDownload) {
+    return;
+  }
+
+  const state = runtimeState.startupDownload;
+  if (!state.active && !state.lastSignature) {
+    return;
+  }
+
+  state.active = false;
+  state.detail = '';
+  state.lastActivityAt = 0;
+  state.percent = null;
+  emitLaunchProgress(runtimeState);
+}
+
+function analyzeStartupDownloadOutput(runtimeState, stream, content) {
+  const state = runtimeState?.startupDownload;
+  if (!state) {
+    return;
+  }
+
+  const carryKey = stream === 'stderr' ? 'stderrCarry' : 'stdoutCarry';
+  const combined = `${state[carryKey] || ''}${String(content || '')}`;
+  state[carryKey] = combined.slice(-STARTUP_DOWNLOAD_CARRY_LIMIT);
+
+  const segments = combined
+    .split(/[\r\n]+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+    .slice(-12);
+
+  let detectedActivity = false;
+  let latestDetail = state.detail;
+  let latestPercent = Number.isFinite(state.percent) ? state.percent : null;
+
+  for (const segment of segments) {
+    const percent = extractDownloadPercent(segment);
+    const looksLikeDownload =
+      /downloading:/i.test(segment) ||
+      (DOWNLOAD_KEYWORD_PATTERN.test(segment) && (DOWNLOAD_SOURCE_PATTERN.test(segment) || /\bdownload/i.test(segment))) ||
+      (state.active && Number.isFinite(percent));
+
+    if (!looksLikeDownload) {
+      continue;
+    }
+
+    detectedActivity = true;
+    if (Number.isFinite(percent)) {
+      latestPercent = latestPercent === null ? percent : Math.max(latestPercent, percent);
+    }
+
+    const itemLabel = extractDownloadItemLabel(segment);
+    if (itemLabel) {
+      latestDetail = `Current file: ${itemLabel}`;
+    } else if (Number.isFinite(percent)) {
+      latestDetail = `Download progress: ${percent}%`;
+    } else {
+      const compact = compactOutputText(segment);
+      if (compact) {
+        latestDetail = compact;
+      }
+    }
+  }
+
+  if (!detectedActivity) {
+    return;
+  }
+
+  state.active = true;
+  state.detectedAt = state.detectedAt || Date.now();
+  state.detail = latestDetail || state.detail || '';
+  state.lastActivityAt = Date.now();
+  state.percent = Number.isFinite(latestPercent) ? Math.min(100, latestPercent) : null;
+  emitLaunchProgress(runtimeState);
+}
+
 function appendRuntimeOutput(runtimeState, key, chunk) {
   const content = typeof chunk === 'string' ? chunk : chunk?.toString?.() || '';
   runtimeState[key] = trimBufferedOutput(`${runtimeState[key] || ''}${content}`, OUTPUT_BUFFER_LIMIT);
@@ -444,7 +639,9 @@ function appendRuntimeOutput(runtimeState, key, chunk) {
   const logKey = key === 'stderrBuffer' ? 'stderrLogBuffer' : 'stdoutLogBuffer';
   runtimeState[logKey] = trimBufferedOutput(`${runtimeState[logKey] || ''}${content}`, OUTPUT_LOG_LIMIT);
 
+  analyzeStartupDownloadOutput(runtimeState, key === 'stderrBuffer' ? 'stderr' : 'stdout', content);
   emitRuntimeEvent({
+    type: 'output',
     toolId: runtimeState.toolId,
     stream: key === 'stderrBuffer' ? 'stderr' : 'stdout',
     chunk: content,
@@ -503,11 +700,13 @@ function createRuntimeLogger(toolState, launchProfile, runtimeOptions = {}) {
 
 async function stopRuntimeProcess(toolId, runtimeState) {
   if (!runtimeState?.process?.pid) {
+    clearLaunchProgress(runtimeState);
     clearRuntime(toolId, runtimeState);
     return;
   }
 
   runtimeState.stopping = true;
+  clearLaunchProgress(runtimeState);
   await killProcessTree(runtimeState.process.pid).catch(() => null);
   clearRuntime(toolId, runtimeState);
 }
@@ -519,10 +718,18 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
 
   if (toolUsesLocalUrl(toolState)) {
     const target = toolState.healthUrl || toolState.launchUrl || `http://127.0.0.1:${toolState.defaultPort}`;
-    const ready = await waitForToolReady(toolState, getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS));
+    const ready = await waitForToolReady(toolState, getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS), runtimeState);
     if (!ready) {
       await logger.warn('Tool did not answer on its expected local URL before the startup timeout.', {
         target,
+        startupDownload: runtimeState.startupDownload?.active
+          ? {
+              detectedAt: runtimeState.startupDownload.detectedAt || null,
+              detail: runtimeState.startupDownload.detail || null,
+              lastActivityAt: runtimeState.startupDownload.lastActivityAt || null,
+              percent: runtimeState.startupDownload.percent,
+            }
+          : null,
         stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
         stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
       });
@@ -533,6 +740,8 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
     await logger.info('Tool answered on its expected local URL.', {
       target,
     });
+    runtimeState.launchConfirmed = true;
+    clearLaunchProgress(runtimeState);
     return;
   }
 
@@ -540,6 +749,8 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
     await logger.info('Tool process started without a local URL health check.', {
       pid: runtimeState.process?.pid || null,
     });
+    runtimeState.launchConfirmed = true;
+    clearLaunchProgress(runtimeState);
     return;
   }
 
@@ -548,18 +759,21 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
     await logger.info('Tool launch was confirmed by an active process after the launcher exited.', {
       runningProcessNames,
     });
+    runtimeState.launchConfirmed = true;
+    clearLaunchProgress(runtimeState);
     return;
   }
 
   throw new Error(`${toolState.name} stopped before Local AI Hub could confirm that it launched.`);
 }
 
-async function confirmLaunchAfterExit(toolState) {
+async function confirmLaunchAfterExit(toolState, runtimeState = null) {
   if (toolUsesLocalUrl(toolState)) {
     return {
       running: await waitForToolReady(
         toolState,
         Math.max(SUCCESS_CONFIRM_TIMEOUT_MS, getStartupTimeoutMs(toolState, SUCCESS_CONFIRM_TIMEOUT_MS)),
+        runtimeState,
       ),
       runningProcessNames: [],
     };
@@ -578,6 +792,7 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
   }
 
   runtimeState.exitHandled = true;
+  clearLaunchProgress(runtimeState);
   clearRuntime(toolState.id, runtimeState);
 
   const logger = runtimeState.logger || createRuntimeLogger(toolState, runtimeState.launchProfile || toolState.launchProfile, runtimeOptions);
@@ -593,11 +808,15 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
       status: 'stopped',
       lastError: null,
     });
+    emitToolState(toolState.id, {
+      status: 'stopped',
+      lastError: null,
+    });
     return;
   }
 
-  const launchState = await confirmLaunchAfterExit(toolState);
-  if (launchState.running) {
+  const launchState = runtimeState.launchConfirmed ? { running: false, runningProcessNames: [] } : await confirmLaunchAfterExit(toolState, runtimeState);
+  if (!runtimeState.launchConfirmed && launchState.running) {
     await logger.info('Launch process exited after the tool became available.', {
       exitCode: code,
       signal,
@@ -608,11 +827,16 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
       status: 'running',
       lastError: null,
     });
+    emitToolState(toolState.id, {
+      status: 'running',
+      lastError: null,
+    });
     return;
   }
 
+  const wasRunning = Boolean(runtimeState.launchConfirmed);
   const isClean = code === 0 || signal === 'SIGTERM';
-  if (isClean) {
+  if (!wasRunning && isClean) {
     await logger.info('Tool process exited cleanly.', {
       exitCode: code,
       signal,
@@ -624,17 +848,30 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
       status: 'stopped',
       lastError: null,
     });
+    emitToolState(toolState.id, {
+      status: 'stopped',
+      lastError: null,
+    });
     return;
   }
 
   const failureText = collectMeaningfulFailureText(toolState, combinedOutput);
-  await logger.error('Tool process exited unexpectedly.', {
-    exitCode: code,
-    signal,
-    launchProfile: buildLaunchCommandSummary(runtimeState.launchProfile || toolState.launchProfile || null),
-    stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
-    stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
-  });
+  if (isClean && wasRunning) {
+    await logger.warn('Tool exited after it had already been confirmed running.', {
+      exitCode: code,
+      signal,
+      stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
+      stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
+    });
+  } else {
+    await logger.error('Tool process exited unexpectedly.', {
+      exitCode: code,
+      signal,
+      launchProfile: buildLaunchCommandSummary(runtimeState.launchProfile || toolState.launchProfile || null),
+      stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
+      stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
+    });
+  }
 
   const recoveryResult = runtimeOptions.autoRecoveryAttempted
     ? { handled: false, recovered: false, userMessage: null }
@@ -653,16 +890,16 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
   }
 
   let message = recoveryResult?.userMessage;
-  if (!message && toolUsesLocalUrl(toolState)) {
+  if (!message && toolUsesLocalUrl(toolState) && !wasRunning) {
     const target = toolState.healthUrl || toolState.launchUrl || `http://127.0.0.1:${toolState.defaultPort}`;
     message = `${toolState.name} stopped before it became available on ${target}. Open the logs folder for the full launch details.`;
   }
 
   if (!message) {
-    message = humanizeError(
-      failureText || `${toolState.name} stopped unexpectedly.`,
-      `${toolState.name} stopped unexpectedly.`,
-    );
+    const fallbackMessage = wasRunning
+      ? `${toolState.name} stopped unexpectedly while it was running.`
+      : `${toolState.name} stopped unexpectedly.`;
+    message = humanizeError(failureText || fallbackMessage, fallbackMessage);
   }
 
   await upsertTool({
@@ -670,6 +907,11 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
     status: 'error',
     lastError: message,
   });
+  emitToolState(toolState.id, {
+    status: 'error',
+    lastError: message,
+  });
+  emitUnexpectedStop(toolState, message);
 }
 
 function attachRuntimeHandlers(toolState, runtimeState, runtimeOptions = {}) {
@@ -735,10 +977,12 @@ async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}
   const runtimeState = rememberRuntime(toolState.id, {
     kind: 'python',
     toolId: toolState.id,
+    toolName: toolState.name,
     process: shellInstance.childProcess,
     shell: shellInstance,
     logger,
     launchProfile: safeLaunchProfile,
+    startupDownload: createStartupDownloadState(toolState),
     stdoutBuffer: '',
     stderrBuffer: '',
     stdoutLogBuffer: '',
@@ -770,9 +1014,11 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
   const runtimeState = rememberRuntime(toolState.id, {
     kind: 'binary',
     toolId: toolState.id,
+    toolName: toolState.name,
     process: child,
     logger,
     launchProfile: safeLaunchProfile,
+    startupDownload: createStartupDownloadState(toolState),
     stdoutBuffer: '',
     stderrBuffer: '',
     stdoutLogBuffer: '',
@@ -806,9 +1052,11 @@ async function launchBatchProfile(toolState, launchProfile, runtimeOptions = {})
   const runtimeState = rememberRuntime(toolState.id, {
     kind: 'batch',
     toolId: toolState.id,
+    toolName: toolState.name,
     process: child,
     logger,
     launchProfile: safeLaunchProfile,
+    startupDownload: createStartupDownloadState(toolState),
     stdoutBuffer: '',
     stderrBuffer: '',
     stdoutLogBuffer: '',
@@ -845,6 +1093,10 @@ async function launchToolInternal(toolState, options = {}) {
       status: 'running',
       lastError: null,
     });
+    emitToolState(toolState.id, {
+      status: 'running',
+      lastError: null,
+    });
     if (!options.skipOpenInterface) {
       openToolInterface(toolState).catch(() => null);
     }
@@ -868,6 +1120,10 @@ async function launchToolInternal(toolState, options = {}) {
       status: 'running',
       lastError: null,
     });
+    emitToolState(toolState.id, {
+      status: 'running',
+      lastError: null,
+    });
     if (!options.skipOpenInterface) {
       openToolInterface(toolState).catch(() => null);
     }
@@ -886,6 +1142,10 @@ async function launchToolInternal(toolState, options = {}) {
   if (launchProfile.kind === 'embedded') {
     await upsertTool({
       id: toolState.id,
+      status: 'running',
+      lastError: null,
+    });
+    emitToolState(toolState.id, {
       status: 'running',
       lastError: null,
     });
@@ -922,6 +1182,10 @@ async function launchToolInternal(toolState, options = {}) {
       status: 'running',
       lastError: null,
     });
+    emitToolState(toolState.id, {
+      status: 'running',
+      lastError: null,
+    });
 
     if (!options.skipOpenInterface) {
       openToolInterface(toolState).catch(() => null);
@@ -936,6 +1200,10 @@ async function launchToolInternal(toolState, options = {}) {
     const message = humanizeError(error, `${toolState.name} could not start.`);
     await upsertTool({
       id: toolState.id,
+      status: 'error',
+      lastError: message,
+    });
+    emitToolState(toolState.id, {
       status: 'error',
       lastError: message,
     });
@@ -968,10 +1236,15 @@ async function stopTool(toolState) {
   const runtime = runtimes.get(toolState.id);
   if (runtime?.process?.pid) {
     runtime.stopping = true;
+    clearLaunchProgress(runtime);
     await killProcessTree(runtime.process.pid);
     clearRuntime(toolState.id, runtime);
     await upsertTool({
       id: toolState.id,
+      status: 'stopped',
+      lastError: null,
+    });
+    emitToolState(toolState.id, {
       status: 'stopped',
       lastError: null,
     });
@@ -982,6 +1255,10 @@ async function stopTool(toolState) {
   if (stoppedProcessNames.length > 0) {
     await upsertTool({
       id: toolState.id,
+      status: 'stopped',
+      lastError: null,
+    });
+    emitToolState(toolState.id, {
       status: 'stopped',
       lastError: null,
     });
@@ -999,12 +1276,17 @@ async function stopTool(toolState) {
     status: 'stopped',
     lastError: null,
   });
+  emitToolState(toolState.id, {
+    status: 'stopped',
+    lastError: null,
+  });
 }
 
 async function disposeAllRuntimes() {
   await Promise.all(
     [...runtimes.values()].map(async (runtime) => {
       runtime.stopping = true;
+      clearLaunchProgress(runtime);
       await killProcessTree(runtime.process?.pid).catch(() => null);
     }),
   );
@@ -1026,4 +1308,6 @@ module.exports = {
   setRuntimeEventSink,
   stopTool,
 };
+
+
 
