@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+﻿import { useEffect, useMemo, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
 
 const MODEL_MANAGER_TOOL_IDS = ['ollama', 'comfyui', 'automatic1111', 'forge', 'lmstudio'];
@@ -107,6 +107,26 @@ function mergeRemoteItems(currentItems, nextItems) {
   }
 
   return merged;
+}
+
+function buildBlockedDiskMessage(subject, preflight) {
+  if (!preflight?.mount) {
+    return `${subject} needs more free disk space before Local AI Hub can continue.`;
+  }
+
+  return `${subject} needs ${formatBytes(preflight.requiredBytes)}, but only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}. Clear space and try again.`;
+}
+
+function buildLowDiskConfirmationMessage(subject, preflight) {
+  if (!preflight?.mount) {
+    return `${subject} may leave the target drive very low on free space. Continue?`;
+  }
+
+  if (preflight?.sizeKnown) {
+    return `${subject} needs about ${formatBytes(preflight.requiredBytes)}. Only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}, so this would leave less than 10% free. Continue?`;
+  }
+
+  return `${subject} may leave ${preflight.mount} very low on free space, and Local AI Hub could not confirm the file size first. Continue?`;
 }
 
 function badgeClass(tone) {
@@ -402,8 +422,34 @@ export default function ModelManager({ tools, onToast }) {
   }, [selectedToolId, selectedSource, modelType, sort, taskType]);
 
   async function handleDownload(item) {
+    const subject = item?.name || item?.fileName || 'This model';
+    const preflightResult = await window.localAIHub.getModelDownloadPreflight({
+      ...item,
+      toolId: selectedToolId,
+    });
+
+    if (!preflightResult?.ok) {
+      onToast(preflightResult?.message || 'Local AI Hub could not check disk space for that model download.', 'error');
+      return;
+    }
+
+    const preflight = preflightResult.data;
+    if (preflight?.blocked) {
+      onToast(buildBlockedDiskMessage(subject, preflight), 'error');
+      return;
+    }
+
+    let lowDiskConfirmed = false;
+    if (preflight?.requiresConfirmation) {
+      lowDiskConfirmed = window.confirm(buildLowDiskConfirmationMessage(subject, preflight));
+      if (!lowDiskConfirmed) {
+        return;
+      }
+    }
+
     const result = await window.localAIHub.downloadModel({
       ...item,
+      lowDiskConfirmed,
       toolId: selectedToolId,
     });
 
@@ -416,7 +462,6 @@ export default function ModelManager({ tools, onToast }) {
     setLocalModels(result.data?.localModels || []);
     browse({ page: 1, cursor: null });
   }
-
   async function handleDelete(model, remoteItem = null) {
     const displayName = remoteItem?.name || model?.name || model?.fileName || 'this model';
     const toolName = selectedTool?.name || 'this tool';
@@ -662,5 +707,6 @@ export default function ModelManager({ tools, onToast }) {
     </section>
   );
 }
+
 
 

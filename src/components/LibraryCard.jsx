@@ -9,14 +9,26 @@ function embeddedActionLabel(tool) {
     return 'Open chat';
   }
 
+  if (tool?.interfaceMode === 'embedded-terminal') {
+    return 'Open console';
+  }
+
   return 'Open workspace';
 }
 
-function PrimaryAction({ tool, busyMap, onLaunch, onStop }) {
+function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
   if (tool.status === 'running') {
     return (
       <button className="ghost-button" disabled={busyMap[`stop:${tool.id}`]} onClick={() => onStop(tool.id)} type="button">
         {busyMap[`stop:${tool.id}`] ? 'Stopping...' : 'Stop'}
+      </button>
+    );
+  }
+
+  if (tool.interfaceMode === 'embedded-terminal') {
+    return (
+      <button className="primary-button" onClick={() => onOpenInterface(tool.id)} type="button">
+        Open console
       </button>
     );
   }
@@ -42,9 +54,10 @@ export default function LibraryCard({
   onSaveSnapshot,
   onRestoreSnapshot,
   onOpenFolder,
+  onUninstall,
 }) {
   const runningUsage = tool.status === 'running' ? formatUsage(resources?.vramUsedMb, resources?.vramTotalMb) : 'Idle';
-  const canRepair = tool.source === 'managed';
+  const canRepair = tool.source === 'managed' || tool.installKind === 'installer-exe';
   const canSnapshot = tool.source === 'managed';
 
   return (
@@ -77,14 +90,22 @@ export default function LibraryCard({
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <PrimaryAction busyMap={busyMap} onLaunch={onLaunch} onStop={onStop} tool={tool} />
-          {String(tool.interfaceMode || '').startsWith('embedded-') ? (
+          <PrimaryAction busyMap={busyMap} onLaunch={onLaunch} onOpenInterface={onOpenInterface} onStop={onStop} tool={tool} />
+          {String(tool.interfaceMode || '').startsWith('embedded-') && tool.interfaceMode !== 'embedded-terminal' ? (
             <button className="ghost-button" onClick={() => onOpenInterface(tool.id)} type="button">
               {embeddedActionLabel(tool)}
             </button>
           ) : null}
           <button className="ghost-button" onClick={() => onToggleSettings(tool.id)} type="button">
             {settingsOpen ? 'Hide settings' : 'Settings'}
+          </button>
+          <button
+            className="ghost-button"
+            disabled={busyMap[`uninstall:${tool.id}`]}
+            onClick={() => onUninstall(tool)}
+            type="button"
+          >
+            {busyMap[`uninstall:${tool.id}`] ? 'Uninstalling...' : 'Uninstall'}
           </button>
         </div>
       </div>
@@ -174,7 +195,7 @@ export default function LibraryCard({
                 <p className="text-sm leading-6 text-slate-400">
                   {canSnapshot
                     ? 'No snapshots saved for this tool yet.'
-                    : 'Snapshots and automated repair are only available for Local AI Hub-managed installs.'}
+                    : 'Snapshots are only available for Local AI Hub-managed installs.'}
                 </p>
               )}
             </div>

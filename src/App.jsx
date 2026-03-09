@@ -1,25 +1,73 @@
 import { useEffect, useMemo, useState } from 'react';
+import AiderPanel from './components/AiderPanel';
 import HardwareGate from './components/HardwareGate';
 import LibraryCard from './components/LibraryCard';
 import ModelManager from './components/ModelManager';
 import OllamaChatPanel from './components/OllamaChatPanel';
 import WhisperPanel from './components/WhisperPanel';
 import ResourceStrip from './components/ResourceStrip';
+import SettingsPanel from './components/SettingsPanel';
 import Sidebar from './components/Sidebar';
 import StoreCard from './components/StoreCard';
+import { formatBytes } from './lib/formatters';
 import { evaluateCompatibility, toolSearchText } from './lib/tool-ui';
 
 const EMPTY_STATE = {
   appDataPath: '',
+  appInstallPath: '',
   downloadedModelCount: 0,
+  executablePath: '',
   firstLaunch: false,
   hardware: null,
   logsPath: '',
+  managedDataPath: '',
   manifests: [],
   manifestStatus: null,
   resources: null,
+  storage: null,
   tools: [],
 };
+
+const CONSOLE_OUTPUT_LIMIT = 48000;
+
+function trimConsoleOutput(value) {
+  const text = String(value || '');
+  return text.length > CONSOLE_OUTPUT_LIMIT ? text.slice(-CONSOLE_OUTPUT_LIMIT) : text;
+}
+
+function combineRuntimeOutput(payload) {
+  const stdout = String(payload?.stdout || '');
+  const stderr = String(payload?.stderr || '');
+  if (stdout && stderr) {
+    return trimConsoleOutput(`${stdout}\n${stderr}`);
+  }
+
+  return trimConsoleOutput(stdout || stderr || '');
+}
+
+function pluralizeLabel(count, singular) {
+  return count === 1 ? singular : `${singular}s`;
+}
+
+function buildBlockedDiskMessage(subject, preflight) {
+  if (!preflight?.mount) {
+    return `${subject} needs more free disk space before Local AI Hub can continue.`;
+  }
+
+  return `${subject} needs ${formatBytes(preflight.requiredBytes)}, but only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}. Clear space and try again.`;
+}
+
+function buildLowDiskConfirmationMessage(subject, preflight) {
+  if (!preflight?.mount) {
+    return `${subject} may leave the target drive very low on free space. Continue?`;
+  }
+
+  if (preflight?.sizeKnown) {
+    return `${subject} needs about ${formatBytes(preflight.requiredBytes)}. Only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}, so this would leave less than 10% free. Continue?`;
+  }
+
+  return `${subject} may leave ${preflight.mount} very low on free space, and Local AI Hub could not confirm the file size first. Continue?`;
+}
 
 function Toast({ toast, onDismiss }) {
   const toneClass =
@@ -60,6 +108,8 @@ export default function App() {
   const [storeSearch, setStoreSearch] = useState('');
   const [storeCategory, setStoreCategory] = useState('All categories');
   const [settingsToolId, setSettingsToolId] = useState(null);
+  const [cleanupPreview, setCleanupPreview] = useState(null);
+  const [storageDraft, setStorageDraft] = useState('');
   const [ollamaChatOpen, setOllamaChatOpen] = useState(false);
   const [ollamaModels, setOllamaModels] = useState([]);
   const [ollamaSelectedModel, setOllamaSelectedModel] = useState('');
@@ -75,6 +125,12 @@ export default function App() {
   const [whisperTranscript, setWhisperTranscript] = useState('');
   const [whisperSegments, setWhisperSegments] = useState([]);
   const [whisperNotice, setWhisperNotice] = useState('');
+  const [aiderPanelOpen, setAiderPanelOpen] = useState(false);
+  const [aiderBusy, setAiderBusy] = useState(false);
+  const [aiderDraft, setAiderDraft] = useState('');
+  const [aiderNotice, setAiderNotice] = useState('');
+  const [aiderOutput, setAiderOutput] = useState('');
+  const [aiderProjectDir, setAiderProjectDir] = useState('');
 
   const manifestMap = useMemo(
     () => Object.fromEntries((appState.manifests || []).map((manifest) => [manifest.id, manifest])),
@@ -93,6 +149,7 @@ export default function App() {
   const toolMap = useMemo(() => Object.fromEntries(tools.map((tool) => [tool.id, tool])), [tools]);
   const ollamaTool = toolMap.ollama || null;
   const whisperTool = toolMap.whisper || null;
+  const aiderTool = toolMap.aider || null;
   const modelManagerCount = Number(appState.downloadedModelCount || 0);
 
   const storeCategories = useMemo(() => {
@@ -175,6 +232,7 @@ export default function App() {
     setActiveTab('library');
 
     if (toolId === 'ollama') {
+      setAiderPanelOpen(false);
       setWhisperPanelOpen(false);
       setOllamaChatOpen(true);
       setOllamaMessages((current) =>
@@ -191,9 +249,18 @@ export default function App() {
     }
 
     if (toolId === 'whisper') {
+      setAiderPanelOpen(false);
       setOllamaChatOpen(false);
       setWhisperPanelOpen(true);
       setWhisperNotice((current) => current || 'Choose an audio file and start transcription.');
+      return;
+    }
+
+    if (toolId === 'aider') {
+      setOllamaChatOpen(false);
+      setWhisperPanelOpen(false);
+      setAiderPanelOpen(true);
+      setAiderNotice((current) => current || 'Choose a project folder and launch Aider to start coding.');
     }
   }
 
@@ -314,6 +381,219 @@ export default function App() {
     setWhisperBusy(false);
   }
 
+  async function loadAiderRuntimeOutput(options = {}) {
+    if (!aiderTool) {
+      return;
+    }
+
+    const result = await window.localAIHub.getToolRuntimeOutput(aiderTool.id);
+    if (!result?.ok) {
+      if (!options.silent) {
+        pushToast(result?.message || 'Local AI Hub could not load the Aider console.', 'error');
+      }
+      return;
+    }
+
+    setAiderOutput(combineRuntimeOutput(result.data));
+  }
+
+  async function chooseAiderProjectFolder() {
+    const result = await window.localAIHub.pickAiderProjectFolder();
+    if (!result?.ok) {
+      pushToast(result?.message || 'Local AI Hub could not open the project folder picker.', 'error');
+      return;
+    }
+
+    if (!result.data?.canceled && result.data?.folderPath) {
+      setAiderProjectDir(result.data.folderPath);
+      setAiderNotice(`Aider will start in ${result.data.folderPath}.`);
+    }
+  }
+
+  async function launchAiderTool() {
+    if (!aiderProjectDir) {
+      pushToast('Choose a project folder before launching Aider.', 'error');
+      return;
+    }
+
+    setAiderOutput('');
+    const launched = await runAction('launch:aider', () => window.localAIHub.launchTool({ toolId: 'aider', projectDir: aiderProjectDir }));
+    if (!launched) {
+      return;
+    }
+
+    setAiderNotice(`Aider is running in ${aiderProjectDir}.`);
+    await loadAiderRuntimeOutput({ silent: true });
+  }
+
+  async function sendAiderInput() {
+    const message = aiderDraft.trim();
+    if (!message) {
+      return;
+    }
+
+    if (aiderTool?.status !== 'running') {
+      pushToast('Launch Aider before sending it a command.', 'error');
+      return;
+    }
+
+    setAiderBusy(true);
+    setAiderOutput((current) => trimConsoleOutput(`${current}${current ? '\n' : ''}> ${message}\n`));
+
+    const result = await window.localAIHub.sendToolInput({
+      toolId: 'aider',
+      input: message,
+    });
+
+    if (!result?.ok) {
+      pushToast(result?.message || 'Local AI Hub could not send that input to Aider.', 'error');
+      setAiderBusy(false);
+      return;
+    }
+
+    setAiderDraft('');
+    setAiderNotice(`Sent a command to ${aiderTool?.name || 'Aider'}.`);
+    setAiderBusy(false);
+  }
+
+  async function uninstallLibraryTool(tool) {
+    if (!tool?.id) {
+      return;
+    }
+
+    const confirmationMessage =
+      tool.source === 'managed'
+        ? `Uninstall ${tool.name} from Local AI Hub? This will delete its managed files from ${tool.installDir} and move it back to Store.`
+        : `Remove ${tool.name} from Local AI Hub? Its files will stay on this PC because Local AI Hub did not install them.`;
+
+    if (!window.confirm(confirmationMessage)) {
+      return;
+    }
+
+    if (settingsToolId === tool.id) {
+      setSettingsToolId(null);
+    }
+
+    await runAction(`uninstall:${tool.id}`, () => window.localAIHub.uninstallTool(tool.id));
+  }
+  async function chooseStorageFolder() {
+    markBusy('settings:pick-folder', true);
+    try {
+      const result = await window.localAIHub.pickStorageFolder();
+      if (!result?.ok) {
+        pushToast(result?.message || 'Local AI Hub could not open the storage folder picker.', 'error');
+        return;
+      }
+
+      if (!result.data?.canceled && result.data?.folderPath) {
+        setStorageDraft(result.data.folderPath);
+      }
+    } finally {
+      markBusy('settings:pick-folder', false);
+    }
+  }
+
+  async function saveStorageLocation(options = {}) {
+    const targetPath = String(options.targetPath || storageDraft || '').trim();
+    if (!targetPath) {
+      pushToast('Choose a storage folder before saving the new location.', 'error');
+      return;
+    }
+
+    let migrateExistingData = false;
+    let migrationSourceRoot = options.migrationSourceRoot || null;
+    if (!migrationSourceRoot && appState.managedDataPath && targetPath !== appState.managedDataPath) {
+      const managedToolCount = tools.filter((tool) => tool.source === 'managed').length;
+      if (managedToolCount > 0) {
+        migrateExistingData = window.confirm(
+          `Move your existing managed Local AI Hub files from ${appState.managedDataPath} into ${targetPath} now? Click OK to move them, or Cancel to keep the current files where they are and use the new folder for future installs.`,
+        );
+      }
+    }
+
+    const saved = await runAction('settings:save-storage', () =>
+      window.localAIHub.setStorageLocation({
+        targetPath,
+        migrateExistingData,
+        migrationSourceRoot,
+      }),
+    );
+    if (saved) {
+      setCleanupPreview(null);
+    }
+  }
+
+  async function migrateLegacyStorage() {
+    const migration = appState.storage?.legacyMigration;
+    if (!migration?.available) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Move about ${formatBytes(migration.totalBytes)} from ${migration.sourceRoot} into ${migration.targetRoot}? Local AI Hub will keep your tracked tools attached and move the larger managed files off C:.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    const migrated = await runAction('settings:migrate-legacy', () =>
+      window.localAIHub.setStorageLocation({
+        targetPath: migration.targetRoot,
+        migrationSourceRoot: migration.sourceRoot,
+      }),
+    );
+    if (migrated) {
+      setCleanupPreview(null);
+    }
+  }
+
+  async function dismissLegacyMigration() {
+    const sourceRoot = appState.storage?.legacyMigration?.sourceRoot;
+    if (!sourceRoot) {
+      return;
+    }
+
+    await runAction('settings:dismiss-migration', () => window.localAIHub.dismissLegacyMigration(sourceRoot));
+  }
+
+  async function previewCleanup(options = {}) {
+    markBusy('settings:preview-cleanup', true);
+    try {
+      const result = await window.localAIHub.getCleanupPreview();
+      if (!result?.ok) {
+        if (!options.silent) {
+          pushToast(result?.message || 'Local AI Hub could not scan the approved cleanup folders right now.', 'error');
+        }
+        return null;
+      }
+
+      setCleanupPreview(result.data);
+      return result.data;
+    } finally {
+      markBusy('settings:preview-cleanup', false);
+    }
+  }
+
+  async function runCleanupNow() {
+    const preview = cleanupPreview || (await previewCleanup({ silent: true }));
+    if (!preview?.totalEntries) {
+      pushToast('Local AI Hub did not find approved leftover files to delete.', 'success');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete ${preview.totalEntries} leftover item${preview.totalEntries === 1 ? '' : 's'} and recover about ${formatBytes(preview.totalBytes)}? Local AI Hub will only remove the exact paths shown in the cleanup preview.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    const cleaned = await runAction('settings:run-cleanup', () => window.localAIHub.runCleanup());
+    if (cleaned) {
+      setCleanupPreview(null);
+      await previewCleanup({ silent: true });
+    }
+  }
   function applyStateResponse(result) {
     if (!result?.ok) {
       throw new Error(result?.message || 'Local AI Hub could not complete that action.');
@@ -350,22 +630,12 @@ export default function App() {
 
   async function runAction(key, operation) {
     const toolId = toolIdFromActionKey(key);
+    let succeeded = false;
     markBusy(key, true);
     try {
       const result = await operation();
       applyStateResponse(result);
-
-      if (key.startsWith('launch:') && ['ollama', 'whisper'].includes(toolId)) {
-        openEmbeddedToolUi(toolId);
-      }
-
-      if (key.startsWith('stop:') && toolId === 'ollama') {
-        setOllamaNotice('Ollama stopped. Launch it again to continue chatting.');
-      }
-
-      if (key.startsWith('stop:') && toolId === 'whisper') {
-        setWhisperNotice('Whisper stopped. Launch it again to continue transcribing.');
-      }
+      succeeded = true;
     } catch (error) {
       if (key.startsWith('install:') || key.startsWith('repair:')) {
         clearProgress(toolId);
@@ -378,8 +648,81 @@ export default function App() {
           : baseMessage;
       pushToast(helpMessage, 'error');
     } finally {
+      if (key.startsWith('stop:') && toolId === 'ollama') {
+        setOllamaNotice('Ollama stopped. Launch it again to continue chatting.');
+      }
+
+      if (key.startsWith('stop:') && toolId === 'whisper') {
+        setWhisperNotice('Whisper stopped. Launch it again to continue transcribing.');
+      }
+
+      if (key.startsWith('stop:') && toolId === 'aider') {
+        setAiderNotice('Aider stopped. Launch it again to continue coding.');
+      }
+
       markBusy(key, false);
     }
+
+    return succeeded;
+  }
+
+  async function installStoreTool(toolId) {
+    const manifest = manifestMap[toolId];
+    const subject = manifest?.name || 'This tool';
+    const preflightResult = await window.localAIHub.getToolInstallPreflight(toolId);
+    if (!preflightResult?.ok) {
+      pushToast(preflightResult?.message || 'Local AI Hub could not check disk space for that install.', 'error');
+      return;
+    }
+
+    const preflight = preflightResult.data;
+    if (preflight?.blocked) {
+      pushToast(buildBlockedDiskMessage(subject, preflight), 'error');
+      return;
+    }
+
+    let lowDiskConfirmed = false;
+    if (preflight?.requiresConfirmation) {
+      lowDiskConfirmed = window.confirm(buildLowDiskConfirmationMessage(subject, preflight));
+      if (!lowDiskConfirmed) {
+        return;
+      }
+    }
+
+    await runAction(`install:${toolId}`, () => window.localAIHub.installTool({ toolId, lowDiskConfirmed }));
+  }
+
+  async function repairLibraryTool(tool) {
+    if (!tool?.id) {
+      return;
+    }
+
+    const previewResult = await window.localAIHub.getRepairPreview(tool.id);
+    if (!previewResult?.ok) {
+      pushToast(previewResult?.message || 'Local AI Hub could not inspect that repair right now.', 'error');
+      return;
+    }
+
+    const preview = previewResult.data || {};
+    let removeOrphanedToolFolders = false;
+    if (preview.orphanedToolFolderCount > 0) {
+      const automaticCleanup = [];
+      if (preview.duplicateFolderCount > 0) {
+        automaticCleanup.push(`${preview.duplicateFolderCount} duplicate ${pluralizeLabel(preview.duplicateFolderCount, 'install folder')}`);
+      }
+      if (preview.temporaryArtifactCount > 0) {
+        automaticCleanup.push(`${preview.temporaryArtifactCount} leftover ${pluralizeLabel(preview.temporaryArtifactCount, 'download or temp item')}`);
+      }
+
+      const automaticMessage = automaticCleanup.length
+        ? `Local AI Hub will also clean ${automaticCleanup.join(' and ')} automatically.`
+        : 'Local AI Hub did not find duplicate install folders or failed downloads for this repair.';
+      const orphanRecovery = preview.orphanedRecoveryBytes > 0 ? formatBytes(preview.orphanedRecoveryBytes) : 'some disk space';
+      const orphanMessage = `${automaticMessage} It also found ${preview.orphanedToolFolderCount} orphaned ${pluralizeLabel(preview.orphanedToolFolderCount, 'tool folder')} in Local AI Hub's managed storage roots. Click OK to delete those orphaned folders too and recover about ${orphanRecovery}. Click Cancel to keep them and continue the repair.`;
+      removeOrphanedToolFolders = window.confirm(orphanMessage);
+    }
+
+    await runAction(`repair:${tool.id}`, () => window.localAIHub.repairTool({ toolId: tool.id, removeOrphanedToolFolders }));
   }
 
   useEffect(() => {
@@ -399,6 +742,14 @@ export default function App() {
 
     const unsubscribeOpenToolUi = window.localAIHub.onOpenToolUi((payload) => {
       openEmbeddedToolUi(payload?.toolId);
+    });
+
+    const unsubscribeRuntimeOutput = window.localAIHub.onRuntimeOutput((payload) => {
+      if (payload?.toolId !== 'aider' || !payload.chunk) {
+        return;
+      }
+
+      setAiderOutput((current) => trimConsoleOutput(`${current}${payload.chunk}`));
     });
 
     const unsubscribeUpdateReady = window.localAIHub.onUpdateReady((payload) => {
@@ -425,6 +776,7 @@ export default function App() {
     return () => {
       unsubscribeInstallProgress();
       unsubscribeOpenToolUi();
+      unsubscribeRuntimeOutput();
       unsubscribeUpdateReady();
       window.clearInterval(intervalId);
     };
@@ -442,6 +794,23 @@ export default function App() {
       tag: 'manifest-status',
     });
   }, [appState.manifestStatus?.warning]);
+
+  useEffect(() => {
+    const migration = appState.storage?.legacyMigration;
+    if (!migration?.available || migration.dismissed) {
+      dismissToast('legacy-migration');
+      return;
+    }
+
+    pushToast(`Local AI Hub found about ${formatBytes(migration.totalBytes)} in older managed files at ${migration.sourceRoot}. Open Settings to move them off your system drive.`, 'success', {
+      id: 'legacy-migration',
+      persistent: true,
+      tag: 'legacy-migration',
+      actionLabel: 'Open Settings',
+      onAction: () => setActiveTab('settings'),
+    });
+  }, [appState.storage?.legacyMigration?.available, appState.storage?.legacyMigration?.dismissed, appState.storage?.legacyMigration?.sourceRoot, appState.storage?.legacyMigration?.totalBytes]);
+
   useEffect(() => {
     if (!ollamaTool) {
       setOllamaChatOpen(false);
@@ -476,6 +845,41 @@ export default function App() {
     setWhisperNotice('Launch Whisper to enable the built-in transcription tools.');
   }, [whisperPanelOpen, whisperTool?.status]);
 
+  useEffect(() => {
+    if (!aiderTool) {
+      setAiderPanelOpen(false);
+      setAiderDraft('');
+      setAiderOutput('');
+      setAiderProjectDir('');
+      return;
+    }
+
+    setAiderProjectDir((current) => current || aiderTool.lastProjectDir || '');
+
+    if (!aiderPanelOpen) {
+      return;
+    }
+
+    if (aiderTool.status === 'running') {
+      setAiderNotice((current) => current || `Aider is running in ${aiderProjectDir || aiderTool.lastProjectDir || 'the selected project folder'}.`);
+      loadAiderRuntimeOutput({ silent: true });
+      return;
+    }
+
+    setAiderNotice((current) => current || 'Choose a project folder and launch Aider to start coding.');
+  }, [aiderPanelOpen, aiderTool?.status, aiderTool?.lastProjectDir, aiderProjectDir]);
+
+  useEffect(() => {
+    setStorageDraft(appState.storage?.managedRoot || '');
+  }, [appState.storage?.managedRoot]);
+
+  useEffect(() => {
+    if (activeTab !== 'settings' || cleanupPreview) {
+      return;
+    }
+
+    previewCleanup({ silent: true });
+  }, [activeTab, cleanupPreview]);
   if (isLoading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-shell text-white">
@@ -514,6 +918,7 @@ export default function App() {
             installedCount={tools.length}
             resources={appState.resources}
             runningCount={runningCount}
+            storage={appState.storage}
           />
 
           {activeTab === 'library' ? (
@@ -556,6 +961,23 @@ export default function App() {
                 />
               ) : null}
 
+              {aiderTool && aiderPanelOpen ? (
+                <AiderPanel
+                  busy={busyMap['launch:aider'] || busyMap['stop:aider'] || aiderBusy}
+                  draft={aiderDraft}
+                  notice={aiderNotice}
+                  onChangeDraft={setAiderDraft}
+                  onChooseProject={chooseAiderProjectFolder}
+                  onHide={() => setAiderPanelOpen(false)}
+                  onLaunch={launchAiderTool}
+                  onSend={sendAiderInput}
+                  onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
+                  output={aiderOutput}
+                  projectDir={aiderProjectDir}
+                  tool={aiderTool}
+                />
+              ) : null}
+
               {tools.length ? (
                 tools.map((tool) => (
                   <LibraryCard
@@ -564,7 +986,8 @@ export default function App() {
                     onLaunch={(toolId) => runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId))}
                     onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
                     onOpenInterface={openEmbeddedToolUi}
-                    onRepair={(toolId) => runAction(`repair:${toolId}`, () => window.localAIHub.repairTool(toolId))}
+                    onUninstall={uninstallLibraryTool}
+                    onRepair={() => repairLibraryTool(tool)}
                     onRestoreSnapshot={(toolId, snapshotFileName) =>
                       runAction(`restore:${toolId}`, () => window.localAIHub.restoreSnapshot({ toolId, snapshotFileName }))
                     }
@@ -623,7 +1046,7 @@ export default function App() {
                       busy={busyMap[`install:${manifest.id}`]}
                       compatibility={evaluateCompatibility(manifest, appState.hardware)}
                       manifest={manifest}
-                      onInstall={(toolId) => runAction(`install:${toolId}`, () => window.localAIHub.installTool(toolId))}
+                      onInstall={(toolId) => installStoreTool(toolId)}
                       progress={progressMap[manifest.id]}
                     />
                   ))
@@ -634,8 +1057,22 @@ export default function App() {
                 )}
               </div>
             </section>
-          ) : (
+          ) : activeTab === 'models' ? (
             <ModelManager onToast={pushToast} tools={tools} />
+          ) : (
+            <SettingsPanel
+              busyMap={busyMap}
+              cleanupPreview={cleanupPreview}
+              onChangeStorageDraft={setStorageDraft}
+              onChooseStorageFolder={chooseStorageFolder}
+              onDismissLegacyMigration={dismissLegacyMigration}
+              onMigrateLegacyStorage={migrateLegacyStorage}
+              onPreviewCleanup={() => previewCleanup()}
+              onRunCleanup={runCleanupNow}
+              onSaveStorageLocation={() => saveStorageLocation()}
+              storage={appState.storage}
+              storageDraft={storageDraft}
+            />
           )}
         </main>
       </div>
@@ -648,4 +1085,13 @@ export default function App() {
     </div>
   );
 }
+
+
+
+
+
+
+
+
+
 

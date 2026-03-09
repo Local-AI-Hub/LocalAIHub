@@ -142,6 +142,26 @@ async function readRequirementFromStrategy(appDir, strategy) {
 }
 
 async function detectPythonRequirement(appDir, manifest, logger) {
+  const explicitRequirement =
+    manifest.installInstructions?.pythonRequirement ||
+    manifest.pythonRequirement ||
+    null;
+  if (explicitRequirement) {
+    const specifier = String(explicitRequirement).trim();
+    if (!specifier) {
+      throw new Error(`Local AI Hub could not read the Python rule for ${manifest.name}.`);
+    }
+
+    await logger.info('Python requirement was provided directly in the tool definition.', {
+      requirement: specifier,
+    });
+    return {
+      kind: 'specifier',
+      source: 'manifest',
+      specifier,
+    };
+  }
+
   const strategies = manifest.installInstructions?.pythonRequirementDetection || manifest.pythonRequirementDetection || [];
   for (const strategy of strategies) {
     const requirement = await readRequirementFromStrategy(appDir, strategy);
@@ -198,4 +218,5 @@ module.exports = {
   requirementToLabel,
   versionSatisfiesRequirement,
 };
+
 

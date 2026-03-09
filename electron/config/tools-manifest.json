@@ -445,5 +445,682 @@
       "%LOCALAPPDATA%\\koboldcpp\\koboldcpp.exe",
       "%APPDATA%\\koboldcpp\\koboldcpp.exe"
     ]
+  },
+  {
+    "id": "fooocus",
+    "name": "Fooocus",
+    "description": "A simplified image generation tool optimized for low-VRAM cards and a great starting point for beginners who want something easier than Automatic1111.",
+    "icon": "FO",
+    "category": "Image generation",
+    "downloadUrl": "https://github.com/lllyasviel/Fooocus/releases/download/v2.5.0/Fooocus_win64_2-5-0.7z",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "binary",
+      "archiveName": "Fooocus_win64_2-5-0.7z",
+      "installSummary": "Downloads the official Windows Fooocus package, keeps it inside Local AI Hub, and launches its beginner-friendly low-VRAM workflow locally.",
+      "configTargets": [
+        "Fooocus\\presets",
+        "Fooocus\\config.txt"
+      ],
+      "externalBatchCandidates": [
+        "run.bat",
+        "run_anime.bat"
+      ],
+      "externalPythonCandidates": [
+        "python_embeded\\python.exe",
+        "python_embedded\\python.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 4096,
+        "recommendedVramMb": 6144,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 24576
+      }
+    },
+    "launchCommand": "python_embeded\\python.exe -s Fooocus\\launch.py --listen 127.0.0.1 --port {port} --disable-in-browser",
+    "externalLaunchCommand": "python_embeded\\python.exe -s Fooocus\\launch.py --listen 127.0.0.1 --port {port} --disable-in-browser",
+    "defaultPort": 7865,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\Fooocus\\run.bat",
+      "%USERPROFILE%\\Documents\\Fooocus\\run.bat",
+      "%USERPROFILE%\\Downloads\\Fooocus\\run.bat",
+      "%LOCALAPPDATA%\\Fooocus\\run.bat",
+      "%APPDATA%\\Fooocus\\run.bat"
+    ],
+    "discovery": {
+      "folderNames": [
+        "Fooocus",
+        "fooocus",
+        "Fooocus_win64",
+        "Fooocus_win64_2-5-0"
+      ],
+      "markerPaths": [
+        "run.bat",
+        "Fooocus\\launch.py",
+        "Fooocus\\entry_with_update.py"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    },
+    "startupTimeoutMs": 180000
+  },
+  {
+    "id": "gpt4all",
+    "name": "GPT4All",
+    "description": "A beginner-friendly local LLM runner with a built-in GUI and one of the most accessible local LLM tools for non-technical users.",
+    "icon": "G4",
+    "category": "LLM tools",
+    "interfaceMode": "desktop-app",
+    "downloadUrl": "https://gpt4all.io/installers/gpt4all-installer-win64.exe",
+    "installInstructions": {
+      "kind": "installer-exe",
+      "runtime": "binary",
+      "downloadFileName": "gpt4all-installer-win64.exe",
+      "installSummary": "Downloads the latest GPT4All Windows installer so Local AI Hub can add an easy local chat app for low-end hardware.",
+      "installerArgs": [],
+      "configTargets": [],
+      "externalExecutableCandidates": [
+        "GPT4All.exe",
+        "gpt4all.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 4096,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "\"GPT4All.exe\"",
+    "detectionPaths": [
+      "%LOCALAPPDATA%\\nomic.ai\\GPT4All\\GPT4All.exe",
+      "%LOCALAPPDATA%\\Programs\\GPT4All\\GPT4All.exe",
+      "%APPDATA%\\GPT4All\\GPT4All.exe",
+      "%PROGRAMFILES%\\GPT4All\\GPT4All.exe",
+      "%ProgramFiles(x86)%\\GPT4All\\GPT4All.exe"
+    ],
+    "discovery": {
+      "folderNames": [
+        "GPT4All",
+        "gpt4all"
+      ],
+      "markerPaths": [
+        "GPT4All.exe",
+        "gpt4all.exe"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "text-generation-webui",
+    "name": "Text Generation WebUI (oobabooga)",
+    "description": "A highly customizable local LLM interface with extensive extension support, a massive community, and a workflow favored by advanced users.",
+    "icon": "TG",
+    "category": "LLM tools",
+    "downloadUrl": "https://github.com/oobabooga/text-generation-webui/archive/refs/heads/main.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "text-generation-webui-main.zip",
+      "installSummary": "Downloads the latest text-generation-webui source, creates a managed Python environment, and prepares its locally hosted advanced LLM interface.",
+      "venvFolder": ".venv",
+      "pythonRequirement": ">=3.11,<3.12",
+      "configTargets": [
+        "user_data",
+        "settings.yaml",
+        "cmd_flags.txt"
+      ],
+      "pipInstalls": [
+        {
+          "kind": "requirements",
+          "value": "requirements.txt"
+        }
+      ],
+      "externalPythonCandidates": [
+        "installer_files\\env\\python.exe",
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": [
+        "start_windows.bat"
+      ],
+      "compatibility": {
+        "minimumVramMb": 4096,
+        "recommendedVramMb": 8192,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python server.py --listen --port {port}",
+    "externalLaunchCommand": "start_windows.bat --listen --port {port}",
+    "defaultPort": 7860,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\text-generation-webui\\server.py",
+      "%USERPROFILE%\\Documents\\text-generation-webui\\server.py",
+      "%USERPROFILE%\\Downloads\\text-generation-webui\\server.py",
+      "%LOCALAPPDATA%\\text-generation-webui\\server.py",
+      "%APPDATA%\\text-generation-webui\\server.py"
+    ],
+    "discovery": {
+      "folderNames": [
+        "text-generation-webui",
+        "text-generation-webui-main",
+        "oobabooga"
+      ],
+      "markerPaths": [
+        "server.py",
+        "start_windows.bat"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "anythingllm",
+    "name": "AnythingLLM",
+    "description": "A local RAG tool for private chats with your own documents, so you can upload PDFs, Word docs, and text files and discuss their contents without data leaving your machine.",
+    "icon": "AL",
+    "category": "LLM tools",
+    "downloadUrl": "https://cdn.anythingllm.com/latest/AnythingLLMDesktop.exe",
+    "installInstructions": {
+      "kind": "installer-exe",
+      "runtime": "binary",
+      "downloadFileName": "AnythingLLMDesktop.exe",
+      "installSummary": "Downloads the latest AnythingLLM Windows desktop installer and wires it into Local AI Hub for local document chat.",
+      "installerArgs": [
+        "/S",
+        "/D={appDir}"
+      ],
+      "configTargets": [],
+      "externalExecutableCandidates": [
+        "AnythingLLM Desktop.exe",
+        "AnythingLLMDesktop.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 4096,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "\"AnythingLLM Desktop.exe\"",
+    "defaultPort": 3001,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%LOCALAPPDATA%\\Programs\\AnythingLLM\\AnythingLLM Desktop.exe",
+      "%PROGRAMFILES%\\AnythingLLM\\AnythingLLM Desktop.exe",
+      "%ProgramFiles(x86)%\\AnythingLLM\\AnythingLLM Desktop.exe",
+      "%APPDATA%\\AnythingLLM\\AnythingLLM Desktop.exe"
+    ],
+    "discovery": {
+      "folderNames": [
+        "AnythingLLM",
+        "Anything LLM"
+      ],
+      "markerPaths": [
+        "AnythingLLM Desktop.exe",
+        "AnythingLLMDesktop.exe"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "rvc",
+    "name": "RVC (Retrieval Voice Cloning)",
+    "description": "A popular local voice cloning and voice conversion tool that lets you clone voices and convert audio locally with no data leaving your machine.",
+    "icon": "RV",
+    "category": "Audio / Speech",
+    "downloadUrl": "https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/archive/refs/heads/main.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "Retrieval-based-Voice-Conversion-WebUI-main.zip",
+      "installSummary": "Downloads the latest RVC WebUI source and creates a managed Python environment for local voice cloning and conversion.",
+      "venvFolder": ".venv",
+      "pythonRequirement": ">=3.10,<3.11",
+      "configTargets": [
+        "configs",
+        "weights"
+      ],
+      "pipInstalls": [
+        {
+          "kind": "requirements",
+          "value": "requirements.txt"
+        }
+      ],
+      "externalPythonCandidates": [
+        "runtime\\python.exe",
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": [
+        "go-web.bat"
+      ],
+      "compatibility": {
+        "minimumVramMb": 6144,
+        "recommendedVramMb": 8192,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python infer-web.py --listen --port {port}",
+    "externalLaunchCommand": "go-web.bat",
+    "defaultPort": 7865,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\Retrieval-based-Voice-Conversion-WebUI\\infer-web.py",
+      "%USERPROFILE%\\Documents\\Retrieval-based-Voice-Conversion-WebUI\\infer-web.py",
+      "%USERPROFILE%\\Downloads\\Retrieval-based-Voice-Conversion-WebUI\\infer-web.py",
+      "%LOCALAPPDATA%\\Retrieval-based-Voice-Conversion-WebUI\\infer-web.py",
+      "%APPDATA%\\Retrieval-based-Voice-Conversion-WebUI\\infer-web.py"
+    ],
+    "discovery": {
+      "folderNames": [
+        "Retrieval-based-Voice-Conversion-WebUI",
+        "RVC",
+        "RVC-WebUI"
+      ],
+      "markerPaths": [
+        "infer-web.py",
+        "go-web.bat"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "jan",
+    "name": "Jan",
+    "description": "A clean, modern desktop app for local LLMs with a polished ChatGPT-like interface and one of the most polished local LLM experiences available.",
+    "icon": "JN",
+    "category": "LLM tools",
+    "interfaceMode": "desktop-app",
+    "downloadUrl": "https://github.com/janhq/jan/releases/latest/download/jan.exe",
+    "installInstructions": {
+      "kind": "single-file",
+      "runtime": "binary",
+      "downloadFileName": "jan.exe",
+      "installSummary": "Downloads the latest Jan desktop executable into Local AI Hub for a polished local chat experience.",
+      "configTargets": [],
+      "externalExecutableCandidates": [
+        "jan.exe",
+        "Jan.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 4096,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "jan.exe",
+    "detectionPaths": [
+      "%LOCALAPPDATA%\\Programs\\Jan\\Jan.exe",
+      "%LOCALAPPDATA%\\Programs\\Jan\\jan.exe",
+      "%PROGRAMFILES%\\Jan\\Jan.exe",
+      "%ProgramFiles(x86)%\\Jan\\Jan.exe",
+      "%APPDATA%\\Jan\\Jan.exe"
+    ],
+    "discovery": {
+      "folderNames": [
+        "Jan",
+        "jan"
+      ],
+      "markerPaths": [
+        "Jan.exe",
+        "jan.exe"
+      ],
+      "pathExecutables": [
+        "jan.exe"
+      ],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "wan21-webui",
+    "name": "Wan2.1 WebUI",
+    "description": "A dedicated frontend for running Wan2.1 video generation models locally. Video generation is aimed at high-VRAM systems, with 16 GB or more strongly recommended.",
+    "icon": "W2",
+    "category": "Video generation",
+    "downloadUrl": "https://github.com/Wan-Video/Wan2.1/archive/refs/heads/main.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "Wan2.1-main.zip",
+      "installSummary": "Downloads the Wan2.1 WebUI source and builds a managed Python environment for local video generation workflows.",
+      "venvFolder": ".venv",
+      "pythonRequirement": ">=3.10,<3.11",
+      "configTargets": [
+        "configs",
+        "outputs"
+      ],
+      "pipInstalls": [
+        {
+          "kind": "requirements",
+          "value": "requirements.txt"
+        }
+      ],
+      "externalPythonCandidates": [
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": [],
+      "compatibility": {
+        "minimumVramMb": 12288,
+        "recommendedVramMb": 16384,
+        "minimumRamMb": 32768,
+        "recommendedRamMb": 65536
+      }
+    },
+    "launchCommand": "python gradio/app.py --server-name 127.0.0.1 --server-port {port}",
+    "defaultPort": 7860,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\Wan2.1\\gradio\\app.py",
+      "%USERPROFILE%\\Documents\\Wan2.1\\gradio\\app.py",
+      "%USERPROFILE%\\Downloads\\Wan2.1\\gradio\\app.py",
+      "%LOCALAPPDATA%\\Wan2.1\\gradio\\app.py",
+      "%APPDATA%\\Wan2.1\\gradio\\app.py"
+    ],
+    "discovery": {
+      "folderNames": [
+        "Wan2.1",
+        "wan2.1",
+        "Wan-Video"
+      ],
+      "markerPaths": [
+        "gradio\\app.py",
+        "gradio\\vace.py"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "audiocraft-webui",
+    "name": "AudioCraft WebUI",
+    "description": "A local web interface for AudioCraft models that supports music generation, sound effects, and audio continuation on your own machine.",
+    "icon": "AC",
+    "category": "Audio / Speech",
+    "downloadUrl": "https://github.com/cocktailpeanut/audiocraft/archive/refs/heads/main.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "audiocraft-main.zip",
+      "installSummary": "Downloads the AudioCraft WebUI source and creates a managed Python environment for local music and sound generation.",
+      "venvFolder": ".venv",
+      "pythonRequirement": ">=3.10,<3.11",
+      "configTargets": [
+        "outputs",
+        "models"
+      ],
+      "pipInstalls": [
+        {
+          "kind": "requirements",
+          "value": "requirements.txt"
+        }
+      ],
+      "externalPythonCandidates": [
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": [],
+      "compatibility": {
+        "minimumVramMb": 6144,
+        "recommendedVramMb": 8192,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python app.py --host 127.0.0.1 --port {port}",
+    "defaultPort": 7860,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\audiocraft\\app.py",
+      "%USERPROFILE%\\Documents\\audiocraft\\app.py",
+      "%USERPROFILE%\\Downloads\\audiocraft\\app.py",
+      "%LOCALAPPDATA%\\audiocraft\\app.py",
+      "%APPDATA%\\audiocraft\\app.py"
+    ],
+    "discovery": {
+      "folderNames": [
+        "audiocraft",
+        "AudioCraft",
+        "audiocraft-main"
+      ],
+      "markerPaths": [
+        "app.py",
+        "requirements.txt"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "aider",
+    "name": "Aider",
+    "description": "An AI pair programming tool that uses local or remote LLMs to assist with coding directly in a project folder, now with a built-in Local AI Hub console.",
+    "icon": "AI",
+    "category": "Coding tools",
+    "interfaceMode": "embedded-terminal",
+    "downloadUrl": "https://pypi.org/project/aider-chat/",
+    "installInstructions": {
+      "kind": "pip-package",
+      "runtime": "python",
+      "installSummary": "Creates a managed Python environment and installs aider-chat locally so you can run terminal-based coding sessions inside Local AI Hub.",
+      "venvFolder": ".venv",
+      "pythonRequirement": ">=3.10,<3.13",
+      "configTargets": [
+        ".aider.conf.yml",
+        ".aider.model.settings.yml"
+      ],
+      "pipInstalls": [
+        {
+          "kind": "package",
+          "value": "aider-chat"
+        }
+      ],
+      "externalPythonCandidates": [
+        "Scripts\\python.exe",
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [
+        "aider.exe",
+        "Scripts\\aider.exe",
+        ".venv\\Scripts\\aider.exe"
+      ],
+      "externalBatchCandidates": [],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 0,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "..\\.venv\\Scripts\\aider.exe",
+    "externalLaunchCommand": "python -m aider",
+    "detectionPaths": [
+      "PATH:aider.exe"
+    ],
+    "discovery": {
+      "folderNames": [
+        "aider-chat",
+        "Aider"
+      ],
+      "markerPaths": [
+        "Scripts\\aider.exe",
+        "Lib\\site-packages\\aider\\__init__.py"
+      ],
+      "pathExecutables": [
+        "aider.exe"
+      ],
+      "pythonModules": [
+        "aider"
+      ]
+    }
+  },
+  {
+    "id": "tabby",
+    "name": "Tabby",
+    "description": "A self-hosted coding assistant and GitHub Copilot alternative that integrates with VS Code and other editors as a local completion server.",
+    "icon": "TB",
+    "category": "Coding tools",
+    "downloadUrl": "https://github.com/TabbyML/tabby/releases/latest/download/tabby_x86_64-windows-msvc.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "binary",
+      "archiveName": "tabby_x86_64-windows-msvc.zip",
+      "installSummary": "Downloads the latest Windows Tabby server binary into Local AI Hub for self-hosted code completion and chat.",
+      "configTargets": [
+        "config.toml"
+      ],
+      "externalExecutableCandidates": [
+        "tabby.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 6144,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "tabby.exe serve --port {port}",
+    "defaultPort": 8080,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "PATH:tabby.exe",
+      "%LOCALAPPDATA%\\Tabby\\tabby.exe",
+      "%PROGRAMFILES%\\Tabby\\tabby.exe",
+      "%ProgramFiles(x86)%\\Tabby\\tabby.exe",
+      "%APPDATA%\\Tabby\\tabby.exe"
+    ],
+    "discovery": {
+      "folderNames": [
+        "Tabby",
+        "tabby"
+      ],
+      "markerPaths": [
+        "tabby.exe"
+      ],
+      "pathExecutables": [
+        "tabby.exe"
+      ],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "triposr",
+    "name": "TripoSR / Trellis",
+    "description": "A local image-to-3D generation workflow from an emerging category that benefits from a capable GPU for converting images into 3D models.",
+    "icon": "3D",
+    "category": "3D generation",
+    "downloadUrl": "https://github.com/VAST-AI-Research/TripoSR/archive/refs/heads/main.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "archiveName": "TripoSR-main.zip",
+      "installSummary": "Downloads the TripoSR image-to-3D source and prepares a managed Python environment for local 3D generation experiments.",
+      "venvFolder": ".venv",
+      "pythonRequirement": ">=3.10,<3.11",
+      "configTargets": [
+        "outputs",
+        "checkpoints"
+      ],
+      "pipInstalls": [
+        {
+          "kind": "requirements",
+          "value": "requirements.txt"
+        }
+      ],
+      "externalPythonCandidates": [
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": [],
+      "compatibility": {
+        "minimumVramMb": 8192,
+        "recommendedVramMb": 12288,
+        "minimumRamMb": 16384,
+        "recommendedRamMb": 32768
+      }
+    },
+    "launchCommand": "python gradio_app.py --server-name 127.0.0.1 --server-port {port}",
+    "defaultPort": 7860,
+    "healthCheckPath": "/",
+    "detectionPaths": [
+      "%USERPROFILE%\\TripoSR\\gradio_app.py",
+      "%USERPROFILE%\\Documents\\TripoSR\\gradio_app.py",
+      "%USERPROFILE%\\Downloads\\TripoSR\\gradio_app.py",
+      "%LOCALAPPDATA%\\TripoSR\\gradio_app.py",
+      "%APPDATA%\\TripoSR\\gradio_app.py"
+    ],
+    "discovery": {
+      "folderNames": [
+        "TripoSR",
+        "triposr",
+        "Trellis"
+      ],
+      "markerPaths": [
+        "gradio_app.py",
+        "requirements.txt"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
+  },
+  {
+    "id": "upscayl",
+    "name": "Upscayl",
+    "description": "A polished dedicated local image upscaler that is one of the most user-friendly upscaling tools available and works well on mid-range hardware.",
+    "icon": "UP",
+    "category": "Image tools",
+    "interfaceMode": "desktop-app",
+    "downloadUrl": "https://github.com/upscayl/upscayl/releases/latest/download/upscayl-2.15.0-win.exe",
+    "installInstructions": {
+      "kind": "installer-exe",
+      "runtime": "binary",
+      "downloadFileName": "upscayl-2.15.0-win.exe",
+      "installSummary": "Downloads the latest Upscayl Windows installer so Local AI Hub can add a polished local upscaler.",
+      "installerArgs": [
+        "/S",
+        "/D={appDir}"
+      ],
+      "configTargets": [],
+      "externalExecutableCandidates": [
+        "Upscayl.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 4096,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "\"Upscayl.exe\"",
+    "detectionPaths": [
+      "%PROGRAMFILES%\\Upscayl\\Upscayl.exe",
+      "%ProgramFiles(x86)%\\Upscayl\\Upscayl.exe",
+      "%LOCALAPPDATA%\\Programs\\Upscayl\\Upscayl.exe"
+    ],
+    "discovery": {
+      "folderNames": [
+        "Upscayl",
+        "upscayl"
+      ],
+      "markerPaths": [
+        "Upscayl.exe"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
   }
 ]

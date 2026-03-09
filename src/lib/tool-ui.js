@@ -29,7 +29,10 @@ export function evaluateCompatibility(manifest, hardware) {
     return {
       label: minimumVramMb >= 6144 ? 'Low VRAM mode' : 'Supported',
       tone: 'info',
-      message: 'This tool should run, but expect smaller batches or lighter models.',
+      message:
+        recommendedVramMb >= 16384
+          ? 'This tool can run, but it is aimed at high-VRAM GPUs and will need conservative settings on this machine.'
+          : 'This tool should run, but expect smaller batches or lighter models.',
     };
   }
 
@@ -37,7 +40,10 @@ export function evaluateCompatibility(manifest, hardware) {
     return {
       label: 'Limited',
       tone: 'warn',
-      message: 'Local AI Hub can install it, but you will need conservative settings.',
+      message:
+        recommendedVramMb >= 16384
+          ? 'Local AI Hub can install it, but this workload is best on a high-VRAM GPU and may be heavily constrained here.'
+          : 'Local AI Hub can install it, but you will need conservative settings.',
     };
   }
 
@@ -88,3 +94,4 @@ export function describeRequirements(manifest) {
 
   return parts.join(' | ') || 'No hardware guidance available.';
 }
+

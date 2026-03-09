@@ -4,41 +4,151 @@ const { app } = require('electron');
 
 const { sanitizeUserMessage } = require('./redactionService');
 
-const CONFIG_VERSION = 2;
+const CONFIG_VERSION = 3;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
 const LEGACY_APP_DATA_DIR_NAMES = ['NestAI'];
+const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'runtimes', 'logs'];
+
 let configOperationQueue = Promise.resolve();
 let storageReadyPromise = null;
+let cachedConfigSnapshot = null;
 
-function getStorageRoots() {
-  const appDataRoot = app.getPath('appData');
-  const root = path.join(appDataRoot, APP_DATA_DIR_NAME);
+function getEnvValueInsensitive(name) {
+  const key = Object.keys(process.env).find((entry) => entry.toLowerCase() === String(name || '').toLowerCase());
+  return key ? process.env[key] : '';
+}
+
+function stripTrailingSeparators(targetPath) {
+  const resolved = path.resolve(String(targetPath || ''));
+  const parsed = path.parse(resolved);
+  if (resolved === parsed.root) {
+    return parsed.root;
+  }
+
+  return resolved.replace(/[\\/]+$/, '');
+}
+
+function normalizeDirectoryPath(value) {
+  return stripTrailingSeparators(String(value || '').trim());
+}
+
+function normalizeOptionalDirectoryPath(value) {
+  const rawValue = String(value || '').trim();
+  if (!rawValue) {
+    return null;
+  }
+
+  return normalizeDirectoryPath(rawValue);
+}
+
+function normalizePathList(values = []) {
+  const seen = new Set();
+  const results = [];
+
+  for (const entry of values || []) {
+    const normalizedEntry = normalizeOptionalDirectoryPath(entry);
+    if (!normalizedEntry) {
+      continue;
+    }
+
+    const key = normalizedEntry.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    results.push(normalizedEntry);
+  }
+
+  return results;
+}
+
+function resolveHomePath() {
+  try {
+    return app.getPath('home');
+  } catch {
+    return getEnvValueInsensitive('USERPROFILE') || process.cwd();
+  }
+}
+
+function resolveRoamingAppDataRoot() {
+  try {
+    return normalizeDirectoryPath(app.getPath('appData'));
+  } catch {
+    return normalizeDirectoryPath(
+      getEnvValueInsensitive('APPDATA') || path.join(resolveHomePath(), 'AppData', 'Roaming'),
+    );
+  }
+}
+
+function resolveLocalAppDataRoot() {
+  return normalizeDirectoryPath(
+    getEnvValueInsensitive('LOCALAPPDATA') || path.join(resolveHomePath(), 'AppData', 'Local'),
+  );
+}
+
+function resolveExecutablePath() {
+  try {
+    const electronExecutable = app.getPath('exe');
+    if (electronExecutable) {
+      return path.resolve(electronExecutable);
+    }
+  } catch {
+    // Fall back to process.execPath below.
+  }
+
+  return path.resolve(process.execPath);
+}
+
+function resolveAppInstallDir(executablePath = resolveExecutablePath()) {
+  if (app?.isPackaged) {
+    return normalizeDirectoryPath(path.dirname(executablePath));
+  }
+
+  return normalizeDirectoryPath(path.resolve(__dirname, '..', '..'));
+}
+
+function buildManagedSubdirectoryPaths(rootPath) {
+  const managedRoot = normalizeDirectoryPath(rootPath);
   return {
-    appDataRoot,
-    root,
-    legacyRoots: LEGACY_APP_DATA_DIR_NAMES.map((name) => path.join(appDataRoot, name)).filter((entry) => entry !== root),
+    managedRoot,
+    downloadsRoot: path.join(managedRoot, 'downloads'),
+    logsRoot: path.join(managedRoot, 'logs'),
+    modelsRoot: path.join(managedRoot, 'models'),
+    runtimesRoot: path.join(managedRoot, 'runtimes'),
+    snapshotsRoot: path.join(managedRoot, 'snapshots'),
+    toolsRoot: path.join(managedRoot, 'tools'),
   };
 }
 
-function getAppPaths() {
-  const storage = getStorageRoots();
-  return {
-    ...storage,
-    configFile: path.join(storage.root, 'config.json'),
-    toolsRoot: path.join(storage.root, 'tools'),
-    snapshotsRoot: path.join(storage.root, 'snapshots'),
-    downloadsRoot: path.join(storage.root, 'downloads'),
-    logsRoot: path.join(storage.root, 'logs'),
-  };
+function buildManagedPathMappings(sourceRoot, targetRoot) {
+  const normalizedSourceRoot = normalizeOptionalDirectoryPath(sourceRoot);
+  const normalizedTargetRoot = normalizeOptionalDirectoryPath(targetRoot);
+  if (!normalizedSourceRoot || !normalizedTargetRoot) {
+    return [];
+  }
+
+  return MANAGED_DATA_SUBDIRECTORIES.map((directoryName) => ({
+    from: path.join(normalizedSourceRoot, directoryName),
+    to: path.join(normalizedTargetRoot, directoryName),
+  }));
 }
 
-function createDefaultConfig() {
-  return {
-    version: CONFIG_VERSION,
-    firstLaunchCompleted: false,
-    hardware: null,
-    tools: {},
-  };
+function buildLegacyConfigRoots(appDataRoot, localAppDataRoot) {
+  return normalizePathList(
+    LEGACY_APP_DATA_DIR_NAMES.flatMap((name) => [
+      path.join(appDataRoot, name),
+      path.join(localAppDataRoot, name),
+    ]),
+  );
+}
+
+function normalizeIgnoredToolIds(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return [...new Set(value.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean))];
 }
 
 function rewriteLegacyPathsInValue(value, pathMappings) {
@@ -57,13 +167,15 @@ function rewriteLegacyPathsInValue(value, pathMappings) {
   }
 
   let nextValue = value;
-  for (const mapping of pathMappings) {
-    if (!mapping.from || !mapping.to) {
+  for (const mapping of pathMappings || []) {
+    const from = normalizeOptionalDirectoryPath(mapping?.from);
+    const to = normalizeOptionalDirectoryPath(mapping?.to);
+    if (!from || !to) {
       continue;
     }
 
-    if (nextValue === mapping.from || nextValue.startsWith(`${mapping.from}${path.sep}`)) {
-      nextValue = `${mapping.to}${nextValue.slice(mapping.from.length)}`;
+    if (nextValue === from || nextValue.startsWith(`${from}${path.sep}`)) {
+      nextValue = `${to}${nextValue.slice(from.length)}`;
     }
   }
 
@@ -90,6 +202,19 @@ function normalizeToolState(toolState, pathMappings) {
   );
 }
 
+function createDefaultConfig() {
+  return {
+    version: CONFIG_VERSION,
+    firstLaunchCompleted: false,
+    hardware: null,
+    ignoredToolIds: [],
+    managedDataRoot: null,
+    managedDataRootHistory: [],
+    dismissedManagedMigrationRoots: [],
+    tools: {},
+  };
+}
+
 function normalizeConfig(config, options = {}) {
   const pathMappings = options.pathMappings || [];
   const tools = Object.fromEntries(
@@ -103,10 +228,89 @@ function normalizeConfig(config, options = {}) {
       ...createDefaultConfig(),
       ...(config || {}),
       version: CONFIG_VERSION,
+      ignoredToolIds: normalizeIgnoredToolIds(config?.ignoredToolIds),
+      managedDataRoot: normalizeOptionalDirectoryPath(config?.managedDataRoot),
+      managedDataRootHistory: normalizePathList([
+        ...(config?.managedDataRootHistory || []),
+        config?.managedDataRoot,
+      ]),
+      dismissedManagedMigrationRoots: normalizePathList(config?.dismissedManagedMigrationRoots || []),
       tools,
     },
     pathMappings,
   );
+}
+
+function readStoredConfigSnapshotSync(configFile) {
+  if (cachedConfigSnapshot) {
+    return cachedConfigSnapshot;
+  }
+
+  try {
+    if (!fs.existsSync(configFile)) {
+      return null;
+    }
+
+    const raw = fs.readFileSync(configFile, 'utf8');
+    if (!String(raw || '').trim()) {
+      return null;
+    }
+
+    cachedConfigSnapshot = normalizeConfig(JSON.parse(raw));
+    return cachedConfigSnapshot;
+  } catch {
+    return null;
+  }
+}
+
+function getStorageRoots(configOverride = null) {
+  const appDataRoot = resolveRoamingAppDataRoot();
+  const localAppDataRoot = resolveLocalAppDataRoot();
+  const root = normalizeDirectoryPath(path.join(appDataRoot, APP_DATA_DIR_NAME));
+  const localRoot = normalizeDirectoryPath(path.join(localAppDataRoot, APP_DATA_DIR_NAME));
+  const configFile = path.join(root, 'config.json');
+  const executablePath = resolveExecutablePath();
+  const appInstallDir = resolveAppInstallDir(executablePath);
+  const defaultManagedRoot = appInstallDir;
+  const storedConfig = configOverride || readStoredConfigSnapshotSync(configFile) || null;
+  const configuredManagedRoot = normalizeOptionalDirectoryPath(storedConfig?.managedDataRoot);
+  const managedRoot = configuredManagedRoot || defaultManagedRoot;
+  const legacyConfigRoots = buildLegacyConfigRoots(appDataRoot, localAppDataRoot).filter(
+    (entry) => entry !== root && entry !== localRoot,
+  );
+  const managedDataRootHistory = normalizePathList(storedConfig?.managedDataRootHistory || []);
+  const knownManagedRoots = normalizePathList([
+    root,
+    defaultManagedRoot,
+    managedRoot,
+    ...managedDataRootHistory,
+    ...legacyConfigRoots,
+  ]);
+
+  return {
+    appDataRoot,
+    appInstallDir,
+    configFile,
+    defaultManagedRoot,
+    executablePath,
+    knownManagedRoots,
+    legacyConfigRoots,
+    legacyRoots: normalizePathList([root, ...legacyConfigRoots, ...managedDataRootHistory]),
+    localAppDataRoot,
+    localRoot,
+    managedDataRootHistory,
+    managedRoot,
+    root,
+  };
+}
+
+function getAppPaths(configOverride = null) {
+  const storage = getStorageRoots(configOverride);
+  return {
+    ...storage,
+    configRoot: storage.root,
+    ...buildManagedSubdirectoryPaths(storage.managedRoot),
+  };
 }
 
 async function mergeJsonFiles(targetPath, sourcePath, mergeJson) {
@@ -124,71 +328,28 @@ async function mergeJsonFiles(targetPath, sourcePath, mergeJson) {
   await fs.writeJson(targetPath, mergedJson, { spaces: 2 });
 }
 
-async function migrateLegacyRoot(paths, legacyRoot) {
+async function mergeLegacyConfigRoot(paths, legacyRoot) {
   if (!legacyRoot || !(await fs.pathExists(legacyRoot))) {
     return;
   }
 
-  if (!(await fs.pathExists(paths.root))) {
-    await fs.move(legacyRoot, paths.root, { overwrite: false });
-  } else {
-    await fs.copy(legacyRoot, paths.root, { overwrite: false, errorOnExist: false, preserveTimestamps: true });
+  await mergeJsonFiles(paths.configFile, path.join(legacyRoot, 'config.json'), (targetJson, sourceJson) => ({
+    ...normalizeConfig(sourceJson),
+    ...normalizeConfig(targetJson),
+    tools: {
+      ...(normalizeConfig(sourceJson).tools || {}),
+      ...(normalizeConfig(targetJson).tools || {}),
+    },
+  }));
 
-    await mergeJsonFiles(paths.configFile, path.join(legacyRoot, 'config.json'), (targetJson, sourceJson) => ({
-      ...normalizeConfig(sourceJson),
-      ...normalizeConfig(targetJson),
-      tools: {
-        ...(normalizeConfig(sourceJson).tools || {}),
-        ...(normalizeConfig(targetJson).tools || {}),
-      },
-    }));
-
-    await mergeJsonFiles(
-      path.join(paths.root, 'model-manager.settings.json'),
-      path.join(legacyRoot, 'model-manager.settings.json'),
-      (targetJson, sourceJson) => ({
-        ...(sourceJson || {}),
-        ...(targetJson || {}),
-      }),
-    );
-
-    await fs.remove(legacyRoot);
-  }
-
-  const pathMappings = [{ from: legacyRoot, to: paths.root }];
-  if (await fs.pathExists(paths.configFile)) {
-    const rawConfig = await fs.readJson(paths.configFile).catch(() => createDefaultConfig());
-    await fs.writeJson(paths.configFile, normalizeConfig(rawConfig, { pathMappings }), { spaces: 2 });
-  }
-}
-
-async function prepareStorage() {
-  const paths = getAppPaths();
-
-  for (const legacyRoot of paths.legacyRoots) {
-    await migrateLegacyRoot(paths, legacyRoot);
-  }
-
-  await Promise.all([
-    fs.ensureDir(paths.root),
-    fs.ensureDir(paths.toolsRoot),
-    fs.ensureDir(paths.snapshotsRoot),
-    fs.ensureDir(paths.downloadsRoot),
-    fs.ensureDir(paths.logsRoot),
-  ]);
-
-  return paths;
-}
-
-async function ensureStorage() {
-  if (!storageReadyPromise) {
-    storageReadyPromise = prepareStorage().catch((error) => {
-      storageReadyPromise = null;
-      throw error;
-    });
-  }
-
-  return storageReadyPromise;
+  await mergeJsonFiles(
+    path.join(paths.configRoot, 'model-manager.settings.json'),
+    path.join(legacyRoot, 'model-manager.settings.json'),
+    (targetJson, sourceJson) => ({
+      ...(sourceJson || {}),
+      ...(targetJson || {}),
+    }),
+  );
 }
 
 function queueConfigOperation(operation) {
@@ -197,13 +358,16 @@ function queueConfigOperation(operation) {
   return next;
 }
 
-async function writeConfigFile(paths, config) {
+async function writeConfigFile(paths, config, options = {}) {
   const normalized = normalizeConfig(config, {
-    pathMappings: paths.legacyRoots.map((legacyRoot) => ({ from: legacyRoot, to: paths.root })),
+    pathMappings: options.pathMappings || [],
   });
   const tempFile = `${paths.configFile}.${process.pid}.${Date.now()}.tmp`;
+  await fs.ensureDir(path.dirname(paths.configFile));
   await fs.writeFile(tempFile, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
   await fs.move(tempFile, paths.configFile, { overwrite: true });
+  cachedConfigSnapshot = normalized;
+  storageReadyPromise = null;
   return normalized;
 }
 
@@ -264,17 +428,17 @@ function extractFirstJsonDocument(raw) {
   return null;
 }
 
-async function recoverConfigFile(paths, raw) {
-  const backupPath = path.join(paths.root, `config.corrupt-${Date.now()}.json`);
+async function recoverConfigFile(paths, raw, options = {}) {
+  const backupPath = path.join(paths.configRoot, `config.corrupt-${Date.now()}.json`);
   await fs.writeFile(backupPath, raw, 'utf8');
 
   const recoveredDocument = extractFirstJsonDocument(raw);
   if (recoveredDocument) {
     try {
       const recoveredConfig = normalizeConfig(JSON.parse(recoveredDocument), {
-        pathMappings: paths.legacyRoots.map((legacyRoot) => ({ from: legacyRoot, to: paths.root })),
+        pathMappings: options.pathMappings || [],
       });
-      await writeConfigFile(paths, recoveredConfig);
+      await writeConfigFile(paths, recoveredConfig, options);
       return recoveredConfig;
     } catch {
       // Fall back to a clean config file below.
@@ -282,31 +446,70 @@ async function recoverConfigFile(paths, raw) {
   }
 
   const replacement = createDefaultConfig();
-  await writeConfigFile(paths, replacement);
+  await writeConfigFile(paths, replacement, options);
   return replacement;
 }
 
-async function readConfigFile(paths) {
+async function readConfigFile(paths, options = {}) {
   if (!(await fs.pathExists(paths.configFile))) {
     const config = createDefaultConfig();
-    await writeConfigFile(paths, config);
+    await writeConfigFile(paths, config, options);
     return config;
   }
 
   const raw = await fs.readFile(paths.configFile, 'utf8');
   if (!raw.trim()) {
     const config = createDefaultConfig();
-    await writeConfigFile(paths, config);
+    await writeConfigFile(paths, config, options);
     return config;
   }
 
   try {
-    return normalizeConfig(JSON.parse(raw), {
-      pathMappings: paths.legacyRoots.map((legacyRoot) => ({ from: legacyRoot, to: paths.root })),
+    const config = normalizeConfig(JSON.parse(raw), {
+      pathMappings: options.pathMappings || [],
     });
+    cachedConfigSnapshot = config;
+    return config;
   } catch {
-    return recoverConfigFile(paths, raw);
+    return recoverConfigFile(paths, raw, options);
   }
+}
+
+async function prepareStorage() {
+  const initialPaths = getAppPaths();
+  await Promise.all([
+    fs.ensureDir(initialPaths.configRoot),
+    fs.ensureDir(initialPaths.localRoot),
+  ]);
+
+  for (const legacyRoot of initialPaths.legacyConfigRoots) {
+    await mergeLegacyConfigRoot(initialPaths, legacyRoot);
+  }
+
+  const config = await readConfigFile(initialPaths);
+  const paths = getAppPaths(config);
+  await Promise.all([
+    fs.ensureDir(paths.configRoot),
+    fs.ensureDir(paths.toolsRoot),
+    fs.ensureDir(paths.snapshotsRoot),
+    fs.ensureDir(paths.downloadsRoot),
+    fs.ensureDir(paths.modelsRoot),
+    fs.ensureDir(paths.runtimesRoot),
+    fs.ensureDir(paths.logsRoot),
+  ]);
+
+  return paths;
+}
+
+async function ensureStorage() {
+  if (!storageReadyPromise) {
+    storageReadyPromise = prepareStorage().catch((error) => {
+      storageReadyPromise = null;
+      throw error;
+    });
+  }
+
+  return storageReadyPromise;
 }
 
 async function readConfig() {
@@ -316,19 +519,19 @@ async function readConfig() {
   });
 }
 
-async function writeConfig(config) {
+async function writeConfig(config, options = {}) {
   return queueConfigOperation(async () => {
     const paths = await ensureStorage();
-    return writeConfigFile(paths, config);
+    return writeConfigFile(paths, config, options);
   });
 }
 
-async function updateConfig(mutator) {
+async function updateConfig(mutator, options = {}) {
   return queueConfigOperation(async () => {
     const paths = await ensureStorage();
     const current = await readConfigFile(paths);
     const next = (await mutator(current)) || current;
-    return writeConfigFile(paths, next);
+    return writeConfigFile(paths, next, options);
   });
 }
 
@@ -349,6 +552,7 @@ async function markFirstLaunchComplete() {
 async function upsertTool(toolState) {
   return updateConfig((config) => ({
     ...config,
+    ignoredToolIds: normalizeIgnoredToolIds(config.ignoredToolIds).filter((toolId) => toolId !== toolState.id),
     tools: {
       ...config.tools,
       [toolState.id]: {
@@ -357,6 +561,39 @@ async function upsertTool(toolState) {
       },
     },
   }));
+}
+
+async function removeTool(toolId) {
+  return updateConfig((config) => {
+    const nextTools = {
+      ...config.tools,
+    };
+    delete nextTools[toolId];
+
+    return {
+      ...config,
+      tools: nextTools,
+    };
+  });
+}
+
+async function setToolIgnored(toolId, ignored) {
+  const normalizedToolId = String(toolId || '').trim().toLowerCase();
+  if (!normalizedToolId) {
+    return readConfig();
+  }
+
+  return updateConfig((config) => {
+    const currentIgnoredToolIds = normalizeIgnoredToolIds(config.ignoredToolIds);
+    const nextIgnoredToolIds = ignored
+      ? [...new Set([...currentIgnoredToolIds, normalizedToolId])]
+      : currentIgnoredToolIds.filter((entry) => entry !== normalizedToolId);
+
+    return {
+      ...config,
+      ignoredToolIds: nextIgnoredToolIds,
+    };
+  });
 }
 
 function humanizeError(error, fallback = 'Something went wrong. Please try again.') {
@@ -370,16 +607,22 @@ function humanizeError(error, fallback = 'Something went wrong. Please try again
 module.exports = {
   APP_DATA_DIR_NAME,
   LEGACY_APP_DATA_DIR_NAMES,
+  MANAGED_DATA_SUBDIRECTORIES,
+  buildManagedPathMappings,
+  buildManagedSubdirectoryPaths,
   createDefaultConfig,
   ensureStorage,
   getAppPaths,
   getStorageRoots,
   humanizeError,
   markFirstLaunchComplete,
+  normalizeDirectoryPath,
+  normalizePathList,
   readConfig,
+  removeTool,
   saveHardwareDetection,
+  setToolIgnored,
   updateConfig,
   upsertTool,
   writeConfig,
 };
-

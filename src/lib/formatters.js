@@ -1,4 +1,4 @@
-export function formatMemory(mb) {
+﻿export function formatMemory(mb) {
   if (!Number.isFinite(mb) || mb <= 0) {
     return 'Not available';
   }
@@ -9,8 +9,12 @@ export function formatMemory(mb) {
 }
 
 export function formatBytes(bytes) {
-  if (!Number.isFinite(bytes) || bytes <= 0) {
+  if (!Number.isFinite(bytes) || bytes < 0) {
     return 'Size unavailable';
+  }
+
+  if (bytes === 0) {
+    return '0 B';
   }
 
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -36,6 +40,15 @@ export function formatUsage(usedMb, totalMb) {
   }
 
   return `${formatMemory(usedMb)} / ${formatMemory(totalMb)}`;
+}
+
+export function formatDiskAvailability(freeBytes, totalBytes) {
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+    return 'Not available';
+  }
+
+  const freeLabel = Number.isFinite(freeBytes) && freeBytes >= 0 ? (freeBytes === 0 ? '0 B' : formatBytes(freeBytes)) : 'Unknown';
+  return `${freeLabel} free of ${formatBytes(totalBytes)}`;
 }
 
 export function formatTimestamp(value) {
@@ -66,3 +79,6 @@ export function statusClass(status) {
 export function progressWidth(progress) {
   return `${Math.max(0, Math.min(100, progress || 0))}%`;
 }
+
+
+

@@ -1,6 +1,6 @@
 const path = require('path');
 
-const { getAppPaths } = require('./configService');
+const { getAppPaths, normalizePathList } = require('./configService');
 
 const SAFE_MANIFEST_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '0.0.0.0', '::1', '[::1]']);
@@ -36,8 +36,22 @@ function sanitizeManifestId(toolId) {
   return normalized;
 }
 
-function resolveManagedToolPaths(toolId, venvFolder = '.venv') {
-  const { toolsRoot } = getAppPaths();
+function getManagedToolsRoots() {
+  const appPaths = getAppPaths();
+  return normalizePathList([
+    appPaths.toolsRoot,
+    ...(appPaths.knownManagedRoots || []).map((rootPath) => path.join(rootPath, 'tools')),
+  ]).map((entry) => normalizeResolvedPath(entry));
+}
+
+function findManagedToolsRootForPath(candidatePath) {
+  const normalizedCandidatePath = normalizeResolvedPath(candidatePath);
+  return getManagedToolsRoots().find((toolsRoot) => isPathInside(toolsRoot, normalizedCandidatePath)) || null;
+}
+
+function resolveManagedToolPaths(toolId, venvFolder = '.venv', options = {}) {
+  const baseManagedRoot = options.managedRoot ? normalizeResolvedPath(options.managedRoot) : getAppPaths().managedRoot;
+  const toolsRoot = normalizeResolvedPath(path.join(baseManagedRoot, 'tools'));
   const safeToolId = sanitizeManifestId(toolId);
   const installDir = path.join(toolsRoot, safeToolId);
   const safeInstallDir = assertPathInside(
@@ -47,7 +61,7 @@ function resolveManagedToolPaths(toolId, venvFolder = '.venv') {
   );
 
   return {
-    toolsRoot: normalizeResolvedPath(toolsRoot),
+    toolsRoot,
     installDir: safeInstallDir,
     appDir: path.join(safeInstallDir, 'app'),
     venvDir: path.join(safeInstallDir, venvFolder || '.venv'),
@@ -109,6 +123,8 @@ module.exports = {
   assertPathInside,
   assertSafeCommandString,
   assertSecureRemoteUrl,
+  findManagedToolsRootForPath,
+  getManagedToolsRoots,
   isLoopbackUrl,
   isPathInside,
   resolveManagedToolPaths,

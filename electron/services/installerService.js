@@ -1,22 +1,261 @@
 const path = require('path');
 const fs = require('fs-extra');
 const { open } = require('node:fs/promises');
+const { app } = require('electron');
 const extract = require('extract-zip');
 
 const { version: APP_VERSION } = require('../../package.json');
 
-const { getAppPaths, humanizeError, upsertTool } = require('./configService');
+const { getAppPaths, humanizeError, removeTool, setToolIgnored, upsertTool } = require('./configService');
 const { verifyDownloadedFileIntegrity } = require('./downloadIntegrityService');
 const { resolvePythonCommand, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { detectPythonRequirement, describePythonRequirement } = require('./pythonRequirementService');
 const { ensureManagedPythonRuntime } = require('./pythonRuntimeService');
+const { applyRepairCleanup, getDiskPreflight, inspectRepairCleanup } = require('./storageMaintenanceService');
 const { syncDiscoveredTools } = require('./toolDiscoveryService');
 const { buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
-const { assertPathInside, assertSecureRemoteUrl, resolveManagedToolPaths } = require('./pathSafetyService');
+const { assertPathInside, assertSecureRemoteUrl, findManagedToolsRootForPath, resolveManagedToolPaths } = require('./pathSafetyService');
 
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const MIN_CACHE_BYTES = 1024;
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '0 B';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(digits).replace(/\.0$/, '')} ${units[unitIndex]}`;
+}
+
+function pluralize(count, singular, plural = null) {
+  return count === 1 ? singular : plural || `${singular}s`;
+}
+
+async function resolveRemoteDownloadSize(downloadUrl, logger) {
+  const safeDownloadUrl = assertSecureRemoteUrl(downloadUrl, 'installer download URL');
+
+  const readSizeFromResponse = (response) => {
+    const contentLength = Number(response.headers.get('content-length')) || 0;
+    if (contentLength > 0) {
+      return contentLength;
+    }
+
+    const contentRange = String(response.headers.get('content-range') || '');
+    const rangeMatch = contentRange.match(/\/(\d+)$/);
+    if (rangeMatch?.[1]) {
+      return Number(rangeMatch[1]) || 0;
+    }
+
+    return 0;
+  };
+
+  const requestSize = async (method, headers = {}) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(safeDownloadUrl, {
+        method,
+        signal: controller.signal,
+        headers: {
+          'User-Agent': `LocalAIHub/${APP_VERSION}`,
+          ...headers,
+        },
+      });
+
+      return response.ok ? readSizeFromResponse(response) : 0;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  try {
+    const headSize = await requestSize('HEAD');
+    if (headSize > 0) {
+      return {
+        requiredBytes: headSize,
+        sizeKnown: true,
+        source: 'head-request',
+      };
+    }
+  } catch (error) {
+    await logger.warn('Installer size preflight HEAD request failed.', {
+      downloadUrl: safeDownloadUrl,
+      error,
+    });
+  }
+
+  try {
+    const rangeSize = await requestSize('GET', {
+      Range: 'bytes=0-0',
+    });
+    if (rangeSize > 0) {
+      return {
+        requiredBytes: rangeSize,
+        sizeKnown: true,
+        source: 'range-request',
+      };
+    }
+  } catch (error) {
+    await logger.warn('Installer size preflight range request failed.', {
+      downloadUrl: safeDownloadUrl,
+      error,
+    });
+  }
+
+  return {
+    requiredBytes: 0,
+    sizeKnown: false,
+    source: 'unknown',
+  };
+}
+async function estimateToolInstallRequirement(manifest, archivePath, logger) {
+  if (archivePath && (await fs.pathExists(archivePath))) {
+    const stats = await fs.stat(archivePath).catch(() => null);
+    if (stats?.size > MIN_CACHE_BYTES) {
+      return {
+        requiredBytes: stats.size,
+        sizeKnown: true,
+        source: 'cached-installer',
+      };
+    }
+  }
+
+  if (manifest.installInstructions.kind === 'pip-package') {
+    return {
+      requiredBytes: 0,
+      sizeKnown: false,
+      source: 'pip-package',
+    };
+  }
+
+  return resolveRemoteDownloadSize(manifest.downloadUrl, logger);
+}
+
+function assertInstallPreflightApproved(preflight, confirmed) {
+  if (!preflight) {
+    return;
+  }
+
+  if (preflight.blocked) {
+    throw new Error(
+      `${preflight.toolName} needs ${formatBytes(preflight.requiredBytes)} but only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}. Clear space and try again.`,
+    );
+  }
+
+  if (preflight.requiresConfirmation && !confirmed) {
+    const sizeMessage = preflight.sizeKnown
+      ? `${preflight.toolName} needs about ${formatBytes(preflight.requiredBytes)} and Local AI Hub needs confirmation before continuing on ${preflight.mount}.`
+      : `${preflight.toolName} may leave this drive very low on free space, and Local AI Hub needs confirmation before continuing on ${preflight.mount}.`;
+    throw new Error(sizeMessage);
+  }
+}
+
+function buildRepairCleanupNotes(cleanupSummary) {
+  const notes = [];
+
+  if (cleanupSummary.removedDuplicateFolders > 0) {
+    notes.push(
+      `removed ${cleanupSummary.removedDuplicateFolders} duplicate ${pluralize(cleanupSummary.removedDuplicateFolders, 'install folder')}`,
+    );
+  }
+
+  if (cleanupSummary.removedTemporaryArtifacts > 0) {
+    notes.push(
+      `cleaned ${cleanupSummary.removedTemporaryArtifacts} leftover ${pluralize(cleanupSummary.removedTemporaryArtifacts, 'download or temp item')}`,
+    );
+  }
+
+  if (cleanupSummary.removedOrphanedToolFolders > 0) {
+    notes.push(
+      `deleted ${cleanupSummary.removedOrphanedToolFolders} orphaned ${pluralize(cleanupSummary.removedOrphanedToolFolders, 'tool folder')}`,
+    );
+  }
+
+  if (cleanupSummary.skippedOrphanedToolFolders > 0) {
+    notes.push(
+      `left ${cleanupSummary.skippedOrphanedToolFolders} orphaned ${pluralize(cleanupSummary.skippedOrphanedToolFolders, 'tool folder')} untouched`,
+    );
+  }
+
+  if (cleanupSummary.recoveredBytes > 0) {
+    notes.push(`recovered ${formatBytes(cleanupSummary.recoveredBytes)} of disk space`);
+  }
+
+  return notes;
+}
+
+function summarizeRepairPlan(cleanupPlan) {
+  const duplicateRecoveryBytes = cleanupPlan.duplicateFolders.reduce(
+    (total, entry) => total + Number(entry.sizeBytes || 0),
+    0,
+  );
+  const orphanedRecoveryBytes = cleanupPlan.orphanedToolFolders.reduce(
+    (total, entry) => total + Number(entry.sizeBytes || 0),
+    0,
+  );
+  const temporaryRecoveryBytes = cleanupPlan.temporaryArtifacts.reduce(
+    (total, entry) => total + Number(entry.sizeBytes || 0),
+    0,
+  );
+
+  return {
+    duplicateFolderCount: cleanupPlan.duplicateFolders.length,
+    duplicateRecoveryBytes,
+    orphanedToolFolderCount: cleanupPlan.orphanedToolFolders.length,
+    orphanedRecoveryBytes,
+    potentialRecoveryBytes: cleanupPlan.potentialRecoveryBytes,
+    requiresOrphanConfirmation: cleanupPlan.requiresOrphanConfirmation,
+    temporaryArtifactCount: cleanupPlan.temporaryArtifacts.length,
+    temporaryRecoveryBytes,
+  };
+}
+
+function buildRepairOutcomeMessage(toolName, notes = []) {
+  if (!notes.length) {
+    return `Local AI Hub repaired ${toolName}.`;
+  }
+
+  return `Local AI Hub repaired ${toolName}: ${notes.join(', ')}.`;
+}
+
+async function getToolInstallPreflight(toolId) {
+  await initializeToolRegistry();
+  const manifest = getToolManifest(toolId);
+  if (!manifest) {
+    throw new Error('Local AI Hub does not recognize that tool.');
+  }
+
+  const logger = createLogger('installer', {
+    toolId,
+    toolName: manifest.name,
+    mode: 'preflight',
+  });
+  const { archivePath } = buildManagedPaths(manifest);
+  const estimate = await estimateToolInstallRequirement(manifest, archivePath, logger);
+  const managedDataPath = getAppPaths().managedRoot;
+  const preflight = await getDiskPreflight(managedDataPath, estimate.requiredBytes);
+
+  return {
+    ...preflight,
+    estimateSource: estimate.source,
+    sizeKnown: estimate.sizeKnown,
+    targetPath: managedDataPath,
+    toolId,
+    toolName: manifest.name,
+  };
+}
 
 function getToolRuntime(manifest) {
   return manifest.installInstructions.runtime;
@@ -41,9 +280,17 @@ function ensureManagedToolStatePaths(toolState) {
     throw new Error('Local AI Hub could not validate the managed tool path.');
   }
 
-  const managedPaths = resolveManagedToolPaths(toolState.id, path.basename(toolState.venvDir || '.venv'));
+  const installRoot = toolState.installDir || toolState.appDir || '';
+  const toolsRootOverride = installRoot ? findManagedToolsRootForPath(installRoot) : null;
+  const managedRootOverride = toolsRootOverride ? path.dirname(toolsRootOverride) : null;
+  const managedPaths = resolveManagedToolPaths(
+    toolState.id,
+    path.basename(toolState.venvDir || '.venv'),
+    managedRootOverride ? { managedRoot: managedRootOverride } : {},
+  );
+  const allowedToolsRoot = toolsRootOverride || managedPaths.toolsRoot;
   const installDir = assertPathInside(
-    managedPaths.toolsRoot,
+    allowedToolsRoot,
     toolState.installDir || managedPaths.installDir,
     'Local AI Hub refused to use a managed install outside its tools folder.',
   );
@@ -275,7 +522,25 @@ async function extractArchive(archivePath, targetDirectory, logger) {
 
   await fs.remove(tempDirectory);
   await fs.ensureDir(tempDirectory);
-  await extract(archivePath, { dir: tempDirectory });
+
+  const extension = path.extname(archivePath).toLowerCase();
+  if (extension === '.7z') {
+    const sevenZipPath = app.isPackaged
+      ? path.join(process.resourcesPath, 'bin', '7za.exe')
+      : path.join(__dirname, '..', '..', 'node_modules', '7zip-bin', 'win', 'x64', '7za.exe');
+
+    if (!(await fs.pathExists(sevenZipPath))) {
+      throw new Error('Local AI Hub is missing its 7-Zip helper and could not unpack that installer package.');
+    }
+
+    await fs.emptyDir(tempDirectory);
+    await runCommand(sevenZipPath, ['x', archivePath, '-y', `-o${tempDirectory}`], {
+      cwd: path.dirname(archivePath),
+      errorMessage: 'Local AI Hub could not unpack the 7-Zip installer package.',
+    });
+  } else {
+    await extract(archivePath, { dir: tempDirectory });
+  }
 
   const entries = await fs.readdir(tempDirectory);
   const firstEntryPath = entries.length === 1 ? path.join(tempDirectory, entries[0]) : null;
@@ -511,6 +776,7 @@ async function toolIsAvailable(toolState) {
 function createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, pythonResolution) {
   const runtime = pythonResolution?.runtime || null;
   const requirement = pythonResolution?.requirement || null;
+  const managedRuntime = runtime?.source === 'managed' ? runtime : null;
   const toolState = {
     id: manifest.id,
     name: manifest.name,
@@ -537,9 +803,12 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
     launchSupported: true,
     displayPath: installDir,
     pythonRequirement: requirement,
-    managedPythonVersion: runtime?.versionString || null,
-    managedPythonPath: runtime?.pythonPath || null,
-    managedPythonInstallDir: runtime?.installDir || null,
+    pythonBootstrapPath: runtime?.pythonPath || runtime?.executable || runtime?.launcher || null,
+    pythonBootstrapSource: runtime?.source || null,
+    pythonBootstrapVersion: runtime?.versionString || null,
+    managedPythonVersion: managedRuntime?.versionString || null,
+    managedPythonPath: managedRuntime?.pythonPath || null,
+    managedPythonInstallDir: managedRuntime?.installDir || null,
   };
 
   toolState.launchProfile = buildManagedLaunchProfile(toolState, manifest);
@@ -713,10 +982,81 @@ async function installExecutableInstallerTool(manifest, options, logger) {
     errorMessage: `Local AI Hub could not run the ${manifest.name} installer.`,
   });
 
-  const toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
+  let toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
   if (!(await toolIsAvailable(toolState))) {
-    throw new Error(`${manifest.name} finished installing, but Local AI Hub could not find its launcher files afterward.`);
+    const discoveredTools = await syncDiscoveredTools({ force: true });
+    const detectedTool = discoveredTools[manifest.id];
+    if (await toolIsAvailable(detectedTool)) {
+      toolState = {
+        ...detectedTool,
+        downloadCachePath: archivePath,
+      };
+    } else {
+      throw new Error(`${manifest.name} finished installing, but Local AI Hub could not find its launcher files afterward.`);
+    }
   }
+
+  await upsertTool(toolState);
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 100,
+    stage: 'complete',
+    message: `${manifest.name} is ready.`,
+  });
+
+  return toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState;
+}
+
+async function installPipPackageTool(manifest, options, logger) {
+  const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest);
+
+  await logger.info('Pip package install requested.', {
+    installDir,
+    archivePath,
+  });
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 5,
+    stage: 'preparing',
+    message: `Preparing ${manifest.name}.`,
+  });
+
+  await fs.ensureDir(installDir);
+  await fs.ensureDir(appDir);
+
+  const pythonResolution = await resolveManagedPythonRuntime(
+    appDir,
+    manifest,
+    logger,
+    options.onProgress,
+    manifest.id,
+  );
+
+  const toolState = createManagedToolState(
+    manifest,
+    installDir,
+    appDir,
+    venvDir,
+    archivePath,
+    pythonResolution,
+  );
+
+  await installPythonDependencies(
+    toolState,
+    manifest,
+    options.onProgress,
+    logger,
+    pythonResolution.runtime,
+  );
+
+  await advanceStep(logger, options.onProgress, {
+    toolId: manifest.id,
+    percent: 98,
+    stage: 'finalizing',
+    message: `${manifest.name} is being registered in Local AI Hub.`,
+  });
 
   await upsertTool(toolState);
 
@@ -743,6 +1083,7 @@ async function installTool(toolId, options = {}) {
   });
 
   try {
+    await setToolIgnored(toolId, false);
     const discoveredTools = await syncDiscoveredTools({ force: true });
     const existingTool = discoveredTools[toolId];
     if (await toolIsAvailable(existingTool)) {
@@ -766,6 +1107,9 @@ async function installTool(toolId, options = {}) {
       };
     }
 
+    const installPreflight = await getToolInstallPreflight(toolId);
+    assertInstallPreflightApproved(installPreflight, Boolean(options.lowDiskConfirmed));
+
     const { archivePath, installDir } = buildManagedPaths(manifest);
 
     await logger.info('Install requested.', {
@@ -784,6 +1128,12 @@ async function installTool(toolId, options = {}) {
     if (installKind === 'installer-exe') {
       const toolState = await installExecutableInstallerTool(manifest, options, logger);
       await logger.info('Installer-based install completed successfully.');
+      return toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState;
+    }
+
+    if (installKind === 'pip-package') {
+      const toolState = await installPipPackageTool(manifest, options, logger);
+      await logger.info('Pip package install completed successfully.');
       return ensureManagedToolStatePaths(toolState);
     }
 
@@ -886,6 +1236,22 @@ async function removePythonCaches(directory) {
   );
 }
 
+async function inspectToolRepair(toolState) {
+  await initializeToolRegistry();
+  const manifest = getToolManifest(toolState?.id);
+  if (!manifest) {
+    throw new Error('Local AI Hub could not find the tool definition for repair.');
+  }
+
+  const safeToolState = toolState?.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState;
+  const cleanupPlan = await inspectRepairCleanup(safeToolState, manifest);
+  return {
+    toolId: toolState.id,
+    toolName: manifest.name,
+    ...summarizeRepairPlan(cleanupPlan),
+  };
+}
+
 async function repairToolInstallation(toolState, options = {}) {
   const manifest = getToolManifest(toolState.id);
   if (!manifest) {
@@ -899,22 +1265,89 @@ async function repairToolInstallation(toolState, options = {}) {
   });
 
   try {
-    toolState = ensureManagedToolStatePaths(toolState);
     const managedPaths = buildManagedPaths(manifest);
-    toolState.downloadCachePath = managedPaths.archivePath;
-    await ensureCachedDownload(manifest, toolState.downloadCachePath, logger, options.onProgress, toolState.id);
+    const installKind = manifest.installInstructions.kind || 'zip';
+    if (toolState.source === 'managed') {
+      toolState = ensureManagedToolStatePaths(toolState);
+    }
 
     await logger.info('Repair requested.', {
       installDir: toolState.installDir,
-      archivePath: toolState.downloadCachePath,
+      archivePath: toolState.downloadCachePath || managedPaths.archivePath,
     });
 
-    const installKind = manifest.installInstructions.kind || 'zip';
-    const repairNotes = [];
+    await advanceStep(logger, options.onProgress, {
+      toolId: toolState.id,
+      percent: 12,
+      stage: 'cleanup',
+      message: 'Checking for duplicate folders and failed downloads.',
+    });
+
+    const cleanupPlan = await inspectRepairCleanup(toolState, manifest);
+    const cleanupSummary = await applyRepairCleanup(cleanupPlan, {
+      logger,
+      removeOrphanedToolFolders: Boolean(options.removeOrphanedToolFolders),
+    });
+    const repairNotes = buildRepairCleanupNotes(cleanupSummary);
     let runtimeChanged = false;
 
+    if (toolState.source !== 'managed') {
+      if (installKind !== 'installer-exe') {
+        throw new Error('Local AI Hub can only repair external installs when the official installer can be rerun safely.');
+      }
+
+      const downloadCachePath = toolState.downloadCachePath || managedPaths.archivePath;
+      await ensureCachedDownload(manifest, downloadCachePath, logger, options.onProgress, toolState.id);
+
+      await logger.info('External installer repair requested.', {
+        installDir: toolState.installDir,
+        archivePath: downloadCachePath,
+      });
+
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 40,
+        stage: 'repairing',
+        message: `Running the ${manifest.name} installer again.`,
+      });
+
+      await runCommand(downloadCachePath, resolveInstallerArgs(manifest, toolState.installDir, toolState.appDir || toolState.installDir), {
+        cwd: path.dirname(downloadCachePath),
+        errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
+      });
+
+      const discoveredTools = await syncDiscoveredTools({ force: true });
+      const repairedExternalTool = discoveredTools[toolState.id];
+      if (!(await toolIsAvailable(repairedExternalTool))) {
+        throw new Error(`Local AI Hub reran the ${manifest.name} installer, but it still could not find the launcher afterward.`);
+      }
+
+      repairNotes.push('reran the official installer');
+      const updatedExternalTool = {
+        ...repairedExternalTool,
+        downloadCachePath,
+        lastError: null,
+        lastRepairMessage: buildRepairOutcomeMessage(manifest.name, repairNotes),
+        status: 'stopped',
+      };
+      await upsertTool(updatedExternalTool);
+
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 100,
+        stage: 'complete',
+        message: updatedExternalTool.lastRepairMessage,
+      });
+
+      return updatedExternalTool;
+    }
+
+    toolState.downloadCachePath = managedPaths.archivePath;
+    if (installKind !== 'pip-package') {
+      await ensureCachedDownload(manifest, toolState.downloadCachePath, logger, options.onProgress, toolState.id);
+    }
+
     if (installKind === 'single-file') {
-      const managedPaths = buildManagedPaths(manifest);
       const destinationPath = assertPathInside(
         managedPaths.appDir,
         path.join(
@@ -945,7 +1378,7 @@ async function repairToolInstallation(toolState, options = {}) {
         errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
       });
       repairNotes.push('reran the official installer from the local cache');
-    } else {
+    } else if (installKind === 'zip') {
       await advanceStep(logger, options.onProgress, {
         toolId: toolState.id,
         percent: 25,
@@ -954,6 +1387,14 @@ async function repairToolInstallation(toolState, options = {}) {
       });
       await extractArchive(toolState.downloadCachePath, toolState.appDir, logger);
       repairNotes.push('restored the application files from the local cache');
+    } else if (installKind === 'pip-package') {
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 25,
+        stage: 'repairing',
+        message: 'Refreshing the tool package inside its Python environment.',
+      });
+      repairNotes.push('refreshed the installed Python package');
     }
 
     if (getToolRuntime(manifest) === 'python') {
@@ -969,7 +1410,11 @@ async function repairToolInstallation(toolState, options = {}) {
         toolState.id,
       );
 
-      runtimeChanged = toolState.managedPythonVersion !== pythonResolution.runtime.versionString;
+      const previousRuntimeVersion = toolState.pythonBootstrapVersion || toolState.managedPythonVersion || null;
+      const previousRuntimeSource = toolState.pythonBootstrapSource || (toolState.managedPythonVersion ? 'managed' : null);
+      runtimeChanged =
+        previousRuntimeVersion !== pythonResolution.runtime.versionString ||
+        previousRuntimeSource !== pythonResolution.runtime.source;
       if (toolState.venvDir) {
         await fs.remove(toolState.venvDir).catch(() => null);
       }
@@ -1000,9 +1445,11 @@ async function repairToolInstallation(toolState, options = {}) {
 
       Object.assign(toolState, rebuiltState);
       repairNotes.push(
-        runtimeChanged
-          ? `recreated the virtual environment with Python ${pythonResolution.runtime.versionString}`
-          : 'recreated the virtual environment',
+        pythonResolution.runtime.source === 'system'
+          ? `recreated the virtual environment with Python ${pythonResolution.runtime.versionString} already installed on this PC`
+          : runtimeChanged
+            ? `recreated the virtual environment with Python ${pythonResolution.runtime.versionString}`
+            : 'recreated the virtual environment',
       );
     }
 
@@ -1011,7 +1458,7 @@ async function repairToolInstallation(toolState, options = {}) {
       source: 'managed',
       managedByLocalAIHub: true,
       lastError: null,
-      lastRepairMessage: `Local AI Hub repaired ${manifest.name}: ${repairNotes.join(', ')}.`,
+      lastRepairMessage: buildRepairOutcomeMessage(manifest.name, repairNotes),
       status: 'stopped',
     };
 
@@ -1026,6 +1473,7 @@ async function repairToolInstallation(toolState, options = {}) {
     });
     await logger.info('Repair completed successfully.', {
       runtimeChanged,
+      cleanupSummary,
     });
 
     return updatedState;
@@ -1037,32 +1485,65 @@ async function repairToolInstallation(toolState, options = {}) {
     throw error;
   }
 }
+async function uninstallTool(toolState) {
+  await initializeToolRegistry();
+  const manifest = getToolManifest(toolState?.id);
+  if (!manifest) {
+    throw new Error('Local AI Hub could not find the tool definition for uninstall.');
+  }
+
+  const logger = createLogger('installer', {
+    toolId: toolState.id,
+    toolName: manifest.name,
+    mode: 'uninstall',
+  });
+
+  try {
+    if (toolState.source === 'managed') {
+      const safeToolState = ensureManagedToolStatePaths(toolState);
+      await logger.info('Managed uninstall requested.', {
+        installDir: safeToolState.installDir,
+      });
+      await fs.remove(safeToolState.installDir).catch(() => null);
+      await removeTool(toolState.id);
+      await setToolIgnored(toolState.id, false);
+      return {
+        ...toolState,
+        status: 'stopped',
+        lastError: null,
+        uninstallMessage: `${manifest.name} was uninstalled and moved back to Store.`,
+      };
+    }
+
+    await logger.info('External install was removed from Local AI Hub tracking only.', {
+      installDir: toolState.installDir || null,
+      displayPath: toolState.displayPath || null,
+    });
+    await removeTool(toolState.id);
+    await setToolIgnored(toolState.id, true);
+    return {
+      ...toolState,
+      status: 'stopped',
+      lastError: null,
+      uninstallMessage:
+        `${manifest.name} was removed from Local AI Hub. Its files were not deleted because Local AI Hub did not install them.`,
+    };
+  } catch (error) {
+    await logger.error('Uninstall failed.', {
+      error,
+      readableMessage: humanizeError(error, `Local AI Hub could not uninstall ${manifest.name}.`),
+    });
+    throw error;
+  }
+}
 
 module.exports = {
+  getToolInstallPreflight,
+  inspectToolRepair,
   installTool,
   repairToolInstallation,
+  uninstallTool,
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

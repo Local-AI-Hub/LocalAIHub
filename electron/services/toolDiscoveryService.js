@@ -96,6 +96,44 @@ async function directoryExists(targetPath) {
   }
 }
 
+function normalizeInstallDirCandidate(candidatePath) {
+  if (!candidatePath) {
+    return null;
+  }
+
+  return path.basename(candidatePath) === 'app' ? path.dirname(candidatePath) : candidatePath;
+}
+
+function getAllowedManagedInstallDirs(manifest) {
+  const currentManagedPaths = resolveManagedToolPaths(
+    manifest.id,
+    manifest.installInstructions.venvFolder || '.venv',
+  );
+  return uniquePaths([
+    currentManagedPaths.installDir,
+    ...getAppPaths().legacyRoots.map((legacyRoot) => path.join(legacyRoot, 'tools', manifest.id)),
+  ]);
+}
+
+function getAllowedManagedLocationKeys(manifest) {
+  const locations = getAllowedManagedInstallDirs(manifest);
+  return new Set(
+    uniquePaths([
+      ...locations,
+      ...locations.map((installDir) => path.join(installDir, 'app')),
+    ]).map((entry) => normalizePathKey(entry)),
+  );
+}
+
+function resolveSafeManagedInstallDir(manifest, installDir) {
+  const normalizedInstallDir = normalizeInstallDirCandidate(installDir);
+  const safeCandidate = getAllowedManagedInstallDirs(manifest).find(
+    (candidate) => normalizePathKey(candidate) === normalizePathKey(normalizedInstallDir),
+  );
+
+  return safeCandidate || resolveManagedToolPaths(manifest.id, manifest.installInstructions.venvFolder || '.venv').installDir;
+}
+
 async function findExecutableOnPath(executableName, logger) {
   const result = await runCommand('where', [executableName], {
     allowFailure: true,
@@ -143,7 +181,7 @@ function parsePythonProbeResult(stdout) {
 async function probePythonModule(moduleName, launcher, launcherArgs = [], logger) {
   const probeSnippet = [
     'import importlib.util, json, sys',
-    `module_name = ${JSON.stringify(moduleName)}` ,
+    `module_name = ${JSON.stringify(moduleName)}`,
     'spec = importlib.util.find_spec(module_name)',
     'print(json.dumps({"found": bool(spec), "python": sys.executable}))',
   ].join('; ');
@@ -459,27 +497,45 @@ function buildExternalToolState(manifest, existingTool, detected) {
   };
 }
 
+function toolUsesManagedInstallLocation(manifest, tool) {
+  if (!tool) {
+    return false;
+  }
 
-function getAllowedManagedInstallDirs(manifest) {
-  const currentManagedPaths = resolveManagedToolPaths(
-    manifest.id,
-    manifest.installInstructions.venvFolder || '.venv',
-  );
-  return uniquePaths([
-    currentManagedPaths.installDir,
-    ...getAppPaths().legacyRoots.map((legacyRoot) => path.join(legacyRoot, 'tools', manifest.id)),
-  ]);
+  if (tool.source === 'managed' || tool.managedByLocalAIHub) {
+    return true;
+  }
+
+  const allowedLocations = getAllowedManagedLocationKeys(manifest);
+  const candidates = uniquePaths([
+    normalizeInstallDirCandidate(tool.installDir),
+    tool.installDir,
+    tool.appDir,
+    normalizeInstallDirCandidate(tool.detectedPath),
+    normalizeInstallDirCandidate(tool.displayPath),
+  ].filter(Boolean));
+
+  return candidates.some((candidate) => allowedLocations.has(normalizePathKey(candidate)));
 }
 
-function resolveSafeManagedInstallDir(manifest, installDir) {
-  const normalizedInstallDir = path.basename(installDir || '') === 'app' ? path.dirname(installDir) : installDir;
-  const safeCandidate = getAllowedManagedInstallDirs(manifest).find(
-    (candidate) => normalizePathKey(candidate) === normalizePathKey(normalizedInstallDir),
-  );
+async function managedInstallDirectoryExists(manifest, installDir) {
+  const resolvedInstallDir = resolveSafeManagedInstallDir(manifest, installDir);
+  const candidateDirs = uniquePaths([
+    normalizeInstallDirCandidate(installDir),
+    resolvedInstallDir,
+    path.join(resolvedInstallDir, 'app'),
+  ].filter(Boolean));
 
-  return safeCandidate || resolveManagedToolPaths(manifest.id, manifest.installInstructions.venvFolder || '.venv').installDir;
+  for (const candidateDir of candidateDirs) {
+    if (await directoryExists(candidateDir)) {
+      return true;
+    }
+  }
+
+  return false;
 }
-async function managedToolIsPresent(tool) {
+
+async function managedToolLauncherExists(tool) {
   if (!tool || tool.source !== 'managed') {
     return false;
   }
@@ -492,14 +548,14 @@ async function managedToolIsPresent(tool) {
     return fileExists(tool.launchProfile.pythonPath);
   }
 
-  if (tool.installDir) {
-    return directoryExists(tool.installDir);
+  if (tool.launchProfile?.kind === 'batch' && tool.launchProfile?.command) {
+    return fileExists(tool.launchProfile.command);
   }
 
   return false;
 }
 
-function buildManagedToolState(existingTool, manifest, installDir = existingTool.installDir) {
+function buildManagedToolState(existingTool, manifest, installDir = existingTool?.installDir) {
   const resolvedInstallDir = resolveSafeManagedInstallDir(manifest, installDir);
   const appDir = path.join(resolvedInstallDir || '', 'app');
   const venvDir = manifest.installInstructions.runtime === 'python'
@@ -525,39 +581,12 @@ function buildManagedToolState(existingTool, manifest, installDir = existingTool
     processNames: manifest.processNames || existingTool?.processNames || [],
     configTargets: manifest.installInstructions.configTargets,
     displayPath: resolvedInstallDir,
+    launchSupported: true,
   };
 
   nextState.launchProfile = buildManagedLaunchProfile(nextState, manifest);
   nextState.executablePath = nextState.launchProfile?.kind === 'binary' ? nextState.launchProfile.executable : nextState.executablePath || null;
   return nextState;
-}
-
-async function discoverManagedRelocation(existingTool, manifest, logger) {
-  const candidates = uniquePaths([
-    existingTool?.installDir,
-    existingTool?.appDir,
-    path.join(getAppPaths().toolsRoot, manifest.id),
-    path.join(getAppPaths().toolsRoot, manifest.id, 'app'),
-    ...getAppPaths().legacyRoots.flatMap((legacyRoot) => [
-      path.join(legacyRoot, 'tools', manifest.id),
-      path.join(legacyRoot, 'tools', manifest.id, 'app'),
-    ]),
-  ].filter(Boolean));
-
-  for (const candidate of candidates) {
-    const nextState = buildManagedToolState(existingTool, manifest, candidate);
-    if (!(await managedToolIsPresent(nextState))) {
-      continue;
-    }
-
-    await logger.info('Managed tool files were relocated and have been reattached.', {
-      toolId: manifest.id,
-      installDir: nextState.installDir,
-    });
-    return nextState;
-  }
-
-  return null;
 }
 
 function buildMissingManagedToolState(existingTool, manifest) {
@@ -570,26 +599,130 @@ function buildMissingManagedToolState(existingTool, manifest) {
   };
 }
 
+function buildBrokenManagedToolState(existingTool, manifest, installDir) {
+  const nextState = buildManagedToolState(existingTool, manifest, installDir);
+  const firstSeenAt = existingTool?.installedAt || existingTool?.detectedAt || new Date().toISOString();
+
+  return {
+    ...nextState,
+    detectedPath: nextState.installDir,
+    displayPath: nextState.installDir,
+    detectedAt: existingTool?.detectedAt || firstSeenAt,
+    installedAt: firstSeenAt,
+    status: 'error',
+    lastRepairMessage: existingTool?.lastRepairMessage || null,
+    lastError: `${manifest.name}'s files are still on this PC, but its launcher or Python runtime is missing. Run Repair to rebuild it.`,
+  };
+}
+
+function buildRecoveredManagedToolState(manifest, existingTool = {}, installDir) {
+  const nextState = buildManagedToolState(existingTool || {}, manifest, installDir);
+  const firstSeenAt = existingTool?.installedAt || existingTool?.detectedAt || new Date().toISOString();
+  return {
+    ...nextState,
+    detectedPath: nextState.installDir,
+    displayPath: nextState.installDir,
+    detectedAt: existingTool?.detectedAt || firstSeenAt,
+    installedAt: firstSeenAt,
+    launchSupported: true,
+    lastError: null,
+    lastRepairMessage: existingTool?.lastRepairMessage || null,
+    status: existingTool?.status === 'running' ? 'stopped' : existingTool?.status || 'stopped',
+  };
+}
+
+async function discoverManagedRelocation(existingTool, manifest, logger) {
+  const candidates = uniquePaths([
+    normalizeInstallDirCandidate(existingTool?.installDir),
+    normalizeInstallDirCandidate(existingTool?.appDir),
+    path.join(getAppPaths().toolsRoot, manifest.id),
+    path.join(getAppPaths().toolsRoot, manifest.id, 'app'),
+    ...getAppPaths().legacyRoots.flatMap((legacyRoot) => [
+      path.join(legacyRoot, 'tools', manifest.id),
+      path.join(legacyRoot, 'tools', manifest.id, 'app'),
+    ]),
+  ].filter(Boolean));
+
+  for (const candidate of candidates) {
+    if (!(await managedInstallDirectoryExists(manifest, candidate))) {
+      continue;
+    }
+
+    const nextState = buildRecoveredManagedToolState(manifest, existingTool, candidate);
+    if (await managedToolLauncherExists(nextState)) {
+      await logger.info('Managed tool files were relocated and have been reattached.', {
+        toolId: manifest.id,
+        installDir: nextState.installDir,
+      });
+      return nextState;
+    }
+
+    await logger.warn('Managed tool files were found, but the launcher is missing. Keeping the tool in Library for repair.', {
+      toolId: manifest.id,
+      installDir: nextState.installDir,
+    });
+    return buildBrokenManagedToolState(existingTool, manifest, candidate);
+  }
+
+  return null;
+}
+
+async function discoverManagedInstallOnDisk(manifest, existingTool, logger) {
+  for (const candidate of getAllowedManagedInstallDirs(manifest)) {
+    if (!(await managedInstallDirectoryExists(manifest, candidate))) {
+      continue;
+    }
+
+    const nextState = buildRecoveredManagedToolState(manifest, existingTool, candidate);
+    if (await managedToolLauncherExists(nextState)) {
+      await logger.info('Managed tool files were found in Local AI Hub storage and reattached.', {
+        toolId: manifest.id,
+        installDir: nextState.installDir,
+      });
+      return nextState;
+    }
+
+    await logger.warn('Managed tool folder exists in Local AI Hub storage, but its launcher is missing. Keeping it attached for repair.', {
+      toolId: manifest.id,
+      installDir: nextState.installDir,
+    });
+    return buildBrokenManagedToolState(existingTool, manifest, candidate);
+  }
+
+  return null;
+}
+
 async function performDiscoveryScan() {
   await initializeToolRegistry();
 
   const logger = createLogger('discovery');
   const config = await readConfig();
   const nextTools = {};
+  const ignoredToolIds = new Set(config.ignoredToolIds || []);
 
   for (const manifest of getToolDefinitions()) {
     const existingTool = config.tools[manifest.id];
+    const shouldTreatAsManaged = toolUsesManagedInstallLocation(manifest, existingTool);
 
-    if (existingTool?.source === 'managed') {
-      const refreshedManagedTool = buildManagedToolState(existingTool, manifest, existingTool.installDir);
-      if (await managedToolIsPresent(refreshedManagedTool)) {
-        nextTools[manifest.id] = refreshedManagedTool;
+    if (shouldTreatAsManaged) {
+      const refreshedManagedTool = buildManagedToolState(existingTool || {}, manifest, existingTool?.installDir || existingTool?.appDir);
+      if (await managedToolLauncherExists(refreshedManagedTool)) {
+        nextTools[manifest.id] = buildRecoveredManagedToolState(manifest, existingTool, refreshedManagedTool.installDir);
         continue;
       }
 
-      await logger.warn('Local AI Hub-managed tool is configured but its files are missing. Starting a rescan.', {
+      if (await managedInstallDirectoryExists(manifest, refreshedManagedTool.installDir)) {
+        await logger.warn('Managed tool folder still exists, but its launcher is missing. Keeping it tracked for repair.', {
+          toolId: manifest.id,
+          installDir: refreshedManagedTool.installDir,
+        });
+        nextTools[manifest.id] = buildBrokenManagedToolState(existingTool, manifest, refreshedManagedTool.installDir);
+        continue;
+      }
+
+      await logger.warn('Managed tool is configured but its files were not found in the expected folder. Starting a rescan.', {
         toolId: manifest.id,
-        installDir: existingTool.installDir,
+        installDir: refreshedManagedTool.installDir,
       });
 
       const relocatedManagedTool = await discoverManagedRelocation(existingTool, manifest, logger);
@@ -604,7 +737,20 @@ async function performDiscoveryScan() {
         continue;
       }
 
-      nextTools[manifest.id] = buildMissingManagedToolState(existingTool, manifest);
+      nextTools[manifest.id] = buildMissingManagedToolState(existingTool || {}, manifest);
+      continue;
+    }
+
+    const recoveredManagedTool = await discoverManagedInstallOnDisk(manifest, existingTool, logger);
+    if (recoveredManagedTool) {
+      nextTools[manifest.id] = recoveredManagedTool;
+      continue;
+    }
+
+    if (ignoredToolIds.has(manifest.id)) {
+      await logger.info('Skipping an ignored external tool during discovery.', {
+        toolId: manifest.id,
+      });
       continue;
     }
 
@@ -651,10 +797,3 @@ module.exports = {
   invalidateDiscoveryCache,
   syncDiscoveredTools,
 };
-
-
-
-
-
-
-

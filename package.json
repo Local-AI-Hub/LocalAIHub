@@ -1,6 +1,6 @@
 {
   "name": "local-ai-hub",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Windows desktop manager for local AI tools",
   "author": "Local AI Hub",
   "private": true,
@@ -28,7 +28,8 @@
     "python-shell": "^5.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "systeminformation": "^5.24.7"
+    "systeminformation": "^5.24.7",
+    "7zip-bin": "^5.2.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.3",
@@ -69,15 +70,19 @@
         "nsis"
       ],
       "artifactName": "LocalAIHub-Setup-${version}.${ext}",
-      "icon": "build/icon.ico"
+      "icon": "icon.ico"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "installerHeaderIcon": "icon.ico",
+      "include": "build/installer.nsh"
     },
-    "icon": "build/icon.ico",
+    "icon": "icon.ico",
     "extraResources": [
       {
         "filter": [
@@ -85,9 +90,15 @@
         ],
         "from": "electron/helpers",
         "to": "helpers"
+      },
+      {
+        "from": "icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "node_modules/7zip-bin/win/x64/7za.exe",
+        "to": "bin/7za.exe"
       }
     ]
   }
 }
-
-

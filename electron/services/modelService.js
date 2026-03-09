@@ -3,7 +3,7 @@ const fs = require('fs-extra');
 const { open } = require('node:fs/promises');
 
 const { version: APP_VERSION } = require('../../package.json');
-const { ensureStorage, humanizeError, readConfig, saveHardwareDetection } = require('./configService');
+const { ensureStorage, getAppPaths, humanizeError, readConfig, saveHardwareDetection } = require('./configService');
 const {
   migrateLegacyModelManagerSecrets,
   readModelManagerSecrets,
@@ -11,7 +11,7 @@ const {
   writeModelManagerSecrets,
 } = require('./credentialService');
 const { runCommand } = require('./commandService');
-const { detectHardwareSnapshot, detectStorageSnapshot, findDiskForPath } = require('./hardwareService');
+const { assessDiskSpace, detectHardwareSnapshot, detectStorageSnapshot, findDiskForPath, getDiskSnapshotForPath } = require('./hardwareService');
 const { createLogger } = require('./logService');
 const { listOllamaModels } = require('./ollamaService');
 const { assertLoopbackUrl, assertSecureRemoteUrl } = require('./pathSafetyService');
@@ -327,7 +327,20 @@ async function saveModelManagerSettings(patch) {
   };
 }
 
-function getOllamaModelsRoot() {
+function getManagedModelRoot(tool, directoryName) {
+  if (!tool || !(tool.source === 'managed' || tool.managedByLocalAIHub)) {
+    return null;
+  }
+
+  return path.join(getAppPaths().modelsRoot, directoryName);
+}
+
+function getOllamaModelsRoot(tool = null) {
+  const managedRoot = getManagedModelRoot(tool, 'ollama');
+  if (managedRoot) {
+    return managedRoot;
+  }
+
   if (process.env.OLLAMA_MODELS) {
     return process.env.OLLAMA_MODELS;
   }
@@ -335,9 +348,10 @@ function getOllamaModelsRoot() {
   return path.join(process.env.USERPROFILE || '', '.ollama', 'models');
 }
 
-function getLmStudioModelsRoot() {
-  return path.join(process.env.USERPROFILE || '', '.lmstudio', 'models');
+function getLmStudioModelsRoot(tool = null) {
+  return getManagedModelRoot(tool, 'lmstudio') || path.join(process.env.USERPROFILE || '', '.lmstudio', 'models');
 }
+
 
 function normalizeBrowseOptions(options = {}, tool) {
   const sort = String(options.sort || 'most-downloaded').trim().toLowerCase();
@@ -369,30 +383,49 @@ async function loadHardwareContext() {
   };
 }
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '0 B';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${value.toFixed(digits).replace(/\.0$/, '')} ${units[unitIndex]}`;
+}
+
 function buildDiskWarning(sizeBytes, disk) {
-  if (!disk || !Number.isFinite(sizeBytes) || sizeBytes <= 0 || !Number.isFinite(disk.sizeBytes) || disk.sizeBytes <= 0) {
+  if (!disk) {
     return null;
   }
 
-  const remainingBytes = disk.freeBytes - sizeBytes;
-  const remainingPercent = remainingBytes / disk.sizeBytes;
-  if (remainingBytes < 0) {
+  const preflight = assessDiskSpace(disk, sizeBytes);
+  if (preflight.blocked) {
     return {
       tone: 'danger',
-      message: `This download is larger than the free space on ${disk.mount}.`,
+      message: `This download needs ${formatBytes(preflight.requiredBytes)}, but only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}.`,
     };
   }
 
-  if (remainingPercent < 0.1) {
+  if (preflight.requiresConfirmation) {
     return {
       tone: 'warn',
-      message: `This download would leave less than 10% free on ${disk.mount}.`,
+      message: preflight.sizeKnown
+        ? `This download would leave less than 10% free on ${preflight.mount}.`
+        : `${preflight.mount} is already below 10% free space.`,
     };
   }
 
   return {
     tone: 'good',
-    message: `${disk.mount} has enough free space for this download.`,
+    message: `${preflight.mount} has enough free space for this download.`,
   };
 }
 
@@ -442,7 +475,7 @@ function buildHardwareFit(sizeBytes, hardware, requirements = null) {
 
 function attachHardwareHints(item, tool, hardwareContext) {
   const targetDirectory = getTargetDirectory(tool, item.modelType, item);
-  const disk = findDiskForPath(hardwareContext.disks, targetDirectory || tool.installDir || tool.appDir || getOllamaModelsRoot());
+  const disk = findDiskForPath(hardwareContext.disks, targetDirectory || tool.installDir || tool.appDir || getOllamaModelsRoot(tool));
   const requirements = item.catalogRequirements || null;
   return {
     ...item,
@@ -498,13 +531,13 @@ function getToolModelDirectories(tool) {
 
   if (tool?.id === 'lmstudio') {
     return {
-      GGUF: getLmStudioModelsRoot(),
+      GGUF: getLmStudioModelsRoot(tool),
     };
   }
 
   if (tool?.id === 'ollama') {
     return {
-      Model: getOllamaModelsRoot(),
+      Model: getOllamaModelsRoot(tool),
     };
   }
 
@@ -519,7 +552,7 @@ function getTargetDirectory(tool, modelType, item = null) {
     const modelName = String(item?.name || '').trim();
     const [owner, repo] = modelName.split('/');
     if (owner && repo) {
-      return path.join(getLmStudioModelsRoot(), owner, repo);
+      return path.join(getLmStudioModelsRoot(tool), owner, repo);
     }
   }
 
@@ -617,7 +650,7 @@ function sumOllamaManifestSize(manifest = {}) {
 }
 
 async function listLocalOllamaModelsFromFilesystem(tool) {
-  const manifestsRoot = path.join(getOllamaModelsRoot(), 'manifests');
+  const manifestsRoot = path.join(getOllamaModelsRoot(tool), 'manifests');
   if (!(await fs.pathExists(manifestsRoot))) {
     return [];
   }
@@ -1519,18 +1552,51 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
     destinationPath,
   };
 }
-async function ensureDiskHasCapacity(targetDirectory, payload) {
-  const disks = await detectStorageSnapshot().catch(() => []);
-  const disk = findDiskForPath(disks, targetDirectory);
-  if (!disk || !Number.isFinite(payload.sizeBytes) || payload.sizeBytes <= 0) {
-    return;
+async function getModelDownloadPreflight(tool, payload = {}) {
+  const targetDirectory = getTargetDirectory(tool, payload.modelType, payload);
+  if (!targetDirectory) {
+    throw new Error(`Local AI Hub could not determine where ${tool.name} stores ${payload.modelType || 'model'} files.`);
   }
 
-  if (disk.freeBytes < payload.sizeBytes) {
-    throw new Error(`${payload.name} is larger than the free space on ${disk.mount}. Clear space and try again.`);
-  }
+  const sizeBytes = Number(payload.sizeBytes || 0);
+  const { disk } = await getDiskSnapshotForPath(targetDirectory);
+  return {
+    ...assessDiskSpace(disk, sizeBytes),
+    disk,
+    modelName: String(payload.name || payload.fileName || 'This download').trim() || 'This download',
+    sizeKnown: Number.isFinite(sizeBytes) && sizeBytes > 0,
+    targetDirectory,
+    toolId: tool.id,
+    toolName: tool.name,
+  };
 }
 
+function buildDiskBlockedMessage(preflight) {
+  const subject = preflight.modelName || 'This download';
+  return `${subject} needs ${formatBytes(preflight.requiredBytes)}, but only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}. Clear space and try again.`;
+}
+
+function buildDiskConfirmationMessage(preflight) {
+  const subject = preflight.modelName || 'This download';
+  if (preflight.sizeKnown) {
+    return `${subject} needs about ${formatBytes(preflight.requiredBytes)}. Only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}, so this would leave less than 10% free. Confirm the download to continue.`;
+  }
+
+  return `Local AI Hub could not confirm the file size for ${subject}. ${preflight.mount} is already below 10% free space, so confirm the download before continuing.`;
+}
+
+async function ensureDiskHasCapacity(tool, payload) {
+  const preflight = await getModelDownloadPreflight(tool, payload);
+  if (preflight.blocked) {
+    throw new Error(buildDiskBlockedMessage(preflight));
+  }
+
+  if (preflight.requiresConfirmation && !payload.lowDiskConfirmed) {
+    throw new Error(buildDiskConfirmationMessage(preflight));
+  }
+
+  return preflight;
+}
 async function downloadRemoteModel(tool, payload, options = {}) {
   const logger = createLogger('models', {
     toolId: tool.id,
@@ -1559,7 +1625,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
     };
   }
 
-  await ensureDiskHasCapacity(targetDirectory, payload);
+  await ensureDiskHasCapacity(tool, payload);
 
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -1616,6 +1682,8 @@ async function downloadRemoteModel(tool, payload, options = {}) {
 }
 
 async function pullOllamaModel(tool, payload, options = {}) {
+  await ensureDiskHasCapacity(tool, payload);
+
   const logger = createLogger('models', {
     toolId: tool.id,
     mode: 'download',
@@ -1786,11 +1854,18 @@ module.exports = {
   countDownloadedModels,
   deleteModel,
   downloadModel,
+  getModelDownloadPreflight,
   listDownloadedModels,
   readModelSettings,
   saveModelManagerSettings,
   supportsModelManager,
 };
+
+
+
+
+
+
 
 
 

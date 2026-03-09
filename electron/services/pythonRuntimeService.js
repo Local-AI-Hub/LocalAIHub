@@ -4,8 +4,8 @@ const { open } = require('node:fs/promises');
 
 const { version: APP_VERSION } = require('../../package.json');
 
-const { ensureStorage, getAppPaths } = require('./configService');
-const { inspectPythonExecutable, runCommand } = require('./commandService');
+const { getAppPaths } = require('./configService');
+const { inspectPythonExecutable, resolvePythonCommand, runCommand } = require('./commandService');
 const { isCompatibleRuntime, requirementToLabel } = require('./pythonRequirementService');
 
 const PYTHON_RUNTIME_CATALOG = [
@@ -37,6 +37,10 @@ const PYTHON_RUNTIME_CATALOG = [
 
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const MIN_INSTALLER_BYTES = 2 * 1024 * 1024;
+const RUNTIME_VERIFY_TIMEOUT_MS = 180000;
+const RUNTIME_VERIFY_POLL_MS = 3000;
+const MANAGED_RUNTIME_SEARCH_DEPTH = 4;
+const POST_INSTALL_STABILIZATION_MS = 1500;
 
 function reportProgress(callback, payload) {
   if (typeof callback === 'function') {
@@ -51,6 +55,12 @@ async function advance(logger, onProgress, payload, context = {}) {
     ...context,
   });
   reportProgress(onProgress, payload);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function selectManagedRuntime(requirement) {
@@ -185,43 +195,259 @@ async function downloadPythonInstaller(runtime, installerPath, logger, onProgres
   });
 }
 
-async function verifyManagedRuntime(runtime, installDir, logger) {
-  const pythonPath = path.join(installDir, 'python.exe');
-  if (!(await fs.pathExists(pythonPath))) {
+function buildMinorCompatibleRequirement(runtime) {
+  const major = runtime.version?.[0] || 3;
+  const minor = runtime.version?.[1] || 0;
+  return {
+    kind: 'specifier',
+    specifier: `>=${major}.${minor},<${major}.${minor + 1}`,
+  };
+}
+
+function versionsShareMajorMinor(left = [], right = []) {
+  return Number(left[0]) === Number(right[0]) && Number(left[1]) === Number(right[1]);
+}
+
+function buildRuntimeMajorMinorTag(runtime) {
+  const major = Number(runtime?.version?.[0] || 3);
+  const minor = Number(runtime?.version?.[1] || 0);
+  return `${major}${minor}`;
+}
+
+function uniqueResolvedPaths(values = []) {
+  const seen = new Set();
+  const results = [];
+
+  for (const value of values) {
+    const normalizedValue = String(value || '').trim();
+    if (!normalizedValue) {
+      continue;
+    }
+
+    const resolvedValue = path.resolve(normalizedValue);
+    const normalizedKey = resolvedValue.toLowerCase();
+    if (seen.has(normalizedKey)) {
+      continue;
+    }
+
+    seen.add(normalizedKey);
+    results.push(resolvedValue);
+  }
+
+  return results;
+}
+
+function getManagedRuntimeCandidateRoots(installDir, runtime) {
+  const parentDir = path.dirname(installDir);
+  const versionTag = runtime?.versionString || '';
+  const majorMinorTag = buildRuntimeMajorMinorTag(runtime);
+  const dottedMajorMinor = runtime?.version?.length >= 2 ? `${runtime.version[0]}.${runtime.version[1]}` : '';
+  const compactVersionTag = versionTag.replace(/[^0-9]/g, '');
+
+  return uniqueResolvedPaths([
+    installDir,
+    path.join(installDir, 'python'),
+    path.join(installDir, 'Python'),
+    path.join(installDir, `Python${majorMinorTag}`),
+    path.join(installDir, `python${majorMinorTag}`),
+    path.join(parentDir, versionTag),
+    path.join(parentDir, compactVersionTag),
+    path.join(parentDir, `Python${majorMinorTag}`),
+    path.join(parentDir, `python${majorMinorTag}`),
+    dottedMajorMinor ? path.join(parentDir, `Python ${dottedMajorMinor}`) : null,
+    versionTag ? path.join(parentDir, `Python-${versionTag}`) : null,
+    versionTag ? path.join(parentDir, `python-${versionTag}`) : null,
+  ]);
+}
+
+async function collectManagedPythonCandidates(installDir, runtime) {
+  const seen = new Set();
+  const results = [];
+  const candidateRoots = getManagedRuntimeCandidateRoots(installDir, runtime);
+
+  const addCandidate = async (candidatePath) => {
+    if (!candidatePath) {
+      return;
+    }
+
+    const normalizedKey = path.resolve(candidatePath).toLowerCase();
+    if (seen.has(normalizedKey)) {
+      return;
+    }
+
+    seen.add(normalizedKey);
+    try {
+      const stats = await fs.stat(candidatePath);
+      if (stats.isFile() && path.basename(candidatePath).toLowerCase() === 'python.exe') {
+        results.push(candidatePath);
+      }
+    } catch {
+      return;
+    }
+  };
+
+  const walk = async (directory, depthRemaining) => {
+    if (depthRemaining < 0 || !(await fs.pathExists(directory))) {
+      return;
+    }
+
+    let entries = [];
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isFile() && entry.name.toLowerCase() === 'python.exe') {
+        await addCandidate(entryPath);
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        await walk(entryPath, depthRemaining - 1);
+      }
+    }
+  };
+
+  for (const root of candidateRoots) {
+    await addCandidate(path.join(root, 'python.exe'));
+    await addCandidate(path.join(root, 'Scripts', 'python.exe'));
+    await walk(root, MANAGED_RUNTIME_SEARCH_DEPTH);
+  }
+
+  return {
+    candidateRoots,
+    candidates: results,
+  };
+}
+
+async function verifyManagedRuntime(runtime, installDir, logger, options = {}) {
+  const { candidates, candidateRoots } = await collectManagedPythonCandidates(installDir, runtime);
+  if (candidates.length === 0) {
+    if (options.logMissing !== false) {
+      await logger.info('Managed Python runtime was not found yet.', {
+        installDir,
+        candidateRoots,
+        expectedVersion: runtime.versionString,
+      });
+    }
     return null;
   }
 
-  try {
-    const metadata = await inspectPythonExecutable(pythonPath);
-    const detected = {
-      installDir,
-      pythonPath,
-      version: metadata.version,
-      versionString: metadata.versionString,
-    };
+  const exactRequirement = {
+    kind: 'specifier',
+    specifier: `==${runtime.versionString}`,
+  };
+  const minorRequirement = buildMinorCompatibleRequirement(runtime);
 
-    if (!isCompatibleRuntime(detected, { kind: 'specifier', specifier: `==${runtime.versionString}` })) {
-      await logger.warn('Managed Python runtime exists but its version does not match the requested runtime.', {
-        expectedVersion: runtime.versionString,
-        detectedVersion: metadata.versionString,
+  for (const pythonPath of candidates) {
+    try {
+      const metadata = await inspectPythonExecutable(pythonPath);
+      const detected = {
         installDir,
+        pythonPath,
+        version: metadata.version,
+        versionString: metadata.versionString,
+      };
+
+      const exactMatch = isCompatibleRuntime(detected, exactRequirement);
+      const minorMatch = isCompatibleRuntime(detected, minorRequirement) || versionsShareMajorMinor(metadata.version, runtime.version);
+      if (!exactMatch && !minorMatch) {
+        await logger.warn('Managed Python candidate version did not match the selected runtime.', {
+          expectedVersion: runtime.versionString,
+          detectedVersion: metadata.versionString,
+          pythonPath,
+        });
+        continue;
+      }
+
+      if (!exactMatch) {
+        await logger.warn('Managed Python runtime matched the requested major/minor version but not the exact patch. Accepting it as compatible.', {
+          expectedVersion: runtime.versionString,
+          detectedVersion: metadata.versionString,
+          pythonPath,
+        });
+      }
+
+      await logger.info('Managed Python runtime is ready.', {
+        version: metadata.versionString,
+        pythonPath,
+      });
+      return {
+        ...runtime,
+        source: 'managed',
+        installDir,
+        pythonPath,
+        version: metadata.version,
+        versionString: metadata.versionString,
+      };
+    } catch (error) {
+      await logger.warn('Managed Python runtime inspection failed for a candidate executable.', {
+        installDir,
+        pythonPath,
+        error,
+      });
+    }
+  }
+
+  return null;
+}
+
+async function waitForManagedRuntime(runtime, installDir, logger) {
+  const deadline = Date.now() + RUNTIME_VERIFY_TIMEOUT_MS;
+  let attempt = 0;
+
+  while (Date.now() < deadline) {
+    const verified = await verifyManagedRuntime(runtime, installDir, logger, {
+      logMissing: attempt === 0 || Date.now() + RUNTIME_VERIFY_POLL_MS >= deadline,
+    });
+    if (verified) {
+      return verified;
+    }
+
+    if (attempt === 0) {
+      await logger.info('Waiting for the managed Python installer to finish writing files.', {
+        installDir,
+        timeoutMs: RUNTIME_VERIFY_TIMEOUT_MS,
+      });
+    }
+
+    attempt += 1;
+    await sleep(RUNTIME_VERIFY_POLL_MS);
+  }
+
+  return null;
+}
+
+async function resolveCompatibleSystemPython(requirement, logger) {
+  try {
+    const systemPython = await resolvePythonCommand();
+    if (!isCompatibleRuntime(systemPython, requirement)) {
+      await logger.warn('A system Python installation is present, but it does not satisfy this tool\'s version requirement.', {
+        executable: systemPython.executable || null,
+        requirement: requirementToLabel(requirement),
+        version: systemPython.versionString,
       });
       return null;
     }
 
-    await logger.info('Managed Python runtime is ready.', {
-      version: metadata.versionString,
-      pythonPath,
+    await logger.warn('Managed Python verification failed. Falling back to a compatible system Python already installed on this PC.', {
+      executable: systemPython.executable || null,
+      version: systemPython.versionString,
     });
+
     return {
-      ...runtime,
-      installDir,
-      pythonPath,
+      ...systemPython,
+      source: 'system',
+      installDir: null,
+      pythonPath: systemPython.executable || null,
     };
   } catch (error) {
-    await logger.warn('Managed Python runtime inspection failed. Local AI Hub will reinstall it.', {
-      installDir,
+    await logger.warn('No compatible system Python fallback was available.', {
       error,
+      requirement: requirementToLabel(requirement),
     });
     return null;
   }
@@ -240,6 +466,7 @@ async function installManagedRuntime(runtime, installDir, installerPath, logger,
 
   await fs.ensureDir(path.dirname(installDir));
   await fs.remove(installDir).catch(() => null);
+  await fs.ensureDir(installDir);
 
   const args = [
     '/quiet',
@@ -260,21 +487,30 @@ async function installManagedRuntime(runtime, installDir, installerPath, logger,
     errorMessage: 'Local AI Hub could not install the required Python runtime.',
   });
 
-  const verified = await verifyManagedRuntime(runtime, installDir, logger);
+  await logger.info('The managed Python installer process exited. Starting runtime verification.', {
+    installDir,
+    installerPath,
+    targetVersion: runtime.versionString,
+  });
+
+  await sleep(POST_INSTALL_STABILIZATION_MS);
+
+  const verified = await waitForManagedRuntime(runtime, installDir, logger);
   if (!verified) {
-    throw new Error('Local AI Hub installed Python, but the managed runtime did not pass verification.');
+    throw new Error('Local AI Hub installed Python, but the managed runtime did not appear in time for verification.');
   }
 
   await logger.info('Managed Python runtime installation completed.', {
-    runtimeVersion: runtime.versionString,
+    runtimeVersion: verified.versionString,
     installDir,
+    pythonPath: verified.pythonPath,
   });
 
   await advance(logger, onProgress, {
     toolId,
     percent: 64,
     stage: 'runtime',
-    message: `Python ${runtime.versionString} is ready for ${toolName}.`,
+    message: `Python ${verified.versionString} is ready for ${toolName}.`,
   });
 
   return verified;
@@ -282,8 +518,8 @@ async function installManagedRuntime(runtime, installDir, installerPath, logger,
 
 async function ensureManagedPythonRuntime(requirement, options) {
   const runtime = selectManagedRuntime(requirement);
-  const { downloadsRoot, root } = getAppPaths();
-  const installDir = path.join(root, 'runtimes', 'python', runtime.versionString);
+  const { downloadsRoot, runtimesRoot } = getAppPaths();
+  const installDir = path.join(runtimesRoot, 'python', runtime.versionString);
   const installerPath = path.join(downloadsRoot, 'python', runtime.installerFileName);
 
   await options.logger.info('Selected managed Python runtime.', {
@@ -297,7 +533,7 @@ async function ensureManagedPythonRuntime(requirement, options) {
       toolId: options.toolId,
       percent: 64,
       stage: 'runtime',
-      message: `Using Local AI Hub-managed Python ${runtime.versionString}.`,
+      message: `Using Local AI Hub-managed Python ${existing.versionString}.`,
     });
     return existing;
   }
@@ -315,7 +551,34 @@ async function ensureManagedPythonRuntime(requirement, options) {
     });
   }
 
-  return installManagedRuntime(runtime, installDir, installerPath, options.logger, options.onProgress, options.toolId, options.toolName);
+  let installError = null;
+  try {
+    return await installManagedRuntime(runtime, installDir, installerPath, options.logger, options.onProgress, options.toolId, options.toolName);
+  } catch (error) {
+    installError = error;
+    await options.logger.warn('Managed Python runtime installation did not verify cleanly.', {
+      error,
+      installerPath,
+      installDir,
+      runtimeVersion: runtime.versionString,
+    });
+  }
+
+  const systemFallback = await resolveCompatibleSystemPython(requirement, options.logger);
+  if (systemFallback) {
+    await advance(options.logger, options.onProgress, {
+      toolId: options.toolId,
+      percent: 64,
+      stage: 'runtime',
+      message: `Using Python ${systemFallback.versionString} already installed on this PC.`,
+    }, {
+      executable: systemFallback.executable || systemFallback.pythonPath || null,
+      source: 'system-python-fallback',
+    });
+    return systemFallback;
+  }
+
+  throw installError;
 }
 
 module.exports = {
@@ -323,3 +586,4 @@ module.exports = {
   ensureManagedPythonRuntime,
   selectManagedRuntime,
 };
+

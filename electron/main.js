@@ -18,12 +18,14 @@ const {
   markFirstLaunchComplete,
   readConfig,
   saveHardwareDetection,
+  upsertTool,
 } = require('./services/configService');
 const {
   browseRemoteModels,
   countDownloadedModels,
   deleteModel,
   downloadModel,
+  getModelDownloadPreflight,
   listDownloadedModels,
   readModelSettings,
   saveModelManagerSettings,
@@ -31,20 +33,27 @@ const {
 } = require('./services/modelService');
 const { invalidateDiscoveryCache, syncDiscoveredTools } = require('./services/toolDiscoveryService');
 const { detectHardwareSnapshot, getLiveResourceUsage } = require('./services/hardwareService');
-const { installTool, repairToolInstallation } = require('./services/installerService');
+const { getToolInstallPreflight, inspectToolRepair, installTool, repairToolInstallation, uninstallTool } = require('./services/installerService');
 const { listOllamaModels, chatWithOllama } = require('./services/ollamaService');
 const {
   disposeAllRuntimes,
+  getRuntimeOutputSnapshot,
   isToolActive,
-  launchTool,
-  stopTool,
+  launchToolFromUserAction,
   resolveToolStatus,
+  sendInputToTool,
+  setRuntimeEventSink,
+  stopTool,
 } = require('./services/processService');
 const { listSnapshots, restoreSnapshot, saveSnapshot } = require('./services/snapshotService');
+const { inspectCleanupTargets, runCleanup } = require('./services/storageCleanupService');
+const { dismissManagedDataMigration, getStorageOverview, setManagedDataRoot } = require('./services/storageLocationService');
 const { getToolCatalog, getToolManifest, initializeToolRegistry } = require('./services/toolRegistry');
 const { getManifestStatus } = require('./services/manifestService');
 const { transcribeWithWhisper } = require('./services/whisperService');
 const { configureAutoUpdates, restartToInstallUpdate } = require('./services/updateService');
+
+const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 
 let mainWindow = null;
 let tray = null;
@@ -58,14 +67,15 @@ function getRendererUrl() {
   return `file://${path.join(__dirname, '..', 'dist', 'index.html')}`;
 }
 
+function getAppIconPath() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, 'icon.ico')
+    : path.join(__dirname, '..', 'icon.ico');
+}
+
 function createTrayIcon() {
-  const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">
-      <rect width="32" height="32" rx="8" fill="#0c1523" />
-      <path d="M8 24V8h4l8 10V8h4v16h-4l-8-10v10z" fill="#5dd7ff" />
-    </svg>
-  `;
-  return nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`);
+  const trayImage = nativeImage.createFromPath(getAppIconPath());
+  return trayImage.isEmpty() ? nativeImage.createEmpty() : trayImage.resize({ width: 16, height: 16 });
 }
 
 function getStopMessage(tool) {
@@ -101,6 +111,17 @@ async function maybeNotifyStoppedTool(tool) {
   }
 }
 
+async function launchToolFromExplicitUserAction(tool, options = {}) {
+  await launchToolFromUserAction(tool, options);
+  const nextState = await buildAppState();
+  const nextTool = toolLookup(tool.id, nextState.tools);
+  openInternalToolInterface(nextTool);
+  return {
+    nextState,
+    nextTool,
+  };
+}
+
 async function buildAppState(options = {}) {
   await initializeToolRegistry({ refreshRemote: Boolean(options.refreshManifest) });
   await syncDiscoveredTools({ force: Boolean(options.forceDiscovery) });
@@ -115,6 +136,8 @@ async function buildAppState(options = {}) {
 
   const latestConfig = await readConfig();
   const paths = getAppPaths();
+  const storage = await getStorageOverview();
+  const manifests = getToolCatalog();
   const tools = await Promise.all(
     Object.values(latestConfig.tools)
       .sort((left, right) => left.name.localeCompare(right.name))
@@ -141,14 +164,18 @@ async function buildAppState(options = {}) {
   ).reduce((total, count) => total + count, 0);
 
   return {
-    appDataPath: paths.root,
+    appDataPath: paths.configRoot,
+    appInstallPath: paths.appInstallDir,
     downloadedModelCount,
+    executablePath: paths.executablePath,
     firstLaunch: !latestConfig.firstLaunchCompleted,
     hardware,
     logsPath: paths.logsRoot,
-    manifests: getToolCatalog(),
+    managedDataPath: paths.managedRoot,
+    manifests,
     manifestStatus: getManifestStatus(),
-    resources: await getLiveResourceUsage(),
+    resources: await getLiveResourceUsage(paths.managedRoot),
+    storage,
     tools,
   };
 }
@@ -180,8 +207,9 @@ async function updateTrayMenu() {
               } else if (tool.launchSupported === false) {
                 await shell.openPath(tool.installDir);
               } else {
-                await launchTool(tool);
-                openInternalToolInterface(tool);
+                await launchToolFromExplicitUserAction(tool, {
+                  launchContext: 'tray-menu',
+                });
               }
               await updateTrayMenu();
             } catch {
@@ -217,7 +245,7 @@ function createWindow() {
     minHeight: 760,
     backgroundColor: '#0a111d',
     autoHideMenuBar: true,
-    icon: path.join(__dirname, '..', 'build', 'icon.ico'),
+    icon: getAppIconPath(),
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -236,6 +264,7 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
   });
+
 
   mainWindow.on('minimize', (event) => {
     event.preventDefault();
@@ -295,21 +324,6 @@ async function withPlainEnglishErrors(handler, fallbackMessage) {
   }
 }
 
-async function ensureOllamaReadyForModels(tool) {
-  if (tool?.id !== 'ollama') {
-    return tool;
-  }
-
-  if (!(await isToolActive(tool))) {
-    await launchTool(tool, {
-      skipOpenInterface: true,
-    });
-  }
-
-  const state = await buildAppState();
-  return modelToolLookup('ollama', state.tools);
-}
-
 function registerIpcHandlers() {
   ipcMain.handle('app:bootstrap', () =>
     withPlainEnglishErrors(() => buildAppState({ forceDiscovery: true, refreshManifest: true }), 'Local AI Hub could not load the app state.'),
@@ -349,9 +363,11 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not restart to install the update.'),
   );
 
-  ipcMain.handle('tools:install', (_event, toolId) =>
+  ipcMain.handle('tools:install', (_event, payload) =>
     withPlainEnglishErrors(async () => {
+      const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const tool = await installTool(toolId, {
+        lowDiskConfirmed: Boolean(payload?.lowDiskConfirmed),
         onProgress: (payload) => sendInstallProgress(payload),
       });
       invalidateDiscoveryCache();
@@ -364,8 +380,13 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not install that tool.'),
   );
 
-  ipcMain.handle('tools:launch', (_event, toolId) =>
+  ipcMain.handle('tools:get-install-preflight', (_event, toolId) =>
+    withPlainEnglishErrors(async () => getToolInstallPreflight(toolId), 'Local AI Hub could not check disk space for that install.'),
+  );
+
+  ipcMain.handle('tools:launch', (_event, payload) =>
     withPlainEnglishErrors(async () => {
+      const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
       if (tool.launchSupported === false) {
@@ -375,17 +396,41 @@ function registerIpcHandlers() {
           state,
         };
       }
-      await launchTool(tool);
-      const nextState = await buildAppState();
-      const nextTool = toolLookup(toolId, nextState.tools);
-      openInternalToolInterface(nextTool);
+
+      const launchOptions = {};
+      if (tool.id === 'aider') {
+        const projectDir = String(payload?.projectDir || tool.lastProjectDir || '').trim();
+        if (!projectDir) {
+          throw new Error('Choose a project folder for Aider before launching it.');
+        }
+
+        launchOptions.launchProfileOverride = {
+          workingDir: projectDir,
+          allowExternalWorkingDir: true,
+        };
+        await upsertTool({
+          id: tool.id,
+          lastProjectDir: projectDir,
+        });
+      }
+      const { nextState, nextTool } = await launchToolFromExplicitUserAction(tool, {
+        ...launchOptions,
+        launchContext: 'ipc-launch',
+      });
+
+      let message = `${nextTool.name} is starting.`;
+      if (String(nextTool.interfaceMode || '').startsWith('embedded-')) {
+        if (nextTool.interfaceMode === 'embedded-whisper') {
+          message = `${nextTool.name} is ready. Local AI Hub opened its transcription view.`;
+        } else if (nextTool.interfaceMode === 'embedded-chat') {
+          message = `${nextTool.name} is starting. Local AI Hub opened its chat view.`;
+        } else if (nextTool.interfaceMode === 'embedded-terminal') {
+          message = `${nextTool.name} is ready. Local AI Hub opened its built-in console.`;
+        }
+      }
+
       return {
-        message:
-          String(nextTool.interfaceMode || '').startsWith('embedded-')
-            ? nextTool.interfaceMode === 'embedded-whisper'
-              ? `${nextTool.name} is ready. Local AI Hub opened its transcription view.`
-              : `${nextTool.name} is starting. Local AI Hub opened its chat view.`
-            : `${nextTool.name} is starting.`,
+        message,
         state: nextState,
       };
     }, 'Local AI Hub could not start that tool.'),
@@ -404,12 +449,14 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not stop that tool.'),
   );
 
-  ipcMain.handle('tools:repair', (_event, toolId) =>
+  ipcMain.handle('tools:repair', (_event, payload) =>
     withPlainEnglishErrors(async () => {
+      const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
       const repairedTool = await repairToolInstallation(tool, {
         onProgress: (payload) => sendInstallProgress(payload),
+        removeOrphanedToolFolders: Boolean(payload?.removeOrphanedToolFolders),
       });
       invalidateDiscoveryCache();
       return {
@@ -419,6 +466,88 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not repair that tool.'),
   );
 
+  ipcMain.handle('tools:get-repair-preview', (_event, toolId) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = toolLookup(toolId, state.tools);
+      return inspectToolRepair(tool);
+    }, 'Local AI Hub could not inspect that repair right now.'),
+  );
+
+  ipcMain.handle('tools:uninstall', (_event, toolId) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = toolLookup(toolId, state.tools);
+      if (tool.source === 'managed' && tool.status === 'running') {
+        await stopTool(tool);
+      }
+      const removedTool = await uninstallTool(tool);
+      invalidateDiscoveryCache();
+      return {
+        message: removedTool.uninstallMessage || `${tool.name} was removed from Local AI Hub.`,
+        state: await buildAppState({ forceDiscovery: true }),
+      };
+    }, 'Local AI Hub could not uninstall that tool.'),
+  );
+
+  ipcMain.handle('settings:pick-storage-folder', () =>
+    withPlainEnglishErrors(async () => {
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: 'Choose a storage folder for Local AI Hub',
+        properties: ['openDirectory', 'createDirectory'],
+      });
+
+      return {
+        canceled: Boolean(result.canceled),
+        folderPath: result.filePaths?.[0] || '',
+      };
+    }, 'Local AI Hub could not open the storage folder picker.'),
+  );
+
+  ipcMain.handle('settings:set-storage-location', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const requestedPath = String(payload?.targetPath || '').trim();
+      if (!requestedPath) {
+        throw new Error('Choose a storage folder before saving the new location.');
+      }
+
+      const parsedPath = path.parse(requestedPath);
+      const normalizedTargetPath = requestedPath === parsedPath.root ? path.join(requestedPath, 'LocalAIHub') : requestedPath;
+      await setManagedDataRoot(normalizedTargetPath, {
+        migrateExistingData: Boolean(payload?.migrateExistingData),
+        migrationSourceRoot: payload?.migrationSourceRoot || null,
+      });
+      invalidateDiscoveryCache();
+      return {
+        message: `Large Local AI Hub files will now use ${normalizedTargetPath}.`,
+        state: await buildAppState({ forceDiscovery: true }),
+      };
+    }, 'Local AI Hub could not save the new storage folder.'),
+  );
+
+  ipcMain.handle('settings:dismiss-legacy-migration', (_event, sourceRoot) =>
+    withPlainEnglishErrors(async () => {
+      await dismissManagedDataMigration(sourceRoot);
+      return {
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not update the migration reminder.'),
+  );
+
+  ipcMain.handle('settings:get-cleanup-preview', () =>
+    withPlainEnglishErrors(() => inspectCleanupTargets(), 'Local AI Hub could not scan the approved cleanup folders right now.'),
+  );
+
+  ipcMain.handle('settings:run-cleanup', () =>
+    withPlainEnglishErrors(async () => {
+      const cleanupSummary = await runCleanup();
+      return {
+        cleanupSummary,
+        message: 'Cleanup finished.',
+        state: await buildAppState({ forceDiscovery: true }),
+      };
+    }, 'Local AI Hub could not remove those leftover files.'),
+  );
   ipcMain.handle('tools:open-folder', (_event, toolId) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
@@ -428,6 +557,37 @@ function registerIpcHandlers() {
         message: `${tool.name}'s folder is open.`,
       };
     }, 'Local AI Hub could not open that folder.'),
+  );
+
+  ipcMain.handle('aider:pick-project-folder', () =>
+    withPlainEnglishErrors(async () => {
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: 'Choose a project folder for Aider',
+        properties: ['openDirectory', 'createDirectory'],
+      });
+
+      return {
+        canceled: Boolean(result.canceled),
+        folderPath: result.filePaths?.[0] || '',
+      };
+    }, 'Local AI Hub could not open the project folder picker.'),
+  );
+
+  ipcMain.handle('tools:get-runtime-output', (_event, toolId) =>
+    withPlainEnglishErrors(async () => getRuntimeOutputSnapshot(toolId), 'Local AI Hub could not load that tool console.'),
+  );
+
+  ipcMain.handle('tools:send-input', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = toolLookup(payload.toolId, state.tools);
+      sendInputToTool(tool.id, payload.input, {
+        appendNewline: payload.appendNewline !== false,
+      });
+      return {
+        message: `${tool.name} received your command.`,
+      };
+    }, 'Local AI Hub could not send that input to the tool.'),
   );
 
   ipcMain.handle('models:get-settings', () =>
@@ -443,31 +603,32 @@ function registerIpcHandlers() {
       };
     }, 'Local AI Hub could not save the Model Manager settings.'),
   );
-
   ipcMain.handle('models:browse', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      const activeTool = tool.id === 'ollama' ? await ensureOllamaReadyForModels(tool) : tool;
-      return browseRemoteModels(activeTool, payload);
+      return browseRemoteModels(tool, payload);
     }, 'Local AI Hub could not load remote models right now.'),
   );
-
   ipcMain.handle('models:list-local', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      const activeTool = tool.id === 'ollama' ? await ensureOllamaReadyForModels(tool) : tool;
-      return listDownloadedModels(activeTool);
+      return listDownloadedModels(tool);
     }, 'Local AI Hub could not load the downloaded models for that tool.'),
   );
-
+  ipcMain.handle('models:get-download-preflight', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = modelToolLookup(payload.toolId, state.tools);
+      return getModelDownloadPreflight(tool, payload);
+    }, 'Local AI Hub could not check disk space for that model download.'),
+  );
   ipcMain.handle('models:download', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      const activeTool = tool.id === 'ollama' ? await ensureOllamaReadyForModels(tool) : tool;
-      const result = await downloadModel(activeTool, payload, {
+      const result = await downloadModel(tool, payload, {
         onProgress: (progress) => sendModelProgress({
           toolId: payload.toolId,
           ...progress,
@@ -475,20 +636,18 @@ function registerIpcHandlers() {
       });
       return {
         message: result.message,
-        localModels: await listDownloadedModels(activeTool),
+        localModels: await listDownloadedModels(tool),
       };
     }, 'Local AI Hub could not download that model.'),
   );
-
   ipcMain.handle('models:delete', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      const activeTool = tool.id === 'ollama' ? await ensureOllamaReadyForModels(tool) : tool;
-      const result = await deleteModel(activeTool, payload);
+      const result = await deleteModel(tool, payload);
       return {
         message: result.message,
-        localModels: await listDownloadedModels(activeTool),
+        localModels: await listDownloadedModels(tool),
       };
     }, 'Local AI Hub could not delete that model.'),
   );
@@ -518,22 +677,18 @@ function registerIpcHandlers() {
       return transcribeWithWhisper(tool, payload);
     }, 'Local AI Hub could not transcribe that audio file.'),
   );
-
   ipcMain.handle('ollama:list-models', () =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup('ollama', state.tools);
-      const activeTool = await ensureOllamaReadyForModels(tool);
-      return listOllamaModels(activeTool);
+      return listOllamaModels(tool);
     }, 'Local AI Hub could not load your local Ollama models.'),
   );
-
   ipcMain.handle('ollama:chat', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup('ollama', state.tools);
-      const activeTool = await ensureOllamaReadyForModels(tool);
-      return chatWithOllama(activeTool, payload);
+      return chatWithOllama(tool, payload);
     }, 'Local AI Hub could not send that message to Ollama.'),
   );
 
@@ -574,7 +729,11 @@ function registerIpcHandlers() {
 }
 
 app.whenReady().then(async () => {
+  app.setAppUserModelId(APP_USER_MODEL_ID);
   createWindow();
+  setRuntimeEventSink((payload) => {
+    mainWindow?.webContents.send('tools:runtime-output', payload);
+  });
   tray = new Tray(createTrayIcon());
   tray.on('click', showWindow);
   registerIpcHandlers();
@@ -603,6 +762,16 @@ app.on('activate', () => {
 
   showWindow();
 });
+
+
+
+
+
+
+
+
+
+
 
 
 

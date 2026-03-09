@@ -1,7 +1,9 @@
-const path = require('path');
+﻿const path = require('path');
 const si = require('systeminformation');
 
 const { runCommand } = require('./commandService');
+
+const LOW_DISK_CONFIRMATION_RATIO = 0.1;
 
 function normalizeMb(value) {
   if (!Number.isFinite(value) || value <= 0) {
@@ -67,6 +69,36 @@ function findDiskForPath(disks = [], targetPath) {
   }
 
   return disks.find((disk) => normalizeDriveRoot(disk.mount).toLowerCase() === driveRoot.toLowerCase()) || null;
+}
+
+function assessDiskSpace(disk, requiredBytes, options = {}) {
+  const minimumRemainingRatio =
+    Number(options.minimumRemainingRatio) > 0 ? Number(options.minimumRemainingRatio) : LOW_DISK_CONFIRMATION_RATIO;
+  const totalBytes = Number(disk?.sizeBytes || 0);
+  const freeBytes = Number(disk?.freeBytes || 0);
+  const hasKnownRequirement = Number.isFinite(requiredBytes) && requiredBytes > 0;
+  const hasDiskInfo = totalBytes > 0 && freeBytes >= 0;
+  const remainingBytes = hasKnownRequirement && hasDiskInfo ? freeBytes - requiredBytes : freeBytes;
+  const remainingRatio = hasDiskInfo ? remainingBytes / totalBytes : null;
+  const currentFreeRatio = hasDiskInfo ? freeBytes / totalBytes : null;
+  const blocked = hasDiskInfo && hasKnownRequirement && remainingBytes < 0;
+  const requiresConfirmation = blocked
+    ? false
+    : hasDiskInfo &&
+      (hasKnownRequirement ? remainingRatio < minimumRemainingRatio : currentFreeRatio < minimumRemainingRatio);
+
+  return {
+    availableBytes: freeBytes,
+    blocked,
+    currentFreeRatio,
+    mount: disk?.mount || '',
+    remainingBytes: hasKnownRequirement && hasDiskInfo ? Math.max(0, remainingBytes) : freeBytes,
+    remainingRatio,
+    requiredBytes: hasKnownRequirement ? requiredBytes : 0,
+    requiresConfirmation,
+    sizeKnown: hasKnownRequirement,
+    totalBytes,
+  };
 }
 
 function pickPrimaryGpu(controllers) {
@@ -230,16 +262,27 @@ async function getDiskSnapshotForPath(targetPath) {
   };
 }
 
-async function getLiveResourceUsage() {
-  const [graphics, memory, nvidia] = await Promise.all([si.graphics(), si.mem(), getNvidiaRuntimeDetails()]);
+async function getLiveResourceUsage(targetPath = null) {
+  const [graphics, memory, nvidia, disks] = await Promise.all([
+    si.graphics(),
+    si.mem(),
+    getNvidiaRuntimeDetails(),
+    targetPath ? detectStorageSnapshot().catch(() => []) : Promise.resolve([]),
+  ]);
   const gpu = pickPrimaryGpu(graphics.controllers);
   const vramTotalMb = resolveControllerVramTotal(gpu, nvidia);
   const controllerVramUsedMb = resolveControllerVramUsed(gpu, vramTotalMb);
   const vramUsedMb = Number.isFinite(nvidia?.vramUsedMb)
     ? nvidia.vramUsedMb
     : controllerVramUsedMb;
+  const targetDisk = targetPath ? findDiskForPath(disks, targetPath) : null;
 
   return {
+    diskFreeBytes: targetDisk?.freeBytes || null,
+    diskMount: targetDisk?.mount || null,
+    diskTotalBytes: targetDisk?.sizeBytes || null,
+    diskUsePercent: targetDisk?.usePercent ?? null,
+    diskUsedBytes: targetDisk?.usedBytes || null,
     gpuName: gpu.model || nvidia?.gpuModel || 'Unknown GPU',
     ramUsedMb: Math.round((memory.active || memory.used || 0) / 1024 / 1024),
     ramTotalMb: Math.round((memory.total || 0) / 1024 / 1024),
@@ -252,6 +295,8 @@ async function getLiveResourceUsage() {
 }
 
 module.exports = {
+  LOW_DISK_CONFIRMATION_RATIO,
+  assessDiskSpace,
   buildDiskSnapshot,
   detectHardwareSnapshot,
   detectStorageSnapshot,
@@ -261,3 +306,4 @@ module.exports = {
   getNvidiaRuntimeDetails,
   normalizeDriveRoot,
 };
+

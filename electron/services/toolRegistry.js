@@ -244,6 +244,7 @@ function normalizeToolDefinition(tool) {
       downloadFileName: installInstructions.downloadFileName || null,
       installSummary: installInstructions.installSummary || 'Downloads and configures this tool inside Local AI Hub.',
       venvFolder: installInstructions.venvFolder || '.venv',
+      pythonRequirement: installInstructions.pythonRequirement || null,
       configTargets: installInstructions.configTargets || [],
       pythonRequirementDetection: installInstructions.pythonRequirementDetection || [],
       pipInstalls: installInstructions.pipInstalls || [],
@@ -274,6 +275,7 @@ function normalizeToolDefinition(tool) {
     },
     launchUrl,
     healthUrl: buildHealthUrl(tool, launchUrl),
+    startupTimeoutMs: Number(tool.startupTimeoutMs) > 0 ? Number(tool.startupTimeoutMs) : null,
     processNames: tool.processNames || deriveProcessNames({
       ...tool,
       externalLaunchCommand,
@@ -314,6 +316,7 @@ function getToolCatalog() {
     launchUrl: tool.launchUrl,
     interfaceMode: tool.interfaceMode,
     installSummary: tool.installInstructions.installSummary,
+    installKind: tool.installInstructions.kind,
     downloadUrl: tool.downloadUrl,
     compatibility: tool.installInstructions.compatibility,
   }));
@@ -336,7 +339,7 @@ function resolveCommandPath(token, baseDir, explicitPath = null, options = {}) {
     return null;
   }
 
-  if (options.allowBareCommandLookup && !path.isAbsolute(token) && !/[\\/]/.test(token)) {
+  if (options.allowBareCommandLookup && !path.isAbsolute(token) && !/[\\\\/]/.test(token)) {
     return token;
   }
 
@@ -352,6 +355,63 @@ function createFolderOnlyProfile(installDir) {
     kind: 'folder',
     path: installDir,
   };
+}
+
+function resolvePythonProfile(commandTokens, context = {}) {
+  const token = commandTokens[0];
+  const canUseBarePython = Boolean(context.allowBarePythonCommand);
+  const pythonPath =
+    context.pythonPath ||
+    (canUseBarePython
+      ? token
+      : path.isAbsolute(token) || /[\\/]/.test(token)
+        ? resolveCommandPath(token, context.baseDir)
+        : null);
+
+  if (!pythonPath) {
+    return null;
+  }
+
+  const pythonArgs = [];
+  let cursor = 1;
+
+  while (cursor < commandTokens.length) {
+    const currentToken = commandTokens[cursor];
+    if (currentToken === '-m') {
+      if (!commandTokens[cursor + 1]) {
+        return null;
+      }
+
+      return {
+        kind: 'python-module',
+        pythonArgs,
+        pythonPath,
+        workingDir: context.workingDir || context.baseDir,
+        allowExternalWorkingDir: Boolean(context.allowExternalWorkingDir),
+        target: commandTokens[cursor + 1],
+        args: commandTokens.slice(cursor + 2),
+        env: context.env || {},
+      };
+    }
+
+    if (!currentToken.startsWith('-') || currentToken === '-') {
+      return {
+        kind: 'python-script',
+        pythonArgs,
+        pythonPath,
+        workingDir: context.workingDir || context.baseDir,
+        allowExternalWorkingDir: Boolean(context.allowExternalWorkingDir),
+        target: currentToken,
+        args: commandTokens.slice(cursor + 1),
+        env: context.env || {},
+      };
+    }
+
+    pythonArgs.push(currentToken);
+    cursor += 1;
+  }
+
+  return null;
 }
 
 function buildLaunchProfileFromCommand(command, context = {}) {
@@ -372,41 +432,14 @@ function buildLaunchProfileFromCommand(command, context = {}) {
       target: tokens[0].slice('embedded://'.length),
       pythonPath: context.pythonPath || null,
       workingDir: context.workingDir || context.baseDir,
+      allowExternalWorkingDir: Boolean(context.allowExternalWorkingDir),
       env: context.env || {},
     };
   }
 
   const head = tokens[0].toLowerCase();
   if (head === 'python' || head === 'py' || head.endsWith('python.exe')) {
-    const pythonPath =
-      context.pythonPath ||
-      resolveCommandPath(tokens[0], context.baseDir, null, {
-        allowBareCommandLookup: Boolean(context.allowBarePythonCommand),
-      });
-
-    if (!tokens[1]) {
-      return null;
-    }
-
-    if (tokens[1] === '-m') {
-      return {
-        kind: 'python-module',
-        pythonPath,
-        workingDir: context.workingDir || context.baseDir,
-        target: tokens[2],
-        args: tokens.slice(3),
-        env: context.env || {},
-      };
-    }
-
-    return {
-      kind: 'python-script',
-      pythonPath,
-      workingDir: context.workingDir || context.baseDir,
-      target: tokens[1],
-      args: tokens.slice(2),
-      env: context.env || {},
-    };
+    return resolvePythonProfile(tokens, context);
   }
 
   if (/\.(bat|cmd)$/i.test(tokens[0])) {
@@ -414,6 +447,7 @@ function buildLaunchProfileFromCommand(command, context = {}) {
       kind: 'batch',
       command: resolveCommandPath(tokens[0], context.baseDir, context.executablePath),
       workingDir: context.workingDir || context.baseDir,
+      allowExternalWorkingDir: Boolean(context.allowExternalWorkingDir),
       args: tokens.slice(1),
       env: context.env || {},
     };
@@ -424,6 +458,7 @@ function buildLaunchProfileFromCommand(command, context = {}) {
     kind: 'binary',
     executable,
     workingDir: context.workingDir || path.dirname(executable),
+    allowExternalWorkingDir: Boolean(context.allowExternalWorkingDir),
     args: tokens.slice(1),
     env: context.env || {},
   };
@@ -517,6 +552,8 @@ module.exports = {
   initializeToolRegistry,
   tokenizeCommand,
 };
+
+
 
 
 

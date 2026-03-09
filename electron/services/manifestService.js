@@ -17,7 +17,7 @@ const {
 
 const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/Local-AI-Hub/LocalAIHub/main/electron/config/tools-manifest.json';
 const REMOTE_MANIFEST_SIGNATURE_URL = `${REMOTE_MANIFEST_URL}.sig`;
-const ALLOWED_INSTALL_KINDS = new Set(['zip', 'single-file', 'installer-exe']);
+const ALLOWED_INSTALL_KINDS = new Set(['zip', 'single-file', 'installer-exe', 'pip-package']);
 const ALLOWED_RUNTIME_KINDS = new Set(['python', 'binary']);
 
 let loadedManifest = null;
@@ -28,6 +28,16 @@ let lastManifestStatus = {
   verified: false,
   warning: null,
 };
+
+function getMissingManifestIds(expectedManifest = [], candidateManifest = []) {
+  const candidateIds = new Set(
+    Array.isArray(candidateManifest) ? candidateManifest.map((tool) => tool.id) : [],
+  );
+
+  return (Array.isArray(expectedManifest) ? expectedManifest : [])
+    .map((tool) => tool.id)
+    .filter((toolId) => !candidateIds.has(toolId));
+}
 
 function getBundledManifestPath() {
   return path.join(__dirname, '..', 'config', 'tools-manifest.json');
@@ -174,48 +184,24 @@ async function fetchText(url, label) {
   return response.text();
 }
 
-async function fetchRemoteManifest(logger) {
+async function fetchRemoteManifest() {
   const [rawManifestText, rawSignatureText] = await Promise.all([
     fetchText(REMOTE_MANIFEST_URL, 'remote manifest URL'),
     fetchText(REMOTE_MANIFEST_SIGNATURE_URL, 'remote manifest signature URL'),
   ]);
   const hash = verifySignedManifest(rawManifestText, rawSignatureText);
   const manifest = normalizeManifest(JSON.parse(rawManifestText));
-  const cachePaths = await writeCachedManifest(rawManifestText, rawSignatureText);
 
-  lastManifestStatus = {
+  return {
     hash,
-    source: 'remote',
-    verified: true,
-    warning: null,
+    manifest,
+    rawManifestText,
+    rawSignatureText,
   };
-
-  await logger.info('Remote tool manifest refreshed successfully.', {
-    cacheManifestPath: cachePaths.manifestPath,
-    cacheSignaturePath: cachePaths.signaturePath,
-    entryCount: manifest.length,
-    manifestHash: hash,
-    manifestUrl: REMOTE_MANIFEST_URL,
-    signatureUrl: REMOTE_MANIFEST_SIGNATURE_URL,
-  });
-
-  return manifest;
 }
 
 async function ensureManifestSeed(logger) {
   if (loadedManifest) {
-    return loadedManifest;
-  }
-
-  const cachedManifest = await readCachedManifest();
-  if (cachedManifest.manifest.length) {
-    loadedManifest = cachedManifest.manifest;
-    lastManifestStatus = {
-      hash: cachedManifest.hash,
-      source: 'cache',
-      verified: true,
-      warning: null,
-    };
     return loadedManifest;
   }
 
@@ -236,6 +222,18 @@ async function ensureManifestSeed(logger) {
     await logger.warn('The bundled tool manifest could not be loaded or verified.', {
       error,
     });
+  }
+
+  const cachedManifest = await readCachedManifest();
+  if (cachedManifest.manifest.length) {
+    loadedManifest = cachedManifest.manifest;
+    lastManifestStatus = {
+      hash: cachedManifest.hash,
+      source: 'cache',
+      verified: true,
+      warning: null,
+    };
+    return loadedManifest;
   }
 
   loadedManifest = [];
@@ -266,7 +264,44 @@ async function loadToolManifest(options = {}) {
 
   refreshPromise = (async () => {
     try {
-      loadedManifest = await fetchRemoteManifest(logger);
+      const remoteManifest = await fetchRemoteManifest();
+      const missingBundledToolIds = getMissingManifestIds(seededManifest, remoteManifest.manifest);
+
+      if (seededManifest.length && missingBundledToolIds.length) {
+        lastManifestStatus = {
+          ...lastManifestStatus,
+          verified: true,
+          warning: null,
+        };
+        await logger.warn('Remote tool manifest is older than the bundled catalog. Keeping bundled catalog.', {
+          bundledEntryCount: seededManifest.length,
+          bundledToolIds: seededManifest.map((tool) => tool.id),
+          missingBundledToolIds,
+          remoteEntryCount: remoteManifest.manifest.length,
+          remoteHash: remoteManifest.hash,
+          remoteToolIds: remoteManifest.manifest.map((tool) => tool.id),
+        });
+        return seededManifest;
+      }
+
+      const cachePaths = await writeCachedManifest(remoteManifest.rawManifestText, remoteManifest.rawSignatureText);
+      loadedManifest = remoteManifest.manifest;
+      lastManifestStatus = {
+        hash: remoteManifest.hash,
+        source: 'remote',
+        verified: true,
+        warning: null,
+      };
+
+      await logger.info('Remote tool manifest refreshed successfully.', {
+        cacheManifestPath: cachePaths.manifestPath,
+        cacheSignaturePath: cachePaths.signaturePath,
+        entryCount: loadedManifest.length,
+        manifestHash: remoteManifest.hash,
+        manifestUrl: REMOTE_MANIFEST_URL,
+        signatureUrl: REMOTE_MANIFEST_SIGNATURE_URL,
+      });
+
       return loadedManifest;
     } catch (error) {
       lastManifestStatus = {
@@ -310,3 +345,4 @@ module.exports = {
   getRemoteManifestUrl,
   loadToolManifest,
 };
+
