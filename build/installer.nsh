@@ -1,3 +1,12 @@
+!macro customInit
+  DetailPrint `Stopping any running "${PRODUCT_NAME}" processes before install.`
+  !ifdef INSTALL_MODE_PER_ALL_USERS
+    nsExec::Exec `taskkill /f /t /im "${APP_EXECUTABLE_FILENAME}"`
+  !else
+    nsExec::Exec `%SYSTEMROOT%\System32\cmd.exe /c taskkill /f /t /im "${APP_EXECUTABLE_FILENAME}" /fi "USERNAME eq %USERNAME%"`
+  !endif
+  Sleep 1200
+!macroend
 !macro customInstall
   StrCpy $R0 "$INSTDIR\resources\icon.ico"
   ${if} ${FileExists} "$R0"

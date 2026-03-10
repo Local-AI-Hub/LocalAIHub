@@ -41,8 +41,19 @@ function assertNonOverlappingRoots(sourceRoot, targetRoot) {
     return;
   }
 
-  if (isPathInside(sourceRoot, targetRoot) || isPathInside(targetRoot, sourceRoot)) {
-    throw new Error('Choose a different storage folder so Local AI Hub can move your files safely.');
+  const sourceManagedPaths = buildManagedSubdirectoryPaths(sourceRoot);
+  const targetManagedPaths = buildManagedSubdirectoryPaths(targetRoot);
+
+  for (const directoryName of ['tools', 'downloads', 'snapshots', 'models', 'runtimes', 'logs']) {
+    const sourcePath = sourceManagedPaths[`${directoryName}Root`];
+    const targetPath = targetManagedPaths[`${directoryName}Root`];
+    if (!sourcePath || !targetPath) {
+      continue;
+    }
+
+    if (isPathInside(sourcePath, targetPath) || isPathInside(targetPath, sourcePath)) {
+      throw new Error('Choose a different storage folder so Local AI Hub can move your files safely.');
+    }
   }
 }
 
@@ -263,10 +274,30 @@ async function getStorageOverview() {
   ]);
 
   const currentDisk = findDiskForPath(disks, paths.managedRoot);
-  const legacyMigration = await inspectManagedDataMigration({
+  const migrationCandidates = [...new Set(
+    [paths.root, paths.localRoot, paths.appInstallDir, paths.defaultManagedRoot]
+      .filter(Boolean)
+      .filter((sourceRoot) => !pathsMatch(sourceRoot, paths.managedRoot))
+      .map((sourceRoot) => normalizeDirectoryPath(sourceRoot)),
+  )];
+  const migrationResults = await Promise.all(
+    migrationCandidates.map((sourceRoot) =>
+      inspectManagedDataMigration({
+        sourceRoot,
+        targetRoot: paths.managedRoot,
+      }),
+    ),
+  );
+  const legacyMigration = migrationResults
+    .filter((migration) => migration.available)
+    .sort((left, right) => Number(right.totalBytes || 0) - Number(left.totalBytes || 0))[0] || {
+    available: false,
+    categories: [],
     sourceRoot: paths.root,
     targetRoot: paths.managedRoot,
-  });
+    totalBytes: 0,
+    toolCount: 0,
+  };
   const dismissedMigrationRoots = new Set((config.dismissedManagedMigrationRoots || []).map((entry) => normalizePathKey(entry)));
 
   return {
@@ -299,5 +330,3 @@ module.exports = {
   normalizePathKey,
   setManagedDataRoot,
 };
-
-

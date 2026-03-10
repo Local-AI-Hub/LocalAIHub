@@ -42,8 +42,12 @@ function configureAutoUpdates(options = {}) {
   }, 12000);
 }
 
+function isUpdateReady() {
+  return Boolean(app.isPackaged && updateReady);
+}
+
 function restartToInstallUpdate() {
-  if (!app.isPackaged || !updateReady) {
+  if (!isUpdateReady()) {
     return false;
   }
 
@@ -53,5 +57,6 @@ function restartToInstallUpdate() {
 
 module.exports = {
   configureAutoUpdates,
+  isUpdateReady,
   restartToInstallUpdate,
 };

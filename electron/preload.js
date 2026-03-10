@@ -1,4 +1,4 @@
-﻿const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
 
 function invoke(channel, payload) {
   return ipcRenderer.invoke(channel, payload);
@@ -46,6 +46,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   restoreSnapshot: (payload) => invoke('snapshots:restore', payload),
   runCleanup: () => invoke('settings:run-cleanup'),
   runPipeline: (payload) => invoke('pipelines:run', payload),
+  saveCloseBehavior: (closeBehavior) => invoke('settings:save-close-behavior', closeBehavior),
   saveModelSettings: (payload) => invoke('models:save-settings', payload),
   savePipeline: (payload) => invoke('pipelines:save', payload),
   saveProviderKey: (payload) => invoke('providers:save-key', payload),

@@ -35,12 +35,15 @@ function CategoryList({ category }) {
 export default function SettingsPanel({
   busyMap,
   cleanupPreview,
+  closeBehaviorDraft,
+  onChangeCloseBehavior,
   onChangeStorageDraft,
   onChooseStorageFolder,
   onDismissLegacyMigration,
   onMigrateLegacyStorage,
   onPreviewCleanup,
   onRunCleanup,
+  onSaveCloseBehavior,
   onSaveStorageLocation,
   storage,
   storageDraft,
@@ -78,7 +81,7 @@ export default function SettingsPanel({
                 {busyMap['settings:save-storage'] ? 'Saving...' : 'Save storage location'}
               </button>
               <button className="ghost-button" onClick={() => onChangeStorageDraft(storage?.defaultManagedRoot || '')} type="button">
-                Use install folder
+                Use default folder
               </button>
             </div>
             <div className="mt-5 space-y-3 text-sm text-slate-300">
@@ -127,14 +130,47 @@ export default function SettingsPanel({
         </div>
       </div>
 
+      <div className="panel p-6">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Window behavior</p>
+            <h3 className="mt-3 text-3xl font-semibold text-white">Choose what the close button does</h3>
+            <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
+              Decide whether the window close button hides Local AI Hub to the tray or fully exits the app and cleans up owned background helpers.
+            </p>
+          </div>
+          <button className="primary-button" disabled={busyMap['settings:save-close-behavior']} onClick={onSaveCloseBehavior} type="button">
+            {busyMap['settings:save-close-behavior'] ? 'Saving...' : 'Save close behavior'}
+          </button>
+        </div>
+
+        <div className="mt-6 grid gap-4 md:grid-cols-2">
+          <button
+            className={`rounded-3xl border p-5 text-left transition ${closeBehaviorDraft === 'tray' ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`}
+            onClick={() => onChangeCloseBehavior('tray')}
+            type="button"
+          >
+            <p className="text-lg font-semibold text-white">Minimize to tray on close</p>
+            <p className="mt-2 text-sm leading-7 text-slate-300">Clicking the X hides the window so your tools can keep running in the background.</p>
+          </button>
+          <button
+            className={`rounded-3xl border p-5 text-left transition ${closeBehaviorDraft === 'exit' ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`}
+            onClick={() => onChangeCloseBehavior('exit')}
+            type="button"
+          >
+            <p className="text-lg font-semibold text-white">Exit app on close</p>
+            <p className="mt-2 text-sm leading-7 text-slate-300">Clicking the X shuts down Local AI Hub, stops owned helpers, and exits cleanly.</p>
+          </button>
+        </div>
+      </div>
       {legacyMigration?.available && !legacyMigration.dismissed ? (
         <div className="panel border border-amber-300/20 bg-amber-300/10 p-6">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <p className="text-xs uppercase tracking-[0.22em] text-amber-100/80">Migration available</p>
-              <h4 className="mt-3 text-2xl font-semibold text-white">Older Local AI Hub files are still on your AppData drive</h4>
+              <h4 className="mt-3 text-2xl font-semibold text-white">Older Local AI Hub files are still in another Local AI Hub folder</h4>
               <p className="mt-3 max-w-3xl text-sm leading-7 text-amber-50/90">
-                Local AI Hub found {legacyMigration.toolCount || 0} managed tool folder{legacyMigration.toolCount === 1 ? '' : 's'} and other large files in {legacyMigration.sourceRoot}. You can move them into {legacyMigration.targetRoot} so future installs and repairs stay off your system drive.
+                Local AI Hub found {legacyMigration.toolCount || 0} managed tool folder{legacyMigration.toolCount === 1 ? '' : 's'} and other large files in {legacyMigration.sourceRoot}. You can move them into {legacyMigration.targetRoot} so future installs, repairs, and app upgrades keep using one stable storage location.
               </p>
               <p className="mt-3 text-sm text-amber-100/80">Estimated data to move: {formatBytes(legacyMigration.totalBytes)}</p>
             </div>

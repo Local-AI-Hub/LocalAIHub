@@ -260,18 +260,51 @@ function uniquePaths(paths = []) {
 
 async function runCommand(command, args = [], options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: {
-        ...process.env,
-        ...(options.env || {}),
-      },
-      shell: Boolean(options.shell),
-      windowsHide: true,
-    });
+    let settled = false;
+    const finalizeResolve = (value) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      resolve(value);
+    };
+    const finalizeReject = (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(error);
+    };
 
     let stdout = '';
     let stderr = '';
+    let child;
+
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env: {
+          ...process.env,
+          ...(options.env || {}),
+        },
+        shell: Boolean(options.shell),
+        windowsHide: true,
+      });
+    } catch (error) {
+      if (options.allowFailure) {
+        finalizeResolve({
+          code: 1,
+          stderr: stderr || error?.message || String(error),
+          stdout,
+        });
+        return;
+      }
+
+      finalizeReject(error);
+      return;
+    }
 
     child.stdout?.on('data', (chunk) => {
       stdout += chunk.toString();
@@ -281,10 +314,21 @@ async function runCommand(command, args = [], options = {}) {
       stderr += chunk.toString();
     });
 
-    child.on('error', reject);
+    child.on('error', (error) => {
+      if (options.allowFailure) {
+        finalizeResolve({
+          code: 1,
+          stderr: stderr || error?.message || String(error),
+          stdout,
+        });
+        return;
+      }
+
+      finalizeReject(error);
+    });
     child.on('close', (code) => {
       if (code === 0 || options.allowFailure) {
-        resolve({
+        finalizeResolve({
           code,
           stderr,
           stdout,
@@ -292,7 +336,7 @@ async function runCommand(command, args = [], options = {}) {
         return;
       }
 
-      reject(new Error(String(stderr || stdout || `${command} failed.`).trim()));
+      finalizeReject(new Error(String(stderr || stdout || `${command} failed.`).trim()));
     });
   });
 }

@@ -37,18 +37,51 @@ function formatVersion(version) {
 
 function runCommand(command, args = [], options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: {
-        ...process.env,
-        ...(options.env || {}),
-      },
-      windowsHide: true,
-      shell: Boolean(options.shell),
-    });
+    let settled = false;
+    const finalizeResolve = (value) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      resolve(value);
+    };
+    const finalizeReject = (error) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(error);
+    };
 
     let stdout = '';
     let stderr = '';
+    let child;
+
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env: {
+          ...process.env,
+          ...(options.env || {}),
+        },
+        windowsHide: true,
+        shell: Boolean(options.shell),
+      });
+    } catch (error) {
+      if (options.allowFailure) {
+        finalizeResolve({
+          code: 1,
+          stdout,
+          stderr: stderr || error?.message || String(error),
+        });
+        return;
+      }
+
+      finalizeReject(error);
+      return;
+    }
 
     child.stdout?.on('data', (chunk) => {
       stdout += chunk.toString();
@@ -59,12 +92,21 @@ function runCommand(command, args = [], options = {}) {
     });
 
     child.on('error', (error) => {
-      reject(error);
+      if (options.allowFailure) {
+        finalizeResolve({
+          code: 1,
+          stdout,
+          stderr: stderr || error?.message || String(error),
+        });
+        return;
+      }
+
+      finalizeReject(error);
     });
 
     child.on('close', (code) => {
       if (code === 0 || options.allowFailure) {
-        resolve({ code, stdout, stderr });
+        finalizeResolve({ code, stdout, stderr });
         return;
       }
 
@@ -72,7 +114,7 @@ function runCommand(command, args = [], options = {}) {
       failure.code = code;
       failure.stdout = stdout;
       failure.stderr = stderr;
-      reject(failure);
+      finalizeReject(failure);
     });
   });
 }

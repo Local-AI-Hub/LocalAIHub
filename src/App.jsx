@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AiderPanel from './components/AiderPanel';
 import CloudChatPanel from './components/CloudChatPanel';
 import ConnectionsPanel from './components/ConnectionsPanel';
@@ -32,6 +32,9 @@ const EMPTY_STATE = {
   providerManifestStatus: null,
   providers: [],
   resources: null,
+  settings: {
+    closeBehavior: 'tray',
+  },
   storage: null,
   toolUpdates: {
     availableCount: 0,
@@ -128,6 +131,7 @@ export default function App() {
   const [settingsToolId, setSettingsToolId] = useState(null);
   const [cleanupPreview, setCleanupPreview] = useState(null);
   const [storageDraft, setStorageDraft] = useState('');
+  const [closeBehaviorDraft, setCloseBehaviorDraft] = useState('tray');
   const [ollamaChatOpen, setOllamaChatOpen] = useState(false);
   const [ollamaModels, setOllamaModels] = useState([]);
   const [ollamaSelectedModel, setOllamaSelectedModel] = useState('');
@@ -865,6 +869,9 @@ export default function App() {
       setCleanupPreview(null);
     }
   }
+  async function saveCloseBehaviorPreference() {
+    await runAction('settings:save-close-behavior', () => window.localAIHub.saveCloseBehavior(closeBehaviorDraft));
+  }
 
   async function migrateLegacyStorage() {
     const migration = appState.storage?.legacyMigration;
@@ -873,7 +880,7 @@ export default function App() {
     }
 
     const confirmed = window.confirm(
-      `Move about ${formatBytes(migration.totalBytes)} from ${migration.sourceRoot} into ${migration.targetRoot}? Local AI Hub will keep your tracked tools attached and move the larger managed files off C:.`,
+      `Move about ${formatBytes(migration.totalBytes)} from ${migration.sourceRoot} into ${migration.targetRoot}? Local AI Hub will keep your tracked tools attached and move the managed files into one stable storage location for future repairs and upgrades.`,
     );
     if (!confirmed) {
       return;
@@ -1358,6 +1365,10 @@ export default function App() {
   }, [appState.storage?.managedRoot]);
 
   useEffect(() => {
+    setCloseBehaviorDraft(appState.settings?.closeBehavior || 'tray');
+  }, [appState.settings?.closeBehavior]);
+
+  useEffect(() => {
     if (activeTab !== 'settings' || cleanupPreview) {
       return;
     }
@@ -1658,12 +1669,15 @@ export default function App() {
               <SettingsPanel
                 busyMap={busyMap}
                 cleanupPreview={cleanupPreview}
+                closeBehaviorDraft={closeBehaviorDraft}
+                onChangeCloseBehavior={setCloseBehaviorDraft}
                 onChangeStorageDraft={setStorageDraft}
                 onChooseStorageFolder={chooseStorageFolder}
                 onDismissLegacyMigration={dismissLegacyMigration}
                 onMigrateLegacyStorage={migrateLegacyStorage}
                 onPreviewCleanup={() => previewCleanup()}
                 onRunCleanup={runCleanupNow}
+                onSaveCloseBehavior={saveCloseBehaviorPreference}
                 onSaveStorageLocation={() => saveStorageLocation()}
                 storage={appState.storage}
                 storageDraft={storageDraft}
@@ -1690,6 +1704,3 @@ export default function App() {
     </div>
   );
 }
-
-
-

@@ -1,4 +1,4 @@
-﻿const path = require('path');
+const path = require('path');
 const fs = require('fs');
 const {
   app,
@@ -19,6 +19,7 @@ const {
   markFirstLaunchComplete,
   readConfig,
   saveHardwareDetection,
+  updateConfig,
   upsertTool,
 } = require('./services/configService');
 const {
@@ -70,7 +71,7 @@ const {
 const { getStatisticsSnapshot, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
 const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./services/toolUpdateService');
 const { transcribeWithWhisper } = require('./services/whisperService');
-const { configureAutoUpdates, restartToInstallUpdate } = require('./services/updateService');
+const { configureAutoUpdates, isUpdateReady, restartToInstallUpdate } = require('./services/updateService');
 const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
 const { cancelPipelineRun, getActiveRunSnapshot, runPipeline, setPipelineEventSink } = require('./services/pipelineExecutionService');
 const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./services/pipelineStoreService');
@@ -82,6 +83,10 @@ const TOOL_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
+let closeBehaviorPreference = 'tray';
+let pendingUpdateInstall = false;
+let shutdownComplete = false;
+let shutdownPromise = null;
 let backgroundHealthInterval = null;
 let toolUpdateInterval = null;
 let healthCheckBusy = false;
@@ -143,6 +148,81 @@ function reportFatalAppError(error, context = {}) {
 
   isQuitting = true;
   app.exit(1);
+}
+
+function normalizeCloseBehavior(value) {
+  return String(value || '').trim().toLowerCase() === 'exit' ? 'exit' : 'tray';
+}
+
+function setCloseBehaviorPreference(value) {
+  closeBehaviorPreference = normalizeCloseBehavior(value);
+}
+
+function shouldMinimizeToTrayOnClose() {
+  return closeBehaviorPreference !== 'exit';
+}
+
+async function shutdownOwnedResources() {
+  if (backgroundHealthInterval) {
+    clearInterval(backgroundHealthInterval);
+    backgroundHealthInterval = null;
+  }
+  if (toolUpdateInterval) {
+    clearInterval(toolUpdateInterval);
+    toolUpdateInterval = null;
+  }
+
+  await disposeAllRuntimes().catch(() => null);
+  await disposeBackgroundTasks().catch(() => null);
+}
+
+async function requestAppQuit(options = {}) {
+  if (options.installUpdate && !isUpdateReady()) {
+    return false;
+  }
+
+  pendingUpdateInstall = pendingUpdateInstall || Boolean(options.installUpdate);
+  if (!shutdownPromise) {
+    shutdownPromise = (async () => {
+      isQuitting = true;
+      await shutdownOwnedResources();
+      shutdownComplete = true;
+
+      if (tray && !tray.isDestroyed()) {
+        tray.destroy();
+        tray = null;
+      }
+
+      if (pendingUpdateInstall) {
+        const installingUpdate = restartToInstallUpdate();
+        if (installingUpdate) {
+          return true;
+        }
+
+        pendingUpdateInstall = false;
+      }
+
+      app.quit();
+      return true;
+    })().catch((error) => {
+      shutdownPromise = null;
+      shutdownComplete = false;
+      isQuitting = false;
+      throw error;
+    });
+  }
+
+  return shutdownPromise;
+}
+
+function reportShutdownError(error, context = {}) {
+  const diagnosticPath = writeDiagnosticLog('shutdown-error', toError(error), context);
+  dialog.showErrorBox(
+    'Local AI Hub could not close cleanly',
+    diagnosticPath
+      ? `Local AI Hub hit a shutdown problem and saved a diagnostic log to:\n${diagnosticPath}`
+      : humanizeError(error, 'Local AI Hub hit a shutdown problem while closing.'),
+  );
 }
 
 function getRendererUrl() {
@@ -349,6 +429,9 @@ async function buildAppState(options = {}) {
     providerManifestStatus: getProviderManifestStatus(),
     providers: await listProviderConnections(),
     resources: await getLiveResourceUsage(paths.managedRoot),
+    settings: {
+      closeBehavior: normalizeCloseBehavior(latestConfig.closeBehavior),
+    },
     storage,
     toolUpdates: await getToolUpdateSnapshot(tools),
     tools,
@@ -406,8 +489,7 @@ async function updateTrayMenu() {
     {
       label: 'Quit',
       click: () => {
-        isQuitting = true;
-        app.quit();
+        requestAppQuit().catch((error) => reportShutdownError(error, { phase: 'tray-quit' }));
       },
     },
   ]);
@@ -472,13 +554,19 @@ function createWindow() {
   });
 
   mainWindow.on('close', (event) => {
-    if (isQuitting) {
+    if (shutdownComplete) {
+      return;
+    }
+
+    if (shouldMinimizeToTrayOnClose()) {
+      event.preventDefault();
+      mainWindow.hide();
+      broadcastWindowActivity(true);
       return;
     }
 
     event.preventDefault();
-    mainWindow.hide();
-    broadcastWindowActivity(true);
+    requestAppQuit().catch((error) => reportShutdownError(error, { phase: 'window-close' }));
   });
 }
 
@@ -693,11 +781,11 @@ function registerIpcHandlers() {
 
   ipcMain.handle('app:restart-to-update', () =>
     withPlainEnglishErrors(async () => {
-      const restarting = restartToInstallUpdate();
-      if (!restarting) {
+      if (!isUpdateReady()) {
         throw new Error('Local AI Hub does not have a downloaded update ready yet.');
       }
 
+      requestAppQuit({ installUpdate: true }).catch((error) => reportShutdownError(error, { phase: 'restart-to-update' }));
       return {
         message: 'Local AI Hub is restarting to install the update.',
       };
@@ -893,6 +981,24 @@ function registerIpcHandlers() {
         state: await buildAppState(),
       };
     }, 'Local AI Hub could not update the migration reminder.'),
+  );
+
+  ipcMain.handle('settings:save-close-behavior', (_event, closeBehavior) =>
+    withPlainEnglishErrors(async () => {
+      const nextCloseBehavior = normalizeCloseBehavior(closeBehavior);
+      await updateConfig((config) => ({
+        ...config,
+        closeBehavior: nextCloseBehavior,
+      }));
+      setCloseBehaviorPreference(nextCloseBehavior);
+      return {
+        message:
+          nextCloseBehavior === 'exit'
+            ? 'Local AI Hub will fully exit when you click the close button.'
+            : 'Local AI Hub will hide to the tray when you click the close button.',
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not save that close-button setting.'),
   );
 
   ipcMain.handle('settings:get-cleanup-preview', () =>
@@ -1211,6 +1317,9 @@ function registerIpcHandlers() {
 
 async function startApplication() {
   app.setAppUserModelId(APP_USER_MODEL_ID);
+  await ensureStorage();
+  const initialConfig = await readConfig();
+  setCloseBehaviorPreference(initialConfig.closeBehavior);
   createWindow();
   setRuntimeEventSink((payload) => {
     if (payload?.type === 'launch-progress') {
@@ -1276,18 +1385,18 @@ app.whenReady()
     });
   });
 
-app.on('before-quit', async () => {
-  isQuitting = true;
-  if (backgroundHealthInterval) {
-    clearInterval(backgroundHealthInterval);
-    backgroundHealthInterval = null;
+app.on('before-quit', (event) => {
+  if (shutdownComplete) {
+    isQuitting = true;
+    return;
   }
-  if (toolUpdateInterval) {
-    clearInterval(toolUpdateInterval);
-    toolUpdateInterval = null;
-  }
-  await disposeAllRuntimes();
-  await disposeBackgroundTasks();
+
+  event.preventDefault();
+  requestAppQuit({ installUpdate: pendingUpdateInstall }).catch((error) => {
+    reportShutdownError(error, { phase: 'before-quit' });
+    shutdownComplete = true;
+    app.exit(1);
+  });
 });
 
 app.on('window-all-closed', () => {
@@ -1313,8 +1422,3 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
-
-
-
-
-

@@ -109,6 +109,30 @@ function resolveAppInstallDir(executablePath = resolveExecutablePath()) {
   return normalizeDirectoryPath(path.resolve(__dirname, '..', '..'));
 }
 
+function resolveDefaultManagedRoot(appInstallDir, localRoot) {
+  const normalizedLocalRoot = normalizeDirectoryPath(localRoot);
+  const normalizedInstallDir = normalizeOptionalDirectoryPath(appInstallDir);
+
+  if (!app?.isPackaged || !normalizedInstallDir) {
+    return normalizedLocalRoot;
+  }
+
+  const installDriveRoot = normalizeOptionalDirectoryPath(path.parse(normalizedInstallDir).root);
+  const localDriveRoot = normalizeOptionalDirectoryPath(path.parse(normalizedLocalRoot).root);
+  if (!installDriveRoot || !localDriveRoot || installDriveRoot.toLowerCase() === localDriveRoot.toLowerCase()) {
+    return normalizedLocalRoot;
+  }
+
+  const installParentDir = normalizeOptionalDirectoryPath(path.dirname(normalizedInstallDir));
+  const parentName = installParentDir ? path.basename(installParentDir).replace(/\s+/g, '').toLowerCase() : '';
+  const managedName = APP_DATA_DIR_NAME.replace(/\s+/g, '').toLowerCase();
+  if (installParentDir && parentName === managedName) {
+    return installParentDir;
+  }
+
+  return normalizeDirectoryPath(path.join(installDriveRoot, APP_DATA_DIR_NAME));
+}
+
 function buildManagedSubdirectoryPaths(rootPath) {
   const managedRoot = normalizeDirectoryPath(rootPath);
   return {
@@ -211,6 +235,10 @@ function normalizeIgnoredToolIds(value) {
   return [...new Set(value.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean))];
 }
 
+function normalizeCloseBehavior(value) {
+  return String(value || '').trim().toLowerCase() === 'exit' ? 'exit' : 'tray';
+}
+
 function rewriteLegacyPathsInValue(value, pathMappings) {
   if (Array.isArray(value)) {
     return value.map((entry) => rewriteLegacyPathsInValue(entry, pathMappings));
@@ -268,6 +296,7 @@ function createDefaultConfig() {
     firstLaunchCompleted: false,
     hardware: null,
     ignoredToolIds: [],
+    closeBehavior: 'tray',
     managedDataRoot: null,
     managedDataRootHistory: [],
     dismissedManagedMigrationRoots: [],
@@ -289,6 +318,7 @@ function normalizeConfig(config, options = {}) {
       ...(config || {}),
       version: CONFIG_VERSION,
       ignoredToolIds: normalizeIgnoredToolIds(config?.ignoredToolIds),
+      closeBehavior: normalizeCloseBehavior(config?.closeBehavior),
       managedDataRoot: normalizeOptionalDirectoryPath(config?.managedDataRoot),
       managedDataRootHistory: normalizePathList([
         ...(config?.managedDataRootHistory || []),
@@ -331,7 +361,7 @@ function getStorageRoots(configOverride = null) {
   const configFile = path.join(root, 'config.json');
   const executablePath = resolveExecutablePath();
   const appInstallDir = resolveAppInstallDir(executablePath);
-  const defaultManagedRoot = appInstallDir;
+  const defaultManagedRoot = resolveDefaultManagedRoot(appInstallDir, localRoot);
   const storedConfig = configOverride || readStoredConfigSnapshotSync(configFile) || null;
   const configuredManagedRoot = normalizeOptionalDirectoryPath(storedConfig?.managedDataRoot);
   const managedRoot = configuredManagedRoot || defaultManagedRoot;
@@ -341,6 +371,8 @@ function getStorageRoots(configOverride = null) {
   const managedDataRootHistory = normalizePathList(storedConfig?.managedDataRootHistory || []);
   const knownManagedRoots = normalizePathList([
     root,
+    localRoot,
+    appInstallDir,
     defaultManagedRoot,
     managedRoot,
     ...managedDataRootHistory,
@@ -355,7 +387,7 @@ function getStorageRoots(configOverride = null) {
     executablePath,
     knownManagedRoots,
     legacyConfigRoots,
-    legacyRoots: normalizePathList([root, ...legacyConfigRoots, ...managedDataRootHistory]),
+    legacyRoots: normalizePathList([root, localRoot, appInstallDir, ...legacyConfigRoots, ...managedDataRootHistory]),
     localAppDataRoot,
     localRoot,
     managedDataRootHistory,
@@ -688,4 +720,3 @@ module.exports = {
   upsertTool,
   writeConfig,
 };
-
