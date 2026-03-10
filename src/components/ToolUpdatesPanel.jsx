@@ -1,6 +1,11 @@
+import { memo } from 'react';
 import { formatTimestamp } from '../lib/formatters';
 
-export default function ToolUpdatesPanel({ busyMap, summary, onUpdateTool }) {
+function isBusy(busyMap, key) {
+  return Boolean(busyMap?.[key]);
+}
+
+function ToolUpdatesPanel({ busyMap, summary, onUpdateTool }) {
   const entries = (summary?.entries || []).filter((entry) => entry.updateAvailable);
   if (!entries.length) {
     return null;
@@ -13,7 +18,7 @@ export default function ToolUpdatesPanel({ busyMap, summary, onUpdateTool }) {
           <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Updates available</p>
           <h3 className="mt-3 text-3xl font-semibold text-white">{summary.availableCount} tool update{summary.availableCount === 1 ? '' : 's'} ready</h3>
           <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
-            Local AI Hub checks for newer releases when the app starts. Nothing updates automatically until you choose Update.
+            Local AI Hub checks for newer releases when the app starts and then once a day. Nothing updates automatically until you choose Update.
           </p>
         </div>
         <p className="text-sm text-slate-400">Checked {formatTimestamp(summary.lastCheckedAt)}</p>
@@ -40,3 +45,15 @@ export default function ToolUpdatesPanel({ busyMap, summary, onUpdateTool }) {
     </section>
   );
 }
+
+function areToolUpdatePropsEqual(prevProps, nextProps) {
+  const prevEntries = prevProps.summary?.entries || [];
+  return (
+    prevProps.summary === nextProps.summary &&
+    prevEntries.every(
+      (entry) => isBusy(prevProps.busyMap, `update:${entry.toolId}`) === isBusy(nextProps.busyMap, `update:${entry.toolId}`),
+    )
+  );
+}
+
+export default memo(ToolUpdatesPanel, areToolUpdatePropsEqual);

@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { formatBytes, formatDiskAvailability, formatTimestamp, formatUsage } from '../lib/formatters';
 
 function MiniBar({ value, maxValue, tone = 'bg-cyan-300' }) {
@@ -49,7 +50,7 @@ function VramHistoryChart({ history }) {
   );
 }
 
-export default function StatisticsPanel({ busy, data, onOpenCleanup, onRefresh }) {
+function StatisticsPanel({ busy, data, onOpenCleanup, onRefresh }) {
   const maxLaunchCount = Math.max(...(data?.launchRanking || []).map((entry) => Number(entry.count || 0)), 1);
   const maxToolBytes = Math.max(...(data?.toolBreakdown || []).map((entry) => Number(entry.totalBytes || 0)), 1);
 
@@ -81,7 +82,7 @@ export default function StatisticsPanel({ busy, data, onOpenCleanup, onRefresh }
             <p className="mt-2 text-sm text-slate-300">Tracked across Local AI Hub's current app, config, and managed storage roots.</p>
           </div>
           <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
-            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Install drive</p>
+            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Storage drive</p>
             <p className="mt-3 text-2xl font-semibold text-white">{data?.totalDiskUsage?.installDrive || 'Not available'}</p>
             <p className="mt-2 text-sm text-slate-300">
               {formatDiskAvailability(data?.totalDiskUsage?.freeBytes, data?.totalDiskUsage?.totalBytes)}
@@ -151,3 +152,9 @@ export default function StatisticsPanel({ busy, data, onOpenCleanup, onRefresh }
     </section>
   );
 }
+
+function areStatisticsPanelPropsEqual(prevProps, nextProps) {
+  return prevProps.busy === nextProps.busy && prevProps.data === nextProps.data;
+}
+
+export default memo(StatisticsPanel, areStatisticsPanelPropsEqual);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AiderPanel from './components/AiderPanel';
 import CloudChatPanel from './components/CloudChatPanel';
 import ConnectionsPanel from './components/ConnectionsPanel';
@@ -14,7 +14,7 @@ import StatisticsPanel from './components/StatisticsPanel';
 import StoreCard from './components/StoreCard';
 import ToolUpdatesPanel from './components/ToolUpdatesPanel';
 import WhisperPanel from './components/WhisperPanel';
-import { formatBytes } from './lib/formatters';
+import { formatBytes, formatUsage } from './lib/formatters';
 import { evaluateCompatibility, toolSearchText } from './lib/tool-ui';
 
 const EMPTY_STATE = {
@@ -41,7 +41,9 @@ const EMPTY_STATE = {
 };
 
 const CONSOLE_OUTPUT_LIMIT = 48000;
-const REFRESH_INTERVAL_MS = 5000;
+const FOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 3000;
+const UNFOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 10000;
+const DISK_RESOURCE_REFRESH_INTERVAL_MS = 30000;
 
 function trimConsoleOutput(value) {
   const text = String(value || '');
@@ -147,9 +149,8 @@ export default function App() {
   const [aiderOutput, setAiderOutput] = useState('');
   const [aiderProjectDir, setAiderProjectDir] = useState('');
   const [statisticsData, setStatisticsData] = useState(null);
-  const [statisticsBusy, setStatisticsBusy] = useState(false);
+  const [statisticsManualBusy, setStatisticsManualBusy] = useState(false);
   const statisticsRefreshInFlightRef = useRef(false);
-  const statisticsQueuedRefreshRef = useRef(null);
   const [cloudChatProviderId, setCloudChatProviderId] = useState('');
   const [cloudModels, setCloudModels] = useState([]);
   const [cloudSelectedModel, setCloudSelectedModel] = useState('');
@@ -160,6 +161,59 @@ export default function App() {
   const [cloudChatBusy, setCloudChatBusy] = useState(false);
   const [providerKeyDrafts, setProviderKeyDrafts] = useState({});
   const [toolUpdateToastCount, setToolUpdateToastCount] = useState(0);
+  const [liveResources, setLiveResources] = useState(null);
+  const [windowActivity, setWindowActivity] = useState({
+    focused: true,
+    visible: true,
+  });
+  const liveResourcesRef = useRef(null);
+  const lastDiskRefreshAtRef = useRef(0);
+
+  const applyLiveResources = useCallback((nextResources, options = {}) => {
+    if (!nextResources) {
+      liveResourcesRef.current = null;
+      setLiveResources(null);
+      if (!options.preserveDisk) {
+        lastDiskRefreshAtRef.current = 0;
+      }
+      return;
+    }
+
+    setLiveResources((current) => {
+      const previousResources = current || liveResourcesRef.current;
+      const mergedResources =
+        options.preserveDisk && previousResources
+          ? {
+              ...nextResources,
+              diskFreeBytes: previousResources.diskFreeBytes ?? null,
+              diskMount: previousResources.diskMount ?? null,
+              diskTotalBytes: previousResources.diskTotalBytes ?? null,
+              diskUsePercent: previousResources.diskUsePercent ?? null,
+              diskUsedBytes: previousResources.diskUsedBytes ?? null,
+            }
+          : nextResources;
+
+      liveResourcesRef.current = mergedResources;
+      if (!options.preserveDisk) {
+        lastDiskRefreshAtRef.current = Date.now();
+      }
+      return mergedResources;
+    });
+  }, []);
+
+  const applyStatePayload = useCallback(
+    (payload) => {
+      if (!payload?.hardware && !Array.isArray(payload?.tools)) {
+        return;
+      }
+
+      setAppState(payload);
+      if (Object.prototype.hasOwnProperty.call(payload, 'resources')) {
+        applyLiveResources(payload.resources || null);
+      }
+    },
+    [applyLiveResources],
+  );
 
   const manifestMap = useMemo(
     () => Object.fromEntries((appState.manifests || []).map((manifest) => [manifest.id, manifest])),
@@ -196,6 +250,7 @@ export default function App() {
     [toolUpdateSummary.entries],
   );
   const activeCloudProvider = cloudChatProviderId ? providerMap[cloudChatProviderId] || null : null;
+  const currentResources = liveResources || appState.resources;
   const modelManagerCount = Number(appState.downloadedModelCount || 0);
   const libraryCount = tools.length + connectedProviders.length;
 
@@ -223,7 +278,11 @@ export default function App() {
     });
   }, [availableStoreTools, storeCategory, storeSearch]);
 
-  const runningCount = tools.filter((tool) => tool.status === 'running').length;
+  const runningCount = useMemo(() => tools.filter((tool) => tool.status === 'running').length, [tools]);
+  const runningUsageLabel = useMemo(
+    () => formatUsage(currentResources?.vramUsedMb, currentResources?.vramTotalMb),
+    [currentResources?.vramTotalMb, currentResources?.vramUsedMb],
+  );
 
   function dismissToast(id) {
     setToasts((current) => current.filter((toast) => toast.id !== id));
@@ -546,18 +605,12 @@ export default function App() {
     const silent = Boolean(options.silent);
 
     if (statisticsRefreshInFlightRef.current) {
-      if (manual) {
-        statisticsQueuedRefreshRef.current = {
-          manual: true,
-          silent,
-        };
-      }
       return false;
     }
 
     statisticsRefreshInFlightRef.current = true;
     if (manual) {
-      setStatisticsBusy(true);
+      setStatisticsManualBusy(true);
     }
 
     try {
@@ -579,15 +632,7 @@ export default function App() {
     } finally {
       statisticsRefreshInFlightRef.current = false;
       if (manual) {
-        setStatisticsBusy(false);
-      }
-
-      const queuedRefresh = statisticsQueuedRefreshRef.current;
-      if (queuedRefresh) {
-        statisticsQueuedRefreshRef.current = null;
-        window.setTimeout(() => {
-          loadStatistics(queuedRefresh);
-        }, 0);
+        setStatisticsManualBusy(false);
       }
     }
   }
@@ -898,9 +943,7 @@ export default function App() {
     }
 
     const payload = result.data?.state || result.data;
-    if (payload?.hardware || Array.isArray(payload?.tools)) {
-      setAppState(payload);
-    }
+    applyStatePayload(payload);
 
     if (result.data?.message) {
       pushToast(result.data.message, 'success');
@@ -915,7 +958,7 @@ export default function App() {
       return;
     }
 
-    setAppState(result.data);
+    applyStatePayload(result.data);
     setIsLoading(false);
   }
 
@@ -1039,6 +1082,11 @@ export default function App() {
 
   useEffect(() => {
     loadState();
+    window.localAIHub.getWindowActivity().then((result) => {
+      if (result?.ok && result.data) {
+        setWindowActivity(result.data);
+      }
+    });
 
     const unsubscribeInstallProgress = window.localAIHub.onInstallProgress((progress) => {
       if (!progress?.toolId) {
@@ -1059,6 +1107,12 @@ export default function App() {
 
     const unsubscribeOpenToolUi = window.localAIHub.onOpenToolUi((payload) => {
       openEmbeddedToolUi(payload?.toolId);
+    });
+
+    const unsubscribeWindowActivity = window.localAIHub.onWindowActivity((payload) => {
+      if (payload) {
+        setWindowActivity(payload);
+      }
     });
 
     const unsubscribeLaunchProgress = window.localAIHub.onLaunchProgress((progress) => {
@@ -1149,16 +1203,10 @@ export default function App() {
       });
     });
 
-    const intervalId = window.setInterval(async () => {
-      const result = await window.localAIHub.refresh();
-      if (result?.ok) {
-        setAppState(result.data);
-      }
-    }, REFRESH_INTERVAL_MS);
-
     return () => {
       unsubscribeInstallProgress();
       unsubscribeOpenToolUi();
+      unsubscribeWindowActivity();
       unsubscribeLaunchProgress();
       unsubscribeRuntimeOutput();
       unsubscribeToolState();
@@ -1166,7 +1214,6 @@ export default function App() {
       unsubscribeToolUpdateSummary();
       unsubscribeUpdateProgress();
       unsubscribeUpdateReady();
-      window.clearInterval(intervalId);
     };
   }, []);
 
@@ -1318,19 +1365,46 @@ export default function App() {
   }, [activeTab, cleanupPreview]);
 
   useEffect(() => {
-    if (activeTab !== 'statistics') {
+    let cancelled = false;
+    let timerId = null;
+    const pollIntervalMs = windowActivity.focused && windowActivity.visible
+      ? FOCUSED_RESOURCE_REFRESH_INTERVAL_MS
+      : UNFOCUSED_RESOURCE_REFRESH_INTERVAL_MS;
+
+    const pollResources = async () => {
+      const shouldIncludeDisk =
+        windowActivity.focused &&
+        windowActivity.visible &&
+        (Date.now() - lastDiskRefreshAtRef.current >= DISK_RESOURCE_REFRESH_INTERVAL_MS || !liveResourcesRef.current?.diskMount);
+      const result = await window.localAIHub.getLiveResources({ includeDisk: shouldIncludeDisk });
+      if (!cancelled && result?.ok && result.data) {
+        applyLiveResources(result.data, {
+          preserveDisk: !shouldIncludeDisk,
+        });
+      }
+
+      if (!cancelled) {
+        timerId = window.setTimeout(pollResources, pollIntervalMs);
+      }
+    };
+
+    pollResources();
+
+    return () => {
+      cancelled = true;
+      if (timerId) {
+        window.clearTimeout(timerId);
+      }
+    };
+  }, [applyLiveResources, windowActivity.focused, windowActivity.visible]);
+
+  useEffect(() => {
+    if (activeTab !== 'statistics' || !windowActivity.focused || !windowActivity.visible) {
       return;
     }
 
     loadStatistics({ silent: true });
-    const intervalId = window.setInterval(() => {
-      loadStatistics({ silent: true });
-    }, REFRESH_INTERVAL_MS);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [activeTab]);
+  }, [activeTab, windowActivity.focused, windowActivity.visible]);
 
   useEffect(() => {
     if (!cloudChatProviderId) {
@@ -1380,7 +1454,7 @@ export default function App() {
           <ResourceStrip
             activeTab={activeTab}
             installedCount={libraryCount}
-            resources={appState.resources}
+            resources={currentResources}
             runningCount={runningCount}
             storage={appState.storage}
             updateCount={toolUpdateSummary.availableCount || 0}
@@ -1491,7 +1565,7 @@ export default function App() {
                   onUninstall={uninstallLibraryTool}
                   onUpdate={updateLibraryTool}
                   progress={progressMap[tool.id]}
-                  resources={appState.resources}
+                  runningUsageLabel={runningUsageLabel}
                   settingsOpen={settingsToolId === tool.id}
                   tool={tool}
                   updateInfo={toolUpdateMap[tool.id]}
@@ -1565,7 +1639,7 @@ export default function App() {
             <ModelManager onToast={pushToast} tools={tools} />
           ) : activeTab === 'statistics' ? (
             <StatisticsPanel
-              busy={statisticsBusy}
+              busy={statisticsManualBusy}
               data={statisticsData || {}}
               onOpenCleanup={() => setActiveTab('settings')}
               onRefresh={() => loadStatistics({ manual: true })}
@@ -1607,3 +1681,4 @@ export default function App() {
     </div>
   );
 }
+

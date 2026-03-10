@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 const {
   app,
   BrowserWindow,
@@ -70,18 +71,77 @@ const { getStatisticsSnapshot, recordToolLaunch, recordVramSample } = require('.
 const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./services/toolUpdateService');
 const { transcribeWithWhisper } = require('./services/whisperService');
 const { configureAutoUpdates, restartToInstallUpdate } = require('./services/updateService');
+const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
 
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
-const TOOL_HEALTH_CHECK_INTERVAL_MS = 10000;
-const STATISTICS_SAMPLE_INTERVAL_MS = 5000;
+const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
+const TOOL_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 let backgroundHealthInterval = null;
-let backgroundStatsInterval = null;
+let toolUpdateInterval = null;
 let healthCheckBusy = false;
 let toolUpdateCheckPromise = null;
+let lastWindowActivity = { focused: true, visible: true };
+let fatalAppErrorHandled = false;
+
+function toError(value) {
+  if (value instanceof Error) {
+    return value;
+  }
+
+  return new Error(typeof value === 'string' ? value : 'Unknown startup error');
+}
+
+function getDiagnosticLogPath() {
+  try {
+    return path.join(app.getPath('temp'), 'LocalAIHub-startup.log');
+  } catch {
+    return path.join(process.cwd(), 'LocalAIHub-startup.log');
+  }
+}
+
+function writeDiagnosticLog(label, error, context = {}) {
+  const diagnosticPath = getDiagnosticLogPath();
+  const payload = {
+    appVersion: app.getVersion(),
+    context,
+    isPackaged: app.isPackaged,
+    message: error?.message || String(error),
+    stack: error?.stack || null,
+    timestamp: new Date().toISOString(),
+  };
+
+  try {
+    fs.appendFileSync(diagnosticPath, `[${payload.timestamp}] [${label}] ${JSON.stringify(payload)}\n`, 'utf8');
+    return diagnosticPath;
+  } catch {
+    return null;
+  }
+}
+
+function reportFatalAppError(error, context = {}) {
+  if (fatalAppErrorHandled) {
+    return;
+  }
+
+  fatalAppErrorHandled = true;
+  const normalizedError = toError(error);
+  const diagnosticPath = writeDiagnosticLog('fatal-startup-error', normalizedError, context);
+  const message = humanizeError(normalizedError, 'Local AI Hub could not start correctly on this PC.');
+
+  dialog.showErrorBox(
+    'Local AI Hub could not start',
+    diagnosticPath
+      ? `${message}\n\nA startup diagnostic log was saved to:\n${diagnosticPath}`
+      : `${message}\n\nLocal AI Hub could not save a startup diagnostic log.`,
+  );
+
+  isQuitting = true;
+  app.exit(1);
+}
 
 function getRendererUrl() {
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -162,6 +222,87 @@ async function launchToolFromExplicitUserAction(tool, options = {}) {
   };
 }
 
+async function buildMergedToolStateList(options = {}) {
+  const config = options.config || (await readConfig());
+  return Promise.all(
+    Object.values(config.tools || {})
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map(async (tool) => {
+        const manifest = getToolManifest(tool.id) || {};
+        const mergedTool = {
+          ...manifest,
+          ...tool,
+        };
+
+        return {
+          ...mergedTool,
+          status: options.resolveStatuses ? await resolveToolStatus(mergedTool) : mergedTool.status || 'stopped',
+          snapshots: options.includeSnapshots && mergedTool.source === 'managed' ? await listSnapshots(mergedTool.id) : [],
+          updateSupported:
+            mergedTool.source === 'managed' ||
+            manifest.installInstructions?.kind === 'installer-exe' ||
+            manifest.installInstructions?.kind === 'single-file' ||
+            manifest.installInstructions?.runtime === 'binary',
+        };
+      }),
+  );
+}
+
+async function hasConfiguredRunningTools() {
+  const config = await readConfig();
+  return Object.values(config.tools || {}).some((tool) => tool.status === 'running');
+}
+
+function getWindowActivityPayload() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return {
+      focused: false,
+      visible: false,
+    };
+  }
+
+  return {
+    focused: mainWindow.isFocused(),
+    visible: mainWindow.isVisible() && !mainWindow.isMinimized(),
+  };
+}
+
+function broadcastWindowActivity(force = false) {
+  const nextActivity = getWindowActivityPayload();
+  if (
+    !force &&
+    nextActivity.focused === lastWindowActivity.focused &&
+    nextActivity.visible === lastWindowActivity.visible
+  ) {
+    return nextActivity;
+  }
+
+  lastWindowActivity = nextActivity;
+  mainWindow?.webContents.send('app:window-activity', nextActivity);
+  return nextActivity;
+}
+
+async function updateHealthMonitor(options = {}) {
+  const hasRunningTools =
+    typeof options.hasRunningTools === 'boolean' ? options.hasRunningTools : await hasConfiguredRunningTools();
+
+  if (!hasRunningTools) {
+    if (backgroundHealthInterval) {
+      clearInterval(backgroundHealthInterval);
+      backgroundHealthInterval = null;
+    }
+    return;
+  }
+
+  if (backgroundHealthInterval || isQuitting) {
+    return;
+  }
+
+  backgroundHealthInterval = setInterval(() => {
+    checkRunningToolsHealth().catch(() => null);
+  }, TOOL_HEALTH_CHECK_INTERVAL_MS);
+}
+
 async function buildAppState(options = {}) {
   await initializeToolRegistry({ refreshRemote: Boolean(options.refreshManifest) });
   await initializeProviderRegistry();
@@ -179,28 +320,11 @@ async function buildAppState(options = {}) {
   const paths = getAppPaths();
   const storage = await getStorageOverview();
   const manifests = getToolCatalog();
-  const tools = await Promise.all(
-    Object.values(latestConfig.tools)
-      .sort((left, right) => left.name.localeCompare(right.name))
-      .map(async (tool) => {
-        const manifest = getToolManifest(tool.id) || {};
-        const mergedTool = {
-          ...manifest,
-          ...tool,
-        };
-
-        return {
-          ...mergedTool,
-          status: await resolveToolStatus(mergedTool),
-          snapshots: mergedTool.source === 'managed' ? await listSnapshots(mergedTool.id) : [],
-          updateSupported:
-            mergedTool.source === 'managed' ||
-            manifest.installInstructions?.kind === 'installer-exe' ||
-            manifest.installInstructions?.kind === 'single-file' ||
-            manifest.installInstructions?.runtime === 'binary',
-        };
-      }),
-  );
+  const tools = await buildMergedToolStateList({
+    config: latestConfig,
+    includeSnapshots: true,
+    resolveStatuses: true,
+  });
   const downloadedModelCount = (
     await Promise.all(
       tools
@@ -243,10 +367,14 @@ async function updateTrayMenu() {
     return;
   }
 
-  const state = await buildAppState();
+  await initializeToolRegistry();
+  const tools = await buildMergedToolStateList({
+    includeSnapshots: false,
+    resolveStatuses: false,
+  });
   const toolItems =
-    state.tools.length > 0
-      ? state.tools.map((tool) => ({
+    tools.length > 0
+      ? tools.map((tool) => ({
           label: tool.status === 'running' ? `Stop ${tool.name}` : `Launch ${tool.name}`,
           click: async () => {
             try {
@@ -312,11 +440,33 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
+    broadcastWindowActivity(true);
+  });
+
+  mainWindow.on('focus', () => {
+    broadcastWindowActivity(true);
+  });
+
+  mainWindow.on('blur', () => {
+    broadcastWindowActivity(true);
+  });
+
+  mainWindow.on('show', () => {
+    broadcastWindowActivity(true);
+  });
+
+  mainWindow.on('hide', () => {
+    broadcastWindowActivity(true);
+  });
+
+  mainWindow.on('restore', () => {
+    broadcastWindowActivity(true);
   });
 
   mainWindow.on('minimize', (event) => {
     event.preventDefault();
     mainWindow.hide();
+    broadcastWindowActivity(true);
   });
 
   mainWindow.on('close', (event) => {
@@ -326,6 +476,7 @@ function createWindow() {
 
     event.preventDefault();
     mainWindow.hide();
+    broadcastWindowActivity(true);
   });
 }
 
@@ -418,6 +569,8 @@ async function checkRunningToolsHealth() {
   try {
     await initializeToolRegistry();
     const config = await readConfig();
+    const activeRunningTools = [];
+
     for (const storedTool of Object.values(config.tools || {})) {
       if (storedTool.status !== 'running') {
         continue;
@@ -429,6 +582,7 @@ async function checkRunningToolsHealth() {
       };
       const active = await isToolActive(mergedTool).catch(() => false);
       if (active) {
+        activeRunningTools.push(mergedTool);
         continue;
       }
 
@@ -451,36 +605,14 @@ async function checkRunningToolsHealth() {
       await showUnexpectedStopNotification(eventPayload).catch(() => null);
     }
 
+    if (activeRunningTools.length > 0) {
+      await recordVramSample(activeRunningTools).catch(() => null);
+    }
+
+    await updateHealthMonitor({ hasRunningTools: activeRunningTools.length > 0 }).catch(() => null);
     await updateTrayMenu().catch(() => null);
   } finally {
     healthCheckBusy = false;
-  }
-}
-
-async function sampleRuntimeStatistics() {
-  if (isQuitting) {
-    return;
-  }
-
-  await initializeToolRegistry();
-  const config = await readConfig();
-  const runningTools = [];
-  for (const storedTool of Object.values(config.tools || {})) {
-    if (storedTool.status !== 'running') {
-      continue;
-    }
-
-    const mergedTool = {
-      ...(getToolManifest(storedTool.id) || {}),
-      ...storedTool,
-    };
-    if (await isToolActive(mergedTool).catch(() => false)) {
-      runningTools.push(mergedTool);
-    }
-  }
-
-  if (runningTools.length > 0) {
-    await recordVramSample(runningTools).catch(() => null);
   }
 }
 
@@ -490,12 +622,10 @@ async function runSilentToolUpdateCheck(tools = null) {
   }
 
   toolUpdateCheckPromise = (async () => {
-    const state = tools ? { tools } : await buildAppState();
-    await refreshInstalledToolUpdates(state.tools || []).catch(() => null);
-    const summary = await getToolUpdateSnapshot(state.tools || []);
-    if (summary.availableCount > 0) {
-      sendToolUpdateSummary(summary);
-    }
+    const toolList = tools || (await buildMergedToolStateList({ includeSnapshots: false, resolveStatuses: false }));
+    await refreshInstalledToolUpdates(toolList).catch(() => null);
+    const summary = await getToolUpdateSnapshot(toolList);
+    sendToolUpdateSummary(summary);
     return summary;
   })();
 
@@ -509,6 +639,7 @@ async function runSilentToolUpdateCheck(tools = null) {
 async function withPlainEnglishErrors(handler, fallbackMessage) {
   try {
     const data = await handler();
+    await updateHealthMonitor().catch(() => null);
     await updateTrayMenu();
     return { ok: true, data };
   } catch (error) {
@@ -526,6 +657,19 @@ function registerIpcHandlers() {
 
   ipcMain.handle('app:refresh', () =>
     withPlainEnglishErrors(buildAppState, 'Local AI Hub could not refresh the dashboard.'),
+  );
+
+  ipcMain.handle('app:get-live-resources', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const { managedRoot } = getAppPaths();
+      return getLiveResourceUsage(managedRoot, {
+        includeDisk: Boolean(payload?.includeDisk),
+      });
+    }, 'Local AI Hub could not refresh live system usage right now.'),
+  );
+
+  ipcMain.handle('app:get-window-activity', () =>
+    withPlainEnglishErrors(async () => getWindowActivityPayload(), 'Local AI Hub could not read the current window activity.'),
   );
 
   ipcMain.handle('app:complete-first-launch', () =>
@@ -566,7 +710,6 @@ function registerIpcHandlers() {
         onProgress: (progressPayload) => sendInstallProgress(progressPayload),
       });
       invalidateDiscoveryCache();
-      await runSilentToolUpdateCheck([tool]).catch(() => null);
       return {
         message:
           tool.installActionMessage ||
@@ -658,7 +801,6 @@ function registerIpcHandlers() {
         onProgress: (progressPayload) => sendUpdateProgress(progressPayload),
       });
       invalidateDiscoveryCache();
-      await runSilentToolUpdateCheck([updatedTool]).catch(() => null);
       return {
         message: updatedTool.lastUpdateMessage || `Local AI Hub updated ${tool.name}.`,
         state: await buildAppState({ forceDiscovery: true }),
@@ -768,8 +910,15 @@ function registerIpcHandlers() {
 
   ipcMain.handle('settings:get-statistics', () =>
     withPlainEnglishErrors(async () => {
-      const state = await buildAppState();
-      return getStatisticsSnapshot(state.tools);
+      const tools = await buildMergedToolStateList({
+        includeSnapshots: false,
+        resolveStatuses: false,
+      });
+      const runningTools = tools.filter((tool) => tool.status === 'running');
+      if (runningTools.length > 0) {
+        await recordVramSample(runningTools).catch(() => null);
+      }
+      return getStatisticsSnapshot(tools);
     }, 'Local AI Hub could not load the statistics screen right now.'),
   );
 
@@ -1003,7 +1152,7 @@ function registerIpcHandlers() {
   );
 }
 
-app.whenReady().then(async () => {
+async function startApplication() {
   app.setAppUserModelId(APP_USER_MODEL_ID);
   createWindow();
   setRuntimeEventSink((payload) => {
@@ -1014,6 +1163,7 @@ app.whenReady().then(async () => {
 
     if (payload?.type === 'tool-state') {
       sendToolState(payload);
+      updateHealthMonitor().catch(() => null);
       updateTrayMenu().catch(() => null);
       return;
     }
@@ -1021,6 +1171,7 @@ app.whenReady().then(async () => {
     if (payload?.type === 'unexpected-stop') {
       sendUnexpectedStop(payload);
       showUnexpectedStopNotification(payload).catch(() => null);
+      updateHealthMonitor().catch(() => null);
       updateTrayMenu().catch(() => null);
       return;
     }
@@ -1036,23 +1187,47 @@ app.whenReady().then(async () => {
   const initialState = await buildAppState({ forceDiscovery: true });
   await updateTrayMenu();
   await runSilentToolUpdateCheck(initialState.tools).catch(() => null);
-  backgroundHealthInterval = setInterval(() => {
-    checkRunningToolsHealth().catch(() => null);
-  }, TOOL_HEALTH_CHECK_INTERVAL_MS);
-  backgroundStatsInterval = setInterval(() => {
-    sampleRuntimeStatistics().catch(() => null);
-  }, STATISTICS_SAMPLE_INTERVAL_MS);
+  await updateHealthMonitor({ hasRunningTools: initialState.tools.some((tool) => tool.status === 'running') });
+  toolUpdateInterval = setInterval(() => {
+    buildMergedToolStateList({ includeSnapshots: false, resolveStatuses: false })
+      .then((tools) => runSilentToolUpdateCheck(tools))
+      .catch(() => null);
+  }, TOOL_UPDATE_CHECK_INTERVAL_MS);
+  broadcastWindowActivity(true);
+}
+
+process.on('uncaughtException', (error) => {
+  reportFatalAppError(error, {
+    phase: 'uncaughtException',
+  });
 });
+
+process.on('unhandledRejection', (reason) => {
+  reportFatalAppError(toError(reason), {
+    phase: 'unhandledRejection',
+  });
+});
+
+app.whenReady()
+  .then(() => startApplication())
+  .catch((error) => {
+    reportFatalAppError(error, {
+      phase: 'whenReady',
+    });
+  });
 
 app.on('before-quit', async () => {
   isQuitting = true;
   if (backgroundHealthInterval) {
     clearInterval(backgroundHealthInterval);
+    backgroundHealthInterval = null;
   }
-  if (backgroundStatsInterval) {
-    clearInterval(backgroundStatsInterval);
+  if (toolUpdateInterval) {
+    clearInterval(toolUpdateInterval);
+    toolUpdateInterval = null;
   }
   await disposeAllRuntimes();
+  await disposeBackgroundTasks();
 });
 
 app.on('window-all-closed', () => {
@@ -1070,3 +1245,13 @@ app.on('activate', () => {
 
   showWindow();
 });
+
+app.on('browser-window-focus', () => {
+  broadcastWindowActivity(true);
+});
+
+app.on('browser-window-blur', () => {
+  broadcastWindowActivity(true);
+});
+
+

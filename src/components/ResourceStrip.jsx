@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { formatDiskAvailability, formatUsage } from '../lib/formatters';
 
 function MetricCard({ label, value, detail, accent }) {
@@ -10,7 +11,7 @@ function MetricCard({ label, value, detail, accent }) {
   );
 }
 
-export default function ResourceStrip({ resources, installedCount, runningCount, activeTab, storage, updateCount = 0 }) {
+function ResourceStrip({ resources, installedCount, runningCount, activeTab, storage, updateCount = 0 }) {
   const activeLabel =
     activeTab === 'library'
       ? 'Library'
@@ -75,3 +76,5 @@ export default function ResourceStrip({ resources, installedCount, runningCount,
     </section>
   );
 }
+
+export default memo(ResourceStrip);

@@ -1,6 +1,6 @@
 {
   "name": "local-ai-hub",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Windows desktop manager for local AI tools",
   "author": "Local AI Hub",
   "private": true,
@@ -53,7 +53,6 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
-      "!electron/helpers/**/*",
       "package.json"
     ],
     "publish": [
@@ -80,13 +79,16 @@
       "installerIcon": "icon.ico",
       "uninstallerIcon": "icon.ico",
       "installerHeaderIcon": "icon.ico",
-      "include": "build/installer.nsh"
+      "include": "build/installer.nsh",
+      "perMachine": false,
+      "selectPerMachineByDefault": false,
+      "allowElevation": false
     },
     "icon": "icon.ico",
     "extraResources": [
       {
         "filter": [
-          "**/*"
+          "**/*.py"
         ],
         "from": "electron/helpers",
         "to": "helpers"

@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs-extra');
+const { version: APP_VERSION } = require('../../package.json');
 
 const { ensureStorage } = require('./configService');
 const { compareVersions, runCommand } = require('./commandService');
@@ -87,7 +88,7 @@ async function fetchJson(url, options = {}) {
     const response = await fetch(url, {
       method: options.method || 'GET',
       headers: {
-        'User-Agent': 'LocalAIHub/0.8.0',
+        'User-Agent': `LocalAIHub/${APP_VERSION}`,
         Accept: 'application/json',
         ...(options.headers || {}),
       },
@@ -112,7 +113,7 @@ async function resolveFinalUrl(url) {
     const response = await fetch(url, {
       method: 'HEAD',
       headers: {
-        'User-Agent': 'LocalAIHub/0.8.0',
+        'User-Agent': `LocalAIHub/${APP_VERSION}`,
       },
       redirect: 'follow',
       signal: controller.signal,
@@ -125,7 +126,7 @@ async function resolveFinalUrl(url) {
     const fallbackResponse = await fetch(url, {
       method: 'GET',
       headers: {
-        'User-Agent': 'LocalAIHub/0.8.0',
+        'User-Agent': `LocalAIHub/${APP_VERSION}`,
       },
       redirect: 'follow',
       signal: controller.signal,

@@ -170,7 +170,7 @@ async function getStatisticsSnapshot(tools = null) {
   const [statistics, trackedTools] = await Promise.all([readStatistics(), getTrackedTools(tools)]);
   const paths = getAppPaths();
   const disks = await detectStorageSnapshot().catch(() => []);
-  const installDrive = findDiskForPath(disks, paths.appInstallDir);
+  const storageDrive = findDiskForPath(disks, paths.managedRoot) || findDiskForPath(disks, paths.appInstallDir);
   const trackedRoots = getUniqueTrackedRoots([paths.configRoot, paths.localRoot, paths.managedRoot, paths.appInstallDir]);
 
   const [toolBreakdown, storageRoots] = await Promise.all([
@@ -212,10 +212,10 @@ async function getStatisticsSnapshot(tools = null) {
     storageRoots,
     toolBreakdown: toolBreakdown.sort((left, right) => right.totalBytes - left.totalBytes || left.toolName.localeCompare(right.toolName)),
     totalDiskUsage: {
-      freeBytes: installDrive?.freeBytes || 0,
-      installDrive: installDrive?.mount || '',
+      freeBytes: storageDrive?.freeBytes || 0,
+      installDrive: storageDrive?.mount || '',
       localAIHubBytes: totalLocalAIHubBytes,
-      totalBytes: installDrive?.sizeBytes || 0,
+      totalBytes: storageDrive?.sizeBytes || 0,
     },
     vramHistory: (statistics.vramHistory || []).slice(-MAX_VRAM_HISTORY_SAMPLES),
   };

@@ -1,4 +1,5 @@
-import { formatTimestamp, formatUsage, progressWidth, statusClass } from '../lib/formatters';
+import { memo } from 'react';
+import { formatTimestamp, progressWidth, statusClass } from '../lib/formatters';
 
 function embeddedActionLabel(tool) {
   if (tool?.interfaceMode === 'embedded-whisper') {
@@ -77,14 +78,42 @@ function ProgressNotice({ progress, showSpinner = false, accent = 'cyan' }) {
   );
 }
 
-export default function LibraryCard({
+function isBusy(busyMap, key) {
+  return Boolean(busyMap?.[key]);
+}
+
+function areLibraryCardPropsEqual(prevProps, nextProps) {
+  const toolId = prevProps.tool?.id;
+  const busyKeys = [
+    `launch:${toolId}`,
+    `stop:${toolId}`,
+    `update:${toolId}`,
+    `repair:${toolId}`,
+    `snapshot:${toolId}`,
+    `restore:${toolId}`,
+    `uninstall:${toolId}`,
+  ];
+
+  return (
+    prevProps.tool === nextProps.tool &&
+    prevProps.launchProgress === nextProps.launchProgress &&
+    prevProps.progress === nextProps.progress &&
+    prevProps.updateProgress === nextProps.updateProgress &&
+    prevProps.updateInfo === nextProps.updateInfo &&
+    prevProps.settingsOpen === nextProps.settingsOpen &&
+    prevProps.runningUsageLabel === nextProps.runningUsageLabel &&
+    busyKeys.every((key) => isBusy(prevProps.busyMap, key) === isBusy(nextProps.busyMap, key))
+  );
+}
+
+function LibraryCard({
   tool,
   launchProgress,
   progress,
   updateProgress,
   updateInfo,
   busyMap,
-  resources,
+  runningUsageLabel,
   settingsOpen,
   onToggleSettings,
   onLaunch,
@@ -97,7 +126,7 @@ export default function LibraryCard({
   onUninstall,
   onUpdate,
 }) {
-  const runningUsage = tool.status === 'running' ? formatUsage(resources?.vramUsedMb, resources?.vramTotalMb) : 'Idle';
+  const runningUsage = tool.status === 'running' ? runningUsageLabel : 'Idle';
   const canRepair = tool.source === 'managed' || tool.installKind === 'installer-exe';
   const canSnapshot = tool.source === 'managed';
   const hasUpdate = Boolean(updateInfo?.updateAvailable);
@@ -259,3 +288,5 @@ export default function LibraryCard({
     </article>
   );
 }
+
+export default memo(LibraryCard, areLibraryCardPropsEqual);

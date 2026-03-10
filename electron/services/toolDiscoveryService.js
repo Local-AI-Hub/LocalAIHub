@@ -4,7 +4,7 @@ const fs = require('fs-extra');
 const { getAppPaths, readConfig, updateConfig } = require('./configService');
 const { resolveManagedToolPaths } = require('./pathSafetyService');
 const { runCommand } = require('./commandService');
-const { createLogger } = require('./logService');
+const { runBackgroundTask } = require('./backgroundTaskService');
 const {
   buildExternalLaunchProfile,
   buildManagedLaunchProfile,
@@ -695,45 +695,35 @@ async function discoverManagedInstallOnDisk(manifest, existingTool, logger) {
 async function performDiscoveryScan() {
   await initializeToolRegistry();
 
-  const logger = createLogger('discovery');
   const config = await readConfig();
+  const manifests = getToolDefinitions();
   const nextTools = {};
   const ignoredToolIds = new Set(config.ignoredToolIds || []);
+  const discoveryResults = await runBackgroundTask('discover-tools', {
+    appPaths: getAppPaths(),
+    ignoredToolIds: [...ignoredToolIds],
+    manifests,
+    tools: config.tools || {},
+  });
 
-  for (const manifest of getToolDefinitions()) {
+  for (const manifest of manifests) {
     const existingTool = config.tools[manifest.id];
-    const shouldTreatAsManaged = toolUsesManagedInstallLocation(manifest, existingTool);
+    const result = discoveryResults?.[manifest.id] || {};
 
-    if (shouldTreatAsManaged) {
-      const refreshedManagedTool = buildManagedToolState(existingTool || {}, manifest, existingTool?.installDir || existingTool?.appDir);
-      if (await managedToolLauncherExists(refreshedManagedTool)) {
-        nextTools[manifest.id] = buildRecoveredManagedToolState(manifest, existingTool, refreshedManagedTool.installDir);
+    if (result.shouldTreatAsManaged) {
+      if (result.managedInstallDir) {
+        const recoveredManagedTool = buildRecoveredManagedToolState(manifest, existingTool, result.managedInstallDir);
+        if (await managedToolLauncherExists(recoveredManagedTool)) {
+          nextTools[manifest.id] = recoveredManagedTool;
+          continue;
+        }
+
+        nextTools[manifest.id] = buildBrokenManagedToolState(existingTool, manifest, result.managedInstallDir);
         continue;
       }
 
-      if (await managedInstallDirectoryExists(manifest, refreshedManagedTool.installDir)) {
-        await logger.warn('Managed tool folder still exists, but its launcher is missing. Keeping it tracked for repair.', {
-          toolId: manifest.id,
-          installDir: refreshedManagedTool.installDir,
-        });
-        nextTools[manifest.id] = buildBrokenManagedToolState(existingTool, manifest, refreshedManagedTool.installDir);
-        continue;
-      }
-
-      await logger.warn('Managed tool is configured but its files were not found in the expected folder. Starting a rescan.', {
-        toolId: manifest.id,
-        installDir: refreshedManagedTool.installDir,
-      });
-
-      const relocatedManagedTool = await discoverManagedRelocation(existingTool, manifest, logger);
-      if (relocatedManagedTool) {
-        nextTools[manifest.id] = relocatedManagedTool;
-        continue;
-      }
-
-      const discoveredExternalTool = await discoverInstallLocation(manifest, existingTool, logger);
-      if (discoveredExternalTool) {
-        nextTools[manifest.id] = buildExternalToolState(manifest, existingTool, discoveredExternalTool);
+      if (result.externalDetected) {
+        nextTools[manifest.id] = buildExternalToolState(manifest, existingTool, result.externalDetected);
         continue;
       }
 
@@ -741,22 +731,23 @@ async function performDiscoveryScan() {
       continue;
     }
 
-    const recoveredManagedTool = await discoverManagedInstallOnDisk(manifest, existingTool, logger);
-    if (recoveredManagedTool) {
-      nextTools[manifest.id] = recoveredManagedTool;
+    if (result.managedInstallDir) {
+      const recoveredManagedTool = buildRecoveredManagedToolState(manifest, existingTool, result.managedInstallDir);
+      if (await managedToolLauncherExists(recoveredManagedTool)) {
+        nextTools[manifest.id] = recoveredManagedTool;
+        continue;
+      }
+
+      nextTools[manifest.id] = buildBrokenManagedToolState(existingTool, manifest, result.managedInstallDir);
       continue;
     }
 
     if (ignoredToolIds.has(manifest.id)) {
-      await logger.info('Skipping an ignored external tool during discovery.', {
-        toolId: manifest.id,
-      });
       continue;
     }
 
-    const discovered = await discoverInstallLocation(manifest, existingTool, logger);
-    if (discovered) {
-      nextTools[manifest.id] = buildExternalToolState(manifest, existingTool, discovered);
+    if (result.externalDetected) {
+      nextTools[manifest.id] = buildExternalToolState(manifest, existingTool, result.externalDetected);
     }
   }
 
@@ -797,3 +788,5 @@ module.exports = {
   invalidateDiscoveryCache,
   syncDiscoveredTools,
 };
+
+

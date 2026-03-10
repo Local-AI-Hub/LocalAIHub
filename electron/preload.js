@@ -15,11 +15,13 @@ contextBridge.exposeInMainWorld('localAIHub', {
   dismissLegacyMigration: (sourceRoot) => invoke('settings:dismiss-legacy-migration', sourceRoot),
   downloadModel: (payload) => invoke('models:download', payload),
   getCleanupPreview: () => invoke('settings:get-cleanup-preview'),
+  getLiveResources: (payload) => invoke('app:get-live-resources', payload),
   getModelDownloadPreflight: (payload) => invoke('models:get-download-preflight', payload),
   getModelSettings: () => invoke('models:get-settings'),
   getRepairPreview: (toolId) => invoke('tools:get-repair-preview', toolId),
   getStatistics: () => invoke('settings:get-statistics'),
   getToolInstallPreflight: (toolId) => invoke('tools:get-install-preflight', toolId),
+  getWindowActivity: () => invoke('app:get-window-activity'),
   getToolRuntimeOutput: (toolId) => invoke('tools:get-runtime-output', toolId),
   installTool: (payload) => invoke('tools:install', payload),
   launchTool: (payload) => invoke('tools:launch', payload),
@@ -67,6 +69,11 @@ contextBridge.exposeInMainWorld('localAIHub', {
     const listener = (_event, payload) => handler(payload);
     ipcRenderer.on('app:open-tool-ui', listener);
     return () => ipcRenderer.removeListener('app:open-tool-ui', listener);
+  },
+  onWindowActivity: (handler) => {
+    const listener = (_event, payload) => handler(payload);
+    ipcRenderer.on('app:window-activity', listener);
+    return () => ipcRenderer.removeListener('app:window-activity', listener);
   },
   onRuntimeOutput: (handler) => {
     const listener = (_event, payload) => handler(payload);

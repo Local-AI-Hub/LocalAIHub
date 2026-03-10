@@ -1,4 +1,10 @@
-export default function ProviderCard({ provider, busyMap, onOpenChat, onOpenSettings }) {
+import { memo } from 'react';
+
+function isBusy(busyMap, key) {
+  return Boolean(busyMap?.[key]);
+}
+
+function ProviderCard({ provider, busyMap, onOpenChat, onOpenSettings }) {
   const statusTone =
     provider.libraryStatus === 'attention'
       ? 'border-amber-300/30 bg-amber-300/10 text-amber-100'
@@ -52,3 +58,13 @@ export default function ProviderCard({ provider, busyMap, onOpenChat, onOpenSett
     </article>
   );
 }
+
+function areProviderCardPropsEqual(prevProps, nextProps) {
+  const providerId = prevProps.provider?.id;
+  return (
+    prevProps.provider === nextProps.provider &&
+    isBusy(prevProps.busyMap, `provider-models:${providerId}`) === isBusy(nextProps.busyMap, `provider-models:${providerId}`)
+  );
+}
+
+export default memo(ProviderCard, areProviderCardPropsEqual);

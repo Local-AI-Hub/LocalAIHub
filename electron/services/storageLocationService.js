@@ -11,6 +11,7 @@ const {
   updateConfig,
 } = require('./configService');
 const { detectStorageSnapshot, findDiskForPath } = require('./hardwareService');
+const { runBackgroundTask } = require('./backgroundTaskService');
 
 const MIGRATABLE_DIRECTORY_LABELS = {
   downloads: 'Installer downloads',
@@ -46,30 +47,9 @@ function assertNonOverlappingRoots(sourceRoot, targetRoot) {
 }
 
 async function calculatePathSize(targetPath) {
-  if (!(await fs.pathExists(targetPath))) {
-    return 0;
-  }
-
-  const stats = await fs.stat(targetPath).catch(() => null);
-  if (!stats) {
-    return 0;
-  }
-
-  if (stats.isFile()) {
-    return stats.size;
-  }
-
-  if (!stats.isDirectory()) {
-    return 0;
-  }
-
-  const entries = await fs.readdir(targetPath, { withFileTypes: true }).catch(() => []);
-  let total = 0;
-  for (const entry of entries) {
-    total += await calculatePathSize(path.join(targetPath, entry.name));
-  }
-
-  return total;
+  return runBackgroundTask('calculate-path-size', {
+    targetPath,
+  });
 }
 
 async function directoryHasChildren(targetPath) {
@@ -319,3 +299,5 @@ module.exports = {
   normalizePathKey,
   setManagedDataRoot,
 };
+
+

@@ -1,7 +1,8 @@
+import { memo } from 'react';
 import { progressWidth } from '../lib/formatters';
 import { compatibilityClass, describeRequirements } from '../lib/tool-ui';
 
-export default function StoreCard({ manifest, compatibility, progress, busy, onInstall }) {
+function StoreCard({ manifest, compatibility, progress, busy, onInstall }) {
   return (
     <article className="store-card">
       <div className="flex items-start justify-between gap-4">
@@ -48,3 +49,16 @@ export default function StoreCard({ manifest, compatibility, progress, busy, onI
     </article>
   );
 }
+
+function areStoreCardPropsEqual(prevProps, nextProps) {
+  return (
+    prevProps.manifest === nextProps.manifest &&
+    prevProps.progress === nextProps.progress &&
+    prevProps.busy === nextProps.busy &&
+    prevProps.compatibility?.label === nextProps.compatibility?.label &&
+    prevProps.compatibility?.message === nextProps.compatibility?.message &&
+    prevProps.compatibility?.tone === nextProps.compatibility?.tone
+  );
+}
+
+export default memo(StoreCard, areStoreCardPropsEqual);

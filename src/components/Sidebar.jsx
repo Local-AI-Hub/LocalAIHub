@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { formatMemory } from '../lib/formatters';
 
 function NavButton({ active, label, count, onClick }) {
@@ -9,7 +10,7 @@ function NavButton({ active, label, count, onClick }) {
   );
 }
 
-export default function Sidebar({
+function Sidebar({
   activeTab,
   hardware,
   installedCount,
@@ -70,3 +71,16 @@ export default function Sidebar({
     </aside>
   );
 }
+
+function areSidebarPropsEqual(prevProps, nextProps) {
+  return (
+    prevProps.activeTab === nextProps.activeTab &&
+    prevProps.hardware === nextProps.hardware &&
+    prevProps.installedCount === nextProps.installedCount &&
+    prevProps.modelManagerCount === nextProps.modelManagerCount &&
+    prevProps.storeCount === nextProps.storeCount &&
+    prevProps.logsBusy === nextProps.logsBusy
+  );
+}
+
+export default memo(Sidebar, areSidebarPropsEqual);
