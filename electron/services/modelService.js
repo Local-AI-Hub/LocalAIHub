@@ -22,6 +22,7 @@ const MODEL_DOWNLOAD_BUFFER_LIMIT = 10 * 1024 * 1024;
 const REMOTE_PAGE_SIZE = 24;
 const OLLAMA_PAGE_SIZE = 40;
 const OLLAMA_LIBRARY_URL = 'https://ollama.com/library';
+const TABBY_MODEL_REGISTRY_URLS = ['https://models.tabbyml.com', 'https://tabby.tabbyml.com/docs/models/'];
 const HUGGING_FACE_SEARCH_URL = 'https://huggingface.co/api/models';
 const HUGGING_FACE_MODEL_URL = 'https://huggingface.co/api/models';
 const CIVITAI_MODELS_URL = 'https://civitai.com/api/v1/models';
@@ -40,6 +41,16 @@ const CIVITAI_SORT_MAP = {
   'most-downloaded': 'Most Downloaded',
   newest: 'Newest',
   'highest-rated': 'Highest Rated',
+};
+const TABBY_SECTION_IDS = {
+  chat: 'chat-models---chat-model',
+  completion: 'completion-models---model',
+  embedding: 'embedding-models',
+};
+const TABBY_SECTION_LABELS = {
+  chat: 'Chat',
+  completion: 'Completion',
+  embedding: 'Embedding',
 };
 const VIDEO_TASK_TYPES = new Set(['video-generation', 'image-to-video']);
 const HIGH_VRAM_VIDEO_REQUIREMENTS = {
@@ -218,6 +229,10 @@ function stripHtml(value) {
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&#x27;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -1401,6 +1416,16 @@ async function browseRemoteModels(tool, options = {}) {
     };
   }
 
+  if (browseOptions.source === 'tabby') {
+    const result = await searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, hardwareContext, logger);
+    return {
+      items: result.items,
+      localModels,
+      pagination: result.pagination,
+      settings: publicSettings,
+    };
+  }
+
   if (browseOptions.source === 'civitai') {
     const result = await searchCivitaiModels(tool, browseOptions, downloadedLookup, settings, hardwareContext, logger);
     return {
@@ -1420,50 +1445,117 @@ async function browseRemoteModels(tool, options = {}) {
   };
 }
 
-function parseOllamaLibraryCards(html, query) {
-  const results = [];
-  const normalizedQuery = String(query || '').trim().toLowerCase();
-  const cardPattern = /<li[^>]*>\s*<a[^>]+href="\/library\/([^"#?]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/li>/gi;
+function parseOllamaCompactNumber(value) {
+  const match = String(value || '').trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*([KMBT])?$/i);
+  if (!match) {
+    return 0;
+  }
+
+  const amount = Number.parseFloat(match[1]);
+  const suffix = String(match[2] || '').toUpperCase();
+  const multiplier = {
+    '': 1,
+    K: 1_000,
+    M: 1_000_000,
+    B: 1_000_000_000,
+    T: 1_000_000_000_000,
+  }[suffix];
+
+  if (!Number.isFinite(amount) || !Number.isFinite(multiplier)) {
+    return 0;
+  }
+
+  return Math.round(amount * multiplier);
+}
+
+function extractOllamaRepoMarkup(html) {
+  const marker = '<div x-test-repos id="repo">';
+  const startIndex = String(html || '').indexOf(marker);
+  if (startIndex < 0) {
+    return String(html || '');
+  }
+
+  const endIndex = html.indexOf('</main>', startIndex);
+  return endIndex > startIndex ? html.slice(startIndex, endIndex) : html.slice(startIndex);
+}
+
+function extractOllamaTextValues(cardHtml, pattern) {
+  const values = [];
   let match = null;
 
-  while ((match = cardPattern.exec(html)) !== null) {
-    const name = match[1];
-    const cardText = stripHtml(match[2]);
-    const lines = cardText.split(/\s{2,}/).map((line) => line.trim()).filter(Boolean);
-    const description = lines.slice(1).join(' ').replace(/\s+/g, ' ').trim();
-    const sizeMatch = cardText.match(/\b([0-9.]+\s*[kmgt]?b(?:\s+[0-9.]+\s*[kmgt]?b)*)\b/i);
-    const sizeLabel = sizeMatch ? sizeMatch[1].trim() : 'Available from Ollama';
+  while ((match = pattern.exec(cardHtml)) !== null) {
+    values.push(stripHtml(match[1]));
+  }
 
-    const combined = `${name} ${description}`.toLowerCase();
-    if (normalizedQuery && !combined.includes(normalizedQuery)) {
+  return values.filter(Boolean);
+}
+
+function parseOllamaLibraryCards(html) {
+  const repoMarkup = extractOllamaRepoMarkup(html);
+  const results = [];
+  const cardPattern = /<li[^>]*x-test-model[^>]*>[\s\S]*?<a href="\/library\/([^"#?]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<\/li>/gi;
+  let match = null;
+
+  while ((match = cardPattern.exec(repoMarkup)) !== null) {
+    const name = stripHtml(match[1]);
+    const cardHtml = match[2];
+    const descriptionMatch = cardHtml.match(/<p[^>]*text-neutral-800[^>]*>([\s\S]*?)<\/p>/i);
+    const sizeLabels = extractOllamaTextValues(cardHtml, /x-test-size[^>]*>([^<]+)</gi);
+    const capabilities = extractOllamaTextValues(cardHtml, /x-test-capability[^>]*>([^<]+)</gi);
+    const pullsMatch = cardHtml.match(/x-test-pull-count>([^<]+)</i);
+    const tagsMatch = cardHtml.match(/x-test-tag-count>([^<]+)</i);
+    const updatedMatch = cardHtml.match(/x-test-updated>([^<]+)</i);
+    const isCloudModel = /bg-cyan-50[^>]*>cloud</i.test(cardHtml);
+    const sizeLabel = sizeLabels.length ? sizeLabels.join(' / ') : isCloudModel ? 'Cloud model' : 'Available from Ollama';
+
+    if (!name) {
       continue;
     }
 
     results.push({
-      id: `ollama:${name}`,
-      description: description || `Ollama model ${name}`,
+      capabilities,
+      description: stripHtml(descriptionMatch?.[1]) || `Ollama model ${name}`,
       downloadUrl: null,
       fileName: name,
+      id: `ollama:${name}`,
       modelType: 'Model',
       name,
       previewUrl: null,
-      sizeBytes: parseHumanSizeToBytes(sizeLabel),
+      pulls: parseOllamaCompactNumber(pullsMatch?.[1] || ''),
+      sizeBytes: 0,
       sizeLabel,
       source: 'ollama',
+      tagCount: Number.parseInt(String(tagsMatch?.[1] || '').replace(/[^0-9]/g, ''), 10) || 0,
       toolId: 'ollama',
+      updatedLabel: stripHtml(updatedMatch?.[1]) || null,
     });
   }
 
   return results;
 }
 
+function normalizeOllamaSort(sort) {
+  return sort === 'newest' ? 'newest' : 'popular';
+}
+
 async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwareContext, logger) {
+  const searchUrl = new URL(OLLAMA_LIBRARY_URL);
+  const normalizedQuery = String(browseOptions.query || '').trim();
+  const normalizedSort = normalizeOllamaSort(browseOptions.sort);
+
+  if (normalizedQuery) {
+    searchUrl.searchParams.set('q', normalizedQuery);
+  }
+  searchUrl.searchParams.set('sort', normalizedSort);
+
   await logger.info('Loading Ollama library page.', {
     page: browseOptions.page,
-    query: browseOptions.query || '',
+    query: normalizedQuery,
+    sort: normalizedSort,
+    url: searchUrl.toString(),
   });
 
-  const response = await fetch(OLLAMA_LIBRARY_URL, {
+  const response = await fetch(searchUrl, {
     headers: {
       'User-Agent': APP_USER_AGENT,
     },
@@ -1474,25 +1566,285 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
   }
 
   const html = await response.text();
-  const allItems = parseOllamaLibraryCards(html, browseOptions.query)
-    .map((entry) =>
-      attachHardwareHints(
+  const allItems = parseOllamaLibraryCards(html).map((entry) =>
+    attachHardwareHints(
+      {
+        ...entry,
+        downloaded: downloadedLookup.has(entry.fileName.toLowerCase()) || downloadedLookup.has(entry.name.toLowerCase()),
+      },
+      tool,
+      hardwareContext,
+    ),
+  );
+
+  const startIndex = (browseOptions.page - 1) * OLLAMA_PAGE_SIZE;
+  const endIndex = startIndex + OLLAMA_PAGE_SIZE;
+  return {
+    items: allItems.slice(startIndex, endIndex),
+    pagination: {
+      hasMore: endIndex < allItems.length,
+      nextCursor: null,
+      nextPage: endIndex < allItems.length ? browseOptions.page + 1 : null,
+    },
+  };
+}
+
+async function fetchTabbyRegistryHtml(logger) {
+  let lastError = null;
+
+  for (const registryUrl of TABBY_MODEL_REGISTRY_URLS) {
+    try {
+      await logger.info('Loading Tabby model registry.', {
+        url: registryUrl,
+      });
+
+      const response = await fetch(registryUrl, {
+        headers: {
+          'User-Agent': APP_USER_AGENT,
+        },
+      });
+
+      if (!response.ok) {
+        lastError = new Error(`Request failed with status ${response.status}.`);
+        continue;
+      }
+
+      const html = await response.text();
+      if (html.includes('<table>')) {
+        return html;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(humanizeError(lastError, 'Local AI Hub could not load the Tabby model registry right now.'));
+}
+
+function extractTabbyRepositoryId(urlValue) {
+  try {
+    const parsedUrl = new URL(urlValue);
+    if (!/huggingface\.co$/i.test(parsedUrl.hostname)) {
+      return null;
+    }
+
+    const parts = parsedUrl.pathname
+      .split('/')
+      .map((part) => part.trim())
+      .filter(Boolean);
+
+    if (parts.length < 2) {
+      return null;
+    }
+
+    return `${parts[0]}/${parts[1]}`;
+  } catch {
+    return null;
+  }
+}
+
+function extractTabbyRegistrySection(html, sectionId) {
+  const sectionPattern = new RegExp(`<h2[^>]*id="${sectionId}"[^>]*>[\\s\\S]*?<table>[\\s\\S]*?<tbody>([\\s\\S]*?)<\\/tbody><\\/table>`, 'i');
+  const match = String(html || '').match(sectionPattern);
+  return match?.[1] || '';
+}
+
+function parseTabbyRegistryEntries(html) {
+  const mergedEntries = new Map();
+
+  for (const [categoryId, sectionId] of Object.entries(TABBY_SECTION_IDS)) {
+    const sectionMarkup = extractTabbyRegistrySection(html, sectionId);
+    if (!sectionMarkup) {
+      continue;
+    }
+
+    const rowPattern = /<tr>([\s\S]*?)<\/tr>/gi;
+    let rowMatch = null;
+    while ((rowMatch = rowPattern.exec(sectionMarkup)) !== null) {
+      const rowHtml = rowMatch[1];
+      const modelMatch = rowHtml.match(/<td>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/td>/i);
+      if (!modelMatch) {
+        continue;
+      }
+
+      const repoUrl = modelMatch[1];
+      const repoId = extractTabbyRepositoryId(repoUrl);
+      if (!repoId) {
+        continue;
+      }
+
+      const name = stripHtml(modelMatch[2]) || repoId;
+      const licenseText = stripHtml((rowHtml.match(/<td>\s*(?:<a[^>]*>)?([\s\S]*?)(?:<\/a>)?\s*<\/td>\s*$/i) || [])[1] || '');
+      const existing = mergedEntries.get(repoId) || {
+        categories: [],
+        license: licenseText || 'License varies by model publisher.',
+        name,
+        repoId,
+        repoUrl,
+      };
+
+      existing.categories = mergeUniqueStrings([...(existing.categories || []), categoryId]);
+      existing.license = existing.license || licenseText || 'License varies by model publisher.';
+      existing.name = existing.name || name;
+      mergedEntries.set(repoId, existing);
+    }
+  }
+
+  return [...mergedEntries.values()];
+}
+
+function getTabbyRegistryCategories(browseOptions, tool) {
+  const selectedType = tool?.id === 'lmstudio' ? 'gguf' : normalizeModelTypeFilter(browseOptions.modelType);
+  const selectedTaskType = normalizeTaskTypeFilter(browseOptions.taskType);
+
+  if (selectedType === 'embedding') {
+    return new Set(['embedding']);
+  }
+
+  if (selectedType === 'audio-speech' || !['all', 'text-generation'].includes(selectedTaskType)) {
+    return new Set();
+  }
+
+  return new Set(['completion', 'chat']);
+}
+
+function matchesTabbyRegistryQuery(entry, query) {
+  const normalizedQuery = String(query || '').trim().toLowerCase();
+  if (!normalizedQuery) {
+    return true;
+  }
+
+  const haystack = [entry.name, entry.repoId, entry.license, ...(entry.categories || []).map((category) => TABBY_SECTION_LABELS[category])]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return haystack.includes(normalizedQuery);
+}
+
+function parseSortableTimestamp(value) {
+  const timestamp = Date.parse(String(value || ''));
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function compareTabbyRegistryDetails(left, right, sort) {
+  if (sort === 'newest') {
+    return (
+      parseSortableTimestamp(right?.lastModified || right?.last_modified || right?.createdAt || right?.created_at) -
+      parseSortableTimestamp(left?.lastModified || left?.last_modified || left?.createdAt || left?.created_at)
+    );
+  }
+
+  if (sort === 'highest-rated') {
+    return (Number(right?.likes || 0) || 0) - (Number(left?.likes || 0) || 0);
+  }
+
+  return (Number(right?.downloads || 0) || 0) - (Number(left?.downloads || 0) || 0);
+}
+
+async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, hardwareContext, logger) {
+  const registryHtml = await fetchTabbyRegistryHtml(logger);
+  const allowedCategories = getTabbyRegistryCategories(browseOptions, tool);
+  if (!allowedCategories.size) {
+    return {
+      items: [],
+      pagination: {
+        hasMore: false,
+        nextCursor: null,
+        nextPage: null,
+      },
+    };
+  }
+
+  const entries = parseTabbyRegistryEntries(registryHtml)
+    .filter((entry) => (entry.categories || []).some((category) => allowedCategories.has(category)))
+    .filter((entry) => matchesTabbyRegistryQuery(entry, browseOptions.query));
+
+  if (!entries.length) {
+    return {
+      items: [],
+      pagination: {
+        hasMore: false,
+        nextCursor: null,
+        nextPage: null,
+      },
+    };
+  }
+
+  const details = await fetchHuggingFaceDetails(
+    entries.map((entry) => ({
+      gated: false,
+      id: entry.repoId,
+      private: false,
+    })),
+    logger,
+  );
+  const detailsById = new Map(details.map((detail) => [detail.id, detail]));
+  const effectiveModelType = tool?.id === 'lmstudio' ? 'gguf' : browseOptions.modelType;
+
+  const resolvedEntries = [];
+  for (const entry of entries) {
+    const detail = detailsById.get(entry.repoId);
+    if (!detail) {
+      continue;
+    }
+
+    const file = await resolveHuggingFaceDownloadFile(detail, effectiveModelType, logger);
+    if (!file) {
+      continue;
+    }
+
+    resolvedEntries.push({
+      detail,
+      entry,
+      file,
+    });
+  }
+
+  resolvedEntries.sort((left, right) => {
+    const detailSort = compareTabbyRegistryDetails(left.detail, right.detail, browseOptions.sort);
+    if (detailSort !== 0) {
+      return detailSort;
+    }
+
+    return String(left.entry.name || left.detail.id || '').localeCompare(String(right.entry.name || right.detail.id || ''));
+  });
+
+  const allItems = await Promise.all(
+    resolvedEntries.map(async ({ detail, entry, file }) => {
+      const fileName = path.basename(file.rfilename);
+      const categoryLabels = mergeUniqueStrings((entry.categories || []).map((category) => TABBY_SECTION_LABELS[category])).join(' / ');
+      return attachHardwareHints(
         {
-          ...entry,
-          downloaded: downloadedLookup.has(entry.fileName.toLowerCase()) || downloadedLookup.has(entry.name.toLowerCase()),
+          id: `tabby:${detail.id}:${fileName}`,
+          author: detail.author || null,
+          description: `Tabby ${categoryLabels || 'registry'} pick | ${buildHuggingFaceDescription(detail)} | ${entry.license}`,
+          downloaded:
+            downloadedLookup.has(fileName.toLowerCase()) ||
+            downloadedLookup.has(detail.id.toLowerCase()) ||
+            downloadedLookup.has(entry.name.toLowerCase()),
+          downloadUrl: buildHuggingFaceResolveUrl(detail.id, file.rfilename),
+          fileName,
+          modelType: file.modelType,
+          name: entry.name || detail.id,
+          previewUrl: await resolveHuggingFacePreview(detail, logger),
+          sizeBytes: Number(file.sizeBytes || 0),
+          source: 'tabby',
+          toolId: tool.id,
         },
         tool,
         hardwareContext,
-      ),
-    );
+      );
+    }),
+  );
 
-  const startIndex = (browseOptions.page - 1) * OLLAMA_PAGE_SIZE;
+  const startIndex = (browseOptions.page - 1) * browseOptions.limit;
+  const endIndex = startIndex + browseOptions.limit;
   return {
-    items: allItems.slice(startIndex, startIndex + OLLAMA_PAGE_SIZE),
+    items: allItems.slice(startIndex, endIndex),
     pagination: {
-      hasMore: startIndex + OLLAMA_PAGE_SIZE < allItems.length,
+      hasMore: endIndex < allItems.length,
       nextCursor: null,
-      nextPage: startIndex + OLLAMA_PAGE_SIZE < allItems.length ? browseOptions.page + 1 : null,
+      nextPage: endIndex < allItems.length ? browseOptions.page + 1 : null,
     },
   };
 }
@@ -1860,6 +2212,10 @@ module.exports = {
   saveModelManagerSettings,
   supportsModelManager,
 };
+
+
+
+
 
 
 

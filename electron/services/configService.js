@@ -8,6 +8,7 @@ const CONFIG_VERSION = 3;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
 const LEGACY_APP_DATA_DIR_NAMES = ['NestAI'];
 const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'runtimes', 'logs'];
+const UNINSTALL_METADATA_FILE = 'uninstall-cleanup.ini';
 
 let configOperationQueue = Promise.resolve();
 let storageReadyPromise = null;
@@ -132,6 +133,65 @@ function buildManagedPathMappings(sourceRoot, targetRoot) {
     from: path.join(normalizedSourceRoot, directoryName),
     to: path.join(normalizedTargetRoot, directoryName),
   }));
+}
+
+function isPathInside(parentPath, candidatePath) {
+  const normalizedParent = normalizeOptionalDirectoryPath(parentPath);
+  const normalizedCandidate = normalizeOptionalDirectoryPath(candidatePath);
+  if (!normalizedParent || !normalizedCandidate) {
+    return false;
+  }
+
+  const parentKey = normalizedParent.toLowerCase();
+  const candidateKey = normalizedCandidate.toLowerCase();
+  return candidateKey === parentKey || candidateKey.startsWith(`${parentKey}${path.sep}`);
+}
+
+function escapeIniValue(value) {
+  return String(value || '').replace(/[\r\n]+/g, ' ').trim();
+}
+
+function buildUninstallCleanupTargets(paths) {
+  const includeIfExternal = (targetPath) => {
+    const normalizedTarget = normalizeOptionalDirectoryPath(targetPath);
+    if (!normalizedTarget || isPathInside(paths.appInstallDir, normalizedTarget)) {
+      return '';
+    }
+
+    return normalizedTarget;
+  };
+
+  const hasExternalManagedRoot = Boolean(paths.managedRoot) && !isPathInside(paths.appInstallDir, paths.managedRoot);
+  return {
+    configRoot: includeIfExternal(paths.configRoot),
+    localRoot: includeIfExternal(paths.localRoot),
+    downloadsRoot: hasExternalManagedRoot ? includeIfExternal(paths.downloadsRoot) : '',
+    logsRoot: hasExternalManagedRoot ? includeIfExternal(paths.logsRoot) : '',
+    modelsRoot: hasExternalManagedRoot ? includeIfExternal(paths.modelsRoot) : '',
+    runtimesRoot: hasExternalManagedRoot ? includeIfExternal(paths.runtimesRoot) : '',
+    snapshotsRoot: hasExternalManagedRoot ? includeIfExternal(paths.snapshotsRoot) : '',
+    toolsRoot: hasExternalManagedRoot ? includeIfExternal(paths.toolsRoot) : '',
+  };
+}
+
+async function writeUninstallCleanupMetadata(paths) {
+  const targets = buildUninstallCleanupTargets(paths);
+  const metadataPath = path.join(paths.configRoot, UNINSTALL_METADATA_FILE);
+  const lines = [
+    '[cleanup]',
+    `ConfigRoot=${escapeIniValue(targets.configRoot)}`,
+    `LocalRoot=${escapeIniValue(targets.localRoot)}`,
+    `ToolsRoot=${escapeIniValue(targets.toolsRoot)}`,
+    `ModelsRoot=${escapeIniValue(targets.modelsRoot)}`,
+    `DownloadsRoot=${escapeIniValue(targets.downloadsRoot)}`,
+    `SnapshotsRoot=${escapeIniValue(targets.snapshotsRoot)}`,
+    `RuntimesRoot=${escapeIniValue(targets.runtimesRoot)}`,
+    `LogsRoot=${escapeIniValue(targets.logsRoot)}`,
+  ];
+
+  await fs.ensureDir(paths.configRoot);
+  await fs.writeFile(metadataPath, `${lines.join('\n')}\n`, 'utf8');
+  return metadataPath;
 }
 
 function buildLegacyConfigRoots(appDataRoot, localAppDataRoot) {
@@ -368,6 +428,7 @@ async function writeConfigFile(paths, config, options = {}) {
   await fs.move(tempFile, paths.configFile, { overwrite: true });
   cachedConfigSnapshot = normalized;
   storageReadyPromise = null;
+  await writeUninstallCleanupMetadata(getAppPaths(normalized));
   return normalized;
 }
 
@@ -498,6 +559,7 @@ async function prepareStorage() {
     fs.ensureDir(paths.logsRoot),
   ]);
 
+  await writeUninstallCleanupMetadata(paths);
   return paths;
 }
 
@@ -626,3 +688,4 @@ module.exports = {
   upsertTool,
   writeConfig,
 };
+

@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
 
 const MODEL_MANAGER_TOOL_IDS = ['ollama', 'comfyui', 'automatic1111', 'forge', 'lmstudio'];
@@ -17,7 +17,10 @@ const SOURCE_OPTIONS = {
     { id: 'huggingface', label: 'Hugging Face' },
     { id: 'civitai', label: 'CivitAI' },
   ],
-  lmstudio: [{ id: 'huggingface', label: 'Hugging Face' }],
+  lmstudio: [
+    { id: 'huggingface', label: 'Hugging Face' },
+    { id: 'tabby', label: 'Tabby Model Registry' },
+  ],
 };
 
 const MODEL_TYPE_OPTIONS = [
@@ -148,7 +151,7 @@ function badgeClass(tone) {
 function PreviewFallback({ source }) {
   return (
     <div className="flex h-full w-full items-center justify-center bg-slate-950/50 text-sm font-semibold uppercase tracking-[0.22em] text-slate-500">
-      {source === 'ollama' ? 'OLL' : source === 'civitai' ? 'CV' : 'HF'}
+      {source === 'ollama' ? 'OLL' : source === 'civitai' ? 'CV' : source === 'tabby' ? 'TB' : 'HF'}
     </div>
   );
 }
@@ -272,7 +275,7 @@ export default function ModelManager({ tools, onToast }) {
 
   const selectedTool = modelTools.find((tool) => tool.id === selectedToolId) || null;
   const sourceOptions = SOURCE_OPTIONS[selectedTool?.id || 'ollama'] || [{ id: 'ollama', label: 'Ollama Library' }];
-  const taskOptionsVisible = selectedSource === 'huggingface' && selectedToolId !== 'ollama';
+  const taskOptionsVisible = ['huggingface', 'tabby'].includes(selectedSource) && selectedToolId !== 'ollama';
   const filterOptionsVisible = selectedToolId !== 'ollama';
 
   function applyToolDefaults(toolId) {
@@ -707,6 +710,8 @@ export default function ModelManager({ tools, onToast }) {
     </section>
   );
 }
+
+
 
 
 
