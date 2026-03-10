@@ -1,4 +1,4 @@
-import { memo } from 'react';
+﻿import { memo } from 'react';
 import { formatDiskAvailability, formatUsage } from '../lib/formatters';
 
 function MetricCard({ label, value, detail, accent }) {
@@ -19,9 +19,11 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
         ? 'Store'
         : activeTab === 'models'
           ? 'Model Manager'
-          : activeTab === 'statistics'
-            ? 'Statistics'
-            : 'Settings';
+          : activeTab === 'pipelines'
+            ? 'Pipeline Builder'
+            : activeTab === 'statistics'
+              ? 'Statistics'
+              : 'Settings';
   const heading =
     activeTab === 'library'
       ? 'Your local AI shelf'
@@ -29,9 +31,11 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
         ? 'Browse installable local AI tools'
         : activeTab === 'models'
           ? 'Manage the models behind your tools'
-          : activeTab === 'statistics'
-            ? 'See what Local AI Hub is using on this PC'
-            : 'Control storage, cleanup, and connections';
+          : activeTab === 'pipelines'
+            ? 'Chain tools and providers into guided workflows'
+            : activeTab === 'statistics'
+              ? 'See what Local AI Hub is using on this PC'
+              : 'Control storage, cleanup, and connections';
   const summary =
     activeTab === 'library'
       ? 'Launch, stop, snapshot, repair, and update the tools already on this machine.'
@@ -39,9 +43,11 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
         ? 'Pick a tool, check whether this hardware is a good fit, and let Local AI Hub handle the setup locally.'
         : activeTab === 'models'
           ? 'Search remote catalogs, download models into the right folders, and remove what you no longer need.'
-          : activeTab === 'statistics'
-            ? 'Review launch counts, disk growth, live VRAM history, and how much space Local AI Hub is using locally.'
-            : 'Choose a storage drive, manage cloud API keys, migrate older installs off C:, and safely remove leftover files.';
+          : activeTab === 'pipelines'
+            ? 'Design node-based workflows, review machine suitability, and execute supported steps one at a time.'
+            : activeTab === 'statistics'
+              ? 'Review launch counts, disk growth, live VRAM history, and how much space Local AI Hub is using locally.'
+              : 'Choose a storage drive, manage cloud API keys, migrate older installs off C:, and safely remove leftover files.';
   const diskDetail = resources?.diskMount
     ? `Storage drive ${resources.diskMount}`
     : storage?.managedRoot

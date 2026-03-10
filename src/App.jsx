@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AiderPanel from './components/AiderPanel';
 import CloudChatPanel from './components/CloudChatPanel';
 import ConnectionsPanel from './components/ConnectionsPanel';
@@ -6,6 +6,7 @@ import HardwareGate from './components/HardwareGate';
 import LibraryCard from './components/LibraryCard';
 import ModelManager from './components/ModelManager';
 import OllamaChatPanel from './components/OllamaChatPanel';
+import PipelineBuilderPanel from './components/PipelineBuilderPanel';
 import ProviderCard from './components/ProviderCard';
 import ResourceStrip from './components/ResourceStrip';
 import SettingsPanel from './components/SettingsPanel';
@@ -1637,6 +1638,14 @@ export default function App() {
             </section>
           ) : activeTab === 'models' ? (
             <ModelManager onToast={pushToast} tools={tools} />
+          ) : activeTab === 'pipelines' ? (
+            <PipelineBuilderPanel
+              hardware={appState.hardware}
+              manifests={appState.manifests}
+              onToast={pushToast}
+              providers={providers}
+              tools={tools}
+            />
           ) : activeTab === 'statistics' ? (
             <StatisticsPanel
               busy={statisticsManualBusy}
@@ -1681,4 +1690,6 @@ export default function App() {
     </div>
   );
 }
+
+
 

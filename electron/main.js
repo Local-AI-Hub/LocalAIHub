@@ -1,4 +1,4 @@
-const path = require('path');
+﻿const path = require('path');
 const fs = require('fs');
 const {
   app,
@@ -72,6 +72,8 @@ const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./servic
 const { transcribeWithWhisper } = require('./services/whisperService');
 const { configureAutoUpdates, restartToInstallUpdate } = require('./services/updateService');
 const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
+const { cancelPipelineRun, getActiveRunSnapshot, runPipeline, setPipelineEventSink } = require('./services/pipelineExecutionService');
+const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./services/pipelineStoreService');
 
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
@@ -1150,6 +1152,61 @@ function registerIpcHandlers() {
       };
     }, 'Local AI Hub could not restore that snapshot.'),
   );
+  ipcMain.handle('pipelines:list', () =>
+    withPlainEnglishErrors(async () => ({
+      pipelines: await listPipelines(),
+    }), 'Local AI Hub could not load the saved pipelines.'),
+  );
+
+  ipcMain.handle('pipelines:get', (_event, pipelineId) =>
+    withPlainEnglishErrors(async () => ({
+      pipeline: await getPipeline(pipelineId),
+    }), 'Local AI Hub could not load that pipeline.'),
+  );
+
+  ipcMain.handle('pipelines:save', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const pipeline = await savePipeline(payload || {});
+      return {
+        message: `${pipeline.name} was saved.`,
+        pipeline,
+        pipelines: await listPipelines(),
+      };
+    }, 'Local AI Hub could not save that pipeline.'),
+  );
+
+  ipcMain.handle('pipelines:delete', (_event, pipelineId) =>
+    withPlainEnglishErrors(async () => {
+      const removedPipeline = await deletePipeline(pipelineId);
+      return {
+        message: `${removedPipeline.name} was deleted.`,
+        pipelines: await listPipelines(),
+      };
+    }, 'Local AI Hub could not delete that pipeline.'),
+  );
+
+  ipcMain.handle('pipelines:get-active-run', () =>
+    withPlainEnglishErrors(async () => ({
+      run: getActiveRunSnapshot(),
+    }), 'Local AI Hub could not read the current pipeline run.'),
+  );
+
+  ipcMain.handle('pipelines:run', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const run = await runPipeline(payload || {});
+      return {
+        message: run?.status === 'completed' ? `${run.pipelineName} finished successfully.` : run?.message,
+        run,
+      };
+    }, 'Local AI Hub could not run that pipeline.'),
+  );
+
+  ipcMain.handle('pipelines:cancel-run', (_event, runId) =>
+    withPlainEnglishErrors(async () => ({
+      message: 'Local AI Hub will stop the active pipeline after the current step finishes.',
+      run: cancelPipelineRun(runId),
+    }), 'Local AI Hub could not cancel that pipeline run.'),
+  );
 }
 
 async function startApplication() {
@@ -1177,6 +1234,9 @@ async function startApplication() {
     }
 
     mainWindow?.webContents.send('tools:runtime-output', payload);
+  });
+  setPipelineEventSink((payload) => {
+    mainWindow?.webContents.send('pipelines:run-update', payload);
   });
   tray = new Tray(createTrayIcon());
   tray.on('click', showWindow);
@@ -1253,5 +1313,8 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
+
+
+
 
 

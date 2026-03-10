@@ -1,4 +1,4 @@
-import { memo } from 'react';
+﻿import { memo } from 'react';
 import { formatMemory } from '../lib/formatters';
 
 function NavButton({ active, label, count, onClick }) {
@@ -15,10 +15,10 @@ function Sidebar({
   hardware,
   installedCount,
   modelManagerCount,
-  storeCount,
   onChangeTab,
   onOpenLogs,
   logsBusy,
+  storeCount,
 }) {
   return (
     <aside className="sidebar-shell">
@@ -34,7 +34,7 @@ function Sidebar({
             </div>
           </div>
           <p className="mt-4 text-sm leading-6 text-slate-300">
-            Keep installs, launches, repair, snapshots, models, and cloud connections in one Windows-native control center.
+            Keep installs, launches, repair, snapshots, pipelines, models, and cloud connections in one Windows-native control center.
           </p>
         </div>
 
@@ -42,6 +42,7 @@ function Sidebar({
           <NavButton active={activeTab === 'library'} count={installedCount} label="Library" onClick={() => onChangeTab('library')} />
           <NavButton active={activeTab === 'store'} count={storeCount} label="Store" onClick={() => onChangeTab('store')} />
           <NavButton active={activeTab === 'models'} count={modelManagerCount} label="Model Manager" onClick={() => onChangeTab('models')} />
+          <NavButton active={activeTab === 'pipelines'} count={null} label="Pipelines" onClick={() => onChangeTab('pipelines')} />
           <NavButton active={activeTab === 'statistics'} count={null} label="Statistics" onClick={() => onChangeTab('statistics')} />
           <NavButton active={activeTab === 'settings'} count={null} label="Settings" onClick={() => onChangeTab('settings')} />
         </div>
