@@ -1,7 +1,10 @@
 ﻿import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 
 const {
+  IMAGE_WORKFLOW_TOOL_IDS,
   NODE_TYPE_LIST,
+  PIPELINE_PORT_KIND_LABELS,
+  SUPPORTED_PORT_KINDS,
   WHISPER_MODELS,
   analyzePipeline,
   buildContextMaps,
@@ -44,8 +47,8 @@ export function getNodePaletteGroups() {
   }
 
   return Object.entries(groups).map(([label, entries]) => ({
-    label,
     entries,
+    label,
   }));
 }
 
@@ -56,7 +59,7 @@ export function createPositionedNode(type, existingNodes = []) {
   return createNode(type, {
     position: {
       x: 120 + column * 320,
-      y: 120 + row * 220,
+      y: 120 + row * 240,
     },
   });
 }
@@ -67,9 +70,9 @@ export function getNodePortCenter(node, direction, portIndex) {
   const baseY = node.position.y + PIPELINE_PORT_SECTION_OFFSET;
   const safeIndex = Number.isFinite(portIndex) ? portIndex : 0;
   return {
+    rowCount,
     x: direction === 'input' ? node.position.x : node.position.x + PIPELINE_NODE_WIDTH,
     y: baseY + safeIndex * PIPELINE_PORT_ROW_HEIGHT + PIPELINE_PORT_ROW_HEIGHT / 2,
-    rowCount,
   };
 }
 
@@ -108,6 +111,10 @@ export function runStatusClassName(status) {
     return 'border-cyan-400/30 bg-cyan-400/12 text-cyan-100';
   }
 
+  if (status === 'paused') {
+    return 'border-violet-400/30 bg-violet-400/12 text-violet-100';
+  }
+
   if (status === 'failed') {
     return 'border-rose-400/30 bg-rose-400/12 text-rose-100';
   }
@@ -123,5 +130,4 @@ export function summarizePreview(value, limit = 160) {
   return trimPreviewText(value, limit);
 }
 
-export { WHISPER_MODELS };
-
+export { IMAGE_WORKFLOW_TOOL_IDS, PIPELINE_PORT_KIND_LABELS, SUPPORTED_PORT_KINDS, WHISPER_MODELS };

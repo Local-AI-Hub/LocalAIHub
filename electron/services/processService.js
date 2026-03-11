@@ -61,6 +61,7 @@ function emitToolState(toolId, patch = {}) {
     toolId,
     status: patch.status || 'stopped',
     lastError: Object.prototype.hasOwnProperty.call(patch, 'lastError') ? patch.lastError : null,
+    ...(Object.prototype.hasOwnProperty.call(patch, 'lastRepairMessage') ? { lastRepairMessage: patch.lastRepairMessage } : {}),
   });
 }
 
@@ -450,6 +451,32 @@ async function isToolActive(toolState) {
   return runningProcessNames.length > 0;
 }
 
+async function isToolReady(toolState) {
+  if (!toolState) {
+    return false;
+  }
+
+  const runtime = runtimes.get(toolState.id);
+  if (runtime?.process && runtime.process.exitCode === null && !runtime.stopping) {
+    if (!toolUsesLocalUrl(toolState)) {
+      return true;
+    }
+
+    return probeUrl(toolState.healthUrl || toolState.launchUrl);
+  }
+
+  if (toolState.launchProfile?.kind === 'embedded') {
+    return toolState.status === 'running';
+  }
+
+  if (toolUsesLocalUrl(toolState)) {
+    return probeUrl(toolState.healthUrl || toolState.launchUrl);
+  }
+
+  const runningProcessNames = await getRunningProcessNames(toolState.processNames);
+  return runningProcessNames.length > 0;
+}
+
 async function openToolInterface(toolState) {
   if (!toolState?.launchUrl || getToolInterfaceMode(toolState) !== 'external-browser') {
     return;
@@ -807,10 +834,12 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
       id: toolState.id,
       status: 'stopped',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'stopped',
       lastError: null,
+      lastRepairMessage: null,
     });
     return;
   }
@@ -826,10 +855,12 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
       id: toolState.id,
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
     return;
   }
@@ -847,10 +878,12 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
       id: toolState.id,
       status: 'stopped',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'stopped',
       lastError: null,
+      lastRepairMessage: null,
     });
     return;
   }
@@ -906,10 +939,12 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
     id: toolState.id,
     status: 'error',
     lastError: message,
+    lastRepairMessage: null,
   });
   emitToolState(toolState.id, {
     status: 'error',
     lastError: message,
+    lastRepairMessage: null,
   });
   emitUnexpectedStop(toolState, message);
 }
@@ -1069,7 +1104,7 @@ async function launchBatchProfile(toolState, launchProfile, runtimeOptions = {})
 }
 
 async function resolveToolStatus(toolState) {
-  if (await isToolActive(toolState)) {
+  if (await isToolReady(toolState)) {
     return 'running';
   }
 
@@ -1092,10 +1127,12 @@ async function launchToolInternal(toolState, options = {}) {
       id: toolState.id,
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
     if (!options.skipOpenInterface) {
       openToolInterface(toolState).catch(() => null);
@@ -1119,10 +1156,12 @@ async function launchToolInternal(toolState, options = {}) {
       id: toolState.id,
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
     if (!options.skipOpenInterface) {
       openToolInterface(toolState).catch(() => null);
@@ -1144,10 +1183,12 @@ async function launchToolInternal(toolState, options = {}) {
       id: toolState.id,
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
 
     return {
@@ -1181,10 +1222,12 @@ async function launchToolInternal(toolState, options = {}) {
       id: toolState.id,
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'running',
       lastError: null,
+      lastRepairMessage: null,
     });
 
     if (!options.skipOpenInterface) {
@@ -1202,10 +1245,12 @@ async function launchToolInternal(toolState, options = {}) {
       id: toolState.id,
       status: 'error',
       lastError: message,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'error',
       lastError: message,
+      lastRepairMessage: null,
     });
     throw new Error(message);
   }
@@ -1243,10 +1288,12 @@ async function stopTool(toolState) {
       id: toolState.id,
       status: 'stopped',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'stopped',
       lastError: null,
+      lastRepairMessage: null,
     });
     return;
   }
@@ -1257,10 +1304,12 @@ async function stopTool(toolState) {
       id: toolState.id,
       status: 'stopped',
       lastError: null,
+      lastRepairMessage: null,
     });
     emitToolState(toolState.id, {
       status: 'stopped',
       lastError: null,
+      lastRepairMessage: null,
     });
     return;
   }
@@ -1275,10 +1324,12 @@ async function stopTool(toolState) {
     id: toolState.id,
     status: 'stopped',
     lastError: null,
+    lastRepairMessage: null,
   });
   emitToolState(toolState.id, {
     status: 'stopped',
     lastError: null,
+    lastRepairMessage: null,
   });
 }
 
@@ -1308,6 +1359,8 @@ module.exports = {
   setRuntimeEventSink,
   stopTool,
 };
+
+
 
 
 

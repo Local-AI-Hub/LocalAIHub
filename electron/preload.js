@@ -36,17 +36,21 @@ contextBridge.exposeInMainWorld('localAIHub', {
   listProviders: () => invoke('providers:list'),
   listSnapshots: (toolId) => invoke('snapshots:list', toolId),
   openLogsFolder: () => invoke('app:open-logs-folder'),
+  openPath: (payload) => invoke('app:open-path', payload),
   openToolFolder: (toolId) => invoke('tools:open-folder', toolId),
   pickAiderProjectFolder: () => invoke('aider:pick-project-folder'),
+  pickPipelineFile: (payload) => invoke('pipelines:pick-file', payload),
   pickStorageFolder: () => invoke('settings:pick-storage-folder'),
   pickWhisperAudioFile: () => invoke('whisper:pick-audio-file'),
   refresh: () => invoke('app:refresh'),
   repairTool: (payload) => invoke('tools:repair', payload),
   restartToUpdate: () => invoke('app:restart-to-update'),
   restoreSnapshot: (payload) => invoke('snapshots:restore', payload),
+  resumePipelineValidation: (payload) => invoke('pipelines:resume-validation', payload),
   runCleanup: () => invoke('settings:run-cleanup'),
   runPipeline: (payload) => invoke('pipelines:run', payload),
   saveCloseBehavior: (closeBehavior) => invoke('settings:save-close-behavior', closeBehavior),
+  saveLiveResourcePolling: (enabled) => invoke('settings:save-live-resource-polling', enabled),
   saveModelSettings: (payload) => invoke('models:save-settings', payload),
   savePipeline: (payload) => invoke('pipelines:save', payload),
   saveProviderKey: (payload) => invoke('providers:save-key', payload),
@@ -113,9 +117,17 @@ contextBridge.exposeInMainWorld('localAIHub', {
     ipcRenderer.on('app:update-ready', listener);
     return () => ipcRenderer.removeListener('app:update-ready', listener);
   },
+  onAppStateUpdated: (handler) => {
+    const listener = (_event, payload) => handler(payload);
+    ipcRenderer.on('app:state-updated', listener);
+    return () => ipcRenderer.removeListener('app:state-updated', listener);
+  },
   onWindowActivity: (handler) => {
     const listener = (_event, payload) => handler(payload);
     ipcRenderer.on('app:window-activity', listener);
     return () => ipcRenderer.removeListener('app:window-activity', listener);
   },
 });
+
+
+

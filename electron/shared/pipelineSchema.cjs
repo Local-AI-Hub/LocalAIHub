@@ -1,8 +1,29 @@
-﻿const PIPELINE_SCHEMA_VERSION = 1;
+﻿const PIPELINE_SCHEMA_VERSION = 2;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
 const PORT_KIND_TEXT = 'text';
-const PORT_KIND_AUDIO_FILE = 'audio-file';
+const PORT_KIND_IMAGE = 'image';
+const PORT_KIND_AUDIO = 'audio';
+const PORT_KIND_VIDEO = 'video';
+const PORT_KIND_FILE = 'file';
+const PORT_KIND_ANY = 'any';
+const PORT_KIND_PASSTHROUGH = 'passthrough';
+const PORT_KIND_AUDIO_FILE = PORT_KIND_AUDIO;
+const SUPPORTED_PORT_KINDS = Object.freeze([
+  PORT_KIND_TEXT,
+  PORT_KIND_IMAGE,
+  PORT_KIND_AUDIO,
+  PORT_KIND_VIDEO,
+  PORT_KIND_FILE,
+]);
+const PIPELINE_PORT_KIND_LABELS = Object.freeze({
+  [PORT_KIND_TEXT]: 'Text',
+  [PORT_KIND_IMAGE]: 'Image',
+  [PORT_KIND_AUDIO]: 'Audio',
+  [PORT_KIND_VIDEO]: 'Video',
+  [PORT_KIND_FILE]: 'File',
+});
+const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(['automatic1111', 'forge']);
 
 const WHISPER_MODELS = [
   { id: 'tiny', label: 'Tiny' },
@@ -30,6 +51,23 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       text: '',
     },
   }),
+  imageInput: Object.freeze({
+    type: 'imageInput',
+    label: 'Image File',
+    category: 'Inputs',
+    description: 'Supplies an image file to later nodes.',
+    inputPorts: [],
+    outputPorts: [
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        label: 'Image',
+      },
+    ],
+    configDefaults: {
+      filePath: '',
+    },
+  }),
   audioInput: Object.freeze({
     type: 'audioInput',
     label: 'Audio File',
@@ -39,8 +77,42 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     outputPorts: [
       {
         id: 'audio',
-        kind: PORT_KIND_AUDIO_FILE,
+        kind: PORT_KIND_AUDIO,
         label: 'Audio',
+      },
+    ],
+    configDefaults: {
+      filePath: '',
+    },
+  }),
+  videoInput: Object.freeze({
+    type: 'videoInput',
+    label: 'Video File',
+    category: 'Inputs',
+    description: 'Supplies a video file to later nodes.',
+    inputPorts: [],
+    outputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
+      },
+    ],
+    configDefaults: {
+      filePath: '',
+    },
+  }),
+  fileInput: Object.freeze({
+    type: 'fileInput',
+    label: 'File Input',
+    category: 'Inputs',
+    description: 'Passes a general file or artifact reference into the workflow.',
+    inputPorts: [],
+    outputPorts: [
+      {
+        id: 'file',
+        kind: PORT_KIND_FILE,
+        label: 'File',
       },
     ],
     configDefaults: {
@@ -94,7 +166,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     inputPorts: [
       {
         id: 'audio',
-        kind: PORT_KIND_AUDIO_FILE,
+        kind: PORT_KIND_AUDIO,
         label: 'Audio',
         required: true,
       },
@@ -111,11 +183,127 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     },
     requiredToolId: 'whisper',
   }),
+  imageAnalyze: Object.freeze({
+    type: 'imageAnalyze',
+    label: 'Image Analysis',
+    category: 'AI Steps',
+    description: 'Uses Automatic1111 or Forge to describe an incoming image.',
+    inputPorts: [
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        label: 'Image',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'text',
+        kind: PORT_KIND_TEXT,
+        label: 'Description',
+      },
+    ],
+    configDefaults: {
+      toolId: '',
+      analysisMode: 'clip',
+      instruction: '',
+    },
+    supportedToolIds: IMAGE_WORKFLOW_TOOL_IDS,
+  }),
+  imageGenerate: Object.freeze({
+    type: 'imageGenerate',
+    label: 'Image Generate',
+    category: 'AI Steps',
+    description: 'Uses Automatic1111 or Forge to turn text into an image file.',
+    inputPorts: [
+      {
+        id: 'prompt',
+        kind: PORT_KIND_TEXT,
+        label: 'Prompt',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        label: 'Image',
+      },
+    ],
+    configDefaults: {
+      toolId: '',
+      negativePrompt: '',
+      width: 832,
+      height: 832,
+      steps: 24,
+      cfgScale: 7,
+      seed: -1,
+    },
+    supportedToolIds: IMAGE_WORKFLOW_TOOL_IDS,
+  }),
+  validation: Object.freeze({
+    type: 'validation',
+    label: 'Validation',
+    category: 'Validation',
+    description: 'Evaluates incoming content and routes it to pass or fail.',
+    inputPorts: [
+      {
+        id: 'input',
+        kind: PORT_KIND_ANY,
+        allowedKinds: SUPPORTED_PORT_KINDS,
+        label: 'Input',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'pass',
+        kind: PORT_KIND_PASSTHROUGH,
+        label: 'Pass',
+        passthroughFrom: 'input',
+      },
+      {
+        id: 'fail',
+        kind: PORT_KIND_PASSTHROUGH,
+        label: 'Fail',
+        passthroughFrom: 'input',
+      },
+    ],
+    configDefaults: {
+      mode: 'user',
+      llmExecutionMode: 'cloud',
+      providerId: '',
+      model: '',
+      ruleset: '',
+      systemPrompt: '',
+    },
+    supportedExecutionModes: [
+      {
+        id: 'user',
+        label: 'User approval',
+      },
+      {
+        id: 'llm',
+        label: 'LLM validator',
+      },
+    ],
+    supportedLlmExecutionModes: [
+      {
+        id: 'cloud',
+        label: 'Cloud provider',
+      },
+      {
+        id: 'ollama',
+        label: 'Ollama (local)',
+        requiredToolId: 'ollama',
+      },
+    ],
+  }),
   textOutput: Object.freeze({
     type: 'textOutput',
     label: 'Text Output',
     category: 'Outputs',
-    description: 'Collects the final text result from the workflow.',
+    description: 'Shows the final text result inline and saves a copy to the run folder.',
     inputPorts: [
       {
         id: 'text',
@@ -127,7 +315,83 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     outputPorts: [],
     terminal: true,
     configDefaults: {
-      title: 'Result',
+      title: 'Text result',
+    },
+  }),
+  imageOutput: Object.freeze({
+    type: 'imageOutput',
+    label: 'Image Output',
+    category: 'Outputs',
+    description: 'Shows the final image and saves a copy to the run folder.',
+    inputPorts: [
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        label: 'Image',
+        required: true,
+      },
+    ],
+    outputPorts: [],
+    terminal: true,
+    configDefaults: {
+      title: 'Image result',
+    },
+  }),
+  audioOutput: Object.freeze({
+    type: 'audioOutput',
+    label: 'Audio Output',
+    category: 'Outputs',
+    description: 'Keeps the final audio artifact and shows where it was saved.',
+    inputPorts: [
+      {
+        id: 'audio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Audio',
+        required: true,
+      },
+    ],
+    outputPorts: [],
+    terminal: true,
+    configDefaults: {
+      title: 'Audio result',
+    },
+  }),
+  videoOutput: Object.freeze({
+    type: 'videoOutput',
+    label: 'Video Output',
+    category: 'Outputs',
+    description: 'Keeps the final video artifact and shows where it was saved.',
+    inputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
+        required: true,
+      },
+    ],
+    outputPorts: [],
+    terminal: true,
+    configDefaults: {
+      title: 'Video result',
+    },
+  }),
+  fileOutput: Object.freeze({
+    type: 'fileOutput',
+    label: 'File Output',
+    category: 'Outputs',
+    description: 'Keeps the final file reference and shows where it was saved.',
+    inputPorts: [
+      {
+        id: 'file',
+        kind: PORT_KIND_FILE,
+        label: 'File',
+        required: true,
+      },
+    ],
+    outputPorts: [],
+    terminal: true,
+    configDefaults: {
+      title: 'File result',
     },
   }),
 });
@@ -163,6 +427,44 @@ function normalizeTimestamp(value) {
 function normalizeNumber(value, fallback) {
   const nextValue = Number(value);
   return Number.isFinite(nextValue) ? nextValue : fallback;
+}
+
+function normalizePortKind(kind) {
+  const normalized = String(kind || '').trim().toLowerCase();
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized === 'audio-file') {
+    return PORT_KIND_AUDIO;
+  }
+
+  return normalized;
+}
+
+function getSupportedPortKinds() {
+  return [...SUPPORTED_PORT_KINDS];
+}
+
+function getPortAllowedKinds(port) {
+  if (!port || typeof port !== 'object') {
+    return [];
+  }
+
+  if (Array.isArray(port.allowedKinds) && port.allowedKinds.length) {
+    return [...new Set(port.allowedKinds.map((entry) => normalizePortKind(entry)).filter(Boolean))];
+  }
+
+  const kind = normalizePortKind(port.kind);
+  if (kind === PORT_KIND_ANY) {
+    return getSupportedPortKinds();
+  }
+
+  if (kind === PORT_KIND_PASSTHROUGH) {
+    return [];
+  }
+
+  return kind ? [kind] : [];
 }
 
 function getNodeTypeDefinition(type) {
@@ -208,7 +510,7 @@ function normalizeNode(node, index = 0) {
       label: toNonEmptyString(node?.label, 'Unknown node'),
       position: {
         x: normalizeNumber(node?.position?.x, DEFAULT_POSITION_X + (index % 3) * 280),
-        y: normalizeNumber(node?.position?.y, DEFAULT_POSITION_Y + Math.floor(index / 3) * 200),
+        y: normalizeNumber(node?.position?.y, DEFAULT_POSITION_Y + Math.floor(index / 3) * 220),
       },
       config: cloneValue(node?.config && typeof node.config === 'object' ? node.config : {}),
     };
@@ -278,9 +580,61 @@ function getPortDefinition(nodeType, direction, portId) {
   const portList = direction === 'input' ? definition?.inputPorts : definition?.outputPorts;
   return (portList || []).find((port) => port.id === portId) || null;
 }
+function resolveOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) {
+  if (!sourcePort) {
+    return [];
+  }
 
-function arePortsCompatible(sourceKind, targetKind) {
-  return Boolean(sourceKind) && Boolean(targetKind) && String(sourceKind) === String(targetKind);
+  const normalizedKind = normalizePortKind(sourcePort.kind);
+  if (normalizedKind && normalizedKind !== PORT_KIND_PASSTHROUGH && normalizedKind !== PORT_KIND_ANY) {
+    return [normalizedKind];
+  }
+
+  if (normalizedKind === PORT_KIND_ANY) {
+    return getSupportedPortKinds();
+  }
+
+  if (!sourceNode || !graph) {
+    return [];
+  }
+
+  const visitKey = `${sourceNode.id}:${sourcePort.id}`;
+  if (visited.has(visitKey)) {
+    return [];
+  }
+
+  visited.add(visitKey);
+  const passthroughPortId = sourcePort.passthroughFrom || 'input';
+  const incomingEdge = graph.incomingEdgeByPortKey.get(`${sourceNode.id}:${passthroughPortId}`);
+  if (!incomingEdge) {
+    return [];
+  }
+
+  const upstreamNode = graph.nodeMap.get(incomingEdge.source.nodeId);
+  const upstreamPort = getPortDefinition(upstreamNode?.type, 'output', incomingEdge.source.portId);
+  return resolveOutputKinds(upstreamNode, upstreamPort, graph, visited);
+}
+
+function doesKindIntersect(leftKinds = [], rightKinds = []) {
+  return leftKinds.some((kind) => rightKinds.includes(kind));
+}
+
+function arePortsCompatible(source, target, options = {}) {
+  const targetKinds = typeof target === 'string' ? getPortAllowedKinds({ kind: target }) : getPortAllowedKinds(target);
+  const sourceKinds =
+    typeof source === 'string'
+      ? getPortAllowedKinds({ kind: source })
+      : resolveOutputKinds(options.sourceNode || null, source, options.graph);
+
+  if (!targetKinds.length) {
+    return false;
+  }
+
+  if (!sourceKinds.length) {
+    return normalizePortKind(source?.kind) === PORT_KIND_PASSTHROUGH;
+  }
+
+  return doesKindIntersect(sourceKinds, targetKinds);
 }
 
 function compareIssueSeverity(leftTone = 'neutral', rightTone = 'neutral') {
@@ -383,9 +737,6 @@ function buildPipelineGraph(definition = {}) {
   const warnings = [];
   const nodeMap = new Map();
   const nodeOrder = pipeline.nodes.map((node) => node.id);
-  const outgoingEdgesByNode = new Map();
-  const incomingEdgesByNode = new Map();
-  const incomingEdgeByPortKey = new Map();
 
   if (!pipeline.nodes.length) {
     errors.push('Add at least one node before running this pipeline.');
@@ -402,10 +753,10 @@ function buildPipelineGraph(definition = {}) {
     }
 
     nodeMap.set(node.id, node);
-    outgoingEdgesByNode.set(node.id, []);
-    incomingEdgesByNode.set(node.id, []);
   }
 
+  const structuralEdges = [];
+  const targetPortKeys = new Set();
   for (const edge of pipeline.edges) {
     const sourceNode = nodeMap.get(edge.source.nodeId);
     const targetNode = nodeMap.get(edge.target.nodeId);
@@ -426,20 +777,49 @@ function buildPipelineGraph(definition = {}) {
       continue;
     }
 
-    if (!arePortsCompatible(sourcePort.kind, targetPort.kind)) {
-      errors.push(`"${sourceNode.label}" cannot connect ${sourcePort.label} to ${targetNode.label}'s ${targetPort.label} input.`);
-      continue;
-    }
-
     const targetKey = `${targetNode.id}:${targetPort.id}`;
-    if (incomingEdgeByPortKey.has(targetKey)) {
+    if (targetPortKeys.has(targetKey)) {
       errors.push(`"${targetNode.label}" already has a connection for ${targetPort.label}.`);
       continue;
     }
 
-    incomingEdgeByPortKey.set(targetKey, edge);
-    outgoingEdgesByNode.get(sourceNode.id).push(edge);
-    incomingEdgesByNode.get(targetNode.id).push(edge);
+    targetPortKeys.add(targetKey);
+    structuralEdges.push({
+      edge,
+      sourceNode,
+      sourcePort,
+      targetNode,
+      targetPort,
+    });
+  }
+
+  const outgoingEdgesByNode = new Map([...nodeMap.keys()].map((nodeId) => [nodeId, []]));
+  const incomingEdgesByNode = new Map([...nodeMap.keys()].map((nodeId) => [nodeId, []]));
+  const incomingEdgeByPortKey = new Map();
+  const compatibilityIncomingEdgeByPortKey = new Map(
+    structuralEdges.map((entry) => [`${entry.targetNode.id}:${entry.targetPort.id}`, entry.edge]),
+  );
+  const validEdges = [];
+  const graphForCompatibility = {
+    pipeline,
+    nodeMap,
+    incomingEdgeByPortKey: compatibilityIncomingEdgeByPortKey,
+  };
+
+  for (const entry of structuralEdges) {
+    if (!arePortsCompatible(entry.sourcePort, entry.targetPort, {
+      sourceNode: entry.sourceNode,
+      targetNode: entry.targetNode,
+      graph: graphForCompatibility,
+    })) {
+      errors.push(`"${entry.sourceNode.label}" cannot connect ${entry.sourcePort.label} to ${entry.targetNode.label}'s ${entry.targetPort.label} input.`);
+      continue;
+    }
+
+    validEdges.push(entry.edge);
+    incomingEdgeByPortKey.set(`${entry.targetNode.id}:${entry.targetPort.id}`, entry.edge);
+    outgoingEdgesByNode.get(entry.sourceNode.id).push(entry.edge);
+    incomingEdgesByNode.get(entry.targetNode.id).push(entry.edge);
   }
 
   const terminalNodeIds = pipeline.nodes.filter((node) => getNodeTypeDefinition(node.type)?.terminal).map((node) => node.id);
@@ -505,26 +885,7 @@ function buildPipelineGraph(definition = {}) {
     errors.push('Local AI Hub found a cycle in the connected part of this pipeline. Remove the loop before running it.');
   }
 
-  for (const nodeId of executionOrder) {
-    const node = nodeMap.get(nodeId);
-    const definition = getNodeTypeDefinition(node?.type);
-    if (!node || !definition) {
-      continue;
-    }
-
-    for (const port of definition.inputPorts || []) {
-      if (!port.required) {
-        continue;
-      }
-
-      const targetKey = `${node.id}:${port.id}`;
-      if (!incomingEdgeByPortKey.has(targetKey)) {
-        errors.push(`"${node.label}" is missing a connection for ${port.label}.`);
-      }
-    }
-  }
-
-  return {
+  const graph = {
     pipeline,
     errors,
     warnings,
@@ -535,10 +896,59 @@ function buildPipelineGraph(definition = {}) {
     reachableNodeIds,
     terminalNodeIds,
     executionOrder,
+    edges: validEdges,
   };
+
+  for (const nodeId of executionOrder) {
+    const node = nodeMap.get(nodeId);
+    const definitionEntry = getNodeTypeDefinition(node?.type);
+    if (!node || !definitionEntry) {
+      continue;
+    }
+
+    for (const port of definitionEntry.inputPorts || []) {
+      if (!port.required) {
+        continue;
+      }
+
+      const targetKey = `${node.id}:${port.id}`;
+      if (!incomingEdgeByPortKey.has(targetKey)) {
+        errors.push(`"${node.label}" is missing a connection for ${port.label}.`);
+      }
+    }
+
+    if (node.type === 'validation') {
+      const passCount = (outgoingEdgesByNode.get(node.id) || []).filter((edge) => edge.source.portId === 'pass').length;
+      const failCount = (outgoingEdgesByNode.get(node.id) || []).filter((edge) => edge.source.portId === 'fail').length;
+      if (passCount === 0 || failCount === 0) {
+        errors.push(`"${node.label}" must connect both the pass and fail outputs before it can run.`);
+      }
+    }
+  }
+
+  return graph;
 }
 
-function getLocalToolRequirement(node) {
+function pickAvailableToolId(candidateToolIds = [], contextMaps = {}) {
+  for (const toolId of candidateToolIds) {
+    if (contextMaps.toolsById?.[toolId] || contextMaps.toolCatalogById?.[toolId]) {
+      return toolId;
+    }
+  }
+
+  return candidateToolIds[0] || null;
+}
+
+function getImageToolIdForNode(node, contextMaps = {}) {
+  const selectedToolId = String(node?.config?.toolId || '').trim();
+  if (selectedToolId) {
+    return selectedToolId;
+  }
+
+  return pickAvailableToolId(IMAGE_WORKFLOW_TOOL_IDS, contextMaps);
+}
+
+function getLocalToolRequirement(node, contextMaps = {}) {
   if (node.type === 'whisperTranscribe') {
     return 'whisper';
   }
@@ -547,11 +957,19 @@ function getLocalToolRequirement(node) {
     return 'ollama';
   }
 
+  if (node.type === 'validation' && node.config?.mode === 'llm' && node.config?.llmExecutionMode === 'ollama') {
+    return 'ollama';
+  }
+
+  if (node.type === 'imageAnalyze' || node.type === 'imageGenerate') {
+    return getImageToolIdForNode(node, contextMaps);
+  }
+
   return null;
 }
 
 function getCompatibilityEntry(node, contextMaps) {
-  const requiredToolId = getLocalToolRequirement(node);
+  const requiredToolId = getLocalToolRequirement(node, contextMaps);
   if (!requiredToolId) {
     return null;
   }
@@ -562,7 +980,7 @@ function getCompatibilityEntry(node, contextMaps) {
     requiredToolId,
     installedTool,
     catalogTool,
-    profile: catalogTool?.compatibility || installedTool?.compatibility || null,
+    profile: catalogTool?.compatibility || catalogTool?.installInstructions?.compatibility || installedTool?.compatibility || null,
   };
 }
 
@@ -580,6 +998,85 @@ function buildNodeIssue(node, tone, message, options = {}) {
     kind: options.kind || 'readiness',
   };
 }
+function getSelectedProviderStatus(providerId, contextMaps) {
+  const provider = contextMaps.providersById[String(providerId || '').trim()] || null;
+  if (!provider) {
+    return {
+      provider: null,
+      tone: 'error',
+      message: 'Choose a connected cloud provider for this step.',
+    };
+  }
+
+  if (!provider.isConnected) {
+    return {
+      provider,
+      tone: 'error',
+      message: 'That cloud provider is not connected on this PC yet.',
+    };
+  }
+
+  return {
+    provider,
+    tone: 'info',
+    message: `${provider.name} will process this step outside your machine.`,
+  };
+}
+
+function analyzeInputFileNode(node, summary) {
+  if (!String(node.config?.filePath || '').trim()) {
+    summary.readiness = {
+      tone: 'error',
+      message: `Choose a file for ${node.label} before running this pipeline.`,
+    };
+    return false;
+  }
+
+  return true;
+}
+
+function analyzeImageToolNode(node, summary, contextMaps) {
+  const selectedToolId = String(node.config?.toolId || '').trim();
+  const effectiveToolId = getImageToolIdForNode(node, contextMaps);
+  if (selectedToolId && !IMAGE_WORKFLOW_TOOL_IDS.includes(selectedToolId)) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Choose Automatic1111 or Forge for this image step.',
+    };
+    return false;
+  }
+
+  if (!effectiveToolId) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Install Automatic1111 or Forge before using this image step.',
+    };
+    return false;
+  }
+
+  const tool = contextMaps.toolsById[effectiveToolId] || null;
+  if (!tool) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Install Automatic1111 or Forge before using this image step.',
+    };
+    return false;
+  }
+
+  if (String(tool.status || '').toLowerCase() !== 'running') {
+    summary.readiness = {
+      tone: 'warn',
+      message: `${tool.name} is not ready yet. Start it from Library and wait for it to finish starting before running this image step.`,
+    };
+    return true;
+  }
+
+  summary.readiness = {
+    tone: 'info',
+    message: `${tool.name} will handle this image step locally.`,
+  };
+  return true;
+}
 
 function analyzePipeline(definition = {}, context = {}) {
   const graph = buildPipelineGraph(definition);
@@ -587,6 +1084,7 @@ function analyzePipeline(definition = {}, context = {}) {
   const issues = [];
   const nodeSummaries = {};
   const compatibilityEntries = [];
+  const localHeavyNodeIds = [];
 
   for (const message of graph.errors) {
     issues.push({ tone: 'error', message });
@@ -628,12 +1126,10 @@ function analyzePipeline(definition = {}, context = {}) {
         issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
       }
 
-      if (node.type === 'audioInput' && !String(node.config?.filePath || '').trim()) {
-        summary.readiness = {
-          tone: 'error',
-          message: 'Choose an audio file before running this pipeline.',
-        };
-        issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+      if (node.type === 'imageInput' || node.type === 'audioInput' || node.type === 'videoInput' || node.type === 'fileInput') {
+        if (!analyzeInputFileNode(node, summary)) {
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        }
       }
 
       if (node.type === 'llmPrompt') {
@@ -645,27 +1141,13 @@ function analyzePipeline(definition = {}, context = {}) {
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (executionMode === 'cloud') {
-          const providerId = String(node.config?.providerId || '').trim();
-          if (!providerId) {
-            summary.readiness = {
-              tone: 'error',
-              message: 'Choose a connected cloud provider for this LLM step.',
-            };
+          const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
+          summary.readiness = {
+            tone: providerStatus.tone,
+            message: providerStatus.message,
+          };
+          if (providerStatus.tone === 'error') {
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-          } else {
-            const provider = contextMaps.providersById[providerId];
-            if (!provider?.isConnected) {
-              summary.readiness = {
-                tone: 'error',
-                message: 'That cloud provider is not connected on this PC yet.',
-              };
-              issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-            } else {
-              summary.readiness = {
-                tone: 'info',
-                message: `${provider.name} will process this step outside your machine.`,
-              };
-            }
           }
         } else {
           const ollamaTool = contextMaps.toolsById.ollama || null;
@@ -678,7 +1160,7 @@ function analyzePipeline(definition = {}, context = {}) {
           } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
             summary.readiness = {
               tone: 'warn',
-              message: 'Ollama is not marked as running. Start it from Library before running this pipeline.',
+              message: 'Ollama is not ready yet. Start it from Library and wait for it to finish starting before running this pipeline.',
             };
             issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
           }
@@ -692,6 +1174,96 @@ function analyzePipeline(definition = {}, context = {}) {
             message: 'Install Whisper before using this transcription step in a pipeline.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        }
+      }
+
+      if (node.type === 'imageAnalyze') {
+        if (!String(node.config?.analysisMode || '').trim()) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose an analysis mode for this image step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          const ready = analyzeImageToolNode(node, summary, contextMaps);
+          if (!ready || summary.readiness.tone === 'error') {
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (summary.readiness.tone === 'warn') {
+            issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+          }
+        }
+      }
+
+      if (node.type === 'imageGenerate') {
+        if (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Use at least 256 by 256 for generated images.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          const ready = analyzeImageToolNode(node, summary, contextMaps);
+          if (!ready || summary.readiness.tone === 'error') {
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (summary.readiness.tone === 'warn') {
+            issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+          }
+        }
+      }
+
+      if (node.type === 'validation') {
+        const outgoingEdges = graph.outgoingEdgesByNode.get(node.id) || [];
+        const passCount = outgoingEdges.filter((edge) => edge.source.portId === 'pass').length;
+        const failCount = outgoingEdges.filter((edge) => edge.source.portId === 'fail').length;
+        if (passCount === 0 || failCount === 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect both the pass and fail outputs before running this validation step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (node.config?.mode === 'llm') {
+          if (!String(node.config?.ruleset || '').trim()) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Describe the pass and fail rules for this validation step.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (!String(node.config?.model || '').trim()) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Choose or enter a model for this validator.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (node.config?.llmExecutionMode === 'ollama') {
+            const ollamaTool = contextMaps.toolsById.ollama || null;
+            if (!ollamaTool) {
+              summary.readiness = {
+                tone: 'error',
+                message: 'Install Ollama before using a local validator.',
+              };
+              issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+            } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
+              summary.readiness = {
+                tone: 'warn',
+                message: 'Ollama is not ready yet. Start it from Library and wait for it to finish starting before running this validator.',
+              };
+              issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+            }
+          } else {
+            const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
+            summary.readiness = {
+              tone: providerStatus.tone,
+              message: providerStatus.message,
+            };
+            if (providerStatus.tone === 'error') {
+              issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+            }
+          }
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This run will pause here and wait for your pass or fail decision.',
+          };
         }
       }
     }
@@ -708,9 +1280,17 @@ function analyzePipeline(definition = {}, context = {}) {
         nodeId: node.id,
         nodeLabel: node.label,
       });
+      localHeavyNodeIds.push(node.id);
     }
 
     nodeSummaries[node.id] = summary;
+  }
+
+  if (localHeavyNodeIds.length > 1) {
+    issues.push({
+      tone: compatibilityEntries.some((entry) => entry.tone === 'warn' || entry.tone === 'danger') ? 'warn' : 'info',
+      message: `This workflow includes ${localHeavyNodeIds.length} local tool steps. Local AI Hub will still run them one at a time.`,
+    });
   }
 
   const highestCompatibility = compatibilityEntries.reduce((current, entry) => {
@@ -725,8 +1305,8 @@ function analyzePipeline(definition = {}, context = {}) {
   if (!compatibilityEntries.length) {
     compatibilitySummary = {
       tone: 'good',
-      label: 'Lightweight',
-      message: 'This pipeline does not include a local GPU-heavy step in Phase 1.',
+      label: 'Flexible typed flow',
+      message: 'This workflow currently depends on text, file, or cloud steps more than a heavy local GPU run.',
     };
   } else if (highestCompatibility) {
     compatibilitySummary = {
@@ -761,8 +1341,17 @@ module.exports = {
   PIPELINE_SCHEMA_VERSION,
   PIPELINE_NODE_TYPES,
   NODE_TYPE_LIST,
+  IMAGE_WORKFLOW_TOOL_IDS,
+  PIPELINE_PORT_KIND_LABELS,
+  PORT_KIND_ANY,
+  PORT_KIND_AUDIO,
   PORT_KIND_AUDIO_FILE,
+  PORT_KIND_FILE,
+  PORT_KIND_IMAGE,
+  PORT_KIND_PASSTHROUGH,
   PORT_KIND_TEXT,
+  PORT_KIND_VIDEO,
+  SUPPORTED_PORT_KINDS,
   WHISPER_MODELS,
   analyzePipeline,
   arePortsCompatible,
@@ -776,9 +1365,15 @@ module.exports = {
   createUniqueId,
   evaluateCompatibilityProfile,
   getDefaultNodeConfig,
+  getImageToolIdForNode,
+  getLocalToolRequirement,
   getNodeTypeDefinition,
+  getPortAllowedKinds,
   getPortDefinition,
+  getSupportedPortKinds,
   normalizePipelineDefinition,
+  normalizePortKind,
+  resolveOutputKinds,
   trimPreviewText,
 };
 

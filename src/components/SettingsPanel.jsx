@@ -36,7 +36,9 @@ export default function SettingsPanel({
   busyMap,
   cleanupPreview,
   closeBehaviorDraft,
+  liveResourcePollingDraft,
   onChangeCloseBehavior,
+  onChangeLiveResourcePolling,
   onChangeStorageDraft,
   onChooseStorageFolder,
   onDismissLegacyMigration,
@@ -44,6 +46,7 @@ export default function SettingsPanel({
   onPreviewCleanup,
   onRunCleanup,
   onSaveCloseBehavior,
+  onSaveLiveResourcePolling,
   onSaveStorageLocation,
   storage,
   storageDraft,
@@ -161,6 +164,40 @@ export default function SettingsPanel({
             <p className="text-lg font-semibold text-white">Exit app on close</p>
             <p className="mt-2 text-sm leading-7 text-slate-300">Clicking the X shuts down Local AI Hub, stops owned helpers, and exits cleanly.</p>
           </button>
+        </div>
+
+        <div className="mt-6 rounded-3xl border border-white/10 bg-slate-950/35 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Live usage polling</p>
+              <h4 className="mt-3 text-2xl font-semibold text-white">Choose whether Local AI Hub keeps sampling RAM and VRAM</h4>
+              <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
+                Continuous live polling can wake up heavier GPU telemetry on some PCs. Keep it off for the quietest behavior, or turn it on if you want live readings in the dashboard.
+              </p>
+            </div>
+            <button className="primary-button" disabled={busyMap['settings:save-live-resource-polling']} onClick={onSaveLiveResourcePolling} type="button">
+              {busyMap['settings:save-live-resource-polling'] ? 'Saving...' : 'Save live polling'}
+            </button>
+          </div>
+
+          <div className="mt-6 grid gap-4 md:grid-cols-2">
+            <button
+              className={`rounded-3xl border p-5 text-left transition ${!liveResourcePollingDraft ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`}
+              onClick={() => onChangeLiveResourcePolling(false)}
+              type="button"
+            >
+              <p className="text-lg font-semibold text-white">Keep live polling off</p>
+              <p className="mt-2 text-sm leading-7 text-slate-300">The dashboard keeps the latest snapshot instead of refreshing GPU and RAM usage in the background.</p>
+            </button>
+            <button
+              className={`rounded-3xl border p-5 text-left transition ${liveResourcePollingDraft ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`}
+              onClick={() => onChangeLiveResourcePolling(true)}
+              type="button"
+            >
+              <p className="text-lg font-semibold text-white">Enable live polling</p>
+              <p className="mt-2 text-sm leading-7 text-slate-300">Local AI Hub refreshes live RAM and VRAM more gently while the app stays open.</p>
+            </button>
+          </div>
         </div>
       </div>
       {legacyMigration?.available && !legacyMigration.dismissed ? (

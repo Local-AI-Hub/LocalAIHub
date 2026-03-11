@@ -49,7 +49,6 @@ const {
   getRuntimeOutputSnapshot,
   isToolActive,
   launchToolFromUserAction,
-  resolveToolStatus,
   sendInputToTool,
   setRuntimeEventSink,
   stopTool,
@@ -71,19 +70,21 @@ const {
 const { getStatisticsSnapshot, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
 const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./services/toolUpdateService');
 const { transcribeWithWhisper } = require('./services/whisperService');
+const { buildMergedToolStateList } = require('./services/toolStateService');
 const { configureAutoUpdates, isUpdateReady, restartToInstallUpdate } = require('./services/updateService');
 const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
-const { cancelPipelineRun, getActiveRunSnapshot, runPipeline, setPipelineEventSink } = require('./services/pipelineExecutionService');
+const { cancelPipelineRun, getActiveRunSnapshot, resumePipelineValidation, runPipeline, setPipelineEventSink } = require('./services/pipelineExecutionService');
 const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./services/pipelineStoreService');
 
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
 const TOOL_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const LIVE_RESOURCE_CACHE_TTL_MS = 5000;
 
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
-let closeBehaviorPreference = 'tray';
+let closeBehaviorPreference = 'exit';
 let pendingUpdateInstall = false;
 let shutdownComplete = false;
 let shutdownPromise = null;
@@ -92,6 +93,11 @@ let toolUpdateInterval = null;
 let healthCheckBusy = false;
 let toolUpdateCheckPromise = null;
 let lastWindowActivity = { focused: true, visible: true };
+let liveResourceCache = {
+  key: '',
+  timestamp: 0,
+  value: null,
+};
 let fatalAppErrorHandled = false;
 
 function toError(value) {
@@ -151,7 +157,7 @@ function reportFatalAppError(error, context = {}) {
 }
 
 function normalizeCloseBehavior(value) {
-  return String(value || '').trim().toLowerCase() === 'exit' ? 'exit' : 'tray';
+  return String(value || '').trim().toLowerCase() === 'tray' ? 'tray' : 'exit';
 }
 
 function setCloseBehaviorPreference(value) {
@@ -304,32 +310,6 @@ async function launchToolFromExplicitUserAction(tool, options = {}) {
   };
 }
 
-async function buildMergedToolStateList(options = {}) {
-  const config = options.config || (await readConfig());
-  return Promise.all(
-    Object.values(config.tools || {})
-      .sort((left, right) => left.name.localeCompare(right.name))
-      .map(async (tool) => {
-        const manifest = getToolManifest(tool.id) || {};
-        const mergedTool = {
-          ...manifest,
-          ...tool,
-        };
-
-        return {
-          ...mergedTool,
-          status: options.resolveStatuses ? await resolveToolStatus(mergedTool) : mergedTool.status || 'stopped',
-          snapshots: options.includeSnapshots && mergedTool.source === 'managed' ? await listSnapshots(mergedTool.id) : [],
-          updateSupported:
-            mergedTool.source === 'managed' ||
-            manifest.installInstructions?.kind === 'installer-exe' ||
-            manifest.installInstructions?.kind === 'single-file' ||
-            manifest.installInstructions?.runtime === 'binary',
-        };
-      }),
-  );
-}
-
 async function hasConfiguredRunningTools() {
   const config = await readConfig();
   return Object.values(config.tools || {}).some((tool) => tool.status === 'running');
@@ -385,6 +365,47 @@ async function updateHealthMonitor(options = {}) {
   }, TOOL_HEALTH_CHECK_INTERVAL_MS);
 }
 
+function buildLiveResourceCacheKey(targetPath, options = {}) {
+  return JSON.stringify({
+    includeDisk: options.includeDisk !== false,
+    targetPath: String(targetPath || ''),
+  });
+}
+
+async function getCachedLiveResources(targetPath, options = {}) {
+  const cacheKey = buildLiveResourceCacheKey(targetPath, options);
+  if (
+    liveResourceCache.value &&
+    liveResourceCache.key === cacheKey &&
+    Date.now() - liveResourceCache.timestamp < LIVE_RESOURCE_CACHE_TTL_MS
+  ) {
+    return liveResourceCache.value;
+  }
+
+  const resources = await getLiveResourceUsage(targetPath, options);
+  liveResourceCache = {
+    key: cacheKey,
+    timestamp: Date.now(),
+    value: resources,
+  };
+  return resources;
+}
+
+async function getDownloadedModelCountSnapshot() {
+  const config = await readConfig();
+  const tools = Object.values(config.tools || {}).filter((tool) => supportsModelManager(tool));
+  const counts = await Promise.all(tools.map((tool) => countDownloadedModels(tool).catch(() => 0)));
+  return counts.reduce((total, count) => total + count, 0);
+}
+
+function sendAppStateUpdate(payload) {
+  if (!payload) {
+    return;
+  }
+
+  mainWindow?.webContents.send('app:state-updated', payload);
+}
+
 async function buildAppState(options = {}) {
   await initializeToolRegistry({ refreshRemote: Boolean(options.refreshManifest) });
   await initializeProviderRegistry();
@@ -406,6 +427,7 @@ async function buildAppState(options = {}) {
     config: latestConfig,
     includeSnapshots: true,
     resolveStatuses: true,
+    syncDiscovered: false,
   });
   const downloadedModelCount = (
     await Promise.all(
@@ -428,9 +450,10 @@ async function buildAppState(options = {}) {
     manifestStatus: getManifestStatus(),
     providerManifestStatus: getProviderManifestStatus(),
     providers: await listProviderConnections(),
-    resources: await getLiveResourceUsage(paths.managedRoot),
+    resources: await getCachedLiveResources(paths.managedRoot, { includeDisk: true }),
     settings: {
       closeBehavior: normalizeCloseBehavior(latestConfig.closeBehavior),
+      liveResourcePolling: Boolean(latestConfig.liveResourcePolling),
     },
     storage,
     toolUpdates: await getToolUpdateSnapshot(tools),
@@ -547,9 +570,7 @@ function createWindow() {
     broadcastWindowActivity(true);
   });
 
-  mainWindow.on('minimize', (event) => {
-    event.preventDefault();
-    mainWindow.hide();
+  mainWindow.on('minimize', () => {
     broadcastWindowActivity(true);
   });
 
@@ -779,6 +800,35 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not open the logs folder.'),
   );
 
+  ipcMain.handle('app:open-path', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const targetPath = path.resolve(String(payload?.path || '').trim());
+      if (!String(payload?.path || '').trim()) {
+        throw new Error('Choose a file or folder first.');
+      }
+
+      if (!fs.existsSync(targetPath)) {
+        throw new Error('Local AI Hub could not find that file or folder anymore.');
+      }
+
+      if (payload?.reveal) {
+        shell.showItemInFolder(targetPath);
+        return {
+          message: 'Local AI Hub opened that location in File Explorer.',
+        };
+      }
+
+      const result = await shell.openPath(targetPath);
+      if (result) {
+        throw new Error(result);
+      }
+
+      return {
+        message: 'Local AI Hub opened that file or folder.',
+      };
+    }, 'Local AI Hub could not open that file or folder.'),
+  );
+
   ipcMain.handle('app:restart-to-update', () =>
     withPlainEnglishErrors(async () => {
       if (!isUpdateReady()) {
@@ -1001,6 +1051,22 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not save that close-button setting.'),
   );
 
+  ipcMain.handle('settings:save-live-resource-polling', (_event, enabled) =>
+    withPlainEnglishErrors(async () => {
+      const liveResourcePolling = Boolean(enabled);
+      await updateConfig((config) => ({
+        ...config,
+        liveResourcePolling,
+      }));
+      return {
+        message: liveResourcePolling
+          ? 'Live RAM and VRAM polling is now on. Local AI Hub will refresh those readings more gently in the background.'
+          : 'Live RAM and VRAM polling is now off. Local AI Hub will keep a quieter snapshot instead of refreshing continuously.',
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not save the live usage polling setting.'),
+  );
+
   ipcMain.handle('settings:get-cleanup-preview', () =>
     withPlainEnglishErrors(() => inspectCleanupTargets(), 'Local AI Hub could not scan the approved cleanup folders right now.'),
   );
@@ -1163,9 +1229,13 @@ function registerIpcHandlers() {
           ...progress,
         }),
       });
+      const localModels = await listDownloadedModels(tool);
+      sendAppStateUpdate({
+        downloadedModelCount: await getDownloadedModelCountSnapshot(),
+      });
       return {
         message: result.message,
-        localModels: await listDownloadedModels(tool),
+        localModels,
       };
     }, 'Local AI Hub could not download that model.'),
   );
@@ -1175,9 +1245,13 @@ function registerIpcHandlers() {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
       const result = await deleteModel(tool, payload);
+      const localModels = await listDownloadedModels(tool);
+      sendAppStateUpdate({
+        downloadedModelCount: await getDownloadedModelCountSnapshot(),
+      });
       return {
         message: result.message,
-        localModels: await listDownloadedModels(tool),
+        localModels,
       };
     }, 'Local AI Hub could not delete that model.'),
   );
@@ -1198,6 +1272,50 @@ function registerIpcHandlers() {
         filePath: result.filePaths?.[0] || '',
       };
     }, 'Local AI Hub could not open the audio picker.'),
+  );
+
+  ipcMain.handle('pipelines:pick-file', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const kind = String(payload?.kind || 'file').trim().toLowerCase();
+      const pickerMap = {
+        audio: {
+          title: 'Choose an audio file',
+          filters: [
+            { name: 'Audio files', extensions: ['mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac', 'wma'] },
+            { name: 'All files', extensions: ['*'] },
+          ],
+        },
+        file: {
+          title: 'Choose a file',
+          filters: [{ name: 'All files', extensions: ['*'] }],
+        },
+        image: {
+          title: 'Choose an image file',
+          filters: [
+            { name: 'Image files', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] },
+            { name: 'All files', extensions: ['*'] },
+          ],
+        },
+        video: {
+          title: 'Choose a video file',
+          filters: [
+            { name: 'Video files', extensions: ['mp4', 'mkv', 'mov', 'webm'] },
+            { name: 'All files', extensions: ['*'] },
+          ],
+        },
+      };
+      const picker = pickerMap[kind] || pickerMap.file;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: picker.title,
+        properties: ['openFile'],
+        filters: picker.filters,
+      });
+
+      return {
+        canceled: Boolean(result.canceled),
+        filePath: result.filePaths?.[0] || '',
+      };
+    }, 'Local AI Hub could not open that file picker.'),
   );
 
   ipcMain.handle('whisper:transcribe', (_event, payload) =>
@@ -1301,7 +1419,7 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const run = await runPipeline(payload || {});
       return {
-        message: run?.status === 'completed' ? `${run.pipelineName} finished successfully.` : run?.message,
+        message: run?.message || 'Local AI Hub started the pipeline run.',
         run,
       };
     }, 'Local AI Hub could not run that pipeline.'),
@@ -1312,6 +1430,13 @@ function registerIpcHandlers() {
       message: 'Local AI Hub will stop the active pipeline after the current step finishes.',
       run: cancelPipelineRun(runId),
     }), 'Local AI Hub could not cancel that pipeline run.'),
+  );
+
+  ipcMain.handle('pipelines:resume-validation', (_event, payload) =>
+    withPlainEnglishErrors(async () => ({
+      message: 'Local AI Hub recorded your validation decision.',
+      run: resumePipelineValidation(payload?.runId, payload || {}),
+    }), 'Local AI Hub could not continue that validation step.'),
   );
 }
 
@@ -1422,3 +1547,16 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
+
+
+
+
+
+
+
+
+
+
+
+
+

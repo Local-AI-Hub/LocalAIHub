@@ -13,7 +13,7 @@ const {
 const { runCommand } = require('./commandService');
 const { assessDiskSpace, detectHardwareSnapshot, detectStorageSnapshot, findDiskForPath, getDiskSnapshotForPath } = require('./hardwareService');
 const { createLogger } = require('./logService');
-const { listOllamaModels } = require('./ollamaService');
+const { buildOllamaUnavailableMessage, finishOllamaSession, listOllamaModels, prepareOllamaSession } = require('./ollamaService');
 const { assertLoopbackUrl, assertSecureRemoteUrl } = require('./pathSafetyService');
 
 const APP_USER_AGENT = `LocalAIHub/${APP_VERSION}`;
@@ -32,6 +32,7 @@ const README_FILE_PATTERN = /(?:^|\/)README\.md$/i;
 const MODEL_MANAGER_TOOL_IDS = new Set(['ollama', 'comfyui', 'automatic1111', 'forge', 'lmstudio']);
 const HUGGING_FACE_FILE_SIZE_CACHE = new Map();
 const HUGGING_FACE_PREVIEW_CACHE = new Map();
+const OLLAMA_FAMILY_CACHE = new Map();
 const HF_SORT_MAP = {
   'most-downloaded': 'downloads',
   newest: 'created_at',
@@ -745,7 +746,7 @@ async function countDownloadedModels(tool) {
   }
 
   if (tool.id === 'ollama') {
-    return (await listLocalOllamaModelsFromFilesystem(tool)).length;
+    return (await listLocalOllamaModels(tool)).length;
   }
 
   return (await listLocalFileModels(tool)).length;
@@ -1468,6 +1469,271 @@ function parseOllamaCompactNumber(value) {
   return Math.round(amount * multiplier);
 }
 
+function parseOllamaSizeBytes(sizeLabels = []) {
+  for (const sizeLabel of sizeLabels || []) {
+    if (!/[KMGT]B$/i.test(String(sizeLabel || '').trim())) {
+      continue;
+    }
+
+    const sizeBytes = parseHumanSizeToBytes(sizeLabel);
+    if (sizeBytes > 0) {
+      return sizeBytes;
+    }
+  }
+
+  return 0;
+}
+
+function buildOllamaAbsoluteUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return null;
+  }
+
+  if (/^https?:\/\//i.test(raw)) {
+    return raw;
+  }
+
+  if (raw.startsWith('/')) {
+    return `https://ollama.com${raw}`;
+  }
+
+  return `https://ollama.com/${raw.replace(/^\/+/, '')}`;
+}
+
+function parseOllamaQueryTokens(value) {
+  return [...new Set(
+    String(value || '')
+      .toLowerCase()
+      .split(/[\s:\/_-]+/)
+      .map((token) => token.trim())
+      .filter(Boolean),
+  )];
+}
+
+function matchesOllamaQuery(entry, query) {
+  const queryTokens = parseOllamaQueryTokens(query);
+  if (!queryTokens.length) {
+    return true;
+  }
+
+  const candidateTokens = parseOllamaQueryTokens(
+    [
+      entry?.contextLabel,
+      entry?.description,
+      entry?.familyDescription,
+      entry?.familyName,
+      entry?.inputLabel,
+      entry?.name,
+      entry?.sizeLabel,
+      entry?.updatedLabel,
+      ...(entry?.capabilities || []),
+      ...(entry?.sizeLabels || []),
+    ]
+      .filter(Boolean)
+      .join(' '),
+  );
+
+  if (!candidateTokens.length) {
+    return false;
+  }
+
+  return queryTokens.every((queryToken) => candidateTokens.some((candidateToken) => candidateToken.includes(queryToken)));
+}
+
+function isOllamaVariantQuery(query) {
+  const normalized = String(query || '').trim();
+  return normalized.includes(':') || /\b\d+(?:\.\d+)?\s*[bmkt]\b/i.test(normalized);
+}
+
+function extractOllamaFamilyDescription(html, fallbackDescription) {
+  const metaDescription = String(html || '').match(/<meta name="description" content="([^"]*)"/i);
+  return stripHtml(metaDescription?.[1]) || fallbackDescription;
+}
+
+function extractOllamaFamilySearchText(html) {
+  const readmeMatch = String(html || '').match(/<div[^>]+id="display"[^>]*>([\s\S]*?)<\/div>\s*<\/div>\s*<div id="editorContainer"/i);
+  return stripHtml(readmeMatch?.[1] || '').slice(0, 4000);
+}
+
+function extractOllamaFamilyPreviewUrl(html) {
+  const previewMatch =
+    String(html || '').match(/<img[^>]+src="((?:https?:\/\/ollama\.com)?\/assets\/library\/[^"]+)"/i) ||
+    String(html || '').match(/&lt;img src=&#34;((?:https?:\/\/ollama\.com)?\/assets\/library\/[^"&]+)&#34;/i);
+  return buildOllamaAbsoluteUrl(previewMatch?.[1] || '');
+}
+
+function parseOllamaFamilyVariants(html, familyName) {
+  const variants = [];
+  const sectionMatch = String(html || '').match(/<section class="flex flex-1 flex-col">[\s\S]*?<h2 class="text-base font-semibold leading-6 text-neutral-900">Models<\/h2>[\s\S]*?<\/section>/i);
+  const sectionHtml = sectionMatch?.[0] || '';
+
+  if (!sectionHtml) {
+    return variants;
+  }
+
+  const rowPattern = /<div class="hidden group[^"]*sm:grid[^"]*">[\s\S]*?<a href="\/library\/([^"#?]+)"[^>]*>([^<]+)<\/a>[\s\S]*?<p class="col-span-2 text-neutral-500">([^<]+)<\/p>[\s\S]*?<p class="col-span-2 text-neutral-500">([^<]+)<\/p>[\s\S]*?<p class="col-span-2 text-neutral-500">\s*([^<]+?)\s*<\/p>[\s\S]*?<\/div>/gi;
+  let match = null;
+
+  while ((match = rowPattern.exec(sectionHtml)) !== null) {
+    const variantName = stripHtml(match[2]);
+    const sizeLabel = stripHtml(match[3]);
+    const contextLabel = stripHtml(match[4]);
+    const inputLabel = stripHtml(match[5]);
+    if (!variantName) {
+      continue;
+    }
+
+    variants.push({
+      contextLabel: contextLabel ? `${contextLabel} context window` : null,
+      familyName,
+      inputLabel: inputLabel || null,
+      isLatestAlias: /:latest$/i.test(variantName),
+      libraryPath: `/library/${match[1]}`,
+      latest: /text-blue-600">latest<\/span>/i.test(match[0]),
+      name: variantName,
+      sizeBytes: parseHumanSizeToBytes(sizeLabel),
+      sizeLabel: sizeLabel || 'Unknown',
+      updatedLabel: null,
+    });
+  }
+
+  return variants;
+}
+
+async function fetchOllamaFamilyDetails(entry, logger) {
+  const cacheKey = String(entry?.slug || entry?.name || '').trim().toLowerCase();
+  if (!cacheKey) {
+    return {
+      description: entry?.description || 'Ollama model',
+      previewUrl: entry?.previewUrl || null,
+      variants: [],
+    };
+  }
+
+  if (!OLLAMA_FAMILY_CACHE.has(cacheKey)) {
+    OLLAMA_FAMILY_CACHE.set(
+      cacheKey,
+      (async () => {
+        const familyUrl = buildOllamaAbsoluteUrl(entry.libraryPath || `/library/${entry.slug || entry.name}`);
+        try {
+          const response = await fetch(familyUrl, {
+            headers: {
+              'User-Agent': APP_USER_AGENT,
+            },
+          });
+
+          if (!response.ok) {
+            throw new Error(`Request failed with status ${response.status}.`);
+          }
+
+          const html = await response.text();
+          return {
+            description: extractOllamaFamilyDescription(html, entry.description || `Ollama model ${entry.name}`),
+            previewUrl: extractOllamaFamilyPreviewUrl(html) || entry.previewUrl || null,
+            searchText: extractOllamaFamilySearchText(html),
+            variants: parseOllamaFamilyVariants(html, entry.name),
+          };
+        } catch (error) {
+          await logger.warn('An Ollama family page could not be loaded.', {
+            error,
+            family: entry.name,
+            url: familyUrl,
+          }).catch(() => null);
+
+          return {
+            description: entry.description || `Ollama model ${entry.name}`,
+            previewUrl: entry.previewUrl || null,
+            searchText: '',
+            variants: [],
+          };
+        }
+      })(),
+    );
+  }
+
+  return OLLAMA_FAMILY_CACHE.get(cacheKey);
+}
+
+function getOllamaDefaultVariant(familyDetails) {
+  const variants = familyDetails?.variants || [];
+  return variants.find((variant) => variant.latest && !variant.isLatestAlias) || variants.find((variant) => variant.isLatestAlias) || variants.find((variant) => variant.latest) || variants[0] || null;
+}
+
+function buildOllamaFamilyCard(entry, familyDetails) {
+  const defaultVariant = getOllamaDefaultVariant(familyDetails);
+  return {
+    ...entry,
+    description: familyDetails?.description || entry.description,
+    familySearchText: familyDetails?.searchText || '',
+    fileName: defaultVariant?.name || entry.fileName,
+    previewUrl: familyDetails?.previewUrl || entry.previewUrl || null,
+    sizeBytes: defaultVariant?.sizeBytes || entry.sizeBytes || 0,
+    sizeLabel: defaultVariant?.sizeLabel || entry.sizeLabel,
+  };
+}
+
+function buildOllamaVariantCard(entry, familyDetails, variant) {
+  return {
+    capabilities: entry.capabilities,
+    contextLabel: variant.contextLabel,
+    description: familyDetails?.description || entry.description,
+    downloadUrl: null,
+    familyDescription: familyDetails?.description || entry.description,
+    familyName: entry.name,
+    familySearchText: familyDetails?.searchText || '',
+    fileName: variant.name,
+    id: `ollama:${variant.name}`,
+    inputLabel: variant.inputLabel,
+    libraryPath: variant.libraryPath,
+    modelType: 'Model',
+    name: variant.name,
+    previewUrl: familyDetails?.previewUrl || entry.previewUrl || null,
+    sizeBytes: variant.sizeBytes,
+    sizeLabel: variant.sizeLabel,
+    source: 'ollama',
+    toolId: 'ollama',
+    updatedLabel: variant.updatedLabel || entry.updatedLabel,
+  };
+}
+
+function matchesOllamaVariantQuery(entry, query) {
+  const normalizedQuery = String(query || '').trim().toLowerCase();
+  if (!normalizedQuery) {
+    return true;
+  }
+
+  const [familyPart, suffixPart = ''] = normalizedQuery.split(':', 2);
+  const normalizedFamilyName = String(entry?.familyName || '').trim().toLowerCase();
+  if (familyPart && normalizedFamilyName && normalizedFamilyName !== familyPart) {
+    return false;
+  }
+
+  const suffixTokens = parseOllamaQueryTokens(suffixPart);
+  const requiredPrimaryTokens = [...new Set([...parseOllamaQueryTokens(familyPart), ...(suffixTokens[0] ? [suffixTokens[0]] : [])])];
+  const primaryTokens = parseOllamaQueryTokens(
+    [entry?.familyName, entry?.name, entry?.sizeLabel, entry?.contextLabel, entry?.inputLabel]
+      .filter(Boolean)
+      .join(' '),
+  );
+  const secondaryTokens = parseOllamaQueryTokens(
+    [entry?.description, entry?.familyDescription, entry?.familySearchText, ...(entry?.capabilities || [])]
+      .filter(Boolean)
+      .join(' '),
+  );
+  const allTokens = parseOllamaQueryTokens(normalizedQuery);
+
+  if (!requiredPrimaryTokens.every((queryToken) => primaryTokens.some((candidateToken) => candidateToken.includes(queryToken)))) {
+    return false;
+  }
+
+  return allTokens.every(
+    (queryToken) =>
+      primaryTokens.some((candidateToken) => candidateToken.includes(queryToken)) ||
+      secondaryTokens.some((candidateToken) => candidateToken.includes(queryToken)),
+  );
+}
+
 function extractOllamaRepoMarkup(html) {
   const marker = '<div x-test-repos id="repo">';
   const startIndex = String(html || '').indexOf(marker);
@@ -1497,6 +1763,7 @@ function parseOllamaLibraryCards(html) {
   let match = null;
 
   while ((match = cardPattern.exec(repoMarkup)) !== null) {
+    const slug = stripHtml(match[1]);
     const name = stripHtml(match[1]);
     const cardHtml = match[2];
     const descriptionMatch = cardHtml.match(/<p[^>]*text-neutral-800[^>]*>([\s\S]*?)<\/p>/i);
@@ -1506,6 +1773,7 @@ function parseOllamaLibraryCards(html) {
     const tagsMatch = cardHtml.match(/x-test-tag-count>([^<]+)</i);
     const updatedMatch = cardHtml.match(/x-test-updated>([^<]+)</i);
     const isCloudModel = /bg-cyan-50[^>]*>cloud</i.test(cardHtml);
+    const sizeBytes = parseOllamaSizeBytes(sizeLabels);
     const sizeLabel = sizeLabels.length ? sizeLabels.join(' / ') : isCloudModel ? 'Cloud model' : 'Available from Ollama';
 
     if (!name) {
@@ -1518,12 +1786,15 @@ function parseOllamaLibraryCards(html) {
       downloadUrl: null,
       fileName: name,
       id: `ollama:${name}`,
+      libraryPath: `/library/${slug}`,
       modelType: 'Model',
       name,
       previewUrl: null,
       pulls: parseOllamaCompactNumber(pullsMatch?.[1] || ''),
-      sizeBytes: 0,
+      sizeBytes,
       sizeLabel,
+      sizeLabels,
+      slug,
       source: 'ollama',
       tagCount: Number.parseInt(String(tagsMatch?.[1] || '').replace(/[^0-9]/g, ''), 10) || 0,
       toolId: 'ollama',
@@ -1542,10 +1813,6 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
   const searchUrl = new URL(OLLAMA_LIBRARY_URL);
   const normalizedQuery = String(browseOptions.query || '').trim();
   const normalizedSort = normalizeOllamaSort(browseOptions.sort);
-
-  if (normalizedQuery) {
-    searchUrl.searchParams.set('q', normalizedQuery);
-  }
   searchUrl.searchParams.set('sort', normalizedSort);
 
   await logger.info('Loading Ollama library page.', {
@@ -1566,25 +1833,120 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
   }
 
   const html = await response.text();
-  const allItems = parseOllamaLibraryCards(html).map((entry) =>
-    attachHardwareHints(
-      {
-        ...entry,
-        downloaded: downloadedLookup.has(entry.fileName.toLowerCase()) || downloadedLookup.has(entry.name.toLowerCase()),
-      },
-      tool,
-      hardwareContext,
-    ),
-  );
-
+  const allFamilies = parseOllamaLibraryCards(html);
   const startIndex = (browseOptions.page - 1) * OLLAMA_PAGE_SIZE;
   const endIndex = startIndex + OLLAMA_PAGE_SIZE;
+
+  if (!normalizedQuery) {
+    const pageFamilies = allFamilies.slice(startIndex, endIndex);
+    const items = await Promise.all(
+      pageFamilies.map(async (entry) => {
+        const familyDetails = await fetchOllamaFamilyDetails(entry, logger);
+        const card = buildOllamaFamilyCard(entry, familyDetails);
+        return attachHardwareHints(
+          {
+            ...card,
+            downloaded:
+              downloadedLookup.has(String(card.fileName || '').toLowerCase()) ||
+              downloadedLookup.has(String(card.name || '').toLowerCase()),
+          },
+          tool,
+          hardwareContext,
+        );
+      }),
+    );
+
+    return {
+      items,
+      pagination: {
+        hasMore: endIndex < allFamilies.length,
+        nextCursor: null,
+        nextPage: endIndex < allFamilies.length ? browseOptions.page + 1 : null,
+      },
+    };
+  }
+
+  let matchedFamilies = allFamilies.filter((entry) => matchesOllamaQuery(entry, normalizedQuery));
+  if (!matchedFamilies.length && normalizedQuery.includes(':')) {
+    const familyQuery = normalizedQuery.split(':')[0].trim();
+    matchedFamilies = allFamilies.filter((entry) => matchesOllamaQuery(entry, familyQuery));
+  }
+  const fullMatchCount = matchedFamilies.length;
+
+  if (!matchedFamilies.length) {
+    return {
+      items: [],
+      pagination: {
+        hasMore: false,
+        nextCursor: null,
+        nextPage: null,
+      },
+    };
+  }
+
+  if (isOllamaVariantQuery(normalizedQuery)) {
+    const variantItems = [];
+
+    for (const entry of matchedFamilies) {
+      const familyDetails = await fetchOllamaFamilyDetails(entry, logger);
+      for (const variant of familyDetails.variants || []) {
+        const card = buildOllamaVariantCard(entry, familyDetails, variant);
+        if (!matchesOllamaVariantQuery(card, normalizedQuery)) {
+          continue;
+        }
+
+        variantItems.push(
+          attachHardwareHints(
+            {
+              ...card,
+              downloaded:
+                downloadedLookup.has(String(card.fileName || '').toLowerCase()) ||
+                downloadedLookup.has(String(card.name || '').toLowerCase()) ||
+                downloadedLookup.has(String(entry.name || '').toLowerCase()),
+            },
+            tool,
+            hardwareContext,
+          ),
+        );
+      }
+    }
+
+    if (variantItems.length) {
+      return {
+        items: variantItems.slice(startIndex, endIndex),
+        pagination: {
+          hasMore: endIndex < variantItems.length,
+          nextCursor: null,
+          nextPage: endIndex < variantItems.length ? browseOptions.page + 1 : null,
+        },
+      };
+    }
+  }
+
+  const pageFamilies = matchedFamilies.slice(startIndex, endIndex);
+  const items = await Promise.all(
+    pageFamilies.map(async (entry) => {
+      const familyDetails = await fetchOllamaFamilyDetails(entry, logger);
+      const card = buildOllamaFamilyCard(entry, familyDetails);
+      return attachHardwareHints(
+        {
+          ...card,
+          downloaded:
+            downloadedLookup.has(String(card.fileName || '').toLowerCase()) ||
+            downloadedLookup.has(String(card.name || '').toLowerCase()),
+        },
+        tool,
+        hardwareContext,
+      );
+    }),
+  );
+
   return {
-    items: allItems.slice(startIndex, endIndex),
+    items,
     pagination: {
-      hasMore: endIndex < allItems.length,
+      hasMore: endIndex < fullMatchCount,
       nextCursor: null,
-      nextPage: endIndex < allItems.length ? browseOptions.page + 1 : null,
+      nextPage: endIndex < fullMatchCount ? browseOptions.page + 1 : null,
     },
   };
 }
@@ -2043,85 +2405,138 @@ async function pullOllamaModel(tool, payload, options = {}) {
     modelId: payload.id,
   });
 
-  const launchUrl = assertLoopbackUrl(tool.launchUrl, 'Ollama API URL');
-  const response = await fetch(new URL('/api/pull', `${launchUrl.replace(/\/$/, '')}/`).toString(), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: payload.name,
-      stream: true,
-    }),
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error(`${payload.name} could not be pulled from Ollama right now.`);
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let latestPercent = 0;
-
-  await logger.info('Ollama model pull started.', {
-    model: payload.name,
-  });
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    if (buffer.length > MODEL_DOWNLOAD_BUFFER_LIMIT) {
-      buffer = buffer.slice(-MODEL_DOWNLOAD_BUFFER_LIMIT);
-    }
-
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
-      }
-
-      let payloadLine = null;
-      try {
-        payloadLine = JSON.parse(trimmed);
-      } catch {
-        continue;
-      }
-
-      const percent = payloadLine.total
-        ? Math.max(latestPercent, Math.round(((payloadLine.completed || 0) / payloadLine.total) * 100))
-        : latestPercent;
-      latestPercent = percent;
-
-      emitProgress(options.onProgress, {
-        downloadId: payload.id,
-        message: payloadLine.status || `Pulling ${payload.name}.`,
-        percent: percent || null,
-        receivedBytes: payloadLine.completed || 0,
-        totalBytes: payloadLine.total || 0,
-      });
-    }
-  }
-
   emitProgress(options.onProgress, {
     downloadId: payload.id,
-    message: `${payload.name} is ready.`,
-    percent: 100,
+    message: `Preparing ${tool.name || 'Ollama'} for the download.`,
+    percent: 1,
     receivedBytes: 0,
-    totalBytes: 0,
+    totalBytes: payload.sizeBytes || 0,
   });
 
-  return {
-    alreadyPresent: false,
-    message: `${payload.name} was downloaded into Ollama.`,
-  };
+  let session = null;
+  try {
+    session = await prepareOllamaSession(tool, {
+      autoStart: true,
+      launchContext: 'model-download',
+    });
+  } catch {
+    throw new Error(buildOllamaUnavailableMessage(tool, {
+      actionLabel: `download ${payload.name}`,
+      autoStartAttempted: true,
+    }));
+  }
+
+  const activeTool = session.tool || tool;
+  const launchUrl = assertLoopbackUrl(activeTool.launchUrl, 'Ollama API URL');
+
+  try {
+    const response = await fetch(new URL('/api/pull', `${launchUrl.replace(/\/$/, '')}/`).toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: payload.name,
+        stream: true,
+      }),
+    });
+
+    if (!response.ok || !response.body) {
+      const raw = await response.text().catch(() => '');
+      let payloadLine = null;
+      try {
+        payloadLine = raw ? JSON.parse(raw) : null;
+      } catch {
+        payloadLine = null;
+      }
+      const detail = String(payloadLine?.error || payloadLine?.message || raw || '').trim();
+      throw new Error(detail ? `${payload.name} could not be pulled from Ollama right now. ${detail}` : `${payload.name} could not be pulled from Ollama right now.`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let latestPercent = 0;
+
+    await logger.info('Ollama model pull started.', {
+      autoStarted: Boolean(session.autoStarted),
+      model: payload.name,
+    });
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      if (buffer.length > MODEL_DOWNLOAD_BUFFER_LIMIT) {
+        buffer = buffer.slice(-MODEL_DOWNLOAD_BUFFER_LIMIT);
+      }
+
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+
+        let payloadLine = null;
+        try {
+          payloadLine = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+
+        const percent = payloadLine.total
+          ? Math.max(latestPercent, Math.round(((payloadLine.completed || 0) / payloadLine.total) * 100))
+          : latestPercent;
+        latestPercent = percent;
+
+        emitProgress(options.onProgress, {
+          downloadId: payload.id,
+          message: payloadLine.status || `Pulling ${payload.name}.`,
+          percent: percent || null,
+          receivedBytes: payloadLine.completed || 0,
+          totalBytes: payloadLine.total || 0,
+        });
+      }
+    }
+
+    emitProgress(options.onProgress, {
+      downloadId: payload.id,
+      message: `${payload.name} is ready.`,
+      percent: 100,
+      receivedBytes: 0,
+      totalBytes: 0,
+    });
+
+    return {
+      alreadyPresent: false,
+      message: session.autoStarted
+        ? `${payload.name} was downloaded into Ollama. Local AI Hub started Ollama for this download and shut it down afterward.`
+        : `${payload.name} was downloaded into Ollama.`,
+    };
+  } catch (error) {
+    await logger.warn('Ollama model pull failed.', {
+      autoStarted: Boolean(session?.autoStarted),
+      error,
+      model: payload.name,
+    });
+
+    if (error?.message?.includes('could not be pulled from Ollama right now.')) {
+      throw error;
+    }
+
+    throw new Error(buildOllamaUnavailableMessage(activeTool, {
+      actionLabel: `download ${payload.name}`,
+      autoStartAttempted: Boolean(session?.autoStarted),
+    }));
+  } finally {
+    await finishOllamaSession(session);
+  }
 }
 
 async function downloadModel(tool, payload, options = {}) {
@@ -2212,6 +2627,13 @@ module.exports = {
   saveModelManagerSettings,
   supportsModelManager,
 };
+
+
+
+
+
+
+
 
 
 

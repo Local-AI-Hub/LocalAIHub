@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
 
 const MODEL_MANAGER_TOOL_IDS = ['ollama', 'comfyui', 'automatic1111', 'forge', 'lmstudio'];
@@ -272,6 +272,7 @@ export default function ModelManager({ tools, onToast }) {
   const [sort, setSort] = useState('most-downloaded');
   const [taskType, setTaskType] = useState(getToolDefaults(modelTools[0]?.id).taskType);
   const [deleteBusyId, setDeleteBusyId] = useState(null);
+  const browseRequestIdRef = useRef(0);
 
   const selectedTool = modelTools.find((tool) => tool.id === selectedToolId) || null;
   const sourceOptions = SOURCE_OPTIONS[selectedTool?.id || 'ollama'] || [{ id: 'ollama', label: 'Ollama Library' }];
@@ -285,6 +286,7 @@ export default function ModelManager({ tools, onToast }) {
     setModelType(defaults.modelType);
     setTaskType(defaults.taskType);
     setSearch('');
+    browseRequestIdRef.current += 1;
     setRemoteItems([]);
     setPagination(EMPTY_PAGINATION);
   }
@@ -321,6 +323,7 @@ export default function ModelManager({ tools, onToast }) {
     const query = options.query !== undefined ? options.query : search;
 
     if (!toolId) {
+      browseRequestIdRef.current += 1;
       setRemoteItems([]);
       setLocalModels([]);
       setPagination(EMPTY_PAGINATION);
@@ -332,6 +335,9 @@ export default function ModelManager({ tools, onToast }) {
     } else {
       setBrowseLoading(true);
     }
+
+    const requestId = browseRequestIdRef.current + 1;
+    browseRequestIdRef.current = requestId;
 
     const result = await window.localAIHub.browseModels({
       cursor: options.cursor || null,
@@ -345,9 +351,17 @@ export default function ModelManager({ tools, onToast }) {
     });
 
     if (!result?.ok) {
+      if (requestId !== browseRequestIdRef.current) {
+        return;
+      }
+
       onToast(result?.message || 'Local AI Hub could not load remote models right now.', 'error');
       setBrowseLoading(false);
       setLoadingMore(false);
+      return;
+    }
+
+    if (requestId !== browseRequestIdRef.current) {
       return;
     }
 
@@ -407,6 +421,7 @@ export default function ModelManager({ tools, onToast }) {
 
   useEffect(() => {
     if (!selectedToolId) {
+      browseRequestIdRef.current += 1;
       setRemoteItems([]);
       setLocalModels([]);
       setPagination(EMPTY_PAGINATION);
@@ -710,6 +725,7 @@ export default function ModelManager({ tools, onToast }) {
     </section>
   );
 }
+
 
 
 

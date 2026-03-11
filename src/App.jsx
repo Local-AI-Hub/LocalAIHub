@@ -33,7 +33,8 @@ const EMPTY_STATE = {
   providers: [],
   resources: null,
   settings: {
-    closeBehavior: 'tray',
+    closeBehavior: 'exit',
+    liveResourcePolling: false,
   },
   storage: null,
   toolUpdates: {
@@ -45,9 +46,9 @@ const EMPTY_STATE = {
 };
 
 const CONSOLE_OUTPUT_LIMIT = 48000;
-const FOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 3000;
-const UNFOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 10000;
-const DISK_RESOURCE_REFRESH_INTERVAL_MS = 30000;
+const FOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 10000;
+const UNFOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 30000;
+const DISK_RESOURCE_REFRESH_INTERVAL_MS = 60000;
 
 function trimConsoleOutput(value) {
   const text = String(value || '');
@@ -131,7 +132,8 @@ export default function App() {
   const [settingsToolId, setSettingsToolId] = useState(null);
   const [cleanupPreview, setCleanupPreview] = useState(null);
   const [storageDraft, setStorageDraft] = useState('');
-  const [closeBehaviorDraft, setCloseBehaviorDraft] = useState('tray');
+  const [closeBehaviorDraft, setCloseBehaviorDraft] = useState('exit');
+  const [liveResourcePollingDraft, setLiveResourcePollingDraft] = useState(false);
   const [ollamaChatOpen, setOllamaChatOpen] = useState(false);
   const [ollamaModels, setOllamaModels] = useState([]);
   const [ollamaSelectedModel, setOllamaSelectedModel] = useState('');
@@ -792,6 +794,7 @@ export default function App() {
               ...tool,
               ...(payload.status ? { status: payload.status } : {}),
               ...(Object.prototype.hasOwnProperty.call(payload, 'lastError') ? { lastError: payload.lastError } : {}),
+              ...(Object.prototype.hasOwnProperty.call(payload, 'lastRepairMessage') ? { lastRepairMessage: payload.lastRepairMessage } : {}),
             }
           : tool,
       ),
@@ -871,6 +874,12 @@ export default function App() {
   }
   async function saveCloseBehaviorPreference() {
     await runAction('settings:save-close-behavior', () => window.localAIHub.saveCloseBehavior(closeBehaviorDraft));
+  }
+
+  async function saveLiveResourcePollingPreference() {
+    await runAction('settings:save-live-resource-polling', () =>
+      window.localAIHub.saveLiveResourcePolling(liveResourcePollingDraft),
+    );
   }
 
   async function migrateLegacyStorage() {
@@ -1123,6 +1132,22 @@ export default function App() {
       }
     });
 
+    const unsubscribeAppStateUpdated = window.localAIHub.onAppStateUpdated((payload) => {
+      if (!payload || typeof payload !== 'object') {
+        return;
+      }
+
+      setAppState((current) => ({
+        ...current,
+        ...payload,
+        settings: payload.settings ? { ...current.settings, ...payload.settings } : current.settings,
+      }));
+
+      if (Object.prototype.hasOwnProperty.call(payload, 'resources')) {
+        applyLiveResources(payload.resources || null);
+      }
+    });
+
     const unsubscribeLaunchProgress = window.localAIHub.onLaunchProgress((progress) => {
       if (!progress?.toolId) {
         return;
@@ -1215,6 +1240,7 @@ export default function App() {
       unsubscribeInstallProgress();
       unsubscribeOpenToolUi();
       unsubscribeWindowActivity();
+      unsubscribeAppStateUpdated();
       unsubscribeLaunchProgress();
       unsubscribeRuntimeOutput();
       unsubscribeToolState();
@@ -1365,8 +1391,12 @@ export default function App() {
   }, [appState.storage?.managedRoot]);
 
   useEffect(() => {
-    setCloseBehaviorDraft(appState.settings?.closeBehavior || 'tray');
+    setCloseBehaviorDraft(appState.settings?.closeBehavior || 'exit');
   }, [appState.settings?.closeBehavior]);
+
+  useEffect(() => {
+    setLiveResourcePollingDraft(Boolean(appState.settings?.liveResourcePolling));
+  }, [appState.settings?.liveResourcePolling]);
 
   useEffect(() => {
     if (activeTab !== 'settings' || cleanupPreview) {
@@ -1377,6 +1407,11 @@ export default function App() {
   }, [activeTab, cleanupPreview]);
 
   useEffect(() => {
+    if (!appState.settings?.liveResourcePolling) {
+      applyLiveResources(null);
+      return undefined;
+    }
+
     let cancelled = false;
     let timerId = null;
     const pollIntervalMs = windowActivity.focused && windowActivity.visible
@@ -1408,7 +1443,7 @@ export default function App() {
         window.clearTimeout(timerId);
       }
     };
-  }, [applyLiveResources, windowActivity.focused, windowActivity.visible]);
+  }, [applyLiveResources, appState.settings?.liveResourcePolling, windowActivity.focused, windowActivity.visible]);
 
   useEffect(() => {
     if (activeTab !== 'statistics' || !windowActivity.focused || !windowActivity.visible) {
@@ -1670,7 +1705,9 @@ export default function App() {
                 busyMap={busyMap}
                 cleanupPreview={cleanupPreview}
                 closeBehaviorDraft={closeBehaviorDraft}
+                liveResourcePollingDraft={liveResourcePollingDraft}
                 onChangeCloseBehavior={setCloseBehaviorDraft}
+                onChangeLiveResourcePolling={setLiveResourcePollingDraft}
                 onChangeStorageDraft={setStorageDraft}
                 onChooseStorageFolder={chooseStorageFolder}
                 onDismissLegacyMigration={dismissLegacyMigration}
@@ -1678,6 +1715,7 @@ export default function App() {
                 onPreviewCleanup={() => previewCleanup()}
                 onRunCleanup={runCleanupNow}
                 onSaveCloseBehavior={saveCloseBehaviorPreference}
+                onSaveLiveResourcePolling={saveLiveResourcePollingPreference}
                 onSaveStorageLocation={() => saveStorageLocation()}
                 storage={appState.storage}
                 storageDraft={storageDraft}
@@ -1704,3 +1742,6 @@ export default function App() {
     </div>
   );
 }
+
+
+

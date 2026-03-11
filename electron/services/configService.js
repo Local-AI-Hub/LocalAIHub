@@ -236,7 +236,7 @@ function normalizeIgnoredToolIds(value) {
 }
 
 function normalizeCloseBehavior(value) {
-  return String(value || '').trim().toLowerCase() === 'exit' ? 'exit' : 'tray';
+  return String(value || '').trim().toLowerCase() === 'tray' ? 'tray' : 'exit';
 }
 
 function rewriteLegacyPathsInValue(value, pathMappings) {
@@ -296,7 +296,8 @@ function createDefaultConfig() {
     firstLaunchCompleted: false,
     hardware: null,
     ignoredToolIds: [],
-    closeBehavior: 'tray',
+    closeBehavior: 'exit',
+    liveResourcePolling: false,
     managedDataRoot: null,
     managedDataRootHistory: [],
     dismissedManagedMigrationRoots: [],
@@ -319,6 +320,7 @@ function normalizeConfig(config, options = {}) {
       version: CONFIG_VERSION,
       ignoredToolIds: normalizeIgnoredToolIds(config?.ignoredToolIds),
       closeBehavior: normalizeCloseBehavior(config?.closeBehavior),
+      liveResourcePolling: Boolean(config?.liveResourcePolling),
       managedDataRoot: normalizeOptionalDirectoryPath(config?.managedDataRoot),
       managedDataRootHistory: normalizePathList([
         ...(config?.managedDataRootHistory || []),
@@ -720,3 +722,7 @@ module.exports = {
   upsertTool,
   writeConfig,
 };
+
+
+
+
