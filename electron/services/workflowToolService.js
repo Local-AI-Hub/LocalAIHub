@@ -61,7 +61,7 @@ async function requestToolJson(tool, endpoint, payload, actionLabel) {
       baseUrl,
       message: error.message,
     });
-    throw new Error(`${tool?.name || 'This image tool'} is not answering on ${baseUrl} yet. Launch it from Library and wait for it to finish starting.`);
+    throw new Error(`${tool?.name || 'This image tool'} is not answering on ${baseUrl} yet. Try the step again after Local AI Hub finishes starting it, or open Library to inspect the tool if it still will not respond.`);
   }
 }
 
@@ -85,7 +85,7 @@ function assertRunningImageTool(tool, actionLabel) {
   }
 
   if (String(tool.status || '').toLowerCase() !== 'running') {
-    throw new Error(`${tool.name} is not marked as running. Start it from Library before using the ${actionLabel} step.`);
+    throw new Error(`${tool.name} is not ready for the ${actionLabel} step yet. Let Local AI Hub finish starting it and try again.`);
   }
 
   return tool;
@@ -157,4 +157,5 @@ module.exports = {
   isImageWorkflowTool,
   resolveSelectedImageTool,
 };
+
 

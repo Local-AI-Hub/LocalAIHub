@@ -109,6 +109,41 @@ function getModelTargetConfig(node) {
   return null;
 }
 
+function buildOllamaModelDetail(model) {
+  const detailParts = [];
+  if (model?.size) {
+    detailParts.push(Math.round(Number(model.size) / 1024 / 1024) + ' MB');
+  }
+  if (model?.supportsImageInput === true) {
+    detailParts.push('Vision');
+  } else if (model?.supportsImageInput === false) {
+    detailParts.push('Text only');
+  }
+  return detailParts.join(' | ');
+}
+
+function collectOllamaModelCapabilities(modelOptionsByNodeId) {
+  const modelCapabilitiesByName = {};
+
+  for (const modelOptions of Object.values(modelOptionsByNodeId || {})) {
+    for (const model of Array.isArray(modelOptions) ? modelOptions : []) {
+      const normalizedId = String(model?.id || '').trim().toLowerCase();
+      if (!normalizedId || modelCapabilitiesByName[normalizedId] || typeof model?.supportsImageInput !== 'boolean') {
+        continue;
+      }
+
+      modelCapabilitiesByName[normalizedId] = {
+        capabilityLabels: Array.isArray(model.capabilityLabels) ? model.capabilityLabels : [],
+        capabilitySource: String(model.capabilitySource || '').trim() || 'unknown',
+        name: String(model.id || '').trim(),
+        supportsImageInput: model.supportsImageInput,
+      };
+    }
+  }
+
+  return modelCapabilitiesByName;
+}
+
 function ArtifactPreview({ artifact, className = '', compact = false }) {
   if (!artifact) {
     return <div className={`rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-4 text-sm leading-6 text-slate-400 ${className}`}>Nothing to preview yet.</div>;
@@ -412,7 +447,7 @@ function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node,
         </div>
       ) : (
         <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-          Local mode reuses the existing Ollama API path. Start Ollama from Library before running this step.
+          Local mode reuses the existing Ollama API path. Local AI Hub will launch Ollama automatically for this step when needed.
         </div>
       )}
 
@@ -490,9 +525,16 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const dragRef = useRef(null);
   const notifiedRunStateRef = useRef('');
 
+  const ollamaModelCapabilitiesByName = useMemo(() => collectOllamaModelCapabilities(modelOptionsByNodeId), [modelOptionsByNodeId]);
+  const pipelineTools = useMemo(
+    () => (Object.keys(ollamaModelCapabilitiesByName).length
+      ? tools.map((tool) => (tool.id === 'ollama' ? { ...tool, modelCapabilitiesByName: ollamaModelCapabilitiesByName } : tool))
+      : tools),
+    [ollamaModelCapabilitiesByName, tools],
+  );
   const contextMaps = useMemo(
-    () => buildPipelineDisplayContext({ hardware, manifests, providers, tools }),
-    [hardware, manifests, providers, tools],
+    () => buildPipelineDisplayContext({ hardware, manifests, providers, tools: pipelineTools }),
+    [hardware, manifests, pipelineTools, providers],
   );
   const analysis = useMemo(() => analyzePipelineDraft(draft, contextMaps), [draft, contextMaps]);
   const graph = useMemo(() => buildPipelineGraph(draft), [draft]);
@@ -800,7 +842,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       const nextMessage = newErrors[0];
       onToast(
         nextMessage.toLowerCase().includes('cycle')
-          ? 'That connection would create a loop. Phase 2 still runs in a simple sequential order.'
+          ? 'That connection would create a loop. Pipeline runs still execute in a simple sequential order.'
           : nextMessage,
         'error',
       );
@@ -877,7 +919,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     const executionMode = node.config?.[modelConfig.executionModeKey] === 'ollama' ? 'ollama' : 'cloud';
     let models = [];
     if (executionMode === 'ollama') {
-      const result = await window.localAIHub.listOllamaModels();
+      const result = await window.localAIHub.listOllamaModels({ includeCapabilities: true });
       if (!result?.ok) {
         setModelsBusyNodeId('');
         onToast(result?.message || 'Local AI Hub could not load your local Ollama models.', 'error');
@@ -887,7 +929,10 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       models = (result.data?.models || []).map((model) => ({
         id: model.name,
         label: model.name,
-        detail: model.size ? `${Math.round(Number(model.size) / 1024 / 1024)} MB` : '',
+        detail: buildOllamaModelDetail(model),
+        capabilityLabels: Array.isArray(model.capabilityLabels) ? model.capabilityLabels : [],
+        capabilitySource: model.capabilitySource || '',
+        supportsImageInput: typeof model.supportsImageInput === 'boolean' ? model.supportsImageInput : undefined,
       }));
     } else {
       const providerId = String(node.config?.[modelConfig.providerIdKey] || '').trim();
@@ -965,7 +1010,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
     if (analysis.compatibilitySummary && ['warn', 'danger'].includes(analysis.compatibilitySummary.tone)) {
       const confirmed = window.confirm(
-        `${analysis.compatibilitySummary.message}\n\nPhase 2 still runs sequentially so only one heavy local step executes at a time. Continue anyway?`,
+        `${analysis.compatibilitySummary.message}\n\nThis pipeline still runs sequentially so only one heavy local step executes at a time. Continue anyway?`,
       );
       if (!confirmed) {
         return;
@@ -981,7 +1026,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     applyRunSnapshot(result.data?.run || null);
-    onToast(result.data?.message || 'Pipeline started.', 'success');
+    onToast(result.data?.message || 'Pipeline started. Local AI Hub will launch any required local tools as the run reaches them.', 'success');
   }
 
   async function handleCancelRun() {
@@ -1000,7 +1045,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     if (result.data?.run) {
       applyRunSnapshot(result.data.run);
     }
-    onToast(result.data?.message || 'Local AI Hub will stop the active pipeline after the current step finishes.', 'success');
+    onToast(result.data?.message || 'Local AI Hub will stop the active pipeline after the current step finishes and shut down any tool it started for the run.', 'success');
   }
 
   async function handleValidationDecision(decision) {
@@ -1045,7 +1090,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Pipeline Builder</p>
             <h3 className="mt-3 text-3xl font-semibold tracking-tight text-white">Build typed Local AI Hub workflows</h3>
             <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
-              Phase 2 generalizes the workflow system across text, image, audio, video, and file artifacts while keeping execution strictly sequential so only one heavy local tool runs at a time.
+              Provider and tool nodes stay capability-aware across text, image, audio, video, and file artifacts while Local AI Hub launches heavy local tools one step at a time.
             </p>
           </div>
 
@@ -1274,6 +1319,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         <div className="mt-3 border-t border-white/10 px-4 py-3">
                           <div className={`rounded-2xl border px-3 py-2 text-xs ${toneToClassName(nodeSummary?.readiness?.tone || nodeSummary?.compatibility?.tone || 'neutral')}`}>
                             <p className="font-semibold text-white">{nodeSummary?.readiness?.message || nodeSummary?.compatibility?.message || 'Ready.'}</p>
+                            {nodeSummary?.capabilitySummary ? <p className="mt-1 leading-5 text-slate-300">{nodeSummary.capabilitySummary.message}</p> : null}
                             {preview ? <p className="mt-1 leading-5 text-slate-200">{preview}</p> : null}
                           </div>
                         </div>
@@ -1319,6 +1365,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                 <div className={`rounded-[24px] border p-4 ${toneToClassName(currentNodeSummary?.readiness?.tone || currentNodeSummary?.compatibility?.tone || 'neutral')}`}>
                   <p className="text-[11px] uppercase tracking-[0.18em] text-slate-300">Readiness</p>
                   <p className="mt-2 text-sm leading-6 text-slate-100">{currentNodeSummary?.readiness?.message || 'This node is ready.'}</p>
+                  {currentNodeSummary?.capabilitySummary ? <p className="mt-2 text-xs leading-5 text-slate-200">{currentNodeSummary.capabilitySummary.message}</p> : null}
                   {currentNodeSummary?.compatibility ? <p className="mt-2 text-xs leading-5 text-slate-200">{currentNodeSummary.compatibility.source}: {currentNodeSummary.compatibility.message}</p> : null}
                 </div>
 
@@ -1346,19 +1393,19 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                 ) : null}
 
                 {selectedNode.type === 'whisperTranscribe' ? (
-                  <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="whisper-model">Whisper model</label><select className="store-input mt-3" id="whisper-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} value={selectedNode.config?.model || 'base'}>{WHISPER_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></div>
+                  <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="whisper-model">Transcription model</label><select className="store-input mt-3" id="whisper-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} value={selectedNode.config?.model || 'base'}>{WHISPER_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></div>
                 ) : null}
 
                 {selectedNode.type === 'imageAnalyze' ? (
                   <div className="space-y-4">
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-tool">Image tool</label><select className="store-input mt-3" id="image-analyze-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-tool">Execution tool</label><select className="store-input mt-3" id="image-analyze-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
                     <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-mode">Analysis mode</label><select className="store-input mt-3" id="image-analyze-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: event.target.value } }))} value={selectedNode.config?.analysisMode || 'clip'}><option value="clip">CLIP caption</option><option value="deepdanbooru">DeepDanbooru tags</option></select></div>
                   </div>
                 ) : null}
 
                 {selectedNode.type === 'imageGenerate' ? (
                   <div className="space-y-4">
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-generate-tool">Image tool</label><select className="store-input mt-3" id="image-generate-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-generate-tool">Execution tool</label><select className="store-input mt-3" id="image-generate-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
                     <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-width">Width</label><input className="store-input mt-3" id="image-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-height">Height</label><input className="store-input mt-3" id="image-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
                     <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-steps">Steps</label><input className="store-input mt-3" id="image-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-cfg">CFG scale</label><input className="store-input mt-3" id="image-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-seed">Seed</label><input className="store-input mt-3" id="image-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
                     <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for the image step." value={selectedNode.config?.negativePrompt || ''} /></div>
@@ -1412,6 +1459,13 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     </section>
   );
 }
+
+
+
+
+
+
+
 
 
 

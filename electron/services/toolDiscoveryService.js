@@ -594,7 +594,7 @@ function buildMissingManagedToolState(existingTool, manifest) {
   return {
     ...nextState,
     status: 'error',
-    lastRepairMessage: existingTool?.lastRepairMessage || null,
+    lastRepairMessage: null,
     lastError: `${manifest.name}'s saved install folder is missing. Local AI Hub rescanned this PC but could not find another copy yet. Run Repair or reinstall it.`,
   };
 }
@@ -610,7 +610,7 @@ function buildBrokenManagedToolState(existingTool, manifest, installDir) {
     detectedAt: existingTool?.detectedAt || firstSeenAt,
     installedAt: firstSeenAt,
     status: 'error',
-    lastRepairMessage: existingTool?.lastRepairMessage || null,
+    lastRepairMessage: null,
     lastError: `${manifest.name}'s files are still on this PC, but its launcher or Python runtime is missing. Run Repair to rebuild it.`,
   };
 }
@@ -626,7 +626,7 @@ function buildRecoveredManagedToolState(manifest, existingTool = {}, installDir)
     installedAt: firstSeenAt,
     launchSupported: true,
     lastError: null,
-    lastRepairMessage: existingTool?.lastRepairMessage || null,
+    lastRepairMessage: null,
     status: existingTool?.status === 'running' ? 'stopped' : existingTool?.status || 'stopped',
   };
 }

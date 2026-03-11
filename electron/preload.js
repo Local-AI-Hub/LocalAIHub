@@ -30,7 +30,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   installTool: (payload) => invoke('tools:install', payload),
   launchTool: (payload) => invoke('tools:launch', payload),
   listLocalModels: (toolId) => invoke('models:list-local', { toolId }),
-  listOllamaModels: () => invoke('ollama:list-models'),
+  listOllamaModels: (options) => invoke('ollama:list-models', options),
   listPipelines: () => invoke('pipelines:list'),
   listProviderModels: (providerId) => invoke('providers:list-models', providerId),
   listProviders: () => invoke('providers:list'),
@@ -128,6 +128,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
     return () => ipcRenderer.removeListener('app:window-activity', listener);
   },
 });
+
 
 
 

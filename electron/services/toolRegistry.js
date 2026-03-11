@@ -3,6 +3,7 @@ const fs = require('fs-extra');
 
 const { getLoadedToolManifest, loadToolManifest } = require('./manifestService');
 const { assertSafeCommandString, assertSecureRemoteUrl, sanitizeManifestId } = require('./pathSafetyService');
+const { getToolPipelineCapabilities } = require('../shared/pipelineCapabilities.cjs');
 
 let cachedToolDefinitions = null;
 let cachedToolManifestKey = '';
@@ -276,6 +277,7 @@ function normalizeToolDefinition(tool) {
     launchUrl,
     healthUrl: buildHealthUrl(tool, launchUrl),
     startupTimeoutMs: Number(tool.startupTimeoutMs) > 0 ? Number(tool.startupTimeoutMs) : null,
+    pipelineCapabilities: getToolPipelineCapabilities(toolId),
     processNames: tool.processNames || deriveProcessNames({
       ...tool,
       externalLaunchCommand,
@@ -319,6 +321,7 @@ function getToolCatalog() {
     installKind: tool.installInstructions.kind,
     downloadUrl: tool.downloadUrl,
     compatibility: tool.installInstructions.compatibility,
+    pipelineCapabilities: tool.pipelineCapabilities,
   }));
 }
 
@@ -552,6 +555,9 @@ module.exports = {
   initializeToolRegistry,
   tokenizeCommand,
 };
+
+
+
 
 
 

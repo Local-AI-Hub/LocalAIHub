@@ -3,6 +3,7 @@ const fs = require('fs-extra');
 
 const { assertSecureRemoteUrl, sanitizeManifestId } = require('./pathSafetyService');
 const { computeManifestDigest, getDefaultManifestSignaturePath, verifyManifestSignature } = require('./manifestSignatureService');
+const { getProviderPipelineCapabilities } = require('../shared/pipelineCapabilities.cjs');
 
 const ALLOWED_AUTH_TYPES = new Set(['bearer', 'x-api-key', 'x-goog-api-key']);
 const ALLOWED_PROTOCOLS = new Set(['openai-compatible', 'anthropic', 'google-gemini']);
@@ -77,6 +78,7 @@ function validateProvider(rawProvider) {
     modelsEndpoint: normalizeEndpoint(rawProvider.modelsEndpoint, `${id} models endpoint`),
     docsUrl: assertSecureRemoteUrl(rawProvider.docsUrl, `${id} docs URL`),
     configuration: normalizeProviderConfiguration(id, rawProvider.configuration || rawProvider.providerConfiguration || {}),
+    pipelineCapabilities: getProviderPipelineCapabilities(id),
   };
 }
 
@@ -142,6 +144,7 @@ function getProviderCatalog() {
     authType: provider.authType,
     docsUrl: provider.docsUrl,
     modelsEndpoint: provider.modelsEndpoint,
+    pipelineCapabilities: provider.pipelineCapabilities || null,
   }));
 }
 
@@ -159,3 +162,6 @@ module.exports = {
   initializeProviderRegistry,
   resolveProviderUrl,
 };
+
+
+

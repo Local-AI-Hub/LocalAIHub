@@ -249,14 +249,67 @@ async function fetchProviderModelsInternal(provider, apiKey) {
   return normalizeOpenAIModels(provider, payload);
 }
 
+function parseInlineDataUrl(value) {
+  const match = String(value || '').trim().match(/^data:([^;]+);base64,(.+)$/i);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    data: match[2].trim(),
+    mimeType: match[1].trim() || 'image/png',
+  };
+}
+
+function normalizeChatContentParts(content) {
+  if (typeof content === 'string') {
+    const text = content.trim();
+    return text ? [{ type: 'text', text }] : [];
+  }
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content
+    .map((entry) => {
+      if (typeof entry === 'string') {
+        const text = entry.trim();
+        return text ? { type: 'text', text } : null;
+      }
+
+      if (entry?.type === 'text' && typeof entry.text === 'string') {
+        const text = entry.text.trim();
+        return text ? { type: 'text', text } : null;
+      }
+
+      if (entry?.type === 'image') {
+        const inlineImage = typeof entry.imageUrl === 'string' ? parseInlineDataUrl(entry.imageUrl) : null;
+        const data = String(entry.data || inlineImage?.data || '').trim();
+        if (!data) {
+          return null;
+        }
+
+        return {
+          type: 'image',
+          data,
+          mimeType: String(entry.mimeType || inlineImage?.mimeType || 'image/png').trim() || 'image/png',
+        };
+      }
+
+      return null;
+    })
+    .filter(Boolean);
+}
+
 function normalizeChatMessages(messages = []) {
   return Array.isArray(messages)
     ? messages
         .map((message) => ({
           role: String(message?.role || '').trim(),
-          content: String(message?.content || '').trim(),
+          content: normalizeChatContentParts(message?.content),
         }))
-        .filter((message) => message.role && message.content)
+        .filter((message) => message.role && message.content.length)
     : [];
 }
 
@@ -290,19 +343,76 @@ function extractTextParts(value) {
   return '';
 }
 
+function toOpenAiCompatibleContent(parts = []) {
+  const normalizedParts = Array.isArray(parts) ? parts : [];
+  if (!normalizedParts.some((part) => part.type === 'image')) {
+    return extractTextParts(normalizedParts);
+  }
+
+  return normalizedParts.map((part) =>
+    part.type === 'image'
+      ? {
+          type: 'image_url',
+          image_url: {
+            url: 'data:' + (part.mimeType || 'image/png') + ';base64,' + part.data,
+          },
+        }
+      : {
+          type: 'text',
+          text: part.text,
+        }
+  );
+}
+
+function toAnthropicContent(parts = []) {
+  return (Array.isArray(parts) ? parts : []).map((part) =>
+    part.type === 'image'
+      ? {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: part.mimeType || 'image/png',
+            data: part.data,
+          },
+        }
+      : {
+          type: 'text',
+          text: part.text,
+        }
+  );
+}
+
+function toGoogleContentParts(parts = []) {
+  return (Array.isArray(parts) ? parts : []).map((part) =>
+    part.type === 'image'
+      ? {
+          inlineData: {
+            mimeType: part.mimeType || 'image/png',
+            data: part.data,
+          },
+        }
+      : {
+          text: part.text,
+        }
+  );
+}
+
 async function sendOpenAICompatibleChat(provider, apiKey, payload) {
   const response = await requestProviderJson(provider, apiKey, provider.configuration?.chatEndpoint || '/chat/completions', {
     method: 'POST',
     body: JSON.stringify({
       model: payload.model,
-      messages: payload.messages,
+      messages: payload.messages.map((message) => ({
+        role: message.role,
+        content: toOpenAiCompatibleContent(message.content),
+      })),
       stream: false,
     }),
   });
 
   const content = extractTextParts(response?.choices?.[0]?.message?.content || response?.choices?.[0]?.text || response?.output_text || '');
   if (!content) {
-    throw new Error(`${provider.name} returned an empty reply.`);
+    throw new Error(provider.name + ' returned an empty reply.');
   }
 
   return {
@@ -316,13 +426,17 @@ async function sendOpenAICompatibleChat(provider, apiKey, payload) {
 }
 
 async function sendAnthropicChat(provider, apiKey, payload) {
-  const systemMessages = payload.messages.filter((message) => message.role === 'system').map((message) => message.content);
+  const systemMessages = payload.messages
+    .filter((message) => message.role === 'system')
+    .map((message) => extractTextParts(message.content))
+    .filter(Boolean);
   const conversation = payload.messages
     .filter((message) => message.role === 'user' || message.role === 'assistant')
     .map((message) => ({
       role: message.role,
-      content: [{ type: 'text', text: message.content }],
-    }));
+      content: toAnthropicContent(message.content),
+    }))
+    .filter((message) => message.content.length);
 
   if (!conversation.length) {
     throw new Error('Type a message before sending it to this provider.');
@@ -340,7 +454,7 @@ async function sendAnthropicChat(provider, apiKey, payload) {
 
   const content = extractTextParts(response?.content || '');
   if (!content) {
-    throw new Error(`${provider.name} returned an empty reply.`);
+    throw new Error(provider.name + ' returned an empty reply.');
   }
 
   return {
@@ -354,20 +468,24 @@ async function sendAnthropicChat(provider, apiKey, payload) {
 }
 
 async function sendGoogleChat(provider, apiKey, payload) {
-  const systemMessages = payload.messages.filter((message) => message.role === 'system').map((message) => message.content);
+  const systemMessages = payload.messages
+    .filter((message) => message.role === 'system')
+    .map((message) => extractTextParts(message.content))
+    .filter(Boolean);
   const contents = payload.messages
     .filter((message) => message.role === 'user' || message.role === 'assistant')
     .map((message) => ({
       role: message.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: message.content }],
-    }));
+      parts: toGoogleContentParts(message.content),
+    }))
+    .filter((message) => message.parts.length);
 
   if (!contents.length) {
     throw new Error('Type a message before sending it to this provider.');
   }
 
-  const modelPath = String(payload.model || '').startsWith('models/') ? payload.model : `models/${payload.model}`;
-  const response = await requestProviderJson(provider, apiKey, `${modelPath}:generateContent`, {
+  const modelPath = String(payload.model || '').startsWith('models/') ? payload.model : 'models/' + payload.model;
+  const response = await requestProviderJson(provider, apiKey, modelPath + ':generateContent', {
     method: 'POST',
     body: JSON.stringify({
       contents,
@@ -383,7 +501,7 @@ async function sendGoogleChat(provider, apiKey, payload) {
 
   const content = extractTextParts(response?.candidates?.[0]?.content?.parts || '');
   if (!content) {
-    throw new Error(`${provider.name} returned an empty reply.`);
+    throw new Error(provider.name + ' returned an empty reply.');
   }
 
   return {
@@ -397,6 +515,7 @@ async function sendGoogleChat(provider, apiKey, payload) {
 }
 
 async function listProviderConnections() {
+
   await initializeProviderRegistry();
   const settings = await readProviderSettings();
 
@@ -628,3 +747,5 @@ module.exports = {
   saveProviderConnection,
   testProviderConnection,
 };
+
+

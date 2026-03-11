@@ -1326,11 +1326,11 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not transcribe that audio file.'),
   );
 
-  ipcMain.handle('ollama:list-models', () =>
+  ipcMain.handle('ollama:list-models', (_event, options) =>
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup('ollama', state.tools);
-      return listOllamaModels(tool);
+      return listOllamaModels(tool, options || {});
     }, 'Local AI Hub could not load your local Ollama models.'),
   );
 
@@ -1427,7 +1427,7 @@ function registerIpcHandlers() {
 
   ipcMain.handle('pipelines:cancel-run', (_event, runId) =>
     withPlainEnglishErrors(async () => ({
-      message: 'Local AI Hub will stop the active pipeline after the current step finishes.',
+      message: 'Local AI Hub will stop the active pipeline after the current step finishes and shut down any tool it started for the run.',
       run: cancelPipelineRun(runId),
     }), 'Local AI Hub could not cancel that pipeline run.'),
   );
@@ -1547,6 +1547,11 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
+
+
+
+
+
 
 
 

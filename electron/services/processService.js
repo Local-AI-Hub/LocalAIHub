@@ -1353,12 +1353,14 @@ module.exports = {
   getRunningToolIds,
   getRuntimeOutputSnapshot,
   isToolActive,
+  isToolReady,
   launchToolFromUserAction,
   resolveToolStatus,
   sendInputToTool,
   setRuntimeEventSink,
   stopTool,
 };
+
 
 
 

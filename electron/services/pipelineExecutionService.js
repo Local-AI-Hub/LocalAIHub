@@ -1,7 +1,7 @@
 const path = require('path');
 const fs = require('fs-extra');
 
-const { chatWithOllama } = require('./ollamaService');
+const { chatWithOllama, inspectOllamaModel, inspectOllamaModelCapabilities } = require('./ollamaService');
 const { listProviderConnections, chatWithProvider } = require('./providerService');
 const { initializeProviderRegistry } = require('./providerRegistry');
 const { getToolCatalog } = require('./toolRegistry');
@@ -23,6 +23,7 @@ const {
   interrogateImageWithWorkflowTool,
   resolveSelectedImageTool,
 } = require('./workflowToolService');
+const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const {
   PORT_KIND_IMAGE,
   analyzePipeline,
@@ -65,12 +66,95 @@ function emitPipelineEvent() {
   }
 }
 
-async function buildPipelineContext() {
+function collectSelectedOllamaModels(definition = {}) {
+  const selectedModels = new Set();
+
+  for (const node of Array.isArray(definition?.nodes) ? definition.nodes : []) {
+    if (node?.type === 'llmPrompt' && node?.config?.executionMode === 'ollama') {
+      const model = String(node.config?.model || '').trim();
+      if (model) {
+        selectedModels.add(model);
+      }
+    }
+
+    if (node?.type === 'validation' && node?.config?.mode === 'llm' && node?.config?.llmExecutionMode === 'ollama') {
+      const model = String(node.config?.model || '').trim();
+      if (model) {
+        selectedModels.add(model);
+      }
+    }
+  }
+
+  return [...selectedModels];
+}
+
+function attachOllamaModelCapabilities(tools = [], modelCapabilitiesByName = {}) {
+  if (!Object.keys(modelCapabilitiesByName).length) {
+    return tools;
+  }
+
+  return tools.map((tool) =>
+    tool?.id === 'ollama'
+      ? {
+          ...tool,
+          modelCapabilitiesByName: {
+            ...(tool.modelCapabilitiesByName || {}),
+            ...modelCapabilitiesByName,
+          },
+        }
+      : tool,
+  );
+}
+
+function getOllamaModelCapabilityEntry(contextMaps, model) {
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  if (!normalizedModel) {
+    return null;
+  }
+
+  const lookup = contextMaps?.toolsById?.ollama?.modelCapabilitiesByName;
+  if (!lookup || typeof lookup !== 'object') {
+    return null;
+  }
+
+  return lookup[normalizedModel] || null;
+}
+
+async function ensureOllamaImageModelSupport(contextMaps, ollamaTool, model) {
+  let capability = getOllamaModelCapabilityEntry(contextMaps, model);
+  if (!capability) {
+    capability = await inspectOllamaModel(ollamaTool, model).catch(() => null);
+    if (capability) {
+      const normalizedModel = String(model || '').trim().toLowerCase();
+      if (!contextMaps.toolsById.ollama.modelCapabilitiesByName || typeof contextMaps.toolsById.ollama.modelCapabilitiesByName !== 'object') {
+        contextMaps.toolsById.ollama.modelCapabilitiesByName = {};
+      }
+      contextMaps.toolsById.ollama.modelCapabilitiesByName[normalizedModel] = capability;
+    }
+  }
+
+  if (capability?.supportsImageInput === false) {
+    throw new Error('Selected model does not support image input. Choose a vision-capable Ollama model before running this step.');
+  }
+}
+
+async function buildPipelineContext(definition = {}) {
   await initializeProviderRegistry();
-  const toolEntries = await buildMergedToolStateList({
+  let toolEntries = await buildMergedToolStateList({
     resolveStatuses: true,
     syncDiscovered: true,
   });
+
+  const selectedOllamaModels = collectSelectedOllamaModels(definition);
+  if (selectedOllamaModels.length) {
+    const ollamaTool = toolEntries.find((tool) => tool?.id === 'ollama') || null;
+    if (ollamaTool) {
+      const modelCapabilitiesByName = await inspectOllamaModelCapabilities(ollamaTool, selectedOllamaModels).catch(() => null);
+      if (modelCapabilitiesByName && Object.keys(modelCapabilitiesByName).length) {
+        toolEntries = attachOllamaModelCapabilities(toolEntries, modelCapabilitiesByName);
+      }
+    }
+  }
 
   return buildContextMaps({
     hardware: null,
@@ -81,7 +165,7 @@ async function buildPipelineContext() {
 }
 
 async function analyzeWithCurrentContext(definition) {
-  const context = await buildPipelineContext();
+  const context = await buildPipelineContext(definition);
   return {
     analysis: analyzePipeline(definition, context),
     context,
@@ -119,7 +203,7 @@ function createRunRecord(analysis, graph, runDirectories) {
     directories: runDirectories,
     executionOrder: [...analysis.executionOrder],
     finishedAt: null,
-    message: 'Local AI Hub is running the pipeline step by step.',
+    message: 'Local AI Hub is running the pipeline step by step and will launch local tools only when needed.',
     nodeStates: createInitialNodeStates(graph),
     pendingValidation: null,
     pipelineId: analysis.pipeline.id,
@@ -145,6 +229,40 @@ function serializeRun(run) {
 
 function getActiveRunSnapshot() {
   return serializeRun(activeRun);
+}
+
+function updateRunMessage(run, message) {
+  const nextMessage = String(message || '').trim();
+  if (!run || !nextMessage) {
+    return;
+  }
+
+  run.message = nextMessage;
+  emitPipelineEvent();
+}
+
+function createProgressReporter(run, nodeId = '') {
+  return (message, runMessage = '') => {
+    if (nodeId) {
+      updateRunningNodeProgress(run, nodeId, message, runMessage);
+      return;
+    }
+
+    updateRunMessage(run, runMessage || message);
+  };
+}
+
+async function disposePipelineTools(orchestrator, run, nodeId, reason) {
+  if (!orchestrator) {
+    return null;
+  }
+
+  try {
+    await orchestrator.dispose(createProgressReporter(run, nodeId), reason);
+    return null;
+  } catch (error) {
+    return error;
+  }
 }
 
 function updateRunningNodeProgress(run, nodeId, message, runMessage = '') {
@@ -203,14 +321,26 @@ function getMissingRequiredInputs(node, graph, resultsByNodeId) {
     .map((port) => port.label);
 }
 
-function buildLlmMessages(node, promptText) {
+async function buildImageMessageContentPart(artifact) {
+  const filePath = path.resolve(String(artifact?.filePath || '').trim());
+  if (!filePath || !(await fs.pathExists(filePath))) {
+    throw new Error('The image for this step could not be found anymore. Choose it again and rerun the pipeline.');
+  }
+
+  return {
+    type: 'image',
+    data: (await fs.readFile(filePath)).toString('base64'),
+    mimeType: String(artifact?.mimeType || 'image/png').trim() || 'image/png',
+  };
+}
+
+async function buildLlmMessages(node, inputArtifact) {
   const instruction = String(node.config?.instruction || '').trim();
   const systemPrompt = String(node.config?.systemPrompt || '').trim();
   const messages = [];
-  const normalizedInput = String(promptText || '').trim();
 
-  if (!normalizedInput) {
-    throw new Error('This LLM step did not receive any text input.');
+  if (!inputArtifact) {
+    throw new Error('This LLM step did not receive any input.');
   }
 
   if (systemPrompt) {
@@ -220,15 +350,38 @@ function buildLlmMessages(node, promptText) {
     });
   }
 
-  messages.push({
-    role: 'user',
-    content: instruction ? `${instruction}\n\nInput:\n${normalizedInput}` : normalizedInput,
-  });
+  if (inputArtifact.kind === 'text') {
+    const normalizedInput = String(inputArtifact.text || '').trim();
+    if (!normalizedInput) {
+      throw new Error('This LLM step did not receive any text input.');
+    }
 
-  return messages;
+    messages.push({
+      role: 'user',
+      content: instruction ? instruction + '\n\nInput:\n' + normalizedInput : normalizedInput,
+    });
+    return messages;
+  }
+
+  if (inputArtifact.kind === PORT_KIND_IMAGE && inputArtifact.filePath) {
+    messages.push({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: instruction || 'Describe this image in plain English.',
+        },
+        await buildImageMessageContentPart(inputArtifact),
+      ],
+    });
+    return messages;
+  }
+
+  throw new Error('This LLM step currently supports text or image input only.');
 }
 
 function buildValidationMessages(node, artifactDescription) {
+
   const ruleset = String(node.config?.ruleset || '').trim();
   const systemPrompt = String(node.config?.systemPrompt || '').trim();
   const messages = [];
@@ -416,6 +569,9 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
       'ollama',
       'Install Ollama before using a local validation step in a pipeline.',
     );
+    if (artifact.kind === PORT_KIND_IMAGE) {
+      await ensureOllamaImageModelSupport(contextMaps, ollamaTool, model);
+    }
     const result = await chatWithOllama(ollamaTool, {
       messages,
       model,
@@ -528,27 +684,30 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
   if (node.type === 'llmPrompt') {
     const promptArtifact = getNodeInputArtifact(node.id, 'prompt', graph, run.resultsByNodeId);
-    const promptText = String(promptArtifact?.text || '').trim();
     const model = String(node.config?.model || '').trim();
     const executionMode = node.config?.executionMode === 'ollama' ? 'ollama' : 'cloud';
-    if (!promptText) {
-      throw new Error('This LLM step did not receive any text input.');
+    if (!promptArtifact) {
+      throw new Error('This LLM step did not receive any input.');
     }
 
     if (!model) {
       throw new Error('Choose or enter a model for the LLM Prompt node before running this pipeline.');
     }
 
-    const messages = buildLlmMessages(node, promptText);
+    const messages = await buildLlmMessages(node, promptArtifact);
+    const inputLabel = promptArtifact.kind === PORT_KIND_IMAGE ? 'image' : 'prompt';
     let content = '';
     let sourceLabel = 'This model';
     if (executionMode === 'ollama') {
-      reportProgress?.('Sending the prompt to Ollama and waiting for a reply.', `Running ${node.label} with Ollama...`);
+      reportProgress?.('Sending the ' + inputLabel + ' to Ollama and waiting for a reply.', 'Running ' + node.label + ' with Ollama...');
       const ollamaTool = await getInstalledToolOrThrow(
         contextMaps,
         'ollama',
         'Install Ollama before using a local LLM step in a pipeline.',
       );
+      if (promptArtifact.kind === PORT_KIND_IMAGE) {
+        await ensureOllamaImageModelSupport(contextMaps, ollamaTool, model);
+      }
       const result = await chatWithOllama(ollamaTool, {
         messages,
         model,
@@ -566,7 +725,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
       }
 
-      reportProgress?.(`Sending the prompt to ${provider.name}.`, `Running ${node.label} with ${provider.name}...`);
+      reportProgress?.('Sending the ' + inputLabel + ' to ' + provider.name + '.', 'Running ' + node.label + ' with ' + provider.name + '...');
       const result = await chatWithProvider(providerId, {
         messages,
         model,
@@ -577,7 +736,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     }
 
     if (!content) {
-      throw new Error(`${sourceLabel} returned an empty reply for this pipeline step.`);
+      throw new Error(sourceLabel + ' returned an empty reply for this pipeline step.');
     }
 
     const artifact = createTextArtifact(content, {
@@ -585,7 +744,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       role: 'generated',
     });
     return {
-      message: `${sourceLabel} returned a reply.`,
+      message: sourceLabel + ' returned a reply.',
       outputs: {
         text: artifact,
       },
@@ -593,6 +752,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     };
   }
   if (node.type === 'whisperTranscribe') {
+
     const audioArtifact = getNodeInputArtifact(node.id, 'audio', graph, run.resultsByNodeId);
     if (!audioArtifact?.filePath) {
       throw new Error('This Whisper step did not receive an audio file.');
@@ -719,13 +879,32 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 }
 
 async function executeActiveRun(graph, context) {
+  const orchestrator = createPipelineToolOrchestrator(context);
+  let orchestratorDisposed = false;
+
+  const disposeOrchestrator = async (nodeId, reason) => {
+    if (orchestratorDisposed) {
+      return null;
+    }
+
+    orchestratorDisposed = true;
+    return disposePipelineTools(orchestrator, activeRun, nodeId, reason);
+  };
+
   try {
-    for (const nodeId of graph.executionOrder) {
+    for (let index = 0; index < graph.executionOrder.length; index += 1) {
+      const nodeId = graph.executionOrder[index];
       if (!activeRun) {
+        await disposeOrchestrator('', 'this pipeline run');
         return;
       }
 
       if (activeRun.cancelRequested) {
+        const cleanupError = await disposeOrchestrator('', 'this cancelled pipeline run');
+        if (cleanupError) {
+          throw cleanupError;
+        }
+
         markRemainingNodes(activeRun, graph, 'cancelled', 'Cancelled before this step started.');
         activeRun.status = 'cancelled';
         activeRun.message = 'Pipeline run cancelled.';
@@ -736,6 +915,8 @@ async function executeActiveRun(graph, context) {
       }
 
       const node = graph.nodeMap.get(nodeId);
+      const nextNodeId = graph.executionOrder[index + 1] || '';
+      const nextNode = nextNodeId ? graph.nodeMap.get(nextNodeId) : null;
       const nodeState = activeRun.nodeStates[nodeId];
       const missingInputs = getMissingRequiredInputs(node, graph, activeRun.resultsByNodeId);
       if (missingInputs.length) {
@@ -754,9 +935,11 @@ async function executeActiveRun(graph, context) {
       activeRun.message = `Running ${node.label}...`;
       emitPipelineEvent();
 
-      const result = await executeNode(node, graph, activeRun, context, (message, runMessage) =>
-        updateRunningNodeProgress(activeRun, node.id, message, runMessage),
-      );
+      const progressReporter = createProgressReporter(activeRun, node.id);
+      await orchestrator.ensureToolForNode(node, progressReporter);
+      const result = await executeNode(node, graph, activeRun, context, progressReporter);
+      await orchestrator.releaseToolForNode(node, nextNode, progressReporter);
+
       activeRun.resultsByNodeId[nodeId] = {
         outputs: Object.fromEntries(
           Object.entries(result.outputs || {}).map(([portId, artifact]) => [portId, serializeArtifactForUi(artifact)]),
@@ -782,7 +965,13 @@ async function executeActiveRun(graph, context) {
     }
 
     if (!activeRun) {
+      await disposeOrchestrator('', 'this pipeline run');
       return;
+    }
+
+    const cleanupError = await disposeOrchestrator('', 'this finished pipeline run');
+    if (cleanupError) {
+      throw cleanupError;
     }
 
     activeRun.status = 'completed';
@@ -794,19 +983,24 @@ async function executeActiveRun(graph, context) {
       return;
     }
 
-    const isCancelled = error instanceof PipelineCancelledError || activeRun.cancelRequested;
+    const cleanupError = await disposeOrchestrator(
+      activeRun.currentNodeId || '',
+      activeRun.cancelRequested ? 'this cancelled pipeline run' : 'this pipeline run',
+    );
+    const finalError = cleanupError && !error ? cleanupError : error;
+    const isCancelled = finalError instanceof PipelineCancelledError || activeRun.cancelRequested;
     const failedNodeId = activeRun.currentNodeId;
     if (failedNodeId && activeRun.nodeStates[failedNodeId]) {
       activeRun.nodeStates[failedNodeId].status = isCancelled ? 'cancelled' : 'failed';
       activeRun.nodeStates[failedNodeId].finishedAt = new Date().toISOString();
-      activeRun.nodeStates[failedNodeId].message = error.message || (isCancelled ? 'Pipeline run cancelled.' : 'This step failed.');
+      activeRun.nodeStates[failedNodeId].message = finalError.message || (isCancelled ? 'Pipeline run cancelled.' : 'This step failed.');
     }
 
     pendingValidationControl = null;
     activeRun.pendingValidation = null;
     markRemainingNodes(activeRun, graph, isCancelled ? 'cancelled' : 'skipped', isCancelled ? 'Cancelled before this step started.' : 'Skipped because an earlier step failed.');
     activeRun.status = isCancelled ? 'cancelled' : 'failed';
-    activeRun.message = isCancelled ? 'Pipeline run cancelled.' : error.message || 'Pipeline run failed.';
+    activeRun.message = isCancelled ? 'Pipeline run cancelled.' : finalError.message || 'Pipeline run failed.';
     activeRun.finishedAt = new Date().toISOString();
     activeRun.currentNodeId = null;
     emitPipelineEvent();
@@ -841,7 +1035,7 @@ function cancelPipelineRun(runId) {
   }
 
   activeRun.cancelRequested = true;
-  activeRun.message = 'Local AI Hub will stop this pipeline after the current step finishes.';
+  activeRun.message = 'Local AI Hub will stop this pipeline after the current step finishes and shut down any tool it started for the run.';
   if (activeRun.status === 'paused' && pendingValidationControl?.resolve) {
     const resolve = pendingValidationControl.resolve;
     pendingValidationControl = null;
@@ -909,6 +1103,11 @@ module.exports = {
   runPipeline,
   setPipelineEventSink,
 };
+
+
+
+
+
 
 
 

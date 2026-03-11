@@ -1,4 +1,12 @@
-﻿const PIPELINE_SCHEMA_VERSION = 2;
+const {
+  PIPELINE_OPERATION_IDS,
+  getProviderIdsForPipelineOperation,
+  getProviderPipelineOperation,
+  getToolIdsForPipelineOperation,
+  getToolPipelineOperation,
+} = require('./pipelineCapabilities.cjs');
+
+const PIPELINE_SCHEMA_VERSION = 2;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
 const PORT_KIND_TEXT = 'text';
@@ -23,7 +31,7 @@ const PIPELINE_PORT_KIND_LABELS = Object.freeze({
   [PORT_KIND_VIDEO]: 'Video',
   [PORT_KIND_FILE]: 'File',
 });
-const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(['automatic1111', 'forge']);
+const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
 
 const WHISPER_MODELS = [
   { id: 'tiny', label: 'Tiny' },
@@ -123,12 +131,13 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'llmPrompt',
     label: 'LLM Prompt',
     category: 'AI Steps',
-    description: 'Sends text to a cloud provider or Ollama and returns text.',
+    description: 'Sends text or an image to a compatible provider or Ollama model and returns text.',
     inputPorts: [
       {
         id: 'prompt',
-        kind: PORT_KIND_TEXT,
-        label: 'Prompt',
+        kind: PORT_KIND_ANY,
+        allowedKinds: [PORT_KIND_TEXT, PORT_KIND_IMAGE],
+        label: 'Input',
         required: true,
       },
     ],
@@ -160,9 +169,9 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   whisperTranscribe: Object.freeze({
     type: 'whisperTranscribe',
-    label: 'Whisper Transcribe',
+    label: 'Audio Transcription',
     category: 'AI Steps',
-    description: 'Runs the installed local Whisper transcription flow.',
+    description: 'Turns incoming audio into text. Choose the transcription model in the inspector.',
     inputPorts: [
       {
         id: 'audio',
@@ -187,7 +196,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'imageAnalyze',
     label: 'Image Analysis',
     category: 'AI Steps',
-    description: 'Uses Automatic1111 or Forge to describe an incoming image.',
+    description: 'Describes an incoming image. Choose the execution tool in the inspector.',
     inputPorts: [
       {
         id: 'image',
@@ -212,9 +221,9 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   imageGenerate: Object.freeze({
     type: 'imageGenerate',
-    label: 'Image Generate',
+    label: 'Image Generation',
     category: 'AI Steps',
-    description: 'Uses Automatic1111 or Forge to turn text into an image file.',
+    description: 'Turns text into an image. Choose the execution tool in the inspector.',
     inputPorts: [
       {
         id: 'prompt',
@@ -728,6 +737,323 @@ function buildContextMaps(context = {}) {
   };
 }
 
+function uniqueKindList(values = []) {
+  return [...new Set((values || []).map((entry) => normalizePortKind(entry)).filter(Boolean))];
+}
+
+function formatPortKindList(kinds = []) {
+  const labels = uniqueKindList(kinds).map((kind) => PIPELINE_PORT_KIND_LABELS[kind] || kind);
+  if (!labels.length) {
+    return 'nothing yet';
+  }
+
+  if (labels.length === 1) {
+    return labels[0];
+  }
+
+  if (labels.length === 2) {
+    return labels[0] + ' or ' + labels[1];
+  }
+
+  return labels.slice(0, -1).join(', ') + ', or ' + labels[labels.length - 1];
+}
+
+function getContextToolEntry(toolId, contextMaps = {}) {
+  const normalizedToolId = String(toolId || '').trim().toLowerCase();
+  if (!normalizedToolId) {
+    return null;
+  }
+
+  return contextMaps.toolsById?.[normalizedToolId] || contextMaps.toolCatalogById?.[normalizedToolId] || null;
+}
+
+function getContextProviderEntry(providerId, contextMaps = {}) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (!normalizedProviderId) {
+    return null;
+  }
+
+  return contextMaps.providersById?.[normalizedProviderId] || null;
+}
+
+function getContextToolOperation(toolId, operationId, contextMaps = {}) {
+  return getContextToolEntry(toolId, contextMaps)?.pipelineCapabilities?.operations?.[operationId] || getToolPipelineOperation(toolId, operationId);
+}
+
+function getContextProviderOperation(providerId, operationId, contextMaps = {}) {
+  return getContextProviderEntry(providerId, contextMaps)?.pipelineCapabilities?.operations?.[operationId] || getProviderPipelineOperation(providerId, operationId);
+}
+
+function mergeCapabilityOperations(operations = []) {
+  const usableOperations = (operations || []).filter(Boolean);
+  if (!usableOperations.length) {
+    return null;
+  }
+
+  return {
+    inputKinds: uniqueKindList(usableOperations.flatMap((operation) => operation.inputKinds || [])),
+    notes: usableOperations.map((operation) => String(operation.notes || '').trim()).find(Boolean) || '',
+    outputKinds: uniqueKindList(usableOperations.flatMap((operation) => operation.outputKinds || [])),
+  };
+}
+
+function getIncomingKindsForNodePort(node, portId, graph) {
+  if (!node || !graph) {
+    return [];
+  }
+
+  const incomingEdge = graph.incomingEdgeByPortKey.get(node.id + ':' + portId);
+  if (!incomingEdge) {
+    return [];
+  }
+
+  const sourceNode = graph.nodeMap.get(incomingEdge.source.nodeId);
+  const sourcePort = getPortDefinition(sourceNode?.type, 'output', incomingEdge.source.portId);
+  return resolveOutputKinds(sourceNode, sourcePort, graph);
+}
+
+function doesModelLikelySupportImages(targetKind, targetId, model) {
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  if (!normalizedModel) {
+    return false;
+  }
+
+  if (targetKind === 'tool' && targetId === 'ollama') {
+    return /(vision|llava|bakllava|moondream|qwen2(\.5)?-?vl|minicpm-v|llama[- ]?3\.2[- ]?vision|internvl)/i.test(normalizedModel);
+  }
+
+  if (targetKind !== 'provider') {
+    return false;
+  }
+
+  if (targetId === 'openai') {
+    return /(gpt-4o|gpt-4\.1|gpt-4\.5|gpt-5|\bo1\b|\bo3\b)/i.test(normalizedModel);
+  }
+
+  if (targetId === 'anthropic') {
+    return /claude-(3|4)/i.test(normalizedModel);
+  }
+
+  if (targetId === 'google') {
+    return /gemini/i.test(normalizedModel);
+  }
+
+  return false;
+}
+
+function resolveToolBackedNodeCapability(node, contextMaps = {}) {
+  if (!node) {
+    return null;
+  }
+
+  if (node.type === 'whisperTranscribe') {
+    const tool = getContextToolEntry('whisper', contextMaps);
+    return {
+      capability: getContextToolOperation('whisper', PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, contextMaps),
+      operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE,
+      targetId: 'whisper',
+      targetKind: 'tool',
+      targetLabel: tool?.name || 'Whisper',
+    };
+  }
+
+  if (node.type === 'imageAnalyze' || node.type === 'imageGenerate') {
+    const operationId = node.type === 'imageAnalyze' ? PIPELINE_OPERATION_IDS.IMAGE_ANALYZE : PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+    const effectiveToolId = getImageToolIdForNode(node, contextMaps);
+    const toolIds = effectiveToolId ? [effectiveToolId] : IMAGE_WORKFLOW_TOOL_IDS;
+    const tool = effectiveToolId ? getContextToolEntry(effectiveToolId, contextMaps) : null;
+    return {
+      capability: mergeCapabilityOperations(toolIds.map((toolId) => getContextToolOperation(toolId, operationId, contextMaps))),
+      operationId,
+      targetId: effectiveToolId || '',
+      targetKind: 'tool',
+      targetLabel: tool?.name || 'Automatic1111 or Forge',
+    };
+  }
+
+  return null;
+}
+
+function resolveLlmNodeCapability(node, contextMaps = {}) {
+  const executionMode = node?.config?.executionMode === 'ollama' ? 'ollama' : 'cloud';
+  if (executionMode === 'ollama') {
+    const tool = getContextToolEntry('ollama', contextMaps);
+    return {
+      capability: getContextToolOperation('ollama', PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps),
+      operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT,
+      targetId: 'ollama',
+      targetKind: 'tool',
+      targetLabel: tool?.name || 'Ollama',
+    };
+  }
+
+  const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+  if (providerId) {
+    const provider = getContextProviderEntry(providerId, contextMaps);
+    return {
+      capability: getContextProviderOperation(providerId, PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps),
+      operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT,
+      targetId: providerId,
+      targetKind: 'provider',
+      targetLabel: provider?.name || 'Cloud provider',
+    };
+  }
+
+  return {
+    capability: mergeCapabilityOperations(
+      getProviderIdsForPipelineOperation(PIPELINE_OPERATION_IDS.LLM_PROMPT).map((entry) => getContextProviderOperation(entry, PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps)),
+    ),
+    operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT,
+    targetId: '',
+    targetKind: 'provider',
+    targetLabel: 'Cloud provider',
+  };
+}
+
+function resolveValidationNodeCapability(node, contextMaps = {}) {
+  if (node?.config?.mode !== 'llm') {
+    return null;
+  }
+
+  const executionMode = node?.config?.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud';
+  if (executionMode === 'ollama') {
+    const tool = getContextToolEntry('ollama', contextMaps);
+    return {
+      capability: getContextToolOperation('ollama', PIPELINE_OPERATION_IDS.VALIDATION_LLM, contextMaps),
+      operationId: PIPELINE_OPERATION_IDS.VALIDATION_LLM,
+      targetId: 'ollama',
+      targetKind: 'tool',
+      targetLabel: tool?.name || 'Ollama',
+    };
+  }
+
+  const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+  if (providerId) {
+    const provider = getContextProviderEntry(providerId, contextMaps);
+    return {
+      capability: getContextProviderOperation(providerId, PIPELINE_OPERATION_IDS.VALIDATION_LLM, contextMaps),
+      operationId: PIPELINE_OPERATION_IDS.VALIDATION_LLM,
+      targetId: providerId,
+      targetKind: 'provider',
+      targetLabel: provider?.name || 'Cloud provider',
+    };
+  }
+
+  return {
+    capability: mergeCapabilityOperations(
+      getProviderIdsForPipelineOperation(PIPELINE_OPERATION_IDS.VALIDATION_LLM).map((entry) => getContextProviderOperation(entry, PIPELINE_OPERATION_IDS.VALIDATION_LLM, contextMaps)),
+    ),
+    operationId: PIPELINE_OPERATION_IDS.VALIDATION_LLM,
+    targetId: '',
+    targetKind: 'provider',
+    targetLabel: 'Cloud provider',
+  };
+}
+
+function resolveNodeCapability(node, contextMaps = {}) {
+  if (!node) {
+    return null;
+  }
+
+  if (node.type === 'llmPrompt') {
+    return resolveLlmNodeCapability(node, contextMaps);
+  }
+
+  if (node.type === 'validation') {
+    return resolveValidationNodeCapability(node, contextMaps);
+  }
+
+  return resolveToolBackedNodeCapability(node, contextMaps);
+}
+
+function buildNodeCapabilitySummary(node, contextMaps = {}) {
+  const resolved = resolveNodeCapability(node, contextMaps);
+  const capability = resolved?.capability || null;
+  if (!capability) {
+    return null;
+  }
+
+  const inputKinds = uniqueKindList(capability.inputKinds);
+  const outputKinds = uniqueKindList(capability.outputKinds);
+  const notes = String(capability.notes || '').trim();
+  return {
+    inputKinds,
+    message: resolved.targetLabel + ' supports ' + formatPortKindList(inputKinds) + ' to ' + formatPortKindList(outputKinds) + ' for this step.' + (notes ? ' ' + notes : ''),
+    notes,
+    outputKinds,
+    targetId: resolved.targetId,
+    targetKind: resolved.targetKind,
+    targetLabel: resolved.targetLabel,
+  };
+}
+
+function getOllamaModelCapabilityEntry(model, contextMaps = {}) {
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  if (!normalizedModel) {
+    return null;
+  }
+
+  const lookup = getContextToolEntry('ollama', contextMaps)?.modelCapabilitiesByName;
+  if (!lookup || typeof lookup !== 'object') {
+    return null;
+  }
+
+  return lookup[normalizedModel] || null;
+}
+
+function getImageModelSupportState(node, capabilitySummary, contextMaps = {}) {
+  if (!capabilitySummary?.inputKinds?.includes(PORT_KIND_IMAGE)) {
+    return {
+      status: 'not-applicable',
+      message: '',
+    };
+  }
+
+  const model = String(node?.config?.model || '').trim();
+  if (!model) {
+    return {
+      status: 'unknown',
+      message: '',
+    };
+  }
+
+  if (capabilitySummary.targetKind === 'tool' && capabilitySummary.targetId === 'ollama') {
+    const capability = getOllamaModelCapabilityEntry(model, contextMaps);
+    if (capability?.supportsImageInput === false) {
+      return {
+        status: 'unsupported',
+        message: 'Selected model does not support image input. Choose a vision-capable Ollama model before running this step.',
+      };
+    }
+
+    if (capability?.supportsImageInput === true) {
+      return {
+        status: 'supported',
+        message: '',
+      };
+    }
+  }
+
+  if (doesModelLikelySupportImages(capabilitySummary.targetKind, capabilitySummary.targetId, model)) {
+    return {
+      status: 'supported',
+      message: '',
+    };
+  }
+
+  if (capabilitySummary.targetKind === 'tool') {
+    return {
+      status: 'unknown',
+      message: 'This step is wired for image input, but Local AI Hub cannot confirm that the selected Ollama model supports images yet. If it refuses the image, switch to a vision-capable Ollama model like Llava or Qwen VL.',
+    };
+  }
+
+  return {
+    status: 'unknown',
+    message: 'This step is wired for image input, but the selected model name does not clearly look image-capable. If the provider rejects the image, choose one of its vision-capable chat models.',
+  };
+}
+
 function buildPipelineGraph(definition = {}) {
   const pipeline = normalizePipelineDefinition(definition, {
     keepCreatedAt: true,
@@ -1066,7 +1392,7 @@ function analyzeImageToolNode(node, summary, contextMaps) {
   if (String(tool.status || '').toLowerCase() !== 'running') {
     summary.readiness = {
       tone: 'warn',
-      message: `${tool.name} is not ready yet. Start it from Library and wait for it to finish starting before running this image step.`,
+      message: `${tool.name} is not running yet. Local AI Hub can start it automatically when this image step begins.`,
     };
     return true;
   }
@@ -1103,6 +1429,7 @@ function analyzePipeline(definition = {}, context = {}) {
         tone: 'good',
         message: 'This node is ready.',
       },
+      capabilitySummary: buildNodeCapabilitySummary(node, contextMaps),
       compatibility: null,
     };
     const definitionEntry = getNodeTypeDefinition(node.type);
@@ -1134,7 +1461,15 @@ function analyzePipeline(definition = {}, context = {}) {
 
       if (node.type === 'llmPrompt') {
         const executionMode = node.config?.executionMode === 'ollama' ? 'ollama' : 'cloud';
-        if (!String(node.config?.model || '').trim()) {
+        const connectedKinds = getIncomingKindsForNodePort(node, 'prompt', graph);
+        const unsupportedKinds = connectedKinds.filter((kind) => !(summary.capabilitySummary?.inputKinds || []).includes(kind));
+        if (unsupportedKinds.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: (summary.capabilitySummary?.targetLabel || 'This target') + ' does not accept ' + formatPortKindList(unsupportedKinds) + ' here. This step currently supports ' + formatPortKindList(summary.capabilitySummary?.inputKinds || [PORT_KIND_TEXT]) + '.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!String(node.config?.model || '').trim()) {
           summary.readiness = {
             tone: 'error',
             message: 'Choose or enter a model for this LLM step.',
@@ -1148,6 +1483,23 @@ function analyzePipeline(definition = {}, context = {}) {
           };
           if (providerStatus.tone === 'error') {
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (connectedKinds.includes(PORT_KIND_IMAGE)) {
+            const imageModelSupport = getImageModelSupportState(node, summary.capabilitySummary, contextMaps);
+            summary.readiness = imageModelSupport.status === 'unsupported'
+              ? {
+                  tone: 'error',
+                  message: imageModelSupport.message,
+                }
+              : imageModelSupport.status === 'unknown'
+                ? {
+                    tone: 'warn',
+                    message: imageModelSupport.message,
+                  }
+                : {
+                    tone: 'info',
+                    message: (providerStatus.provider?.name || 'That provider') + ' can read the connected image and return text.',
+                  };
+            issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
           }
         } else {
           const ollamaTool = contextMaps.toolsById.ollama || null;
@@ -1160,9 +1512,31 @@ function analyzePipeline(definition = {}, context = {}) {
           } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
             summary.readiness = {
               tone: 'warn',
-              message: 'Ollama is not ready yet. Start it from Library and wait for it to finish starting before running this pipeline.',
+              message: 'Ollama is not running yet. Local AI Hub can start it automatically when this pipeline begins.',
             };
             issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+          } else if (connectedKinds.includes(PORT_KIND_IMAGE)) {
+            const imageModelSupport = getImageModelSupportState(node, summary.capabilitySummary, contextMaps);
+            summary.readiness = imageModelSupport.status === 'unsupported'
+              ? {
+                  tone: 'error',
+                  message: imageModelSupport.message,
+                }
+              : imageModelSupport.status === 'unknown'
+                ? {
+                    tone: 'warn',
+                    message: imageModelSupport.message,
+                  }
+                : {
+                    tone: 'info',
+                    message: 'Ollama will read the connected image and return text.',
+                  };
+            issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
+          } else {
+            summary.readiness = {
+              tone: 'info',
+              message: 'Ollama will process this text step locally.',
+            };
           }
         }
       }
@@ -1245,7 +1619,7 @@ function analyzePipeline(definition = {}, context = {}) {
             } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
               summary.readiness = {
                 tone: 'warn',
-                message: 'Ollama is not ready yet. Start it from Library and wait for it to finish starting before running this validator.',
+                message: 'Ollama is not running yet. Local AI Hub can start it automatically when this validator runs.',
               };
               issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
             }
@@ -1378,4 +1752,8 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
+
+
+
+
 
