@@ -49,6 +49,7 @@
     "launchCommand": "python main.py --listen 127.0.0.1 --port {port}",
     "defaultPort": 8188,
     "healthCheckPath": "/",
+    "startupTimeoutMs": 240000,
     "detectionPaths": [
       "%USERPROFILE%\\ComfyUI\\main.py",
       "%USERPROFILE%\\Documents\\ComfyUI\\main.py",

@@ -1,13 +1,17 @@
 const {
   PIPELINE_OPERATION_IDS,
+  TOOL_PIPELINE_STRATEGY_IDS,
+  getGraphWorkflowToolIds,
   getOperationDrivenToolIdsForPipelineOperation,
   getProviderIdsForPipelineOperation,
   getProviderModelCapabilities,
   getProviderPipelineOperation,
+  getRunnableGraphWorkflowToolIds,
   getToolPipelineOperation,
+  getToolPipelineStrategy,
 } = require('./pipelineCapabilities.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 3;
+const PIPELINE_SCHEMA_VERSION = 4;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
@@ -34,6 +38,7 @@ const PIPELINE_PORT_KIND_LABELS = Object.freeze({
   [PORT_KIND_FILE]: 'File',
 });
 const PIPELINE_OPERATION_LABELS = Object.freeze({
+  [PIPELINE_OPERATION_IDS.GRAPH_WORKFLOW]: 'Graph workflow',
   [PIPELINE_OPERATION_IDS.IMAGE_ANALYZE]: 'Image analysis',
   [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: 'Image generation',
   [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: 'Video generation',
@@ -56,6 +61,9 @@ const MODEL_STEP_CLOUD_OPERATION_OPTIONS = Object.freeze([
   },
 ]);
 const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
+const GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getGraphWorkflowToolIds());
+const RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getRunnableGraphWorkflowToolIds());
+const DEFAULT_GRAPH_WORKFLOW_TOOL_ID = RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS[0] || GRAPH_WORKFLOW_TOOL_IDS[0] || 'comfyui';
 
 const WHISPER_MODELS = [
   { id: 'tiny', label: 'Tiny' },
@@ -300,6 +308,51 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       seed: -1,
     },
     supportedToolIds: IMAGE_WORKFLOW_TOOL_IDS,
+  }),
+  graphWorkflow: Object.freeze({
+    type: 'graphWorkflow',
+    label: 'Graph Workflow',
+    category: 'Graph Workflows',
+    description: 'Runs a graph-native local workflow with explicit typed boundaries. Use this for ComfyUI and future graph-style tools instead of the model-step abstraction.',
+    inputPorts: [
+      {
+        id: 'text',
+        kind: PORT_KIND_TEXT,
+        label: 'Text',
+      },
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        label: 'Image',
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        label: 'Image',
+      },
+    ],
+    configDefaults: {
+      toolId: DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
+      workflowText: '',
+      inputBindings: {
+        text: {
+          field: 'text',
+          nodeId: '',
+        },
+        image: {
+          field: 'image',
+          nodeId: '',
+        },
+      },
+      outputBindings: {
+        image: {
+          nodeId: '',
+        },
+      },
+    },
+    supportedToolIds: GRAPH_WORKFLOW_TOOL_IDS,
   }),
   validation: Object.freeze({
     type: 'validation',
@@ -688,6 +741,72 @@ function getModelStepLocalToolId(node, contextMaps = {}) {
   }
 
   return pickAvailableToolId(IMAGE_WORKFLOW_TOOL_IDS, contextMaps);
+}
+
+function getGraphWorkflowToolId(node) {
+  const selectedToolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  return selectedToolId || DEFAULT_GRAPH_WORKFLOW_TOOL_ID;
+}
+
+function getGraphWorkflowInputBinding(node, portId) {
+  const binding = node?.config?.inputBindings?.[portId];
+  return binding && typeof binding === 'object' ? binding : {};
+}
+
+function getGraphWorkflowOutputBinding(node, portId) {
+  const binding = node?.config?.outputBindings?.[portId];
+  return binding && typeof binding === 'object' ? binding : {};
+}
+
+function parseGraphWorkflowDefinitionText(workflowText) {
+  const raw = String(workflowText || '').trim();
+  if (!raw) {
+    return {
+      ok: false,
+      message: 'Paste the exported ComfyUI API workflow JSON before running this graph workflow step.',
+      workflow: null,
+    };
+  }
+
+  let workflow = null;
+  try {
+    workflow = JSON.parse(raw);
+  } catch {
+    return {
+      ok: false,
+      message: 'Paste valid ComfyUI API workflow JSON before running this graph workflow step.',
+      workflow: null,
+    };
+  }
+
+  if (!workflow || Array.isArray(workflow) || typeof workflow !== 'object') {
+    return {
+      ok: false,
+      message: 'Paste the API-format workflow JSON exported from ComfyUI for this graph workflow step.',
+      workflow: null,
+    };
+  }
+
+  const nodeEntries = Object.entries(workflow).filter(([, entry]) => entry && typeof entry === 'object');
+  if (!nodeEntries.length || !nodeEntries.some(([, entry]) => entry.class_type && entry.inputs && typeof entry.inputs === 'object')) {
+    return {
+      ok: false,
+      message: 'Paste the API-format workflow JSON exported from ComfyUI for this graph workflow step.',
+      workflow: null,
+    };
+  }
+
+  return {
+    ok: true,
+    message: '',
+    workflow,
+  };
+}
+
+function getGraphWorkflowNodeEntry(workflow, nodeId) {
+  return workflow && typeof workflow === 'object'
+    ? workflow[String(nodeId || '').trim()] || null
+    : null;
 }
 
 function doesToolExposeDownloadedModel(tool, model) {
@@ -1272,6 +1391,26 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
       targetId: effectiveToolId || '',
       targetKind: 'tool',
       targetLabel: tool?.name || 'Automatic1111 or Forge',
+    };
+  }
+
+  if (node.type === 'graphWorkflow') {
+    const toolId = getGraphWorkflowToolId(node);
+    const tool = getContextToolEntry(toolId, contextMaps);
+    const strategy = getToolPipelineStrategy(toolId);
+    const runnable = RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) && strategy?.id === TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW;
+    return {
+      capability: runnable
+        ? {
+            inputKinds: [PORT_KIND_TEXT, PORT_KIND_IMAGE],
+            notes: 'This step runs an exported ComfyUI API workflow inside the pipeline with explicit text and image boundary mappings.',
+            outputKinds: [PORT_KIND_IMAGE],
+          }
+        : null,
+      operationId: PIPELINE_OPERATION_IDS.GRAPH_WORKFLOW,
+      targetId: toolId,
+      targetKind: 'tool',
+      targetLabel: tool?.name || (toolId ? toolId : 'Graph workflow tool'),
     };
   }
 
@@ -1867,6 +2006,10 @@ function getLocalToolRequirement(node, contextMaps = {}) {
     return getImageToolIdForNode(node, contextMaps);
   }
 
+  if (node.type === 'graphWorkflow') {
+    return getGraphWorkflowToolId(node);
+  }
+
   return null;
 }
 
@@ -1986,7 +2129,7 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps) {
   if (selectedToolId && !IMAGE_WORKFLOW_TOOL_IDS.includes(selectedToolId)) {
     summary.readiness = {
       tone: 'error',
-      message: 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools are intentionally deferred to later nested workflow support.',
+      message: 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.',
     };
     return false;
   }
@@ -2019,6 +2162,141 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps) {
   summary.readiness = {
     tone: 'info',
     message: tool.name + ' will turn the connected text prompt into an image locally.',
+  };
+  return true;
+}
+
+function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
+  const toolId = getGraphWorkflowToolId(node);
+  const toolLabel = getContextToolEntry(toolId, contextMaps)?.name || 'This graph workflow tool';
+  const strategy = getToolPipelineStrategy(toolId);
+
+  if (!toolId || !GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) || !strategy) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Choose a graph-native workflow tool for this step.',
+    };
+    return false;
+  }
+
+  if (!RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) || strategy.id !== TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW) {
+    summary.readiness = {
+      tone: 'error',
+      message: toolLabel + ' is listed as a graph-native tool, but this build only wires ComfyUI into pipeline execution so far. Choose ComfyUI for now.',
+    };
+    return false;
+  }
+
+  const parsedWorkflow = parseGraphWorkflowDefinitionText(node.config?.workflowText);
+  if (!parsedWorkflow.ok) {
+    summary.readiness = {
+      tone: 'error',
+      message: parsedWorkflow.message,
+    };
+    return false;
+  }
+
+  const textBinding = getGraphWorkflowInputBinding(node, 'text');
+  const imageBinding = getGraphWorkflowInputBinding(node, 'image');
+  const outputBinding = getGraphWorkflowOutputBinding(node, 'image');
+  const textNodeId = String(textBinding.nodeId || '').trim();
+  const textField = String(textBinding.field || '').trim();
+  const imageNodeId = String(imageBinding.nodeId || '').trim();
+  const imageField = String(imageBinding.field || '').trim();
+  const outputNodeId = String(outputBinding.nodeId || '').trim();
+
+  const textConnected = getIncomingKindsForNodePort(node, 'text', graph).length > 0;
+  if (textConnected && (!textNodeId || !textField)) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Map the Text input to a ComfyUI node and field before running this graph workflow step.',
+    };
+    return false;
+  }
+
+  if (textNodeId) {
+    const workflowNode = getGraphWorkflowNodeEntry(parsedWorkflow.workflow, textNodeId);
+    if (!workflowNode) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'The mapped ComfyUI text node could not be found in the pasted workflow JSON.',
+      };
+      return false;
+    }
+
+    if (!textField || !workflowNode.inputs || typeof workflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(workflowNode.inputs, textField)) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'The mapped ComfyUI text field could not be found in the pasted workflow JSON.',
+      };
+      return false;
+    }
+  }
+
+  const imageConnected = getIncomingKindsForNodePort(node, 'image', graph).length > 0;
+  if (imageConnected && (!imageNodeId || !imageField)) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Map the Image input to a ComfyUI node and field before running this graph workflow step.',
+    };
+    return false;
+  }
+
+  if (imageNodeId) {
+    const workflowNode = getGraphWorkflowNodeEntry(parsedWorkflow.workflow, imageNodeId);
+    if (!workflowNode) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'The mapped ComfyUI image node could not be found in the pasted workflow JSON.',
+      };
+      return false;
+    }
+
+    if (!imageField || !workflowNode.inputs || typeof workflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(workflowNode.inputs, imageField)) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'The mapped ComfyUI image field could not be found in the pasted workflow JSON.',
+      };
+      return false;
+    }
+  }
+
+  if (!outputNodeId) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Choose the ComfyUI node that should feed the Image output port before running this graph workflow step.',
+    };
+    return false;
+  }
+
+  if (!getGraphWorkflowNodeEntry(parsedWorkflow.workflow, outputNodeId)) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'The selected ComfyUI image output node could not be found in the pasted workflow JSON.',
+    };
+    return false;
+  }
+
+  const installedTool = contextMaps.toolsById[toolId] || null;
+  if (!installedTool) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Install ComfyUI before using this graph workflow step.',
+    };
+    return false;
+  }
+
+  if (String(installedTool.status || '').toLowerCase() !== 'running') {
+    summary.readiness = {
+      tone: 'warn',
+      message: installedTool.name + ' is not running yet. Local AI Hub can start it automatically when this graph workflow begins.',
+    };
+    return true;
+  }
+
+  summary.readiness = {
+    tone: 'info',
+    message: installedTool.name + ' will run the pasted workflow locally and return the selected image artifact back into the main pipeline.',
   };
   return true;
 }
@@ -2286,6 +2564,17 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
+      if (node.type === 'graphWorkflow') {
+        const ready = analyzeGraphWorkflowNode(node, graph, summary, contextMaps);
+        if (!ready || summary.readiness.tone === 'error') {
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (summary.readiness.tone === 'warn') {
+          issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+        } else {
+          issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
+        }
+      }
+
       if (node.type === 'validation') {
         const outgoingEdges = graph.outgoingEdgesByNode.get(node.id) || [];
         const passCount = outgoingEdges.filter((edge) => edge.source.portId === 'pass').length;
@@ -2526,6 +2815,7 @@ module.exports = {
   PIPELINE_SCHEMA_VERSION,
   PIPELINE_NODE_TYPES,
   NODE_TYPE_LIST,
+  GRAPH_WORKFLOW_TOOL_IDS,
   IMAGE_WORKFLOW_TOOL_IDS,
   PIPELINE_OPERATION_IDS,
   PIPELINE_PORT_KIND_LABELS,
@@ -2552,6 +2842,7 @@ module.exports = {
   createUniqueId,
   evaluateCompatibilityProfile,
   getDefaultNodeConfig,
+  getGraphWorkflowToolId,
   getImageToolIdForNode,
   getLocalToolRequirement,
   getModelStepExecutionMode,

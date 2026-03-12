@@ -49,6 +49,7 @@ const {
   getRuntimeOutputSnapshot,
   isToolActive,
   launchToolFromUserAction,
+  prepareToolForMaintenance,
   sendInputToTool,
   setRuntimeEventSink,
   stopTool,
@@ -933,9 +934,7 @@ function registerIpcHandlers() {
       const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
-      if (tool.status === 'running') {
-        await stopTool(tool);
-      }
+      await prepareToolForMaintenance(tool);
 
       const updatedTool = await updateToolInstallation(tool, {
         onProgress: (progressPayload) => sendUpdateProgress(progressPayload),
@@ -953,6 +952,7 @@ function registerIpcHandlers() {
       const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
+      await prepareToolForMaintenance(tool);
       const repairedTool = await repairToolInstallation(tool, {
         onProgress: (progressPayload) => sendInstallProgress(progressPayload),
         removeOrphanedToolFolders: Boolean(payload?.removeOrphanedToolFolders),
@@ -977,8 +977,8 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
-      if (tool.source === 'managed' && tool.status === 'running') {
-        await stopTool(tool);
+      if (tool.source === 'managed') {
+        await prepareToolForMaintenance(tool);
       }
       const removedTool = await uninstallTool(tool);
       invalidateDiscoveryCache();
@@ -1547,21 +1547,4 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 

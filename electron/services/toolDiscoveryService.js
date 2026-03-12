@@ -487,7 +487,7 @@ function buildExternalToolState(manifest, existingTool, detected) {
     processNames: manifest.processNames || existingTool?.processNames || [],
     detectedAt: new Date().toISOString(),
     installedAt: existingTool?.installedAt || existingTool?.detectedAt || new Date().toISOString(),
-    status: existingTool?.status === 'error' ? 'stopped' : existingTool?.status || 'stopped',
+    status: existingTool?.status === 'error' || existingTool?.status === 'starting' ? 'stopped' : existingTool?.status || 'stopped',
     lastError: null,
     lastRepairMessage: null,
     venvDir: null,
@@ -627,7 +627,7 @@ function buildRecoveredManagedToolState(manifest, existingTool = {}, installDir)
     launchSupported: true,
     lastError: null,
     lastRepairMessage: null,
-    status: existingTool?.status === 'running' ? 'stopped' : existingTool?.status || 'stopped',
+    status: existingTool?.status === 'running' || existingTool?.status === 'starting' ? 'stopped' : existingTool?.status || 'stopped',
   };
 }
 
@@ -788,5 +788,4 @@ module.exports = {
   invalidateDiscoveryCache,
   syncDiscoveredTools,
 };
-
 

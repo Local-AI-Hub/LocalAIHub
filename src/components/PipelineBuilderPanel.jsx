@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 import {
+  GRAPH_WORKFLOW_TOOL_IDS,
   IMAGE_WORKFLOW_TOOL_IDS,
   PIPELINE_NODE_WIDTH,
   WHISPER_MODELS,
@@ -182,6 +183,13 @@ function buildNodePreview(node, runState) {
     return `${node.config?.toolId || 'Auto image tool'} | ${node.config?.width || 832}x${node.config?.height || 832}`;
   }
 
+  if (node.type === 'graphWorkflow') {
+    const workflowDefinition = parseGraphWorkflowDefinition(node.config?.workflowText);
+    const nodeCountLabel = workflowDefinition.ok ? workflowDefinition.nodeEntries.length + ' workflow nodes' : 'Paste workflow JSON';
+    const outputNodeId = String(node.config?.outputBindings?.image?.nodeId || '').trim();
+    return (node.config?.toolId || 'Graph workflow tool') + ' | ' + nodeCountLabel + (outputNodeId ? ' | output ' + outputNodeId : '');
+  }
+
   if (node.type === 'validation') {
     return node.config?.mode === 'llm'
       ? `${node.config?.llmExecutionMode === 'ollama' ? 'Ollama' : node.config?.providerId || 'Cloud validator'}${node.config?.model ? ` | ${node.config.model}` : ''}`
@@ -330,6 +338,99 @@ function collectLocalToolModelsByToolId(modelOptionsByNodeId) {
   }
 
   return localModelsByToolId;
+}
+
+function sortGraphWorkflowNodeEntries(entries = []) {
+  return [...entries].sort((left, right) => {
+    const leftNumber = Number(left.id);
+    const rightNumber = Number(right.id);
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+      return leftNumber - rightNumber;
+    }
+
+    return left.id.localeCompare(right.id, undefined, {
+      numeric: true,
+      sensitivity: 'base',
+    });
+  });
+}
+
+function formatGraphWorkflowNodeLabel(entry) {
+  const nodeId = String(entry?.id || '').trim();
+  const classType = String(entry?.classType || '').trim();
+  return classType ? nodeId + ' - ' + classType : nodeId || 'Workflow node';
+}
+
+function parseGraphWorkflowDefinition(workflowText) {
+  const raw = String(workflowText || '').trim();
+  if (!raw) {
+    return {
+      message: 'Paste the exported ComfyUI API workflow JSON to configure this graph step.',
+      nodeEntries: [],
+      ok: false,
+      workflow: null,
+    };
+  }
+
+  try {
+    const workflow = JSON.parse(raw);
+    if (!workflow || Array.isArray(workflow) || typeof workflow !== 'object') {
+      return {
+        message: 'This graph workflow step needs a ComfyUI API workflow JSON object keyed by node ID.',
+        nodeEntries: [],
+        ok: false,
+        workflow: null,
+      };
+    }
+
+    const nodeEntries = sortGraphWorkflowNodeEntries(
+      Object.entries(workflow)
+        .filter(([, entry]) => entry && typeof entry === 'object')
+        .map(([id, entry]) => ({
+          classType: String(entry.class_type || entry.classType || '').trim(),
+          id: String(id || '').trim(),
+          inputFields: Object.keys(entry.inputs || {}).sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' })),
+        }))
+        .filter((entry) => entry.id),
+    );
+
+    if (!nodeEntries.length) {
+      return {
+        message: 'This graph workflow JSON does not contain any workflow nodes yet.',
+        nodeEntries: [],
+        ok: false,
+        workflow,
+      };
+    }
+
+    return {
+      message: 'Loaded ' + nodeEntries.length + ' workflow nodes.',
+      nodeEntries,
+      ok: true,
+      workflow,
+    };
+  } catch {
+    return {
+      message: 'Local AI Hub could not read that graph workflow JSON. Paste the exported ComfyUI API workflow JSON for this step.',
+      nodeEntries: [],
+      ok: false,
+      workflow: null,
+    };
+  }
+}
+
+function getGraphWorkflowFieldOptions(definition, nodeId) {
+  if (!definition?.ok) {
+    return [];
+  }
+
+  const normalizedNodeId = String(nodeId || '').trim();
+  if (!normalizedNodeId) {
+    return [];
+  }
+
+  const nodeEntry = definition.nodeEntries.find((entry) => entry.id === normalizedNodeId) || null;
+  return nodeEntry?.inputFields || [];
 }
 
 function ArtifactPreview({ artifact, className = '', compact = false }) {
@@ -706,7 +807,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localIm
             </select>
           </div>
           <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-            This mode runs a single Automatic1111 or Forge text-to-image request inside the current sequential pipeline. ComfyUI and other graph-native local workflows stay deferred until Local AI Hub adds nested workflow support.
+            This mode runs a single Automatic1111 or Forge text-to-image request inside the current sequential pipeline. Use the Graph Workflow step when you need a graph-native tool such as ComfyUI.
           </div>
         </div>
       ) : (
@@ -829,6 +930,38 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   );
   const connectedProviders = useMemo(() => (providers || []).filter((provider) => provider.isConnected), [providers]);
   const imageTools = useMemo(() => tools.filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
+  const graphWorkflowTools = useMemo(() => {
+    const entries = [...(tools || []), ...(manifests || [])];
+    const seenToolIds = new Set();
+    return entries.filter((tool) => {
+      const toolId = String(tool?.id || '').trim();
+      if (!toolId || seenToolIds.has(toolId) || !GRAPH_WORKFLOW_TOOL_IDS.includes(toolId)) {
+        return false;
+      }
+
+      seenToolIds.add(toolId);
+      return true;
+    });
+  }, [manifests, tools]);
+  const selectedGraphWorkflowDefinition = useMemo(
+    () => (selectedNode?.type === 'graphWorkflow' ? parseGraphWorkflowDefinition(selectedNode.config?.workflowText) : null),
+    [selectedNode],
+  );
+  const graphWorkflowNodeOptions = selectedGraphWorkflowDefinition?.nodeEntries || [];
+  const graphWorkflowTextFieldOptions = useMemo(
+    () => getGraphWorkflowFieldOptions(selectedGraphWorkflowDefinition, selectedNode?.config?.inputBindings?.text?.nodeId),
+    [selectedGraphWorkflowDefinition, selectedNode?.config?.inputBindings?.text?.nodeId],
+  );
+  const graphWorkflowImageFieldOptions = useMemo(
+    () => getGraphWorkflowFieldOptions(selectedGraphWorkflowDefinition, selectedNode?.config?.inputBindings?.image?.nodeId),
+    [selectedGraphWorkflowDefinition, selectedNode?.config?.inputBindings?.image?.nodeId],
+  );
+  const selectedGraphWorkflowTool = useMemo(
+    () => (selectedNode?.type === 'graphWorkflow'
+      ? graphWorkflowTools.find((tool) => tool.id === (selectedNode.config?.toolId || graphWorkflowTools[0]?.id || '')) || null
+      : null),
+    [graphWorkflowTools, selectedNode],
+  );
   const currentPipelineSaved = useMemo(() => pipelines.some((pipeline) => pipeline.id === draft.id), [pipelines, draft.id]);
   const currentNodeSummary = selectedNode ? analysis.nodeSummaries?.[selectedNode.id] || null : null;
   const canvasSize = useMemo(() => {
@@ -878,6 +1011,38 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       nodes: current.nodes.map((node) => (node.id === nodeId ? updater(node) : node)),
     }));
     markDirty();
+  }
+
+  function updateGraphWorkflowInputBinding(nodeId, portId, nextBinding) {
+    updateNode(nodeId, (currentNode) => ({
+      ...currentNode,
+      config: {
+        ...currentNode.config,
+        inputBindings: {
+          ...(currentNode.config?.inputBindings || {}),
+          [portId]: {
+            ...(currentNode.config?.inputBindings?.[portId] || {}),
+            ...nextBinding,
+          },
+        },
+      },
+    }));
+  }
+
+  function updateGraphWorkflowOutputBinding(nodeId, portId, nextBinding) {
+    updateNode(nodeId, (currentNode) => ({
+      ...currentNode,
+      config: {
+        ...currentNode.config,
+        outputBindings: {
+          ...(currentNode.config?.outputBindings || {}),
+          [portId]: {
+            ...(currentNode.config?.outputBindings?.[portId] || {}),
+            ...nextBinding,
+          },
+        },
+      },
+    }));
   }
 
   async function refreshPipelineList() {
@@ -1838,6 +2003,199 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                     <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-width">Width</label><input className="store-input mt-3" id="image-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-height">Height</label><input className="store-input mt-3" id="image-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
                     <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-steps">Steps</label><input className="store-input mt-3" id="image-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-cfg">CFG scale</label><input className="store-input mt-3" id="image-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-seed">Seed</label><input className="store-input mt-3" id="image-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
                     <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for the image step." value={selectedNode.config?.negativePrompt || ''} /></div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'graphWorkflow' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-workflow-tool">Execution tool</label>
+                      <select
+                        className="store-input mt-3"
+                        id="graph-workflow-tool"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            toolId: event.target.value,
+                          },
+                        }))}
+                        value={selectedNode.config?.toolId || graphWorkflowTools[0]?.id || ''}
+                      >
+                        <option value="">Choose a graph workflow tool</option>
+                        {graphWorkflowTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}
+                      </select>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">Use this step for graph-native local tools instead of flattening them into the model-step abstraction. The first slice supports exported ComfyUI API workflow JSON with explicit typed boundary mappings.</p>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      The main pipeline stays on this canvas. The workflow JSON below defines the graph-native sub-workflow that runs inside {selectedGraphWorkflowTool?.name || 'the selected tool'}. Local AI Hub still runs the overall pipeline sequentially and saves explicit typed outputs back into the run folder.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-workflow-json">Workflow JSON</label>
+                      <textarea
+                        className="store-input mt-3 min-h-[220px] resize-none font-mono text-xs leading-6"
+                        id="graph-workflow-json"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            workflowText: event.target.value,
+                          },
+                        }))}
+                        placeholder="Paste the exported ComfyUI API workflow JSON here."
+                        value={selectedNode.config?.workflowText || ''}
+                      />
+                      {selectedGraphWorkflowDefinition ? (
+                        <p className={'mt-2 text-xs leading-5 ' + (selectedGraphWorkflowDefinition.ok ? 'text-emerald-200' : 'text-amber-200')}>
+                          {selectedGraphWorkflowDefinition.message}
+                        </p>
+                      ) : null}
+                      <p className="mt-2 text-xs leading-5 text-slate-400">In this first graph-native pass, Local AI Hub supports explicit text input, image input, and image output boundaries for ComfyUI workflows.</p>
+                    </div>
+                    <div className="grid gap-4 xl:grid-cols-2">
+                      <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                        <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Pipeline Text to Workflow</p>
+                        <div className="mt-3 space-y-3">
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-text-node">Workflow node</label>
+                            {selectedGraphWorkflowDefinition?.ok ? (
+                              <select
+                                className="store-input mt-3"
+                                id="graph-text-node"
+                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: '', nodeId: event.target.value })}
+                                value={selectedNode.config?.inputBindings?.text?.nodeId || ''}
+                              >
+                                <option value="">Leave text input unused</option>
+                                {graphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}
+                              </select>
+                            ) : (
+                              <input
+                                className="store-input mt-3"
+                                id="graph-text-node"
+                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { nodeId: event.target.value })}
+                                placeholder="For example: 6"
+                                value={selectedNode.config?.inputBindings?.text?.nodeId || ''}
+                              />
+                            )}
+                          </div>
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-text-field">Workflow field</label>
+                            {graphWorkflowTextFieldOptions.length ? (
+                              <select
+                                className="store-input mt-3"
+                                id="graph-text-field"
+                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })}
+                                value={selectedNode.config?.inputBindings?.text?.field || ''}
+                              >
+                                <option value="">Choose a workflow field</option>
+                                {graphWorkflowTextFieldOptions.map((field) => <option key={field} value={field}>{field}</option>)}
+                              </select>
+                            ) : (
+                              <input
+                                className="store-input mt-3"
+                                id="graph-text-field"
+                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })}
+                                placeholder="For example: text"
+                                value={selectedNode.config?.inputBindings?.text?.field || ''}
+                              />
+                            )}
+                          </div>
+                        </div>
+                        <p className="mt-3 text-xs leading-5 text-slate-400">Leave this mapping blank when the graph workflow does not use the main pipeline Text input port.</p>
+                      </div>
+                      <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                        <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Pipeline Image to Workflow</p>
+                        <div className="mt-3 space-y-3">
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-image-node">Workflow node</label>
+                            {selectedGraphWorkflowDefinition?.ok ? (
+                              <select
+                                className="store-input mt-3"
+                                id="graph-image-node"
+                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: '', nodeId: event.target.value })}
+                                value={selectedNode.config?.inputBindings?.image?.nodeId || ''}
+                              >
+                                <option value="">Leave image input unused</option>
+                                {graphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}
+                              </select>
+                            ) : (
+                              <input
+                                className="store-input mt-3"
+                                id="graph-image-node"
+                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
+                                placeholder="For example: 12"
+                                value={selectedNode.config?.inputBindings?.image?.nodeId || ''}
+                              />
+                            )}
+                          </div>
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-image-field">Workflow field</label>
+                            {graphWorkflowImageFieldOptions.length ? (
+                              <select
+                                className="store-input mt-3"
+                                id="graph-image-field"
+                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: event.target.value })}
+                                value={selectedNode.config?.inputBindings?.image?.field || ''}
+                              >
+                                <option value="">Choose a workflow field</option>
+                                {graphWorkflowImageFieldOptions.map((field) => <option key={field} value={field}>{field}</option>)}
+                              </select>
+                            ) : (
+                              <input
+                                className="store-input mt-3"
+                                id="graph-image-field"
+                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: event.target.value })}
+                                placeholder="For example: image"
+                                value={selectedNode.config?.inputBindings?.image?.field || ''}
+                              />
+                            )}
+                          </div>
+                        </div>
+                        <p className="mt-3 text-xs leading-5 text-slate-400">When this port is connected, Local AI Hub uploads the incoming image to the selected graph tool before the workflow runs.</p>
+                      </div>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Workflow Image to Pipeline</p>
+                      <div className="mt-3">
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-output-node">Output node</label>
+                        {selectedGraphWorkflowDefinition?.ok ? (
+                          <select
+                            className="store-input mt-3"
+                            id="graph-output-node"
+                            onChange={(event) => updateGraphWorkflowOutputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
+                            value={selectedNode.config?.outputBindings?.image?.nodeId || ''}
+                          >
+                            <option value="">Choose the image output node</option>
+                            {graphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}
+                          </select>
+                        ) : (
+                          <input
+                            className="store-input mt-3"
+                            id="graph-output-node"
+                            onChange={(event) => updateGraphWorkflowOutputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
+                            placeholder="For example: 19"
+                            value={selectedNode.config?.outputBindings?.image?.nodeId || ''}
+                          />
+                        )}
+                      </div>
+                      <p className="mt-3 text-xs leading-5 text-slate-400">Choose the node that emits images in ComfyUI history, usually PreviewImage or SaveImage. The resulting image stays explicit and previewable in the main pipeline.</p>
+                    </div>
+                    {selectedGraphWorkflowDefinition?.ok ? (
+                      <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                        <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Parsed Workflow Nodes</p>
+                        <div className="mt-3 space-y-2 max-h-[240px] overflow-auto pr-1">
+                          {graphWorkflowNodeOptions.slice(0, 18).map((entry) => (
+                            <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3" key={entry.id}>
+                              <p className="text-sm font-medium text-white">{formatGraphWorkflowNodeLabel(entry)}</p>
+                              <p className="mt-1 text-xs leading-5 text-slate-400">
+                                {entry.inputFields.length ? 'Inputs: ' + entry.inputFields.join(', ') : 'No editable inputs detected.'}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                        {graphWorkflowNodeOptions.length > 18 ? <p className="mt-3 text-xs leading-5 text-slate-500">Showing the first 18 nodes from the pasted workflow.</p> : null}
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
 

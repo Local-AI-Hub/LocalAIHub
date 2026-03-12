@@ -25,6 +25,7 @@ const {
   interrogateImageWithWorkflowTool,
   resolveSelectedImageTool,
 } = require('./workflowToolService');
+const { executeGraphWorkflowNode } = require('./graphWorkflowService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const {
   PIPELINE_OPERATION_IDS,
@@ -35,6 +36,7 @@ const {
   buildPipelineGraph,
   buildContextMaps,
   createUniqueId,
+  getGraphWorkflowToolId,
   getModelStepOperationId,
   getNodeTypeDefinition,
   getPortDefinition,
@@ -1079,7 +1081,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
     if (executionMode === 'localTool') {
       if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-        throw new Error('Local AI Hub currently supports only text-to-image generation for operation-driven local tools. ComfyUI-style graph workflows and local video generation stay deferred until a later pipeline pass.');
+        throw new Error('Local AI Hub currently supports only text-to-image generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
       }
 
       const prompt = buildImageGenerationPrompt(node, promptArtifact);
@@ -1320,6 +1322,24 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       },
       preview: summarizeArtifact(artifact),
     };
+  }
+
+  if (node.type === 'graphWorkflow') {
+    const toolId = getGraphWorkflowToolId(node);
+    const installMessage = toolId === 'comfyui'
+      ? 'Install ComfyUI before using a graph workflow step in a pipeline.'
+      : 'Install the selected graph workflow tool before using this step in a pipeline.';
+    const tool = await getInstalledToolOrThrow(contextMaps, toolId, installMessage);
+    return executeGraphWorkflowNode({
+      inputArtifacts: {
+        image: getNodeInputArtifact(node.id, 'image', graph, run.resultsByNodeId),
+        text: getNodeInputArtifact(node.id, 'text', graph, run.resultsByNodeId),
+      },
+      node,
+      reportProgress,
+      runDirectories: run.directories,
+      tool,
+    });
   }
 
   if (node.type === 'validation') {
@@ -1607,6 +1627,8 @@ module.exports = {
   runPipeline,
   setPipelineEventSink,
 };
+
+
 
 
 

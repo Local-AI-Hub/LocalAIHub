@@ -10,7 +10,7 @@ function resolveAction(toolState, busyMap, handlers, tool) {
     };
   }
 
-  if (toolState.status === 'running') {
+  if (toolState.status === 'running' || toolState.status === 'starting') {
     return {
       label: 'Stop',
       disabled: Boolean(busyMap[`stop:${tool.id}`]),
@@ -131,3 +131,4 @@ export default function InstallerGrid({
     </section>
   );
 }
+

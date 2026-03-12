@@ -1,4 +1,4 @@
-﻿const path = require('path');
+const path = require('path');
 const fs = require('fs-extra');
 
 const { getAppPaths, readConfig } = require('./configService');
@@ -6,6 +6,12 @@ const { assessDiskSpace, getDiskSnapshotForPath } = require('./hardwareService')
 
 const TEMP_FILE_PATTERNS = [/\.download$/i, /\.part$/i, /\.partial$/i, /\.tmp$/i, /\.temp$/i];
 const TEMP_DIRECTORY_PATTERNS = [/__extract$/i, /__restore$/i, /\.tmp$/i, /\.temp$/i, /^tmp$/i];
+const RETRYABLE_REMOVE_ERROR_CODES = new Set(['EBUSY', 'ENOTEMPTY', 'EPERM']);
+const REMOVE_RETRY_DELAYS_MS = [400, 1000, 2000, 4000];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function normalizeInstallPathKey(targetPath) {
   if (!targetPath) {
@@ -278,6 +284,46 @@ async function inspectRepairCleanup(toolState, manifest) {
   };
 }
 
+function isRetryableRemoveError(error) {
+  const errorCode = String(error?.code || '').trim().toUpperCase();
+  return RETRYABLE_REMOVE_ERROR_CODES.has(errorCode);
+}
+
+async function removePathWithRetries(targetPath, logger, operationLabel) {
+  let attempt = 0;
+  let lastError = null;
+
+  while (attempt <= REMOVE_RETRY_DELAYS_MS.length) {
+    if (!(await fs.pathExists(targetPath))) {
+      return;
+    }
+
+    try {
+      await fs.remove(targetPath);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableRemoveError(error) || attempt === REMOVE_RETRY_DELAYS_MS.length) {
+        const retryMessage = path.basename(targetPath) || targetPath;
+        throw new Error(`Local AI Hub could not finish cleanup because ${retryMessage} is still being used by Windows. Let the tool finish closing, then try again.`);
+      }
+
+      await logger?.warn?.('Cleanup target is still busy. Retrying removal.', {
+        operationLabel,
+        path: targetPath,
+        attempt: attempt + 1,
+        error,
+      });
+      await sleep(REMOVE_RETRY_DELAYS_MS[attempt]);
+      attempt += 1;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+}
+
 async function removeEntries(entries = [], logger, operationLabel) {
   let recoveredBytes = 0;
   let removedCount = 0;
@@ -288,7 +334,7 @@ async function removeEntries(entries = [], logger, operationLabel) {
     }
 
     const sizeBytes = Number(entry.sizeBytes || (await calculatePathSize(entry.path)) || 0);
-    await fs.remove(entry.path);
+    await removePathWithRetries(entry.path, logger, operationLabel);
     removedCount += 1;
     recoveredBytes += sizeBytes;
     await logger?.info?.('Removed a Local AI Hub cleanup target.', {

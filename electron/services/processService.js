@@ -15,12 +15,16 @@ const OPEN_TIMEOUT_MS = 30000;
 const SUCCESS_CONFIRM_TIMEOUT_MS = 15000;
 const OUTPUT_BUFFER_LIMIT = 64000;
 const OUTPUT_LOG_LIMIT = 1024 * 1024;
+const PROCESS_SHUTDOWN_WAIT_MS = 15000;
+const PROCESS_RELEASE_SETTLE_MS = 1500;
+const STARTUP_PENDING_GRACE_MS = 5 * 60 * 1000;
 const STARTUP_DOWNLOAD_ACTIVITY_GRACE_MS = 15 * 60 * 1000;
 const STARTUP_DOWNLOAD_CARRY_LIMIT = 256;
 const DOWNLOAD_KEYWORD_PATTERN = /\b(download(?:ing|ed)?|fetch(?:ing|ed)?|retriev(?:e|ing|ed)?|pull(?:ing|ed)?|sync(?:ing|ed)?|cache(?:ing|d)?|checkpoint|weights?)\b/i;
 const DOWNLOAD_SOURCE_PATTERN = /(https?:\/\/|huggingface|civitai|modelscope|\.safetensors\b|\.ckpt\b|\.pth\b|\.bin\b|\.onnx\b|\.gguf\b|\.pt\b)/i;
 const DOWNLOAD_PROGRESS_PATTERN = /(?:^|[\s|])(\d{1,3})%(?=\s|\||$)/g;
 let runtimeEventSink = null;
+const pendingStartupMonitors = new Map();
 
 function getHelperScriptPath() {
   return app.isPackaged
@@ -384,6 +388,10 @@ async function waitForToolReady(toolState, timeoutMs = OPEN_TIMEOUT_MS, runtimeS
 
   const baseDeadline = Date.now() + timeoutMs;
   while (true) {
+    if (runtimeState?.stopping || runtimeState?.exitHandled) {
+      return false;
+    }
+
     if (await probeUrl(toolState.healthUrl || toolState.launchUrl)) {
       return true;
     }
@@ -410,6 +418,24 @@ function getStartupTimeoutMs(toolState, fallbackMs = OPEN_TIMEOUT_MS) {
   return fallbackMs;
 }
 
+function getPendingStartupTimeoutMs(toolState) {
+  return Math.max(getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS), STARTUP_PENDING_GRACE_MS);
+}
+
+async function persistToolRuntimeState(toolState, status, extra = {}) {
+  await upsertTool({
+    id: toolState.id,
+    status,
+    lastError: Object.prototype.hasOwnProperty.call(extra, 'lastError') ? extra.lastError : null,
+    lastRepairMessage: Object.prototype.hasOwnProperty.call(extra, 'lastRepairMessage') ? extra.lastRepairMessage : null,
+  });
+
+  emitToolState(toolState.id, {
+    status,
+    lastError: Object.prototype.hasOwnProperty.call(extra, 'lastError') ? extra.lastError : null,
+    lastRepairMessage: Object.prototype.hasOwnProperty.call(extra, 'lastRepairMessage') ? extra.lastRepairMessage : null,
+  });
+}
 async function getRunningProcessNames(processNames = []) {
   const matches = [];
 
@@ -725,7 +751,56 @@ function createRuntimeLogger(toolState, launchProfile, runtimeOptions = {}) {
   });
 }
 
+async function waitForRuntimeExit(runtimeState, timeoutMs = PROCESS_SHUTDOWN_WAIT_MS) {
+  if (!runtimeState?.process || runtimeState.process.exitCode !== null) {
+    return true;
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+      runtimeState.process.removeListener('close', handleClose);
+      resolve(value);
+    };
+
+    const handleClose = () => finish(true);
+    const timer = setTimeout(() => finish(runtimeState.process.exitCode !== null), timeoutMs);
+
+    runtimeState.process.once('close', handleClose);
+  });
+}
+
+async function waitForNamedProcessesToStop(processNames = [], timeoutMs = PROCESS_SHUTDOWN_WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const runningProcessNames = await getRunningProcessNames(processNames);
+    if (runningProcessNames.length === 0) {
+      return true;
+    }
+
+    await sleep(500);
+  }
+
+  return (await getRunningProcessNames(processNames)).length === 0;
+}
+
+function buildPendingStartupMessage(toolState, target) {
+  return `${toolState.name} is still starting and has not answered on ${target} yet. Local AI Hub will keep waiting in the background.`;
+}
+
+function buildPendingStartupFailureMessage(toolState, target) {
+  return `${toolState.name} is still not answering on ${target}. Local AI Hub stopped waiting in the background. Open the logs folder for the full launch details.`;
+}
+
 async function stopRuntimeProcess(toolId, runtimeState) {
+  pendingStartupMonitors.delete(toolId);
+
   if (!runtimeState?.process?.pid) {
     clearLaunchProgress(runtimeState);
     clearRuntime(toolId, runtimeState);
@@ -735,20 +810,112 @@ async function stopRuntimeProcess(toolId, runtimeState) {
   runtimeState.stopping = true;
   clearLaunchProgress(runtimeState);
   await killProcessTree(runtimeState.process.pid).catch(() => null);
+  await waitForRuntimeExit(runtimeState).catch(() => false);
   clearRuntime(toolId, runtimeState);
 }
 
-async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
+async function monitorPendingLaunch(toolState, runtimeState = null, options = {}) {
+  if (!toolState?.id) {
+    return null;
+  }
+
+  const existingMonitor = pendingStartupMonitors.get(toolState.id);
+  if (existingMonitor) {
+    return existingMonitor;
+  }
+
+  const monitorPromise = (async () => {
+    const logger = runtimeState?.logger || createRuntimeLogger(toolState, runtimeState?.launchProfile || toolState.launchProfile, {
+      launchContext: options.launchContext || 'pending-startup',
+    });
+    const target = toolState.healthUrl || toolState.launchUrl || `http://127.0.0.1:${toolState.defaultPort}`;
+
+    try {
+      const ready = await waitForToolReady(toolState, getPendingStartupTimeoutMs(toolState), runtimeState);
+      if (runtimeState?.stopping || runtimeState?.exitHandled) {
+        return;
+      }
+
+      if (!ready) {
+        await logger.warn('Tool never became ready after Local AI Hub kept waiting in the background.', {
+          target,
+          stdout: runtimeState?.stdoutLogBuffer || runtimeState?.stdoutBuffer || '',
+          stderr: runtimeState?.stderrLogBuffer || runtimeState?.stderrBuffer || '',
+        });
+
+        if (runtimeState?.process?.pid && runtimeState.process.exitCode === null) {
+          await stopRuntimeProcess(toolState.id, runtimeState);
+        }
+
+        const message = buildPendingStartupFailureMessage(toolState, target);
+        await persistToolRuntimeState(toolState, 'error', {
+          lastError: message,
+          lastRepairMessage: null,
+        });
+        emitUnexpectedStop(toolState, message);
+        return;
+      }
+
+      if (runtimeState) {
+        runtimeState.launchConfirmed = true;
+        clearLaunchProgress(runtimeState);
+      }
+
+      await logger.info('Tool answered on its expected local URL after Local AI Hub kept waiting in the background.', {
+        target,
+      });
+      await persistToolRuntimeState(toolState, 'running', {
+        lastError: null,
+        lastRepairMessage: null,
+      });
+
+      if (options.openInterfaceWhenReady) {
+        openToolInterface(toolState).catch(() => null);
+      }
+    } catch (error) {
+      if (runtimeState?.stopping || runtimeState?.exitHandled) {
+        return;
+      }
+
+      const message = humanizeError(error, buildPendingStartupFailureMessage(toolState, target));
+      await logger.error('Background startup wait failed.', {
+        error,
+        target,
+      });
+      await persistToolRuntimeState(toolState, 'error', {
+        lastError: message,
+        lastRepairMessage: null,
+      });
+      emitUnexpectedStop(toolState, message);
+    } finally {
+      pendingStartupMonitors.delete(toolState.id);
+    }
+  })();
+
+  pendingStartupMonitors.set(toolState.id, monitorPromise);
+  return monitorPromise;
+}
+
+async function waitForLaunchConfirmation(toolState, runtimeState, logger, options = {}) {
   if (!runtimeState) {
-    return;
+    return {
+      status: 'stopped',
+    };
   }
 
   if (toolUsesLocalUrl(toolState)) {
     const target = toolState.healthUrl || toolState.launchUrl || `http://127.0.0.1:${toolState.defaultPort}`;
-    const ready = await waitForToolReady(toolState, getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS), runtimeState);
+    const confirmationTimeoutMs = options.allowPendingStartup
+      ? Math.min(getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS), OPEN_TIMEOUT_MS)
+      : getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS);
+    const ready = await waitForToolReady(toolState, confirmationTimeoutMs, runtimeState);
     if (!ready) {
+      const processStillRunning = runtimeState.process?.exitCode === null && !runtimeState.stopping;
+      const runningProcessNames = processStillRunning ? [] : await getRunningProcessNames(toolState.processNames);
       await logger.warn('Tool did not answer on its expected local URL before the startup timeout.', {
         target,
+        processStillRunning,
+        runningProcessNames,
         startupDownload: runtimeState.startupDownload?.active
           ? {
               detectedAt: runtimeState.startupDownload.detectedAt || null,
@@ -760,6 +927,14 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
         stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
         stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
       });
+
+      if (options.allowPendingStartup && (processStillRunning || runningProcessNames.length > 0)) {
+        return {
+          status: 'starting',
+          target,
+        };
+      }
+
       await stopRuntimeProcess(toolState.id, runtimeState);
       throw new Error(`${toolState.name} did not answer on ${target} before Local AI Hub's startup check finished. Open the logs folder for the full launch details.`);
     }
@@ -769,7 +944,9 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
     });
     runtimeState.launchConfirmed = true;
     clearLaunchProgress(runtimeState);
-    return;
+    return {
+      status: 'running',
+    };
   }
 
   if (runtimeState.process?.exitCode === null && !runtimeState.stopping) {
@@ -778,7 +955,9 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
     });
     runtimeState.launchConfirmed = true;
     clearLaunchProgress(runtimeState);
-    return;
+    return {
+      status: 'running',
+    };
   }
 
   const runningProcessNames = await getRunningProcessNames(toolState.processNames);
@@ -788,12 +967,13 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger) {
     });
     runtimeState.launchConfirmed = true;
     clearLaunchProgress(runtimeState);
-    return;
+    return {
+      status: 'running',
+    };
   }
 
   throw new Error(`${toolState.name} stopped before Local AI Hub could confirm that it launched.`);
 }
-
 async function confirmLaunchAfterExit(toolState, runtimeState = null) {
   if (toolUsesLocalUrl(toolState)) {
     return {
@@ -819,6 +999,7 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
   }
 
   runtimeState.exitHandled = true;
+  pendingStartupMonitors.delete(toolState.id);
   clearLaunchProgress(runtimeState);
   clearRuntime(toolState.id, runtimeState);
 
@@ -1108,6 +1289,10 @@ async function resolveToolStatus(toolState) {
     return 'running';
   }
 
+  if (toolState?.status === 'starting') {
+    return (await isToolActive(toolState)) ? 'starting' : 'stopped';
+  }
+
   if (toolState?.status === 'running') {
     return 'stopped';
   }
@@ -1120,17 +1305,37 @@ async function launchToolInternal(toolState, options = {}) {
     throw new Error('Local AI Hub could not find that tool in its installed list.');
   }
 
-  const runtime = runtimes.get(toolState.id);
-  if (runtime?.process && runtime.process.exitCode === null && !runtime.stopping) {
-    await waitForLaunchConfirmation(toolState, runtime, runtime.logger || createRuntimeLogger(toolState, runtime.launchProfile || toolState.launchProfile, options));
-    await upsertTool({
-      id: toolState.id,
-      status: 'running',
+  const markStarting = async () => {
+    await persistToolRuntimeState(toolState, 'starting', {
       lastError: null,
       lastRepairMessage: null,
     });
-    emitToolState(toolState.id, {
-      status: 'running',
+    return {
+      ...toolState,
+      status: 'starting',
+      lastError: null,
+      lastRepairMessage: null,
+    };
+  };
+
+  const runtime = runtimes.get(toolState.id);
+  if (runtime?.process && runtime.process.exitCode === null && !runtime.stopping) {
+    const launchResult = await waitForLaunchConfirmation(
+      toolState,
+      runtime,
+      runtime.logger || createRuntimeLogger(toolState, runtime.launchProfile || toolState.launchProfile, options),
+      options,
+    );
+    if (launchResult.status === 'starting') {
+      const pendingTool = await markStarting();
+      monitorPendingLaunch(toolState, runtime, {
+        launchContext: options.launchContext,
+        openInterfaceWhenReady: !options.skipOpenInterface,
+      }).catch(() => null);
+      return pendingTool;
+    }
+
+    await persistToolRuntimeState(toolState, 'running', {
       lastError: null,
       lastRepairMessage: null,
     });
@@ -1146,20 +1351,25 @@ async function launchToolInternal(toolState, options = {}) {
 
   if (await isToolActive(toolState)) {
     if (toolUsesLocalUrl(toolState)) {
-      const ready = await waitForToolReady(toolState, getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS));
+      const confirmationTimeoutMs = options.allowPendingStartup
+        ? Math.min(getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS), OPEN_TIMEOUT_MS)
+        : getStartupTimeoutMs(toolState, OPEN_TIMEOUT_MS);
+      const ready = await waitForToolReady(toolState, confirmationTimeoutMs);
       if (!ready) {
-        throw new Error(`${toolState.name} is running, but it is not answering on its local URL yet.`);
+        if (!options.allowPendingStartup) {
+          throw new Error(`${toolState.name} is running, but it is not answering on its local URL yet.`);
+        }
+
+        const pendingTool = await markStarting();
+        monitorPendingLaunch(toolState, null, {
+          launchContext: options.launchContext,
+          openInterfaceWhenReady: !options.skipOpenInterface,
+        }).catch(() => null);
+        return pendingTool;
       }
     }
 
-    await upsertTool({
-      id: toolState.id,
-      status: 'running',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    emitToolState(toolState.id, {
-      status: 'running',
+    await persistToolRuntimeState(toolState, 'running', {
       lastError: null,
       lastRepairMessage: null,
     });
@@ -1179,14 +1389,7 @@ async function launchToolInternal(toolState, options = {}) {
   }
 
   if (launchProfile.kind === 'embedded') {
-    await upsertTool({
-      id: toolState.id,
-      status: 'running',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    emitToolState(toolState.id, {
-      status: 'running',
+    await persistToolRuntimeState(toolState, 'running', {
       lastError: null,
       lastRepairMessage: null,
     });
@@ -1216,16 +1419,25 @@ async function launchToolInternal(toolState, options = {}) {
       throw new Error(`Local AI Hub does not know how to launch ${toolState.name}.`);
     }
 
-    await waitForLaunchConfirmation(toolState, runtimeState, runtimeState.logger);
-
-    await upsertTool({
-      id: toolState.id,
-      status: 'running',
+    await persistToolRuntimeState(toolState, 'starting', {
       lastError: null,
       lastRepairMessage: null,
     });
-    emitToolState(toolState.id, {
-      status: 'running',
+
+    const launchResult = await waitForLaunchConfirmation(toolState, runtimeState, runtimeState.logger, options);
+    if (launchResult.status === 'starting') {
+      monitorPendingLaunch(toolState, runtimeState, {
+        launchContext: options.launchContext,
+        openInterfaceWhenReady: !options.skipOpenInterface,
+      }).catch(() => null);
+      return {
+        ...toolState,
+        status: 'starting',
+        lastError: null,
+      };
+    }
+
+    await persistToolRuntimeState(toolState, 'running', {
       lastError: null,
       lastRepairMessage: null,
     });
@@ -1241,14 +1453,7 @@ async function launchToolInternal(toolState, options = {}) {
     };
   } catch (error) {
     const message = humanizeError(error, `${toolState.name} could not start.`);
-    await upsertTool({
-      id: toolState.id,
-      status: 'error',
-      lastError: message,
-      lastRepairMessage: null,
-    });
-    emitToolState(toolState.id, {
-      status: 'error',
+    await persistToolRuntimeState(toolState, 'error', {
       lastError: message,
       lastRepairMessage: null,
     });
@@ -1259,10 +1464,10 @@ async function launchToolInternal(toolState, options = {}) {
 async function launchToolFromUserAction(toolState, options = {}) {
   return launchToolInternal(toolState, {
     ...options,
+    allowPendingStartup: options.allowPendingStartup === undefined ? true : Boolean(options.allowPendingStartup),
     launchContext: options.launchContext || 'user-action',
   });
 }
-
 async function stopNamedProcesses(processNames = []) {
   const runningProcessNames = await getRunningProcessNames(processNames);
 
@@ -1278,20 +1483,16 @@ async function stopNamedProcesses(processNames = []) {
 }
 
 async function stopTool(toolState) {
+  pendingStartupMonitors.delete(toolState.id);
+
   const runtime = runtimes.get(toolState.id);
   if (runtime?.process?.pid) {
     runtime.stopping = true;
     clearLaunchProgress(runtime);
     await killProcessTree(runtime.process.pid);
+    await waitForRuntimeExit(runtime).catch(() => false);
     clearRuntime(toolState.id, runtime);
-    await upsertTool({
-      id: toolState.id,
-      status: 'stopped',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    emitToolState(toolState.id, {
-      status: 'stopped',
+    await persistToolRuntimeState(toolState, 'stopped', {
       lastError: null,
       lastRepairMessage: null,
     });
@@ -1300,14 +1501,8 @@ async function stopTool(toolState) {
 
   const stoppedProcessNames = await stopNamedProcesses(toolState.processNames);
   if (stoppedProcessNames.length > 0) {
-    await upsertTool({
-      id: toolState.id,
-      status: 'stopped',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    emitToolState(toolState.id, {
-      status: 'stopped',
+    await waitForNamedProcessesToStop(stoppedProcessNames).catch(() => false);
+    await persistToolRuntimeState(toolState, 'stopped', {
       lastError: null,
       lastRepairMessage: null,
     });
@@ -1320,19 +1515,29 @@ async function stopTool(toolState) {
     );
   }
 
-  await upsertTool({
-    id: toolState.id,
-    status: 'stopped',
-    lastError: null,
-    lastRepairMessage: null,
-  });
-  emitToolState(toolState.id, {
-    status: 'stopped',
+  await persistToolRuntimeState(toolState, 'stopped', {
     lastError: null,
     lastRepairMessage: null,
   });
 }
 
+async function prepareToolForMaintenance(toolState) {
+  const wasActive = await isToolActive(toolState).catch(() => false);
+  if (wasActive) {
+    await stopTool(toolState);
+  }
+
+  await sleep(PROCESS_RELEASE_SETTLE_MS);
+
+  const stillActive = await isToolActive(toolState).catch(() => false);
+  if (stillActive) {
+    throw new Error(`${toolState.name} is still using files on this PC. Let it finish closing, then try again.`);
+  }
+
+  return {
+    wasActive,
+  };
+}
 async function disposeAllRuntimes() {
   await Promise.all(
     [...runtimes.values()].map(async (runtime) => {
@@ -1355,14 +1560,10 @@ module.exports = {
   isToolActive,
   isToolReady,
   launchToolFromUserAction,
+  prepareToolForMaintenance,
   resolveToolStatus,
   sendInputToTool,
   setRuntimeEventSink,
   stopTool,
 };
-
-
-
-
-
 

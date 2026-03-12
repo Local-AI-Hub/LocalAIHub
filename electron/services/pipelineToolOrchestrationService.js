@@ -109,6 +109,7 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
     }
 
     const startedTool = await launchToolFromUserAction(tool, {
+      allowPendingStartup: false,
       launchContext: 'pipeline-run',
       skipOpenInterface: true,
     });
@@ -184,6 +185,4 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
 module.exports = {
   createPipelineToolOrchestrator,
 };
-
-
 

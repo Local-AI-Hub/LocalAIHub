@@ -1,7 +1,8 @@
-﻿import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
+import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 
 const {
   IMAGE_WORKFLOW_TOOL_IDS,
+  GRAPH_WORKFLOW_TOOL_IDS,
   NODE_TYPE_LIST,
   PIPELINE_PORT_KIND_LABELS,
   SUPPORTED_PORT_KINDS,
@@ -130,4 +131,4 @@ export function summarizePreview(value, limit = 160) {
   return trimPreviewText(value, limit);
 }
 
-export { IMAGE_WORKFLOW_TOOL_IDS, PIPELINE_PORT_KIND_LABELS, SUPPORTED_PORT_KINDS, WHISPER_MODELS };
+export { GRAPH_WORKFLOW_TOOL_IDS, IMAGE_WORKFLOW_TOOL_IDS, PIPELINE_PORT_KIND_LABELS, SUPPORTED_PORT_KINDS, WHISPER_MODELS };

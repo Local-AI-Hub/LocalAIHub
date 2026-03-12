@@ -1,4 +1,4 @@
-﻿export function formatMemory(mb) {
+export function formatMemory(mb) {
   if (!Number.isFinite(mb) || mb <= 0) {
     return 'Not available';
   }
@@ -69,6 +69,10 @@ export function statusClass(status) {
     return 'border-signal/40 bg-signal/10 text-signal';
   }
 
+  if (status === 'starting') {
+    return 'border-amber-300/40 bg-amber-300/10 text-amber-100';
+  }
+
   if (status === 'error') {
     return 'border-danger/40 bg-danger/10 text-danger';
   }
@@ -79,6 +83,4 @@ export function statusClass(status) {
 export function progressWidth(progress) {
   return `${Math.max(0, Math.min(100, progress || 0))}%`;
 }
-
-
 

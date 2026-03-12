@@ -1,7 +1,7 @@
 import { formatTimestamp, statusClass } from '../lib/formatters';
 
 function primaryAction(tool, busyMap, handlers) {
-  if (tool.status === 'running') {
+  if (tool.status === 'running' || tool.status === 'starting') {
     return {
       label: 'Stop',
       variant: 'ghost-button',
@@ -170,3 +170,4 @@ export default function ToolCard({
     </article>
   );
 }
+

@@ -5,6 +5,7 @@ const MODALITY_VIDEO = 'video';
 const MODALITY_FILE = 'file';
 
 const PIPELINE_OPERATION_IDS = Object.freeze({
+  GRAPH_WORKFLOW: 'graphWorkflow',
   IMAGE_ANALYZE: 'imageAnalyze',
   IMAGE_GENERATE: 'imageGenerate',
   VIDEO_GENERATE: 'videoGenerate',
@@ -15,6 +16,7 @@ const PIPELINE_OPERATION_IDS = Object.freeze({
 
 const TOOL_PIPELINE_STRATEGY_IDS = Object.freeze({
   GRAPH_NATIVE_DEFERRED: 'graph-native-deferred',
+  GRAPH_NATIVE_WORKFLOW: 'graph-native-workflow',
   LOCAL_MODEL_RUNTIME: 'local-model-runtime',
   LOCAL_OPERATION_TOOL: 'local-operation-tool',
 });
@@ -36,14 +38,14 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
     notes: 'Forge exposes a simple WebUI API that fits the current sequential model-step pipeline for text-to-image generation.',
   }),
   comfyui: Object.freeze({
-    id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_DEFERRED,
+    id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW,
     label: 'Graph-native workflow tool',
-    notes: 'ComfyUI stays deferred until Local AI Hub adds nested canvas workflow support instead of pretending it is a one-call model step.',
+    notes: 'ComfyUI uses the dedicated graph workflow step with explicit typed boundary mappings instead of the model-step abstraction.',
   }),
   invokeai: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_DEFERRED,
     label: 'Graph-native workflow tool',
-    notes: 'InvokeAI local generation is deferred until Local AI Hub adds richer workflow-native pipeline integration.',
+    notes: 'InvokeAI remains deferred until Local AI Hub adds a dedicated graph-workflow adapter for it.',
   }),
 });
 
@@ -387,6 +389,32 @@ function getProviderIdsForPipelineOperation(operationId) {
     .map(([providerId]) => providerId);
 }
 
+function getToolIdsForPipelineStrategy(strategyIds) {
+  const normalizedStrategyIds = (Array.isArray(strategyIds) ? strategyIds : [strategyIds])
+    .map((strategyId) => String(strategyId || '').trim())
+    .filter(Boolean);
+
+  if (!normalizedStrategyIds.length) {
+    return [];
+  }
+
+  return Object.entries(TOOL_PIPELINE_STRATEGIES)
+    .filter(([, record]) => normalizedStrategyIds.includes(record?.id))
+    .map(([toolId]) => toolId);
+}
+
+function getGraphWorkflowToolIds(options = {}) {
+  const strategyIds = [TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW];
+  if (options.includeDeferred !== false) {
+    strategyIds.push(TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_DEFERRED);
+  }
+
+  return getToolIdsForPipelineStrategy(strategyIds);
+}
+
+function getRunnableGraphWorkflowToolIds() {
+  return getToolIdsForPipelineStrategy(TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW);
+}
 function getOperationDrivenToolIdsForPipelineOperation(operationId) {
   return Object.entries(TOOL_PIPELINE_CAPABILITIES)
     .filter(([toolId, record]) => {
@@ -408,16 +436,23 @@ module.exports = {
   PIPELINE_OPERATION_IDS,
   TOOL_PIPELINE_STRATEGY_IDS,
   doesProviderModelSupportOperation,
+  getGraphWorkflowToolIds,
   getOperationDrivenToolIdsForPipelineOperation,
   getProviderIdsForPipelineOperation,
   getProviderModelCapabilities,
   getProviderModelOperation,
   getProviderPipelineCapabilities,
   getProviderPipelineOperation,
+  getRunnableGraphWorkflowToolIds,
   getToolIdsForPipelineOperation,
+  getToolIdsForPipelineStrategy,
   getToolPipelineCapabilities,
   getToolPipelineOperation,
   getToolPipelineStrategy,
 };
 
 module.exports.default = module.exports;
+
+
+
+

@@ -18,7 +18,7 @@ function embeddedActionLabel(tool) {
 }
 
 function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
-  if (tool.status === 'running') {
+  if (tool.status === 'running' || tool.status === 'starting') {
     return (
       <button className="ghost-button" disabled={busyMap[`stop:${tool.id}`]} onClick={() => onStop(tool.id)} type="button">
         {busyMap[`stop:${tool.id}`] ? 'Stopping...' : 'Stop'}
@@ -126,7 +126,7 @@ function LibraryCard({
   onUninstall,
   onUpdate,
 }) {
-  const runningUsage = tool.status === 'running' ? runningUsageLabel : 'Idle';
+  const runningUsage = tool.status === 'running' ? runningUsageLabel : tool.status === 'starting' ? 'Starting up' : 'Idle';
   const canRepair = tool.source === 'managed' || tool.installKind === 'installer-exe';
   const canSnapshot = tool.source === 'managed';
   const hasUpdate = Boolean(updateInfo?.updateAvailable);
@@ -290,3 +290,4 @@ function LibraryCard({
 }
 
 export default memo(LibraryCard, areLibraryCardPropsEqual);
+
