@@ -113,6 +113,14 @@ async function generateImageWithWorkflowTool(tool, options = {}) {
       seed: Number.isFinite(Number(options.seed)) ? Number(options.seed) : -1,
       steps: Number(options.steps || 24),
       width: Number(options.width || 832),
+      ...(String(options.model || '').trim()
+        ? {
+            override_settings: {
+              sd_model_checkpoint: String(options.model || '').trim(),
+            },
+            override_settings_restore_afterwards: true,
+          }
+        : {}),
     },
     'generate-image',
   );

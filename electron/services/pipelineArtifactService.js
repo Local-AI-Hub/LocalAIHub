@@ -1,4 +1,4 @@
-﻿const path = require('path');
+const path = require('path');
 const fs = require('fs-extra');
 const { pathToFileURL } = require('url');
 
@@ -216,6 +216,24 @@ async function saveBase64Artifact(runDirectories, base64Payload, options = {}) {
   });
 }
 
+async function saveBufferArtifact(runDirectories, bufferPayload, options = {}) {
+  const extension = options.extension || KIND_EXTENSIONS[options.kind || PORT_KIND_FILE] || '.bin';
+  const filePath = await nextAvailableFilePath(runDirectories.artifactsDir, options.baseName || options.displayName || 'artifact', extension);
+  const buffer = Buffer.isBuffer(bufferPayload)
+    ? bufferPayload
+    : bufferPayload instanceof ArrayBuffer
+      ? Buffer.from(bufferPayload)
+      : ArrayBuffer.isView(bufferPayload)
+        ? Buffer.from(bufferPayload.buffer, bufferPayload.byteOffset, bufferPayload.byteLength)
+        : Buffer.from(bufferPayload || '');
+  await fs.writeFile(filePath, buffer);
+  return buildFileArtifact(filePath, {
+    displayName: options.displayName,
+    kind: options.kind,
+    role: options.role || 'generated',
+  });
+}
+
 async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
   const title = String(options.title || artifact?.displayName || 'result').trim() || 'result';
   if (artifact.kind === PORT_KIND_TEXT) {
@@ -292,7 +310,9 @@ module.exports = {
   ensureRunDirectories,
   inferKindFromPath,
   saveBase64Artifact,
+  saveBufferArtifact,
   sanitizeSegment,
   serializeArtifactForUi,
   summarizeArtifact,
 };
+

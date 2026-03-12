@@ -16,7 +16,7 @@ import {
   toneToClassName,
 } from '../lib/pipeline-ui';
 
-const { buildPipelineGraph, createEdge, createEmptyPipeline, getPortDefinition } = pipelineShared;
+const { buildPipelineGraph, createEdge, createEmptyPipeline, getPortDefinition, PIPELINE_OPERATION_IDS, PIPELINE_PORT_KIND_LABELS, PIPELINE_RETRY_LOOP_MAX_ATTEMPTS } = pipelineShared;
 const CANVAS_MIN_WIDTH = 1280;
 const CANVAS_MIN_HEIGHT = 820;
 
@@ -39,6 +39,114 @@ function formatDateLabel(value) {
   }
 }
 
+function formatArtifactKindLabel(kind) {
+  return PIPELINE_PORT_KIND_LABELS[String(kind || '').trim()] || 'Artifact';
+}
+
+function formatFileSize(sizeBytes) {
+  const numericSize = Number(sizeBytes || 0);
+  if (!Number.isFinite(numericSize) || numericSize <= 0) {
+    return '';
+  }
+
+  if (numericSize >= 1024 * 1024) {
+    return `${Math.max(0.1, Math.round((numericSize / 1024 / 1024) * 10) / 10)} MB`;
+  }
+
+  return `${Math.max(1, Math.round(numericSize / 1024))} KB`;
+}
+
+function getIncomingConnectionCount(graph, nodeId, portId) {
+  const portKey = `${nodeId}:${portId}`;
+  const incomingEdges = graph?.incomingEdgesByPortKey?.get?.(portKey);
+  if (Array.isArray(incomingEdges)) {
+    return incomingEdges.length;
+  }
+
+  return graph?.incomingEdgeByPortKey?.has?.(portKey) ? 1 : 0;
+}
+
+function formatAttemptLabel(iteration, loopMaxAttempts) {
+  const attemptNumber = Number(iteration || 0);
+  const maxAttempts = Number(loopMaxAttempts || 0);
+  if (maxAttempts > 0) {
+    return `Attempt ${Math.max(1, attemptNumber || 1)} of ${maxAttempts}`;
+  }
+
+  if (attemptNumber > 1) {
+    return `Attempt ${attemptNumber}`;
+  }
+
+  return '';
+}
+
+function getRetryLoopTargetOptions(nodes = [], graph, loopNodeId) {
+  const loopNode = (Array.isArray(nodes) ? nodes : []).find((node) => node.id === loopNodeId);
+  if (!loopNode) {
+    return [];
+  }
+
+  const upstreamNodeIds = new Set();
+  const queue = [loopNodeId];
+  while (queue.length > 0) {
+    const currentNodeId = queue.shift();
+    for (const edge of graph?.incomingEdgesByNode?.get?.(currentNodeId) || []) {
+      if (upstreamNodeIds.has(edge.source.nodeId)) {
+        continue;
+      }
+
+      upstreamNodeIds.add(edge.source.nodeId);
+      queue.push(edge.source.nodeId);
+    }
+  }
+
+  const candidateNodes = (Array.isArray(nodes) ? nodes : []).filter((node) => {
+    if (!node || node.id === loopNodeId || node.type === 'retryLoop') {
+      return false;
+    }
+
+    if (getPipelineNodeDefinition(node.type)?.terminal) {
+      return false;
+    }
+
+    return upstreamNodeIds.size === 0 || upstreamNodeIds.has(node.id);
+  });
+
+  if (candidateNodes.length) {
+    return candidateNodes;
+  }
+
+  return (Array.isArray(nodes) ? nodes : []).filter((node) => node?.id !== loopNodeId && node?.type !== 'retryLoop' && !getPipelineNodeDefinition(node.type)?.terminal);
+}
+
+function ArtifactFacts({ artifact, className = '' }) {
+  if (!artifact) {
+    return null;
+  }
+
+  const facts = [
+    formatArtifactKindLabel(artifact.kind),
+    artifact.mimeType || '',
+    artifact.width && artifact.height ? `${artifact.width}x${artifact.height}` : '',
+    formatFileSize(artifact.sizeBytes),
+    artifact.fileName || '',
+  ].filter(Boolean);
+
+  if (!facts.length) {
+    return null;
+  }
+
+  return (
+    <div className={`flex flex-wrap gap-2 ${className}`}>
+      {facts.map((fact, index) => (
+        <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[11px] uppercase tracking-[0.16em] text-slate-300" key={`${fact}-${index}`}>
+          {fact}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function buildNodePreview(node, runState) {
   const nodeRunState = runState?.nodeStates?.[node.id];
   if (nodeRunState?.preview) {
@@ -54,8 +162,12 @@ function buildNodePreview(node, runState) {
   }
 
   if (node.type === 'llmPrompt') {
-    const modeLabel = node.config?.executionMode === 'ollama' ? 'Ollama' : (node.config?.providerId || 'Cloud provider');
-    return `${modeLabel}${node.config?.model ? ` | ${node.config.model}` : ''}`;
+    const modeLabel = node.config?.executionMode === 'ollama'
+      ? 'Ollama'
+      : node.config?.executionMode === 'localTool'
+        ? (node.config?.toolId || 'Local image tool')
+        : (node.config?.providerId || 'Cloud provider');
+    return `${getModelStepOperationLabel(node)} | ${modeLabel}${node.config?.model ? ` | ${node.config.model}` : ''}`;
   }
 
   if (node.type === 'whisperTranscribe') {
@@ -74,6 +186,14 @@ function buildNodePreview(node, runState) {
     return node.config?.mode === 'llm'
       ? `${node.config?.llmExecutionMode === 'ollama' ? 'Ollama' : node.config?.providerId || 'Cloud validator'}${node.config?.model ? ` | ${node.config.model}` : ''}`
       : 'Pauses for a pass or fail decision';
+  }
+
+  if (node.type === 'branchMerge') {
+    return 'Waits for earlier branches to settle, then forwards the single active branch';
+  }
+
+  if (node.type === 'retryLoop') {
+    return `${node.config?.retryTargetNodeId || 'Choose retry target'} | ${Math.max(2, Number(node.config?.maxAttempts || 3) || 3)} attempts`;
   }
 
   if (node.type.endsWith('Output')) {
@@ -109,6 +229,42 @@ function getModelTargetConfig(node) {
   return null;
 }
 
+function getSelectedModelStepOperationId(node) {
+  if (node?.config?.executionMode === 'ollama') {
+    return PIPELINE_OPERATION_IDS.LLM_PROMPT;
+  }
+
+  if (node?.config?.executionMode === 'localTool') {
+    return PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  }
+
+  return node?.config?.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+    ? PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+    : node?.config?.operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      : PIPELINE_OPERATION_IDS.LLM_PROMPT;
+}
+
+function getModelStepOperationLabel(node) {
+  const operationId = getSelectedModelStepOperationId(node);
+  return operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+    ? 'Image generation'
+    : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? 'Video generation'
+      : 'Text response';
+}
+
+function buildModelOptionDetail(model) {
+  const detailParts = [];
+  if (model?.detail) {
+    detailParts.push(model.detail);
+  }
+  if (Array.isArray(model?.capabilityLabels) && model.capabilityLabels.length) {
+    detailParts.push(model.capabilityLabels.join(' | '));
+  }
+  return detailParts.join(' | ');
+}
+
 function buildOllamaModelDetail(model) {
   const detailParts = [];
   if (model?.size) {
@@ -142,6 +298,38 @@ function collectOllamaModelCapabilities(modelOptionsByNodeId) {
   }
 
   return modelCapabilitiesByName;
+}
+
+function collectLocalToolModelsByToolId(modelOptionsByNodeId) {
+  const localModelsByToolId = {};
+
+  for (const modelOptions of Object.values(modelOptionsByNodeId || {})) {
+    for (const model of Array.isArray(modelOptions) ? modelOptions : []) {
+      const toolId = String(model?.toolId || '').trim();
+      const modelId = String(model?.id || '').trim();
+      if (!toolId || !modelId) {
+        continue;
+      }
+
+      if (!localModelsByToolId[toolId]) {
+        localModelsByToolId[toolId] = [];
+      }
+
+      if (localModelsByToolId[toolId].some((entry) => String(entry?.id || '').trim().toLowerCase() === modelId.toLowerCase())) {
+        continue;
+      }
+
+      localModelsByToolId[toolId].push({
+        ...model,
+        downloaded: true,
+        fileName: model.fileName || model.id,
+        name: model.name || model.label || model.id,
+        toolId,
+      });
+    }
+  }
+
+  return localModelsByToolId;
 }
 
 function ArtifactPreview({ artifact, className = '', compact = false }) {
@@ -245,6 +433,7 @@ function ResultCard({ result, onOpenPath, onRevealPath }) {
         </div>
         {result.destinationPath ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">Saved</span> : null}
       </div>
+      <ArtifactFacts artifact={artifact} className="mt-4" />
       <div className="mt-4">
         <ArtifactPreview artifact={artifact} />
       </div>
@@ -259,19 +448,28 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
   }
 
   const artifact = pendingValidation.artifact || null;
+  const artifactLabel = formatArtifactKindLabel(artifact?.kind);
+  const artifactName = artifact?.displayName || artifact?.fileName || '';
   const artifactPath = artifact?.filePath || '';
+  const attemptLabel = formatAttemptLabel(pendingValidation.iteration, pendingValidation.loopMaxAttempts);
   return (
     <div className="rounded-[26px] border border-violet-400/30 bg-violet-400/10 p-4 text-violet-50">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-xs uppercase tracking-[0.22em] text-violet-100/80">Awaiting validation</p>
           <p className="mt-2 text-lg font-semibold text-white">{pendingValidation.nodeLabel}</p>
+          {attemptLabel ? <p className="mt-2 text-xs uppercase tracking-[0.18em] text-violet-100/80">{attemptLabel}</p> : null}
+          {artifactName ? <p className="mt-2 text-sm leading-6 text-violet-50/90">Reviewing {artifactLabel.toLowerCase()}: {artifactName}</p> : null}
         </div>
-        <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[11px] uppercase tracking-[0.18em] text-white/85">
-          Paused
-        </span>
+        <div className="flex flex-wrap items-center gap-2">
+          {artifact ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[11px] uppercase tracking-[0.18em] text-white/85">{artifactLabel}</span> : null}
+          <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[11px] uppercase tracking-[0.18em] text-white/85">
+            Paused
+          </span>
+        </div>
       </div>
-      <p className="mt-3 text-sm leading-6 text-violet-50/90">Review the received content, then choose pass or fail to continue this run.</p>
+      <p className="mt-3 text-sm leading-6 text-violet-50/90">Review the received artifact below. If a preview is available, Local AI Hub shows it here before you choose pass or fail.</p>
+      <ArtifactFacts artifact={artifact} className="mt-4" />
       <div className="mt-4">
         <ArtifactPreview artifact={artifact} />
       </div>
@@ -301,6 +499,8 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
 
 function PipelineTimeline({ draft, runState, validationComment, onChangeValidationComment, onDecideValidation, onOpenPath, onRevealPath, validationBusy }) {
   const activeNodeState = runState?.currentNodeId ? runState.nodeStates?.[runState.currentNodeId] || null : null;
+  const activeAttemptLabel = formatAttemptLabel(activeNodeState?.iteration, activeNodeState?.loopMaxAttempts);
+  const loopStates = Object.values(runState?.loopStates || {});
 
   if (!runState) {
     return (
@@ -323,7 +523,19 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
           </span>
         </div>
         <p className="mt-3 text-sm leading-6 text-slate-200">{runState.message}</p>
-        {activeNodeState ? <p className="mt-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">Current step: {activeNodeState.nodeLabel || activeNodeState.nodeId}</p> : null}
+        {loopStates.length ? (
+          <div className="mt-4 flex flex-wrap gap-2">
+            {loopStates.map((loopState) => {
+              const attemptLabel = formatAttemptLabel(loopState.attempt, loopState.maxAttempts);
+              return (
+                <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[11px] uppercase tracking-[0.16em] text-slate-200" key={loopState.loopNodeId}>
+                  {loopState.loopLabel}: {attemptLabel || 'Ready'}{loopState.status && loopState.status !== 'ready' ? ` | ${loopState.status}` : ''}
+                </span>
+              );
+            })}
+          </div>
+        ) : null}
+        {activeNodeState ? <p className="mt-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">Current step: {activeNodeState.nodeLabel || activeNodeState.nodeId}{activeAttemptLabel ? ` | ${activeAttemptLabel}` : ''}</p> : null}
         <p className="mt-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">
           Started {formatDateLabel(runState.startedAt)}{runState.finishedAt ? ` | Finished ${formatDateLabel(runState.finishedAt)}` : ''}
         </p>
@@ -350,6 +562,7 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
             {runState.executionOrder.map((nodeId, index) => {
               const node = draft.nodes.find((entry) => entry.id === nodeId);
               const nodeState = runState.nodeStates?.[nodeId];
+              const attemptLabel = formatAttemptLabel(nodeState?.iteration, nodeState?.loopMaxAttempts);
               return (
                 <div key={nodeId} className={`rounded-2xl border px-3 py-3 ${runStatusClassName(nodeState?.status || 'queued')}`}>
                   <div className="flex items-center justify-between gap-3">
@@ -359,6 +572,7 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
                     <span className="text-[11px] uppercase tracking-[0.18em] text-slate-300">{nodeState?.status || 'queued'}</span>
                   </div>
                   <p className="mt-2 text-sm leading-6 text-slate-100">{nodeState?.message || 'Waiting to run.'}</p>
+                  {attemptLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">{attemptLabel}</p> : null}
                   {nodeState?.preview ? <p className="mt-2 text-xs leading-5 text-slate-300">{nodeState.preview}</p> : null}
                   {nodeState?.selectedBranch ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">Routed to {nodeState.selectedBranch}</p> : null}
                   {nodeState?.destinationPath ? <input className="store-input mt-3" readOnly value={nodeState.destinationPath} /> : null}
@@ -388,8 +602,15 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
   );
 }
 
-function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node, onRefreshModels, onUpdateNode, executionModeKey, providerIdKey }) {
-  const executionMode = node.config?.[executionModeKey] === 'ollama' ? 'ollama' : 'cloud';
+function ModelTargetFields({ allowLocalTool = false, connectedProviders, localImageTools = [], modelOptions, modelsBusy, node, onRefreshModels, onUpdateNode, executionModeKey, providerIdKey }) {
+  const executionMode = node.config?.[executionModeKey] === 'ollama'
+    ? 'ollama'
+    : allowLocalTool && node.config?.[executionModeKey] === 'localTool'
+      ? 'localTool'
+      : 'cloud';
+  const localImageToolId = String(node.config?.toolId || localImageTools[0]?.id || '').trim();
+  const selectedLocalImageTool = localImageTools.find((tool) => tool.id === localImageToolId) || null;
+
   return (
     <>
       <div>
@@ -399,21 +620,31 @@ function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node,
         <select
           className="store-input mt-3"
           id={`${node.id}-execution-mode`}
-          onChange={(event) =>
+          onChange={(event) => {
+            const nextExecutionMode = event.target.value;
             onUpdateNode(node.id, (currentNode) => ({
               ...currentNode,
               config: {
                 ...currentNode.config,
-                [executionModeKey]: event.target.value,
-                [providerIdKey]: event.target.value === 'cloud' ? currentNode.config?.[providerIdKey] || '' : '',
+                [executionModeKey]: nextExecutionMode,
+                ...(currentNode.type === 'llmPrompt' && nextExecutionMode === 'ollama'
+                  ? { operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }
+                  : currentNode.type === 'llmPrompt' && nextExecutionMode === 'localTool'
+                    ? { operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE }
+                    : {}),
+                ...(currentNode.type === 'llmPrompt'
+                  ? { toolId: nextExecutionMode === 'localTool' ? currentNode.config?.toolId || localImageTools[0]?.id || '' : currentNode.config?.toolId || '' }
+                  : {}),
+                [providerIdKey]: nextExecutionMode === 'cloud' ? currentNode.config?.[providerIdKey] || '' : '',
                 model: '',
               },
-            }))
-          }
+            }));
+          }}
           value={executionMode}
         >
           <option value="cloud">Cloud provider</option>
           <option value="ollama">Ollama (local)</option>
+          {allowLocalTool ? <option value="localTool">Local image tool</option> : null}
         </select>
       </div>
 
@@ -445,6 +676,39 @@ function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node,
             ))}
           </select>
         </div>
+      ) : executionMode === 'localTool' ? (
+        <div className="space-y-3">
+          <div>
+            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`${node.id}-local-tool`}>
+              Local image tool
+            </label>
+            <select
+              className="store-input mt-3"
+              id={`${node.id}-local-tool`}
+              onChange={(event) =>
+                onUpdateNode(node.id, (currentNode) => ({
+                  ...currentNode,
+                  config: {
+                    ...currentNode.config,
+                    model: '',
+                    toolId: event.target.value,
+                  },
+                }))
+              }
+              value={node.config?.toolId || localImageToolId || ''}
+            >
+              <option value="">Choose Automatic1111 or Forge</option>
+              {localImageTools.map((tool) => (
+                <option key={tool.id} value={tool.id}>
+                  {tool.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+            This mode runs a single Automatic1111 or Forge text-to-image request inside the current sequential pipeline. ComfyUI and other graph-native local workflows stay deferred until Local AI Hub adds nested workflow support.
+          </div>
+        </div>
       ) : (
         <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
           Local mode reuses the existing Ollama API path. Local AI Hub will launch Ollama automatically for this step when needed.
@@ -453,7 +717,7 @@ function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node,
 
       <div>
         <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`${node.id}-model`}>
-          Model
+          {executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
         </label>
         <input
           className="store-input mt-3"
@@ -467,7 +731,7 @@ function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node,
               },
             }))
           }
-          placeholder="Enter or pick a model"
+          placeholder={executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : 'Enter or pick a model'}
           value={node.config?.model || ''}
         />
         <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -475,7 +739,15 @@ function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node,
             {modelsBusy ? 'Refreshing...' : 'Refresh models'}
           </button>
           <span className="text-xs text-slate-500">
-            {executionMode === 'ollama' ? 'Loads local Ollama models.' : 'Loads models from the selected cloud provider.'}
+            {executionMode === 'ollama'
+              ? 'Loads local Ollama models.'
+              : executionMode === 'localTool'
+                ? `Loads local checkpoints from ${selectedLocalImageTool?.name || 'the selected image tool'}.`
+                : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                  ? 'Loads cloud image models for this provider step.'
+                  : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                    ? 'Loads cloud video models for this provider step.'
+                    : 'Loads models from the selected cloud provider.'}
           </span>
         </div>
         {modelOptions?.length ? (
@@ -495,8 +767,8 @@ function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node,
                 }
                 type="button"
               >
-                <div className="font-medium text-white">{model.label || model.id}</div>
-                {model.detail ? <div className="mt-1 text-xs text-slate-400">{model.detail}</div> : null}
+                <div className="font-medium text-white">{model.label || model.name || model.id}</div>
+                {buildModelOptionDetail(model) ? <div className="mt-1 text-xs text-slate-400">{buildModelOptionDetail(model)}</div> : null}
               </button>
             ))}
           </div>
@@ -505,6 +777,7 @@ function ModelTargetFields({ connectedProviders, modelOptions, modelsBusy, node,
     </>
   );
 }
+
 export default function PipelineBuilderPanel({ hardware, manifests, onToast, providers, tools }) {
   const [pipelines, setPipelines] = useState([]);
   const [draft, setDraft] = useState(() => createEmptyPipeline());
@@ -526,11 +799,22 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const notifiedRunStateRef = useRef('');
 
   const ollamaModelCapabilitiesByName = useMemo(() => collectOllamaModelCapabilities(modelOptionsByNodeId), [modelOptionsByNodeId]);
+  const localToolModelsByToolId = useMemo(() => collectLocalToolModelsByToolId(modelOptionsByNodeId), [modelOptionsByNodeId]);
   const pipelineTools = useMemo(
-    () => (Object.keys(ollamaModelCapabilitiesByName).length
-      ? tools.map((tool) => (tool.id === 'ollama' ? { ...tool, modelCapabilitiesByName: ollamaModelCapabilitiesByName } : tool))
+    () => (Object.keys(ollamaModelCapabilitiesByName).length || Object.keys(localToolModelsByToolId).length
+      ? tools.map((tool) => {
+          if (tool.id === 'ollama' && Object.keys(ollamaModelCapabilitiesByName).length) {
+            return { ...tool, modelCapabilitiesByName: ollamaModelCapabilitiesByName };
+          }
+
+          if (localToolModelsByToolId[tool.id]) {
+            return { ...tool, downloadedModels: localToolModelsByToolId[tool.id] };
+          }
+
+          return tool;
+        })
       : tools),
-    [ollamaModelCapabilitiesByName, tools],
+    [localToolModelsByToolId, ollamaModelCapabilitiesByName, tools],
   );
   const contextMaps = useMemo(
     () => buildPipelineDisplayContext({ hardware, manifests, providers, tools: pipelineTools }),
@@ -539,6 +823,10 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const analysis = useMemo(() => analyzePipelineDraft(draft, contextMaps), [draft, contextMaps]);
   const graph = useMemo(() => buildPipelineGraph(draft), [draft]);
   const selectedNode = useMemo(() => draft.nodes.find((node) => node.id === selectedNodeId) || null, [draft.nodes, selectedNodeId]);
+  const retryLoopTargetOptions = useMemo(
+    () => (selectedNode?.type === 'retryLoop' ? getRetryLoopTargetOptions(draft.nodes, graph, selectedNode.id) : []),
+    [draft.nodes, graph, selectedNode],
+  );
   const connectedProviders = useMemo(() => (providers || []).filter((provider) => provider.isConnected), [providers]);
   const imageTools = useMemo(() => tools.filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
   const currentPipelineSaved = useMemo(() => pipelines.some((pipeline) => pipeline.id === draft.id), [pipelines, draft.id]);
@@ -831,10 +1119,27 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       return;
     }
 
-    const nextEdges = draft.edges.filter((edge) => !(edge.target.nodeId === targetNodeId && edge.target.portId === targetPortId));
+    const existingExactEdge = draft.edges.find(
+      (edge) =>
+        edge.source.nodeId === sourceNodeId
+        && edge.source.portId === sourcePortId
+        && edge.target.nodeId === targetNodeId
+        && edge.target.portId === targetPortId,
+    );
+    if (existingExactEdge) {
+      onToast('Those ports are already connected.', 'error');
+      return;
+    }
+
+    const existingTargetEdges = draft.edges.filter((edge) => edge.target.nodeId === targetNodeId && edge.target.portId === targetPortId);
+    if (existingTargetEdges.length && !targetPort.allowMultipleConnections) {
+      onToast(`${targetNode.label} already has a connection for ${targetPort.label}. Remove it first, or use a Branch Merge node to recombine multiple branches.`, 'error');
+      return;
+    }
+
     const nextDraft = {
       ...draft,
-      edges: [...nextEdges, createEdge(sourceNodeId, sourcePortId, targetNodeId, targetPortId)],
+      edges: [...draft.edges, createEdge(sourceNodeId, sourcePortId, targetNodeId, targetPortId)],
     };
     const nextGraph = buildPipelineGraph(nextDraft);
     const newErrors = nextGraph.errors.filter((message) => !graph.errors.includes(message));
@@ -842,7 +1147,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       const nextMessage = newErrors[0];
       onToast(
         nextMessage.toLowerCase().includes('cycle')
-          ? 'That connection would create a loop. Pipeline runs still execute in a simple sequential order.'
+          ? 'That connection would create a raw cycle. Use a Retry Loop node when you want a bounded retry path.'
           : nextMessage,
         'error',
       );
@@ -916,7 +1221,12 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     setModelsBusyNodeId(node.id);
-    const executionMode = node.config?.[modelConfig.executionModeKey] === 'ollama' ? 'ollama' : 'cloud';
+    const rawExecutionMode = String(node.config?.[modelConfig.executionModeKey] || '').trim();
+    const executionMode = rawExecutionMode === 'ollama'
+      ? 'ollama'
+      : node.type === 'llmPrompt' && rawExecutionMode === 'localTool'
+        ? 'localTool'
+        : 'cloud';
     let models = [];
     if (executionMode === 'ollama') {
       const result = await window.localAIHub.listOllamaModels({ includeCapabilities: true });
@@ -934,6 +1244,44 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
         capabilitySource: model.capabilitySource || '',
         supportsImageInput: typeof model.supportsImageInput === 'boolean' ? model.supportsImageInput : undefined,
       }));
+    } else if (executionMode === 'localTool') {
+      const toolId = String(node.config?.toolId || imageTools[0]?.id || '').trim();
+      if (!toolId) {
+        setModelsBusyNodeId('');
+        onToast('Install Automatic1111 or Forge before refreshing local image checkpoints for this step.', 'error');
+        return;
+      }
+
+      const result = await window.localAIHub.listLocalModels(toolId);
+      if (!result?.ok) {
+        setModelsBusyNodeId('');
+        onToast(result?.message || 'Local AI Hub could not load local checkpoints for that image tool.', 'error');
+        return;
+      }
+
+      models = (result.data || [])
+        .filter((model) => {
+          const modelType = String(model?.modelType || '').trim().toLowerCase();
+          return modelType === 'checkpoint' || modelType === 'inpainting';
+        })
+        .map((model) => ({
+          ...model,
+          id: String(model.fileName || model.name || model.id || '').trim(),
+          label: model.name || model.fileName || model.id,
+          detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
+          toolId,
+        }))
+        .filter((model) => model.id);
+
+      if (!String(node.config?.toolId || '').trim()) {
+        updateNode(node.id, (currentNode) => ({
+          ...currentNode,
+          config: {
+            ...currentNode.config,
+            toolId,
+          },
+        }));
+      }
     } else {
       const providerId = String(node.config?.[modelConfig.providerIdKey] || '').trim();
       if (!providerId) {
@@ -942,7 +1290,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
         return;
       }
 
-      const result = await window.localAIHub.listProviderModels(providerId);
+      const result = await window.localAIHub.listProviderModels(node.type === 'llmPrompt' ? { operationId: getSelectedModelStepOperationId(node), providerId } : providerId);
       if (!result?.ok) {
         setModelsBusyNodeId('');
         onToast(result?.message || 'Local AI Hub could not load models for that cloud provider.', 'error');
@@ -1184,9 +1532,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
           <div className="panel p-5">
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node palette</p>
-            <p className="mt-2 text-lg font-semibold text-white">Inputs, AI, validation, outputs</p>
+            <p className="mt-2 text-lg font-semibold text-white">Inputs, AI, flow, validation, outputs</p>
             <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs leading-6 text-slate-400">
-              Add nodes across text, image, audio, video, and file workflows. Connections stay typed, and validation can branch to pass or fail.
+              Add nodes across text, image, audio, video, and file workflows. Connections stay typed, validation can branch to pass or fail, and Branch Merge recombines compatible paths explicitly.
             </div>
             <div className="mt-4 space-y-4">
               {paletteGroups.map((group) => (
@@ -1219,7 +1567,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                 <p className="mt-2 text-lg font-semibold text-white">Drag nodes and connect typed ports</p>
               </div>
               <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Click an output port, then an input port</span>
+                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Click an output port, then an input port. Use Branch Merge to recombine pass and fail paths.</span>
                 {pendingConnection ? <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => setPendingConnection(null)} type="button">Cancel connection</button> : null}
               </div>
             </div>
@@ -1271,6 +1619,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                           {Array.from({ length: rowCount }).map((_, index) => {
                             const inputPort = inputPorts[index] || null;
                             const outputPort = outputPorts[index] || null;
+                            const inputConnectionCount = inputPort ? getIncomingConnectionCount(graph, node.id, inputPort.id) : 0;
+                            const allowsMultipleInputConnections = Boolean(inputPort?.allowMultipleConnections);
                             return (
                               <div className="grid h-9 grid-cols-2 items-center gap-4" key={`${node.id}-row-${index}`}>
                                 <div className="flex items-center gap-2">
@@ -1289,6 +1639,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                                     >
                                       <span className="h-2.5 w-2.5 rounded-full bg-white/70" />
                                       <span className="truncate">{inputPort.label}</span>
+                                      {allowsMultipleInputConnections ? <span className="rounded-full border border-white/10 bg-slate-950/50 px-2 py-0.5 text-[10px] text-slate-200">{inputConnectionCount}</span> : null}
                                     </button>
                                   ) : null}
                                 </div>
@@ -1386,9 +1737,87 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
                 {selectedNode.type === 'llmPrompt' ? (
                   <div className="space-y-4">
-                    <ModelTargetFields connectedProviders={connectedProviders} executionModeKey="executionMode" modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-instruction">Task / instruction</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-instruction" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder="Optional guidance to apply to the incoming text." value={selectedNode.config?.instruction || ''} /></div>
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional persistent instruction for this step." value={selectedNode.config?.systemPrompt || ''} /></div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-operation">
+                        Operation
+                      </label>
+                      <select
+                        className="store-input mt-3"
+                        disabled={selectedNode.config?.executionMode === 'ollama' || selectedNode.config?.executionMode === 'localTool'}
+                        id="llm-operation"
+                        onChange={(event) =>
+                          updateNode(selectedNode.id, (currentNode) => ({
+                            ...currentNode,
+                            config: {
+                              ...currentNode.config,
+                              model: '',
+                              operationId: event.target.value,
+                            },
+                          }))
+                        }
+                        value={getSelectedModelStepOperationId(selectedNode)}
+                      >
+                        <option value={PIPELINE_OPERATION_IDS.LLM_PROMPT}>Text response</option>
+                        <option value={PIPELINE_OPERATION_IDS.IMAGE_GENERATE}>Image generation</option>
+                        <option value={PIPELINE_OPERATION_IDS.VIDEO_GENERATE}>Video generation</option>
+                      </select>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">
+                        {selectedNode.config?.executionMode === 'ollama'
+                          ? 'Local Ollama mode currently returns text only.'
+                          : selectedNode.config?.executionMode === 'localTool'
+                            ? 'Local image tool mode is fixed to text-to-image and returns an image artifact from the Image output port.'
+                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                              ? 'This step returns an image artifact from the Image output port.'
+                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                ? 'This step returns a video artifact from the Video output port.'
+                                : 'This step returns a text artifact from the Text output port.'}
+                      </p>
+                    </div>
+                    <ModelTargetFields allowLocalTool connectedProviders={connectedProviders} executionModeKey="executionMode" localImageTools={imageTools} modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-instruction">
+                        {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                          ? 'Prompt prefix / style guidance'
+                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                            ? 'Motion guidance / prompt shaping'
+                            : 'Task / instruction'}
+                      </label>
+                      <textarea
+                        className="store-input mt-3 min-h-[120px] resize-none"
+                        id="llm-instruction"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))}
+                        placeholder={getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                          ? 'Optional style or scene guidance to prepend to the incoming prompt.'
+                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                            ? 'For text-to-video, this is optional extra guidance. For image-to-video, use this box for the motion prompt.'
+                            : 'Optional guidance to apply to the incoming text.'}
+                        value={selectedNode.config?.instruction || ''}
+                      />
+                      {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
+                        <p className="mt-2 text-xs leading-5 text-slate-400">
+                          Text input becomes the base video prompt. If this step is connected to an image, use this box for the motion prompt that should animate that image.
+                        </p>
+                      ) : null}
+                    </div>
+                    {selectedNode.config?.executionMode === 'localTool' ? (
+                      <div className="space-y-4">
+                        <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-width">Width</label><input className="store-input mt-3" id="llm-local-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-height">Height</label><input className="store-input mt-3" id="llm-local-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
+                        <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-steps">Steps</label><input className="store-input mt-3" id="llm-local-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-cfg">CFG scale</label><input className="store-input mt-3" id="llm-local-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-seed">Seed</label><input className="store-input mt-3" id="llm-local-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-local-negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for this local image step." value={selectedNode.config?.negativePrompt || ''} /></div>
+                      </div>
+                    ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? (
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-size">Image size</label><select className="store-input mt-3" id="llm-image-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-quality">Quality</label><select className="store-input mt-3" id="llm-image-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-background">Background</label><select className="store-input mt-3" id="llm-image-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div>
+                      </div>
+                    ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
+                      <div className="space-y-3">
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-video-size">Video size</label><select className="store-input mt-3" id="llm-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="1280x720">1280 x 720 (landscape)</option><option value="720x1280">720 x 1280 (portrait)</option></select></div>
+                        <p className="text-xs leading-5 text-slate-400">Local AI Hub currently requests an 8 second Sora clip and saves the finished video locally. If you connect an image here, make sure it matches the selected video size.</p>
+                      </div>
+                    ) : null}
+                    {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.LLM_PROMPT ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional persistent instruction for this step." value={selectedNode.config?.systemPrompt || ''} /></div> : null}
                   </div>
                 ) : null}
 
@@ -1422,8 +1851,60 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="validation-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional validator instruction." value={selectedNode.config?.systemPrompt || ''} /></div>
                       </>
                     ) : (
-                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This run will pause at the validation node, show the received content, and wait for your pass or fail decision.</div>
+                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This run will pause at the validation node, show the connected artifact preview when possible, and wait for your pass or fail decision.</div>
                     )}
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'retryLoop' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="retry-loop-target">Retry from</label>
+                      <select
+                        className="store-input mt-3"
+                        id="retry-loop-target"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            retryTargetNodeId: event.target.value,
+                          },
+                        }))}
+                        value={selectedNode.config?.retryTargetNodeId || ''}
+                      >
+                        <option value="">Choose an earlier step</option>
+                        {retryLoopTargetOptions.map((node) => (
+                          <option key={node.id} value={node.id}>{node.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="retry-loop-max">Max attempts</label>
+                      <input
+                        className="store-input mt-3"
+                        id="retry-loop-max"
+                        max={PIPELINE_RETRY_LOOP_MAX_ATTEMPTS}
+                        min="2"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            maxAttempts: Number(event.target.value || 0) || 0,
+                          },
+                        }))}
+                        type="number"
+                        value={selectedNode.config?.maxAttempts || 3}
+                      />
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Connect the Complete input to the branch that should exit the loop and the Retry input to the branch that should trigger another attempt. Local AI Hub reruns the selected earlier step and the closed steps between it and this node, one attempt at a time, until the limit is reached.
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'branchMerge' ? (
+                  <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                    Connect two or more compatible branches here. Local AI Hub waits for earlier branches to finish or skip, then forwards the single branch that still has an artifact. If two live results arrive together, the run stops with a plain-English error so the merge stays explicit.
                   </div>
                 ) : null}
 
@@ -1459,6 +1940,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     </section>
   );
 }
+
 
 
 

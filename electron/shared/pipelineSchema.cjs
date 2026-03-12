@@ -1,12 +1,14 @@
 const {
   PIPELINE_OPERATION_IDS,
+  getOperationDrivenToolIdsForPipelineOperation,
   getProviderIdsForPipelineOperation,
+  getProviderModelCapabilities,
   getProviderPipelineOperation,
-  getToolIdsForPipelineOperation,
   getToolPipelineOperation,
 } = require('./pipelineCapabilities.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 2;
+const PIPELINE_SCHEMA_VERSION = 3;
+const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
 const PORT_KIND_TEXT = 'text';
@@ -31,7 +33,29 @@ const PIPELINE_PORT_KIND_LABELS = Object.freeze({
   [PORT_KIND_VIDEO]: 'Video',
   [PORT_KIND_FILE]: 'File',
 });
-const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
+const PIPELINE_OPERATION_LABELS = Object.freeze({
+  [PIPELINE_OPERATION_IDS.IMAGE_ANALYZE]: 'Image analysis',
+  [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: 'Image generation',
+  [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: 'Video generation',
+  [PIPELINE_OPERATION_IDS.LLM_PROMPT]: 'Text response',
+  [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: 'LLM validation',
+  [PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE]: 'Transcription',
+});
+const MODEL_STEP_CLOUD_OPERATION_OPTIONS = Object.freeze([
+  {
+    id: PIPELINE_OPERATION_IDS.LLM_PROMPT,
+    label: 'Text response',
+  },
+  {
+    id: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+    label: 'Image generation',
+  },
+  {
+    id: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+    label: 'Video generation',
+  },
+]);
+const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
 
 const WHISPER_MODELS = [
   { id: 'tiny', label: 'Tiny' },
@@ -129,9 +153,9 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   llmPrompt: Object.freeze({
     type: 'llmPrompt',
-    label: 'LLM Prompt',
+    label: 'Model Step',
     category: 'AI Steps',
-    description: 'Sends text or an image to a compatible provider or Ollama model and returns text.',
+    description: 'Sends text or an image to a compatible model and returns the selected typed output.',
     inputPorts: [
       {
         id: 'prompt',
@@ -147,14 +171,37 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         kind: PORT_KIND_TEXT,
         label: 'Text',
       },
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        label: 'Image',
+      },
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
+      },
     ],
     configDefaults: {
       executionMode: 'cloud',
+      operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT,
       providerId: '',
+      toolId: '',
       model: '',
       instruction: '',
       systemPrompt: '',
+      imageSize: '1024x1024',
+      imageQuality: 'auto',
+      imageBackground: 'auto',
+      videoSize: '1280x720',
+      negativePrompt: '',
+      width: 832,
+      height: 832,
+      steps: 24,
+      cfgScale: 7,
+      seed: -1,
     },
+    cloudOperationOptions: MODEL_STEP_CLOUD_OPERATION_OPTIONS,
     supportedExecutionModes: [
       {
         id: 'cloud',
@@ -164,6 +211,10 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         id: 'ollama',
         label: 'Ollama (local)',
         requiredToolId: 'ollama',
+      },
+      {
+        id: 'localTool',
+        label: 'Local image tool',
       },
     ],
   }),
@@ -307,6 +358,64 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         requiredToolId: 'ollama',
       },
     ],
+  }),
+  branchMerge: Object.freeze({
+    type: 'branchMerge',
+    label: 'Branch Merge',
+    category: 'Flow',
+    description: 'Recombines routed branches and forwards the single branch that stayed active.',
+    inputPorts: [
+      {
+        id: 'branch',
+        kind: PORT_KIND_ANY,
+        allowedKinds: SUPPORTED_PORT_KINDS,
+        label: 'Branches',
+        required: true,
+        allowMultipleConnections: true,
+        minimumConnections: 2,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'result',
+        kind: PORT_KIND_PASSTHROUGH,
+        label: 'Result',
+        passthroughFrom: 'branch',
+      },
+    ],
+    configDefaults: {},
+  }),
+  retryLoop: Object.freeze({
+    type: 'retryLoop',
+    label: 'Retry Loop',
+    category: 'Flow',
+    description: 'Retries an earlier step or subflow when the retry branch stays active, then exits through the complete branch.',
+    inputPorts: [
+      {
+        id: 'complete',
+        kind: PORT_KIND_ANY,
+        allowedKinds: SUPPORTED_PORT_KINDS,
+        label: 'Complete',
+      },
+      {
+        id: 'retry',
+        kind: PORT_KIND_ANY,
+        allowedKinds: SUPPORTED_PORT_KINDS,
+        label: 'Retry',
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'result',
+        kind: PORT_KIND_PASSTHROUGH,
+        label: 'Result',
+        passthroughFrom: 'complete',
+      },
+    ],
+    configDefaults: {
+      retryTargetNodeId: '',
+      maxAttempts: 3,
+    },
   }),
   textOutput: Object.freeze({
     type: 'textOutput',
@@ -476,6 +585,125 @@ function getPortAllowedKinds(port) {
   return kind ? [kind] : [];
 }
 
+function doesPortAllowMultipleConnections(port) {
+  return Boolean(port?.allowMultipleConnections);
+}
+
+function getIncomingEdgesForPortKey(graph, portKey) {
+  if (!graph || !portKey) {
+    return [];
+  }
+
+  const incomingEdges = graph.incomingEdgesByPortKey?.get?.(portKey);
+  if (Array.isArray(incomingEdges)) {
+    return incomingEdges.filter(Boolean);
+  }
+
+  const incomingEdge = graph.incomingEdgeByPortKey?.get?.(portKey);
+  return incomingEdge ? [incomingEdge] : [];
+}
+
+function intersectKindLists(kindLists = []) {
+  if (!kindLists.length) {
+    return [];
+  }
+
+  let intersection = uniqueKindList(kindLists[0]);
+  for (const kindList of kindLists.slice(1)) {
+    const normalizedKinds = uniqueKindList(kindList);
+    intersection = intersection.filter((kind) => normalizedKinds.includes(kind));
+    if (!intersection.length) {
+      break;
+    }
+  }
+
+  return intersection;
+}
+
+function getIncomingKindsForPort(node, port, graph, visited = new Set()) {
+  if (!node || !port || !graph) {
+    return [];
+  }
+
+  const incomingEdges = getIncomingEdgesForPortKey(graph, `${node.id}:${port.id}`);
+  if (!incomingEdges.length) {
+    return [];
+  }
+
+  const incomingKindLists = incomingEdges
+    .map((edge) => {
+      const sourceNode = graph.nodeMap.get(edge.source.nodeId);
+      const sourcePort = getPortDefinition(sourceNode?.type, 'output', edge.source.portId);
+      return resolveOutputKinds(sourceNode, sourcePort, graph, new Set(visited));
+    })
+    .filter((kindList) => kindList.length);
+
+  if (!incomingKindLists.length) {
+    return [];
+  }
+
+  const mergedKinds = doesPortAllowMultipleConnections(port)
+    ? intersectKindLists(incomingKindLists)
+    : uniqueKindList(incomingKindLists.flat());
+  const allowedKinds = getPortAllowedKinds(port);
+  return allowedKinds.length ? mergedKinds.filter((kind) => allowedKinds.includes(kind)) : mergedKinds;
+}
+
+function getPipelineOperationLabel(operationId) {
+  return PIPELINE_OPERATION_LABELS[operationId] || 'Model output';
+}
+
+function getModelStepExecutionMode(node) {
+  return node?.config?.executionMode === 'ollama'
+    ? 'ollama'
+    : node?.config?.executionMode === 'localTool'
+      ? 'localTool'
+      : 'cloud';
+}
+
+function getModelStepOperationId(node) {
+  if (node?.type !== 'llmPrompt') {
+    return PIPELINE_OPERATION_IDS.LLM_PROMPT;
+  }
+
+  const executionMode = getModelStepExecutionMode(node);
+  if (executionMode === 'ollama') {
+    return PIPELINE_OPERATION_IDS.LLM_PROMPT;
+  }
+
+  if (executionMode === 'localTool') {
+    return PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  }
+
+  const requestedOperationId = String(node?.config?.operationId || '').trim();
+  return MODEL_STEP_CLOUD_OPERATION_OPTIONS.some((entry) => entry.id === requestedOperationId)
+    ? requestedOperationId
+    : PIPELINE_OPERATION_IDS.LLM_PROMPT;
+}
+
+function getModelStepLocalToolId(node, contextMaps = {}) {
+  const selectedToolId = String(node?.config?.toolId || '').trim();
+  if (selectedToolId) {
+    return selectedToolId;
+  }
+
+  return pickAvailableToolId(IMAGE_WORKFLOW_TOOL_IDS, contextMaps);
+}
+
+function doesToolExposeDownloadedModel(tool, model) {
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  if (!normalizedModel) {
+    return false;
+  }
+
+  return (Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : []).some((entry) => {
+    const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.path]
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean);
+    return candidates.includes(normalizedModel);
+  });
+}
+
 function getNodeTypeDefinition(type) {
   return PIPELINE_NODE_TYPES[type] || null;
 }
@@ -614,14 +842,11 @@ function resolveOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) 
 
   visited.add(visitKey);
   const passthroughPortId = sourcePort.passthroughFrom || 'input';
-  const incomingEdge = graph.incomingEdgeByPortKey.get(`${sourceNode.id}:${passthroughPortId}`);
-  if (!incomingEdge) {
-    return [];
-  }
-
-  const upstreamNode = graph.nodeMap.get(incomingEdge.source.nodeId);
-  const upstreamPort = getPortDefinition(upstreamNode?.type, 'output', incomingEdge.source.portId);
-  return resolveOutputKinds(upstreamNode, upstreamPort, graph, visited);
+  const passthroughInputPort = getPortDefinition(sourceNode.type, 'input', passthroughPortId) || {
+    id: passthroughPortId,
+    kind: PORT_KIND_ANY,
+  };
+  return getIncomingKindsForPort(sourceNode, passthroughInputPort, graph, visited);
 }
 
 function doesKindIntersect(leftKinds = [], rightKinds = []) {
@@ -640,10 +865,195 @@ function arePortsCompatible(source, target, options = {}) {
   }
 
   if (!sourceKinds.length) {
-    return normalizePortKind(source?.kind) === PORT_KIND_PASSTHROUGH;
+    if (normalizePortKind(source?.kind) !== PORT_KIND_PASSTHROUGH) {
+      return false;
+    }
+
+    if (!options.sourceNode || !options.graph) {
+      return true;
+    }
+
+    const passthroughPortId = source?.passthroughFrom || 'input';
+    return getIncomingEdgesForPortKey(options.graph, `${options.sourceNode.id}:${passthroughPortId}`).length === 0;
   }
 
   return doesKindIntersect(sourceKinds, targetKinds);
+}
+
+function collectConnectedNodeIds(startNodeId, edgeMap, direction = 'target', allowedNodeIds = null) {
+  const visited = new Set();
+  const queue = [startNodeId];
+
+  while (queue.length > 0) {
+    const currentNodeId = queue.shift();
+    if (!currentNodeId || visited.has(currentNodeId)) {
+      continue;
+    }
+
+    if (allowedNodeIds instanceof Set && !allowedNodeIds.has(currentNodeId)) {
+      continue;
+    }
+
+    visited.add(currentNodeId);
+    for (const edge of edgeMap.get(currentNodeId) || []) {
+      const nextNodeId = direction === 'source' ? edge.source.nodeId : edge.target.nodeId;
+      if (!visited.has(nextNodeId)) {
+        queue.push(nextNodeId);
+      }
+    }
+  }
+
+  return visited;
+}
+
+function getRetryLoopAttemptLimit(node) {
+  return Number(node?.config?.maxAttempts || 0);
+}
+
+function addRetryLoopIssue(graph, nodeId, message) {
+  if (!graph?.retryLoopIssuesByNodeId?.has(nodeId)) {
+    graph.retryLoopIssuesByNodeId.set(nodeId, []);
+  }
+
+  graph.retryLoopIssuesByNodeId.get(nodeId).push(message);
+}
+
+function populateRetryLoopMetadata(graph) {
+  if (!graph) {
+    return;
+  }
+
+  const retryLoopNodes = graph.executionOrder
+    .map((nodeId) => graph.nodeMap.get(nodeId))
+    .filter((node) => node?.type === 'retryLoop');
+
+  for (const node of retryLoopNodes) {
+    const completeEdges = graph.incomingEdgesByPortKey.get(node.id + ':complete') || [];
+    const retryEdges = graph.incomingEdgesByPortKey.get(node.id + ':retry') || [];
+    if (!completeEdges.length || !retryEdges.length) {
+      addRetryLoopIssue(graph, node.id, 'Connect both the Complete and Retry inputs before running this loop.');
+    }
+
+    const maxAttempts = getRetryLoopAttemptLimit(node);
+    if (!Number.isInteger(maxAttempts)) {
+      addRetryLoopIssue(graph, node.id, 'Enter a whole number for the loop attempt limit.');
+    } else if (maxAttempts < 2) {
+      addRetryLoopIssue(graph, node.id, 'Set this loop to at least 2 attempts so it can actually retry.');
+    } else if (maxAttempts > PIPELINE_RETRY_LOOP_MAX_ATTEMPTS) {
+      addRetryLoopIssue(graph, node.id, 'This first loop pass allows up to ' + PIPELINE_RETRY_LOOP_MAX_ATTEMPTS + ' attempts so runs stay bounded and understandable.');
+    }
+
+    const retryTargetNodeId = String(node.config?.retryTargetNodeId || '').trim();
+    if (!retryTargetNodeId) {
+      addRetryLoopIssue(graph, node.id, 'Choose which earlier step should rerun when this loop takes the Retry branch.');
+    }
+
+    const retryTargetNode = retryTargetNodeId ? graph.nodeMap.get(retryTargetNodeId) || null : null;
+    if (retryTargetNodeId && !retryTargetNode) {
+      addRetryLoopIssue(graph, node.id, 'The selected retry target no longer exists in this pipeline.');
+    }
+
+    const loopIndex = Number(graph.executionIndexByNodeId.get(node.id));
+    const targetIndex = retryTargetNode ? Number(graph.executionIndexByNodeId.get(retryTargetNode.id)) : -1;
+    if (retryTargetNode) {
+      if (!graph.reachableNodeIds.has(retryTargetNode.id)) {
+        addRetryLoopIssue(graph, node.id, 'Choose a retry target that still leads to an output in this pipeline.');
+      } else if (!Number.isFinite(targetIndex) || !Number.isFinite(loopIndex) || targetIndex >= loopIndex) {
+        addRetryLoopIssue(graph, node.id, 'Choose an earlier step for this retry loop. The retry target must stay upstream of the Retry Loop node.');
+      }
+    }
+
+    if ((graph.retryLoopIssuesByNodeId.get(node.id) || []).length) {
+      continue;
+    }
+
+    const nodesReachableFromTarget = collectConnectedNodeIds(retryTargetNode.id, graph.outgoingEdgesByNode, 'target', graph.reachableNodeIds);
+    const nodesThatReachLoop = collectConnectedNodeIds(node.id, graph.incomingEdgesByNode, 'source', graph.reachableNodeIds);
+    const segmentNodeIds = new Set([...nodesReachableFromTarget].filter((nodeId) => nodesThatReachLoop.has(nodeId)));
+    segmentNodeIds.add(node.id);
+
+    if (!segmentNodeIds.has(retryTargetNode.id)) {
+      addRetryLoopIssue(graph, node.id, 'Connect the selected retry target forward into this Retry Loop node before running it.');
+      continue;
+    }
+
+    if ([...completeEdges, ...retryEdges].some((edge) => !segmentNodeIds.has(edge.source.nodeId))) {
+      addRetryLoopIssue(graph, node.id, 'Feed both loop branches from the steps between the retry target and this Retry Loop node.');
+    }
+
+    const completePort = getPortDefinition(node.type, 'input', 'complete');
+    const retryPort = getPortDefinition(node.type, 'input', 'retry');
+    const completeKinds = getIncomingKindsForPort(node, completePort, graph);
+    const retryKinds = getIncomingKindsForPort(node, retryPort, graph);
+    if (completeKinds.length && retryKinds.length && !doesKindIntersect(completeKinds, retryKinds)) {
+      addRetryLoopIssue(graph, node.id, 'The Complete and Retry branches must stay on the same artifact type in this first loop pass.');
+    }
+
+    let loopLeakDetected = false;
+    for (const segmentNodeId of segmentNodeIds) {
+      if (segmentNodeId === node.id) {
+        continue;
+      }
+
+      for (const edge of graph.outgoingEdgesByNode.get(segmentNodeId) || []) {
+        if (!graph.reachableNodeIds.has(edge.target.nodeId)) {
+          continue;
+        }
+
+        if (edge.target.nodeId === node.id) {
+          continue;
+        }
+
+        if (!segmentNodeIds.has(edge.target.nodeId)) {
+          loopLeakDetected = true;
+          break;
+        }
+      }
+
+      if (loopLeakDetected) {
+        break;
+      }
+    }
+
+    if (loopLeakDetected) {
+      addRetryLoopIssue(graph, node.id, 'Keep every step in this retry span inside the loop until it reaches the Retry Loop node. Move outside outputs and side branches after the loop result.');
+    }
+
+    const nestedLoopNodes = [...segmentNodeIds].filter((segmentNodeId) => segmentNodeId !== node.id && graph.nodeMap.get(segmentNodeId)?.type === 'retryLoop');
+    if (nestedLoopNodes.length) {
+      addRetryLoopIssue(graph, node.id, 'Nested retry loops are not supported in this first loop pass. Finish one loop before starting another.');
+    }
+
+    const overlappingNodeId = [...segmentNodeIds].find((segmentNodeId) => {
+      const existingLoopNodeId = graph.retryLoopNodeIdsBySegmentNodeId.get(segmentNodeId);
+      return existingLoopNodeId && existingLoopNodeId !== node.id;
+    });
+    if (overlappingNodeId) {
+      addRetryLoopIssue(graph, node.id, 'Overlapping retry loops are not supported yet. Keep each retry span separate.');
+    }
+
+    if ((graph.retryLoopIssuesByNodeId.get(node.id) || []).length) {
+      continue;
+    }
+
+    const segmentExecutionOrder = graph.executionOrder.filter((nodeId) => segmentNodeIds.has(nodeId));
+    const loopMetadata = {
+      completeKinds,
+      loopLabel: node.label,
+      loopNodeId: node.id,
+      maxAttempts,
+      retryKinds,
+      retryTargetLabel: retryTargetNode.label,
+      retryTargetNodeId: retryTargetNode.id,
+      segmentExecutionOrder,
+      segmentNodeIds: [...segmentNodeIds],
+    };
+
+    graph.retryLoopsByNodeId.set(node.id, loopMetadata);
+    for (const segmentNodeId of segmentExecutionOrder) {
+      graph.retryLoopNodeIdsBySegmentNodeId.set(segmentNodeId, node.id);
+    }
+  }
 }
 
 function compareIssueSeverity(leftTone = 'neutral', rightTone = 'neutral') {
@@ -802,14 +1212,8 @@ function getIncomingKindsForNodePort(node, portId, graph) {
     return [];
   }
 
-  const incomingEdge = graph.incomingEdgeByPortKey.get(node.id + ':' + portId);
-  if (!incomingEdge) {
-    return [];
-  }
-
-  const sourceNode = graph.nodeMap.get(incomingEdge.source.nodeId);
-  const sourcePort = getPortDefinition(sourceNode?.type, 'output', incomingEdge.source.portId);
-  return resolveOutputKinds(sourceNode, sourcePort, graph);
+  const port = getPortDefinition(node.type, 'input', portId);
+  return getIncomingKindsForPort(node, port, graph);
 }
 
 function doesModelLikelySupportImages(targetKind, targetId, model) {
@@ -875,7 +1279,8 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
 }
 
 function resolveLlmNodeCapability(node, contextMaps = {}) {
-  const executionMode = node?.config?.executionMode === 'ollama' ? 'ollama' : 'cloud';
+  const executionMode = getModelStepExecutionMode(node);
+  const operationId = getModelStepOperationId(node);
   if (executionMode === 'ollama') {
     const tool = getContextToolEntry('ollama', contextMaps);
     return {
@@ -887,12 +1292,25 @@ function resolveLlmNodeCapability(node, contextMaps = {}) {
     };
   }
 
+  if (executionMode === 'localTool') {
+    const effectiveToolId = getModelStepLocalToolId(node, contextMaps);
+    const toolIds = effectiveToolId ? [effectiveToolId] : IMAGE_WORKFLOW_TOOL_IDS;
+    const tool = effectiveToolId ? getContextToolEntry(effectiveToolId, contextMaps) : null;
+    return {
+      capability: mergeCapabilityOperations(toolIds.map((toolId) => getContextToolOperation(toolId, operationId, contextMaps))),
+      operationId,
+      targetId: effectiveToolId || '',
+      targetKind: 'tool',
+      targetLabel: tool?.name || 'Automatic1111 or Forge',
+    };
+  }
+
   const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
   if (providerId) {
     const provider = getContextProviderEntry(providerId, contextMaps);
     return {
-      capability: getContextProviderOperation(providerId, PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps),
-      operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT,
+      capability: getContextProviderOperation(providerId, operationId, contextMaps),
+      operationId,
       targetId: providerId,
       targetKind: 'provider',
       targetLabel: provider?.name || 'Cloud provider',
@@ -901,9 +1319,9 @@ function resolveLlmNodeCapability(node, contextMaps = {}) {
 
   return {
     capability: mergeCapabilityOperations(
-      getProviderIdsForPipelineOperation(PIPELINE_OPERATION_IDS.LLM_PROMPT).map((entry) => getContextProviderOperation(entry, PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps)),
+      getProviderIdsForPipelineOperation(operationId).map((entry) => getContextProviderOperation(entry, operationId, contextMaps)),
     ),
-    operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT,
+    operationId,
     targetId: '',
     targetKind: 'provider',
     targetLabel: 'Cloud provider',
@@ -968,19 +1386,40 @@ function resolveNodeCapability(node, contextMaps = {}) {
 
 function buildNodeCapabilitySummary(node, contextMaps = {}) {
   const resolved = resolveNodeCapability(node, contextMaps);
-  const capability = resolved?.capability || null;
-  if (!capability) {
+  if (!resolved) {
     return null;
+  }
+
+  const capability = resolved.capability || null;
+  if (!capability) {
+    return {
+      inputKinds: [],
+      message: resolved.targetLabel + ' does not support ' + getPipelineOperationLabel(resolved.operationId).toLowerCase() + ' for this step yet.',
+      notes: '',
+      operationId: resolved.operationId,
+      operationLabel: getPipelineOperationLabel(resolved.operationId),
+      outputKinds: [],
+      supported: false,
+      targetId: resolved.targetId,
+      targetKind: resolved.targetKind,
+      targetLabel: resolved.targetLabel,
+    };
   }
 
   const inputKinds = uniqueKindList(capability.inputKinds);
   const outputKinds = uniqueKindList(capability.outputKinds);
   const notes = String(capability.notes || '').trim();
+  const message = resolved.operationId === PIPELINE_OPERATION_IDS.VALIDATION_LLM
+    ? resolved.targetLabel + ' can review ' + formatPortKindList(inputKinds) + ' in this validation step.' + (notes ? ' ' + notes : '')
+    : resolved.targetLabel + ' supports ' + formatPortKindList(inputKinds) + ' to ' + formatPortKindList(outputKinds) + ' for this step.' + (notes ? ' ' + notes : '');
   return {
     inputKinds,
-    message: resolved.targetLabel + ' supports ' + formatPortKindList(inputKinds) + ' to ' + formatPortKindList(outputKinds) + ' for this step.' + (notes ? ' ' + notes : ''),
+    message,
     notes,
+    operationId: resolved.operationId,
+    operationLabel: getPipelineOperationLabel(resolved.operationId),
     outputKinds,
+    supported: true,
     targetId: resolved.targetId,
     targetKind: resolved.targetKind,
     targetLabel: resolved.targetLabel,
@@ -1054,6 +1493,90 @@ function getImageModelSupportState(node, capabilitySummary, contextMaps = {}) {
   };
 }
 
+function getConnectedOutputPortEntries(node, graph) {
+  if (!node || !graph) {
+    return [];
+  }
+
+  return (graph.outgoingEdgesByNode.get(node.id) || [])
+    .map((edge) => ({
+      edge,
+      port: getPortDefinition(node.type, 'output', edge.source.portId),
+    }))
+    .filter((entry) => entry.port);
+}
+
+function getUnexpectedOutputConnectionMessage(node, supportedOutputKinds = [], graph) {
+  const normalizedOutputKinds = uniqueKindList(supportedOutputKinds);
+  const unsupportedEntry = getConnectedOutputPortEntries(node, graph).find((entry) => {
+    const portKind = normalizePortKind(entry.port?.kind);
+    return portKind && !normalizedOutputKinds.includes(portKind);
+  });
+
+  if (!unsupportedEntry) {
+    return '';
+  }
+
+  const portKind = normalizePortKind(unsupportedEntry.port?.kind);
+  const targetNode = graph.nodeMap.get(unsupportedEntry.edge.target.nodeId);
+  return 'This step is set to return ' + formatPortKindList(normalizedOutputKinds) + ', but it is currently wired through the ' + (PIPELINE_PORT_KIND_LABELS[portKind] || unsupportedEntry.port?.label || 'selected') + ' output to ' + (targetNode?.label || 'another node') + '. Use the matching output port for this operation.';
+}
+
+function getModelStepSupportState(node, capabilitySummary, contextMaps = {}, connectedKinds = []) {
+  const model = String(node?.config?.model || '').trim();
+  if (!model || !capabilitySummary) {
+    return {
+      status: 'unknown',
+      message: '',
+    };
+  }
+
+  if (capabilitySummary.targetKind === 'tool' && capabilitySummary.targetId && capabilitySummary.targetId !== 'ollama') {
+    const tool = getContextToolEntry(capabilitySummary.targetId, contextMaps);
+    const downloadedModels = Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : [];
+    if (!downloadedModels.length) {
+      return {
+        status: 'unknown',
+        message: capabilitySummary.targetLabel + ' has not shared its local checkpoint list yet. Refresh the local model list or make sure the tool is installed on this PC before running this step.',
+      };
+    }
+
+    if (!doesToolExposeDownloadedModel(tool, model)) {
+      return {
+        status: 'unsupported',
+        message: 'Selected checkpoint is not available in ' + capabilitySummary.targetLabel + '. Refresh the local model list or download that checkpoint before running this step.',
+      };
+    }
+  }
+
+  if (capabilitySummary.targetKind === 'provider' && capabilitySummary.targetId) {
+    const modelCapabilities = getProviderModelCapabilities(capabilitySummary.targetId, model);
+    if (!modelCapabilities?.operations?.[capabilitySummary.operationId]) {
+      return {
+        status: 'unsupported',
+        message:
+          capabilitySummary.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+            ? 'Selected model does not support image generation on ' + capabilitySummary.targetLabel + '. Choose a dedicated image model such as gpt-image-1 before running this step.'
+            : capabilitySummary.operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+              ? 'Selected model does not support video generation on ' + capabilitySummary.targetLabel + '. Choose a Sora video model such as sora-2 before running this step.'
+              : 'Selected model does not support ' + getPipelineOperationLabel(capabilitySummary.operationId).toLowerCase() + ' on ' + capabilitySummary.targetLabel + '. Choose a compatible chat model before running this step.',
+      };
+    }
+  }
+
+  if (
+    (capabilitySummary.operationId === PIPELINE_OPERATION_IDS.LLM_PROMPT || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.VALIDATION_LLM)
+    && connectedKinds.includes(PORT_KIND_IMAGE)
+  ) {
+    return getImageModelSupportState(node, capabilitySummary, contextMaps);
+  }
+
+  return {
+    status: 'supported',
+    message: '',
+  };
+}
+
 function buildPipelineGraph(definition = {}) {
   const pipeline = normalizePipelineDefinition(definition, {
     keepCreatedAt: true,
@@ -1082,7 +1605,8 @@ function buildPipelineGraph(definition = {}) {
   }
 
   const structuralEdges = [];
-  const targetPortKeys = new Set();
+  const edgeKeys = new Set();
+  const targetPortKeys = new Map();
   for (const edge of pipeline.edges) {
     const sourceNode = nodeMap.get(edge.source.nodeId);
     const targetNode = nodeMap.get(edge.target.nodeId);
@@ -1103,13 +1627,22 @@ function buildPipelineGraph(definition = {}) {
       continue;
     }
 
+    const edgeKey = `${sourceNode.id}:${sourcePort.id}->${targetNode.id}:${targetPort.id}`;
+    if (edgeKeys.has(edgeKey)) {
+      errors.push(`"${sourceNode.label}" is already connected to "${targetNode.label}" through ${targetPort.label}.`);
+      continue;
+    }
+
+    edgeKeys.add(edgeKey);
     const targetKey = `${targetNode.id}:${targetPort.id}`;
-    if (targetPortKeys.has(targetKey)) {
+    const existingTargetEdges = targetPortKeys.get(targetKey) || [];
+    if (existingTargetEdges.length && !doesPortAllowMultipleConnections(targetPort)) {
       errors.push(`"${targetNode.label}" already has a connection for ${targetPort.label}.`);
       continue;
     }
 
-    targetPortKeys.add(targetKey);
+    existingTargetEdges.push(edge);
+    targetPortKeys.set(targetKey, existingTargetEdges);
     structuralEdges.push({
       edge,
       sourceNode,
@@ -1121,16 +1654,41 @@ function buildPipelineGraph(definition = {}) {
 
   const outgoingEdgesByNode = new Map([...nodeMap.keys()].map((nodeId) => [nodeId, []]));
   const incomingEdgesByNode = new Map([...nodeMap.keys()].map((nodeId) => [nodeId, []]));
-  const incomingEdgeByPortKey = new Map();
+  const incomingEdgesByPortKey = new Map();
+  const compatibilityIncomingEdgesByPortKey = new Map();
+  for (const entry of structuralEdges) {
+    const targetKey = `${entry.targetNode.id}:${entry.targetPort.id}`;
+    if (!compatibilityIncomingEdgesByPortKey.has(targetKey)) {
+      compatibilityIncomingEdgesByPortKey.set(targetKey, []);
+    }
+
+    compatibilityIncomingEdgesByPortKey.get(targetKey).push(entry.edge);
+  }
+
   const compatibilityIncomingEdgeByPortKey = new Map(
-    structuralEdges.map((entry) => [`${entry.targetNode.id}:${entry.targetPort.id}`, entry.edge]),
+    [...compatibilityIncomingEdgesByPortKey.entries()].map(([portKey, edges]) => [portKey, edges[0]]),
   );
   const validEdges = [];
   const graphForCompatibility = {
     pipeline,
     nodeMap,
+    incomingEdgesByPortKey: compatibilityIncomingEdgesByPortKey,
     incomingEdgeByPortKey: compatibilityIncomingEdgeByPortKey,
   };
+  const invalidMultiInputPortKeys = new Set();
+
+  for (const entry of structuralEdges) {
+    const targetKey = `${entry.targetNode.id}:${entry.targetPort.id}`;
+    if (
+      doesPortAllowMultipleConnections(entry.targetPort)
+      && !invalidMultiInputPortKeys.has(targetKey)
+      && (compatibilityIncomingEdgesByPortKey.get(targetKey) || []).length > 1
+      && !getIncomingKindsForPort(entry.targetNode, entry.targetPort, graphForCompatibility).length
+    ) {
+      errors.push(`"${entry.targetNode.label}" can only merge branches that stay on the same artifact type. Connect branches that all carry text, image, audio, video, or file output.`);
+      invalidMultiInputPortKeys.add(targetKey);
+    }
+  }
 
   for (const entry of structuralEdges) {
     if (!arePortsCompatible(entry.sourcePort, entry.targetPort, {
@@ -1143,10 +1701,19 @@ function buildPipelineGraph(definition = {}) {
     }
 
     validEdges.push(entry.edge);
-    incomingEdgeByPortKey.set(`${entry.targetNode.id}:${entry.targetPort.id}`, entry.edge);
+    const targetKey = `${entry.targetNode.id}:${entry.targetPort.id}`;
+    if (!incomingEdgesByPortKey.has(targetKey)) {
+      incomingEdgesByPortKey.set(targetKey, []);
+    }
+
+    incomingEdgesByPortKey.get(targetKey).push(entry.edge);
     outgoingEdgesByNode.get(entry.sourceNode.id).push(entry.edge);
     incomingEdgesByNode.get(entry.targetNode.id).push(entry.edge);
   }
+
+  const incomingEdgeByPortKey = new Map(
+    [...incomingEdgesByPortKey.entries()].map(([portKey, edges]) => [portKey, edges[0]]),
+  );
 
   const terminalNodeIds = pipeline.nodes.filter((node) => getNodeTypeDefinition(node.type)?.terminal).map((node) => node.id);
   if (!terminalNodeIds.length) {
@@ -1218,10 +1785,15 @@ function buildPipelineGraph(definition = {}) {
     nodeMap,
     outgoingEdgesByNode,
     incomingEdgesByNode,
+    incomingEdgesByPortKey,
     incomingEdgeByPortKey,
     reachableNodeIds,
     terminalNodeIds,
     executionOrder,
+    executionIndexByNodeId: new Map(executionOrder.map((nodeId, index) => [nodeId, index])),
+    retryLoopIssuesByNodeId: new Map(),
+    retryLoopNodeIdsBySegmentNodeId: new Map(),
+    retryLoopsByNodeId: new Map(),
     edges: validEdges,
   };
 
@@ -1233,25 +1805,25 @@ function buildPipelineGraph(definition = {}) {
     }
 
     for (const port of definitionEntry.inputPorts || []) {
-      if (!port.required) {
+      const targetKey = `${node.id}:${port.id}`;
+      const incomingEdges = incomingEdgesByPortKey.get(targetKey) || [];
+      if (port.required && !incomingEdges.length) {
+        errors.push(`"${node.label}" is missing a connection for ${port.label}.`);
         continue;
       }
 
-      const targetKey = `${node.id}:${port.id}`;
-      if (!incomingEdgeByPortKey.has(targetKey)) {
-        errors.push(`"${node.label}" is missing a connection for ${port.label}.`);
-      }
-    }
-
-    if (node.type === 'validation') {
-      const passCount = (outgoingEdgesByNode.get(node.id) || []).filter((edge) => edge.source.portId === 'pass').length;
-      const failCount = (outgoingEdgesByNode.get(node.id) || []).filter((edge) => edge.source.portId === 'fail').length;
-      if (passCount === 0 || failCount === 0) {
-        errors.push(`"${node.label}" must connect both the pass and fail outputs before it can run.`);
+      if (
+        doesPortAllowMultipleConnections(port)
+        && incomingEdges.length > 1
+        && !invalidMultiInputPortKeys.has(targetKey)
+        && !getIncomingKindsForPort(node, port, graph).length
+      ) {
+        errors.push(`"${node.label}" can only merge branches that stay on the same artifact type. Connect branches that all carry text, image, audio, video, or file output.`);
       }
     }
   }
 
+  populateRetryLoopMetadata(graph);
   return graph;
 }
 
@@ -1279,8 +1851,12 @@ function getLocalToolRequirement(node, contextMaps = {}) {
     return 'whisper';
   }
 
-  if (node.type === 'llmPrompt' && node.config?.executionMode === 'ollama') {
+  if (node.type === 'llmPrompt' && getModelStepExecutionMode(node) === 'ollama') {
     return 'ollama';
+  }
+
+  if (node.type === 'llmPrompt' && getModelStepExecutionMode(node) === 'localTool') {
+    return getModelStepLocalToolId(node, contextMaps);
   }
 
   if (node.type === 'validation' && node.config?.mode === 'llm' && node.config?.llmExecutionMode === 'ollama') {
@@ -1392,14 +1968,57 @@ function analyzeImageToolNode(node, summary, contextMaps) {
   if (String(tool.status || '').toLowerCase() !== 'running') {
     summary.readiness = {
       tone: 'warn',
-      message: `${tool.name} is not running yet. Local AI Hub can start it automatically when this image step begins.`,
+      message: tool.name + ' is not running yet. Local AI Hub can start it automatically when this image step begins.',
     };
     return true;
   }
 
   summary.readiness = {
     tone: 'info',
-    message: `${tool.name} will handle this image step locally.`,
+    message: tool.name + ' will handle this image step locally.',
+  };
+  return true;
+}
+
+function analyzeModelStepLocalToolNode(node, summary, contextMaps) {
+  const selectedToolId = String(node.config?.toolId || '').trim();
+  const effectiveToolId = getModelStepLocalToolId(node, contextMaps);
+  if (selectedToolId && !IMAGE_WORKFLOW_TOOL_IDS.includes(selectedToolId)) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools are intentionally deferred to later nested workflow support.',
+    };
+    return false;
+  }
+
+  if (!effectiveToolId) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Install Automatic1111 or Forge before using the local image tool mode in a model step.',
+    };
+    return false;
+  }
+
+  const tool = contextMaps.toolsById[effectiveToolId] || null;
+  if (!tool) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Install Automatic1111 or Forge before using the local image tool mode in a model step.',
+    };
+    return false;
+  }
+
+  if (String(tool.status || '').toLowerCase() !== 'running') {
+    summary.readiness = {
+      tone: 'warn',
+      message: tool.name + ' is not running yet. Local AI Hub can start it automatically when this model step begins.',
+    };
+    return true;
+  }
+
+  summary.readiness = {
+    tone: 'info',
+    message: tool.name + ' will turn the connected text prompt into an image locally.',
   };
   return true;
 }
@@ -1460,83 +2079,165 @@ function analyzePipeline(definition = {}, context = {}) {
       }
 
       if (node.type === 'llmPrompt') {
-        const executionMode = node.config?.executionMode === 'ollama' ? 'ollama' : 'cloud';
+        const executionMode = getModelStepExecutionMode(node);
+        const operationId = getModelStepOperationId(node);
         const connectedKinds = getIncomingKindsForNodePort(node, 'prompt', graph);
-        const unsupportedKinds = connectedKinds.filter((kind) => !(summary.capabilitySummary?.inputKinds || []).includes(kind));
-        if (unsupportedKinds.length) {
+        if (summary.capabilitySummary?.supported === false) {
           summary.readiness = {
             tone: 'error',
-            message: (summary.capabilitySummary?.targetLabel || 'This target') + ' does not accept ' + formatPortKindList(unsupportedKinds) + ' here. This step currently supports ' + formatPortKindList(summary.capabilitySummary?.inputKinds || [PORT_KIND_TEXT]) + '.',
+            message: summary.capabilitySummary.message,
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (!String(node.config?.model || '').trim()) {
-          summary.readiness = {
-            tone: 'error',
-            message: 'Choose or enter a model for this LLM step.',
-          };
-          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (executionMode === 'cloud') {
-          const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
-          summary.readiness = {
-            tone: providerStatus.tone,
-            message: providerStatus.message,
-          };
-          if (providerStatus.tone === 'error') {
-            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-          } else if (connectedKinds.includes(PORT_KIND_IMAGE)) {
-            const imageModelSupport = getImageModelSupportState(node, summary.capabilitySummary, contextMaps);
-            summary.readiness = imageModelSupport.status === 'unsupported'
-              ? {
-                  tone: 'error',
-                  message: imageModelSupport.message,
-                }
-              : imageModelSupport.status === 'unknown'
-                ? {
-                    tone: 'warn',
-                    message: imageModelSupport.message,
-                  }
-                : {
-                    tone: 'info',
-                    message: (providerStatus.provider?.name || 'That provider') + ' can read the connected image and return text.',
-                  };
-            issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
-          }
         } else {
-          const ollamaTool = contextMaps.toolsById.ollama || null;
-          if (!ollamaTool) {
+          const unsupportedKinds = connectedKinds.filter((kind) => !(summary.capabilitySummary?.inputKinds || []).includes(kind));
+          const outputConnectionMessage = getUnexpectedOutputConnectionMessage(node, summary.capabilitySummary?.outputKinds || [], graph);
+          if (unsupportedKinds.length) {
             summary.readiness = {
               tone: 'error',
-              message: 'Install Ollama before using the local LLM mode in a pipeline.',
+              message: (summary.capabilitySummary?.targetLabel || 'This target') + ' does not accept ' + formatPortKindList(unsupportedKinds) + ' here. This step currently supports ' + formatPortKindList(summary.capabilitySummary?.inputKinds || [PORT_KIND_TEXT]) + '.',
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-          } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
+          } else if (!String(node.config?.model || '').trim()) {
             summary.readiness = {
-              tone: 'warn',
-              message: 'Ollama is not running yet. Local AI Hub can start it automatically when this pipeline begins.',
+              tone: 'error',
+              message: 'Choose or enter a model for this model step.',
             };
-            issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
-          } else if (connectedKinds.includes(PORT_KIND_IMAGE)) {
-            const imageModelSupport = getImageModelSupportState(node, summary.capabilitySummary, contextMaps);
-            summary.readiness = imageModelSupport.status === 'unsupported'
-              ? {
-                  tone: 'error',
-                  message: imageModelSupport.message,
-                }
-              : imageModelSupport.status === 'unknown'
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (outputConnectionMessage) {
+            summary.readiness = {
+              tone: 'error',
+              message: outputConnectionMessage,
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (
+            operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+            && connectedKinds.includes(PORT_KIND_IMAGE)
+            && !String(node.config?.instruction || '').trim()
+          ) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'This video step is using an image input. Add motion guidance in the instruction box before running it.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (executionMode === 'cloud') {
+            const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
+            summary.readiness = {
+              tone: providerStatus.tone,
+              message: providerStatus.message,
+            };
+            if (providerStatus.tone === 'error') {
+              issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+            } else {
+              const modelSupport = getModelStepSupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
+              summary.readiness = modelSupport.status === 'unsupported'
                 ? {
-                    tone: 'warn',
-                    message: imageModelSupport.message,
+                    tone: 'error',
+                    message: modelSupport.message,
                   }
-                : {
-                    tone: 'info',
-                    message: 'Ollama will read the connected image and return text.',
+                : modelSupport.status === 'unknown'
+                  ? {
+                      tone: 'warn',
+                      message: modelSupport.message,
+                    }
+                  : operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                    ? {
+                        tone: 'info',
+                        message: (providerStatus.provider?.name || 'That provider') + ' will turn the connected text prompt into an image.',
+                      }
+                    : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                      ? connectedKinds.includes(PORT_KIND_IMAGE)
+                        ? {
+                            tone: 'info',
+                            message: (providerStatus.provider?.name || 'That provider') + ' will use the connected image and your motion guidance to render a video.',
+                          }
+                        : {
+                            tone: 'info',
+                            message: (providerStatus.provider?.name || 'That provider') + ' will turn the connected prompt into a video artifact.',
+                          }
+                      : connectedKinds.includes(PORT_KIND_IMAGE)
+                        ? {
+                            tone: 'info',
+                            message: (providerStatus.provider?.name || 'That provider') + ' can read the connected image and return text.',
+                          }
+                        : {
+                            tone: 'info',
+                            message: (providerStatus.provider?.name || 'That provider') + ' will return text for this step.',
+                          };
+              issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
+            }
+          } else if (executionMode === 'localTool') {
+            if (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256) {
+              summary.readiness = {
+                tone: 'error',
+                message: 'Use at least 256 by 256 for local image generation in a model step.',
+              };
+              issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+            } else {
+              const ready = analyzeModelStepLocalToolNode(node, summary, contextMaps);
+              if (!ready || summary.readiness.tone === 'error') {
+                issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+              } else {
+                const modelSupport = getModelStepSupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
+                if (modelSupport.status === 'unsupported') {
+                  summary.readiness = {
+                    tone: 'error',
+                    message: modelSupport.message,
                   };
-            issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
+                  issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+                } else if (modelSupport.status === 'unknown') {
+                  summary.readiness = {
+                    tone: 'warn',
+                    message: modelSupport.message,
+                  };
+                  issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+                } else if (summary.readiness.tone === 'warn') {
+                  issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+                } else {
+                  issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
+                }
+              }
+            }
           } else {
-            summary.readiness = {
-              tone: 'info',
-              message: 'Ollama will process this text step locally.',
-            };
+            const ollamaTool = contextMaps.toolsById.ollama || null;
+            if (!ollamaTool) {
+              summary.readiness = {
+                tone: 'error',
+                message: 'Install Ollama before using the local model mode in a pipeline.',
+              };
+              issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+            } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
+              summary.readiness = {
+                tone: 'warn',
+                message: 'Ollama is not running yet. Local AI Hub can start it automatically when this pipeline begins.',
+              };
+              issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+            } else {
+              const modelSupport = getModelStepSupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
+              summary.readiness = modelSupport.status === 'unsupported'
+                ? {
+                    tone: 'error',
+                    message: modelSupport.message,
+                  }
+                : modelSupport.status === 'unknown'
+                  ? {
+                      tone: 'warn',
+                      message: modelSupport.message,
+                    }
+                  : connectedKinds.includes(PORT_KIND_IMAGE)
+                    ? {
+                        tone: 'info',
+                        message: 'Ollama will read the connected image and return text.',
+                      }
+                    : {
+                        tone: 'info',
+                        message: 'Ollama will process this text step locally.',
+                      };
+              if (summary.readiness.tone === 'error') {
+                issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+              } else if (summary.readiness.tone === 'warn') {
+                issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+              }
+            }
           }
         }
       }
@@ -1589,6 +2290,7 @@ function analyzePipeline(definition = {}, context = {}) {
         const outgoingEdges = graph.outgoingEdgesByNode.get(node.id) || [];
         const passCount = outgoingEdges.filter((edge) => edge.source.portId === 'pass').length;
         const failCount = outgoingEdges.filter((edge) => edge.source.portId === 'fail').length;
+        const connectedKinds = getIncomingKindsForNodePort(node, 'input', graph);
         if (passCount === 0 || failCount === 0) {
           summary.readiness = {
             tone: 'error',
@@ -1596,47 +2298,156 @@ function analyzePipeline(definition = {}, context = {}) {
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (node.config?.mode === 'llm') {
-          if (!String(node.config?.ruleset || '').trim()) {
+          if (summary.capabilitySummary?.supported === false) {
             summary.readiness = {
               tone: 'error',
-              message: 'Describe the pass and fail rules for this validation step.',
+              message: summary.capabilitySummary.message,
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-          } else if (!String(node.config?.model || '').trim()) {
-            summary.readiness = {
-              tone: 'error',
-              message: 'Choose or enter a model for this validator.',
-            };
-            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-          } else if (node.config?.llmExecutionMode === 'ollama') {
-            const ollamaTool = contextMaps.toolsById.ollama || null;
-            if (!ollamaTool) {
+          } else {
+            const unsupportedKinds = connectedKinds.filter((kind) => !(summary.capabilitySummary?.inputKinds || []).includes(kind));
+            if (unsupportedKinds.length) {
               summary.readiness = {
                 tone: 'error',
-                message: 'Install Ollama before using a local validator.',
+                message: (summary.capabilitySummary?.targetLabel || 'This validator') + ' does not accept ' + formatPortKindList(unsupportedKinds) + ' here. This validation step currently supports ' + formatPortKindList(summary.capabilitySummary?.inputKinds || [PORT_KIND_TEXT]) + '.',
               };
               issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-            } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
+            } else if (!String(node.config?.ruleset || '').trim()) {
               summary.readiness = {
-                tone: 'warn',
-                message: 'Ollama is not running yet. Local AI Hub can start it automatically when this validator runs.',
+                tone: 'error',
+                message: 'Describe the pass and fail rules for this validation step.',
               };
-              issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
-            }
-          } else {
-            const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
-            summary.readiness = {
-              tone: providerStatus.tone,
-              message: providerStatus.message,
-            };
-            if (providerStatus.tone === 'error') {
               issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+            } else if (!String(node.config?.model || '').trim()) {
+              summary.readiness = {
+                tone: 'error',
+                message: 'Choose or enter a model for this validator.',
+              };
+              issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+            } else if (node.config?.llmExecutionMode === 'ollama') {
+              const ollamaTool = contextMaps.toolsById.ollama || null;
+              if (!ollamaTool) {
+                summary.readiness = {
+                  tone: 'error',
+                  message: 'Install Ollama before using a local validator.',
+                };
+                issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+              } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
+                summary.readiness = {
+                  tone: 'warn',
+                  message: 'Ollama is not running yet. Local AI Hub can start it automatically when this validator runs.',
+                };
+                issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+              } else {
+                const modelSupport = getModelStepSupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
+                summary.readiness = modelSupport.status === 'unsupported'
+                  ? {
+                      tone: 'error',
+                      message: modelSupport.message,
+                    }
+                  : modelSupport.status === 'unknown'
+                    ? {
+                        tone: 'warn',
+                        message: modelSupport.message,
+                      }
+                    : connectedKinds.includes(PORT_KIND_IMAGE)
+                      ? {
+                          tone: 'info',
+                          message: 'Ollama will review the connected image and return a pass or fail decision.',
+                        }
+                      : {
+                          tone: 'info',
+                          message: 'Ollama will run this validation locally and return a pass or fail decision.',
+                        };
+                if (summary.readiness.tone === 'error') {
+                  issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+                } else if (summary.readiness.tone === 'warn') {
+                  issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+                }
+              }
+            } else {
+              const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
+              summary.readiness = {
+                tone: providerStatus.tone,
+                message: providerStatus.message,
+              };
+              if (providerStatus.tone === 'error') {
+                issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+              } else {
+                const modelSupport = getModelStepSupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
+                summary.readiness = modelSupport.status === 'unsupported'
+                  ? {
+                      tone: 'error',
+                      message: modelSupport.message,
+                    }
+                  : modelSupport.status === 'unknown'
+                    ? {
+                        tone: 'warn',
+                        message: modelSupport.message,
+                      }
+                    : connectedKinds.includes(PORT_KIND_IMAGE)
+                      ? {
+                          tone: 'info',
+                          message: (providerStatus.provider?.name || 'That provider') + ' can review the connected image and return a pass or fail decision.',
+                        }
+                      : {
+                          tone: 'info',
+                          message: (providerStatus.provider?.name || 'That provider') + ' will review this validation input and return a pass or fail decision.',
+                        };
+                if (summary.readiness.tone === 'error') {
+                  issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+                } else if (summary.readiness.tone === 'warn') {
+                  issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+                }
+              }
             }
           }
         } else {
           summary.readiness = {
             tone: 'info',
-            message: 'This run will pause here and wait for your pass or fail decision.',
+            message: 'This run will pause here, show the connected artifact preview when possible, and wait for your pass or fail decision.',
+          };
+        }
+      }
+
+      if (node.type === 'retryLoop') {
+        const loopIssues = graph.retryLoopIssuesByNodeId.get(node.id) || [];
+        const loopMeta = graph.retryLoopsByNodeId.get(node.id) || null;
+        if (loopIssues.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: loopIssues[0],
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (loopMeta) {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This loop reruns from ' + loopMeta.retryTargetLabel + ' until the Complete branch wins or attempt ' + loopMeta.maxAttempts + ' is reached.',
+          };
+        }
+      }
+
+      if (node.type === 'branchMerge') {
+        const branchPort = getPortDefinition(node.type, 'input', 'branch');
+        const branchEdges = graph.incomingEdgesByPortKey.get(node.id + ':branch') || [];
+        const minimumConnections = Math.max(2, Number(branchPort?.minimumConnections || 0) || 0);
+        const connectedKinds = getIncomingKindsForNodePort(node, 'branch', graph);
+        if (branchEdges.length < minimumConnections) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect both sides of the branch before running this merge step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!connectedKinds.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect branches that all carry the same artifact type before running this merge step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This merge waits for earlier branches to finish or skip, then forwards the single branch that stayed active.',
           };
         }
       }
@@ -1716,7 +2527,9 @@ module.exports = {
   PIPELINE_NODE_TYPES,
   NODE_TYPE_LIST,
   IMAGE_WORKFLOW_TOOL_IDS,
+  PIPELINE_OPERATION_IDS,
   PIPELINE_PORT_KIND_LABELS,
+  PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
   PORT_KIND_ANY,
   PORT_KIND_AUDIO,
   PORT_KIND_AUDIO_FILE,
@@ -1741,6 +2554,9 @@ module.exports = {
   getDefaultNodeConfig,
   getImageToolIdForNode,
   getLocalToolRequirement,
+  getModelStepExecutionMode,
+  getModelStepLocalToolId,
+  getModelStepOperationId,
   getNodeTypeDefinition,
   getPortAllowedKinds,
   getPortDefinition,
@@ -1752,6 +2568,7 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
+
 
 
 

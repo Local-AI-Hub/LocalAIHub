@@ -2,9 +2,10 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const { chatWithOllama, inspectOllamaModel, inspectOllamaModelCapabilities } = require('./ollamaService');
-const { listProviderConnections, chatWithProvider } = require('./providerService');
+const { chatWithProvider, listProviderConnections, runProviderOperation } = require('./providerService');
 const { initializeProviderRegistry } = require('./providerRegistry');
 const { getToolCatalog } = require('./toolRegistry');
+const { listDownloadedModels } = require('./modelService');
 const { buildMergedToolStateList, getResolvedToolState } = require('./toolStateService');
 const { DEFAULT_WHISPER_MODEL, transcribeWithWhisper } = require('./whisperService');
 const {
@@ -15,6 +16,7 @@ const {
   describeArtifactForLlm,
   ensureRunDirectories,
   saveBase64Artifact,
+  saveBufferArtifact,
   serializeArtifactForUi,
   summarizeArtifact,
 } = require('./pipelineArtifactService');
@@ -25,12 +27,17 @@ const {
 } = require('./workflowToolService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const {
+  PIPELINE_OPERATION_IDS,
   PORT_KIND_IMAGE,
+  PORT_KIND_TEXT,
+  PORT_KIND_VIDEO,
   analyzePipeline,
   buildPipelineGraph,
   buildContextMaps,
   createUniqueId,
+  getModelStepOperationId,
   getNodeTypeDefinition,
+  getPortDefinition,
   trimPreviewText,
 } = require('../shared/pipelineSchema.cjs');
 
@@ -106,6 +113,67 @@ function attachOllamaModelCapabilities(tools = [], modelCapabilitiesByName = {})
   );
 }
 
+function collectSelectedLocalImageToolIds(definition = {}) {
+  const selectedToolIds = new Set();
+  let hasLocalImageModelStep = false;
+
+  for (const node of Array.isArray(definition?.nodes) ? definition.nodes : []) {
+    if (node?.type !== 'llmPrompt' || node?.config?.executionMode !== 'localTool') {
+      continue;
+    }
+
+    hasLocalImageModelStep = true;
+    const toolId = String(node?.config?.toolId || '').trim().toLowerCase();
+    if (toolId) {
+      selectedToolIds.add(toolId);
+    }
+  }
+
+  if (!hasLocalImageModelStep) {
+    return [];
+  }
+
+  return selectedToolIds.size ? [...selectedToolIds] : ['automatic1111', 'forge'];
+}
+
+function filterLocalImageCheckpointModels(models = []) {
+  return (Array.isArray(models) ? models : []).filter((model) => {
+    const modelType = String(model?.modelType || '').trim().toLowerCase();
+    return modelType === 'checkpoint' || modelType === 'inpainting';
+  });
+}
+
+function attachDownloadedToolModels(tools = [], downloadedModelsByToolId = {}) {
+  if (!Object.keys(downloadedModelsByToolId).length) {
+    return tools;
+  }
+
+  return tools.map((tool) => {
+    if (!tool?.id || !downloadedModelsByToolId[tool.id]) {
+      return tool;
+    }
+
+    return {
+      ...tool,
+      downloadedModels: downloadedModelsByToolId[tool.id],
+    };
+  });
+}
+
+function getDownloadedToolModelEntry(tool, model) {
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  if (!normalizedModel) {
+    return null;
+  }
+
+  return (Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : []).find((entry) => {
+    const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.path]
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean);
+    return candidates.includes(normalizedModel);
+  }) || null;
+}
+
 function getOllamaModelCapabilityEntry(contextMaps, model) {
   const normalizedModel = String(model || '').trim().toLowerCase();
   if (!normalizedModel) {
@@ -156,6 +224,16 @@ async function buildPipelineContext(definition = {}) {
     }
   }
 
+  const selectedLocalImageToolIds = collectSelectedLocalImageToolIds(definition);
+  if (selectedLocalImageToolIds.length) {
+    const downloadedModelsByToolId = {};
+    for (const toolId of selectedLocalImageToolIds) {
+      downloadedModelsByToolId[toolId] = filterLocalImageCheckpointModels(await listDownloadedModels(toolId).catch(() => []));
+    }
+
+    toolEntries = attachDownloadedToolModels(toolEntries, downloadedModelsByToolId);
+  }
+
   return buildContextMaps({
     hardware: null,
     providers: await listProviderConnections(),
@@ -179,11 +257,16 @@ function createInitialNodeStates(graph) {
     nodeStates[node.id] = {
       destinationPath: '',
       finishedAt: null,
+      iteration: 1,
+      loopLabel: '',
+      loopMaxAttempts: null,
+      loopNodeId: '',
       message: graph.reachableNodeIds.has(node.id) ? 'Waiting for earlier steps to finish.' : 'Skipped because it is not connected to an output.',
       nodeId: node.id,
       nodeLabel: node.label,
       outputs: {},
       preview: '',
+      runCount: 0,
       selectedBranch: '',
       startedAt: null,
       status: graph.reachableNodeIds.has(node.id) ? 'queued' : 'skipped',
@@ -195,6 +278,24 @@ function createInitialNodeStates(graph) {
   return nodeStates;
 }
 
+function createLoopStateRecords(graph) {
+  const loopStates = {};
+
+  for (const [loopNodeId, loopMeta] of graph.retryLoopsByNodeId.entries()) {
+    loopStates[loopNodeId] = {
+      attempt: 1,
+      loopLabel: loopMeta.loopLabel,
+      loopNodeId,
+      maxAttempts: loopMeta.maxAttempts,
+      retryTargetLabel: loopMeta.retryTargetLabel,
+      retryTargetNodeId: loopMeta.retryTargetNodeId,
+      status: 'ready',
+    };
+  }
+
+  return loopStates;
+}
+
 function createRunRecord(analysis, graph, runDirectories) {
   const runId = createUniqueId('run');
   return {
@@ -203,6 +304,7 @@ function createRunRecord(analysis, graph, runDirectories) {
     directories: runDirectories,
     executionOrder: [...analysis.executionOrder],
     finishedAt: null,
+    loopStates: createLoopStateRecords(graph),
     message: 'Local AI Hub is running the pipeline step by step and will launch local tools only when needed.',
     nodeStates: createInitialNodeStates(graph),
     pendingValidation: null,
@@ -300,13 +402,87 @@ function markRemainingNodes(run, graph, status, message) {
   }
 }
 
-function getNodeInputArtifact(nodeId, portId, graph, resultsByNodeId) {
-  const edge = graph.incomingEdgeByPortKey.get(`${nodeId}:${portId}`);
-  if (!edge) {
-    return undefined;
+function getNodeLoopState(run, graph, nodeId) {
+  const loopNodeId = graph.retryLoopNodeIdsBySegmentNodeId?.get?.(nodeId) || '';
+  const loopState = loopNodeId ? run.loopStates?.[loopNodeId] || null : null;
+  return {
+    iteration: loopState?.attempt || 1,
+    loopLabel: loopState?.loopLabel || '',
+    loopMaxAttempts: loopState?.maxAttempts || null,
+    loopNodeId,
+  };
+}
+
+function applyNodeLoopState(nodeState, loopState) {
+  if (!nodeState) {
+    return;
   }
 
-  return resultsByNodeId[edge.source.nodeId]?.outputs?.[edge.source.portId];
+  nodeState.iteration = loopState?.iteration || 1;
+  nodeState.loopLabel = loopState?.loopLabel || '';
+  nodeState.loopMaxAttempts = loopState?.loopMaxAttempts || null;
+  nodeState.loopNodeId = loopState?.loopNodeId || '';
+}
+
+function resetLoopSegmentForRetry(run, graph, loopNodeId, nextAttempt) {
+  const loopMeta = graph.retryLoopsByNodeId.get(loopNodeId) || null;
+  const loopState = run.loopStates?.[loopNodeId] || null;
+  if (!loopMeta || !loopState) {
+    return;
+  }
+
+  loopState.attempt = nextAttempt;
+  loopState.status = 'retrying';
+  for (const segmentNodeId of loopMeta.segmentExecutionOrder) {
+    delete run.resultsByNodeId[segmentNodeId];
+    const nodeState = run.nodeStates?.[segmentNodeId];
+    if (!nodeState) {
+      continue;
+    }
+
+    nodeState.status = 'queued';
+    nodeState.startedAt = null;
+    nodeState.finishedAt = null;
+    nodeState.message = 'Waiting for attempt ' + nextAttempt + ' of ' + loopState.maxAttempts + '.';
+    nodeState.outputs = {};
+    nodeState.preview = '';
+    nodeState.selectedBranch = '';
+    nodeState.destinationPath = '';
+    nodeState.validation = null;
+    applyNodeLoopState(nodeState, {
+      iteration: nextAttempt,
+      loopLabel: loopState.loopLabel,
+      loopMaxAttempts: loopState.maxAttempts,
+      loopNodeId,
+    });
+  }
+}
+
+function getIncomingEdgesForPortKey(graph, portKey) {
+  if (!graph || !portKey) {
+    return [];
+  }
+
+  const incomingEdges = graph.incomingEdgesByPortKey?.get?.(portKey);
+  if (Array.isArray(incomingEdges)) {
+    return incomingEdges.filter(Boolean);
+  }
+
+  const incomingEdge = graph.incomingEdgeByPortKey?.get?.(portKey);
+  return incomingEdge ? [incomingEdge] : [];
+}
+
+function getNodeInputArtifacts(nodeId, portId, graph, resultsByNodeId) {
+  return getIncomingEdgesForPortKey(graph, `${nodeId}:${portId}`)
+    .map((edge) => ({
+      artifact: resultsByNodeId[edge.source.nodeId]?.outputs?.[edge.source.portId] || null,
+      edge,
+    }))
+    .filter((entry) => Boolean(entry.artifact));
+}
+
+function getNodeInputArtifact(nodeId, portId, graph, resultsByNodeId) {
+  return getNodeInputArtifacts(nodeId, portId, graph, resultsByNodeId)[0]?.artifact;
 }
 
 function getMissingRequiredInputs(node, graph, resultsByNodeId) {
@@ -317,7 +493,7 @@ function getMissingRequiredInputs(node, graph, resultsByNodeId) {
 
   return (definition.inputPorts || [])
     .filter((port) => port.required)
-    .filter((port) => !getNodeInputArtifact(node.id, port.id, graph, resultsByNodeId))
+    .filter((port) => getNodeInputArtifacts(node.id, port.id, graph, resultsByNodeId).length === 0)
     .map((port) => port.label);
 }
 
@@ -350,7 +526,7 @@ async function buildLlmMessages(node, inputArtifact) {
     });
   }
 
-  if (inputArtifact.kind === 'text') {
+  if (inputArtifact.kind === PORT_KIND_TEXT) {
     const normalizedInput = String(inputArtifact.text || '').trim();
     if (!normalizedInput) {
       throw new Error('This LLM step did not receive any text input.');
@@ -380,10 +556,83 @@ async function buildLlmMessages(node, inputArtifact) {
   throw new Error('This LLM step currently supports text or image input only.');
 }
 
-function buildValidationMessages(node, artifactDescription) {
+function buildImageGenerationPrompt(node, inputArtifact) {
+  if (!inputArtifact) {
+    throw new Error('This image generation step did not receive any input.');
+  }
+
+  if (inputArtifact.kind !== PORT_KIND_TEXT) {
+    throw new Error('This image generation step currently needs text input.');
+  }
+
+  const promptText = String(inputArtifact.text || '').trim();
+  if (!promptText) {
+    throw new Error('This image generation step did not receive any text prompt.');
+  }
+
+  const promptPrefix = String(node.config?.instruction || '').trim();
+  return promptPrefix ? promptPrefix + '\n\nPrompt:\n' + promptText : promptText;
+
+}
+
+async function buildVideoGenerationRequest(node, inputArtifact) {
+  if (!inputArtifact) {
+    throw new Error('This video generation step did not receive any input.');
+  }
+
+  const size = String(node.config?.videoSize || '1280x720').trim() || '1280x720';
+  const motionPrompt = String(node.config?.instruction || '').trim();
+
+  if (inputArtifact.kind === PORT_KIND_TEXT) {
+    const promptText = String(inputArtifact.text || '').trim();
+    if (!promptText) {
+      throw new Error('This video generation step did not receive any text prompt.');
+    }
+
+    return {
+      prompt: motionPrompt ? motionPrompt + '\n\nPrompt:\n' + promptText : promptText,
+      referenceImage: null,
+      size,
+    };
+  }
+
+  if (inputArtifact.kind === PORT_KIND_IMAGE && inputArtifact.filePath) {
+    if (!motionPrompt) {
+      throw new Error('This video generation step is using an image input. Add motion guidance in the instruction box before running it.');
+    }
+
+    const filePath = path.resolve(String(inputArtifact.filePath || '').trim());
+    if (!filePath || !(await fs.pathExists(filePath))) {
+      throw new Error('The reference image for this video step could not be found anymore. Choose it again and rerun the pipeline.');
+    }
+
+    const [expectedWidth, expectedHeight] = size.split('x').map((value) => Number(value || 0));
+    if (expectedWidth > 0 && expectedHeight > 0 && inputArtifact.width && inputArtifact.height) {
+      if (Number(inputArtifact.width) !== expectedWidth || Number(inputArtifact.height) !== expectedHeight) {
+        throw new Error('This video step is set to ' + size + ', but the connected image is ' + inputArtifact.width + 'x' + inputArtifact.height + '. Choose a matching video size or supply a matching image.');
+      }
+    }
+
+    return {
+      prompt: motionPrompt,
+      referenceImage: {
+        buffer: await fs.readFile(filePath),
+        fileName: String(inputArtifact.fileName || path.basename(filePath)).trim() || path.basename(filePath),
+        mimeType: String(inputArtifact.mimeType || 'image/png').trim() || 'image/png',
+      },
+      size,
+    };
+  }
+
+  throw new Error('This video generation step currently accepts text or image input only.');
+}
+
+async function buildValidationMessages(node, artifact, contextMaps) {
 
   const ruleset = String(node.config?.ruleset || '').trim();
   const systemPrompt = String(node.config?.systemPrompt || '').trim();
+  const artifactDescription = await buildValidationArtifactDescription(artifact, contextMaps);
+  const reviewPrompt = `Validation rules:\n${ruleset}\n\nArtifact to review:\n${artifactDescription}${artifact?.kind === PORT_KIND_IMAGE && artifact.filePath ? '\n\nThe actual image is attached below. Review the image itself first and use the details above as supporting context.' : ''}\n\nReturn JSON only.`;
   const messages = [];
 
   messages.push({
@@ -392,7 +641,15 @@ function buildValidationMessages(node, artifactDescription) {
   });
   messages.push({
     role: 'user',
-    content: `Validation rules:\n${ruleset}\n\nArtifact to review:\n${artifactDescription}\n\nReturn JSON only.`,
+    content: artifact?.kind === PORT_KIND_IMAGE && artifact.filePath
+      ? [
+          {
+            type: 'text',
+            text: reviewPrompt,
+          },
+          await buildImageMessageContentPart(artifact),
+        ]
+      : reviewPrompt,
   });
 
   return messages;
@@ -489,8 +746,13 @@ async function waitForUserValidation(run, node, artifact) {
   }
 
   const nodeState = run.nodeStates[node.id];
+  const iteration = Number(nodeState?.iteration || 1);
+  const loopMaxAttempts = Number(nodeState?.loopMaxAttempts || 0) || null;
+  const attemptLabel = loopMaxAttempts ? 'Attempt ' + iteration + ' of ' + loopMaxAttempts : iteration > 1 ? 'Attempt ' + iteration : '';
   const pendingValidation = {
     artifact: serializeArtifactForUi(artifact),
+    iteration,
+    loopMaxAttempts,
     mode: 'user',
     nodeId: node.id,
     nodeLabel: node.label,
@@ -506,10 +768,14 @@ async function waitForUserValidation(run, node, artifact) {
       runId: run.runId,
     };
     run.status = 'paused';
-    run.message = `Paused at ${node.label}. Local AI Hub is waiting for your decision.`;
+    run.message = attemptLabel
+      ? `Paused at ${node.label} (${attemptLabel}). Local AI Hub is waiting for your decision.`
+      : `Paused at ${node.label}. Local AI Hub is waiting for your decision.`;
     run.pendingValidation = pendingValidation;
     nodeState.status = 'paused';
-    nodeState.message = 'Waiting for your pass or fail decision.';
+    nodeState.message = attemptLabel
+      ? 'Waiting for your pass or fail decision for ' + attemptLabel.toLowerCase() + '.'
+      : 'Waiting for your pass or fail decision.';
     nodeState.preview = summarizeArtifact(artifact);
     emitPipelineEvent();
   });
@@ -554,8 +820,7 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
     };
   }
 
-  const description = await buildValidationArtifactDescription(artifact, contextMaps);
-  const messages = buildValidationMessages(node, description);
+  const messages = await buildValidationMessages(node, artifact, contextMaps);
   const model = String(node.config?.model || '').trim();
   if (!model) {
     throw new Error('Choose or enter a model for this validator before running the pipeline.');
@@ -612,6 +877,83 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
       mode: 'llm',
       rawReply: reply,
       reason,
+    },
+  };
+}
+
+function executeBranchMergeNode(node, graph, run) {
+  const activeBranchEntries = getNodeInputArtifacts(node.id, 'branch', graph, run.resultsByNodeId);
+  if (!activeBranchEntries.length) {
+    throw new Error('This merge step did not receive any active branch output.');
+  }
+
+  if (activeBranchEntries.length > 1) {
+    const sourceLabels = activeBranchEntries.map((entry) => {
+      const sourceNode = graph.nodeMap.get(entry.edge.source.nodeId);
+      const sourcePort = getPortDefinition(sourceNode?.type, 'output', entry.edge.source.portId);
+      return `${sourceNode?.label || 'Another step'} (${sourcePort?.label || entry.edge.source.portId})`;
+    });
+    throw new Error('This merge step received more than one live branch result at once: ' + sourceLabels.join(', ') + '. Branch Merge currently expects exactly one active branch. Add another validation gate or restructure the flow before this merge.');
+  }
+
+  const selectedArtifact = activeBranchEntries[0].artifact;
+  return {
+    message: 'Branch Merge forwarded the active branch.',
+    outputs: {
+      result: selectedArtifact,
+    },
+    preview: summarizeArtifact(selectedArtifact),
+  };
+}
+
+function executeRetryLoopNode(node, graph, run) {
+  const completeArtifact = getNodeInputArtifact(node.id, 'complete', graph, run.resultsByNodeId);
+  const retryArtifact = getNodeInputArtifact(node.id, 'retry', graph, run.resultsByNodeId);
+  if (completeArtifact && retryArtifact) {
+    throw new Error('This Retry Loop node received both the Complete and Retry branches at the same time. Keep the loop exit and retry paths mutually exclusive.');
+  }
+
+  if (!completeArtifact && !retryArtifact) {
+    throw new Error('This Retry Loop node did not receive a live branch yet.');
+  }
+
+  const loopMeta = graph.retryLoopsByNodeId.get(node.id) || null;
+  const loopState = run.loopStates?.[node.id] || null;
+  if (!loopMeta || !loopState) {
+    throw new Error('Local AI Hub could not prepare that retry loop. Reopen the pipeline and try again.');
+  }
+
+  const currentAttempt = Number(loopState.attempt || 1);
+  const maxAttempts = Number(loopState.maxAttempts || loopMeta.maxAttempts || 1);
+  if (completeArtifact) {
+    loopState.status = 'completed';
+    return {
+      message: currentAttempt > 1
+        ? node.label + ' exited the loop on attempt ' + currentAttempt + ' of ' + maxAttempts + '.'
+        : node.label + ' exited the loop on the first attempt.',
+      outputs: {
+        result: completeArtifact,
+      },
+      preview: summarizeArtifact(completeArtifact),
+      selectedBranch: 'complete',
+    };
+  }
+
+  if (currentAttempt >= maxAttempts) {
+    loopState.status = 'failed';
+    throw new Error(node.label + ' reached its ' + maxAttempts + '-attempt safety limit while the Retry branch was still active. Adjust the loop or raise the limit before running it again.');
+  }
+
+  return {
+    message: node.label + ' is starting attempt ' + (currentAttempt + 1) + ' of ' + maxAttempts + ' from ' + loopMeta.retryTargetLabel + '.',
+    outputs: {},
+    preview: retryArtifact ? summarizeArtifact(retryArtifact) : '',
+    selectedBranch: 'retry',
+    loopControl: {
+      action: 'retry',
+      loopNodeId: node.id,
+      nextAttempt: currentAttempt + 1,
+      retryTargetNodeId: loopMeta.retryTargetNodeId,
     },
   };
 }
@@ -685,20 +1027,24 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
   if (node.type === 'llmPrompt') {
     const promptArtifact = getNodeInputArtifact(node.id, 'prompt', graph, run.resultsByNodeId);
     const model = String(node.config?.model || '').trim();
-    const executionMode = node.config?.executionMode === 'ollama' ? 'ollama' : 'cloud';
+    const executionMode = node.config?.executionMode === 'ollama' ? 'ollama' : node.config?.executionMode === 'localTool' ? 'localTool' : 'cloud';
+    const operationId = getModelStepOperationId(node);
     if (!promptArtifact) {
       throw new Error('This LLM step did not receive any input.');
     }
 
     if (!model) {
-      throw new Error('Choose or enter a model for the LLM Prompt node before running this pipeline.');
+      throw new Error('Choose or enter a model for the model step before running this pipeline.');
     }
 
-    const messages = await buildLlmMessages(node, promptArtifact);
-    const inputLabel = promptArtifact.kind === PORT_KIND_IMAGE ? 'image' : 'prompt';
-    let content = '';
     let sourceLabel = 'This model';
     if (executionMode === 'ollama') {
+      if (operationId !== PIPELINE_OPERATION_IDS.LLM_PROMPT) {
+        throw new Error('Local AI Hub can only return text from Ollama model steps right now. Switch this step back to Text response or choose a cloud image or video model.');
+      }
+
+      const messages = await buildLlmMessages(node, promptArtifact);
+      const inputLabel = promptArtifact.kind === PORT_KIND_IMAGE ? 'image' : 'prompt';
       reportProgress?.('Sending the ' + inputLabel + ' to Ollama and waiting for a reply.', 'Running ' + node.label + ' with Ollama...');
       const ollamaTool = await getInstalledToolOrThrow(
         contextMaps,
@@ -712,29 +1058,154 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         messages,
         model,
       });
-      content = String(result?.message?.content || '').trim();
+      const content = String(result?.message?.content || '').trim();
       sourceLabel = 'Ollama';
-    } else {
-      const providerId = String(node.config?.providerId || '').trim();
-      if (!providerId) {
-        throw new Error('Choose a connected cloud provider before running this LLM step.');
+      if (!content) {
+        throw new Error(sourceLabel + ' returned an empty reply for this pipeline step.');
       }
 
-      const provider = contextMaps.providersById[providerId] || null;
-      if (!provider?.isConnected) {
-        throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
-      }
-
-      reportProgress?.('Sending the ' + inputLabel + ' to ' + provider.name + '.', 'Running ' + node.label + ' with ' + provider.name + '...');
-      const result = await chatWithProvider(providerId, {
-        messages,
-        model,
-        providerId,
+      const artifact = createTextArtifact(content, {
+        displayName: node.label,
+        role: 'generated',
       });
-      content = String(result?.message?.content || '').trim();
-      sourceLabel = provider.name;
+      return {
+        message: sourceLabel + ' returned a reply.',
+        outputs: {
+          text: artifact,
+        },
+        preview: summarizeArtifact(artifact),
+      };
     }
 
+    if (executionMode === 'localTool') {
+      if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+        throw new Error('Local AI Hub currently supports only text-to-image generation for operation-driven local tools. ComfyUI-style graph workflows and local video generation stay deferred until a later pipeline pass.');
+      }
+
+      const prompt = buildImageGenerationPrompt(node, promptArtifact);
+      const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'local image generation');
+      const selectedCheckpoint = getDownloadedToolModelEntry(tool, model);
+      if (!selectedCheckpoint) {
+        throw new Error(tool.name + ' does not have the selected checkpoint available locally. Refresh the local model list or download that checkpoint before running this step.');
+      }
+
+      reportProgress?.('Sending the prompt to ' + tool.name + ' for local image generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
+      const generated = await generateImageWithWorkflowTool(tool, {
+        cfgScale: node.config?.cfgScale,
+        height: node.config?.height,
+        model: selectedCheckpoint.fileName || selectedCheckpoint.name || model,
+        negativePrompt: node.config?.negativePrompt,
+        prompt,
+        seed: node.config?.seed,
+        steps: node.config?.steps,
+        width: node.config?.width,
+      });
+      const artifact = await saveBase64Artifact(run.directories, generated.base64Image, {
+        baseName: node.label + '-' + Date.now(),
+        displayName: node.label,
+        extension: '.png',
+        kind: PORT_KIND_IMAGE,
+        role: 'generated',
+      });
+      return {
+        destinationPath: artifact.filePath,
+        message: tool.name + ' generated an image locally and saved the intermediate file to ' + artifact.filePath + '.',
+        outputs: {
+          image: artifact,
+        },
+        preview: summarizeArtifact(artifact),
+      };
+    }
+    const providerId = String(node.config?.providerId || '').trim();
+    if (!providerId) {
+      throw new Error('Choose a connected cloud provider before running this model step.');
+    }
+
+    const provider = contextMaps.providersById[providerId] || null;
+    if (!provider?.isConnected) {
+      throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
+    }
+
+    sourceLabel = provider.name;
+    if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+      const prompt = buildImageGenerationPrompt(node, promptArtifact);
+      reportProgress?.('Sending the prompt to ' + provider.name + ' for image generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
+      const result = await runProviderOperation(providerId, {
+        background: node.config?.imageBackground,
+        model,
+        operationId,
+        prompt,
+        providerId,
+        quality: node.config?.imageQuality,
+        size: node.config?.imageSize,
+      });
+      const base64Image = String(result?.images?.[0]?.base64Data || '').trim();
+      if (!base64Image) {
+        throw new Error(sourceLabel + ' finished the request, but it did not return an image.');
+      }
+
+      const artifact = await saveBase64Artifact(run.directories, base64Image, {
+        baseName: node.label + '-' + Date.now(),
+        displayName: node.label,
+        extension: '.png',
+        kind: 'image',
+        role: 'generated',
+      });
+      return {
+        destinationPath: artifact.filePath,
+        message: sourceLabel + ' generated an image and saved the intermediate file to ' + artifact.filePath + '.',
+        outputs: {
+          image: artifact,
+        },
+        preview: summarizeArtifact(artifact),
+      };
+    }
+
+    if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+      const videoRequest = await buildVideoGenerationRequest(node, promptArtifact);
+      reportProgress?.('Sending the prompt to ' + provider.name + ' for video generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
+      const result = await runProviderOperation(providerId, {
+        imageReference: videoRequest.referenceImage,
+        model,
+        onProgress: (message) => reportProgress?.(message, 'Running ' + node.label + ' with ' + provider.name + '...'),
+        operationId,
+        prompt: videoRequest.prompt,
+        providerId,
+        seconds: 8,
+        size: videoRequest.size,
+      });
+      const videoBuffer = result?.videos?.[0]?.buffer || null;
+      if (!videoBuffer) {
+        throw new Error(sourceLabel + ' finished the request, but it did not return a video file.');
+      }
+
+      const artifact = await saveBufferArtifact(run.directories, videoBuffer, {
+        baseName: node.label + '-' + Date.now(),
+        displayName: node.label,
+        extension: String(result?.videos?.[0]?.extension || '.mp4').trim() || '.mp4',
+        kind: PORT_KIND_VIDEO,
+        role: 'generated',
+      });
+      return {
+        destinationPath: artifact.filePath,
+        message: sourceLabel + ' generated a video and saved the intermediate file to ' + artifact.filePath + '.',
+        outputs: {
+          video: artifact,
+        },
+        preview: summarizeArtifact(artifact),
+      };
+    }
+
+    const messages = await buildLlmMessages(node, promptArtifact);
+    const inputLabel = promptArtifact.kind === PORT_KIND_IMAGE ? 'image' : 'prompt';
+    reportProgress?.('Sending the ' + inputLabel + ' to ' + provider.name + '.', 'Running ' + node.label + ' with ' + provider.name + '...');
+    const result = await runProviderOperation(providerId, {
+      messages,
+      model,
+      operationId,
+      providerId,
+    });
+    const content = String(result?.message?.content || '').trim();
     if (!content) {
       throw new Error(sourceLabel + ' returned an empty reply for this pipeline step.');
     }
@@ -855,6 +1326,14 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     return executeValidationNode(node, graph, run, contextMaps, reportProgress);
   }
 
+  if (node.type === 'branchMerge') {
+    return executeBranchMergeNode(node, graph, run);
+  }
+
+  if (node.type === 'retryLoop') {
+    return executeRetryLoopNode(node, graph, run);
+  }
+
   if (node.type === 'textOutput') {
     return executeOutputNode(node, 'text', graph, run);
   }
@@ -892,7 +1371,8 @@ async function executeActiveRun(graph, context) {
   };
 
   try {
-    for (let index = 0; index < graph.executionOrder.length; index += 1) {
+    let index = 0;
+    while (index < graph.executionOrder.length) {
       const nodeId = graph.executionOrder[index];
       if (!activeRun) {
         await disposeOrchestrator('', 'this pipeline run');
@@ -918,21 +1398,28 @@ async function executeActiveRun(graph, context) {
       const nextNodeId = graph.executionOrder[index + 1] || '';
       const nextNode = nextNodeId ? graph.nodeMap.get(nextNodeId) : null;
       const nodeState = activeRun.nodeStates[nodeId];
+      const nodeLoopState = getNodeLoopState(activeRun, graph, nodeId);
+      applyNodeLoopState(nodeState, nodeLoopState);
+
       const missingInputs = getMissingRequiredInputs(node, graph, activeRun.resultsByNodeId);
       if (missingInputs.length) {
         nodeState.status = 'skipped';
         nodeState.finishedAt = new Date().toISOString();
         nodeState.message = `Skipped because ${missingInputs.join(', ')} did not receive content from the active branch.`;
         emitPipelineEvent();
+        index += 1;
         continue;
       }
 
       nodeState.status = 'running';
       nodeState.startedAt = new Date().toISOString();
+      nodeState.runCount = Number(nodeState.runCount || 0) + 1;
       nodeState.message = 'Running now.';
       activeRun.currentNodeId = nodeId;
       activeRun.status = 'running';
-      activeRun.message = `Running ${node.label}...`;
+      activeRun.message = nodeLoopState.loopMaxAttempts
+        ? `Running ${node.label} (attempt ${nodeLoopState.iteration} of ${nodeLoopState.loopMaxAttempts})...`
+        : `Running ${node.label}...`;
       emitPipelineEvent();
 
       const progressReporter = createProgressReporter(activeRun, node.id);
@@ -960,8 +1447,25 @@ async function executeActiveRun(graph, context) {
       }
 
       activeRun.currentNodeId = null;
-      activeRun.message = `${node.label} finished.`;
+      activeRun.message = result.loopControl?.action === 'retry'
+        ? (result.message || `${node.label} requested another attempt.`)
+        : `${node.label} finished.`;
       emitPipelineEvent();
+
+      if (result.loopControl?.action === 'retry') {
+        resetLoopSegmentForRetry(activeRun, graph, result.loopControl.loopNodeId, result.loopControl.nextAttempt);
+        const retryTargetIndex = Number(graph.executionIndexByNodeId.get(result.loopControl.retryTargetNodeId));
+        if (!Number.isFinite(retryTargetIndex)) {
+          throw new Error('Local AI Hub could not resume that retry loop. Reopen the pipeline and try again.');
+        }
+
+        activeRun.message = result.message || `Retrying ${node.label}.`;
+        emitPipelineEvent();
+        index = retryTargetIndex;
+        continue;
+      }
+
+      index += 1;
     }
 
     if (!activeRun) {
@@ -1103,6 +1607,10 @@ module.exports = {
   runPipeline,
   setPipelineEventSink,
 };
+
+
+
+
 
 
 

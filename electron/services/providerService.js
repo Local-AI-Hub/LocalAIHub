@@ -5,11 +5,18 @@ const { ensureStorage, humanizeError } = require('./configService');
 const { getProviderSecret, maskSecret, setProviderSecret } = require('./credentialService');
 const { createLogger } = require('./logService');
 const { getProviderCatalog, getProviderManifest, initializeProviderRegistry, resolveProviderUrl } = require('./providerRegistry');
+const { PIPELINE_OPERATION_IDS, getProviderModelCapabilities } = require('../shared/pipelineCapabilities.cjs');
 
 const PROVIDER_SETTINGS_FILE = 'provider-connections.json';
 const PROVIDER_SETTINGS_VERSION = 1;
 const REQUEST_TIMEOUT_MS = 15000;
-
+const PROVIDER_DOWNLOAD_TIMEOUT_MS = 300000;
+const OPENAI_VIDEO_STATUS_TIMEOUT_MS = 10 * 60 * 1000;
+const OPENAI_VIDEO_STATUS_POLL_MS = 5000;
+const OPENAI_IMAGE_SIZES = new Set(['1024x1024', '1536x1024', '1024x1536', 'auto']);
+const OPENAI_IMAGE_QUALITIES = new Set(['auto', 'low', 'medium', 'high']);
+const OPENAI_IMAGE_BACKGROUNDS = new Set(['auto', 'opaque', 'transparent']);
+const OPENAI_VIDEO_SIZES = new Set(['1280x720', '720x1280']);
 function createDefaultSettings() {
   return {
     version: PROVIDER_SETTINGS_VERSION,
@@ -126,6 +133,57 @@ async function requestProviderJson(provider, apiKey, endpoint, options = {}) {
   }
 }
 
+async function requestProviderBuffer(provider, apiKey, endpoint, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs || PROVIDER_DOWNLOAD_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(resolveProviderUrl(provider, endpoint), {
+      method: options.method || 'GET',
+      headers: buildProviderHeaders(provider, apiKey, options.contentType === null ? null : options.contentType || null),
+      body: options.body,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const rawText = await response.text();
+      let payload = {};
+      if (rawText) {
+        try {
+          payload = JSON.parse(rawText);
+        } catch {
+          payload = { rawText };
+        }
+      }
+
+      const responseMessage =
+        payload?.error?.message ||
+        payload?.error ||
+        payload?.message ||
+        payload?.detail ||
+        payload?.rawText ||
+        `${provider.name} returned ${response.status}.`;
+      throw new Error(String(responseMessage).trim());
+    }
+
+    return {
+      buffer: Buffer.from(await response.arrayBuffer()),
+      contentType: String(response.headers.get('content-type') || '').trim() || 'application/octet-stream',
+    };
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`${provider.name} took too long to return the finished file.`);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function waitForProvider(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 function matchesBlockedModel(provider, modelId) {
   const blockedPatterns = provider.configuration?.blockedModelPatterns || [];
   const normalizedId = String(modelId || '').toLowerCase();
@@ -138,15 +196,68 @@ function matchesBlockedModel(provider, modelId) {
   });
 }
 
-function normalizeOpenAIModels(provider, payload) {
-  return (payload?.data || [])
+function normalizeProviderOperationId(value) {
+  const normalized = String(value || '').trim();
+  return Object.values(PIPELINE_OPERATION_IDS).includes(normalized) ? normalized : '';
+}
+
+function normalizeListProviderModelsRequest(request) {
+  if (request && typeof request === 'object' && !Array.isArray(request)) {
+    return {
+      operationId: normalizeProviderOperationId(request.operationId),
+      providerId: String(request.providerId || '').trim(),
+    };
+  }
+
+  return {
+    operationId: '',
+    providerId: String(request || '').trim(),
+  };
+}
+
+function buildProviderModelMetadata(provider, modelId) {
+  const capabilities = getProviderModelCapabilities(provider.id, modelId);
+  return {
+    capabilityLabels: Array.isArray(capabilities?.capabilityLabels) ? capabilities.capabilityLabels : [],
+    capabilitySource: String(capabilities?.capabilitySource || '').trim() || 'provider-default',
+    supportedPipelineOperationIds: Object.keys(capabilities?.operations || {}),
+  };
+}
+
+function shouldIncludeProviderModel(provider, modelId, operationId = '') {
+  if (!String(modelId || '').trim()) {
+    return false;
+  }
+
+  if (operationId) {
+    return Boolean(getProviderModelCapabilities(provider.id, modelId)?.operations?.[operationId]);
+  }
+
+  return !matchesBlockedModel(provider, modelId);
+}
+
+function finalizeProviderModels(provider, models = [], options = {}) {
+  const operationId = normalizeProviderOperationId(options.operationId);
+  return (Array.isArray(models) ? models : [])
+    .filter((entry) => shouldIncludeProviderModel(provider, entry?.id, operationId))
     .map((entry) => ({
-      id: String(entry?.id || '').trim(),
-      label: String(entry?.id || '').trim(),
-      detail: String(entry?.owned_by || provider.name || '').trim() || null,
+      ...entry,
+      ...buildProviderModelMetadata(provider, entry.id),
     }))
-    .filter((entry) => entry.id && !matchesBlockedModel(provider, entry.id))
     .sort((left, right) => left.label.localeCompare(right.label));
+}
+
+function normalizeAllowedValue(value, allowedValues, fallback) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return allowedValues.has(normalized) ? normalized : fallback;
+}
+
+function normalizeOpenAIModels(provider, payload) {
+  return (payload?.data || []).map((entry) => ({
+    id: String(entry?.id || '').trim(),
+    label: String(entry?.id || '').trim(),
+    detail: String(entry?.owned_by || provider.name || '').trim() || null,
+  }));
 }
 
 function normalizeAnthropicModels(payload) {
@@ -170,8 +281,7 @@ function normalizeGoogleModels(provider, payload) {
         ? entry.supportedGenerationMethods.includes('generateContent')
         : false,
     }))
-    .filter((entry) => entry.id && entry.supportsGenerateContent && !matchesBlockedModel(provider, entry.id))
-    .sort((left, right) => left.label.localeCompare(right.label));
+    .filter((entry) => entry.id && entry.supportsGenerateContent);
 }
 
 function selectPreferredModel(provider, models, savedModel) {
@@ -233,20 +343,21 @@ async function loadProviderSecretOrThrow(providerId) {
   return apiKey;
 }
 
-async function fetchProviderModelsInternal(provider, apiKey) {
+async function fetchProviderModelsInternal(provider, apiKey, options = {}) {
   const payload = await requestProviderJson(provider, apiKey, provider.modelsEndpoint, {
     method: 'GET',
   });
 
+  let models = [];
   if (provider.configuration?.protocol === 'anthropic') {
-    return normalizeAnthropicModels(payload);
+    models = normalizeAnthropicModels(payload);
+  } else if (provider.configuration?.protocol === 'google-gemini') {
+    models = normalizeGoogleModels(provider, payload);
+  } else {
+    models = normalizeOpenAIModels(provider, payload);
   }
 
-  if (provider.configuration?.protocol === 'google-gemini') {
-    return normalizeGoogleModels(provider, payload);
-  }
-
-  return normalizeOpenAIModels(provider, payload);
+  return finalizeProviderModels(provider, models, options);
 }
 
 function parseInlineDataUrl(value) {
@@ -514,6 +625,155 @@ async function sendGoogleChat(provider, apiKey, payload) {
   };
 }
 
+async function sendOpenAiImageGeneration(provider, apiKey, payload) {
+  if (provider.id !== 'openai') {
+    throw new Error(provider.name + ' does not support cloud image generation in Local AI Hub yet.');
+  }
+
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw new Error('Enter a text prompt before generating an image.');
+  }
+
+  const model = String(payload.model || '').trim();
+  if (!model) {
+    throw new Error('Choose an OpenAI image model before generating an image.');
+  }
+
+  const response = await requestProviderJson(provider, apiKey, '/images/generations', {
+    method: 'POST',
+    body: JSON.stringify({
+      background: normalizeAllowedValue(payload.background, OPENAI_IMAGE_BACKGROUNDS, 'auto'),
+      model,
+      n: 1,
+      output_format: 'png',
+      prompt,
+      quality: normalizeAllowedValue(payload.quality, OPENAI_IMAGE_QUALITIES, 'auto'),
+      size: normalizeAllowedValue(payload.size, OPENAI_IMAGE_SIZES, '1024x1024'),
+    }),
+  });
+
+  const image = Array.isArray(response?.data)
+    ? response.data.find((entry) => String(entry?.b64_json || '').trim())
+    : null;
+  const base64Data = String(image?.b64_json || '').trim();
+  if (!base64Data) {
+    throw new Error(provider.name + ' finished the request, but it did not return an image.');
+  }
+
+  return {
+    createdAt: new Date().toISOString(),
+    images: [
+      {
+        base64Data,
+        mimeType: 'image/png',
+      },
+    ],
+    model,
+  };
+}
+
+async function sendOpenAiVideoGeneration(provider, apiKey, payload) {
+  if (provider.id !== 'openai') {
+    throw new Error(provider.name + ' does not support cloud video generation in Local AI Hub yet.');
+  }
+
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw new Error('Enter a prompt before generating a video.');
+  }
+
+  const model = String(payload.model || '').trim();
+  if (!model) {
+    throw new Error('Choose an OpenAI video model before generating a video.');
+  }
+
+  const onProgress = typeof payload.onProgress === 'function' ? payload.onProgress : null;
+  const formData = new FormData();
+  formData.append('model', model);
+  formData.append('prompt', prompt);
+  formData.append('size', normalizeAllowedValue(payload.size, OPENAI_VIDEO_SIZES, '1280x720'));
+  formData.append('seconds', String(Math.max(1, Number(payload.seconds || 8) || 8)));
+
+  const referenceImage = payload.imageReference && typeof payload.imageReference === 'object' ? payload.imageReference : null;
+  if (referenceImage?.buffer) {
+    const mimeType = String(referenceImage.mimeType || 'image/png').trim() || 'image/png';
+    const fileName = String(referenceImage.fileName || 'reference.png').trim() || 'reference.png';
+    formData.append('input_reference', new Blob([referenceImage.buffer], { type: mimeType }), fileName);
+  }
+
+  onProgress?.('Submitting the video render request to OpenAI.');
+  const started = await requestProviderJson(provider, apiKey, '/videos', {
+    method: 'POST',
+    body: formData,
+    contentType: null,
+    timeoutMs: 60000,
+  });
+
+  const videoId = String(started?.id || '').trim();
+  if (!videoId) {
+    throw new Error(provider.name + ' accepted the request, but it did not return a video job ID.');
+  }
+
+  const startedAt = Date.now();
+  let latestPayload = started;
+  let latestStatus = String(started?.status || '').trim().toLowerCase();
+  while (latestStatus !== 'completed') {
+    if (['failed', 'cancelled', 'canceled', 'rejected', 'error'].includes(latestStatus)) {
+      const failureMessage =
+        latestPayload?.error?.message ||
+        latestPayload?.last_error?.message ||
+        latestPayload?.failure?.message ||
+        latestPayload?.message ||
+        provider.name + ' could not finish that video request.';
+      throw new Error(String(failureMessage).trim());
+    }
+
+    if (Date.now() - startedAt > OPENAI_VIDEO_STATUS_TIMEOUT_MS) {
+      throw new Error(provider.name + ' is still rendering that video. Try again in a moment or shorten the request.');
+    }
+
+    onProgress?.(
+      latestStatus === 'queued'
+        ? 'OpenAI queued the video render. Waiting for the job to start.'
+        : latestStatus === 'processing' || latestStatus === 'in_progress' || latestStatus === 'running'
+          ? 'OpenAI is rendering the video now.'
+          : 'Waiting for OpenAI to finish the video render.',
+    );
+    await waitForProvider(OPENAI_VIDEO_STATUS_POLL_MS);
+    latestPayload = await requestProviderJson(provider, apiKey, `/videos/${videoId}`, {
+      method: 'GET',
+      timeoutMs: 60000,
+    });
+    latestStatus = String(latestPayload?.status || '').trim().toLowerCase();
+  }
+
+  onProgress?.('Downloading the finished video from OpenAI.');
+  const content = await requestProviderBuffer(provider, apiKey, `/videos/${videoId}/content`, {
+    method: 'GET',
+    contentType: null,
+    timeoutMs: PROVIDER_DOWNLOAD_TIMEOUT_MS,
+  });
+
+  if (!content.buffer?.length) {
+    throw new Error(provider.name + ' finished the request, but the video file was empty.');
+  }
+
+  const mimeType = content.contentType.startsWith('video/') ? content.contentType : 'video/mp4';
+  const extension = mimeType.includes('webm') ? '.webm' : mimeType.includes('quicktime') ? '.mov' : '.mp4';
+  return {
+    createdAt: new Date().toISOString(),
+    model,
+    videos: [
+      {
+        buffer: content.buffer,
+        extension,
+        id: videoId,
+        mimeType,
+      },
+    ],
+  };
+}
 async function listProviderConnections() {
 
   await initializeProviderRegistry();
@@ -580,22 +840,24 @@ async function disconnectProvider(providerId) {
   };
 }
 
-async function listProviderModels(providerId) {
+async function listProviderModels(request) {
   await initializeProviderRegistry();
-  const provider = getProviderManifest(providerId);
+  const normalizedRequest = normalizeListProviderModelsRequest(request);
+  const provider = getProviderManifest(normalizedRequest.providerId);
   if (!provider) {
     throw new Error('Local AI Hub could not find that cloud provider.');
   }
 
   const apiKey = await loadProviderSecretOrThrow(provider.id);
   const logger = createLogger('providers', {
+    operationId: normalizedRequest.operationId || 'default',
     providerId: provider.id,
     mode: 'list-models',
   });
 
   const settings = await readProviderSettings();
   try {
-    const models = await fetchProviderModelsInternal(provider, apiKey);
+    const models = await fetchProviderModelsInternal(provider, apiKey, normalizedRequest);
     const selectedModel = selectPreferredModel(provider, models, settings.providers[provider.id]?.selectedModel || '');
 
     await updateProviderSettings((currentSettings) => ({
@@ -619,7 +881,7 @@ async function listProviderModels(providerId) {
     await logger.warn('Provider model list request failed.', {
       message: error.message,
     });
-    throw new Error(humanizeError(error, `Local AI Hub could not load models from ${provider.name}.`));
+    throw new Error(humanizeError(error, 'Local AI Hub could not load models from ' + provider.name + '.'));
   }
 }
 
@@ -700,7 +962,7 @@ async function chatWithProvider(providerId, payload = {}) {
   const messages = normalizeChatMessages(payload.messages);
   const model = String(payload.model || '').trim();
   if (!model) {
-    throw new Error(`Choose a ${provider.name} model before sending a message.`);
+    throw new Error('Choose a ' + provider.name + ' model before sending a message.');
   }
 
   if (!messages.length) {
@@ -730,9 +992,63 @@ async function chatWithProvider(providerId, payload = {}) {
 
     return result;
   } catch (error) {
-    const message = humanizeError(error, `Local AI Hub could not send that message to ${provider.name}.`);
+    const message = humanizeError(error, 'Local AI Hub could not send that message to ' + provider.name + '.');
     await logger.warn('Provider chat request failed.', {
       message,
+    });
+    throw new Error(message);
+  }
+}
+
+async function runProviderOperation(providerId, payload = {}) {
+  const operationId = normalizeProviderOperationId(payload.operationId);
+  if (!operationId || operationId === PIPELINE_OPERATION_IDS.LLM_PROMPT) {
+    return chatWithProvider(providerId, payload);
+  }
+
+  await initializeProviderRegistry();
+  const provider = getProviderManifest(providerId);
+  if (!provider) {
+    throw new Error('Local AI Hub could not find that cloud provider.');
+  }
+
+  const apiKey = await loadProviderSecretOrThrow(provider.id);
+  const logger = createLogger('providers', {
+    providerId: provider.id,
+    mode: operationId,
+  });
+  const model = String(payload.model || '').trim();
+  if (!model) {
+    throw new Error('Choose a ' + provider.name + ' model before running this step.');
+  }
+
+  try {
+    let result = null;
+    if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+      result = await sendOpenAiImageGeneration(provider, apiKey, payload);
+    } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+      result = await sendOpenAiVideoGeneration(provider, apiKey, payload);
+    } else {
+      throw new Error(provider.name + ' does not support that pipeline operation yet.');
+    }
+
+    await updateProviderSettings((settings) => ({
+      ...settings,
+      providers: {
+        ...settings.providers,
+        [provider.id]: {
+          ...(settings.providers[provider.id] || {}),
+          selectedModel: model,
+        },
+      },
+    }));
+
+    return result;
+  } catch (error) {
+    const message = humanizeError(error, 'Local AI Hub could not run that ' + provider.name + ' provider step.');
+    await logger.warn('Provider operation request failed.', {
+      message,
+      operationId,
     });
     throw new Error(message);
   }
@@ -744,6 +1060,7 @@ module.exports = {
   listProviderConnections,
   listProviderModels,
   readProviderSettings,
+  runProviderOperation,
   saveProviderConnection,
   testProviderConnection,
 };
