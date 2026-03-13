@@ -17,7 +17,23 @@ import {
   toneToClassName,
 } from '../lib/pipeline-ui';
 
-const { arePortsCompatible, buildPipelineGraph, createEdge, createEmptyPipeline, getPortDefinition, PIPELINE_OPERATION_IDS, PIPELINE_PORT_KIND_LABELS, PIPELINE_RETRY_LOOP_MAX_ATTEMPTS } = pipelineShared;
+const {
+  arePortsCompatible,
+  buildPipelineGraph,
+  createEdge,
+  createEmptyPipeline,
+  getDefaultGraphWorkflowBindings,
+  getGraphWorkflowContract,
+  getGraphWorkflowFieldOptions,
+  getGraphWorkflowInputBinding,
+  getGraphWorkflowOutputBinding,
+  getGraphWorkflowOutputNodeOptions,
+  getPortDefinition,
+  parseGraphWorkflowDefinitionText,
+  PIPELINE_OPERATION_IDS,
+  PIPELINE_PORT_KIND_LABELS,
+  PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
+} = pipelineShared;
 const CANVAS_MIN_WIDTH = 1280;
 const CANVAS_MIN_HEIGHT = 820;
 
@@ -184,12 +200,16 @@ function buildNodePreview(node, runState) {
   }
 
   if (node.type === 'graphWorkflow') {
-    const workflowDefinition = parseGraphWorkflowDefinition(node.config?.workflowText);
-    const nodeCountLabel = workflowDefinition.ok ? workflowDefinition.nodeEntries.length + ' workflow nodes' : 'Paste workflow JSON';
-    const outputNodeId = String(node.config?.outputBindings?.image?.nodeId || '').trim();
+    const contract = getGraphWorkflowContract(node.config?.toolId);
+    const workflowDefinition = parseGraphWorkflowDefinitionText(node.config?.toolId, node.config?.workflowText);
+    const nodeCountLabel = workflowDefinition.ok
+      ? workflowDefinition.nodeEntries.length + ' parsed nodes'
+      : contract.supportsExecution
+        ? contract.workflowFormat?.label || 'Workflow definition'
+        : 'Planned contract';
+    const outputNodeId = String(getGraphWorkflowOutputBinding(node, 'image')?.nodeId || '').trim();
     return (node.config?.toolId || 'Graph workflow tool') + ' | ' + nodeCountLabel + (outputNodeId ? ' | output ' + outputNodeId : '');
   }
-
   if (node.type === 'validation') {
     return node.config?.mode === 'llm'
       ? `${node.config?.llmExecutionMode === 'ollama' ? 'Ollama' : node.config?.providerId || 'Cloud validator'}${node.config?.model ? ` | ${node.config.model}` : ''}`
@@ -340,99 +360,15 @@ function collectLocalToolModelsByToolId(modelOptionsByNodeId) {
   return localModelsByToolId;
 }
 
-function sortGraphWorkflowNodeEntries(entries = []) {
-  return [...entries].sort((left, right) => {
-    const leftNumber = Number(left.id);
-    const rightNumber = Number(right.id);
-    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
-      return leftNumber - rightNumber;
-    }
-
-    return left.id.localeCompare(right.id, undefined, {
-      numeric: true,
-      sensitivity: 'base',
-    });
-  });
-}
-
 function formatGraphWorkflowNodeLabel(entry) {
   const nodeId = String(entry?.id || '').trim();
   const classType = String(entry?.classType || '').trim();
   return classType ? nodeId + ' - ' + classType : nodeId || 'Workflow node';
 }
 
-function parseGraphWorkflowDefinition(workflowText) {
-  const raw = String(workflowText || '').trim();
-  if (!raw) {
-    return {
-      message: 'Paste the exported ComfyUI API workflow JSON to configure this graph step.',
-      nodeEntries: [],
-      ok: false,
-      workflow: null,
-    };
-  }
-
-  try {
-    const workflow = JSON.parse(raw);
-    if (!workflow || Array.isArray(workflow) || typeof workflow !== 'object') {
-      return {
-        message: 'This graph workflow step needs a ComfyUI API workflow JSON object keyed by node ID.',
-        nodeEntries: [],
-        ok: false,
-        workflow: null,
-      };
-    }
-
-    const nodeEntries = sortGraphWorkflowNodeEntries(
-      Object.entries(workflow)
-        .filter(([, entry]) => entry && typeof entry === 'object')
-        .map(([id, entry]) => ({
-          classType: String(entry.class_type || entry.classType || '').trim(),
-          id: String(id || '').trim(),
-          inputFields: Object.keys(entry.inputs || {}).sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' })),
-        }))
-        .filter((entry) => entry.id),
-    );
-
-    if (!nodeEntries.length) {
-      return {
-        message: 'This graph workflow JSON does not contain any workflow nodes yet.',
-        nodeEntries: [],
-        ok: false,
-        workflow,
-      };
-    }
-
-    return {
-      message: 'Loaded ' + nodeEntries.length + ' workflow nodes.',
-      nodeEntries,
-      ok: true,
-      workflow,
-    };
-  } catch {
-    return {
-      message: 'Local AI Hub could not read that graph workflow JSON. Paste the exported ComfyUI API workflow JSON for this step.',
-      nodeEntries: [],
-      ok: false,
-      workflow: null,
-    };
-  }
+function formatGraphWorkflowAdapterLabel(contract) {
+  return contract?.supportsExecution ? 'Runs in Local AI Hub' : 'Planned adapter';
 }
-
-function getGraphWorkflowFieldOptions(definition, nodeId) {
-  if (!definition?.ok) {
-    return [];
-  }
-
-  const normalizedNodeId = String(nodeId || '').trim();
-  if (!normalizedNodeId) {
-    return [];
-  }
-
-  const nodeEntry = definition.nodeEntries.find((entry) => entry.id === normalizedNodeId) || null;
-  return nodeEntry?.inputFields || [];
-}
-
 function ArtifactPreview({ artifact, className = '', compact = false }) {
   if (!artifact) {
     return <div className={`rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-4 text-sm leading-6 text-slate-400 ${className}`}>Nothing to preview yet.</div>;
@@ -1019,24 +955,48 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       return true;
     });
   }, [manifests, tools]);
-  const selectedGraphWorkflowDefinition = useMemo(
-    () => (selectedNode?.type === 'graphWorkflow' ? parseGraphWorkflowDefinition(selectedNode.config?.workflowText) : null),
-    [selectedNode],
-  );
-  const graphWorkflowNodeOptions = selectedGraphWorkflowDefinition?.nodeEntries || [];
-  const graphWorkflowTextFieldOptions = useMemo(
-    () => getGraphWorkflowFieldOptions(selectedGraphWorkflowDefinition, selectedNode?.config?.inputBindings?.text?.nodeId),
-    [selectedGraphWorkflowDefinition, selectedNode?.config?.inputBindings?.text?.nodeId],
-  );
-  const graphWorkflowImageFieldOptions = useMemo(
-    () => getGraphWorkflowFieldOptions(selectedGraphWorkflowDefinition, selectedNode?.config?.inputBindings?.image?.nodeId),
-    [selectedGraphWorkflowDefinition, selectedNode?.config?.inputBindings?.image?.nodeId],
-  );
   const selectedGraphWorkflowTool = useMemo(
     () => (selectedNode?.type === 'graphWorkflow'
       ? graphWorkflowTools.find((tool) => tool.id === (selectedNode.config?.toolId || graphWorkflowTools[0]?.id || '')) || null
       : null),
     [graphWorkflowTools, selectedNode],
+  );
+  const selectedGraphWorkflowToolContract = useMemo(
+    () => (selectedNode?.type === 'graphWorkflow'
+      ? getGraphWorkflowContract(selectedNode.config?.toolId || selectedGraphWorkflowTool?.id || graphWorkflowTools[0]?.id || '')
+      : null),
+    [graphWorkflowTools, selectedGraphWorkflowTool, selectedNode],
+  );
+  const selectedGraphWorkflowDefinition = useMemo(
+    () => (selectedNode?.type === 'graphWorkflow'
+      ? parseGraphWorkflowDefinitionText(selectedNode.config?.toolId || selectedGraphWorkflowTool?.id || '', selectedNode.config?.workflowText)
+      : null),
+    [selectedGraphWorkflowTool, selectedNode],
+  );
+  const graphWorkflowNodeOptions = selectedGraphWorkflowDefinition?.nodeEntries || [];
+  const graphWorkflowTextBinding = useMemo(
+    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowInputBinding(selectedNode, 'text') : null),
+    [selectedNode],
+  );
+  const graphWorkflowImageBinding = useMemo(
+    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowInputBinding(selectedNode, 'image') : null),
+    [selectedNode],
+  );
+  const graphWorkflowOutputBinding = useMemo(
+    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowOutputBinding(selectedNode, 'image') : null),
+    [selectedNode],
+  );
+  const graphWorkflowTextFieldOptions = useMemo(
+    () => getGraphWorkflowFieldOptions(selectedGraphWorkflowDefinition, graphWorkflowTextBinding?.nodeId, 'text'),
+    [graphWorkflowTextBinding?.nodeId, selectedGraphWorkflowDefinition],
+  );
+  const graphWorkflowImageFieldOptions = useMemo(
+    () => getGraphWorkflowFieldOptions(selectedGraphWorkflowDefinition, graphWorkflowImageBinding?.nodeId, 'image'),
+    [graphWorkflowImageBinding?.nodeId, selectedGraphWorkflowDefinition],
+  );
+  const graphWorkflowOutputNodeOptions = useMemo(
+    () => getGraphWorkflowOutputNodeOptions(selectedGraphWorkflowDefinition, 'image'),
+    [selectedGraphWorkflowDefinition],
   );
   const currentPipelineSaved = useMemo(() => pipelines.some((pipeline) => pipeline.id === draft.id), [pipelines, draft.id]);
   const currentNodeSummary = selectedNode ? analysis.nodeSummaries?.[selectedNode.id] || null : null;
@@ -1077,6 +1037,15 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     });
   }
 
+  function rememberHistoricalRunNotification(nextRun) {
+    if (!nextRun?.runId || !nextRun?.status) {
+      return;
+    }
+
+    if (nextRun.status === 'completed' || nextRun.status === 'failed' || nextRun.status === 'cancelled') {
+      notifiedRunStateRef.current = `${nextRun.runId}:${nextRun.status}`;
+    }
+  }
   function markDirty() {
     setDirty(true);
   }
@@ -1194,7 +1163,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       }
 
       if (activeRunResult?.ok) {
-        applyRunSnapshot(activeRunResult.data?.run || null);
+        const historicalRun = activeRunResult.data?.run || null;
+        rememberHistoricalRunNotification(historicalRun);
+        applyRunSnapshot(historicalRun);
       } else if (activeRunResult?.message) {
         onToast(activeRunResult.message, 'error');
       }
@@ -1233,10 +1204,10 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
     if (runState.status === 'completed') {
       onToast(runState.message || `${runState.pipelineName} finished successfully.`, 'success');
-      notifiedRunStateRef.current = notificationKey;
+      notifiedRunStateRef.current = `${runState.runId}:${runState.status}`;
     } else if (runState.status === 'failed' || runState.status === 'cancelled') {
       onToast(runState.message || 'Pipeline run stopped.', 'error');
-      notifiedRunStateRef.current = notificationKey;
+      notifiedRunStateRef.current = `${runState.runId}:${runState.status}`;
     }
   }, [onToast, runState]);
 
@@ -1771,8 +1742,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
           </div>
         </div>
       </div>
-      <div className="grid gap-5 xl:grid-cols-[280px,minmax(0,1fr),360px]">
-        <aside className="space-y-5">
+      <div className="space-y-5">
           <div className="panel p-5">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -1781,7 +1751,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
               </div>
               <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => refreshPipelineList()} type="button">Refresh list</button>
             </div>
-            <div className="mt-4 space-y-3">
+            <div className="mt-4 grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
               {pipelines.length ? pipelines.map((pipeline) => (
                 <SavedPipelineRow active={pipeline.id === draft.id} key={pipeline.id} onClick={() => loadSavedPipeline(pipeline.id)} pipeline={pipeline} />
               )) : (
@@ -1798,11 +1768,11 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs leading-6 text-slate-400">
               Add nodes across text, image, audio, video, and file workflows. Connections stay typed, validation can branch to pass or fail, and Branch Merge recombines compatible paths explicitly.
             </div>
-            <div className="mt-4 space-y-4">
+            <div className="mt-4 grid gap-4 xl:grid-cols-2 2xl:grid-cols-4">
               {paletteGroups.map((group) => (
-                <div key={group.label}>
+                <div key={group.label} className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
                   <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{group.label}</p>
-                  <div className="mt-2 space-y-2">
+                  <div className="mt-3 space-y-2">
                     {group.entries.map((entry) => (
                       <button
                         className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition hover:border-cyan-300/25 hover:bg-white/10"
@@ -1819,9 +1789,482 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
               ))}
             </div>
           </div>
-        </aside>
 
-        <div className="space-y-5">
+          <div className="panel p-5">
+            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Inspector</p>
+            <p className="mt-2 text-lg font-semibold text-white">{selectedNode ? selectedNode.label : 'Select a node'}</p>
+            {selectedNode ? (
+              <div className="mt-4 space-y-4">
+                <div>
+                  <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="node-label">Node label</label>
+                  <input className="store-input mt-3" id="node-label" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, label: event.target.value }))} value={selectedNode.label} />
+                </div>
+
+                <div className={`rounded-[24px] border p-4 ${toneToClassName(currentNodeSummary?.readiness?.tone || currentNodeSummary?.compatibility?.tone || 'neutral')}`}>
+                  <p className="text-[11px] uppercase tracking-[0.18em] text-slate-300">Readiness</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-100">{currentNodeSummary?.readiness?.message || 'This node is ready.'}</p>
+                  {currentNodeSummary?.capabilitySummary ? <p className="mt-2 text-xs leading-5 text-slate-200">{currentNodeSummary.capabilitySummary.message}</p> : null}
+                  {currentNodeSummary?.compatibility ? <p className="mt-2 text-xs leading-5 text-slate-200">{currentNodeSummary.compatibility.source}: {currentNodeSummary.compatibility.message}</p> : null}
+                </div>
+
+                {selectedNode.type === 'textInput' ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="node-text-input">Text input</label><textarea className="store-input mt-3 min-h-[180px] resize-none" id="node-text-input" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, text: event.target.value } }))} placeholder="Write the initial text for this workflow." value={selectedNode.config?.text || ''} /></div> : null}
+
+                {['imageInput', 'audioInput', 'videoInput', 'fileInput'].includes(selectedNode.type) ? (
+                  <div className="space-y-3">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="node-file-input">Selected file</label>
+                      <input className="store-input mt-3" id="node-file-input" readOnly value={selectedNode.config?.filePath || ''} />
+                    </div>
+                    <div className="flex flex-wrap gap-3">
+                      <button className="ghost-button" onClick={() => chooseNodeFile(selectedNode.id, selectedNode.type === 'imageInput' ? 'image' : selectedNode.type === 'audioInput' ? 'audio' : selectedNode.type === 'videoInput' ? 'video' : 'file')} type="button">Choose file</button>
+                      <button className="ghost-button" onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, filePath: '' } }))} type="button">Clear</button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'llmPrompt' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-operation">
+                        Operation
+                      </label>
+                      <select
+                        className="store-input mt-3"
+                        disabled={selectedNode.config?.executionMode === 'ollama' || selectedNode.config?.executionMode === 'localTool'}
+                        id="llm-operation"
+                        onChange={(event) =>
+                          updateNode(selectedNode.id, (currentNode) => ({
+                            ...currentNode,
+                            config: {
+                              ...currentNode.config,
+                              model: '',
+                              operationId: event.target.value,
+                            },
+                          }))
+                        }
+                        value={getSelectedModelStepOperationId(selectedNode)}
+                      >
+                        <option value={PIPELINE_OPERATION_IDS.LLM_PROMPT}>Text response</option>
+                        <option value={PIPELINE_OPERATION_IDS.IMAGE_GENERATE}>Image generation</option>
+                        <option value={PIPELINE_OPERATION_IDS.VIDEO_GENERATE}>Video generation</option>
+                      </select>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">
+                        {selectedNode.config?.executionMode === 'ollama'
+                          ? 'Local Ollama mode currently returns text only.'
+                          : selectedNode.config?.executionMode === 'localTool'
+                            ? 'Local image tool mode is fixed to text-to-image and returns an image artifact from the Image output port.'
+                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                              ? 'This step returns an image artifact from the Image output port.'
+                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                ? 'This step returns a video artifact from the Video output port.'
+                                : 'This step returns a text artifact from the Text output port.'}
+                      </p>
+                    </div>
+                    <ModelTargetFields allowLocalTool connectedProviders={connectedProviders} executionModeKey="executionMode" localImageTools={imageTools} modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-instruction">
+                        {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                          ? 'Prompt prefix / style guidance'
+                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                            ? 'Motion guidance / prompt shaping'
+                            : 'Task / instruction'}
+                      </label>
+                      <textarea
+                        className="store-input mt-3 min-h-[120px] resize-none"
+                        id="llm-instruction"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))}
+                        placeholder={getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                          ? 'Optional style or scene guidance to prepend to the incoming prompt.'
+                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                            ? 'For text-to-video, this is optional extra guidance. For image-to-video, use this box for the motion prompt.'
+                            : 'Optional guidance to apply to the incoming text.'}
+                        value={selectedNode.config?.instruction || ''}
+                      />
+                      {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
+                        <p className="mt-2 text-xs leading-5 text-slate-400">
+                          Text input becomes the base video prompt. If this step is connected to an image, use this box for the motion prompt that should animate that image.
+                        </p>
+                      ) : null}
+                    </div>
+                    {selectedNode.config?.executionMode === 'localTool' ? (
+                      <div className="space-y-4">
+                        <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-width">Width</label><input className="store-input mt-3" id="llm-local-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-height">Height</label><input className="store-input mt-3" id="llm-local-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
+                        <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-steps">Steps</label><input className="store-input mt-3" id="llm-local-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-cfg">CFG scale</label><input className="store-input mt-3" id="llm-local-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-seed">Seed</label><input className="store-input mt-3" id="llm-local-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-local-negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for this local image step." value={selectedNode.config?.negativePrompt || ''} /></div>
+                      </div>
+                    ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? (
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-size">Image size</label><select className="store-input mt-3" id="llm-image-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-quality">Quality</label><select className="store-input mt-3" id="llm-image-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-background">Background</label><select className="store-input mt-3" id="llm-image-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div>
+                      </div>
+                    ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
+                      <div className="space-y-3">
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-video-size">Video size</label><select className="store-input mt-3" id="llm-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="1280x720">1280 x 720 (landscape)</option><option value="720x1280">720 x 1280 (portrait)</option></select></div>
+                        <p className="text-xs leading-5 text-slate-400">Local AI Hub currently requests an 8 second Sora clip and saves the finished video locally. If you connect an image here, make sure it matches the selected video size.</p>
+                      </div>
+                    ) : null}
+                    {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.LLM_PROMPT ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional persistent instruction for this step." value={selectedNode.config?.systemPrompt || ''} /></div> : null}
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'whisperTranscribe' ? (
+                  <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="whisper-model">Transcription model</label><select className="store-input mt-3" id="whisper-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} value={selectedNode.config?.model || 'base'}>{WHISPER_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></div>
+                ) : null}
+
+                {selectedNode.type === 'imageAnalyze' ? (
+                  <div className="space-y-4">
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-tool">Execution tool</label><select className="store-input mt-3" id="image-analyze-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-mode">Analysis mode</label><select className="store-input mt-3" id="image-analyze-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: event.target.value } }))} value={selectedNode.config?.analysisMode || 'clip'}><option value="clip">CLIP caption</option><option value="deepdanbooru">DeepDanbooru tags</option></select></div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'imageGenerate' ? (
+                  <div className="space-y-4">
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-generate-tool">Execution tool</label><select className="store-input mt-3" id="image-generate-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                    <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-width">Width</label><input className="store-input mt-3" id="image-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-height">Height</label><input className="store-input mt-3" id="image-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
+                    <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-steps">Steps</label><input className="store-input mt-3" id="image-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-cfg">CFG scale</label><input className="store-input mt-3" id="image-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-seed">Seed</label><input className="store-input mt-3" id="image-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for the image step." value={selectedNode.config?.negativePrompt || ''} /></div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'graphWorkflow' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-workflow-tool">Execution tool</label>
+                      <select
+                        className="store-input mt-3"
+                        id="graph-workflow-tool"
+                        onChange={(event) => {
+                          const nextToolId = event.target.value;
+                          const nextBindings = getDefaultGraphWorkflowBindings(nextToolId);
+                          updateNode(selectedNode.id, (currentNode) => ({
+                            ...currentNode,
+                            config: {
+                              ...currentNode.config,
+                              inputBindings: nextBindings.inputBindings,
+                              outputBindings: nextBindings.outputBindings,
+                              toolId: nextToolId,
+                              workflowFormat: nextBindings.workflowFormat,
+                              workflowText: '',
+                            },
+                          }));
+                        }}
+                        value={selectedNode.config?.toolId || graphWorkflowTools[0]?.id || ''}
+                      >
+                        <option value="">Choose a graph workflow tool</option>
+                        {graphWorkflowTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}
+                      </select>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">Use this step for graph-native local tools instead of flattening them into the model-step abstraction. Each tool keeps its own workflow contract and honest limitations.</p>
+                    </div>
+                    <div className="grid gap-4 xl:grid-cols-2">
+                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-4 text-sm leading-6 text-slate-300">
+                        <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Graph Contract</p>
+                        <p className="mt-3 text-base font-semibold text-white">{selectedGraphWorkflowTool?.name || 'Graph workflow tool'}</p>
+                        <p className="mt-2 text-xs uppercase tracking-[0.18em] text-slate-400">{formatGraphWorkflowAdapterLabel(selectedGraphWorkflowToolContract)}</p>
+                        <p className="mt-3 text-sm leading-6 text-slate-300">{selectedGraphWorkflowToolContract?.notes}</p>
+                      </div>
+                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-4 text-sm leading-6 text-slate-300">
+                        <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Workflow Format</p>
+                        <p className="mt-3 text-base font-semibold text-white">{selectedGraphWorkflowToolContract?.workflowFormat?.label || 'Workflow definition'}</p>
+                        <p className="mt-3 text-sm leading-6 text-slate-300">{selectedGraphWorkflowToolContract?.workflowFormat?.summary}</p>
+                      </div>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      The main pipeline stays on this canvas. This node marks a clear boundary between the main pipeline and the graph-native sub-workflow that runs inside {selectedGraphWorkflowTool?.name || 'the selected tool'}. Local AI Hub still runs the overall pipeline sequentially and saves explicit typed outputs back into the run folder.
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-3">
+                      {(selectedGraphWorkflowToolContract?.inputPorts || []).map((entry) => (
+                        <div className="rounded-[24px] border border-white/10 bg-slate-950/35 px-4 py-4" key={entry.portId}>
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Input Boundary</p>
+                          <p className="mt-2 text-sm font-semibold text-white">{entry.label}</p>
+                          <p className="mt-2 text-xs uppercase tracking-[0.18em] text-slate-400">{entry.bindingMode}</p>
+                          <p className="mt-3 text-xs leading-5 text-slate-400">{entry.description}</p>
+                        </div>
+                      ))}
+                      {(selectedGraphWorkflowToolContract?.outputPorts || []).map((entry) => (
+                        <div className="rounded-[24px] border border-white/10 bg-slate-950/35 px-4 py-4" key={entry.portId}>
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Output Boundary</p>
+                          <p className="mt-2 text-sm font-semibold text-white">{entry.label}</p>
+                          <p className="mt-2 text-xs uppercase tracking-[0.18em] text-slate-400">{entry.bindingMode}</p>
+                          <p className="mt-3 text-xs leading-5 text-slate-400">{entry.description}</p>
+                        </div>
+                      ))}
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-workflow-json">Workflow definition</label>
+                      <textarea
+                        className="store-input mt-3 min-h-[220px] resize-none font-mono text-xs leading-6"
+                        id="graph-workflow-json"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            workflowText: event.target.value,
+                          },
+                        }))}
+                        placeholder={selectedGraphWorkflowToolContract?.workflowFormat?.placeholder || 'Paste the workflow definition here.'}
+                        value={selectedNode.config?.workflowText || ''}
+                      />
+                      {selectedGraphWorkflowDefinition ? (
+                        <p className={'mt-2 text-xs leading-5 ' + (selectedGraphWorkflowDefinition.ok ? 'text-emerald-200' : 'text-amber-200')}>
+                          {selectedGraphWorkflowDefinition.message}
+                        </p>
+                      ) : null}
+                      {selectedGraphWorkflowToolContract?.limitations ? <p className="mt-2 text-xs leading-5 text-slate-400">{selectedGraphWorkflowToolContract.limitations}</p> : null}
+                    </div>
+                    {selectedGraphWorkflowToolContract?.workflowImportSupported ? (
+                      <>
+                        <div className="grid gap-4 xl:grid-cols-2">
+                          <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Pipeline Text to Graph Boundary</p>
+                            <div className="mt-3 space-y-3">
+                              <div>
+                                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-text-node">Workflow node</label>
+                                {selectedGraphWorkflowDefinition?.ok ? (
+                                  <select
+                                    className="store-input mt-3"
+                                    id="graph-text-node"
+                                    onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: '', nodeId: event.target.value })}
+                                    value={graphWorkflowTextBinding?.nodeId || ''}
+                                  >
+                                    <option value="">Leave text input unused</option>
+                                    {graphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}
+                                  </select>
+                                ) : (
+                                  <input
+                                    className="store-input mt-3"
+                                    id="graph-text-node"
+                                    onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { nodeId: event.target.value })}
+                                    placeholder="For example: 6"
+                                    value={graphWorkflowTextBinding?.nodeId || ''}
+                                  />
+                                )}
+                              </div>
+                              <div>
+                                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-text-field">Workflow field</label>
+                                {graphWorkflowTextFieldOptions.length ? (
+                                  <select
+                                    className="store-input mt-3"
+                                    id="graph-text-field"
+                                    onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })}
+                                    value={graphWorkflowTextBinding?.field || ''}
+                                  >
+                                    <option value="">Choose a workflow field</option>
+                                    {graphWorkflowTextFieldOptions.map((field) => <option key={field} value={field}>{field}</option>)}
+                                  </select>
+                                ) : (
+                                  <input
+                                    className="store-input mt-3"
+                                    id="graph-text-field"
+                                    onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })}
+                                    placeholder="For example: text"
+                                    value={graphWorkflowTextBinding?.field || ''}
+                                  />
+                                )}
+                              </div>
+                            </div>
+                            <p className="mt-3 text-xs leading-5 text-slate-400">Leave this mapping blank when the imported graph does not consume the main pipeline Text port.</p>
+                          </div>
+                          <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Pipeline Image to Graph Boundary</p>
+                            <div className="mt-3 space-y-3">
+                              <div>
+                                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-image-node">Workflow node</label>
+                                {selectedGraphWorkflowDefinition?.ok ? (
+                                  <select
+                                    className="store-input mt-3"
+                                    id="graph-image-node"
+                                    onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: '', nodeId: event.target.value })}
+                                    value={graphWorkflowImageBinding?.nodeId || ''}
+                                  >
+                                    <option value="">Leave image input unused</option>
+                                    {graphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}
+                                  </select>
+                                ) : (
+                                  <input
+                                    className="store-input mt-3"
+                                    id="graph-image-node"
+                                    onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
+                                    placeholder="For example: 12"
+                                    value={graphWorkflowImageBinding?.nodeId || ''}
+                                  />
+                                )}
+                              </div>
+                              <div>
+                                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-image-field">Workflow field</label>
+                                {graphWorkflowImageFieldOptions.length ? (
+                                  <select
+                                    className="store-input mt-3"
+                                    id="graph-image-field"
+                                    onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: event.target.value })}
+                                    value={graphWorkflowImageBinding?.field || ''}
+                                  >
+                                    <option value="">Choose a workflow field</option>
+                                    {graphWorkflowImageFieldOptions.map((field) => <option key={field} value={field}>{field}</option>)}
+                                  </select>
+                                ) : (
+                                  <input
+                                    className="store-input mt-3"
+                                    id="graph-image-field"
+                                    onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: event.target.value })}
+                                    placeholder="For example: image"
+                                    value={graphWorkflowImageBinding?.field || ''}
+                                  />
+                                )}
+                              </div>
+                            </div>
+                            <p className="mt-3 text-xs leading-5 text-slate-400">When this port is connected, Local AI Hub uploads the incoming image to the selected graph tool before the workflow runs.</p>
+                          </div>
+                        </div>
+                        <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Graph Output Boundary to Main Pipeline</p>
+                          <div className="mt-3">
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-output-node">Output node</label>
+                            {selectedGraphWorkflowDefinition?.ok ? (
+                              <select
+                                className="store-input mt-3"
+                                id="graph-output-node"
+                                onChange={(event) => updateGraphWorkflowOutputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
+                                value={graphWorkflowOutputBinding?.nodeId || ''}
+                              >
+                                <option value="">Choose the image output node</option>
+                                {(graphWorkflowOutputNodeOptions.length ? graphWorkflowOutputNodeOptions : graphWorkflowNodeOptions).map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}{entry.imageOutputCandidate ? ' (likely image output)' : ''}</option>)}
+                              </select>
+                            ) : (
+                              <input
+                                className="store-input mt-3"
+                                id="graph-output-node"
+                                onChange={(event) => updateGraphWorkflowOutputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
+                                placeholder="For example: 19"
+                                value={graphWorkflowOutputBinding?.nodeId || ''}
+                              />
+                            )}
+                          </div>
+                          <p className="mt-3 text-xs leading-5 text-slate-400">Choose the node that emits the image artifact back into the main pipeline. Local AI Hub keeps that artifact explicit and previewable after the graph step finishes.</p>
+                        </div>
+                        {selectedGraphWorkflowDefinition?.ok ? (
+                          <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Parsed Workflow Nodes</p>
+                            <div className="mt-3 space-y-2 max-h-[260px] overflow-auto pr-1">
+                              {graphWorkflowNodeOptions.slice(0, 18).map((entry) => (
+                                <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3" key={entry.id}>
+                                  <p className="text-sm font-medium text-white">{formatGraphWorkflowNodeLabel(entry)}</p>
+                                  <p className="mt-1 text-xs leading-5 text-slate-400">
+                                    {entry.inputFields.length ? 'Inputs: ' + entry.inputFields.join(', ') : 'No editable inputs detected.'}
+                                  </p>
+                                  {entry.boundaryFieldOptions?.text?.length ? <p className="mt-1 text-xs leading-5 text-cyan-100/90">Text-friendly fields: {entry.boundaryFieldOptions.text.slice(0, 4).join(', ')}</p> : null}
+                                  {entry.boundaryFieldOptions?.image?.length ? <p className="mt-1 text-xs leading-5 text-sky-100/90">Image-friendly fields: {entry.boundaryFieldOptions.image.slice(0, 4).join(', ')}</p> : null}
+                                  {entry.imageOutputCandidate ? <p className="mt-1 text-xs leading-5 text-emerald-200">Likely image output node</p> : null}
+                                </div>
+                              ))}
+                            </div>
+                            {graphWorkflowNodeOptions.length > 18 ? <p className="mt-3 text-xs leading-5 text-slate-500">Showing the first 18 parsed nodes from the imported workflow.</p> : null}
+                          </div>
+                        ) : null}
+                      </>
+                    ) : (
+                      <div className="rounded-[24px] border border-amber-300/20 bg-amber-300/10 px-4 py-4 text-sm leading-6 text-amber-100">
+                        {selectedGraphWorkflowToolContract?.executionBlockedMessage}
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+                {selectedNode.type === 'validation' ? (
+                  <div className="space-y-4">
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-mode">Validation mode</label><select className="store-input mt-3" id="validation-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, mode: event.target.value } }))} value={selectedNode.config?.mode || 'user'}><option value="user">User approval</option><option value="llm">LLM validator</option></select></div>
+                    {selectedNode.config?.mode === 'llm' ? (
+                      <>
+                        <ModelTargetFields connectedProviders={connectedProviders} executionModeKey="llmExecutionMode" modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-ruleset">Ruleset / rubric</label><textarea className="store-input mt-3 min-h-[140px] resize-none" id="validation-ruleset" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, ruleset: event.target.value } }))} placeholder="Describe what should count as pass versus fail." value={selectedNode.config?.ruleset || ''} /></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="validation-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional validator instruction." value={selectedNode.config?.systemPrompt || ''} /></div>
+                      </>
+                    ) : (
+                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This run will pause at the validation node, show the connected artifact preview when possible, and wait for your pass or fail decision.</div>
+                    )}
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'retryLoop' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="retry-loop-target">Retry from</label>
+                      <select
+                        className="store-input mt-3"
+                        id="retry-loop-target"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            retryTargetNodeId: event.target.value,
+                          },
+                        }))}
+                        value={selectedNode.config?.retryTargetNodeId || ''}
+                      >
+                        <option value="">Choose an earlier step</option>
+                        {retryLoopTargetOptions.map((node) => (
+                          <option key={node.id} value={node.id}>{node.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="retry-loop-max">Max attempts</label>
+                      <input
+                        className="store-input mt-3"
+                        id="retry-loop-max"
+                        max={PIPELINE_RETRY_LOOP_MAX_ATTEMPTS}
+                        min="2"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            maxAttempts: Number(event.target.value || 0) || 0,
+                          },
+                        }))}
+                        type="number"
+                        value={selectedNode.config?.maxAttempts || 3}
+                      />
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Connect the Complete input to the branch that should exit the loop and the Retry input to the branch that should trigger another attempt. Local AI Hub reruns the selected earlier step and the closed steps between it and this node, one attempt at a time, until the limit is reached.
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'branchMerge' ? (
+                  <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                    Connect two or more compatible branches here. Local AI Hub waits for earlier branches to finish or skip, then forwards the single branch that still has an artifact. If two live results arrive together, the run stops with a plain-English error so the merge stays explicit.
+                  </div>
+                ) : null}
+
+                {selectedNode.type.endsWith('Output') ? (
+                  <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="output-title">Output title</label><input className="store-input mt-3" id="output-title" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, title: event.target.value } }))} value={selectedNode.config?.title || ''} /></div>
+                ) : null}
+
+                <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                  <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Connections</p>
+                  <div className="mt-3 space-y-3">
+                    {draft.edges.filter((edge) => edge.source.nodeId === selectedNode.id || edge.target.nodeId === selectedNode.id).length ? draft.edges.filter((edge) => edge.source.nodeId === selectedNode.id || edge.target.nodeId === selectedNode.id).map((edge) => {
+                      const sourceNode = draft.nodes.find((node) => node.id === edge.source.nodeId);
+                      const targetNode = draft.nodes.find((node) => node.id === edge.target.nodeId);
+                      const sourcePort = getPortDefinition(sourceNode?.type, 'output', edge.source.portId);
+                      const targetPort = getPortDefinition(targetNode?.type, 'input', edge.target.portId);
+                      return (
+                        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3" key={edge.id}>
+                          <p className="text-sm font-medium text-white">{sourceNode?.label || 'Unknown'}: <span className="text-slate-400">{sourcePort?.label || edge.source.portId}</span></p>
+                          <p className="mt-1 text-sm text-slate-300">to {targetNode?.label || 'Unknown'}: <span className="text-slate-400">{targetPort?.label || edge.target.portId}</span></p>
+                          <button className="ghost-button mt-3 px-3 py-1.5 text-xs" onClick={() => removeEdge(edge.id)} type="button">Remove connection</button>
+                        </div>
+                      );
+                    }) : <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-3 py-4 text-sm leading-6 text-slate-400">This node has no connections yet.</div>}
+                  </div>
+                </div>
+
+                <button className="ghost-button w-full justify-center" onClick={() => removeNode(selectedNode.id)} type="button">Delete node</button>
+              </div>
+            ) : <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">Select a node on the canvas to edit its settings and inspect its connections.</div>}
+          </div>
+
           <div className="panel p-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
@@ -1835,8 +2278,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
               </div>
             </div>
 
-            <div className="mt-4 rounded-[28px] border border-white/10 bg-slate-950/30 p-3">
-              <div className="relative h-[820px] overflow-auto rounded-[24px] border border-dashed border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(67,171,255,0.08),transparent_24%),linear-gradient(180deg,rgba(7,15,26,0.96),rgba(5,10,18,0.96))]" ref={canvasRef}>
+            <div className="mt-4 rounded-[28px] border border-white/10 bg-slate-950/30 p-2">
+              <div className="relative h-[860px] overflow-auto rounded-[24px] border border-dashed border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(67,171,255,0.08),transparent_24%),linear-gradient(180deg,rgba(7,15,26,0.96),rgba(5,10,18,0.96))]" ref={canvasRef}>
                 <div className="relative" style={{ height: `${canvasSize.height}px`, width: `${canvasSize.width}px` }}>
                   <svg className="absolute inset-0 h-full w-full">
                     {graphEdges.map((edge) => {
@@ -1990,439 +2433,12 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
               />
             </div>
           </div>
-        </div>
-
-        <aside className="space-y-5">
-          <div className="panel p-5">
-            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Inspector</p>
-            <p className="mt-2 text-lg font-semibold text-white">{selectedNode ? selectedNode.label : 'Select a node'}</p>
-            {selectedNode ? (
-              <div className="mt-4 space-y-4">
-                <div>
-                  <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="node-label">Node label</label>
-                  <input className="store-input mt-3" id="node-label" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, label: event.target.value }))} value={selectedNode.label} />
-                </div>
-
-                <div className={`rounded-[24px] border p-4 ${toneToClassName(currentNodeSummary?.readiness?.tone || currentNodeSummary?.compatibility?.tone || 'neutral')}`}>
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-slate-300">Readiness</p>
-                  <p className="mt-2 text-sm leading-6 text-slate-100">{currentNodeSummary?.readiness?.message || 'This node is ready.'}</p>
-                  {currentNodeSummary?.capabilitySummary ? <p className="mt-2 text-xs leading-5 text-slate-200">{currentNodeSummary.capabilitySummary.message}</p> : null}
-                  {currentNodeSummary?.compatibility ? <p className="mt-2 text-xs leading-5 text-slate-200">{currentNodeSummary.compatibility.source}: {currentNodeSummary.compatibility.message}</p> : null}
-                </div>
-
-                {selectedNode.type === 'textInput' ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="node-text-input">Text input</label><textarea className="store-input mt-3 min-h-[180px] resize-none" id="node-text-input" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, text: event.target.value } }))} placeholder="Write the initial text for this workflow." value={selectedNode.config?.text || ''} /></div> : null}
-
-                {['imageInput', 'audioInput', 'videoInput', 'fileInput'].includes(selectedNode.type) ? (
-                  <div className="space-y-3">
-                    <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="node-file-input">Selected file</label>
-                      <input className="store-input mt-3" id="node-file-input" readOnly value={selectedNode.config?.filePath || ''} />
-                    </div>
-                    <div className="flex flex-wrap gap-3">
-                      <button className="ghost-button" onClick={() => chooseNodeFile(selectedNode.id, selectedNode.type === 'imageInput' ? 'image' : selectedNode.type === 'audioInput' ? 'audio' : selectedNode.type === 'videoInput' ? 'video' : 'file')} type="button">Choose file</button>
-                      <button className="ghost-button" onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, filePath: '' } }))} type="button">Clear</button>
-                    </div>
-                  </div>
-                ) : null}
-
-                {selectedNode.type === 'llmPrompt' ? (
-                  <div className="space-y-4">
-                    <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-operation">
-                        Operation
-                      </label>
-                      <select
-                        className="store-input mt-3"
-                        disabled={selectedNode.config?.executionMode === 'ollama' || selectedNode.config?.executionMode === 'localTool'}
-                        id="llm-operation"
-                        onChange={(event) =>
-                          updateNode(selectedNode.id, (currentNode) => ({
-                            ...currentNode,
-                            config: {
-                              ...currentNode.config,
-                              model: '',
-                              operationId: event.target.value,
-                            },
-                          }))
-                        }
-                        value={getSelectedModelStepOperationId(selectedNode)}
-                      >
-                        <option value={PIPELINE_OPERATION_IDS.LLM_PROMPT}>Text response</option>
-                        <option value={PIPELINE_OPERATION_IDS.IMAGE_GENERATE}>Image generation</option>
-                        <option value={PIPELINE_OPERATION_IDS.VIDEO_GENERATE}>Video generation</option>
-                      </select>
-                      <p className="mt-2 text-xs leading-5 text-slate-400">
-                        {selectedNode.config?.executionMode === 'ollama'
-                          ? 'Local Ollama mode currently returns text only.'
-                          : selectedNode.config?.executionMode === 'localTool'
-                            ? 'Local image tool mode is fixed to text-to-image and returns an image artifact from the Image output port.'
-                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
-                              ? 'This step returns an image artifact from the Image output port.'
-                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                                ? 'This step returns a video artifact from the Video output port.'
-                                : 'This step returns a text artifact from the Text output port.'}
-                      </p>
-                    </div>
-                    <ModelTargetFields allowLocalTool connectedProviders={connectedProviders} executionModeKey="executionMode" localImageTools={imageTools} modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
-                    <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-instruction">
-                        {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
-                          ? 'Prompt prefix / style guidance'
-                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                            ? 'Motion guidance / prompt shaping'
-                            : 'Task / instruction'}
-                      </label>
-                      <textarea
-                        className="store-input mt-3 min-h-[120px] resize-none"
-                        id="llm-instruction"
-                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))}
-                        placeholder={getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
-                          ? 'Optional style or scene guidance to prepend to the incoming prompt.'
-                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                            ? 'For text-to-video, this is optional extra guidance. For image-to-video, use this box for the motion prompt.'
-                            : 'Optional guidance to apply to the incoming text.'}
-                        value={selectedNode.config?.instruction || ''}
-                      />
-                      {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
-                        <p className="mt-2 text-xs leading-5 text-slate-400">
-                          Text input becomes the base video prompt. If this step is connected to an image, use this box for the motion prompt that should animate that image.
-                        </p>
-                      ) : null}
-                    </div>
-                    {selectedNode.config?.executionMode === 'localTool' ? (
-                      <div className="space-y-4">
-                        <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-width">Width</label><input className="store-input mt-3" id="llm-local-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-height">Height</label><input className="store-input mt-3" id="llm-local-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
-                        <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-steps">Steps</label><input className="store-input mt-3" id="llm-local-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-cfg">CFG scale</label><input className="store-input mt-3" id="llm-local-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-seed">Seed</label><input className="store-input mt-3" id="llm-local-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-local-negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for this local image step." value={selectedNode.config?.negativePrompt || ''} /></div>
-                      </div>
-                    ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? (
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-size">Image size</label><select className="store-input mt-3" id="llm-image-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div>
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-quality">Quality</label><select className="store-input mt-3" id="llm-image-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div>
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-background">Background</label><select className="store-input mt-3" id="llm-image-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div>
-                      </div>
-                    ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
-                      <div className="space-y-3">
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-video-size">Video size</label><select className="store-input mt-3" id="llm-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="1280x720">1280 x 720 (landscape)</option><option value="720x1280">720 x 1280 (portrait)</option></select></div>
-                        <p className="text-xs leading-5 text-slate-400">Local AI Hub currently requests an 8 second Sora clip and saves the finished video locally. If you connect an image here, make sure it matches the selected video size.</p>
-                      </div>
-                    ) : null}
-                    {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.LLM_PROMPT ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional persistent instruction for this step." value={selectedNode.config?.systemPrompt || ''} /></div> : null}
-                  </div>
-                ) : null}
-
-                {selectedNode.type === 'whisperTranscribe' ? (
-                  <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="whisper-model">Transcription model</label><select className="store-input mt-3" id="whisper-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} value={selectedNode.config?.model || 'base'}>{WHISPER_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></div>
-                ) : null}
-
-                {selectedNode.type === 'imageAnalyze' ? (
-                  <div className="space-y-4">
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-tool">Execution tool</label><select className="store-input mt-3" id="image-analyze-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-mode">Analysis mode</label><select className="store-input mt-3" id="image-analyze-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: event.target.value } }))} value={selectedNode.config?.analysisMode || 'clip'}><option value="clip">CLIP caption</option><option value="deepdanbooru">DeepDanbooru tags</option></select></div>
-                  </div>
-                ) : null}
-
-                {selectedNode.type === 'imageGenerate' ? (
-                  <div className="space-y-4">
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-generate-tool">Execution tool</label><select className="store-input mt-3" id="image-generate-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
-                    <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-width">Width</label><input className="store-input mt-3" id="image-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-height">Height</label><input className="store-input mt-3" id="image-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
-                    <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-steps">Steps</label><input className="store-input mt-3" id="image-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-cfg">CFG scale</label><input className="store-input mt-3" id="image-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-seed">Seed</label><input className="store-input mt-3" id="image-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for the image step." value={selectedNode.config?.negativePrompt || ''} /></div>
-                  </div>
-                ) : null}
-
-                {selectedNode.type === 'graphWorkflow' ? (
-                  <div className="space-y-4">
-                    <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-workflow-tool">Execution tool</label>
-                      <select
-                        className="store-input mt-3"
-                        id="graph-workflow-tool"
-                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
-                          ...currentNode,
-                          config: {
-                            ...currentNode.config,
-                            toolId: event.target.value,
-                          },
-                        }))}
-                        value={selectedNode.config?.toolId || graphWorkflowTools[0]?.id || ''}
-                      >
-                        <option value="">Choose a graph workflow tool</option>
-                        {graphWorkflowTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}
-                      </select>
-                      <p className="mt-2 text-xs leading-5 text-slate-400">Use this step for graph-native local tools instead of flattening them into the model-step abstraction. The first slice supports exported ComfyUI API workflow JSON with explicit typed boundary mappings.</p>
-                    </div>
-                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      The main pipeline stays on this canvas. The workflow JSON below defines the graph-native sub-workflow that runs inside {selectedGraphWorkflowTool?.name || 'the selected tool'}. Local AI Hub still runs the overall pipeline sequentially and saves explicit typed outputs back into the run folder.
-                    </div>
-                    <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-workflow-json">Workflow JSON</label>
-                      <textarea
-                        className="store-input mt-3 min-h-[220px] resize-none font-mono text-xs leading-6"
-                        id="graph-workflow-json"
-                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
-                          ...currentNode,
-                          config: {
-                            ...currentNode.config,
-                            workflowText: event.target.value,
-                          },
-                        }))}
-                        placeholder="Paste the exported ComfyUI API workflow JSON here."
-                        value={selectedNode.config?.workflowText || ''}
-                      />
-                      {selectedGraphWorkflowDefinition ? (
-                        <p className={'mt-2 text-xs leading-5 ' + (selectedGraphWorkflowDefinition.ok ? 'text-emerald-200' : 'text-amber-200')}>
-                          {selectedGraphWorkflowDefinition.message}
-                        </p>
-                      ) : null}
-                      <p className="mt-2 text-xs leading-5 text-slate-400">In this first graph-native pass, Local AI Hub supports explicit text input, image input, and image output boundaries for ComfyUI workflows.</p>
-                    </div>
-                    <div className="grid gap-4 xl:grid-cols-2">
-                      <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
-                        <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Pipeline Text to Workflow</p>
-                        <div className="mt-3 space-y-3">
-                          <div>
-                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-text-node">Workflow node</label>
-                            {selectedGraphWorkflowDefinition?.ok ? (
-                              <select
-                                className="store-input mt-3"
-                                id="graph-text-node"
-                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: '', nodeId: event.target.value })}
-                                value={selectedNode.config?.inputBindings?.text?.nodeId || ''}
-                              >
-                                <option value="">Leave text input unused</option>
-                                {graphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}
-                              </select>
-                            ) : (
-                              <input
-                                className="store-input mt-3"
-                                id="graph-text-node"
-                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { nodeId: event.target.value })}
-                                placeholder="For example: 6"
-                                value={selectedNode.config?.inputBindings?.text?.nodeId || ''}
-                              />
-                            )}
-                          </div>
-                          <div>
-                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-text-field">Workflow field</label>
-                            {graphWorkflowTextFieldOptions.length ? (
-                              <select
-                                className="store-input mt-3"
-                                id="graph-text-field"
-                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })}
-                                value={selectedNode.config?.inputBindings?.text?.field || ''}
-                              >
-                                <option value="">Choose a workflow field</option>
-                                {graphWorkflowTextFieldOptions.map((field) => <option key={field} value={field}>{field}</option>)}
-                              </select>
-                            ) : (
-                              <input
-                                className="store-input mt-3"
-                                id="graph-text-field"
-                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })}
-                                placeholder="For example: text"
-                                value={selectedNode.config?.inputBindings?.text?.field || ''}
-                              />
-                            )}
-                          </div>
-                        </div>
-                        <p className="mt-3 text-xs leading-5 text-slate-400">Leave this mapping blank when the graph workflow does not use the main pipeline Text input port.</p>
-                      </div>
-                      <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
-                        <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Pipeline Image to Workflow</p>
-                        <div className="mt-3 space-y-3">
-                          <div>
-                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-image-node">Workflow node</label>
-                            {selectedGraphWorkflowDefinition?.ok ? (
-                              <select
-                                className="store-input mt-3"
-                                id="graph-image-node"
-                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: '', nodeId: event.target.value })}
-                                value={selectedNode.config?.inputBindings?.image?.nodeId || ''}
-                              >
-                                <option value="">Leave image input unused</option>
-                                {graphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}
-                              </select>
-                            ) : (
-                              <input
-                                className="store-input mt-3"
-                                id="graph-image-node"
-                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
-                                placeholder="For example: 12"
-                                value={selectedNode.config?.inputBindings?.image?.nodeId || ''}
-                              />
-                            )}
-                          </div>
-                          <div>
-                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-image-field">Workflow field</label>
-                            {graphWorkflowImageFieldOptions.length ? (
-                              <select
-                                className="store-input mt-3"
-                                id="graph-image-field"
-                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: event.target.value })}
-                                value={selectedNode.config?.inputBindings?.image?.field || ''}
-                              >
-                                <option value="">Choose a workflow field</option>
-                                {graphWorkflowImageFieldOptions.map((field) => <option key={field} value={field}>{field}</option>)}
-                              </select>
-                            ) : (
-                              <input
-                                className="store-input mt-3"
-                                id="graph-image-field"
-                                onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'image', { field: event.target.value })}
-                                placeholder="For example: image"
-                                value={selectedNode.config?.inputBindings?.image?.field || ''}
-                              />
-                            )}
-                          </div>
-                        </div>
-                        <p className="mt-3 text-xs leading-5 text-slate-400">When this port is connected, Local AI Hub uploads the incoming image to the selected graph tool before the workflow runs.</p>
-                      </div>
-                    </div>
-                    <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
-                      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Workflow Image to Pipeline</p>
-                      <div className="mt-3">
-                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-output-node">Output node</label>
-                        {selectedGraphWorkflowDefinition?.ok ? (
-                          <select
-                            className="store-input mt-3"
-                            id="graph-output-node"
-                            onChange={(event) => updateGraphWorkflowOutputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
-                            value={selectedNode.config?.outputBindings?.image?.nodeId || ''}
-                          >
-                            <option value="">Choose the image output node</option>
-                            {graphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}
-                          </select>
-                        ) : (
-                          <input
-                            className="store-input mt-3"
-                            id="graph-output-node"
-                            onChange={(event) => updateGraphWorkflowOutputBinding(selectedNode.id, 'image', { nodeId: event.target.value })}
-                            placeholder="For example: 19"
-                            value={selectedNode.config?.outputBindings?.image?.nodeId || ''}
-                          />
-                        )}
-                      </div>
-                      <p className="mt-3 text-xs leading-5 text-slate-400">Choose the node that emits images in ComfyUI history, usually PreviewImage or SaveImage. The resulting image stays explicit and previewable in the main pipeline.</p>
-                    </div>
-                    {selectedGraphWorkflowDefinition?.ok ? (
-                      <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
-                        <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Parsed Workflow Nodes</p>
-                        <div className="mt-3 space-y-2 max-h-[240px] overflow-auto pr-1">
-                          {graphWorkflowNodeOptions.slice(0, 18).map((entry) => (
-                            <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3" key={entry.id}>
-                              <p className="text-sm font-medium text-white">{formatGraphWorkflowNodeLabel(entry)}</p>
-                              <p className="mt-1 text-xs leading-5 text-slate-400">
-                                {entry.inputFields.length ? 'Inputs: ' + entry.inputFields.join(', ') : 'No editable inputs detected.'}
-                              </p>
-                            </div>
-                          ))}
-                        </div>
-                        {graphWorkflowNodeOptions.length > 18 ? <p className="mt-3 text-xs leading-5 text-slate-500">Showing the first 18 nodes from the pasted workflow.</p> : null}
-                      </div>
-                    ) : null}
-                  </div>
-                ) : null}
-
-                {selectedNode.type === 'validation' ? (
-                  <div className="space-y-4">
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-mode">Validation mode</label><select className="store-input mt-3" id="validation-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, mode: event.target.value } }))} value={selectedNode.config?.mode || 'user'}><option value="user">User approval</option><option value="llm">LLM validator</option></select></div>
-                    {selectedNode.config?.mode === 'llm' ? (
-                      <>
-                        <ModelTargetFields connectedProviders={connectedProviders} executionModeKey="llmExecutionMode" modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-ruleset">Ruleset / rubric</label><textarea className="store-input mt-3 min-h-[140px] resize-none" id="validation-ruleset" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, ruleset: event.target.value } }))} placeholder="Describe what should count as pass versus fail." value={selectedNode.config?.ruleset || ''} /></div>
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="validation-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional validator instruction." value={selectedNode.config?.systemPrompt || ''} /></div>
-                      </>
-                    ) : (
-                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This run will pause at the validation node, show the connected artifact preview when possible, and wait for your pass or fail decision.</div>
-                    )}
-                  </div>
-                ) : null}
-
-                {selectedNode.type === 'retryLoop' ? (
-                  <div className="space-y-4">
-                    <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="retry-loop-target">Retry from</label>
-                      <select
-                        className="store-input mt-3"
-                        id="retry-loop-target"
-                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
-                          ...currentNode,
-                          config: {
-                            ...currentNode.config,
-                            retryTargetNodeId: event.target.value,
-                          },
-                        }))}
-                        value={selectedNode.config?.retryTargetNodeId || ''}
-                      >
-                        <option value="">Choose an earlier step</option>
-                        {retryLoopTargetOptions.map((node) => (
-                          <option key={node.id} value={node.id}>{node.label}</option>
-                        ))}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="retry-loop-max">Max attempts</label>
-                      <input
-                        className="store-input mt-3"
-                        id="retry-loop-max"
-                        max={PIPELINE_RETRY_LOOP_MAX_ATTEMPTS}
-                        min="2"
-                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
-                          ...currentNode,
-                          config: {
-                            ...currentNode.config,
-                            maxAttempts: Number(event.target.value || 0) || 0,
-                          },
-                        }))}
-                        type="number"
-                        value={selectedNode.config?.maxAttempts || 3}
-                      />
-                    </div>
-                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Connect the Complete input to the branch that should exit the loop and the Retry input to the branch that should trigger another attempt. Local AI Hub reruns the selected earlier step and the closed steps between it and this node, one attempt at a time, until the limit is reached.
-                    </div>
-                  </div>
-                ) : null}
-
-                {selectedNode.type === 'branchMerge' ? (
-                  <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                    Connect two or more compatible branches here. Local AI Hub waits for earlier branches to finish or skip, then forwards the single branch that still has an artifact. If two live results arrive together, the run stops with a plain-English error so the merge stays explicit.
-                  </div>
-                ) : null}
-
-                {selectedNode.type.endsWith('Output') ? (
-                  <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="output-title">Output title</label><input className="store-input mt-3" id="output-title" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, title: event.target.value } }))} value={selectedNode.config?.title || ''} /></div>
-                ) : null}
-
-                <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Connections</p>
-                  <div className="mt-3 space-y-3">
-                    {draft.edges.filter((edge) => edge.source.nodeId === selectedNode.id || edge.target.nodeId === selectedNode.id).length ? draft.edges.filter((edge) => edge.source.nodeId === selectedNode.id || edge.target.nodeId === selectedNode.id).map((edge) => {
-                      const sourceNode = draft.nodes.find((node) => node.id === edge.source.nodeId);
-                      const targetNode = draft.nodes.find((node) => node.id === edge.target.nodeId);
-                      const sourcePort = getPortDefinition(sourceNode?.type, 'output', edge.source.portId);
-                      const targetPort = getPortDefinition(targetNode?.type, 'input', edge.target.portId);
-                      return (
-                        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3" key={edge.id}>
-                          <p className="text-sm font-medium text-white">{sourceNode?.label || 'Unknown'}: <span className="text-slate-400">{sourcePort?.label || edge.source.portId}</span></p>
-                          <p className="mt-1 text-sm text-slate-300">to {targetNode?.label || 'Unknown'}: <span className="text-slate-400">{targetPort?.label || edge.target.portId}</span></p>
-                          <button className="ghost-button mt-3 px-3 py-1.5 text-xs" onClick={() => removeEdge(edge.id)} type="button">Remove connection</button>
-                        </div>
-                      );
-                    }) : <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-3 py-4 text-sm leading-6 text-slate-400">This node has no connections yet.</div>}
-                  </div>
-                </div>
-
-                <button className="ghost-button w-full justify-center" onClick={() => removeNode(selectedNode.id)} type="button">Delete node</button>
-              </div>
-            ) : <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">Select a node on the canvas to edit its settings and inspect its connections.</div>}
-          </div>
-        </aside>
       </div>
     </section>
   );
 }
+
+
 
 
 

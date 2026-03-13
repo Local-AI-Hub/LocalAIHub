@@ -24,14 +24,9 @@ function Sidebar({
     <aside className="sidebar-shell">
       <div>
         <div className="rounded-[28px] border border-white/10 bg-white/5 p-5">
-          <div className="flex items-center gap-4">
-            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-cyan-400/15 text-lg font-semibold tracking-[0.22em] text-cyan-200">
-              NA
-            </div>
-            <div>
-              <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Local AI Hub</p>
-              <h1 className="mt-1 text-2xl font-semibold text-white">Steam for local AI</h1>
-            </div>
+          <div>
+            <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Local AI Hub</p>
+            <h1 className="mt-1 text-2xl font-semibold text-white">Steam for local AI</h1>
           </div>
           <p className="mt-4 text-sm leading-6 text-slate-300">
             Keep installs, launches, repair, snapshots, pipelines, models, and cloud connections in one Windows-native control center.

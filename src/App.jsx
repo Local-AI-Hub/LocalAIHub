@@ -1483,9 +1483,13 @@ export default function App() {
     );
   }
 
+  const shellGridClassName = activeTab === 'pipelines'
+    ? 'mx-auto grid max-w-[1760px] gap-5 xl:grid-cols-[280px,minmax(0,1fr)]'
+    : 'mx-auto grid max-w-[1600px] gap-5 xl:grid-cols-[280px,1fr]';
+
   return (
     <div className="min-h-screen bg-shell px-5 py-5 text-white lg:px-6">
-      <div className="mx-auto grid max-w-[1600px] gap-5 xl:grid-cols-[280px,1fr]">
+      <div className={shellGridClassName}>
         <Sidebar
           activeTab={activeTab}
           hardware={appState.hardware}
@@ -1497,7 +1501,7 @@ export default function App() {
           storeCount={availableStoreTools.length}
         />
 
-        <main className="space-y-5">
+        <main className="min-w-0 space-y-5">
           <ResourceStrip
             activeTab={activeTab}
             installedCount={libraryCount}

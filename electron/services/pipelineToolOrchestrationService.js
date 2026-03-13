@@ -2,6 +2,10 @@ const { getLocalToolRequirement } = require('../shared/pipelineSchema.cjs');
 const { isToolActive, isToolReady, launchToolFromUserAction, stopTool } = require('./processService');
 const { getResolvedToolState } = require('./toolStateService');
 
+const TOOL_READY_POLL_INTERVAL_MS = 1500;
+const TOOL_READY_TIMEOUT_PADDING_MS = 15000;
+const TOOL_READY_FALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
+
 function updateContextTool(contextMaps, tool) {
   if (!contextMaps?.toolsById || !tool?.id) {
     return;
@@ -14,6 +18,20 @@ function buildRunLabel(nodeLabel, toolName, template) {
   return template
     .replace('{nodeLabel}', nodeLabel || 'this step')
     .replace('{toolName}', toolName || 'this tool');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getToolReadyTimeoutMs(tool) {
+  const timeoutMs = Number(tool?.startupTimeoutMs);
+  return Math.max(Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0, TOOL_READY_FALLBACK_TIMEOUT_MS) + TOOL_READY_TIMEOUT_PADDING_MS;
+}
+
+function buildToolNotReadyMessage(tool) {
+  const target = tool?.healthUrl || tool?.launchUrl || `http://127.0.0.1:${tool?.defaultPort || 0}`;
+  return `${tool?.name || 'This tool'} did not become ready on ${target} before Local AI Hub stopped waiting for this pipeline step. Open the logs folder for the full launch details.`;
 }
 
 async function resolveManagedTool(toolId, contextMaps) {
@@ -58,6 +76,61 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
     session.active = false;
     session.tool = nextTool;
     updateContextTool(contextMaps, nextTool);
+  }
+
+  async function waitForToolSessionReady(node, session, reportProgress) {
+    const deadline = Date.now() + getToolReadyTimeoutMs(session?.tool);
+    let lastProgressAt = 0;
+
+    while (Date.now() < deadline) {
+      const latestTool = (await resolveManagedTool(session.toolId, contextMaps)) || session.tool;
+      session.tool = latestTool;
+      updateContextTool(contextMaps, latestTool);
+
+      const ready = await isToolReady(latestTool).catch(() => false);
+      if (ready) {
+        const nextTool = {
+          ...latestTool,
+          lastError: null,
+          status: 'running',
+        };
+        session.active = true;
+        session.tool = nextTool;
+        updateContextTool(contextMaps, nextTool);
+        return nextTool;
+      }
+
+      const active = await isToolActive(latestTool).catch(() => Boolean(session.active));
+      const status = String(latestTool?.status || '').trim().toLowerCase();
+      session.active = active || status === 'starting';
+
+      if (status === 'error') {
+        throw new Error(latestTool?.lastError || `${latestTool?.name || 'This tool'} could not finish starting for this pipeline step.`);
+      }
+
+      if (!active && status !== 'starting') {
+        throw new Error(latestTool?.lastError || `${latestTool?.name || 'This tool'} stopped before it became ready for this pipeline step.`);
+      }
+
+      if (Date.now() - lastProgressAt >= 6000) {
+        reportProgress?.(
+          `${latestTool?.name || 'This tool'} is still starting. Local AI Hub is keeping the pipeline paused so it can keep control of the tool if it becomes ready late.`,
+          buildRunLabel(node?.label, latestTool?.name, 'Waiting for {toolName} to be ready for {nodeLabel}...'),
+        );
+        lastProgressAt = Date.now();
+      }
+
+      await sleep(TOOL_READY_POLL_INTERVAL_MS);
+    }
+
+    const latestTool = (await resolveManagedTool(session.toolId, contextMaps)) || session.tool;
+    session.tool = latestTool;
+    if (session.startedByPipeline) {
+      await stopTool(latestTool).catch(() => null);
+      session.active = false;
+    }
+
+    throw new Error(latestTool?.lastError || buildToolNotReadyMessage(latestTool));
   }
 
   async function ensureToolForNode(node, reportProgress) {
@@ -109,7 +182,7 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
     }
 
     const startedTool = await launchToolFromUserAction(tool, {
-      allowPendingStartup: false,
+      allowPendingStartup: true,
       launchContext: 'pipeline-run',
       skipOpenInterface: true,
     });
@@ -123,6 +196,14 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
     };
     sessionsByToolId.set(session.toolId, session);
     updateContextTool(contextMaps, startedTool);
+
+    const readyTool = wasReady || (String(startedTool?.status || '').trim().toLowerCase() === 'running' && await isToolReady(startedTool).catch(() => false))
+      ? startedTool
+      : await waitForToolSessionReady(node, session, reportProgress);
+
+    session.active = true;
+    session.tool = readyTool;
+    updateContextTool(contextMaps, readyTool);
 
     if (!wasReady) {
       reportProgress?.(
@@ -185,4 +266,3 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
 module.exports = {
   createPipelineToolOrchestrator,
 };
-

@@ -4,10 +4,20 @@ const { randomUUID } = require('crypto');
 
 const { createLogger } = require('./logService');
 const { saveBufferArtifact, summarizeArtifact } = require('./pipelineArtifactService');
+const {
+  getGraphWorkflowContract,
+  getGraphWorkflowInputBinding,
+  getGraphWorkflowNodeEntry,
+  getGraphWorkflowOutputBinding,
+  parseGraphWorkflowDefinitionText,
+} = require('../shared/graphWorkflowContracts.cjs');
 const { PORT_KIND_IMAGE, PORT_KIND_TEXT } = require('../shared/pipelineSchema.cjs');
 
 const COMFYUI_POLL_INTERVAL_MS = 1500;
 const COMFYUI_TIMEOUT_MS = 5 * 60 * 1000;
+const INVOKEAI_POLL_INTERVAL_MS = 1500;
+const INVOKEAI_TIMEOUT_MS = 10 * 60 * 1000;
+const INVOKEAI_DEFAULT_QUEUE_ID = 'default';
 
 function getToolBaseUrl(tool) {
   const launchUrl = tool?.launchUrl || `http://127.0.0.1:${tool?.defaultPort || 8188}`;
@@ -153,29 +163,13 @@ async function requestGraphWorkflowBuffer(tool, endpoint, options = {}, actionLa
   }
 }
 
-function parseGraphWorkflowText(workflowText) {
-  const raw = String(workflowText || '').trim();
-  if (!raw) {
-    throw new Error('Paste the exported ComfyUI API workflow JSON before running this graph workflow step.');
+function parseGraphWorkflowText(toolId, workflowText) {
+  const parsedWorkflow = parseGraphWorkflowDefinitionText(toolId, workflowText);
+  if (!parsedWorkflow.ok) {
+    throw new Error(parsedWorkflow.message);
   }
 
-  let workflow = null;
-  try {
-    workflow = JSON.parse(raw);
-  } catch {
-    throw new Error('Local AI Hub could not read that graph workflow JSON. Paste the exported ComfyUI API workflow JSON for this step.');
-  }
-
-  if (!workflow || Array.isArray(workflow) || typeof workflow !== 'object') {
-    throw new Error('This graph workflow step needs a ComfyUI API workflow JSON object keyed by node ID.');
-  }
-
-  const nodeIds = Object.keys(workflow);
-  if (!nodeIds.length) {
-    throw new Error('This graph workflow JSON does not contain any workflow nodes yet.');
-  }
-
-  return workflow;
+  return parsedWorkflow.executionGraph || parsedWorkflow.workflow;
 }
 
 function getWorkflowNodeEntry(workflow, nodeId, label) {
@@ -184,7 +178,7 @@ function getWorkflowNodeEntry(workflow, nodeId, label) {
     throw new Error(`Choose a workflow node for the ${label} mapping.`);
   }
 
-  const entry = workflow[normalizedNodeId];
+  const entry = getGraphWorkflowNodeEntry(workflow, normalizedNodeId);
   if (!entry || typeof entry !== 'object') {
     throw new Error(`The selected workflow node ${normalizedNodeId} for the ${label} mapping is missing from the pasted graph JSON.`);
   }
@@ -398,9 +392,268 @@ function buildOutputFileExtension(fileName) {
   return extension || '.png';
 }
 
+function buildInvokeAiBatchField(nodeId, field, value, label) {
+  const normalizedNodeId = String(nodeId || '').trim();
+  if (!normalizedNodeId) {
+    throw new Error(`Choose a workflow node for the ${label} mapping.`);
+  }
+
+  const normalizedField = String(field || '').trim();
+  if (!normalizedField) {
+    throw new Error(`Choose a workflow field for the ${label} mapping.`);
+  }
+
+  return {
+    field_name: normalizedField,
+    items: [value],
+    node_path: normalizedNodeId,
+  };
+}
+
+async function uploadInvokeAiImage(tool, artifact) {
+  const filePath = path.resolve(String(artifact?.filePath || '').trim());
+  if (!filePath || !(await fs.pathExists(filePath))) {
+    throw new Error('The image input for this graph workflow step could not be found anymore. Choose it again and rerun the pipeline.');
+  }
+
+  const mimeType = String(artifact?.mimeType || 'image/png').trim() || 'image/png';
+  const fileName = String(artifact?.fileName || path.basename(filePath)).trim() || path.basename(filePath);
+  const formData = new FormData();
+  formData.append('file', new Blob([await fs.readFile(filePath)], { type: mimeType }), fileName);
+
+  const uploaded = await requestGraphWorkflowJson(tool, '/v1/images/upload?image_category=user&is_intermediate=false', {
+    body: formData,
+    contentType: null,
+    method: 'POST',
+  }, 'upload the graph workflow image input');
+
+  const imageName = String(uploaded?.image_name || uploaded?.imageName || '').trim();
+  if (!imageName) {
+    throw new Error('InvokeAI accepted the uploaded image, but it did not return a usable image name for the graph input.');
+  }
+
+  return {
+    fileName,
+    imageName,
+    response: uploaded,
+  };
+}
+
+async function enqueueInvokeAiBatch(tool, batch) {
+  const payload = await requestGraphWorkflowJson(tool, `/v1/queue/${encodeURIComponent(INVOKEAI_DEFAULT_QUEUE_ID)}/enqueue_batch`, {
+    body: {
+      batch,
+      prepend: false,
+    },
+    method: 'POST',
+  }, 'submit the InvokeAI graph workflow');
+
+  const itemIds = Array.isArray(payload?.item_ids)
+    ? payload.item_ids.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+    : [];
+  if (!itemIds.length) {
+    throw new Error('InvokeAI accepted the graph workflow, but it did not return any queue item IDs to track.');
+  }
+
+  const batchId = String(payload?.batch?.batch_id || batch?.batch_id || '').trim();
+  if (!batchId) {
+    throw new Error('InvokeAI accepted the graph workflow, but it did not return a batch ID to track.');
+  }
+
+  return {
+    batchId,
+    itemId: itemIds[0],
+    itemIds,
+    queueId: INVOKEAI_DEFAULT_QUEUE_ID,
+    response: payload,
+  };
+}
+
+function normalizeInvokeAiQueueItem(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  if (payload.session && typeof payload.session === 'string') {
+    try {
+      return {
+        ...payload,
+        session: JSON.parse(payload.session),
+      };
+    } catch {
+      return payload;
+    }
+  }
+
+  return payload;
+}
+
+function buildInvokeAiQueueFailureMessage(queueItem) {
+  const directMessage = String(queueItem?.error_message || queueItem?.error || '').trim();
+  if (directMessage) {
+    return directMessage;
+  }
+
+  return 'InvokeAI stopped before it finished the graph workflow.';
+}
+
+function buildInvokeAiProgressMessage(queueItem, batchStatus) {
+  const executedCount = Array.isArray(queueItem?.session?.executed_history) ? queueItem.session.executed_history.length : 0;
+  const totalNodeCount = queueItem?.session?.graph?.nodes && typeof queueItem.session.graph.nodes === 'object'
+    ? Object.keys(queueItem.session.graph.nodes).length
+    : 0;
+  if (executedCount > 0 && totalNodeCount > 0) {
+    return `InvokeAI is still processing the graph workflow (${executedCount} of ${totalNodeCount} graph nodes completed).`;
+  }
+
+  if (Number(batchStatus?.in_progress || 0) > 0 || String(queueItem?.status || '').trim().toLowerCase() === 'in_progress') {
+    return 'InvokeAI is still processing the queued graph workflow.';
+  }
+
+  return 'InvokeAI has the graph workflow queued and Local AI Hub is still waiting for the final image output.';
+}
+
+async function getInvokeAiQueueItem(tool, queueId, itemId) {
+  const payload = await requestGraphWorkflowJson(tool, `/v1/queue/${encodeURIComponent(queueId)}/i/${encodeURIComponent(String(itemId))}`, {
+    method: 'GET',
+  }, 'check the InvokeAI queue item');
+  return normalizeInvokeAiQueueItem(payload);
+}
+
+async function getInvokeAiBatchStatus(tool, queueId, batchId) {
+  return requestGraphWorkflowJson(tool, `/v1/queue/${encodeURIComponent(queueId)}/b/${encodeURIComponent(batchId)}/status`, {
+    method: 'GET',
+  }, 'check the InvokeAI batch status');
+}
+
+async function waitForInvokeAiWorkflow(tool, queueId, batchId, itemId, reportProgress, nodeLabel) {
+  const startedAt = Date.now();
+  let pollCount = 0;
+
+  while (Date.now() - startedAt < INVOKEAI_TIMEOUT_MS) {
+    const [queueItem, batchStatus] = await Promise.all([
+      getInvokeAiQueueItem(tool, queueId, itemId),
+      getInvokeAiBatchStatus(tool, queueId, batchId).catch(() => null),
+    ]);
+
+    const status = String(queueItem?.status || '').trim().toLowerCase();
+    if (status === 'failed') {
+      throw new Error(buildInvokeAiQueueFailureMessage(queueItem));
+    }
+
+    if (status === 'canceled') {
+      throw new Error('InvokeAI canceled the graph workflow before it finished.');
+    }
+
+    if (status === 'completed') {
+      return {
+        batchStatus,
+        queueItem,
+      };
+    }
+
+    pollCount += 1;
+    if (pollCount % 4 === 0) {
+      reportProgress?.(
+        buildInvokeAiProgressMessage(queueItem, batchStatus),
+        `Running ${nodeLabel} with ${getToolLabel(tool)}...`,
+      );
+    }
+
+    await sleep(INVOKEAI_POLL_INTERVAL_MS);
+  }
+
+  throw new Error(`${getToolLabel(tool)} is taking longer than expected to finish this graph workflow step. Open InvokeAI to inspect its queue, then try again.`);
+}
+
+function collectInvokeAiPreparedNodeIds(session, outputNodeId) {
+  const directPrepared = session?.source_prepared_mapping?.[outputNodeId];
+  if (Array.isArray(directPrepared)) {
+    return directPrepared.map((value) => String(value || '').trim()).filter(Boolean);
+  }
+
+  if (directPrepared && typeof directPrepared === 'object') {
+    return Object.values(directPrepared).map((value) => String(value || '').trim()).filter(Boolean);
+  }
+
+  return [];
+}
+
+function collectInvokeAiImageNames(value, results = [], seen = new Set()) {
+  if (value === null || value === undefined) {
+    return results;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectInvokeAiImageNames(entry, results, seen);
+    }
+    return results;
+  }
+
+  if (typeof value !== 'object') {
+    return results;
+  }
+
+  if (seen.has(value)) {
+    return results;
+  }
+  seen.add(value);
+
+  const directImageName = String(value.image_name || '').trim();
+  if (directImageName) {
+    results.push(directImageName);
+  }
+
+  if (value.image && typeof value.image === 'object') {
+    collectInvokeAiImageNames(value.image, results, seen);
+  }
+
+  for (const entry of Object.values(value)) {
+    if (entry && typeof entry === 'object') {
+      collectInvokeAiImageNames(entry, results, seen);
+    }
+  }
+
+  return results;
+}
+
+function getInvokeAiOutputImageName(queueItem, outputNodeId) {
+  const session = queueItem?.session || null;
+  const preparedNodeIds = collectInvokeAiPreparedNodeIds(session, outputNodeId);
+  const candidateNodeIds = [...new Set([String(outputNodeId || '').trim(), ...preparedNodeIds].filter(Boolean))];
+  const imageNames = [];
+
+  for (const nodeId of candidateNodeIds) {
+    const result = session?.results?.[nodeId];
+    if (!result || typeof result !== 'object') {
+      continue;
+    }
+
+    collectInvokeAiImageNames(result, imageNames);
+  }
+
+  const uniqueImageNames = [...new Set(imageNames.map((value) => String(value || '').trim()).filter(Boolean))];
+  if (uniqueImageNames.length > 1) {
+    throw new Error(`The selected output node ${outputNodeId} produced multiple images. Choose a single final image node for this pipeline step.`);
+  }
+
+  if (!uniqueImageNames.length) {
+    throw new Error(`The selected output node ${outputNodeId} finished in InvokeAI, but Local AI Hub could not find an image result for it. Choose a final image node such as a decode or image-output node.`);
+  }
+
+  return uniqueImageNames[0];
+}
+
+async function downloadInvokeAiImage(tool, imageName) {
+  return requestGraphWorkflowBuffer(tool, `/v1/images/i/${encodeURIComponent(imageName)}/full`, {
+    method: 'GET',
+  }, 'download the InvokeAI graph workflow image output');
+}
+
 async function executeComfyUiGraphWorkflow({ inputArtifacts = {}, node, reportProgress, runDirectories, tool }) {
   const nodeLabel = String(node?.label || 'Graph Workflow').trim() || 'Graph Workflow';
-  const workflow = parseGraphWorkflowText(node?.config?.workflowText);
+  const workflow = parseGraphWorkflowText(tool?.id || node?.config?.toolId, node?.config?.workflowText);
   const workingWorkflow = JSON.parse(JSON.stringify(workflow));
   const textArtifact = getGraphInputArtifact(inputArtifacts, 'text');
   const imageArtifact = getGraphInputArtifact(inputArtifacts, 'image');
@@ -464,18 +717,109 @@ async function executeComfyUiGraphWorkflow({ inputArtifacts = {}, node, reportPr
   };
 }
 
+async function executeInvokeAiGraphWorkflow({ inputArtifacts = {}, node, reportProgress, runDirectories, tool }) {
+  const nodeLabel = String(node?.label || 'Graph Workflow').trim() || 'Graph Workflow';
+  const parsedDefinition = parseGraphWorkflowDefinitionText(tool?.id || node?.config?.toolId, node?.config?.workflowText);
+  if (!parsedDefinition.ok || !parsedDefinition.executionGraph) {
+    throw new Error(parsedDefinition.message || 'Local AI Hub could not read an executable InvokeAI graph from this workflow definition.');
+  }
+
+  const executionGraph = JSON.parse(JSON.stringify(parsedDefinition.executionGraph));
+  const textArtifact = getGraphInputArtifact(inputArtifacts, 'text');
+  const imageArtifact = getGraphInputArtifact(inputArtifacts, 'image');
+  const textBinding = getGraphWorkflowInputBinding(node, 'text');
+  const imageBinding = getGraphWorkflowInputBinding(node, 'image');
+  const outputBinding = getGraphWorkflowOutputBinding(node, 'image');
+  const outputNodeId = String(outputBinding?.nodeId || '').trim();
+
+  getGraphWorkflowNodeEntry(parsedDefinition.workflow, outputNodeId);
+
+  const batchData = [];
+  if (textArtifact) {
+    const textValue = String(textArtifact.text || '').trim();
+    if (!textValue) {
+      throw new Error('The connected text input for this graph workflow step is empty.');
+    }
+
+    batchData.push([
+      buildInvokeAiBatchField(textBinding.nodeId, textBinding.field, textValue, 'text input'),
+    ]);
+  }
+
+  if (imageArtifact) {
+    reportProgress?.(
+      `Uploading the connected image to ${getToolLabel(tool)} for this graph workflow.`,
+      `Running ${nodeLabel} with ${getToolLabel(tool)}...`,
+    );
+    const uploadedImage = await uploadInvokeAiImage(tool, imageArtifact);
+    batchData.push([
+      buildInvokeAiBatchField(imageBinding.nodeId, imageBinding.field, { image_name: uploadedImage.imageName }, 'image input'),
+    ]);
+  }
+
+  const batch = {
+    batch_id: randomUUID(),
+    destination: 'local-ai-hub-pipeline',
+    graph: executionGraph,
+    origin: 'local-ai-hub-pipeline',
+    runs: 1,
+    ...(batchData.length ? { data: batchData } : {}),
+    ...(parsedDefinition.invokeWorkflow ? { workflow: parsedDefinition.invokeWorkflow } : {}),
+  };
+
+  reportProgress?.(
+    `Submitting the graph workflow to ${getToolLabel(tool)}.`,
+    `Running ${nodeLabel} with ${getToolLabel(tool)}...`,
+  );
+  const enqueued = await enqueueInvokeAiBatch(tool, batch);
+
+  reportProgress?.(
+    `${getToolLabel(tool)} accepted the graph workflow and added it to its queue.`,
+    `Running ${nodeLabel} with ${getToolLabel(tool)}...`,
+  );
+  const completedRun = await waitForInvokeAiWorkflow(tool, enqueued.queueId, enqueued.batchId, enqueued.itemId, reportProgress, nodeLabel);
+  const imageName = getInvokeAiOutputImageName(completedRun.queueItem, outputNodeId);
+
+  reportProgress?.(
+    `Downloading the graph workflow image output from ${getToolLabel(tool)}.`,
+    `Running ${nodeLabel} with ${getToolLabel(tool)}...`,
+  );
+  const imageBuffer = await downloadInvokeAiImage(tool, imageName);
+  const artifact = await saveBufferArtifact(runDirectories, imageBuffer, {
+    baseName: `${nodeLabel}-${Date.now()}`,
+    displayName: nodeLabel,
+    extension: buildOutputFileExtension(imageName),
+    kind: PORT_KIND_IMAGE,
+    role: 'generated',
+  });
+
+  return {
+    destinationPath: artifact.filePath,
+    message: `${getToolLabel(tool)} finished the graph workflow and saved the image output to ${artifact.filePath}.`,
+    outputs: {
+      image: artifact,
+    },
+    preview: summarizeArtifact(artifact),
+  };
+}
+
 const GRAPH_WORKFLOW_ADAPTERS = Object.freeze({
   comfyui: Object.freeze({
     execute: executeComfyUiGraphWorkflow,
     label: 'ComfyUI',
   }),
+  invokeai: Object.freeze({
+    execute: executeInvokeAiGraphWorkflow,
+    label: 'InvokeAI',
+  }),
 });
 
 async function executeGraphWorkflowNode(options = {}) {
   const tool = options.tool || null;
+  const contract = getGraphWorkflowContract(tool?.id || options?.node?.config?.toolId);
   const adapter = tool?.id ? GRAPH_WORKFLOW_ADAPTERS[String(tool.id || '').trim().toLowerCase()] || null : null;
-  if (!adapter) {
-    throw new Error(`${getToolLabel(tool)} does not have a graph workflow adapter in Local AI Hub yet. Choose ComfyUI for this first graph-native pipeline slice.`);
+  if (!contract?.supportsExecution || !adapter) {
+    throw new Error(contract?.executionBlockedMessage || `${getToolLabel(tool)} does not have a graph workflow adapter in Local AI Hub yet.`);
   }
 
   return adapter.execute(options);

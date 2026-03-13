@@ -40,12 +40,12 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
   comfyui: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW,
     label: 'Graph-native workflow tool',
-    notes: 'ComfyUI uses the dedicated graph workflow step with explicit typed boundary mappings instead of the model-step abstraction.',
+    notes: 'ComfyUI uses the dedicated graph workflow step with explicit typed boundaries and an imported workflow contract instead of the model-step abstraction.',
   }),
   invokeai: Object.freeze({
-    id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_DEFERRED,
+    id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW,
     label: 'Graph-native workflow tool',
-    notes: 'InvokeAI remains deferred until Local AI Hub adds a dedicated graph-workflow adapter for it.',
+    notes: 'InvokeAI uses the dedicated graph workflow step with an imported workflow-or-graph contract and Local AI Hub submits the executable graph through InvokeAI\'s queue API.',
   }),
 });
 
@@ -477,6 +477,7 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
+
 
 
 

@@ -158,6 +158,154 @@ function deriveGitHubRepo(downloadUrl) {
   }
 }
 
+function deriveGitHubArchiveRef(downloadUrl) {
+  try {
+    const parsed = new URL(downloadUrl);
+    if (!/github\.com$/i.test(parsed.hostname)) {
+      return null;
+    }
+
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    if (parts.length < 6 || parts[2] !== 'archive' || parts[3] !== 'refs') {
+      return null;
+    }
+
+    const refKind = parts[4];
+    if (refKind !== 'heads' && refKind !== 'tags') {
+      return null;
+    }
+
+    const refSegments = parts.slice(5);
+    if (!refSegments.length) {
+      return null;
+    }
+
+    refSegments[refSegments.length - 1] = refSegments[refSegments.length - 1].replace(/\.(zip|tar\.gz)$/i, '');
+    const ref = refSegments.filter(Boolean).join('/');
+    if (!ref) {
+      return null;
+    }
+
+    return {
+      owner: parts[0],
+      repo: parts[1],
+      ref,
+      refKind,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildGitHubRefUrlParts(ref) {
+  return String(ref || '')
+    .split('/')
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
+async function fetchText(url, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs || REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: options.method || 'GET',
+      headers: {
+        'User-Agent': `LocalAIHub/${APP_VERSION}`,
+        Accept: options.accept || 'text/plain, application/json;q=0.9, */*;q=0.8',
+        ...(options.headers || {}),
+      },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`${response.status}`);
+    }
+
+    return response.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseRemoteVersionFromText(filePath, rawText) {
+  const normalizedPath = String(filePath || '').replace(/\\/g, '/').toLowerCase();
+  if (!normalizedPath || !rawText) {
+    return '';
+  }
+
+  if (normalizedPath.endsWith('/package.json') || normalizedPath === 'package.json') {
+    try {
+      const payload = JSON.parse(rawText);
+      return normalizeVersion(payload?.version || '');
+    } catch {
+      return '';
+    }
+  }
+
+  if (normalizedPath.endsWith('/pyproject.toml') || normalizedPath === 'pyproject.toml') {
+    const match = String(rawText).match(/^version\s*=\s*["']([^"']+)["']/m);
+    return normalizeVersion(match?.[1] || '');
+  }
+
+  if (normalizedPath.endsWith('/__init__.py')) {
+    const match = String(rawText).match(/__version__\s*=\s*["']([^"']+)["']/m);
+    return normalizeVersion(match?.[1] || '');
+  }
+
+  return '';
+}
+
+function getRemoteVersionCandidateFiles(manifest) {
+  const candidates = new Set();
+  const installInstructions = manifest?.installInstructions || {};
+
+  candidates.add('package.json');
+  candidates.add('pyproject.toml');
+  candidates.add(`${String(manifest?.id || '').replace(/-/g, '_')}/__init__.py`);
+
+  for (const detection of installInstructions.pythonRequirementDetection || []) {
+    if (detection?.file) {
+      candidates.add(String(detection.file).replace(/\\/g, '/'));
+    }
+  }
+
+  return [...candidates].filter(Boolean);
+}
+
+async function detectRemoteVersionFromGitHubArchive(manifest) {
+  const archiveRef = deriveGitHubArchiveRef(manifest.downloadUrl);
+  if (!archiveRef) {
+    return null;
+  }
+
+  const refPath = buildGitHubRefUrlParts(archiveRef.ref);
+  const releaseUrl = `https://github.com/${archiveRef.owner}/${archiveRef.repo}/tree/${refPath}`;
+  const sourceLabel = archiveRef.refKind === 'heads' ? 'GitHub branch' : 'GitHub tag archive';
+
+  for (const filePath of getRemoteVersionCandidateFiles(manifest)) {
+    const normalizedFilePath = String(filePath).replace(/\\/g, '/');
+    const remoteUrl = `https://raw.githubusercontent.com/${archiveRef.owner}/${archiveRef.repo}/${refPath}/${normalizedFilePath}`;
+    const rawText = await fetchText(remoteUrl).catch(() => '');
+    const availableVersion = parseRemoteVersionFromText(normalizedFilePath, rawText);
+    if (availableVersion) {
+      return {
+        availableVersion,
+        releaseUrl,
+        sourceLabel,
+      };
+    }
+  }
+
+  return {
+    availableVersion: '',
+    releaseUrl,
+    sourceLabel,
+  };
+}
+
 function derivePipPackageName(manifest) {
   const packageInstruction = (manifest?.installInstructions?.pipInstalls || []).find((entry) => entry.kind === 'package');
   return String(packageInstruction?.value || '').trim();
@@ -259,6 +407,11 @@ async function detectRemoteVersion(manifest) {
       releaseUrl: `https://pypi.org/project/${pipPackageName}/`,
       sourceLabel: 'PyPI',
     };
+  }
+
+  const githubArchiveVersion = await detectRemoteVersionFromGitHubArchive(manifest);
+  if (githubArchiveVersion) {
+    return githubArchiveVersion;
   }
 
   const githubRepo = deriveGitHubRepo(manifest.downloadUrl);

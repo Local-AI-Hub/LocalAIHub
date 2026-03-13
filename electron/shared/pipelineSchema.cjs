@@ -10,8 +10,19 @@ const {
   getToolPipelineOperation,
   getToolPipelineStrategy,
 } = require('./pipelineCapabilities.cjs');
+const {
+  GRAPH_WORKFLOW_BINDING_MODE_IDS,
+  getDefaultGraphWorkflowBindings,
+  getGraphWorkflowContract,
+  getGraphWorkflowFieldOptions,
+  getGraphWorkflowInputBinding,
+  getGraphWorkflowNodeEntry,
+  getGraphWorkflowOutputBinding,
+  getGraphWorkflowOutputNodeOptions,
+  parseGraphWorkflowDefinitionText,
+} = require('./graphWorkflowContracts.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 4;
+const PIPELINE_SCHEMA_VERSION = 5;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
@@ -64,6 +75,7 @@ const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipeli
 const GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getGraphWorkflowToolIds());
 const RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getRunnableGraphWorkflowToolIds());
 const DEFAULT_GRAPH_WORKFLOW_TOOL_ID = RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS[0] || GRAPH_WORKFLOW_TOOL_IDS[0] || 'comfyui';
+const DEFAULT_GRAPH_WORKFLOW_BINDINGS = Object.freeze(getDefaultGraphWorkflowBindings(DEFAULT_GRAPH_WORKFLOW_TOOL_ID));
 
 const WHISPER_MODELS = [
   { id: 'tiny', label: 'Tiny' },
@@ -334,23 +346,12 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       },
     ],
     configDefaults: {
+      graphContractVersion: 1,
       toolId: DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
+      workflowFormat: DEFAULT_GRAPH_WORKFLOW_BINDINGS.workflowFormat,
       workflowText: '',
-      inputBindings: {
-        text: {
-          field: 'text',
-          nodeId: '',
-        },
-        image: {
-          field: 'image',
-          nodeId: '',
-        },
-      },
-      outputBindings: {
-        image: {
-          nodeId: '',
-        },
-      },
+      inputBindings: DEFAULT_GRAPH_WORKFLOW_BINDINGS.inputBindings,
+      outputBindings: DEFAULT_GRAPH_WORKFLOW_BINDINGS.outputBindings,
     },
     supportedToolIds: GRAPH_WORKFLOW_TOOL_IDS,
   }),
@@ -808,66 +809,6 @@ function getGraphWorkflowToolId(node) {
   return selectedToolId || DEFAULT_GRAPH_WORKFLOW_TOOL_ID;
 }
 
-function getGraphWorkflowInputBinding(node, portId) {
-  const binding = node?.config?.inputBindings?.[portId];
-  return binding && typeof binding === 'object' ? binding : {};
-}
-
-function getGraphWorkflowOutputBinding(node, portId) {
-  const binding = node?.config?.outputBindings?.[portId];
-  return binding && typeof binding === 'object' ? binding : {};
-}
-
-function parseGraphWorkflowDefinitionText(workflowText) {
-  const raw = String(workflowText || '').trim();
-  if (!raw) {
-    return {
-      ok: false,
-      message: 'Paste the exported ComfyUI API workflow JSON before running this graph workflow step.',
-      workflow: null,
-    };
-  }
-
-  let workflow = null;
-  try {
-    workflow = JSON.parse(raw);
-  } catch {
-    return {
-      ok: false,
-      message: 'Paste valid ComfyUI API workflow JSON before running this graph workflow step.',
-      workflow: null,
-    };
-  }
-
-  if (!workflow || Array.isArray(workflow) || typeof workflow !== 'object') {
-    return {
-      ok: false,
-      message: 'Paste the API-format workflow JSON exported from ComfyUI for this graph workflow step.',
-      workflow: null,
-    };
-  }
-
-  const nodeEntries = Object.entries(workflow).filter(([, entry]) => entry && typeof entry === 'object');
-  if (!nodeEntries.length || !nodeEntries.some(([, entry]) => entry.class_type && entry.inputs && typeof entry.inputs === 'object')) {
-    return {
-      ok: false,
-      message: 'Paste the API-format workflow JSON exported from ComfyUI for this graph workflow step.',
-      workflow: null,
-    };
-  }
-
-  return {
-    ok: true,
-    message: '',
-    workflow,
-  };
-}
-
-function getGraphWorkflowNodeEntry(workflow, nodeId) {
-  return workflow && typeof workflow === 'object'
-    ? workflow[String(nodeId || '').trim()] || null
-    : null;
-}
 
 function doesToolExposeDownloadedModel(tool, model) {
   const normalizedModel = String(model || '').trim().toLowerCase();
@@ -1520,14 +1461,13 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
   if (node.type === 'graphWorkflow') {
     const toolId = getGraphWorkflowToolId(node);
     const tool = getContextToolEntry(toolId, contextMaps);
-    const strategy = getToolPipelineStrategy(toolId);
-    const runnable = RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) && strategy?.id === TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW;
+    const contract = getGraphWorkflowContract(toolId);
     return {
-      capability: runnable
+      capability: contract.supportsExecution
         ? {
-            inputKinds: [PORT_KIND_TEXT, PORT_KIND_IMAGE],
-            notes: 'This step runs an exported ComfyUI API workflow inside the pipeline with explicit text and image boundary mappings.',
-            outputKinds: [PORT_KIND_IMAGE],
+            inputKinds: (contract.inputPorts || []).map((entry) => entry.kind),
+            notes: contract.notes,
+            outputKinds: (contract.outputPorts || []).map((entry) => entry.kind),
           }
         : null,
       operationId: PIPELINE_OPERATION_IDS.GRAPH_WORKFLOW,
@@ -2378,8 +2318,9 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
   const toolId = getGraphWorkflowToolId(node);
   const toolLabel = getContextToolEntry(toolId, contextMaps)?.name || 'This graph workflow tool';
   const strategy = getToolPipelineStrategy(toolId);
+  const contract = getGraphWorkflowContract(toolId);
 
-  if (!toolId || !GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) || !strategy) {
+  if (!toolId || !GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) || !strategy || !contract) {
     summary.readiness = {
       tone: 'error',
       message: 'Choose a graph-native workflow tool for this step.',
@@ -2387,15 +2328,15 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
     return false;
   }
 
-  if (!RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) || strategy.id !== TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW) {
+  if (!contract.supportsExecution || !RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) || strategy.id !== TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW) {
     summary.readiness = {
       tone: 'error',
-      message: toolLabel + ' is listed as a graph-native tool, but this build only wires ComfyUI into pipeline execution so far. Choose ComfyUI for now.',
+      message: toolLabel + ' is modeled as a graph-native workflow tool, but ' + contract.executionBlockedMessage,
     };
     return false;
   }
 
-  const parsedWorkflow = parseGraphWorkflowDefinitionText(node.config?.workflowText);
+  const parsedWorkflow = parseGraphWorkflowDefinitionText(toolId, node.config?.workflowText);
   if (!parsedWorkflow.ok) {
     summary.readiness = {
       tone: 'error',
@@ -2414,10 +2355,10 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
   const outputNodeId = String(outputBinding.nodeId || '').trim();
 
   const textConnected = getIncomingKindsForNodePort(node, 'text', graph).length > 0;
-  if (textConnected && (!textNodeId || !textField)) {
+  if (textConnected && (!textNodeId || !textField || textBinding.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_FIELD)) {
     summary.readiness = {
       tone: 'error',
-      message: 'Map the Text input to a ComfyUI node and field before running this graph workflow step.',
+      message: 'Map the Text input boundary to a workflow node and field before running this graph workflow step.',
     };
     return false;
   }
@@ -2427,7 +2368,7 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
     if (!workflowNode) {
       summary.readiness = {
         tone: 'error',
-        message: 'The mapped ComfyUI text node could not be found in the pasted workflow JSON.',
+        message: 'The mapped text boundary node could not be found in the imported workflow definition.',
       };
       return false;
     }
@@ -2435,17 +2376,17 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
     if (!textField || !workflowNode.inputs || typeof workflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(workflowNode.inputs, textField)) {
       summary.readiness = {
         tone: 'error',
-        message: 'The mapped ComfyUI text field could not be found in the pasted workflow JSON.',
+        message: 'The mapped text boundary field could not be found in the imported workflow definition.',
       };
       return false;
     }
   }
 
   const imageConnected = getIncomingKindsForNodePort(node, 'image', graph).length > 0;
-  if (imageConnected && (!imageNodeId || !imageField)) {
+  if (imageConnected && (!imageNodeId || !imageField || imageBinding.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_FIELD)) {
     summary.readiness = {
       tone: 'error',
-      message: 'Map the Image input to a ComfyUI node and field before running this graph workflow step.',
+      message: 'Map the Image input boundary to a workflow node and field before running this graph workflow step.',
     };
     return false;
   }
@@ -2455,7 +2396,7 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
     if (!workflowNode) {
       summary.readiness = {
         tone: 'error',
-        message: 'The mapped ComfyUI image node could not be found in the pasted workflow JSON.',
+        message: 'The mapped image boundary node could not be found in the imported workflow definition.',
       };
       return false;
     }
@@ -2463,16 +2404,16 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
     if (!imageField || !workflowNode.inputs || typeof workflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(workflowNode.inputs, imageField)) {
       summary.readiness = {
         tone: 'error',
-        message: 'The mapped ComfyUI image field could not be found in the pasted workflow JSON.',
+        message: 'The mapped image boundary field could not be found in the imported workflow definition.',
       };
       return false;
     }
   }
 
-  if (!outputNodeId) {
+  if (!outputNodeId || outputBinding.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_OUTPUT) {
     summary.readiness = {
       tone: 'error',
-      message: 'Choose the ComfyUI node that should feed the Image output port before running this graph workflow step.',
+      message: 'Choose the workflow node that should feed the Image output boundary before running this graph workflow step.',
     };
     return false;
   }
@@ -2480,7 +2421,7 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
   if (!getGraphWorkflowNodeEntry(parsedWorkflow.workflow, outputNodeId)) {
     summary.readiness = {
       tone: 'error',
-      message: 'The selected ComfyUI image output node could not be found in the pasted workflow JSON.',
+      message: 'The selected image output boundary node could not be found in the imported workflow definition.',
     };
     return false;
   }
@@ -2489,7 +2430,7 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
   if (!installedTool) {
     summary.readiness = {
       tone: 'error',
-      message: 'Install ComfyUI before using this graph workflow step.',
+      message: 'Install ' + toolLabel + ' before using this graph workflow step.',
     };
     return false;
   }
@@ -2504,11 +2445,10 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
 
   summary.readiness = {
     tone: 'info',
-    message: installedTool.name + ' will run the pasted workflow locally and return the selected image artifact back into the main pipeline.',
+    message: installedTool.name + ' will run the imported ' + (contract.workflowFormat?.label || 'graph workflow definition') + ' and return the selected image artifact back into the main pipeline.',
   };
   return true;
 }
-
 function analyzePipeline(definition = {}, context = {}) {
   const graph = buildPipelineGraph(definition);
   const contextMaps = buildContextMaps(context);
@@ -3039,7 +2979,14 @@ module.exports = {
   createNode,
   createUniqueId,
   evaluateCompatibilityProfile,
+  getDefaultGraphWorkflowBindings,
   getDefaultNodeConfig,
+  getGraphWorkflowContract,
+  getGraphWorkflowFieldOptions,
+  getGraphWorkflowInputBinding,
+  getGraphWorkflowNodeEntry,
+  getGraphWorkflowOutputBinding,
+  getGraphWorkflowOutputNodeOptions,
   getGraphWorkflowToolId,
   getImageToolIdForNode,
   getLocalToolRequirement,
@@ -3052,6 +2999,7 @@ module.exports = {
   getSupportedPortKinds,
   normalizePipelineDefinition,
   normalizePortKind,
+  parseGraphWorkflowDefinitionText,
   resolveOutputKinds,
   trimPreviewText,
 };
