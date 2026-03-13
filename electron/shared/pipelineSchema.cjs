@@ -163,7 +163,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'llmPrompt',
     label: 'Model Step',
     category: 'AI Steps',
-    description: 'Sends text or an image to a compatible model and returns the selected typed output.',
+    description: 'Sends compatible text or media to a model and returns the selected typed output.',
     inputPorts: [
       {
         id: 'prompt',
@@ -617,9 +617,69 @@ function getSupportedPortKinds() {
   return [...SUPPORTED_PORT_KINDS];
 }
 
-function getPortAllowedKinds(port) {
+function resolveDynamicInputKinds(node, port) {
+  if (!node || !port) {
+    return [];
+  }
+
+  if (node.type === 'llmPrompt' && port.id === 'prompt') {
+    const executionMode = getModelStepExecutionMode(node);
+    const operationId = getModelStepOperationId(node);
+
+    if (executionMode === 'ollama') {
+      return uniqueKindList(getToolPipelineOperation('ollama', PIPELINE_OPERATION_IDS.LLM_PROMPT)?.inputKinds || []);
+    }
+
+    if (executionMode === 'localTool') {
+      const toolId = getModelStepLocalToolId(node, {});
+      const toolIds = toolId ? [toolId] : IMAGE_WORKFLOW_TOOL_IDS;
+      return uniqueKindList(toolIds.flatMap((entry) => getToolPipelineOperation(entry, operationId)?.inputKinds || []));
+    }
+
+    const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+    const modelId = String(node?.config?.model || '').trim();
+    if (providerId) {
+      const providerOperation = modelId
+        ? getProviderModelCapabilities(providerId, modelId)?.operations?.[operationId] || getProviderPipelineOperation(providerId, operationId)
+        : getProviderPipelineOperation(providerId, operationId);
+      return uniqueKindList(providerOperation?.inputKinds || []);
+    }
+
+    return uniqueKindList(
+      getProviderIdsForPipelineOperation(operationId).flatMap((entry) => getProviderPipelineOperation(entry, operationId)?.inputKinds || []),
+    );
+  }
+
+  if (node.type === 'validation' && port.id === 'input' && node.config?.mode === 'llm') {
+    const executionMode = node?.config?.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud';
+    if (executionMode === 'ollama') {
+      return uniqueKindList(getToolPipelineOperation('ollama', PIPELINE_OPERATION_IDS.VALIDATION_LLM)?.inputKinds || []);
+    }
+
+    const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+    if (providerId) {
+      return uniqueKindList(getProviderPipelineOperation(providerId, PIPELINE_OPERATION_IDS.VALIDATION_LLM)?.inputKinds || []);
+    }
+
+    return uniqueKindList(
+      getProviderIdsForPipelineOperation(PIPELINE_OPERATION_IDS.VALIDATION_LLM)
+        .flatMap((entry) => getProviderPipelineOperation(entry, PIPELINE_OPERATION_IDS.VALIDATION_LLM)?.inputKinds || []),
+    );
+  }
+
+  return [];
+}
+
+function getPortAllowedKinds(port, options = {}) {
   if (!port || typeof port !== 'object') {
     return [];
+  }
+
+  const dynamicKinds = options?.direction === 'input'
+    ? resolveDynamicInputKinds(options?.node || null, port)
+    : [];
+  if (dynamicKinds.length) {
+    return dynamicKinds;
   }
 
   if (Array.isArray(port.allowedKinds) && port.allowedKinds.length) {
@@ -698,7 +758,7 @@ function getIncomingKindsForPort(node, port, graph, visited = new Set()) {
   const mergedKinds = doesPortAllowMultipleConnections(port)
     ? intersectKindLists(incomingKindLists)
     : uniqueKindList(incomingKindLists.flat());
-  const allowedKinds = getPortAllowedKinds(port);
+  const allowedKinds = getPortAllowedKinds(port, { direction: 'input', node });
   return allowedKinds.length ? mergedKinds.filter((kind) => allowedKinds.includes(kind)) : mergedKinds;
 }
 
@@ -973,7 +1033,7 @@ function doesKindIntersect(leftKinds = [], rightKinds = []) {
 }
 
 function arePortsCompatible(source, target, options = {}) {
-  const targetKinds = typeof target === 'string' ? getPortAllowedKinds({ kind: target }) : getPortAllowedKinds(target);
+  const targetKinds = typeof target === 'string' ? getPortAllowedKinds({ kind: target }) : getPortAllowedKinds(target, { direction: 'input', node: options.targetNode || null });
   const sourceKinds =
     typeof source === 'string'
       ? getPortAllowedKinds({ kind: source })
@@ -1287,6 +1347,69 @@ function formatPortKindList(kinds = []) {
   return labels.slice(0, -1).join(', ') + ', or ' + labels[labels.length - 1];
 }
 
+function formatValidationReviewKinds(directKinds = [], derivedKinds = []) {
+  const direct = uniqueKindList(directKinds);
+  const derived = uniqueKindList(derivedKinds).filter((kind) => !direct.includes(kind));
+  const segments = [];
+
+  if (direct.length) {
+    segments.push(formatPortKindList(direct) + ' directly');
+  }
+
+  if (derived.length) {
+    segments.push(formatPortKindList(derived) + ' through extracted evidence');
+  }
+
+  if (!segments.length) {
+    return 'nothing yet';
+  }
+
+  return segments.length === 2 ? segments[0] + ' and ' + segments[1] : segments[0];
+}
+
+function getValidationKindMode(capabilitySummary, kind) {
+  const normalizedKind = normalizePortKind(kind);
+  if (!normalizedKind || !capabilitySummary) {
+    return '';
+  }
+
+  const directKinds = uniqueKindList(
+    capabilitySummary.directInputKinds && capabilitySummary.directInputKinds.length
+      ? capabilitySummary.directInputKinds
+      : capabilitySummary.inputKinds,
+  );
+  if (directKinds.includes(normalizedKind)) {
+    return 'direct';
+  }
+
+  const derivedKinds = uniqueKindList(capabilitySummary.derivedInputKinds || []);
+  return derivedKinds.includes(normalizedKind) ? 'derived' : '';
+}
+
+function getValidationReadyMessage(targetLabel, capabilitySummary, connectedKinds = []) {
+  const kinds = uniqueKindList(connectedKinds);
+  if (kinds.includes(PORT_KIND_VIDEO)) {
+    return targetLabel + ' will review the connected video and return a pass or fail decision.';
+  }
+
+  if (kinds.includes(PORT_KIND_FILE)) {
+    const mode = getValidationKindMode(capabilitySummary, PORT_KIND_FILE);
+    if (mode === 'direct') {
+      return targetLabel + ' will review the connected file and return a pass or fail decision.';
+    }
+
+    if (mode === 'derived') {
+      return targetLabel + ' will review extracted document text and metadata from the connected file and return a pass or fail decision.';
+    }
+  }
+
+  if (kinds.includes(PORT_KIND_IMAGE)) {
+    return targetLabel + ' can review the connected image and return a pass or fail decision.';
+  }
+
+  return targetLabel + ' will review this validation input and return a pass or fail decision.';
+}
+
 function getContextToolEntry(toolId, contextMaps = {}) {
   const normalizedToolId = String(toolId || '').trim().toLowerCase();
   if (!normalizedToolId) {
@@ -1532,6 +1655,8 @@ function buildNodeCapabilitySummary(node, contextMaps = {}) {
   const capability = resolved.capability || null;
   if (!capability) {
     return {
+      derivedInputKinds: [],
+      directInputKinds: [],
       inputKinds: [],
       message: resolved.targetLabel + ' does not support ' + getPipelineOperationLabel(resolved.operationId).toLowerCase() + ' for this step yet.',
       notes: '',
@@ -1546,12 +1671,16 @@ function buildNodeCapabilitySummary(node, contextMaps = {}) {
   }
 
   const inputKinds = uniqueKindList(capability.inputKinds);
+  const directInputKinds = uniqueKindList(capability.directInputKinds && capability.directInputKinds.length ? capability.directInputKinds : inputKinds);
+  const derivedInputKinds = uniqueKindList(capability.derivedInputKinds || []);
   const outputKinds = uniqueKindList(capability.outputKinds);
   const notes = String(capability.notes || '').trim();
   const message = resolved.operationId === PIPELINE_OPERATION_IDS.VALIDATION_LLM
-    ? resolved.targetLabel + ' can review ' + formatPortKindList(inputKinds) + ' in this validation step.' + (notes ? ' ' + notes : '')
+    ? resolved.targetLabel + ' can review ' + formatValidationReviewKinds(directInputKinds, derivedInputKinds) + ' in this validation step.' + (notes ? ' ' + notes : '')
     : resolved.targetLabel + ' supports ' + formatPortKindList(inputKinds) + ' to ' + formatPortKindList(outputKinds) + ' for this step.' + (notes ? ' ' + notes : '');
   return {
+    derivedInputKinds,
+    directInputKinds,
     inputKinds,
     message,
     notes,
@@ -1629,6 +1758,85 @@ function getImageModelSupportState(node, capabilitySummary, contextMaps = {}) {
   return {
     status: 'unknown',
     message: 'This step is wired for image input, but the selected model name does not clearly look image-capable. If the provider rejects the image, choose one of its vision-capable chat models.',
+  };
+}
+
+function getValidationModalitySupportState(node, capabilitySummary, contextMaps = {}, connectedKinds = []) {
+  if (!capabilitySummary || capabilitySummary.operationId !== PIPELINE_OPERATION_IDS.VALIDATION_LLM) {
+    return {
+      status: 'supported',
+      message: '',
+    };
+  }
+
+  const normalizedKinds = uniqueKindList(connectedKinds);
+  if (!normalizedKinds.length) {
+    return {
+      status: 'supported',
+      message: '',
+    };
+  }
+
+  const targetLabel = capabilitySummary.targetLabel || 'This validator';
+  const directKinds = uniqueKindList(
+    capabilitySummary.directInputKinds && capabilitySummary.directInputKinds.length
+      ? capabilitySummary.directInputKinds
+      : capabilitySummary.inputKinds,
+  );
+  const derivedKinds = uniqueKindList(capabilitySummary.derivedInputKinds || []);
+
+  if (normalizedKinds.includes(PORT_KIND_IMAGE) && directKinds.includes(PORT_KIND_IMAGE)) {
+    const imageSupport = getImageModelSupportState(node, capabilitySummary, contextMaps);
+    if (imageSupport.status !== 'not-applicable') {
+      return imageSupport;
+    }
+  }
+
+  if (normalizedKinds.includes(PORT_KIND_VIDEO)) {
+    if (directKinds.includes(PORT_KIND_VIDEO)) {
+      return capabilitySummary.targetKind === 'provider' && capabilitySummary.targetId === 'google'
+        ? {
+            status: 'supported',
+            message: '',
+          }
+        : {
+            status: 'unknown',
+            message: targetLabel + ' can accept a video attachment here, but Local AI Hub cannot confirm per-model video review support from the current catalog yet. If it refuses the video, switch to a Gemini multimodal model or use user approval.',
+          };
+    }
+
+    return {
+      status: 'unsupported',
+      message: targetLabel + ' cannot review video input in this validation step yet. Choose a Gemini validator or use user approval for this artifact.',
+    };
+  }
+
+  if (normalizedKinds.includes(PORT_KIND_FILE)) {
+    if (directKinds.includes(PORT_KIND_FILE)) {
+      if (capabilitySummary.targetKind === 'provider' && capabilitySummary.targetId === 'anthropic') {
+        return {
+          status: 'unknown',
+          message: 'Claude can review PDF documents directly here. Other file types may fall back to extracted text depending on the file.',
+        };
+      }
+
+      return {
+        status: 'supported',
+        message: '',
+      };
+    }
+
+    if (derivedKinds.includes(PORT_KIND_FILE)) {
+      return {
+        status: 'limited',
+        message: targetLabel + ' will review extracted text and metadata from the connected file. It will not inspect the raw file directly in this step.',
+      };
+    }
+  }
+
+  return {
+    status: 'supported',
+    message: '',
   };
 }
 
@@ -2628,26 +2836,21 @@ function analyzePipeline(definition = {}, context = {}) {
                 };
                 issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
               } else {
-                const modelSupport = getModelStepSupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
+                const modelSupport = getValidationModalitySupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
                 summary.readiness = modelSupport.status === 'unsupported'
                   ? {
                       tone: 'error',
                       message: modelSupport.message,
                     }
-                  : modelSupport.status === 'unknown'
+                  : modelSupport.status === 'unknown' || modelSupport.status === 'limited'
                     ? {
                         tone: 'warn',
                         message: modelSupport.message,
                       }
-                    : connectedKinds.includes(PORT_KIND_IMAGE)
-                      ? {
-                          tone: 'info',
-                          message: 'Ollama will review the connected image and return a pass or fail decision.',
-                        }
-                      : {
-                          tone: 'info',
-                          message: 'Ollama will run this validation locally and return a pass or fail decision.',
-                        };
+                    : {
+                        tone: 'info',
+                        message: getValidationReadyMessage('Ollama', summary.capabilitySummary, connectedKinds),
+                      };
                 if (summary.readiness.tone === 'error') {
                   issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
                 } else if (summary.readiness.tone === 'warn') {
@@ -2663,26 +2866,21 @@ function analyzePipeline(definition = {}, context = {}) {
               if (providerStatus.tone === 'error') {
                 issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
               } else {
-                const modelSupport = getModelStepSupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
+                const modelSupport = getValidationModalitySupportState(node, summary.capabilitySummary, contextMaps, connectedKinds);
                 summary.readiness = modelSupport.status === 'unsupported'
                   ? {
                       tone: 'error',
                       message: modelSupport.message,
                     }
-                  : modelSupport.status === 'unknown'
+                  : modelSupport.status === 'unknown' || modelSupport.status === 'limited'
                     ? {
                         tone: 'warn',
                         message: modelSupport.message,
                       }
-                    : connectedKinds.includes(PORT_KIND_IMAGE)
-                      ? {
-                          tone: 'info',
-                          message: (providerStatus.provider?.name || 'That provider') + ' can review the connected image and return a pass or fail decision.',
-                        }
-                      : {
-                          tone: 'info',
-                          message: (providerStatus.provider?.name || 'That provider') + ' will review this validation input and return a pass or fail decision.',
-                        };
+                    : {
+                        tone: 'info',
+                        message: getValidationReadyMessage(providerStatus.provider?.name || 'That provider', summary.capabilitySummary, connectedKinds),
+                      };
                 if (summary.readiness.tone === 'error') {
                   issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
                 } else if (summary.readiness.tone === 'warn') {

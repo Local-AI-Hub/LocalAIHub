@@ -372,6 +372,23 @@ function parseInlineDataUrl(value) {
   };
 }
 
+function normalizeBinaryContentPart(entry, fallbackType = 'file') {
+  const normalizedType = String(entry?.type || fallbackType).trim().toLowerCase();
+  const inlineData = typeof entry?.imageUrl === 'string' ? parseInlineDataUrl(entry.imageUrl) : null;
+  const data = String(entry?.data || inlineData?.data || '').trim();
+  if (!data) {
+    return null;
+  }
+
+  const fallbackMimeType = normalizedType === 'video' ? 'video/mp4' : normalizedType === 'image' ? 'image/png' : 'application/octet-stream';
+  return {
+    type: normalizedType,
+    data,
+    fileName: String(entry?.fileName || '').trim(),
+    mimeType: String(entry?.mimeType || inlineData?.mimeType || fallbackMimeType).trim() || fallbackMimeType,
+  };
+}
+
 function normalizeChatContentParts(content) {
   if (typeof content === 'string') {
     const text = content.trim();
@@ -394,18 +411,8 @@ function normalizeChatContentParts(content) {
         return text ? { type: 'text', text } : null;
       }
 
-      if (entry?.type === 'image') {
-        const inlineImage = typeof entry.imageUrl === 'string' ? parseInlineDataUrl(entry.imageUrl) : null;
-        const data = String(entry.data || inlineImage?.data || '').trim();
-        if (!data) {
-          return null;
-        }
-
-        return {
-          type: 'image',
-          data,
-          mimeType: String(entry.mimeType || inlineImage?.mimeType || 'image/png').trim() || 'image/png',
-        };
+      if (entry?.type === 'image' || entry?.type === 'video' || entry?.type === 'file') {
+        return normalizeBinaryContentPart(entry, entry.type);
       }
 
       return null;
@@ -486,19 +493,29 @@ function toAnthropicContent(parts = []) {
             data: part.data,
           },
         }
-      : {
-          type: 'text',
-          text: part.text,
-        }
+      : part.type === 'file'
+        ? {
+            type: 'document',
+            source: {
+              type: 'base64',
+              media_type: part.mimeType || 'application/pdf',
+              data: part.data,
+            },
+            title: part.fileName || 'document',
+          }
+        : {
+            type: 'text',
+            text: part.text,
+          }
   );
 }
 
 function toGoogleContentParts(parts = []) {
   return (Array.isArray(parts) ? parts : []).map((part) =>
-    part.type === 'image'
+    part.type === 'image' || part.type === 'video' || part.type === 'file'
       ? {
           inlineData: {
-            mimeType: part.mimeType || 'image/png',
+            mimeType: part.mimeType || (part.type === 'video' ? 'video/mp4' : part.type === 'image' ? 'image/png' : 'application/octet-stream'),
             data: part.data,
           },
         }
@@ -1064,5 +1081,7 @@ module.exports = {
   saveProviderConnection,
   testProviderConnection,
 };
+
+
 
 

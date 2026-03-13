@@ -27,8 +27,10 @@ const {
 } = require('./workflowToolService');
 const { executeGraphWorkflowNode } = require('./graphWorkflowService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
+const { getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
   PIPELINE_OPERATION_IDS,
+  PORT_KIND_FILE,
   PORT_KIND_IMAGE,
   PORT_KIND_TEXT,
   PORT_KIND_VIDEO,
@@ -499,22 +501,148 @@ function getMissingRequiredInputs(node, graph, resultsByNodeId) {
     .map((port) => port.label);
 }
 
-async function buildImageMessageContentPart(artifact) {
+async function buildArtifactMessageContentPart(artifact, partType = 'file') {
   const filePath = path.resolve(String(artifact?.filePath || '').trim());
   if (!filePath || !(await fs.pathExists(filePath))) {
-    throw new Error('The image for this step could not be found anymore. Choose it again and rerun the pipeline.');
+    const missingLabel = partType === 'video'
+      ? 'video'
+      : partType === 'image'
+        ? 'image'
+        : 'file';
+    throw new Error('The ' + missingLabel + ' for this step could not be found anymore. Choose it again and rerun the pipeline.');
   }
 
+  const fallbackMimeType = partType === 'video'
+    ? 'video/mp4'
+    : partType === 'image'
+      ? 'image/png'
+      : 'application/octet-stream';
   return {
-    type: 'image',
+    type: partType,
     data: (await fs.readFile(filePath)).toString('base64'),
-    mimeType: String(artifact?.mimeType || 'image/png').trim() || 'image/png',
+    fileName: String(artifact?.fileName || path.basename(filePath)).trim() || path.basename(filePath),
+    mimeType: String(artifact?.mimeType || fallbackMimeType).trim() || fallbackMimeType,
   };
+}
+
+async function buildImageMessageContentPart(artifact) {
+  return buildArtifactMessageContentPart(artifact, 'image');
+}
+
+async function buildVideoMessageContentPart(artifact) {
+  return buildArtifactMessageContentPart(artifact, 'video');
+}
+
+async function buildFileMessageContentPart(artifact) {
+  return buildArtifactMessageContentPart(artifact, 'file');
+}
+
+function uniqueKinds(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [values]).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))];
+}
+
+function getLlmPromptCapabilityProfile(node) {
+  const executionMode = node?.config?.executionMode === 'ollama'
+    ? 'ollama'
+    : node?.config?.executionMode === 'localTool'
+      ? 'localTool'
+      : 'cloud';
+  const operationId = executionMode === 'localTool'
+    ? getModelStepOperationId(node)
+    : PIPELINE_OPERATION_IDS.LLM_PROMPT;
+  const providerId = String(node?.config?.providerId || '').trim();
+  const modelId = String(node?.config?.model || '').trim();
+  const capability = executionMode === 'ollama'
+    ? getToolPipelineOperation('ollama', PIPELINE_OPERATION_IDS.LLM_PROMPT)
+    : executionMode === 'cloud' && providerId
+      ? getProviderModelCapabilities(providerId, modelId)?.operations?.[operationId] || getProviderPipelineOperation(providerId, operationId)
+      : executionMode === 'cloud'
+        ? getProviderPipelineOperation('', operationId)
+        : null;
+  const inputKinds = uniqueKinds(capability?.inputKinds || []);
+  const directKinds = uniqueKinds(Array.isArray(capability?.directInputKinds) && capability.directInputKinds.length ? capability.directInputKinds : inputKinds);
+  return {
+    capability: capability || null,
+    directKinds,
+    inputKinds,
+  };
+}
+
+function getValidationCapabilityProfile(node) {
+  const capability = node?.config?.llmExecutionMode === 'ollama'
+    ? getToolPipelineOperation('ollama', PIPELINE_OPERATION_IDS.VALIDATION_LLM)
+    : getProviderPipelineOperation(String(node?.config?.providerId || '').trim(), PIPELINE_OPERATION_IDS.VALIDATION_LLM);
+  const inputKinds = uniqueKinds(capability?.inputKinds || []);
+  const directKinds = uniqueKinds(Array.isArray(capability?.directInputKinds) && capability.directInputKinds.length ? capability.directInputKinds : inputKinds);
+  const derivedKinds = uniqueKinds(capability?.derivedInputKinds || []);
+  return {
+    capability: capability || null,
+    derivedKinds,
+    directKinds,
+    inputKinds,
+  };
+}
+
+function getValidationEvidenceModeLabel(reviewContext = {}) {
+  switch (String(reviewContext?.evidenceMode || '').trim()) {
+    case 'direct-image':
+      return 'The validator can inspect the attached image directly.';
+    case 'direct-video':
+      return 'The validator can inspect the attached video directly.';
+    case 'direct-file':
+      return 'The validator can inspect the attached file directly.';
+    case 'derived-file-text':
+      return 'The validator cannot open the raw file directly here, so Local AI Hub is sending extracted document text and metadata.';
+    case 'derived-image-description':
+      return 'The validator is relying on extracted image description and metadata instead of a direct image attachment.';
+    case 'text-only':
+      return 'The validator is reviewing plain text only.';
+    default:
+      return 'The validator is reviewing metadata and any extracted supporting context only.';
+  }
+}
+
+function canAttachValidationFileDirectly(node, artifact, profile) {
+  if (!profile?.directKinds?.includes(PORT_KIND_FILE) || !artifact?.filePath || node?.config?.llmExecutionMode === 'ollama') {
+    return false;
+  }
+
+  const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+  if (providerId === 'google') {
+    return true;
+  }
+
+  return providerId === 'anthropic' && String(artifact?.mimeType || '').trim().toLowerCase() === 'application/pdf';
+}
+
+function canAttachValidationVideoDirectly(node, artifact, profile) {
+  return Boolean(
+    profile?.directKinds?.includes(PORT_KIND_VIDEO)
+      && artifact?.filePath
+      && node?.config?.llmExecutionMode !== 'ollama'
+      && String(node?.config?.providerId || '').trim().toLowerCase() === 'google',
+  );
+}
+
+function buildValidationPrompt(node, artifactDescription, reviewContext) {
+  const ruleset = String(node.config?.ruleset || '').trim() || 'Decide whether this artifact should pass or fail based on the available evidence.';
+  const sections = [
+    'Validation rules:\n' + ruleset,
+    'Evidence mode:\n' + getValidationEvidenceModeLabel(reviewContext),
+    reviewContext?.limitations?.length ? 'Evidence limitations:\n- ' + reviewContext.limitations.join('\n- ') : '',
+    'Artifact to review:\n' + artifactDescription,
+    reviewContext?.attachedPartTypes?.length
+      ? 'The actual ' + reviewContext.attachedPartTypes.join(' and ') + ' evidence is attached below. Review the attachment first and use the details above as supporting context.'
+      : 'No binary attachment is included for this review. Use only the evidence described above.',
+    'Return JSON only.',
+  ].filter(Boolean);
+  return sections.join('\n\n');
 }
 
 async function buildLlmMessages(node, inputArtifact) {
   const instruction = String(node.config?.instruction || '').trim();
   const systemPrompt = String(node.config?.systemPrompt || '').trim();
+  const capabilityProfile = getLlmPromptCapabilityProfile(node);
   const messages = [];
 
   if (!inputArtifact) {
@@ -555,7 +683,37 @@ async function buildLlmMessages(node, inputArtifact) {
     return messages;
   }
 
-  throw new Error('This LLM step currently supports text or image input only.');
+  if ((inputArtifact.kind === PORT_KIND_FILE || inputArtifact.kind === PORT_KIND_VIDEO) && inputArtifact.filePath) {
+    if (!capabilityProfile.directKinds.includes(inputArtifact.kind)) {
+      throw new Error(
+        inputArtifact.kind === PORT_KIND_VIDEO
+          ? 'This model step does not accept video input with the selected target.'
+          : 'This model step does not accept file input with the selected target.',
+      );
+    }
+
+    const artifactDescription = await describeArtifactForLlm(inputArtifact);
+    const attachment = inputArtifact.kind === PORT_KIND_VIDEO
+      ? await buildVideoMessageContentPart(inputArtifact)
+      : await buildFileMessageContentPart(inputArtifact);
+    const defaultPrompt = inputArtifact.kind === PORT_KIND_VIDEO
+      ? 'Review this video and respond in plain English.'
+      : 'Review this file and respond in plain English.';
+
+    messages.push({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: (instruction || defaultPrompt) + '\n\nArtifact details:\n' + artifactDescription,
+        },
+        attachment,
+      ],
+    });
+    return messages;
+  }
+
+  throw new Error('This LLM step currently supports only the artifact types allowed by the selected provider or model mode.');
 }
 
 function buildImageGenerationPrompt(node, inputArtifact) {
@@ -630,31 +788,110 @@ async function buildVideoGenerationRequest(node, inputArtifact) {
 }
 
 async function buildValidationMessages(node, artifact, contextMaps) {
-
-  const ruleset = String(node.config?.ruleset || '').trim();
   const systemPrompt = String(node.config?.systemPrompt || '').trim();
   const artifactDescription = await buildValidationArtifactDescription(artifact, contextMaps);
-  const reviewPrompt = `Validation rules:\n${ruleset}\n\nArtifact to review:\n${artifactDescription}${artifact?.kind === PORT_KIND_IMAGE && artifact.filePath ? '\n\nThe actual image is attached below. Review the image itself first and use the details above as supporting context.' : ''}\n\nReturn JSON only.`;
-  const messages = [];
+  const profile = getValidationCapabilityProfile(node);
+  const attachments = [];
+  const limitations = [];
+  let evidenceMode = artifact?.kind === PORT_KIND_TEXT ? 'text-only' : 'summary-only';
 
+  if (artifact?.kind === PORT_KIND_IMAGE) {
+    if (profile.directKinds.includes(PORT_KIND_IMAGE) && artifact.filePath) {
+      attachments.push(await buildImageMessageContentPart(artifact));
+      evidenceMode = 'direct-image';
+    } else {
+      limitations.push('The selected validator cannot inspect the raw image directly in this step.');
+      evidenceMode = 'derived-image-description';
+    }
+  } else if (artifact?.kind === PORT_KIND_VIDEO) {
+    if (canAttachValidationVideoDirectly(node, artifact, profile)) {
+      attachments.push(await buildVideoMessageContentPart(artifact));
+      evidenceMode = 'direct-video';
+    } else {
+      limitations.push('The selected validator cannot inspect the raw video directly in this step. Only metadata and any extracted notes below are available.');
+    }
+  } else if (artifact?.kind === PORT_KIND_FILE) {
+    if (canAttachValidationFileDirectly(node, artifact, profile)) {
+      attachments.push(await buildFileMessageContentPart(artifact));
+      evidenceMode = 'direct-file';
+      if (String(artifact.previewText || '').trim()) {
+        limitations.push('Use the attached file as the primary evidence. The extracted preview below is only supporting context.');
+      }
+    } else if (profile.derivedKinds.includes(PORT_KIND_FILE)) {
+      limitations.push('The selected validator will review extracted document text and metadata. It will not inspect the raw file directly in this step.');
+      evidenceMode = 'derived-file-text';
+    } else {
+      limitations.push('This validator can only use the metadata and preview text below for this file.');
+    }
+  }
+
+  const reviewContext = {
+    artifactKind: String(artifact?.kind || '').trim(),
+    attachedPartTypes: attachments.map((part) => part.type),
+    derivedKinds: profile.derivedKinds,
+    directKinds: profile.directKinds,
+    evidenceMode,
+    limitations,
+  };
+
+  const messages = [];
   messages.push({
     role: 'system',
-    content: `${systemPrompt ? `${systemPrompt}\n\n` : ''}Return only valid JSON with keys decision and reason. decision must be "pass" or "fail".`,
+    content:
+      (systemPrompt ? systemPrompt + '\n\n' : '')
+      + 'Return only valid JSON with keys decision, reason, summary, confidence, evidenceMode, evidenceLimitations, and criteriaResults. '
+      + 'decision must be "pass" or "fail". confidence must be a number between 0 and 1. '
+      + 'criteriaResults must be an array of objects with criterion, decision, and reason.',
   });
   messages.push({
     role: 'user',
-    content: artifact?.kind === PORT_KIND_IMAGE && artifact.filePath
+    content: attachments.length
       ? [
           {
             type: 'text',
-            text: reviewPrompt,
+            text: buildValidationPrompt(node, artifactDescription, reviewContext),
           },
-          await buildImageMessageContentPart(artifact),
+          ...attachments,
         ]
-      : reviewPrompt,
+      : buildValidationPrompt(node, artifactDescription, reviewContext),
   });
 
-  return messages;
+  return {
+    messages,
+    reviewContext,
+  };
+}
+
+function clampValidationConfidence(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  return Math.min(1, Math.max(0, numeric));
+}
+
+function normalizeValidationCriteriaResults(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => {
+      const criterion = String(entry?.criterion || entry?.name || '').trim();
+      const decision = String(entry?.decision || entry?.result || '').trim().toLowerCase();
+      const reason = String(entry?.reason || entry?.explanation || '').trim();
+      if (!criterion && !reason) {
+        return null;
+      }
+
+      return {
+        criterion,
+        decision: decision === 'pass' || decision === 'fail' ? decision : '',
+        reason,
+      };
+    })
+    .filter(Boolean);
 }
 
 function parseValidationDecision(replyText) {
@@ -675,8 +912,13 @@ function parseValidationDecision(replyText) {
       const decision = String(parsed?.decision || parsed?.result || '').trim().toLowerCase();
       if (decision === 'pass' || decision === 'fail') {
         return {
+          confidence: clampValidationConfidence(parsed?.confidence ?? parsed?.score),
+          criteriaResults: normalizeValidationCriteriaResults(parsed?.criteriaResults || parsed?.criteria || parsed?.checks),
           decision,
-          reason: String(parsed?.reason || parsed?.explanation || raw).trim(),
+          evidenceLimitations: String(parsed?.evidenceLimitations || parsed?.limitations || '').trim(),
+          evidenceMode: String(parsed?.evidenceMode || parsed?.reviewMode || '').trim(),
+          reason: String(parsed?.reason || parsed?.explanation || parsed?.summary || raw).trim(),
+          summary: String(parsed?.summary || parsed?.overallSummary || '').trim(),
         };
       }
     } catch {
@@ -690,11 +932,30 @@ function parseValidationDecision(replyText) {
   }
 
   return {
+    confidence: null,
+    criteriaResults: [],
     decision: match[1].toLowerCase(),
+    evidenceLimitations: '',
+    evidenceMode: '',
     reason: raw,
+    summary: '',
   };
 }
 
+function buildValidationPreview(parsed, reviewContext) {
+  const parts = [String(parsed?.decision || '').trim().toUpperCase()];
+  if (parsed?.summary) {
+    parts.push(parsed.summary);
+  } else if (parsed?.reason) {
+    parts.push(parsed.reason);
+  }
+
+  if (reviewContext?.evidenceMode && reviewContext.evidenceMode !== 'text-only') {
+    parts.push(getValidationEvidenceModeLabel(reviewContext));
+  }
+
+  return trimPreviewText(parts.filter(Boolean).join(' | '), 220);
+}
 async function getInstalledToolOrThrow(contextMaps, toolId, message) {
   const normalizedToolId = String(toolId || '').trim().toLowerCase();
   const currentTool = await getResolvedToolState(normalizedToolId, {
@@ -737,6 +998,18 @@ async function buildValidationArtifactDescription(artifact, contextMaps) {
         // Fall back to file metadata when the image tool is unavailable.
       }
     }
+  }
+
+  if (artifact?.kind === PORT_KIND_FILE) {
+    if (String(artifact.previewText || '').trim()) {
+      description = `${description}\n\nExtracted document text:\n${artifact.previewText}`;
+    } else {
+      description = `${description}\n\nNo text excerpt could be extracted from this file in Local AI Hub.`;
+    }
+  }
+
+  if (artifact?.kind === PORT_KIND_VIDEO) {
+    description = `${description}\n\nLocal AI Hub does not extract video frames in this build. Validators without direct video support only receive the metadata above.`;
   }
 
   return description;
@@ -822,7 +1095,9 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
     };
   }
 
-  const messages = await buildValidationMessages(node, artifact, contextMaps);
+  const validationRequest = await buildValidationMessages(node, artifact, contextMaps);
+  const messages = validationRequest.messages;
+  const reviewContext = validationRequest.reviewContext;
   const model = String(node.config?.model || '').trim();
   if (!model) {
     throw new Error('Choose or enter a model for this validator before running the pipeline.');
@@ -867,18 +1142,25 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
   const parsed = parseValidationDecision(reply);
   const selectedBranch = parsed.decision === 'pass' ? 'pass' : 'fail';
   const reason = parsed.reason || `Validator selected ${selectedBranch}.`;
+  const evidenceLimitations = parsed.evidenceLimitations || (reviewContext.limitations || []).join(' ');
   return {
     message: `Validator routed this item to ${selectedBranch}.`,
     outputs: {
       [selectedBranch]: artifact,
     },
-    preview: trimPreviewText(reason),
+    preview: buildValidationPreview(parsed, reviewContext),
     selectedBranch,
     validation: {
+      confidence: parsed.confidence,
+      criteriaResults: parsed.criteriaResults,
       decision: selectedBranch,
+      evidenceLimitations,
+      evidenceMode: parsed.evidenceMode || reviewContext.evidenceMode,
       mode: 'llm',
       rawReply: reply,
       reason,
+      reviewContext,
+      summary: parsed.summary || '',
     },
   };
 }
@@ -1627,6 +1909,8 @@ module.exports = {
   runPipeline,
   setPipelineEventSink,
 };
+
+
 
 
 

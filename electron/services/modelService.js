@@ -647,6 +647,10 @@ async function listLocalOllamaModelsFromFilesystem(tool) {
   return [...uniqueModels.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
 async function listLocalOllamaModels(tool) {
+  if (String(tool?.status || '').trim().toLowerCase() !== 'running') {
+    return listLocalOllamaModelsFromFilesystem(tool);
+  }
+
   try {
     const response = await listOllamaModels(tool);
     return (response.models || []).map((model) => ({

@@ -17,7 +17,7 @@ import {
   toneToClassName,
 } from '../lib/pipeline-ui';
 
-const { buildPipelineGraph, createEdge, createEmptyPipeline, getPortDefinition, PIPELINE_OPERATION_IDS, PIPELINE_PORT_KIND_LABELS, PIPELINE_RETRY_LOOP_MAX_ATTEMPTS } = pipelineShared;
+const { arePortsCompatible, buildPipelineGraph, createEdge, createEmptyPipeline, getPortDefinition, PIPELINE_OPERATION_IDS, PIPELINE_PORT_KIND_LABELS, PIPELINE_RETRY_LOOP_MAX_ATTEMPTS } = pipelineShared;
 const CANVAS_MIN_WIDTH = 1280;
 const CANVAS_MIN_HEIGHT = 820;
 
@@ -485,6 +485,79 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
   );
 }
 
+function formatValidationEvidenceMode(validation) {
+  const evidenceMode = String(validation?.evidenceMode || validation?.reviewContext?.evidenceMode || '').trim();
+  if (!evidenceMode) {
+    return '';
+  }
+
+  if (evidenceMode === 'direct-image') {
+    return 'Reviewed attached image';
+  }
+
+  if (evidenceMode === 'direct-video') {
+    return 'Reviewed attached video';
+  }
+
+  if (evidenceMode === 'direct-file') {
+    return 'Reviewed attached file';
+  }
+
+  if (evidenceMode === 'derived-file-text') {
+    return 'Reviewed extracted document text';
+  }
+
+  if (evidenceMode === 'derived-image-description') {
+    return 'Reviewed extracted image description';
+  }
+
+  if (evidenceMode === 'text-only') {
+    return 'Reviewed plain text';
+  }
+
+  return 'Reviewed supporting metadata';
+}
+
+function formatValidationConfidence(confidence) {
+  const numeric = Number(confidence);
+  if (!Number.isFinite(numeric)) {
+    return '';
+  }
+
+  return `${Math.round(Math.max(0, Math.min(1, numeric)) * 100)}% confidence`;
+}
+
+function ValidationResultSummary({ validation }) {
+  if (!validation) {
+    return null;
+  }
+
+  const evidenceMode = formatValidationEvidenceMode(validation);
+  const confidenceLabel = formatValidationConfidence(validation.confidence);
+  const criteriaResults = Array.isArray(validation.criteriaResults) ? validation.criteriaResults.slice(0, 3) : [];
+  const reason = validation.summary || validation.reason || '';
+  const limitations = validation.evidenceLimitations || '';
+
+  return (
+    <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-3 text-xs leading-5 text-slate-200">
+      <p className="uppercase tracking-[0.18em] text-slate-400">Validation result</p>
+      <p className="mt-2 text-sm font-medium text-white">{String(validation.decision || '').toUpperCase() || 'Decision recorded'}</p>
+      {reason ? <p className="mt-2 text-slate-300">{reason}</p> : null}
+      {evidenceMode || confidenceLabel ? <p className="mt-2 text-slate-400">{[evidenceMode, confidenceLabel].filter(Boolean).join(' | ')}</p> : null}
+      {criteriaResults.length ? (
+        <div className="mt-2 space-y-1 text-slate-300">
+          {criteriaResults.map((entry, index) => (
+            <p key={`${entry.criterion || 'criterion'}-${index}`}>
+              {entry.criterion || 'Criterion'}: {entry.decision || 'not scored'}{entry.reason ? ` - ${entry.reason}` : ''}
+            </p>
+          ))}
+        </div>
+      ) : null}
+      {limitations ? <p className="mt-2 text-amber-200/90">{limitations}</p> : null}
+    </div>
+  );
+}
+
 function PathButtons({ path, onOpenPath, onRevealPath }) {
   if (!path) {
     return null;
@@ -676,6 +749,7 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
                   {attemptLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">{attemptLabel}</p> : null}
                   {nodeState?.preview ? <p className="mt-2 text-xs leading-5 text-slate-300">{nodeState.preview}</p> : null}
                   {nodeState?.selectedBranch ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">Routed to {nodeState.selectedBranch}</p> : null}
+                  <ValidationResultSummary validation={nodeState?.validation} />
                   {nodeState?.destinationPath ? <input className="store-input mt-3" readOnly value={nodeState.destinationPath} /> : null}
                   <PathButtons onOpenPath={onOpenPath} onRevealPath={onRevealPath} path={nodeState?.destinationPath || ''} />
                 </div>
@@ -883,6 +957,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const [pipelines, setPipelines] = useState([]);
   const [draft, setDraft] = useState(() => createEmptyPipeline());
   const [selectedNodeId, setSelectedNodeId] = useState('');
+  const [selectedEdgeId, setSelectedEdgeId] = useState('');
   const [pendingConnection, setPendingConnection] = useState(null);
   const [runState, setRunState] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -924,6 +999,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const analysis = useMemo(() => analyzePipelineDraft(draft, contextMaps), [draft, contextMaps]);
   const graph = useMemo(() => buildPipelineGraph(draft), [draft]);
   const selectedNode = useMemo(() => draft.nodes.find((node) => node.id === selectedNodeId) || null, [draft.nodes, selectedNodeId]);
+  const selectedEdge = useMemo(() => draft.edges.find((edge) => edge.id === selectedEdgeId) || null, [draft.edges, selectedEdgeId]);
   const retryLoopTargetOptions = useMemo(
     () => (selectedNode?.type === 'retryLoop' ? getRetryLoopTargetOptions(draft.nodes, graph, selectedNode.id) : []),
     [draft.nodes, graph, selectedNode],
@@ -1240,6 +1316,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       edges: current.edges.filter((edge) => edge.source.nodeId !== nodeId && edge.target.nodeId !== nodeId),
     }));
     setSelectedNodeId((current) => (current === nodeId ? '' : current));
+    setSelectedEdgeId('');
     markDirty();
   }
 
@@ -1248,6 +1325,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       ...current,
       edges: current.edges.filter((edge) => edge.id !== edgeId),
     }));
+    setSelectedEdgeId((current) => (current === edgeId ? '' : current));
     markDirty();
   }
 
@@ -1322,7 +1400,26 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     replaceDraft(nextDraft, {
       dirty: true,
     });
+    setSelectedEdgeId('');
     setSelectedNodeId(targetNodeId);
+  }
+
+  function isPendingConnectionCompatible(targetNode, targetPort) {
+    if (!pendingConnection || !targetNode || !targetPort) {
+      return false;
+    }
+
+    const sourceNode = draft.nodes.find((node) => node.id === pendingConnection.sourceNodeId);
+    const sourcePort = getPortDefinition(sourceNode?.type, 'output', pendingConnection.sourcePortId);
+    if (!sourceNode || !sourcePort) {
+      return false;
+    }
+
+    return arePortsCompatible(sourcePort, targetPort, {
+      graph,
+      sourceNode,
+      targetNode,
+    });
   }
 
   async function handleSavePipeline() {
@@ -1394,7 +1491,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
         : 'cloud';
     let models = [];
     if (executionMode === 'ollama') {
-      const result = await window.localAIHub.listOllamaModels({ includeCapabilities: true });
+      const result = await window.localAIHub.listOllamaModels({ includeCapabilities: true, preferLocalLibrary: true });
       if (!result?.ok) {
         setModelsBusyNodeId('');
         onToast(result?.message || 'Local AI Hub could not load your local Ollama models.', 'error');
@@ -1732,7 +1829,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                 <p className="mt-2 text-lg font-semibold text-white">Drag nodes and connect typed ports</p>
               </div>
               <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Click an output port, then an input port. Use Branch Merge to recombine pass and fail paths.</span>
+                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Click an output port, then an input port. Click a connection line to disconnect it.</span>
+                {selectedEdge ? <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => removeEdge(selectedEdge.id)} type="button">Disconnect selected link</button> : null}
                 {pendingConnection ? <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => setPendingConnection(null)} type="button">Cancel connection</button> : null}
               </div>
             </div>
@@ -1740,7 +1838,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             <div className="mt-4 rounded-[28px] border border-white/10 bg-slate-950/30 p-3">
               <div className="relative h-[820px] overflow-auto rounded-[24px] border border-dashed border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(67,171,255,0.08),transparent_24%),linear-gradient(180deg,rgba(7,15,26,0.96),rgba(5,10,18,0.96))]" ref={canvasRef}>
                 <div className="relative" style={{ height: `${canvasSize.height}px`, width: `${canvasSize.width}px` }}>
-                  <svg className="pointer-events-none absolute inset-0 h-full w-full">
+                  <svg className="absolute inset-0 h-full w-full">
                     {graphEdges.map((edge) => {
                       const sourceNode = graph.nodeMap.get(edge.source.nodeId);
                       const targetNode = graph.nodeMap.get(edge.target.nodeId);
@@ -1752,7 +1850,32 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                       const targetPoint = getNodePortCenter(targetNode, 'input', targetIndex);
                       const curveOffset = Math.max(80, (targetPoint.x - sourcePoint.x) / 2);
                       const pathValue = `M ${sourcePoint.x} ${sourcePoint.y} C ${sourcePoint.x + curveOffset} ${sourcePoint.y}, ${targetPoint.x - curveOffset} ${targetPoint.y}, ${targetPoint.x} ${targetPoint.y}`;
-                      return <path d={pathValue} fill="none" key={edge.id} stroke="rgba(103, 214, 255, 0.58)" strokeWidth="3" />;
+                      const selected = selectedEdge?.id === edge.id;
+                      return (
+                        <g key={edge.id}>
+                          <path
+                            d={pathValue}
+                            fill="none"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setPendingConnection(null);
+                              setSelectedEdgeId(edge.id);
+                              setSelectedNodeId('');
+                            }}
+                            pointerEvents="stroke"
+                            stroke="transparent"
+                            strokeWidth="16"
+                            style={{ cursor: 'pointer' }}
+                          />
+                          <path
+                            d={pathValue}
+                            fill="none"
+                            pointerEvents="none"
+                            stroke={selected ? 'rgba(147, 226, 255, 0.98)' : 'rgba(103, 214, 255, 0.58)'}
+                            strokeWidth={selected ? '5' : '3'}
+                          />
+                        </g>
+                      );
                     })}
                   </svg>
 
@@ -1768,7 +1891,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                       <div
                         className={`absolute rounded-[28px] border bg-[#0f1825]/96 shadow-soft ${selectedNodeId === node.id ? 'border-cyan-300/45' : 'border-white/10'}`}
                         key={node.id}
-                        onClick={() => setSelectedNodeId(node.id)}
+                        onClick={() => { setSelectedEdgeId(''); setSelectedNodeId(node.id); }}
                         style={{ left: `${node.position.x}px`, minHeight: `${getNodeCardHeight(node)}px`, top: `${node.position.y}px`, width: `${PIPELINE_NODE_WIDTH}px` }}
                       >
                         <div className="flex cursor-grab items-start justify-between gap-3 rounded-t-[28px] border-b border-white/10 px-4 py-4" onMouseDown={(event) => startDrag(node.id, event)} role="presentation">
@@ -1791,10 +1914,11 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                                 <div className="flex items-center gap-2">
                                   {inputPort ? (
                                     <button
-                                      className={`flex items-center gap-2 rounded-full border px-2 py-1 text-left text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection && (pendingConnection.isDynamic || pendingConnection.kind === inputPort.kind || inputPort.allowedKinds?.includes(pendingConnection.kind)) ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
+                                      className={`flex items-center gap-2 rounded-full border px-2 py-1 text-left text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection && isPendingConnectionCompatible(node, inputPort) ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
                                       onClick={(event) => {
                                         event.stopPropagation();
                                         if (!pendingConnection) {
+                                          setSelectedEdgeId('');
                                           setSelectedNodeId(node.id);
                                           return;
                                         }
@@ -1814,6 +1938,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                                       className={`flex items-center gap-2 rounded-full border px-2 py-1 text-right text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection?.sourceNodeId === node.id && pendingConnection?.sourcePortId === outputPort.id ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
                                       onClick={(event) => {
                                         event.stopPropagation();
+                                        setSelectedEdgeId('');
                                         setPendingConnection({
                                           isDynamic: outputPort.kind === 'passthrough' || outputPort.kind === 'any',
                                           kind: outputPort.kind,
@@ -2298,6 +2423,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     </section>
   );
 }
+
+
 
 
 

@@ -58,8 +58,10 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
-        notes: 'Image validation requires a vision-capable Ollama model.',
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        derivedInputKinds: Object.freeze([MODALITY_FILE]),
+        notes: 'Image validation requires a vision-capable Ollama model. Document-style files are reviewed through extracted text and metadata.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
     }),
@@ -112,7 +114,10 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        derivedInputKinds: Object.freeze([MODALITY_FILE]),
+        notes: 'Document-style files are reviewed through extracted text and metadata in the current OpenAI-compatible chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: Object.freeze({
@@ -131,11 +136,14 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
   anthropic: Object.freeze({
     operations: Object.freeze({
       [PIPELINE_OPERATION_IDS.LLM_PROMPT]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
+        notes: 'Claude can review images and many document-style files in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
+        notes: 'PDF documents can be attached directly. Other document-style files fall back to extracted text when needed.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
     }),
@@ -144,11 +152,14 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
   google: Object.freeze({
     operations: Object.freeze({
       [PIPELINE_OPERATION_IDS.LLM_PROMPT]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE]),
+        notes: 'Gemini can review attached images, videos, and document-style files in the current provider path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE]),
+        notes: 'Gemini validation can review attached images, videos, and document-style files in the current provider path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
     }),
@@ -161,7 +172,10 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE]),
+        directInputKinds: Object.freeze([MODALITY_TEXT]),
+        derivedInputKinds: Object.freeze([MODALITY_FILE]),
+        notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
     }),
@@ -174,7 +188,10 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE]),
+        directInputKinds: Object.freeze([MODALITY_TEXT]),
+        derivedInputKinds: Object.freeze([MODALITY_FILE]),
+        notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
     }),
@@ -187,7 +204,10 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE]),
+        directInputKinds: Object.freeze([MODALITY_TEXT]),
+        derivedInputKinds: Object.freeze([MODALITY_FILE]),
+        notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
     }),
@@ -200,7 +220,10 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE]),
+        directInputKinds: Object.freeze([MODALITY_TEXT]),
+        derivedInputKinds: Object.freeze([MODALITY_FILE]),
+        notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
     }),
@@ -258,6 +281,8 @@ function cloneOperation(operation) {
 
   return {
     ...operation,
+    derivedInputKinds: cloneKinds(operation.derivedInputKinds),
+    directInputKinds: cloneKinds(operation.directInputKinds),
     inputKinds: cloneKinds(operation.inputKinds),
     outputKinds: cloneKinds(operation.outputKinds),
   };

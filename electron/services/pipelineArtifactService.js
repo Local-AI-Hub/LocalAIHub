@@ -19,7 +19,7 @@ try {
   nativeImage = null;
 }
 
-const TEXT_FILE_EXTENSIONS = new Set(['.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log']);
+const TEXT_FILE_EXTENSIONS = new Set(['.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log', '.html', '.xml', '.ini', '.rtf']);
 const MIME_TYPES = {
   '.aac': 'audio/aac',
   '.flac': 'audio/flac',
@@ -27,12 +27,14 @@ const MIME_TYPES = {
   '.jpeg': 'image/jpeg',
   '.jpg': 'image/jpeg',
   '.json': 'application/json',
+  '.md': 'text/markdown',
   '.m4a': 'audio/mp4',
   '.mkv': 'video/x-matroska',
   '.mov': 'video/quicktime',
   '.mp3': 'audio/mpeg',
   '.mp4': 'video/mp4',
   '.ogg': 'audio/ogg',
+  '.pdf': 'application/pdf',
   '.png': 'image/png',
   '.txt': 'text/plain',
   '.wav': 'audio/wav',
@@ -293,10 +295,15 @@ async function describeArtifactForLlm(artifact) {
   const lines = [
     `Type: ${artifact.kind}`,
     artifact.displayName ? `Name: ${artifact.displayName}` : '',
+    artifact.fileName ? `File name: ${artifact.fileName}` : '',
+    artifact.mimeType ? `MIME type: ${artifact.mimeType}` : '',
+    artifact.extension ? `Extension: ${artifact.extension}` : '',
+    artifact.role ? `Role: ${artifact.role}` : '',
     artifact.filePath ? `Path: ${artifact.filePath}` : '',
     artifact.width && artifact.height ? `Dimensions: ${artifact.width}x${artifact.height}` : '',
     artifact.sizeBytes ? `Size: ${artifact.sizeBytes} bytes` : '',
     artifact.previewText ? `Excerpt: ${artifact.previewText}` : '',
+    artifact.summary ? `Summary: ${artifact.summary}` : '',
   ].filter(Boolean);
   return lines.join('\n');
 }

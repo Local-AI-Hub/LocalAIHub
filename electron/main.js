@@ -940,9 +940,13 @@ function registerIpcHandlers() {
         onProgress: (progressPayload) => sendUpdateProgress(progressPayload),
       });
       invalidateDiscoveryCache();
+      const nextState = await buildAppState({ forceDiscovery: true });
+      await refreshInstalledToolUpdates(nextState.tools).catch(() => null);
+      nextState.toolUpdates = await getToolUpdateSnapshot(nextState.tools);
+      sendToolUpdateSummary(nextState.toolUpdates);
       return {
-        message: updatedTool.lastUpdateMessage || `Local AI Hub updated ${tool.name}.`,
-        state: await buildAppState({ forceDiscovery: true }),
+        message: updatedTool.lastUpdateMessage || 'Local AI Hub updated ' + tool.name + '.',
+        state: nextState,
       };
     }, 'Local AI Hub could not update that tool.'),
   );
@@ -1328,9 +1332,23 @@ function registerIpcHandlers() {
 
   ipcMain.handle('ollama:list-models', (_event, options) =>
     withPlainEnglishErrors(async () => {
+      const requestOptions = options || {};
       const state = await buildAppState();
       const tool = toolLookup('ollama', state.tools);
-      return listOllamaModels(tool, options || {});
+      if (requestOptions.preferLocalLibrary && String(tool?.status || '').trim().toLowerCase() !== 'running') {
+        const localModels = await listDownloadedModels(tool);
+        return {
+          baseUrl: '',
+          fromLibraryState: true,
+          models: localModels.map((model) => ({
+            modifiedAt: model.modifiedAt || null,
+            name: model.name,
+            size: Number(model.sizeBytes || 0),
+          })),
+        };
+      }
+
+      return listOllamaModels(tool, requestOptions);
     }, 'Local AI Hub could not load your local Ollama models.'),
   );
 
