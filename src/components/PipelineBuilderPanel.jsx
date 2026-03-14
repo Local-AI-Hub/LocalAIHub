@@ -221,7 +221,9 @@ function buildNodePreview(node, runState) {
   }
 
   if (node.type === 'retryLoop') {
-    return `${node.config?.retryTargetNodeId || 'Choose retry target'} | ${Math.max(2, Number(node.config?.maxAttempts || 3) || 3)} attempts`;
+    const retryTerminationAction = String(node.config?.retryTerminationAction || 'fail').trim() === 'complete' ? 'keep retry on stop' : 'fail on stop';
+    const repeatRuleLabel = node.config?.stopWhenRetryArtifactRepeats ? ' | stop if unchanged' : '';
+    return (node.config?.retryTargetNodeId || 'Choose retry target') + ' | ' + Math.max(2, Number(node.config?.maxAttempts || 3) || 3) + ' attempts | ' + retryTerminationAction + repeatRuleLabel;
   }
 
   if (node.type.endsWith('Output')) {
@@ -494,6 +496,36 @@ function ValidationResultSummary({ validation }) {
   );
 }
 
+function AttemptHistoryList({ entries, title }) {
+  const historyEntries = Array.isArray(entries) ? entries.filter(Boolean).slice().reverse() : [];
+  if (!historyEntries.length) {
+    return null;
+  }
+
+  return (
+    <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-3">
+      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{title}</p>
+      <div className="mt-2 space-y-2">
+        {historyEntries.map((entry, index) => {
+          const attemptLabel = formatAttemptLabel(entry?.attempt, entry?.loopMaxAttempts) || 'Earlier attempt';
+          return (
+            <div className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2" key={`${title}-${entry?.attempt || index}-${entry?.recordedAt || index}`}>
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">{attemptLabel}</p>
+                <span className="text-[10px] uppercase tracking-[0.16em] text-slate-500">{entry?.status || 'completed'}</span>
+              </div>
+              {entry?.message ? <p className="mt-2 text-xs leading-5 text-slate-300">{entry.message}</p> : null}
+              {entry?.selectedBranch ? <p className="mt-2 text-[10px] uppercase tracking-[0.16em] text-slate-500">Routed to {entry.selectedBranch}</p> : null}
+              {entry?.loopPathLabel ? <p className="mt-2 text-[10px] uppercase tracking-[0.16em] text-slate-500">Loop path: {entry.loopPathLabel}</p> : null}
+              {entry?.preview ? <p className="mt-2 text-xs leading-5 text-slate-400">{entry.preview}</p> : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function PathButtons({ path, onOpenPath, onRevealPath }) {
   if (!path) {
     return null;
@@ -569,6 +601,7 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
           <p className="text-xs uppercase tracking-[0.22em] text-violet-100/80">Awaiting validation</p>
           <p className="mt-2 text-lg font-semibold text-white">{pendingValidation.nodeLabel}</p>
           {attemptLabel ? <p className="mt-2 text-xs uppercase tracking-[0.18em] text-violet-100/80">{attemptLabel}</p> : null}
+          {pendingValidation.loopPathLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-violet-100/70">Loop path: {pendingValidation.loopPathLabel}</p> : null}
           {artifactName ? <p className="mt-2 text-sm leading-6 text-violet-50/90">Reviewing {artifactLabel.toLowerCase()}: {artifactName}</p> : null}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -645,7 +678,14 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
             })}
           </div>
         ) : null}
-        {activeNodeState ? <p className="mt-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">Current step: {activeNodeState.nodeLabel || activeNodeState.nodeId}{activeAttemptLabel ? ` | ${activeAttemptLabel}` : ''}</p> : null}
+        {loopStates.some((loopState) => Array.isArray(loopState.history) && loopState.history.length) ? (
+          <div className="mt-3 space-y-3">
+            {loopStates.map((loopState) => (
+              <AttemptHistoryList entries={loopState.history} key={`${loopState.loopNodeId}-history`} title={`${loopState.loopLabel} activity`} />
+            ))}
+          </div>
+        ) : null}
+        {activeNodeState ? <p className="mt-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">Current step: {activeNodeState.nodeLabel || activeNodeState.nodeId}{activeAttemptLabel ? ` | ${activeAttemptLabel}` : ''}{activeNodeState?.loopPathLabel ? ` | ${activeNodeState.loopPathLabel}` : ''}</p> : null}
         <p className="mt-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">
           Started {formatDateLabel(runState.startedAt)}{runState.finishedAt ? ` | Finished ${formatDateLabel(runState.finishedAt)}` : ''}
         </p>
@@ -683,9 +723,12 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
                   </div>
                   <p className="mt-2 text-sm leading-6 text-slate-100">{nodeState?.message || 'Waiting to run.'}</p>
                   {attemptLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">{attemptLabel}</p> : null}
+                  {nodeState?.loopPathLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-500">Loop path: {nodeState.loopPathLabel}</p> : null}
+                  {nodeState?.runCount > 1 ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-500">Ran {nodeState.runCount} times in this run</p> : null}
                   {nodeState?.preview ? <p className="mt-2 text-xs leading-5 text-slate-300">{nodeState.preview}</p> : null}
                   {nodeState?.selectedBranch ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">Routed to {nodeState.selectedBranch}</p> : null}
                   <ValidationResultSummary validation={nodeState?.validation} />
+                  <AttemptHistoryList entries={nodeState?.history} title="Previous attempts" />
                   {nodeState?.destinationPath ? <input className="store-input mt-3" readOnly value={nodeState.destinationPath} /> : null}
                   <PathButtons onOpenPath={onOpenPath} onRevealPath={onRevealPath} path={nodeState?.destinationPath || ''} />
                 </div>
@@ -936,6 +979,10 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const graph = useMemo(() => buildPipelineGraph(draft), [draft]);
   const selectedNode = useMemo(() => draft.nodes.find((node) => node.id === selectedNodeId) || null, [draft.nodes, selectedNodeId]);
   const selectedEdge = useMemo(() => draft.edges.find((edge) => edge.id === selectedEdgeId) || null, [draft.edges, selectedEdgeId]);
+  const selectedRetryLoopMeta = useMemo(
+    () => (selectedNode?.type === 'retryLoop' ? graph.retryLoopsByNodeId?.get?.(selectedNode.id) || null : null),
+    [graph, selectedNode],
+  );
   const retryLoopTargetOptions = useMemo(
     () => (selectedNode?.type === 'retryLoop' ? getRetryLoopTargetOptions(draft.nodes, graph, selectedNode.id) : []),
     [draft.nodes, graph, selectedNode],
@@ -2225,15 +2272,59 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         value={selectedNode.config?.maxAttempts || 3}
                       />
                     </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="retry-loop-repeat">Early stop rule</label>
+                      <select
+                        className="store-input mt-3"
+                        id="retry-loop-repeat"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            stopWhenRetryArtifactRepeats: event.target.value === 'repeat',
+                          },
+                        }))}
+                        value={selectedNode.config?.stopWhenRetryArtifactRepeats ? 'repeat' : 'limit-only'}
+                      >
+                        <option value="limit-only">Only stop on Complete or the attempt limit</option>
+                        <option value="repeat">Also stop if the Retry artifact repeats</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="retry-loop-stop-action">When Retry is still active</label>
+                      <select
+                        className="store-input mt-3"
+                        id="retry-loop-stop-action"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            retryTerminationAction: event.target.value === 'complete' ? 'complete' : 'fail',
+                          },
+                        }))}
+                        value={selectedNode.config?.retryTerminationAction === 'complete' ? 'complete' : 'fail'}
+                      >
+                        <option value="fail">Stop the run with an error</option>
+                        <option value="complete">Exit the loop and keep the Retry artifact</option>
+                      </select>
+                    </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Connect the Complete input to the branch that should exit the loop and the Retry input to the branch that should trigger another attempt. Local AI Hub reruns the selected earlier step and the closed steps between it and this node, one attempt at a time, until the limit is reached.
+                      Connect the Complete input to the branch that should exit the loop and the Retry input to the branch that should trigger another attempt. {selectedRetryLoopMeta?.retryEntryMode === 'branchMerge'
+                        ? 'Later attempts feed the retry artifact back through the target Branch Merge automatically.'
+                        : selectedRetryLoopMeta?.retryEntryMode === 'inputPort'
+                          ? 'Later attempts feed the retry artifact back into ' + selectedRetryLoopMeta.retryTargetLabel + ' through ' + (selectedRetryLoopMeta.retryEntryPortLabel || 'its selected input') + '.'
+                          : selectedRetryLoopMeta?.retryEntryLimitation || 'Later attempts rerun the selected earlier step using its connected inputs when there is not one clear retry re-entry port.'} {selectedNode.config?.stopWhenRetryArtifactRepeats
+                        ? 'Local AI Hub also stops early if the Retry branch produces the same artifact twice in a row.'
+                        : 'By default, Local AI Hub keeps retrying until the Complete branch wins or the attempt limit is reached.'} {selectedNode.config?.retryTerminationAction === 'complete'
+                        ? 'When a stop rule triggers while Retry is still active, the loop exits and keeps the latest Retry artifact.'
+                        : 'When a stop rule triggers while Retry is still active, the run stops with a plain-English error.'}
                     </div>
                   </div>
                 ) : null}
 
                 {selectedNode.type === 'branchMerge' ? (
                   <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                    Connect two or more compatible branches here. Local AI Hub waits for earlier branches to finish or skip, then forwards the single branch that still has an artifact. If two live results arrive together, the run stops with a plain-English error so the merge stays explicit.
+                    Connect compatible branches here. Local AI Hub waits for earlier branches to finish or skip, then forwards the single branch that still has an artifact. When this merge is the retry target for a Retry Loop, the first attempt uses the connected branch and later attempts can re-enter with the loop-carried retry artifact. If two unrelated live results arrive together, the run stops with a plain-English error so the merge stays explicit.
                   </div>
                 ) : null}
 

@@ -469,6 +469,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     configDefaults: {
       retryTargetNodeId: '',
       maxAttempts: 3,
+      retryTerminationAction: 'fail',
+      stopWhenRetryArtifactRepeats: false,
     },
   }),
   textOutput: Object.freeze({
@@ -1030,12 +1032,112 @@ function getRetryLoopAttemptLimit(node) {
   return Number(node?.config?.maxAttempts || 0);
 }
 
+function getRetryLoopTerminationAction(node) {
+  return String(node?.config?.retryTerminationAction || '').trim() === 'complete' ? 'complete' : 'fail';
+}
+
+function doesRetryLoopStopOnRepeatedArtifact(node) {
+  return Boolean(node?.config?.stopWhenRetryArtifactRepeats);
+}
+
+function getRetryLoopReentryDescriptor(graph, retryTargetNode, retryKinds = []) {
+  if (!graph || !retryTargetNode) {
+    return {
+      limitation: '',
+      mode: 'none',
+      portId: '',
+      portLabel: '',
+    };
+  }
+
+  if (retryTargetNode.type === 'branchMerge') {
+    return {
+      limitation: '',
+      mode: 'branchMerge',
+      portId: 'branch',
+      portLabel: 'Branches',
+    };
+  }
+
+  const definition = getNodeTypeDefinition(retryTargetNode.type);
+  const inputPorts = Array.isArray(definition?.inputPorts) ? definition.inputPorts : [];
+  const eligiblePorts = inputPorts.filter((port) => {
+    if (!port || doesPortAllowMultipleConnections(port)) {
+      return false;
+    }
+
+    const allowedKinds = getPortAllowedKinds(port, { direction: 'input', node: retryTargetNode });
+    if (!allowedKinds.length || !doesKindIntersect(allowedKinds, retryKinds)) {
+      return false;
+    }
+
+    return Boolean(port.required) || getIncomingEdgesForPortKey(graph, retryTargetNode.id + ':' + port.id).length > 0;
+  });
+
+  if (eligiblePorts.length === 1) {
+    const selectedPort = eligiblePorts[0];
+    return {
+      limitation: '',
+      mode: 'inputPort',
+      portId: selectedPort.id,
+      portLabel: selectedPort.label || selectedPort.id,
+    };
+  }
+
+  if (eligiblePorts.length > 1) {
+    return {
+      limitation: 'Later attempts rerun from ' + retryTargetNode.label + ' using its connected inputs because the retry artifact matches more than one input on that step. Add a Branch Merge or target a step with one clear compatible input if you want automatic re-entry.',
+      mode: 'none',
+      portId: '',
+      portLabel: '',
+    };
+  }
+
+  return {
+    limitation: 'Later attempts rerun from ' + retryTargetNode.label + ' using its connected inputs because this step does not have one clear compatible input for the retry artifact.',
+    mode: 'none',
+    portId: '',
+    portLabel: '',
+  };
+}
+
 function addRetryLoopIssue(graph, nodeId, message) {
   if (!graph?.retryLoopIssuesByNodeId?.has(nodeId)) {
     graph.retryLoopIssuesByNodeId.set(nodeId, []);
   }
 
   graph.retryLoopIssuesByNodeId.get(nodeId).push(message);
+}
+
+function appendRetryLoopNodeId(map, nodeId, loopNodeId) {
+  if (!map || !nodeId || !loopNodeId) {
+    return;
+  }
+
+  const existingLoopNodeIds = Array.isArray(map.get(nodeId)) ? map.get(nodeId) : [];
+  if (!existingLoopNodeIds.includes(loopNodeId)) {
+    map.set(nodeId, [...existingLoopNodeIds, loopNodeId]);
+  }
+}
+
+function sortRetryLoopNodeIds(graph, loopNodeIds = []) {
+  return [...new Set(Array.isArray(loopNodeIds) ? loopNodeIds.filter(Boolean) : [])].sort((leftLoopNodeId, rightLoopNodeId) => {
+    const leftLoopMeta = graph?.retryLoopsByNodeId?.get(leftLoopNodeId) || null;
+    const rightLoopMeta = graph?.retryLoopsByNodeId?.get(rightLoopNodeId) || null;
+    const leftTargetIndex = Number(leftLoopMeta?.retryTargetIndex);
+    const rightTargetIndex = Number(rightLoopMeta?.retryTargetIndex);
+    if (leftTargetIndex !== rightTargetIndex) {
+      return leftTargetIndex - rightTargetIndex;
+    }
+
+    const leftLoopIndex = Number(leftLoopMeta?.loopIndex);
+    const rightLoopIndex = Number(rightLoopMeta?.loopIndex);
+    if (leftLoopIndex !== rightLoopIndex) {
+      return rightLoopIndex - leftLoopIndex;
+    }
+
+    return String(leftLoopNodeId).localeCompare(String(rightLoopNodeId));
+  });
 }
 
 function populateRetryLoopMetadata(graph) {
@@ -1060,7 +1162,7 @@ function populateRetryLoopMetadata(graph) {
     } else if (maxAttempts < 2) {
       addRetryLoopIssue(graph, node.id, 'Set this loop to at least 2 attempts so it can actually retry.');
     } else if (maxAttempts > PIPELINE_RETRY_LOOP_MAX_ATTEMPTS) {
-      addRetryLoopIssue(graph, node.id, 'This first loop pass allows up to ' + PIPELINE_RETRY_LOOP_MAX_ATTEMPTS + ' attempts so runs stay bounded and understandable.');
+      addRetryLoopIssue(graph, node.id, 'This control-flow model allows up to ' + PIPELINE_RETRY_LOOP_MAX_ATTEMPTS + ' attempts so runs stay bounded and understandable.');
     }
 
     const retryTargetNodeId = String(node.config?.retryTargetNodeId || '').trim();
@@ -1105,8 +1207,9 @@ function populateRetryLoopMetadata(graph) {
     const retryPort = getPortDefinition(node.type, 'input', 'retry');
     const completeKinds = getIncomingKindsForPort(node, completePort, graph);
     const retryKinds = getIncomingKindsForPort(node, retryPort, graph);
+    const retryEntry = getRetryLoopReentryDescriptor(graph, retryTargetNode, retryKinds);
     if (completeKinds.length && retryKinds.length && !doesKindIntersect(completeKinds, retryKinds)) {
-      addRetryLoopIssue(graph, node.id, 'The Complete and Retry branches must stay on the same artifact type in this first loop pass.');
+      addRetryLoopIssue(graph, node.id, 'The Complete and Retry branches must stay on the same artifact type so retries remain deterministic.');
     }
 
     let loopLeakDetected = false;
@@ -1139,17 +1242,15 @@ function populateRetryLoopMetadata(graph) {
       addRetryLoopIssue(graph, node.id, 'Keep every step in this retry span inside the loop until it reaches the Retry Loop node. Move outside outputs and side branches after the loop result.');
     }
 
-    const nestedLoopNodes = [...segmentNodeIds].filter((segmentNodeId) => segmentNodeId !== node.id && graph.nodeMap.get(segmentNodeId)?.type === 'retryLoop');
-    if (nestedLoopNodes.length) {
-      addRetryLoopIssue(graph, node.id, 'Nested retry loops are not supported in this first loop pass. Finish one loop before starting another.');
-    }
-
-    const overlappingNodeId = [...segmentNodeIds].find((segmentNodeId) => {
-      const existingLoopNodeId = graph.retryLoopNodeIdsBySegmentNodeId.get(segmentNodeId);
-      return existingLoopNodeId && existingLoopNodeId !== node.id;
-    });
-    if (overlappingNodeId) {
-      addRetryLoopIssue(graph, node.id, 'Overlapping retry loops are not supported yet. Keep each retry span separate.');
+    if (retryTargetNode.type === 'branchMerge') {
+      const branchPort = getPortDefinition(retryTargetNode.type, 'input', 'branch');
+      const branchEdges = graph.incomingEdgesByPortKey.get(retryTargetNode.id + ':branch') || [];
+      const explicitBranchKinds = branchPort ? getIncomingKindsForPort(retryTargetNode, branchPort, graph) : [];
+      if (!branchEdges.length) {
+        addRetryLoopIssue(graph, node.id, 'Connect at least one upstream branch into the retry target merge so the first attempt has content to run.');
+      } else if (explicitBranchKinds.length && retryKinds.length && !doesKindIntersect(explicitBranchKinds, retryKinds)) {
+        addRetryLoopIssue(graph, node.id, 'The retry target merge must accept the same artifact type that the Retry branch carries back into the loop.');
+      }
     }
 
     if ((graph.retryLoopIssuesByNodeId.get(node.id) || []).length) {
@@ -1159,21 +1260,74 @@ function populateRetryLoopMetadata(graph) {
     const segmentExecutionOrder = graph.executionOrder.filter((nodeId) => segmentNodeIds.has(nodeId));
     const loopMetadata = {
       completeKinds,
+      loopIndex,
       loopLabel: node.label,
       loopNodeId: node.id,
       maxAttempts,
+      retryEntryLimitation: retryEntry.limitation,
+      retryEntryMode: retryEntry.mode,
+      retryEntryPortId: retryEntry.portId,
+      retryEntryPortLabel: retryEntry.portLabel,
       retryKinds,
+      retryTargetIndex: targetIndex,
       retryTargetLabel: retryTargetNode.label,
       retryTargetNodeId: retryTargetNode.id,
       segmentExecutionOrder,
       segmentNodeIds: [...segmentNodeIds],
+      stopWhenRetryArtifactRepeats: doesRetryLoopStopOnRepeatedArtifact(node),
+      terminationAction: getRetryLoopTerminationAction(node),
     };
 
     graph.retryLoopsByNodeId.set(node.id, loopMetadata);
+    appendRetryLoopNodeId(graph.retryLoopNodeIdsByTargetNodeId, retryTargetNode.id, node.id);
     for (const segmentNodeId of segmentExecutionOrder) {
-      graph.retryLoopNodeIdsBySegmentNodeId.set(segmentNodeId, node.id);
+      appendRetryLoopNodeId(graph.retryLoopNodeIdsBySegmentNodeId, segmentNodeId, node.id);
     }
   }
+
+  for (const [segmentNodeId, loopNodeIds] of graph.retryLoopNodeIdsBySegmentNodeId.entries()) {
+    graph.retryLoopNodeIdsBySegmentNodeId.set(segmentNodeId, sortRetryLoopNodeIds(graph, loopNodeIds));
+  }
+
+  for (const [targetNodeId, loopNodeIds] of graph.retryLoopNodeIdsByTargetNodeId.entries()) {
+    graph.retryLoopNodeIdsByTargetNodeId.set(targetNodeId, sortRetryLoopNodeIds(graph, loopNodeIds));
+  }
+}
+
+function getRetryLoopEntryMetadataList(graph, nodeId) {
+  if (!graph?.retryLoopsByNodeId || !nodeId) {
+    return [];
+  }
+
+  const loopNodeIds = Array.isArray(graph.retryLoopNodeIdsByTargetNodeId?.get(nodeId))
+    ? graph.retryLoopNodeIdsByTargetNodeId.get(nodeId)
+    : [];
+  return loopNodeIds
+    .map((loopNodeId) => graph.retryLoopsByNodeId.get(loopNodeId) || null)
+    .filter(Boolean);
+}
+
+function getRetryLoopEntryMetadata(graph, nodeId) {
+  return getRetryLoopEntryMetadataList(graph, nodeId)[0] || null;
+}
+
+function buildRetryLoopReadinessMessage(node, loopMeta) {
+  const targetLabel = loopMeta?.retryTargetLabel || 'the selected retry target';
+  const baseMessage = 'This loop reruns from ' + targetLabel + ' until the Complete branch wins or attempt ' + loopMeta.maxAttempts + ' is reached.';
+  const reentryMessage = loopMeta?.retryEntryMode === 'branchMerge'
+    ? ' Later attempts feed the retry artifact back through ' + targetLabel + '.'
+    : loopMeta?.retryEntryMode === 'inputPort'
+      ? ' Later attempts feed the retry artifact back into ' + targetLabel + ' through ' + (loopMeta.retryEntryPortLabel || loopMeta.retryEntryPortId || 'its selected input') + '.'
+      : loopMeta?.retryEntryLimitation
+        ? ' ' + loopMeta.retryEntryLimitation
+        : '';
+  const terminationMessage = getRetryLoopTerminationAction(node) === 'complete'
+    ? ' If the Retry branch is still active when a stop rule triggers, Local AI Hub exits the loop and keeps the latest retry artifact.'
+    : ' If the Retry branch is still active when a stop rule triggers, Local AI Hub stops the run with a plain-English error.';
+  const repeatedArtifactMessage = doesRetryLoopStopOnRepeatedArtifact(node)
+    ? ' It also stops early if the Retry branch produces the same artifact on consecutive attempts.'
+    : '';
+  return baseMessage + reentryMessage + terminationMessage + repeatedArtifactMessage;
 }
 
 function compareIssueSeverity(leftTone = 'neutral', rightTone = 'neutral') {
@@ -2080,6 +2234,7 @@ function buildPipelineGraph(definition = {}) {
     executionIndexByNodeId: new Map(executionOrder.map((nodeId, index) => [nodeId, index])),
     retryLoopIssuesByNodeId: new Map(),
     retryLoopNodeIdsBySegmentNodeId: new Map(),
+    retryLoopNodeIdsByTargetNodeId: new Map(),
     retryLoopsByNodeId: new Map(),
     edges: validEdges,
   };
@@ -2849,7 +3004,7 @@ function analyzePipeline(definition = {}, context = {}) {
         } else if (loopMeta) {
           summary.readiness = {
             tone: 'info',
-            message: 'This loop reruns from ' + loopMeta.retryTargetLabel + ' until the Complete branch wins or attempt ' + loopMeta.maxAttempts + ' is reached.',
+            message: buildRetryLoopReadinessMessage(node, loopMeta),
           };
         }
       }
@@ -2857,12 +3012,15 @@ function analyzePipeline(definition = {}, context = {}) {
       if (node.type === 'branchMerge') {
         const branchPort = getPortDefinition(node.type, 'input', 'branch');
         const branchEdges = graph.incomingEdgesByPortKey.get(node.id + ':branch') || [];
-        const minimumConnections = Math.max(2, Number(branchPort?.minimumConnections || 0) || 0);
+        const retryEntryMeta = getRetryLoopEntryMetadata(graph, node.id);
+        const minimumConnections = retryEntryMeta ? 1 : Math.max(2, Number(branchPort?.minimumConnections || 0) || 0);
         const connectedKinds = getIncomingKindsForNodePort(node, 'branch', graph);
         if (branchEdges.length < minimumConnections) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect both sides of the branch before running this merge step.',
+            message: retryEntryMeta
+              ? 'Connect at least one upstream branch before running this merge. Later retry attempts will feed the loop artifact back in automatically.'
+              : 'Connect both sides of the branch before running this merge step.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (!connectedKinds.length) {
@@ -2874,7 +3032,9 @@ function analyzePipeline(definition = {}, context = {}) {
         } else {
           summary.readiness = {
             tone: 'info',
-            message: 'This merge waits for earlier branches to finish or skip, then forwards the single branch that stayed active.',
+            message: retryEntryMeta
+              ? 'This merge forwards its connected branch on the first attempt, then switches to the loop retry artifact on later attempts.'
+              : 'This merge waits for earlier branches to finish or skip, then forwards the single branch that stayed active.',
           };
         }
       }

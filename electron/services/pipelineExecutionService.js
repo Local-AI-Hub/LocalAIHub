@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs-extra');
 
@@ -259,12 +260,15 @@ function createInitialNodeStates(graph) {
 
   for (const node of graph.pipeline.nodes) {
     nodeStates[node.id] = {
+      activeLoops: [],
       destinationPath: '',
       finishedAt: null,
+      history: [],
       iteration: 1,
       loopLabel: '',
       loopMaxAttempts: null,
       loopNodeId: '',
+      loopPathLabel: '',
       message: graph.reachableNodeIds.has(node.id) ? 'Waiting for earlier steps to finish.' : 'Skipped because it is not connected to an output.',
       nodeId: node.id,
       nodeLabel: node.label,
@@ -288,6 +292,9 @@ function createLoopStateRecords(graph) {
   for (const [loopNodeId, loopMeta] of graph.retryLoopsByNodeId.entries()) {
     loopStates[loopNodeId] = {
       attempt: 1,
+      carriedArtifact: null,
+      history: [],
+      lastRetryArtifactSignature: '',
       loopLabel: loopMeta.loopLabel,
       loopNodeId,
       maxAttempts: loopMeta.maxAttempts,
@@ -406,14 +413,79 @@ function markRemainingNodes(run, graph, status, message) {
   }
 }
 
+function cloneLoopContexts(loopContexts = []) {
+  return Array.isArray(loopContexts)
+    ? loopContexts.filter(Boolean).map((entry) => ({ ...entry }))
+    : [];
+}
+
+function formatLoopAttemptLabel(iteration, loopMaxAttempts) {
+  const attemptNumber = Number(iteration || 0);
+  const maxAttempts = Number(loopMaxAttempts || 0);
+  if (maxAttempts > 0) {
+    return 'attempt ' + Math.max(1, attemptNumber || 1) + ' of ' + maxAttempts;
+  }
+
+  if (attemptNumber > 1) {
+    return 'attempt ' + attemptNumber;
+  }
+
+  return '';
+}
+
+function formatLoopPathLabel(loopContexts = []) {
+  const entries = cloneLoopContexts(loopContexts);
+  if (entries.length <= 1) {
+    return '';
+  }
+
+  return entries
+    .map((entry) => {
+      const attemptLabel = formatLoopAttemptLabel(entry?.iteration, entry?.loopMaxAttempts);
+      if (entry?.loopLabel && attemptLabel) {
+        return entry.loopLabel + ' ' + attemptLabel;
+      }
+
+      return entry?.loopLabel || attemptLabel || '';
+    })
+    .filter(Boolean)
+    .join(' -> ');
+}
+
+function getNodeLoopContexts(run, graph, nodeId) {
+  const loopNodeIds = graph.retryLoopNodeIdsBySegmentNodeId?.get?.(nodeId);
+  if (!Array.isArray(loopNodeIds) || !loopNodeIds.length) {
+    return [];
+  }
+
+  return loopNodeIds
+    .map((loopNodeId) => {
+      const loopState = run.loopStates?.[loopNodeId] || null;
+      if (!loopState) {
+        return null;
+      }
+
+      return {
+        iteration: loopState.attempt || 1,
+        loopLabel: loopState.loopLabel || '',
+        loopMaxAttempts: loopState.maxAttempts || null,
+        loopNodeId,
+        status: loopState.status || 'ready',
+      };
+    })
+    .filter(Boolean);
+}
+
 function getNodeLoopState(run, graph, nodeId) {
-  const loopNodeId = graph.retryLoopNodeIdsBySegmentNodeId?.get?.(nodeId) || '';
-  const loopState = loopNodeId ? run.loopStates?.[loopNodeId] || null : null;
+  const activeLoops = getNodeLoopContexts(run, graph, nodeId);
+  const primaryLoop = activeLoops.length ? activeLoops[activeLoops.length - 1] : null;
   return {
-    iteration: loopState?.attempt || 1,
-    loopLabel: loopState?.loopLabel || '',
-    loopMaxAttempts: loopState?.maxAttempts || null,
-    loopNodeId,
+    activeLoops,
+    iteration: primaryLoop?.iteration || 1,
+    loopLabel: primaryLoop?.loopLabel || '',
+    loopMaxAttempts: primaryLoop?.loopMaxAttempts || null,
+    loopNodeId: primaryLoop?.loopNodeId || '',
+    loopPathLabel: formatLoopPathLabel(activeLoops),
   };
 }
 
@@ -422,10 +494,94 @@ function applyNodeLoopState(nodeState, loopState) {
     return;
   }
 
+  nodeState.activeLoops = cloneLoopContexts(loopState?.activeLoops);
   nodeState.iteration = loopState?.iteration || 1;
   nodeState.loopLabel = loopState?.loopLabel || '';
   nodeState.loopMaxAttempts = loopState?.loopMaxAttempts || null;
   nodeState.loopNodeId = loopState?.loopNodeId || '';
+  nodeState.loopPathLabel = loopState?.loopPathLabel || '';
+}
+
+function appendHistoryEntry(entries, entry, maxEntries = 12) {
+  const history = Array.isArray(entries) ? [...entries] : [];
+  history.push(entry);
+  return history.slice(-maxEntries);
+}
+
+function recordNodeAttemptHistory(nodeState) {
+  if (!nodeState || (!nodeState.runCount && nodeState.status === 'queued')) {
+    return;
+  }
+
+  nodeState.history = appendHistoryEntry(nodeState.history, {
+    activeLoops: cloneLoopContexts(nodeState.activeLoops),
+    attempt: Number(nodeState.iteration || 1),
+    loopMaxAttempts: Number(nodeState.loopMaxAttempts || 0) || null,
+    loopPathLabel: nodeState.loopPathLabel || '',
+    message: nodeState.message || '',
+    preview: nodeState.preview || '',
+    recordedAt: new Date().toISOString(),
+    selectedBranch: nodeState.selectedBranch || '',
+    status: nodeState.status || 'queued',
+    validation: nodeState.validation ? JSON.parse(JSON.stringify(nodeState.validation)) : null,
+  });
+}
+
+function recordLoopHistory(loopState, entry) {
+  if (!loopState) {
+    return;
+  }
+
+  const activeLoops = cloneLoopContexts(entry?.activeLoops);
+  loopState.history = appendHistoryEntry(loopState.history, {
+    ...entry,
+    activeLoops,
+    loopPathLabel: entry?.loopPathLabel || formatLoopPathLabel(activeLoops),
+    recordedAt: new Date().toISOString(),
+  });
+}
+
+function resetLoopStateForFreshPass(loopState) {
+  if (!loopState) {
+    return;
+  }
+
+  loopState.attempt = 1;
+  loopState.carriedArtifact = null;
+  loopState.lastRetryArtifactSignature = '';
+  loopState.status = 'ready';
+}
+
+function resetNestedLoopStatesForRetry(run, graph, loopNodeId) {
+  const triggeringLoopMeta = graph.retryLoopsByNodeId.get(loopNodeId) || null;
+  if (!triggeringLoopMeta) {
+    return;
+  }
+
+  const segmentNodeIds = new Set(triggeringLoopMeta.segmentNodeIds || []);
+  for (const [nestedLoopNodeId, nestedLoopMeta] of graph.retryLoopsByNodeId.entries()) {
+    if (nestedLoopNodeId === loopNodeId || !segmentNodeIds.has(nestedLoopNodeId)) {
+      continue;
+    }
+
+    const nestedLoopState = run.loopStates?.[nestedLoopNodeId] || null;
+    if (!nestedLoopState) {
+      continue;
+    }
+
+    if (Number(nestedLoopState.attempt || 1) > 1 || nestedLoopState.status !== 'ready' || nestedLoopState.carriedArtifact) {
+      recordLoopHistory(nestedLoopState, {
+        attempt: Number(nestedLoopState.attempt || 1),
+        loopMaxAttempts: Number(nestedLoopState.maxAttempts || 0) || nestedLoopMeta.maxAttempts || null,
+        message: triggeringLoopMeta.loopLabel + ' restarted ' + nestedLoopMeta.loopLabel + ' from its first attempt.',
+        preview: '',
+        selectedBranch: '',
+        status: 'reset',
+      });
+    }
+
+    resetLoopStateForFreshPass(nestedLoopState);
+  }
 }
 
 function resetLoopSegmentForRetry(run, graph, loopNodeId, nextAttempt) {
@@ -437,6 +593,8 @@ function resetLoopSegmentForRetry(run, graph, loopNodeId, nextAttempt) {
 
   loopState.attempt = nextAttempt;
   loopState.status = 'retrying';
+  resetNestedLoopStatesForRetry(run, graph, loopNodeId);
+
   for (const segmentNodeId of loopMeta.segmentExecutionOrder) {
     delete run.resultsByNodeId[segmentNodeId];
     const nodeState = run.nodeStates?.[segmentNodeId];
@@ -444,6 +602,7 @@ function resetLoopSegmentForRetry(run, graph, loopNodeId, nextAttempt) {
       continue;
     }
 
+    recordNodeAttemptHistory(nodeState);
     nodeState.status = 'queued';
     nodeState.startedAt = null;
     nodeState.finishedAt = null;
@@ -453,12 +612,7 @@ function resetLoopSegmentForRetry(run, graph, loopNodeId, nextAttempt) {
     nodeState.selectedBranch = '';
     nodeState.destinationPath = '';
     nodeState.validation = null;
-    applyNodeLoopState(nodeState, {
-      iteration: nextAttempt,
-      loopLabel: loopState.loopLabel,
-      loopMaxAttempts: loopState.maxAttempts,
-      loopNodeId,
-    });
+    applyNodeLoopState(nodeState, getNodeLoopState(run, graph, segmentNodeId));
   }
 }
 
@@ -476,8 +630,22 @@ function getIncomingEdgesForPortKey(graph, portKey) {
   return incomingEdge ? [incomingEdge] : [];
 }
 
-function getNodeInputArtifacts(nodeId, portId, graph, resultsByNodeId) {
-  return getIncomingEdgesForPortKey(graph, `${nodeId}:${portId}`)
+function getNodeInputArtifacts(nodeId, portId, graph, resultsByNodeId, run = null) {
+  if (run) {
+    const carriedEntries = getLoopCarriedArtifactsForNodePort(nodeId, portId, graph, run);
+    if (carriedEntries.length) {
+      const selectedEntry = carriedEntries[carriedEntries.length - 1];
+      return [{
+        artifact: selectedEntry.artifact,
+        edge: null,
+        isLoopRetry: true,
+        loopMeta: selectedEntry.loopMeta,
+        loopState: selectedEntry.loopState,
+      }];
+    }
+  }
+
+  return getIncomingEdgesForPortKey(graph, nodeId + ':' + portId)
     .map((edge) => ({
       artifact: resultsByNodeId[edge.source.nodeId]?.outputs?.[edge.source.portId] || null,
       edge,
@@ -485,11 +653,169 @@ function getNodeInputArtifacts(nodeId, portId, graph, resultsByNodeId) {
     .filter((entry) => Boolean(entry.artifact));
 }
 
-function getNodeInputArtifact(nodeId, portId, graph, resultsByNodeId) {
-  return getNodeInputArtifacts(nodeId, portId, graph, resultsByNodeId)[0]?.artifact;
+function getNodeInputArtifact(nodeId, portId, graph, resultsByNodeId, run = null) {
+  return getNodeInputArtifacts(nodeId, portId, graph, resultsByNodeId, run)[0]?.artifact;
 }
 
-function getMissingRequiredInputs(node, graph, resultsByNodeId) {
+function getLoopCarriedArtifactsForNode(nodeId, graph, run) {
+  const loopNodeIds = graph.retryLoopNodeIdsByTargetNodeId?.get?.(nodeId);
+  if (!Array.isArray(loopNodeIds) || !loopNodeIds.length) {
+    return [];
+  }
+
+  return loopNodeIds
+    .map((loopNodeId) => {
+      const loopMeta = graph.retryLoopsByNodeId.get(loopNodeId) || null;
+      const loopState = run.loopStates?.[loopNodeId] || null;
+      if (!loopMeta || !loopState || loopMeta.retryEntryMode !== 'branchMerge') {
+        return null;
+      }
+
+      if (Number(loopState.attempt || 1) <= 1 || !loopState.carriedArtifact) {
+        return null;
+      }
+
+      return {
+        artifact: loopState.carriedArtifact,
+        loopMeta,
+        loopState,
+      };
+    })
+    .filter(Boolean);
+}
+
+function getLoopCarriedArtifactForNode(nodeId, graph, run) {
+  const carriedEntries = getLoopCarriedArtifactsForNode(nodeId, graph, run);
+  return carriedEntries.length ? carriedEntries[carriedEntries.length - 1] : null;
+}
+
+function getLoopCarriedArtifactsForNodePort(nodeId, portId, graph, run) {
+  const loopNodeIds = graph.retryLoopNodeIdsByTargetNodeId?.get?.(nodeId);
+  if (!Array.isArray(loopNodeIds) || !loopNodeIds.length) {
+    return [];
+  }
+
+  return loopNodeIds
+    .map((loopNodeId) => {
+      const loopMeta = graph.retryLoopsByNodeId.get(loopNodeId) || null;
+      const loopState = run.loopStates?.[loopNodeId] || null;
+      if (!loopMeta || !loopState || loopMeta.retryEntryMode !== 'inputPort' || loopMeta.retryEntryPortId !== portId) {
+        return null;
+      }
+
+      if (Number(loopState.attempt || 1) <= 1 || !loopState.carriedArtifact) {
+        return null;
+      }
+
+      return {
+        artifact: loopState.carriedArtifact,
+        loopMeta,
+        loopState,
+      };
+    })
+    .filter(Boolean);
+}
+
+function resolveRetryLoopTerminationAction(loopMeta, node) {
+  return String(loopMeta?.terminationAction || node?.config?.retryTerminationAction || '').trim() === 'complete' ? 'complete' : 'fail';
+}
+
+function shouldStopRetryLoopOnRepeatedArtifact(loopMeta, node) {
+  const explicitValue = typeof loopMeta?.stopWhenRetryArtifactRepeats === 'boolean'
+    ? loopMeta.stopWhenRetryArtifactRepeats
+    : node?.config?.stopWhenRetryArtifactRepeats;
+  return Boolean(explicitValue);
+}
+
+function createArtifactTerminationSignature(artifact) {
+  if (!artifact || typeof artifact !== 'object') {
+    return '';
+  }
+
+  const signatureParts = [
+    String(artifact.kind || ''),
+    String(artifact.text || ''),
+    String(artifact.previewText || ''),
+    String(artifact.summary || ''),
+    String(artifact.fileName || ''),
+    String(artifact.mimeType || ''),
+    String(artifact.width || ''),
+    String(artifact.height || ''),
+    String(artifact.sizeBytes || ''),
+  ];
+  const filePath = String(artifact.filePath || '').trim();
+  if (!filePath) {
+    return signatureParts.join('|');
+  }
+
+  try {
+    if (!fs.existsSync(filePath)) {
+      return signatureParts.join('|');
+    }
+
+    const stat = fs.statSync(filePath);
+    const hash = crypto.createHash('sha1');
+    const maxFullHashBytes = 8 * 1024 * 1024;
+    const sampleBytes = 256 * 1024;
+    if (stat.size <= maxFullHashBytes) {
+      hash.update(fs.readFileSync(filePath));
+    } else {
+      const descriptor = fs.openSync(filePath, 'r');
+      try {
+        const headLength = Math.min(sampleBytes, stat.size);
+        const headBuffer = Buffer.alloc(headLength);
+        fs.readSync(descriptor, headBuffer, 0, headLength, 0);
+        hash.update(headBuffer);
+
+        const tailLength = Math.min(sampleBytes, stat.size);
+        const tailBuffer = Buffer.alloc(tailLength);
+        fs.readSync(descriptor, tailBuffer, 0, tailLength, Math.max(0, stat.size - tailLength));
+        hash.update(tailBuffer);
+        hash.update(String(stat.size));
+      } finally {
+        fs.closeSync(descriptor);
+      }
+    }
+
+    signatureParts.push(hash.digest('hex'));
+  } catch (error) {
+    signatureParts.push(String(error?.message || 'hash-unavailable'));
+  }
+
+  return signatureParts.join('|');
+}
+
+function finalizeRetryLoopTermination({ action, loopState, message, nodeLoopState, retryArtifact, maxAttempts }) {
+  const completed = action === 'complete';
+  loopState.carriedArtifact = null;
+  loopState.lastRetryArtifactSignature = '';
+  loopState.status = completed ? 'completed' : 'failed';
+  recordLoopHistory(loopState, {
+    activeLoops: nodeLoopState.activeLoops,
+    attempt: Number(loopState.attempt || 1),
+    loopMaxAttempts: maxAttempts,
+    loopPathLabel: nodeLoopState.loopPathLabel,
+    message,
+    preview: retryArtifact ? summarizeArtifact(retryArtifact) : '',
+    selectedBranch: 'retry-terminated',
+    status: completed ? 'completed' : 'failed',
+  });
+
+  if (completed) {
+    return {
+      message,
+      outputs: {
+        result: retryArtifact,
+      },
+      preview: retryArtifact ? summarizeArtifact(retryArtifact) : '',
+      selectedBranch: 'retry-terminated',
+    };
+  }
+
+  throw new Error(message);
+}
+
+function getMissingRequiredInputs(node, graph, resultsByNodeId, run = null) {
   const definition = getNodeTypeDefinition(node?.type);
   if (!definition) {
     return [];
@@ -497,7 +823,7 @@ function getMissingRequiredInputs(node, graph, resultsByNodeId) {
 
   return (definition.inputPorts || [])
     .filter((port) => port.required)
-    .filter((port) => getNodeInputArtifacts(node.id, port.id, graph, resultsByNodeId).length === 0)
+    .filter((port) => getNodeInputArtifacts(node.id, port.id, graph, resultsByNodeId, run).length === 0)
     .map((port) => port.label);
 }
 
@@ -1023,11 +1349,14 @@ async function waitForUserValidation(run, node, artifact) {
   const nodeState = run.nodeStates[node.id];
   const iteration = Number(nodeState?.iteration || 1);
   const loopMaxAttempts = Number(nodeState?.loopMaxAttempts || 0) || null;
-  const attemptLabel = loopMaxAttempts ? 'Attempt ' + iteration + ' of ' + loopMaxAttempts : iteration > 1 ? 'Attempt ' + iteration : '';
+  const loopPathLabel = String(nodeState?.loopPathLabel || '').trim();
+  const attemptLabel = loopPathLabel || (loopMaxAttempts ? 'Attempt ' + iteration + ' of ' + loopMaxAttempts : iteration > 1 ? 'Attempt ' + iteration : '');
   const pendingValidation = {
+    activeLoops: cloneLoopContexts(nodeState?.activeLoops),
     artifact: serializeArtifactForUi(artifact),
     iteration,
     loopMaxAttempts,
+    loopPathLabel,
     mode: 'user',
     nodeId: node.id,
     nodeLabel: node.label,
@@ -1071,7 +1400,7 @@ async function waitForUserValidation(run, node, artifact) {
 }
 
 async function executeValidationNode(node, graph, run, contextMaps, reportProgress) {
-  const artifact = getNodeInputArtifact(node.id, 'input', graph, run.resultsByNodeId);
+  const artifact = getNodeInputArtifact(node.id, 'input', graph, run.resultsByNodeId, run);
   if (!artifact) {
     throw new Error('This validation step did not receive any content.');
   }
@@ -1166,6 +1495,25 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
 }
 
 function executeBranchMergeNode(node, graph, run) {
+  const carriedEntries = getLoopCarriedArtifactsForNode(node.id, graph, run);
+  if (carriedEntries.length > 1) {
+    const loopLabels = carriedEntries.map((entry) => entry.loopMeta?.loopLabel || entry.loopMeta?.loopNodeId || 'Another retry loop');
+    throw new Error('This merge step received retry artifacts from more than one active loop at the same time: ' + loopLabels.join(', ') + '. Route those loops through separate merge points so the re-entry path stays explicit.');
+  }
+
+  const carriedEntry = carriedEntries[0] || null;
+  if (carriedEntry?.artifact) {
+    const selectedArtifact = carriedEntry.artifact;
+    return {
+      message: (carriedEntry.loopMeta?.loopLabel || 'Retry loop') + ' fed its retry artifact back through this merge.',
+      outputs: {
+        result: selectedArtifact,
+      },
+      preview: summarizeArtifact(selectedArtifact),
+      selectedBranch: 'loop-retry',
+    };
+  }
+
   const activeBranchEntries = getNodeInputArtifacts(node.id, 'branch', graph, run.resultsByNodeId);
   if (!activeBranchEntries.length) {
     throw new Error('This merge step did not receive any active branch output.');
@@ -1187,12 +1535,13 @@ function executeBranchMergeNode(node, graph, run) {
       result: selectedArtifact,
     },
     preview: summarizeArtifact(selectedArtifact),
+    selectedBranch: 'connected-branch',
   };
 }
 
 function executeRetryLoopNode(node, graph, run) {
-  const completeArtifact = getNodeInputArtifact(node.id, 'complete', graph, run.resultsByNodeId);
-  const retryArtifact = getNodeInputArtifact(node.id, 'retry', graph, run.resultsByNodeId);
+  const completeArtifact = getNodeInputArtifact(node.id, 'complete', graph, run.resultsByNodeId, run);
+  const retryArtifact = getNodeInputArtifact(node.id, 'retry', graph, run.resultsByNodeId, run);
   if (completeArtifact && retryArtifact) {
     throw new Error('This Retry Loop node received both the Complete and Retry branches at the same time. Keep the loop exit and retry paths mutually exclusive.');
   }
@@ -1209,8 +1558,24 @@ function executeRetryLoopNode(node, graph, run) {
 
   const currentAttempt = Number(loopState.attempt || 1);
   const maxAttempts = Number(loopState.maxAttempts || loopMeta.maxAttempts || 1);
+  const nodeLoopState = getNodeLoopState(run, graph, node.id);
+  const terminationAction = resolveRetryLoopTerminationAction(loopMeta, node);
   if (completeArtifact) {
+    loopState.carriedArtifact = null;
+    loopState.lastRetryArtifactSignature = '';
     loopState.status = 'completed';
+    recordLoopHistory(loopState, {
+      activeLoops: nodeLoopState.activeLoops,
+      attempt: currentAttempt,
+      loopMaxAttempts: maxAttempts,
+      loopPathLabel: nodeLoopState.loopPathLabel,
+      message: currentAttempt > 1
+        ? node.label + ' exited the loop on attempt ' + currentAttempt + ' of ' + maxAttempts + '.'
+        : node.label + ' exited the loop on the first attempt.',
+      preview: summarizeArtifact(completeArtifact),
+      selectedBranch: 'complete',
+      status: 'completed',
+    });
     return {
       message: currentAttempt > 1
         ? node.label + ' exited the loop on attempt ' + currentAttempt + ' of ' + maxAttempts + '.'
@@ -1223,11 +1588,54 @@ function executeRetryLoopNode(node, graph, run) {
     };
   }
 
-  if (currentAttempt >= maxAttempts) {
-    loopState.status = 'failed';
-    throw new Error(node.label + ' reached its ' + maxAttempts + '-attempt safety limit while the Retry branch was still active. Adjust the loop or raise the limit before running it again.');
+  const retrySignature = retryArtifact ? createArtifactTerminationSignature(retryArtifact) : '';
+  const repeatedRetryArtifact = Boolean(
+    shouldStopRetryLoopOnRepeatedArtifact(loopMeta, node)
+    && retrySignature
+    && loopState.lastRetryArtifactSignature
+    && retrySignature === loopState.lastRetryArtifactSignature
+  );
+  if (repeatedRetryArtifact) {
+    const repeatedMessage = terminationAction === 'complete'
+      ? node.label + ' stopped after attempt ' + currentAttempt + ' because the Retry branch produced the same artifact twice in a row, so Local AI Hub kept the latest retry artifact.'
+      : node.label + ' stopped after attempt ' + currentAttempt + ' because the Retry branch produced the same artifact twice in a row. Adjust the loop or disable that stop rule before running it again.';
+    return finalizeRetryLoopTermination({
+      action: terminationAction,
+      loopState,
+      maxAttempts,
+      message: repeatedMessage,
+      nodeLoopState,
+      retryArtifact,
+    });
   }
 
+  if (currentAttempt >= maxAttempts) {
+    const maxAttemptMessage = terminationAction === 'complete'
+      ? node.label + ' reached its ' + maxAttempts + '-attempt stop rule while the Retry branch was still active, so Local AI Hub kept the latest retry artifact.'
+      : node.label + ' reached its ' + maxAttempts + '-attempt safety limit while the Retry branch was still active. Adjust the loop or raise the limit before running it again.';
+    return finalizeRetryLoopTermination({
+      action: terminationAction,
+      loopState,
+      maxAttempts,
+      message: maxAttemptMessage,
+      nodeLoopState,
+      retryArtifact,
+    });
+  }
+
+  loopState.carriedArtifact = retryArtifact || null;
+  loopState.lastRetryArtifactSignature = retrySignature;
+  loopState.status = 'retrying';
+  recordLoopHistory(loopState, {
+    activeLoops: nodeLoopState.activeLoops,
+    attempt: currentAttempt,
+    loopMaxAttempts: maxAttempts,
+    loopPathLabel: nodeLoopState.loopPathLabel,
+    message: node.label + ' is starting attempt ' + (currentAttempt + 1) + ' of ' + maxAttempts + ' from ' + loopMeta.retryTargetLabel + '.',
+    preview: retryArtifact ? summarizeArtifact(retryArtifact) : '',
+    selectedBranch: 'retry',
+    status: 'retrying',
+  });
   return {
     message: node.label + ' is starting attempt ' + (currentAttempt + 1) + ' of ' + maxAttempts + ' from ' + loopMeta.retryTargetLabel + '.',
     outputs: {},
@@ -1243,7 +1651,7 @@ function executeRetryLoopNode(node, graph, run) {
 }
 
 async function executeOutputNode(node, inputPortId, graph, run) {
-  const artifact = getNodeInputArtifact(node.id, inputPortId, graph, run.resultsByNodeId);
+  const artifact = getNodeInputArtifact(node.id, inputPortId, graph, run.resultsByNodeId, run);
   if (!artifact) {
     throw new Error('This output step did not receive any content to save.');
   }
@@ -1309,7 +1717,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
   }
 
   if (node.type === 'llmPrompt') {
-    const promptArtifact = getNodeInputArtifact(node.id, 'prompt', graph, run.resultsByNodeId);
+    const promptArtifact = getNodeInputArtifact(node.id, 'prompt', graph, run.resultsByNodeId, run);
     const model = String(node.config?.model || '').trim();
     const executionMode = node.config?.executionMode === 'ollama' ? 'ollama' : node.config?.executionMode === 'localTool' ? 'localTool' : 'cloud';
     const operationId = getModelStepOperationId(node);
@@ -1508,7 +1916,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
   }
   if (node.type === 'whisperTranscribe') {
 
-    const audioArtifact = getNodeInputArtifact(node.id, 'audio', graph, run.resultsByNodeId);
+    const audioArtifact = getNodeInputArtifact(node.id, 'audio', graph, run.resultsByNodeId, run);
     if (!audioArtifact?.filePath) {
       throw new Error('This Whisper step did not receive an audio file.');
     }
@@ -1542,7 +1950,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
   }
 
   if (node.type === 'imageAnalyze') {
-    const imageArtifact = getNodeInputArtifact(node.id, 'image', graph, run.resultsByNodeId);
+    const imageArtifact = getNodeInputArtifact(node.id, 'image', graph, run.resultsByNodeId, run);
     if (!imageArtifact?.filePath) {
       throw new Error('This image analysis step did not receive an image file.');
     }
@@ -1572,7 +1980,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
   }
 
   if (node.type === 'imageGenerate') {
-    const promptArtifact = getNodeInputArtifact(node.id, 'prompt', graph, run.resultsByNodeId);
+    const promptArtifact = getNodeInputArtifact(node.id, 'prompt', graph, run.resultsByNodeId, run);
     const prompt = String(promptArtifact?.text || '').trim();
     if (!prompt) {
       throw new Error('This image generation step did not receive any text prompt.');
@@ -1614,8 +2022,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     const tool = await getInstalledToolOrThrow(contextMaps, toolId, installMessage);
     return executeGraphWorkflowNode({
       inputArtifacts: {
-        image: getNodeInputArtifact(node.id, 'image', graph, run.resultsByNodeId),
-        text: getNodeInputArtifact(node.id, 'text', graph, run.resultsByNodeId),
+        image: getNodeInputArtifact(node.id, 'image', graph, run.resultsByNodeId, run),
+        text: getNodeInputArtifact(node.id, 'text', graph, run.resultsByNodeId, run),
       },
       node,
       reportProgress,
@@ -1703,7 +2111,7 @@ async function executeActiveRun(graph, context) {
       const nodeLoopState = getNodeLoopState(activeRun, graph, nodeId);
       applyNodeLoopState(nodeState, nodeLoopState);
 
-      const missingInputs = getMissingRequiredInputs(node, graph, activeRun.resultsByNodeId);
+      const missingInputs = getMissingRequiredInputs(node, graph, activeRun.resultsByNodeId, activeRun);
       if (missingInputs.length) {
         nodeState.status = 'skipped';
         nodeState.finishedAt = new Date().toISOString();
@@ -1719,8 +2127,14 @@ async function executeActiveRun(graph, context) {
       nodeState.message = 'Running now.';
       activeRun.currentNodeId = nodeId;
       activeRun.status = 'running';
-      activeRun.message = nodeLoopState.loopMaxAttempts
-        ? `Running ${node.label} (attempt ${nodeLoopState.iteration} of ${nodeLoopState.loopMaxAttempts})...`
+      const loopRunLabel = nodeLoopState.loopPathLabel
+        || (nodeLoopState.loopMaxAttempts
+          ? `Attempt ${nodeLoopState.iteration} of ${nodeLoopState.loopMaxAttempts}`
+          : nodeLoopState.iteration > 1
+            ? `Attempt ${nodeLoopState.iteration}`
+            : '');
+      activeRun.message = loopRunLabel
+        ? `Running ${node.label} (${loopRunLabel})...`
         : `Running ${node.label}...`;
       emitPipelineEvent();
 
