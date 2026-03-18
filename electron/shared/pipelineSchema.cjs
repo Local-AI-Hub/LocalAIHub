@@ -72,6 +72,7 @@ const MODEL_STEP_CLOUD_OPERATION_OPTIONS = Object.freeze([
   },
 ]);
 const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
+const VIDEO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.VIDEO_GENERATE));
 const GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getGraphWorkflowToolIds());
 const RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getRunnableGraphWorkflowToolIds());
 const DEFAULT_GRAPH_WORKFLOW_TOOL_ID = RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS[0] || GRAPH_WORKFLOW_TOOL_IDS[0] || 'comfyui';
@@ -234,7 +235,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       },
       {
         id: 'localTool',
-        label: 'Local image tool',
+        label: 'Local media tool',
       },
     ],
   }),
@@ -343,6 +344,11 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         id: 'image',
         kind: PORT_KIND_IMAGE,
         label: 'Image',
+      },
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
       },
     ],
     configDefaults: {
@@ -635,7 +641,7 @@ function resolveDynamicInputKinds(node, port) {
 
     if (executionMode === 'localTool') {
       const toolId = getModelStepLocalToolId(node, {});
-      const toolIds = toolId ? [toolId] : IMAGE_WORKFLOW_TOOL_IDS;
+      const toolIds = toolId ? [toolId] : getOperationDrivenToolIdsForModelStepOperation(operationId);
       return uniqueKindList(toolIds.flatMap((entry) => getToolPipelineOperation(entry, operationId)?.inputKinds || []));
     }
 
@@ -788,7 +794,9 @@ function getModelStepOperationId(node) {
   }
 
   if (executionMode === 'localTool') {
-    return PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+    return String(node?.config?.operationId || '').trim() === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      : PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
   }
 
   const requestedOperationId = String(node?.config?.operationId || '').trim();
@@ -797,13 +805,17 @@ function getModelStepOperationId(node) {
     : PIPELINE_OPERATION_IDS.LLM_PROMPT;
 }
 
+function getOperationDrivenToolIdsForModelStepOperation(operationId) {
+  return operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? VIDEO_WORKFLOW_TOOL_IDS : IMAGE_WORKFLOW_TOOL_IDS;
+}
+
 function getModelStepLocalToolId(node, contextMaps = {}) {
   const selectedToolId = String(node?.config?.toolId || '').trim();
   if (selectedToolId) {
     return selectedToolId;
   }
 
-  return pickAvailableToolId(IMAGE_WORKFLOW_TOOL_IDS, contextMaps);
+  return pickAvailableToolId(getOperationDrivenToolIdsForModelStepOperation(getModelStepOperationId(node)), contextMaps);
 }
 
 function getGraphWorkflowToolId(node) {
@@ -1650,14 +1662,15 @@ function resolveLlmNodeCapability(node, contextMaps = {}) {
 
   if (executionMode === 'localTool') {
     const effectiveToolId = getModelStepLocalToolId(node, contextMaps);
-    const toolIds = effectiveToolId ? [effectiveToolId] : IMAGE_WORKFLOW_TOOL_IDS;
+    const toolIds = effectiveToolId ? [effectiveToolId] : getOperationDrivenToolIdsForModelStepOperation(operationId);
     const tool = effectiveToolId ? getContextToolEntry(effectiveToolId, contextMaps) : null;
+    const fallbackLabel = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? 'Wan2.1 WebUI' : 'Automatic1111 or Forge';
     return {
       capability: mergeCapabilityOperations(toolIds.map((toolId) => getContextToolOperation(toolId, operationId, contextMaps))),
       operationId,
       targetId: effectiveToolId || '',
       targetKind: 'tool',
-      targetLabel: tool?.name || 'Automatic1111 or Forge',
+      targetLabel: tool?.name || fallbackLabel,
     };
   }
 
@@ -2427,12 +2440,21 @@ function analyzeImageToolNode(node, summary, contextMaps) {
 }
 
 function analyzeModelStepLocalToolNode(node, summary, contextMaps) {
+  const operationId = getModelStepOperationId(node);
   const selectedToolId = String(node.config?.toolId || '').trim();
+  const supportedToolIds = getOperationDrivenToolIdsForModelStepOperation(operationId);
   const effectiveToolId = getModelStepLocalToolId(node, contextMaps);
-  if (selectedToolId && !IMAGE_WORKFLOW_TOOL_IDS.includes(selectedToolId)) {
+  const installMessage = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+    ? 'Install Wan2.1 WebUI before using local video generation in a model step.'
+    : 'Install Automatic1111 or Forge before using the local image tool mode in a model step.';
+  const selectionMessage = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+    ? 'Choose Wan2.1 WebUI for this local video model step. ComfyUI video workflows use the dedicated Graph Workflow step instead of this model-step mode.'
+    : 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.';
+
+  if (selectedToolId && !supportedToolIds.includes(selectedToolId)) {
     summary.readiness = {
       tone: 'error',
-      message: 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.',
+      message: selectionMessage,
     };
     return false;
   }
@@ -2440,7 +2462,7 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps) {
   if (!effectiveToolId) {
     summary.readiness = {
       tone: 'error',
-      message: 'Install Automatic1111 or Forge before using the local image tool mode in a model step.',
+      message: installMessage,
     };
     return false;
   }
@@ -2449,9 +2471,26 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps) {
   if (!tool) {
     summary.readiness = {
       tone: 'error',
-      message: 'Install Automatic1111 or Forge before using the local image tool mode in a model step.',
+      message: installMessage,
     };
     return false;
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+    const videoSize = String(node.config?.videoSize || '').trim();
+    if (tool.id === 'wan21-webui' && videoSize && !['832x480', '1280x720'].includes(videoSize)) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Wan2.1 currently supports 832x480 or 1280x720 in this first local-video pipeline slice. Choose one of those video sizes or use ComfyUI graph workflows for other layouts.',
+      };
+      return false;
+    }
+
+    summary.readiness = {
+      tone: 'info',
+      message: tool.name + ' will run this video generation step through its dedicated local backend adapter. Local AI Hub keeps the pipeline sequential and saves the rendered video back into the run folder.',
+    };
+    return true;
   }
 
   if (String(tool.status || '').toLowerCase() !== 'running') {
@@ -2500,85 +2539,101 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
     return false;
   }
 
-  const textBinding = getGraphWorkflowInputBinding(node, 'text');
-  const imageBinding = getGraphWorkflowInputBinding(node, 'image');
-  const outputBinding = getGraphWorkflowOutputBinding(node, 'image');
-  const textNodeId = String(textBinding.nodeId || '').trim();
-  const textField = String(textBinding.field || '').trim();
-  const imageNodeId = String(imageBinding.nodeId || '').trim();
-  const imageField = String(imageBinding.field || '').trim();
-  const outputNodeId = String(outputBinding.nodeId || '').trim();
+  const inputBoundaryMessages = {
+    image: {
+      field: 'The mapped image boundary field could not be found in the imported workflow definition.',
+      missing: 'Map the Image input boundary to a workflow node and field before running this graph workflow step.',
+      node: 'The mapped image boundary node could not be found in the imported workflow definition.',
+    },
+    text: {
+      field: 'The mapped text boundary field could not be found in the imported workflow definition.',
+      missing: 'Map the Text input boundary to a workflow node and field before running this graph workflow step.',
+      node: 'The mapped text boundary node could not be found in the imported workflow definition.',
+    },
+  };
 
-  const textConnected = getIncomingKindsForNodePort(node, 'text', graph).length > 0;
-  if (textConnected && (!textNodeId || !textField || textBinding.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_FIELD)) {
-    summary.readiness = {
-      tone: 'error',
-      message: 'Map the Text input boundary to a workflow node and field before running this graph workflow step.',
-    };
-    return false;
-  }
+  for (const inputSpec of contract.inputPorts || []) {
+    const portId = String(inputSpec.portId || '').trim();
+    const binding = getGraphWorkflowInputBinding(node, portId);
+    const nodeId = String(binding.nodeId || '').trim();
+    const field = String(binding.field || '').trim();
+    const connected = getIncomingKindsForNodePort(node, portId, graph).length > 0;
+    const messages = inputBoundaryMessages[portId] || inputBoundaryMessages.text;
+    if (connected && (!nodeId || !field || binding.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_FIELD)) {
+      summary.readiness = {
+        tone: 'error',
+        message: messages.missing,
+      };
+      return false;
+    }
 
-  if (textNodeId) {
-    const workflowNode = getGraphWorkflowNodeEntry(parsedWorkflow.workflow, textNodeId);
+    if (!nodeId) {
+      continue;
+    }
+
+    const workflowNode = getGraphWorkflowNodeEntry(parsedWorkflow.workflow, nodeId);
     if (!workflowNode) {
       summary.readiness = {
         tone: 'error',
-        message: 'The mapped text boundary node could not be found in the imported workflow definition.',
+        message: messages.node,
       };
       return false;
     }
 
-    if (!textField || !workflowNode.inputs || typeof workflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(workflowNode.inputs, textField)) {
+    if (!field || !workflowNode.inputs || typeof workflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(workflowNode.inputs, field)) {
       summary.readiness = {
         tone: 'error',
-        message: 'The mapped text boundary field could not be found in the imported workflow definition.',
+        message: messages.field,
       };
       return false;
     }
   }
 
-  const imageConnected = getIncomingKindsForNodePort(node, 'image', graph).length > 0;
-  if (imageConnected && (!imageNodeId || !imageField || imageBinding.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_FIELD)) {
+  const supportedOutputKinds = (contract.outputPorts || []).map((entry) => entry.kind);
+  const unexpectedOutputMessage = getUnexpectedOutputConnectionMessage(node, supportedOutputKinds, graph);
+  if (unexpectedOutputMessage) {
     summary.readiness = {
       tone: 'error',
-      message: 'Map the Image input boundary to a workflow node and field before running this graph workflow step.',
+      message: unexpectedOutputMessage,
     };
     return false;
   }
 
-  if (imageNodeId) {
-    const workflowNode = getGraphWorkflowNodeEntry(parsedWorkflow.workflow, imageNodeId);
-    if (!workflowNode) {
-      summary.readiness = {
-        tone: 'error',
-        message: 'The mapped image boundary node could not be found in the imported workflow definition.',
-      };
-      return false;
-    }
+  const outgoingEdges = graph.outgoingEdgesByNode.get(node.id) || [];
+  const connectedOutputPortIds = [...new Set(outgoingEdges.map((edge) => String(edge?.source?.portId || '').trim()).filter(Boolean))];
+  const requiredOutputSpecs = connectedOutputPortIds.length
+    ? (contract.outputPorts || []).filter((entry) => connectedOutputPortIds.includes(String(entry.portId || '').trim()))
+    : contract.outputPorts || [];
 
-    if (!imageField || !workflowNode.inputs || typeof workflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(workflowNode.inputs, imageField)) {
-      summary.readiness = {
-        tone: 'error',
-        message: 'The mapped image boundary field could not be found in the imported workflow definition.',
-      };
-      return false;
-    }
-  }
-
-  if (!outputNodeId || outputBinding.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_OUTPUT) {
+  if (!requiredOutputSpecs.length) {
     summary.readiness = {
       tone: 'error',
-      message: 'Choose the workflow node that should feed the Image output boundary before running this graph workflow step.',
+      message: 'Choose at least one output boundary for this graph workflow step before running it.',
     };
     return false;
   }
 
-  if (!getGraphWorkflowNodeEntry(parsedWorkflow.workflow, outputNodeId)) {
-    summary.readiness = {
-      tone: 'error',
-      message: 'The selected image output boundary node could not be found in the imported workflow definition.',
-    };
-    return false;
+  for (const outputSpec of requiredOutputSpecs) {
+    const portId = String(outputSpec.portId || '').trim();
+    const outputBinding = getGraphWorkflowOutputBinding(node, portId);
+    const outputNodeId = String(outputBinding.nodeId || '').trim();
+    const outputLabel = outputSpec.label || (PIPELINE_PORT_KIND_LABELS[normalizePortKind(outputSpec.kind)] || 'workflow output');
+    const lowerLabel = String(outputLabel).toLowerCase();
+    if (!outputNodeId || outputBinding.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_OUTPUT) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Choose the workflow node that should feed the ' + outputLabel + ' boundary before running this graph workflow step.',
+      };
+      return false;
+    }
+
+    if (!getGraphWorkflowNodeEntry(parsedWorkflow.workflow, outputNodeId)) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'The selected ' + lowerLabel + ' boundary node could not be found in the imported workflow definition.',
+      };
+      return false;
+    }
   }
 
   const installedTool = contextMaps.toolsById[toolId] || null;
@@ -2600,10 +2655,11 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
 
   summary.readiness = {
     tone: 'info',
-    message: installedTool.name + ' will run the imported ' + (contract.workflowFormat?.label || 'graph workflow definition') + ' and return the selected image artifact back into the main pipeline.',
+    message: installedTool.name + ' will run the imported ' + (contract.workflowFormat?.label || 'graph workflow definition') + ' and return the selected typed output back into the main pipeline.',
   };
   return true;
 }
+
 function analyzePipeline(definition = {}, context = {}) {
   const graph = buildPipelineGraph(definition);
   const contextMaps = buildContextMaps(context);
@@ -3127,6 +3183,7 @@ module.exports = {
   PORT_KIND_TEXT,
   PORT_KIND_VIDEO,
   SUPPORTED_PORT_KINDS,
+  VIDEO_WORKFLOW_TOOL_IDS,
   WHISPER_MODELS,
   analyzePipeline,
   arePortsCompatible,

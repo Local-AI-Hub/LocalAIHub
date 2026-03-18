@@ -3,6 +3,21 @@ const fs = require('fs-extra');
 
 const { compareVersions, formatVersion } = require('./commandService');
 
+const DEFAULT_REQUIREMENT_STRATEGIES = [
+  {
+    kind: 'pyproject',
+    file: 'pyproject.toml',
+  },
+  {
+    kind: 'setup-cfg',
+    file: 'setup.cfg',
+  },
+  {
+    kind: 'setup-py',
+    file: 'setup.py',
+  },
+];
+
 function parseVersionParts(value) {
   return String(value || '')
     .trim()
@@ -19,7 +34,7 @@ function parseSpecifier(specifier) {
     .map((clause) => {
       const match = clause.match(/^(<=|>=|==|!=|~=|<|>)\s*([0-9][0-9A-Za-z_.-]*)$/);
       if (!match) {
-        throw new Error(`Local AI Hub could not read the Python version rule \"${clause}\".`);
+        throw new Error(`Local AI Hub could not read the Python version rule "${clause}".`);
       }
 
       return {
@@ -122,6 +137,89 @@ function detectAutomatic1111Requirement(content, strategy) {
   };
 }
 
+function detectClassifiedPythonMinors(content, strategy) {
+  const supportedMinors = [...content.matchAll(/Programming Language :: Python :: 3\.(\d+)/g)]
+    .map((match) => Number.parseInt(match[1], 10))
+    .filter((value) => Number.isFinite(value));
+
+  if (!supportedMinors.length) {
+    return null;
+  }
+
+  return {
+    kind: 'minor-list',
+    source: strategy.file,
+    supportedMinors: [...new Set(supportedMinors)].sort((left, right) => left - right),
+  };
+}
+
+function normalizeDetectedSpecifier(value) {
+  return String(value || '').trim().replace(/^['"]|['"]$/g, '');
+}
+
+function detectSetupCfgRequirement(content, strategy) {
+  const match = content.match(/^[ \t]*python_requires\s*=\s*(.+)$/im);
+  if (match?.[1]) {
+    const specifier = normalizeDetectedSpecifier(match[1]);
+    if (specifier) {
+      return {
+        kind: 'specifier',
+        source: strategy.file,
+        specifier,
+      };
+    }
+  }
+
+  const classifierRequirement = detectClassifiedPythonMinors(content, strategy);
+  if (classifierRequirement) {
+    return classifierRequirement;
+  }
+
+  throw new Error('Local AI Hub could not find a Python requirement in setup.cfg.');
+}
+
+function detectSetupPyRequirement(content, strategy) {
+  const match = content.match(/python_requires\s*=\s*["']([^"']+)["']/i);
+  if (match?.[1]) {
+    return {
+      kind: 'specifier',
+      source: strategy.file,
+      specifier: normalizeDetectedSpecifier(match[1]),
+    };
+  }
+
+  const classifierRequirement = detectClassifiedPythonMinors(content, strategy);
+  if (classifierRequirement) {
+    return classifierRequirement;
+  }
+
+  throw new Error('Local AI Hub could not find a Python requirement in setup.py.');
+}
+
+function buildRequirementStrategies(manifest) {
+  const manifestStrategies = manifest.installInstructions?.pythonRequirementDetection || manifest.pythonRequirementDetection || [];
+  const seen = new Set();
+  const ordered = [];
+
+  for (const strategy of [...manifestStrategies, ...DEFAULT_REQUIREMENT_STRATEGIES]) {
+    const kind = String(strategy?.kind || '').trim();
+    const file = String(strategy?.file || '').trim();
+    if (!kind || !file) {
+      continue;
+    }
+
+    const key = `${kind}::${file.toLowerCase()}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    ordered.push({ kind, file });
+  }
+
+  return ordered;
+}
+
 async function readRequirementFromStrategy(appDir, strategy) {
   const filePath = path.join(appDir, strategy.file);
   if (!(await fs.pathExists(filePath))) {
@@ -136,6 +234,14 @@ async function readRequirementFromStrategy(appDir, strategy) {
 
   if (strategy.kind === 'automatic1111-launch-utils') {
     return detectAutomatic1111Requirement(content, strategy);
+  }
+
+  if (strategy.kind === 'setup-cfg') {
+    return detectSetupCfgRequirement(content, strategy);
+  }
+
+  if (strategy.kind === 'setup-py') {
+    return detectSetupPyRequirement(content, strategy);
   }
 
   throw new Error(`Local AI Hub does not know how to inspect the Python rules from ${strategy.file}.`);
@@ -162,18 +268,25 @@ async function detectPythonRequirement(appDir, manifest, logger) {
     };
   }
 
-  const strategies = manifest.installInstructions?.pythonRequirementDetection || manifest.pythonRequirementDetection || [];
+  const strategies = buildRequirementStrategies(manifest);
   for (const strategy of strategies) {
-    const requirement = await readRequirementFromStrategy(appDir, strategy);
-    if (!requirement) {
-      continue;
-    }
+    try {
+      const requirement = await readRequirementFromStrategy(appDir, strategy);
+      if (!requirement) {
+        continue;
+      }
 
-    await logger.info('Python requirement detected from the downloaded tool files.', {
-      source: requirement.source,
-      requirement: requirement.kind === 'minor-list' ? requirement.supportedMinors : requirement.specifier,
-    });
-    return requirement;
+      await logger.info('Python requirement detected from the downloaded tool files.', {
+        source: requirement.source,
+        requirement: requirement.kind === 'minor-list' ? requirement.supportedMinors : requirement.specifier,
+      });
+      return requirement;
+    } catch (error) {
+      await logger.warn('A Python requirement strategy did not resolve a usable version rule. Trying the next metadata file.', {
+        strategy,
+        error,
+      });
+    }
   }
 
   throw new Error(
@@ -218,5 +331,3 @@ module.exports = {
   requirementToLabel,
   versionSatisfiesRequirement,
 };
-
-

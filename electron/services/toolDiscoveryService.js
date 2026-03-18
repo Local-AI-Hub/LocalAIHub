@@ -548,6 +548,10 @@ async function managedToolLauncherExists(tool) {
     return fileExists(tool.launchProfile.pythonPath);
   }
 
+  if (tool.launchProfile?.kind === 'embedded' && tool.launchProfile?.pythonPath) {
+    return fileExists(tool.launchProfile.pythonPath);
+  }
+
   if (tool.launchProfile?.kind === 'batch' && tool.launchProfile?.command) {
     return fileExists(tool.launchProfile.command);
   }
@@ -627,7 +631,7 @@ function buildRecoveredManagedToolState(manifest, existingTool = {}, installDir)
     launchSupported: true,
     lastError: null,
     lastRepairMessage: null,
-    status: existingTool?.status === 'running' || existingTool?.status === 'starting' ? 'stopped' : existingTool?.status || 'stopped',
+    status: existingTool?.status === 'running' || existingTool?.status === 'starting' || existingTool?.status === 'error' ? 'stopped' : existingTool?.status || 'stopped',
   };
 }
 
@@ -709,29 +713,26 @@ async function performDiscoveryScan() {
   for (const manifest of manifests) {
     const existingTool = config.tools[manifest.id];
     const result = discoveryResults?.[manifest.id] || {};
+    const trackedManagedTool = existingTool?.source === 'managed' || existingTool?.managedByLocalAIHub;
 
     if (result.shouldTreatAsManaged) {
-      if (result.managedInstallDir) {
+      if (trackedManagedTool && result.managedInstallDir) {
         const recoveredManagedTool = buildRecoveredManagedToolState(manifest, existingTool, result.managedInstallDir);
         if (await managedToolLauncherExists(recoveredManagedTool)) {
           nextTools[manifest.id] = recoveredManagedTool;
           continue;
         }
-
         nextTools[manifest.id] = buildBrokenManagedToolState(existingTool, manifest, result.managedInstallDir);
         continue;
       }
-
       if (result.externalDetected) {
         nextTools[manifest.id] = buildExternalToolState(manifest, existingTool, result.externalDetected);
         continue;
       }
-
       nextTools[manifest.id] = buildMissingManagedToolState(existingTool || {}, manifest);
       continue;
     }
-
-    if (result.managedInstallDir) {
+    if (trackedManagedTool && result.managedInstallDir) {
       const recoveredManagedTool = buildRecoveredManagedToolState(manifest, existingTool, result.managedInstallDir);
       if (await managedToolLauncherExists(recoveredManagedTool)) {
         nextTools[manifest.id] = recoveredManagedTool;
@@ -788,4 +789,5 @@ module.exports = {
   invalidateDiscoveryCache,
   syncDiscoveredTools,
 };
+
 

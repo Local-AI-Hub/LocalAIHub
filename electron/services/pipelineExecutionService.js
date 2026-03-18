@@ -27,6 +27,7 @@ const {
   resolveSelectedImageTool,
 } = require('./workflowToolService');
 const { executeGraphWorkflowNode } = require('./graphWorkflowService');
+const { generateVideoWithLocalVideoTool } = require('./localVideoService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const { getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
@@ -123,7 +124,7 @@ function collectSelectedLocalImageToolIds(definition = {}) {
   let hasLocalImageModelStep = false;
 
   for (const node of Array.isArray(definition?.nodes) ? definition.nodes : []) {
-    if (node?.type !== 'llmPrompt' || node?.config?.executionMode !== 'localTool') {
+    if (node?.type !== 'llmPrompt' || node?.config?.executionMode !== 'localTool' || getModelStepOperationId(node) !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
       continue;
     }
 
@@ -863,6 +864,52 @@ async function buildFileMessageContentPart(artifact) {
   return buildArtifactMessageContentPart(artifact, 'file');
 }
 
+function getArtifactBinaryPartType(artifact, fallbackType = 'file') {
+  const partType = String(artifact?.attachmentKind || '').trim().toLowerCase();
+  if (partType === 'image' || partType === 'video' || partType === 'file') {
+    return partType;
+  }
+
+  return fallbackType;
+}
+
+function getArtifactReviewLabel(artifact) {
+  if (!artifact) {
+    return 'artifact';
+  }
+
+  if (artifact.kind === PORT_KIND_VIDEO && artifact.previewKind === 'animated-image') {
+    return 'animated image';
+  }
+
+  if (artifact.kind === PORT_KIND_VIDEO) {
+    return 'video';
+  }
+
+  if (artifact.kind === PORT_KIND_IMAGE) {
+    return artifact.isAnimated ? 'animated image' : 'image';
+  }
+
+  if (artifact.kind === PORT_KIND_FILE) {
+    return 'file';
+  }
+
+  return artifact.kind || 'artifact';
+}
+
+async function buildPreferredArtifactMessageContentPart(artifact, fallbackType = 'file') {
+  const partType = getArtifactBinaryPartType(artifact, fallbackType);
+  if (partType === 'image') {
+    return buildImageMessageContentPart(artifact);
+  }
+
+  if (partType === 'video') {
+    return buildVideoMessageContentPart(artifact);
+  }
+
+  return buildFileMessageContentPart(artifact);
+}
+
 function uniqueKinds(values = []) {
   return [...new Set((Array.isArray(values) ? values : [values]).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))];
 }
@@ -915,6 +962,8 @@ function getValidationEvidenceModeLabel(reviewContext = {}) {
       return 'The validator can inspect the attached image directly.';
     case 'direct-video':
       return 'The validator can inspect the attached video directly.';
+    case 'direct-animated-image':
+      return 'The validator can inspect the attached animated image directly as motion evidence.';
     case 'direct-file':
       return 'The validator can inspect the attached file directly.';
     case 'derived-file-text':
@@ -1019,12 +1068,14 @@ async function buildLlmMessages(node, inputArtifact) {
     }
 
     const artifactDescription = await describeArtifactForLlm(inputArtifact);
-    const attachment = inputArtifact.kind === PORT_KIND_VIDEO
-      ? await buildVideoMessageContentPart(inputArtifact)
-      : await buildFileMessageContentPart(inputArtifact);
-    const defaultPrompt = inputArtifact.kind === PORT_KIND_VIDEO
-      ? 'Review this video and respond in plain English.'
-      : 'Review this file and respond in plain English.';
+    const attachmentPartType = inputArtifact.kind === PORT_KIND_VIDEO
+      ? getArtifactBinaryPartType(inputArtifact, 'video')
+      : getArtifactBinaryPartType(inputArtifact, 'file');
+    const attachment = await buildPreferredArtifactMessageContentPart(inputArtifact, inputArtifact.kind === PORT_KIND_VIDEO ? 'video' : 'file');
+    const reviewLabel = inputArtifact.kind === PORT_KIND_VIDEO && attachmentPartType === 'image'
+      ? 'animated image'
+      : getArtifactReviewLabel(inputArtifact);
+    const defaultPrompt = 'Review this ' + reviewLabel + ' and respond in plain English.';
 
     messages.push({
       role: 'user',
@@ -1076,8 +1127,10 @@ async function buildVideoGenerationRequest(node, inputArtifact) {
     }
 
     return {
+      negativePrompt: String(node.config?.negativePrompt || '').trim(),
       prompt: motionPrompt ? motionPrompt + '\n\nPrompt:\n' + promptText : promptText,
       referenceImage: null,
+      referenceImagePath: '',
       size,
     };
   }
@@ -1100,12 +1153,14 @@ async function buildVideoGenerationRequest(node, inputArtifact) {
     }
 
     return {
+      negativePrompt: String(node.config?.negativePrompt || '').trim(),
       prompt: motionPrompt,
       referenceImage: {
         buffer: await fs.readFile(filePath),
         fileName: String(inputArtifact.fileName || path.basename(filePath)).trim() || path.basename(filePath),
         mimeType: String(inputArtifact.mimeType || 'image/png').trim() || 'image/png',
       },
+      referenceImagePath: filePath,
       size,
     };
   }
@@ -1131,10 +1186,11 @@ async function buildValidationMessages(node, artifact, contextMaps) {
     }
   } else if (artifact?.kind === PORT_KIND_VIDEO) {
     if (canAttachValidationVideoDirectly(node, artifact, profile)) {
-      attachments.push(await buildVideoMessageContentPart(artifact));
-      evidenceMode = 'direct-video';
+      const attachmentPartType = getArtifactBinaryPartType(artifact, 'video');
+      attachments.push(await buildPreferredArtifactMessageContentPart(artifact, 'video'));
+      evidenceMode = attachmentPartType === 'image' ? 'direct-animated-image' : 'direct-video';
     } else {
-      limitations.push('The selected validator cannot inspect the raw video directly in this step. Only metadata and any extracted notes below are available.');
+      limitations.push('The selected validator cannot inspect this ' + getArtifactReviewLabel(artifact) + ' directly in this step. Only metadata and any extracted notes below are available.');
     }
   } else if (artifact?.kind === PORT_KIND_FILE) {
     if (canAttachValidationFileDirectly(node, artifact, profile)) {
@@ -1308,8 +1364,21 @@ async function getSelectedImageToolOrThrow(contextMaps, node, actionLabel) {
     `Install Automatic1111 or Forge before using the ${actionLabel} step.`,
   );
 }
+
+async function getSelectedLocalVideoToolOrThrow(contextMaps, node, actionLabel) {
+  const selectedToolId = String(node?.config?.toolId || 'wan21-webui').trim().toLowerCase() || 'wan21-webui';
+  return getInstalledToolOrThrow(
+    contextMaps,
+    selectedToolId,
+    `Install Wan2.1 WebUI before using the ${actionLabel} step.`,
+  );
+}
 async function buildValidationArtifactDescription(artifact, contextMaps) {
   let description = await describeArtifactForLlm(artifact);
+
+  if (artifact?.kind === PORT_KIND_IMAGE && artifact.isAnimated) {
+    description = `${description}\n\nThis image is animated rather than a single still frame.`;
+  }
 
   if (artifact?.kind === PORT_KIND_IMAGE && artifact.filePath) {
     const imageTool = resolveSelectedImageTool(contextMaps, { config: {} });
@@ -1335,7 +1404,9 @@ async function buildValidationArtifactDescription(artifact, contextMaps) {
   }
 
   if (artifact?.kind === PORT_KIND_VIDEO) {
-    description = `${description}\n\nLocal AI Hub does not extract video frames in this build. Validators without direct video support only receive the metadata above.`;
+    description = artifact.previewKind === 'animated-image'
+      ? `${description}\n\nThis motion artifact is stored as an animated image file rather than an mp4-style video container. Validators without direct motion support only receive the metadata above.`
+      : `${description}\n\nLocal AI Hub does not extract video frames in this build. Validators without direct video support only receive the metadata above.`;
   }
 
   return description;
@@ -1725,7 +1796,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       throw new Error('This LLM step did not receive any input.');
     }
 
-    if (!model) {
+    const requiresExplicitModel = !(executionMode === 'localTool' && operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE);
+    if (!model && requiresExplicitModel) {
       throw new Error('Choose or enter a model for the model step before running this pipeline.');
     }
 
@@ -1770,8 +1842,28 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     }
 
     if (executionMode === 'localTool') {
+      if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+        const tool = await getSelectedLocalVideoToolOrThrow(contextMaps, node, 'local video generation');
+        const videoRequest = await buildVideoGenerationRequest(node, promptArtifact);
+        reportProgress?.('Sending the request to ' + tool.name + ' for local video generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
+        return generateVideoWithLocalVideoTool(tool, {
+          displayName: node.label,
+          fps: 15,
+          model,
+          negativePrompt: videoRequest.negativePrompt,
+          nodeLabel: node.label,
+          prompt: videoRequest.prompt,
+          referenceImagePath: videoRequest.referenceImagePath,
+          reportProgress,
+          runDirectories: run.directories,
+          seed: node.config?.seed,
+          size: videoRequest.size,
+          steps: node.config?.steps,
+        });
+      }
+
       if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-        throw new Error('Local AI Hub currently supports only text-to-image generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
+        throw new Error('Local AI Hub currently supports only image or video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
       }
 
       const prompt = buildImageGenerationPrompt(node, promptArtifact);

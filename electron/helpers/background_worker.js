@@ -662,6 +662,7 @@ async function resolveDetectionPath(detectionPath) {
 }
 
 function getTrackedPathCandidates(existingTool, manifest, appPaths) {
+  const trackedManagedTool = existingTool?.source === 'managed' || existingTool?.managedByLocalAIHub;
   return uniquePaths([
     existingTool?.detectedPath,
     existingTool?.displayPath,
@@ -671,12 +672,16 @@ function getTrackedPathCandidates(existingTool, manifest, appPaths) {
     existingTool?.launchProfile?.command,
     existingTool?.launchProfile?.pythonPath,
     existingTool?.externalPythonPath,
-    path.join(appPaths.toolsRoot, manifest.id),
-    path.join(appPaths.toolsRoot, manifest.id, 'app'),
-    ...(appPaths.legacyRoots || []).flatMap((legacyRoot) => [
-      path.join(legacyRoot, 'tools', manifest.id),
-      path.join(legacyRoot, 'tools', manifest.id, 'app'),
-    ]),
+    ...(trackedManagedTool
+      ? [
+          path.join(appPaths.toolsRoot, manifest.id),
+          path.join(appPaths.toolsRoot, manifest.id, 'app'),
+          ...(appPaths.legacyRoots || []).flatMap((legacyRoot) => [
+            path.join(legacyRoot, 'tools', manifest.id),
+            path.join(legacyRoot, 'tools', manifest.id, 'app'),
+          ]),
+        ]
+      : []),
   ].filter(Boolean));
 }
 
@@ -850,7 +855,7 @@ async function discoverTools(payload = {}) {
           normalizeInstallDirCandidate(existingTool?.appDir),
           ...getAllowedManagedInstallDirs(manifest, appPaths),
         ]
-      : getAllowedManagedInstallDirs(manifest, appPaths);
+      : [];
 
     const managedInstallDir = await findManagedInstallCandidate(manifest, managedCandidates, appPaths);
     const externalDetected =

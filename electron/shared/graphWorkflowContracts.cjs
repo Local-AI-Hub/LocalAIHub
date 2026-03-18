@@ -15,6 +15,7 @@ const GRAPH_WORKFLOW_BOUNDARY_DIRECTION_IDS = Object.freeze({
 
 const PORT_KIND_TEXT = 'text';
 const PORT_KIND_IMAGE = 'image';
+const PORT_KIND_VIDEO = 'video';
 const DEFAULT_GRAPH_WORKFLOW_TOOL_ID = 'comfyui';
 const INVOKEAI_RESERVED_GRAPH_FIELDS = new Set(['id', 'is_intermediate', 'type', 'use_cache']);
 
@@ -47,6 +48,13 @@ const GRAPH_WORKFLOW_TOOL_CONTRACTS = Object.freeze({
         kind: PORT_KIND_IMAGE,
         label: 'Workflow Image',
         portId: 'image',
+      }),
+      Object.freeze({
+        bindingMode: GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_OUTPUT,
+        description: 'Choose the ComfyUI node whose saved video should return to the main pipeline as an explicit video artifact.',
+        kind: PORT_KIND_VIDEO,
+        label: 'Workflow Video',
+        portId: 'video',
       }),
     ]),
     supportsExecution: true,
@@ -248,6 +256,7 @@ function buildComfyUiNodeEntry(id, entry) {
     id: String(id || '').trim(),
     imageOutputCandidate: /^(PreviewImage|SaveImage|SaveAnimatedWEBP)$/i.test(classType),
     inputFields,
+    videoOutputCandidate: /^(SaveVideo|VHS_VideoCombine|VideoCombine|SaveAnimatedWEBP)$/i.test(classType),
   };
 }
 
@@ -302,9 +311,13 @@ function parseComfyUiWorkflowDefinition(workflowText) {
   const imageOutputNodeOptions = nodeEntries.some((entry) => entry.imageOutputCandidate)
     ? nodeEntries.filter((entry) => entry.imageOutputCandidate)
     : nodeEntries;
+  const videoOutputNodeOptions = nodeEntries.some((entry) => entry.videoOutputCandidate)
+    ? nodeEntries.filter((entry) => entry.videoOutputCandidate)
+    : nodeEntries;
 
   return {
     imageOutputNodeOptions,
+    videoOutputNodeOptions,
     message: 'Loaded ' + nodeEntries.length + ' workflow nodes from ComfyUI API JSON.',
     nodeEntries,
     ok: true,
@@ -586,6 +599,7 @@ function parseGraphWorkflowDefinitionText(toolId, workflowText) {
   return {
     contract,
     imageOutputNodeOptions: [],
+    videoOutputNodeOptions: [],
     message: raw
       ? contract.executionBlockedMessage
       : contract.workflowFormat?.summary || contract.executionBlockedMessage,
@@ -639,8 +653,13 @@ function getGraphWorkflowOutputNodeOptions(definition, portId = 'image') {
     return [];
   }
 
-  if (String(portId || '').trim() === 'image' && Array.isArray(definition.imageOutputNodeOptions) && definition.imageOutputNodeOptions.length) {
+  const normalizedPortId = String(portId || '').trim();
+  if (normalizedPortId === 'image' && Array.isArray(definition.imageOutputNodeOptions) && definition.imageOutputNodeOptions.length) {
     return [...definition.imageOutputNodeOptions];
+  }
+
+  if (normalizedPortId === 'video' && Array.isArray(definition.videoOutputNodeOptions) && definition.videoOutputNodeOptions.length) {
+    return [...definition.videoOutputNodeOptions];
   }
 
   return [...(definition.nodeEntries || [])];

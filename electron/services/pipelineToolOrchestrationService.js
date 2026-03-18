@@ -1,4 +1,5 @@
-const { getLocalToolRequirement } = require('../shared/pipelineSchema.cjs');
+const { getLocalToolRequirement, getModelStepExecutionMode, getModelStepOperationId, PIPELINE_OPERATION_IDS } = require('../shared/pipelineSchema.cjs');
+const { getLocalVideoToolRuntimeMode, LOCAL_VIDEO_RUNTIME_MODE_IDS } = require('./localVideoService');
 const { isToolActive, isToolReady, launchToolFromUserAction, stopTool } = require('./processService');
 const { getResolvedToolState } = require('./toolStateService');
 
@@ -136,6 +137,13 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
   async function ensureToolForNode(node, reportProgress) {
     const requiredToolId = getLocalToolRequirement(node, contextMaps);
     if (!requiredToolId) {
+      return null;
+    }
+
+    if (node?.type === 'llmPrompt'
+      && getModelStepExecutionMode(node) === 'localTool'
+      && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      && getLocalVideoToolRuntimeMode(requiredToolId) === LOCAL_VIDEO_RUNTIME_MODE_IDS.DIRECT_COMMAND) {
       return null;
     }
 

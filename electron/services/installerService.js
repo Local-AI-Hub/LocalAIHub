@@ -524,7 +524,7 @@ async function extractArchive(archivePath, targetDirectory, logger) {
   await fs.ensureDir(tempDirectory);
 
   const extension = path.extname(archivePath).toLowerCase();
-  if (extension === '.7z') {
+  if (extension === '.7z' || extension === '.exe') {
     const sevenZipPath = app.isPackaged
       ? path.join(process.resourcesPath, 'bin', '7za.exe')
       : path.join(__dirname, '..', '..', 'node_modules', '7zip-bin', 'win', 'x64', '7za.exe');
@@ -536,7 +536,7 @@ async function extractArchive(archivePath, targetDirectory, logger) {
     await fs.emptyDir(tempDirectory);
     await runCommand(sevenZipPath, ['x', archivePath, '-y', `-o${tempDirectory}`], {
       cwd: path.dirname(archivePath),
-      errorMessage: 'Local AI Hub could not unpack the 7-Zip installer package.',
+      errorMessage: 'Local AI Hub could not unpack the installer package.',
     });
   } else {
     await extract(archivePath, { dir: tempDirectory });
@@ -796,6 +796,14 @@ async function toolIsAvailable(toolState) {
     return fs.pathExists(toolState.launchProfile.pythonPath);
   }
 
+  if (toolState.launchProfile?.kind === 'embedded' && toolState.launchProfile?.pythonPath) {
+    if (isBareCommand(toolState.launchProfile.pythonPath)) {
+      return toolState.installDir ? fs.pathExists(toolState.installDir) : true;
+    }
+
+    return fs.pathExists(toolState.launchProfile.pythonPath);
+  }
+
   if (toolState.launchProfile?.kind === 'batch' && toolState.launchProfile?.command) {
     return fs.pathExists(toolState.launchProfile.command);
   }
@@ -897,6 +905,125 @@ function resolveInstallerArgs(manifest, installDir, appDir) {
     .filter(Boolean);
 }
 
+function quoteWindowsShellArgument(value) {
+  const text = String(value || '');
+  if (!text) {
+    return '""';
+  }
+
+  return /[\s"]/u.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function isInstallerAccessError(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const message = String(error?.message || '');
+  return code === 'EACCES' || code === 'EPERM' || /\b(EACCES|EPERM)\b/i.test(message);
+}
+
+async function runInstallerExecutableFile(installerPath, installerArgs, logger, errorMessage) {
+  const commandOptions = {
+    cwd: path.dirname(installerPath),
+    errorMessage,
+  };
+
+  try {
+    await runCommand(installerPath, installerArgs, commandOptions);
+    return {
+      launchMethod: 'direct',
+    };
+  } catch (error) {
+    if (!isInstallerAccessError(error)) {
+      throw error;
+    }
+
+    await logger.warn('The installer executable could not be launched directly. Retrying through cmd.exe.', {
+      installerPath,
+      error,
+    });
+
+    const commandLine = [quoteWindowsShellArgument(installerPath), ...installerArgs.map(quoteWindowsShellArgument)].join(' ');
+    await runCommand('cmd.exe', ['/d', '/s', '/c', commandLine], commandOptions);
+    return {
+      launchMethod: 'cmd-wrapper',
+    };
+  }
+}
+
+async function resolveInstalledExecutableToolState(manifest, installDir, appDir, venvDir, archivePath) {
+  let toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
+  if (await toolIsAvailable(toolState)) {
+    return ensureManagedToolStatePaths(toolState);
+  }
+
+  const discoveredTools = await syncDiscoveredTools({ force: true });
+  const detectedTool = discoveredTools[manifest.id];
+  if (await toolIsAvailable(detectedTool)) {
+    toolState = {
+      ...detectedTool,
+      downloadCachePath: archivePath,
+    };
+    return toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState;
+  }
+
+  return null;
+}
+
+async function recoverExecutableInstallerPayload(manifest, archivePath, appDir, onProgress, logger) {
+  await logger.warn('The installer did not leave a verified launcher. Recovering the app files directly from the installer package.', {
+    archivePath,
+    appDir,
+  });
+  await advanceStep(logger, onProgress, {
+    toolId: manifest.id,
+    percent: 84,
+    stage: 'installing',
+    message: `Recovering ${manifest.name} directly from the installer package.`,
+  });
+  await extractArchive(archivePath, appDir, logger);
+}
+
+async function materializeExecutableInstallerTool(manifest, paths, options = {}) {
+  const { appDir, archivePath, installDir, venvDir } = paths;
+  const installerArgs = resolveInstallerArgs(manifest, installDir, appDir);
+  const errorMessage = options.errorMessage || `Local AI Hub could not run the ${manifest.name} installer.`;
+  let installerRunError = null;
+  let launchMethod = null;
+  let recoveredFromArchive = false;
+
+  try {
+    const installerRun = await runInstallerExecutableFile(archivePath, installerArgs, options.logger, errorMessage);
+    launchMethod = installerRun.launchMethod;
+  } catch (error) {
+    installerRunError = error;
+    await options.logger.warn('Installer execution did not complete cleanly. Local AI Hub will try to recover the app files directly from the installer package.', {
+      archivePath,
+      error,
+    });
+  }
+
+  let toolState = await resolveInstalledExecutableToolState(manifest, installDir, appDir, venvDir, archivePath);
+  if (!toolState) {
+    recoveredFromArchive = true;
+    launchMethod = 'archive-extract';
+    await recoverExecutableInstallerPayload(manifest, archivePath, appDir, options.onProgress, options.logger);
+    toolState = await resolveInstalledExecutableToolState(manifest, installDir, appDir, venvDir, archivePath);
+  }
+
+  if (!toolState) {
+    if (installerRunError) {
+      throw installerRunError;
+    }
+
+    throw new Error(`${manifest.name} finished installing, but Local AI Hub could not find its launcher files afterward.`);
+  }
+
+  return {
+    launchMethod,
+    recoveredFromArchive,
+    toolState,
+  };
+}
+
 async function ensureCachedDownload(manifest, archivePath, logger, onProgress, toolId) {
   assertSecureRemoteUrl(manifest.downloadUrl, `${manifest.name} download URL`);
 
@@ -982,7 +1109,8 @@ async function installSingleFileTool(manifest, options, logger) {
 }
 
 async function installExecutableInstallerTool(manifest, options, logger) {
-  const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest);
+  const managedPaths = buildManagedPaths(manifest);
+  const { appDir, archivePath, installDir } = managedPaths;
 
   await logger.info('Installer executable requested.', {
     archivePath,
@@ -1007,26 +1135,20 @@ async function installExecutableInstallerTool(manifest, options, logger) {
     message: `Running the official ${manifest.name} installer.`,
   });
 
-  await runCommand(archivePath, resolveInstallerArgs(manifest, installDir, appDir), {
-    cwd: path.dirname(archivePath),
+  const materializedInstall = await materializeExecutableInstallerTool(manifest, managedPaths, {
     errorMessage: `Local AI Hub could not run the ${manifest.name} installer.`,
+    logger,
+    onProgress: options.onProgress,
   });
-
-  let toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
-  if (!(await toolIsAvailable(toolState))) {
-    const discoveredTools = await syncDiscoveredTools({ force: true });
-    const detectedTool = discoveredTools[manifest.id];
-    if (await toolIsAvailable(detectedTool)) {
-      toolState = {
-        ...detectedTool,
-        downloadCachePath: archivePath,
-      };
-    } else {
-      throw new Error(`${manifest.name} finished installing, but Local AI Hub could not find its launcher files afterward.`);
-    }
-  }
+  const toolState = materializedInstall.toolState;
 
   await upsertTool(toolState);
+  await logger.info('Installer executable materialized successfully.', {
+    archivePath,
+    installDir,
+    launchMethod: materializedInstall.launchMethod,
+    recoveredFromArchive: materializedInstall.recoveredFromArchive,
+  });
 
   await advanceStep(logger, options.onProgress, {
     toolId: manifest.id,
@@ -1037,7 +1159,6 @@ async function installExecutableInstallerTool(manifest, options, logger) {
 
   return toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState;
 }
-
 async function installPipPackageTool(manifest, options, logger) {
   const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest);
 
@@ -1111,11 +1232,15 @@ async function installTool(toolId, options = {}) {
     toolId,
     toolName: manifest.name,
   });
+  const managedPaths = buildManagedPaths(manifest);
+  let existingTool = null;
+  let rollbackManagedInstallOnFailure = true;
 
   try {
     await setToolIgnored(toolId, false);
     const discoveredTools = await syncDiscoveredTools({ force: true });
-    const existingTool = discoveredTools[toolId];
+    existingTool = discoveredTools[toolId];
+    rollbackManagedInstallOnFailure = !(existingTool?.source === 'managed' || existingTool?.managedByLocalAIHub);
     if (await toolIsAvailable(existingTool)) {
       const existingPath = existingTool.displayPath || existingTool.installDir;
       const installActionMessage =
@@ -1140,7 +1265,7 @@ async function installTool(toolId, options = {}) {
     const installPreflight = await getToolInstallPreflight(toolId);
     assertInstallPreflightApproved(installPreflight, Boolean(options.lowDiskConfirmed));
 
-    const { archivePath, installDir } = buildManagedPaths(manifest);
+    const { archivePath, installDir } = managedPaths;
 
     await logger.info('Install requested.', {
       installDir,
@@ -1167,7 +1292,7 @@ async function installTool(toolId, options = {}) {
       return ensureManagedToolStatePaths(toolState);
     }
 
-    const { appDir, venvDir } = buildManagedPaths(manifest);
+    const { appDir, venvDir } = managedPaths;
 
     await advanceStep(logger, options.onProgress, {
       toolId,
@@ -1238,14 +1363,21 @@ async function installTool(toolId, options = {}) {
 
     return ensureManagedToolStatePaths(toolState);
   } catch (error) {
+    const readableMessage = humanizeError(error, `Local AI Hub could not install ${manifest.name}.`);
+    if (rollbackManagedInstallOnFailure) {
+      await fs.remove(managedPaths.installDir).catch(() => null);
+      await logger.warn('Removed incomplete managed install after a failed install attempt.', {
+        installDir: managedPaths.installDir,
+      });
+    }
+
     await logger.error('Install failed.', {
       error,
-      readableMessage: humanizeError(error, `Local AI Hub could not install ${manifest.name}.`),
+      readableMessage,
     });
     throw error;
   }
 }
-
 async function removePythonCaches(directory) {
   if (!(await fs.pathExists(directory))) {
     return;
@@ -1341,10 +1473,12 @@ async function repairToolInstallation(toolState, options = {}) {
         message: `Running the ${manifest.name} installer again.`,
       });
 
-      await runCommand(downloadCachePath, resolveInstallerArgs(manifest, toolState.installDir, toolState.appDir || toolState.installDir), {
-        cwd: path.dirname(downloadCachePath),
-        errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
-      });
+      await runInstallerExecutableFile(
+        downloadCachePath,
+        resolveInstallerArgs(manifest, toolState.installDir, toolState.appDir || toolState.installDir),
+        logger,
+        `Local AI Hub could not rerun the ${manifest.name} installer.`,
+      );
 
       const discoveredTools = await syncDiscoveredTools({ force: true });
       const repairedExternalTool = discoveredTools[toolState.id];
@@ -1403,11 +1537,26 @@ async function repairToolInstallation(toolState, options = {}) {
         stage: 'repairing',
         message: `Running the ${manifest.name} installer again.`,
       });
-      await runCommand(toolState.downloadCachePath, resolveInstallerArgs(manifest, toolState.installDir, toolState.appDir), {
-        cwd: path.dirname(toolState.downloadCachePath),
-        errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
-      });
-      repairNotes.push('reran the official installer from the local cache');
+      const repairedInstaller = await materializeExecutableInstallerTool(
+        manifest,
+        {
+          appDir: toolState.appDir,
+          archivePath: toolState.downloadCachePath,
+          installDir: toolState.installDir,
+          venvDir: toolState.venvDir,
+        },
+        {
+          errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
+          logger,
+          onProgress: options.onProgress,
+        },
+      );
+      Object.assign(toolState, repairedInstaller.toolState);
+      repairNotes.push(
+        repairedInstaller.recoveredFromArchive
+          ? 'restored the application files directly from the local installer package'
+          : 'reran the official installer from the local cache',
+      );
     } else if (installKind === 'zip') {
       await advanceStep(logger, options.onProgress, {
         toolId: toolState.id,
@@ -1508,9 +1657,16 @@ async function repairToolInstallation(toolState, options = {}) {
 
     return updatedState;
   } catch (error) {
+    const readableMessage = humanizeError(error, `Local AI Hub could not repair ${manifest.name}.`);
+    await upsertTool({
+      id: toolState.id,
+      lastError: readableMessage,
+      lastRepairMessage: null,
+      status: 'error',
+    }).catch(() => null);
     await logger.error('Repair failed.', {
       error,
-      readableMessage: humanizeError(error, `Local AI Hub could not repair ${manifest.name}.`),
+      readableMessage,
     });
     throw error;
   }
@@ -1708,12 +1864,34 @@ async function updateToolInstallation(toolState, options = {}) {
         message: `Running the latest ${manifest.name} installer.`,
       });
 
-      await runCommand(downloadCachePath, resolveInstallerArgs(manifest, installDir, appDir), {
-        cwd: path.dirname(downloadCachePath),
-        errorMessage: `Local AI Hub could not run the ${manifest.name} updater.`,
-      });
+      if (isManagedInstall) {
+        const materializedUpdate = await materializeExecutableInstallerTool(
+          manifest,
+          {
+            appDir,
+            archivePath: downloadCachePath,
+            installDir,
+            venvDir: safeToolState.venvDir || managedPaths.venvDir,
+          },
+          {
+            errorMessage: `Local AI Hub could not run the ${manifest.name} updater.`,
+            logger,
+            onProgress: options.onProgress,
+          },
+        );
+        updatedState = {
+          ...updatedState,
+          ...materializedUpdate.toolState,
+          downloadCachePath,
+        };
+      } else {
+        await runInstallerExecutableFile(
+          downloadCachePath,
+          resolveInstallerArgs(manifest, installDir, appDir),
+          logger,
+          `Local AI Hub could not run the ${manifest.name} updater.`,
+        );
 
-      if (!isManagedInstall) {
         const discoveredTools = await syncDiscoveredTools({ force: true });
         const refreshedTool = discoveredTools[safeToolState.id];
         if (await toolIsAvailable(refreshedTool)) {
@@ -1847,3 +2025,4 @@ module.exports = {
   uninstallTool,
   updateToolInstallation,
 };
+

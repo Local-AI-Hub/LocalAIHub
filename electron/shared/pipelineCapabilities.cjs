@@ -37,6 +37,11 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
     label: 'Operation-driven local tool',
     notes: 'Forge exposes a simple WebUI API that fits the current sequential model-step pipeline for text-to-image generation.',
   }),
+  'wan21-webui': Object.freeze({
+    id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
+    label: 'Operation-driven local tool',
+    notes: 'Wan2.1 WebUI fits the sequential model-step pipeline for local video generation, but Local AI Hub runs it through a dedicated direct Python adapter instead of flattening graph-native tools into the same shape.',
+  }),
   comfyui: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW,
     label: 'Graph-native workflow tool',
@@ -100,6 +105,16 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT]),
         notes: 'Runs a single text-to-image request through the Stable Diffusion WebUI API.',
         outputKinds: Object.freeze([MODALITY_IMAGE]),
+      }),
+    }),
+    targetType: 'tool',
+  }),
+  'wan21-webui': Object.freeze({
+    operations: Object.freeze({
+      [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        notes: 'Runs a local Wan video request through a dedicated direct Python adapter. Text input produces text-to-video. Image input produces image-to-video when motion guidance is supplied in the step instruction box.',
+        outputKinds: Object.freeze([MODALITY_VIDEO]),
       }),
     }),
     targetType: 'tool',

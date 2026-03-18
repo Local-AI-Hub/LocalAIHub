@@ -8,30 +8,25 @@ const { getAppPaths } = require('./configService');
 const { inspectPythonExecutable, resolvePythonCommand, runCommand } = require('./commandService');
 const { isCompatibleRuntime, requirementToLabel } = require('./pythonRequirementService');
 
+// Keep this catalog on python.org releases that still ship standalone Windows installers.
 const PYTHON_RUNTIME_CATALOG = [
   {
-    version: [3, 10, 19],
-    versionString: '3.10.19',
-    installerFileName: 'python-3.10.19-amd64.exe',
-    installerUrl: 'https://www.python.org/ftp/python/3.10.19/python-3.10.19-amd64.exe',
+    version: [3, 10, 11],
+    versionString: '3.10.11',
+    installerFileName: 'python-3.10.11-amd64.exe',
+    installerUrl: 'https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe',
   },
   {
-    version: [3, 11, 14],
-    versionString: '3.11.14',
-    installerFileName: 'python-3.11.14-amd64.exe',
-    installerUrl: 'https://www.python.org/ftp/python/3.11.14/python-3.11.14-amd64.exe',
+    version: [3, 11, 9],
+    versionString: '3.11.9',
+    installerFileName: 'python-3.11.9-amd64.exe',
+    installerUrl: 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe',
   },
   {
-    version: [3, 12, 12],
-    versionString: '3.12.12',
-    installerFileName: 'python-3.12.12-amd64.exe',
-    installerUrl: 'https://www.python.org/ftp/python/3.12.12/python-3.12.12-amd64.exe',
-  },
-  {
-    version: [3, 13, 12],
-    versionString: '3.13.12',
-    installerFileName: 'python-3.13.12-amd64.exe',
-    installerUrl: 'https://www.python.org/ftp/python/3.13.12/python-3.13.12-amd64.exe',
+    version: [3, 12, 10],
+    versionString: '3.12.10',
+    installerFileName: 'python-3.12.10-amd64.exe',
+    installerUrl: 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe',
   },
 ];
 
@@ -67,7 +62,7 @@ function selectManagedRuntime(requirement) {
   const compatible = PYTHON_RUNTIME_CATALOG.filter((runtime) => isCompatibleRuntime(runtime, requirement));
   if (compatible.length === 0) {
     throw new Error(
-      `Local AI Hub could not find a managed Python runtime that matches ${requirementToLabel(requirement)}.`,
+      `Local AI Hub could not find a managed Python runtime with a Windows installer that matches ${requirementToLabel(requirement)}.`,
     );
   }
 
@@ -94,10 +89,32 @@ async function fetchWithTimeout(url, logger) {
       throw new Error('Local AI Hub could not reach python.org to download the required runtime.');
     }
 
-    throw error;
+    await logger.warn('Python runtime download connection failed before the installer started downloading.', {
+      url,
+      error,
+    });
+    throw new Error('Local AI Hub could not connect to python.org to download the required runtime.');
   } finally {
     clearTimeout(timer);
   }
+}
+
+function buildDownloadFailureMessage(runtime, response) {
+  const status = Number(response?.status || 0);
+
+  if (status === 404 || status === 410) {
+    return `Local AI Hub could not find the Windows installer for Python ${runtime.versionString} on python.org.`;
+  }
+
+  if (status === 403) {
+    return `Local AI Hub could not download Python ${runtime.versionString} because python.org refused the request.`;
+  }
+
+  if (status >= 500) {
+    return `Local AI Hub could not download Python ${runtime.versionString} because python.org is unavailable right now.`;
+  }
+
+  return `Local AI Hub could not download Python ${runtime.versionString} from python.org.`;
 }
 
 async function hasUsableInstaller(installerPath, logger) {
@@ -133,8 +150,24 @@ async function downloadPythonInstaller(runtime, installerPath, logger, onProgres
   });
 
   const response = await fetchWithTimeout(runtime.installerUrl, logger);
-  if (!response.ok || !response.body) {
-    throw new Error('Local AI Hub could not download the required Python runtime from python.org.');
+  if (!response.ok) {
+    await logger.warn('python.org did not return a downloadable Python installer.', {
+      runtimeVersion: runtime.versionString,
+      installerUrl: runtime.installerUrl,
+      status: response.status,
+      statusText: response.statusText,
+    });
+    throw new Error(buildDownloadFailureMessage(runtime, response));
+  }
+
+  if (!response.body) {
+    await logger.warn('python.org responded to the Python installer request without a response body.', {
+      runtimeVersion: runtime.versionString,
+      installerUrl: runtime.installerUrl,
+      status: response.status,
+      statusText: response.statusText,
+    });
+    throw new Error(`Local AI Hub reached python.org for Python ${runtime.versionString}, but the installer file did not start downloading.`);
   }
 
   await fs.ensureDir(path.dirname(installerPath));
@@ -186,6 +219,17 @@ async function downloadPythonInstaller(runtime, installerPath, logger, onProgres
     throw error;
   } finally {
     await fileHandle.close().catch(() => null);
+  }
+
+  if (downloaded < MIN_INSTALLER_BYTES) {
+    await logger.warn('Downloaded Python installer was too small to be usable.', {
+      runtimeVersion: runtime.versionString,
+      installerPath,
+      totalBytes: downloaded,
+      minimumBytes: MIN_INSTALLER_BYTES,
+    });
+    await fs.remove(installerPath).catch(() => null);
+    throw new Error(`Local AI Hub downloaded Python ${runtime.versionString}, but the installer file was incomplete.`);
   }
 
   await logger.info('Python runtime download completed.', {

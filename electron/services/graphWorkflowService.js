@@ -11,13 +11,16 @@ const {
   getGraphWorkflowOutputBinding,
   parseGraphWorkflowDefinitionText,
 } = require('../shared/graphWorkflowContracts.cjs');
-const { PORT_KIND_IMAGE, PORT_KIND_TEXT } = require('../shared/pipelineSchema.cjs');
+const { PORT_KIND_IMAGE, PORT_KIND_TEXT, PORT_KIND_VIDEO } = require('../shared/pipelineSchema.cjs');
 
 const COMFYUI_POLL_INTERVAL_MS = 1500;
 const COMFYUI_TIMEOUT_MS = 5 * 60 * 1000;
 const INVOKEAI_POLL_INTERVAL_MS = 1500;
 const INVOKEAI_TIMEOUT_MS = 10 * 60 * 1000;
 const INVOKEAI_DEFAULT_QUEUE_ID = 'default';
+const COMFYUI_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+const COMFYUI_VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov', '.mkv']);
+const COMFYUI_ANIMATED_IMAGE_EXTENSIONS = new Set(['.gif', '.webp']);
 
 function getToolBaseUrl(tool) {
   const launchUrl = tool?.launchUrl || `http://127.0.0.1:${tool?.defaultPort || 8188}`;
@@ -334,40 +337,81 @@ async function waitForComfyUiWorkflow(tool, promptId, reportProgress, nodeLabel)
   throw new Error(`${getToolLabel(tool)} is taking longer than expected to finish this graph workflow step. Open the tool to inspect its queue, then try again.`);
 }
 
-function getOutputImageReference(historyEntry, outputNodeId) {
-  const outputEntry = historyEntry?.outputs?.[outputNodeId] || null;
-  if (!outputEntry || typeof outputEntry !== 'object') {
-    throw new Error(`The selected output node ${outputNodeId} did not produce any saved graph workflow output. Choose a node that emits images, such as PreviewImage or SaveImage.`);
-  }
-
-  const imageEntry = Array.isArray(outputEntry.images) ? outputEntry.images[0] || null : null;
-  if (!imageEntry) {
-    throw new Error(`The selected output node ${outputNodeId} finished, but it did not return an image. This first graph workflow slice expects an image-emitting ComfyUI node.`);
-  }
-
-  const fileName = String(imageEntry.filename || imageEntry.name || '').trim();
+function normalizeComfyUiFileReference(entry, fallbackType = 'output') {
+  const fileName = String(entry?.filename || entry?.name || '').trim();
   if (!fileName) {
-    throw new Error(`The selected output node ${outputNodeId} returned an image record without a file name.`);
+    return null;
   }
 
   return {
     fileName,
-    subfolder: String(imageEntry.subfolder || '').trim(),
-    type: String(imageEntry.type || 'output').trim() || 'output',
+    subfolder: String(entry?.subfolder || '').trim(),
+    type: String(entry?.type || fallbackType).trim() || fallbackType,
   };
 }
 
-async function downloadComfyUiImage(tool, imageReference) {
-  const params = new URLSearchParams();
-  params.set('filename', imageReference.fileName);
-  params.set('type', imageReference.type || 'output');
-  if (imageReference.subfolder) {
-    params.set('subfolder', imageReference.subfolder);
+function collectComfyUiOutputReferences(outputEntry) {
+  if (!outputEntry || typeof outputEntry !== 'object') {
+    return [];
   }
 
+  return [
+    ...(Array.isArray(outputEntry.images) ? outputEntry.images : []),
+    ...(Array.isArray(outputEntry.videos) ? outputEntry.videos : []),
+    ...(Array.isArray(outputEntry.gifs) ? outputEntry.gifs : []),
+    ...(Array.isArray(outputEntry.files) ? outputEntry.files : []),
+  ]
+    .map((entry) => normalizeComfyUiFileReference(entry))
+    .filter(Boolean);
+}
+
+function getComfyUiOutputReference(historyEntry, outputNodeId, expectedKind) {
+  const outputEntry = historyEntry?.outputs?.[outputNodeId] || null;
+  if (!outputEntry || typeof outputEntry !== 'object') {
+    const expectedLabel = expectedKind === PORT_KIND_VIDEO ? 'video' : 'image';
+    throw new Error(`The selected output node ${outputNodeId} did not produce any saved graph workflow output. Choose a node that emits a ${expectedLabel} file.`);
+  }
+
+  const references = collectComfyUiOutputReferences(outputEntry);
+  if (!references.length) {
+    const expectedLabel = expectedKind === PORT_KIND_VIDEO ? 'video' : 'image';
+    throw new Error(`The selected output node ${outputNodeId} finished, but it did not return a saved ${expectedLabel} file.`);
+  }
+
+  if (expectedKind === PORT_KIND_IMAGE) {
+    const imageReference = references.find((entry) => COMFYUI_IMAGE_EXTENSIONS.has(path.extname(entry.fileName).toLowerCase())) || null;
+    if (!imageReference) {
+      throw new Error(`The selected output node ${outputNodeId} did not return an image file. Choose a node such as PreviewImage or SaveImage for the image boundary.`);
+    }
+
+    return imageReference;
+  }
+
+  const videoReference = references.find((entry) => COMFYUI_VIDEO_EXTENSIONS.has(path.extname(entry.fileName).toLowerCase())) || null;
+  if (videoReference) {
+    return videoReference;
+  }
+
+  const animatedImageReference = references.find((entry) => COMFYUI_ANIMATED_IMAGE_EXTENSIONS.has(path.extname(entry.fileName).toLowerCase())) || null;
+  if (animatedImageReference) {
+    return animatedImageReference;
+  }
+
+  throw new Error(`The selected output node ${outputNodeId} did not return a video file. Choose a ComfyUI video save node such as SaveVideo, VHS_VideoCombine, or SaveAnimatedWEBP for the video boundary.`);
+}
+
+async function downloadComfyUiOutput(tool, fileReference, expectedKind) {
+  const params = new URLSearchParams();
+  params.set('filename', fileReference.fileName);
+  params.set('type', fileReference.type || 'output');
+  if (fileReference.subfolder) {
+    params.set('subfolder', fileReference.subfolder);
+  }
+
+  const expectedLabel = expectedKind === PORT_KIND_VIDEO ? 'video' : 'image';
   return requestGraphWorkflowBuffer(tool, `/view?${params.toString()}`, {
     method: 'GET',
-  }, 'download the graph workflow image output');
+  }, `download the graph workflow ${expectedLabel} output`);
 }
 
 function getGraphInputArtifact(inputArtifacts, portId) {
@@ -659,7 +703,17 @@ async function executeComfyUiGraphWorkflow({ inputArtifacts = {}, node, reportPr
   const imageArtifact = getGraphInputArtifact(inputArtifacts, 'image');
   const textBinding = node?.config?.inputBindings?.text || {};
   const imageBinding = node?.config?.inputBindings?.image || {};
-  const outputNodeId = String(node?.config?.outputBindings?.image?.nodeId || '').trim();
+  const contract = getGraphWorkflowContract(tool?.id || node?.config?.toolId);
+  const requestedOutputs = (contract?.outputPorts || [])
+    .map((spec) => ({
+      binding: getGraphWorkflowOutputBinding(node, spec.portId),
+      spec,
+    }))
+    .filter(({ binding }) => String(binding?.nodeId || '').trim());
+
+  if (!requestedOutputs.length) {
+    throw new Error('Choose at least one graph workflow output boundary before running this step.');
+  }
 
   if (textArtifact) {
     const textValue = String(textArtifact.text || '').trim();
@@ -679,7 +733,9 @@ async function executeComfyUiGraphWorkflow({ inputArtifacts = {}, node, reportPr
     setWorkflowInput(workingWorkflow, imageBinding.nodeId, imageBinding.field, uploadedImage.reference, 'image input');
   }
 
-  getWorkflowNodeEntry(workingWorkflow, outputNodeId, 'image output');
+  for (const { binding, spec } of requestedOutputs) {
+    getWorkflowNodeEntry(workingWorkflow, binding.nodeId, `${String(spec.label || spec.portId || 'output').toLowerCase()} output`);
+  }
 
   reportProgress?.(
     `Submitting the graph workflow to ${getToolLabel(tool)}.`,
@@ -692,28 +748,49 @@ async function executeComfyUiGraphWorkflow({ inputArtifacts = {}, node, reportPr
     `Running ${nodeLabel} with ${getToolLabel(tool)}...`,
   );
   const historyEntry = await waitForComfyUiWorkflow(tool, promptId, reportProgress, nodeLabel);
-  const outputImage = getOutputImageReference(historyEntry, outputNodeId);
 
-  reportProgress?.(
-    `Downloading the graph workflow image output from ${getToolLabel(tool)}.`,
-    `Running ${nodeLabel} with ${getToolLabel(tool)}...`,
-  );
-  const imageBuffer = await downloadComfyUiImage(tool, outputImage);
-  const artifact = await saveBufferArtifact(runDirectories, imageBuffer, {
-    baseName: `${nodeLabel}-${Date.now()}`,
-    displayName: nodeLabel,
-    extension: buildOutputFileExtension(outputImage.fileName),
-    kind: PORT_KIND_IMAGE,
-    role: 'generated',
-  });
+  const outputs = {};
+  const savedArtifacts = [];
+  for (const { binding, spec } of requestedOutputs) {
+    const outputNodeId = String(binding.nodeId || '').trim();
+    const outputReference = getComfyUiOutputReference(historyEntry, outputNodeId, spec.kind);
+    const outputLabel = spec.kind === PORT_KIND_VIDEO ? 'video' : 'image';
+
+    reportProgress?.(
+      `Downloading the graph workflow ${outputLabel} output from ${getToolLabel(tool)}.`,
+      `Running ${nodeLabel} with ${getToolLabel(tool)}...`,
+    );
+    const outputBuffer = await downloadComfyUiOutput(tool, outputReference, spec.kind);
+    const artifact = await saveBufferArtifact(runDirectories, outputBuffer, {
+      baseName: `${nodeLabel}-${spec.portId}-${Date.now()}`,
+      displayName: nodeLabel,
+      extension: buildOutputFileExtension(outputReference.fileName),
+      kind: spec.kind,
+      role: 'generated',
+    });
+    if (spec.kind === PORT_KIND_VIDEO && artifact.previewKind !== 'video' && artifact.previewKind !== 'animated-image') {
+      throw new Error(`The selected output node ${outputNodeId} returned a still image instead of motion output. Choose a ComfyUI save node that writes mp4, webm, mov, mkv, gif, or animated webp output for the video boundary.`);
+    }
+
+    outputs[spec.portId] = artifact;
+    savedArtifacts.push({
+      artifact,
+      label: spec.kind === PORT_KIND_VIDEO
+        ? (artifact.previewKind === 'animated-image' ? 'animated image' : 'video')
+        : outputLabel,
+    });
+  }
+
+  const primaryArtifact = savedArtifacts.find((entry) => entry.artifact.kind === PORT_KIND_VIDEO)?.artifact || savedArtifacts[0]?.artifact || null;
+  const message = savedArtifacts.length === 1
+    ? `${getToolLabel(tool)} finished the graph workflow and saved the ${savedArtifacts[0].label} output to ${savedArtifacts[0].artifact.filePath}.`
+    : `${getToolLabel(tool)} finished the graph workflow and saved ${savedArtifacts.map((entry) => entry.label).join(' and ')} outputs to the run folder.`;
 
   return {
-    destinationPath: artifact.filePath,
-    message: `${getToolLabel(tool)} finished the graph workflow and saved the image output to ${artifact.filePath}.`,
-    outputs: {
-      image: artifact,
-    },
-    preview: summarizeArtifact(artifact),
+    destinationPath: primaryArtifact?.filePath || '',
+    message,
+    outputs,
+    preview: summarizeArtifact(primaryArtifact),
   };
 }
 

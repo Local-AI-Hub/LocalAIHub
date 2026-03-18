@@ -333,6 +333,90 @@ function firstExistingRelativePath(basePath, relativePaths = []) {
   return relativePaths.find((relativePath) => fs.existsSync(path.join(basePath, relativePath))) || null;
 }
 
+function listDirectoryFiles(basePath, matcher) {
+  if (!basePath || !fs.existsSync(basePath)) {
+    return [];
+  }
+
+  try {
+    return fs
+      .readdirSync(basePath, { withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => path.join(basePath, entry.name))
+      .filter((entryPath) => (typeof matcher === 'function' ? matcher(entryPath) : true));
+  } catch {
+    return [];
+  }
+}
+
+function normalizeNameForMatch(value) {
+  return String(value || '').replace(/[^a-z0-9]+/gi, '').toLowerCase();
+}
+
+function findExistingManagedCandidate(searchRoots = [], relativeCandidates = []) {
+  for (const root of mergeUnique(searchRoots)) {
+    if (!root) {
+      continue;
+    }
+
+    for (const candidate of mergeUnique(relativeCandidates)) {
+      if (!candidate) {
+        continue;
+      }
+
+      const resolved = path.isAbsolute(candidate) ? candidate : path.join(root, candidate);
+      if (fs.existsSync(resolved)) {
+        return resolved;
+      }
+    }
+  }
+
+  return null;
+}
+
+function findManagedBinaryExecutable(toolState, manifest) {
+  const searchRoots = mergeUnique([toolState.appDir, toolState.installDir].filter(Boolean));
+  if (!searchRoots.length) {
+    return null;
+  }
+
+  const launchToken = tokenizeCommand(manifest.launchCommand)[0] || '';
+  const directCandidate = findExistingManagedCandidate(searchRoots, [
+    launchToken,
+    ...(manifest.installInstructions?.externalExecutableCandidates || []),
+  ]);
+  if (directCandidate) {
+    return directCandidate;
+  }
+
+  const normalizedExpectedNames = new Set(
+    [
+      normalizeNameForMatch(path.basename(launchToken, path.extname(launchToken))),
+      normalizeNameForMatch(path.basename(manifest.id || '', path.extname(manifest.id || ''))),
+      normalizeNameForMatch(manifest.name),
+    ].filter(Boolean),
+  );
+  const ignoredExecutableNames = new Set(['elevate', 'squirrel', 'update', 'uninstall', 'unins000']);
+
+  for (const root of searchRoots) {
+    const executables = listDirectoryFiles(root, (entryPath) => /.exe$/i.test(entryPath));
+    const namedMatch = executables.find((entryPath) => {
+      const normalizedBaseName = normalizeNameForMatch(path.basename(entryPath, '.exe'));
+      return normalizedExpectedNames.has(normalizedBaseName);
+    });
+    if (namedMatch) {
+      return namedMatch;
+    }
+
+    const primaryExecutables = executables.filter((entryPath) => !ignoredExecutableNames.has(normalizeNameForMatch(path.basename(entryPath, '.exe'))));
+    if (primaryExecutables.length === 1) {
+      return primaryExecutables[0];
+    }
+  }
+
+  return null;
+}
+
 function resolveCommandPath(token, baseDir, explicitPath = null, options = {}) {
   if (explicitPath) {
     return explicitPath;
@@ -468,14 +552,19 @@ function buildLaunchProfileFromCommand(command, context = {}) {
 }
 
 function buildManagedLaunchProfile(toolState, manifest) {
+  const baseDir = toolState.appDir || toolState.installDir;
   const pythonPath =
     manifest.installInstructions.runtime === 'python'
       ? path.join(toolState.venvDir, 'Scripts', 'python.exe')
       : null;
+  const executablePath = manifest.installInstructions.runtime === 'binary'
+    ? findManagedBinaryExecutable(toolState, manifest)
+    : null;
 
   return buildLaunchProfileFromCommand(manifest.launchCommand, {
-    baseDir: toolState.appDir,
-    workingDir: toolState.appDir,
+    baseDir,
+    workingDir: executablePath ? path.dirname(executablePath) : baseDir,
+    executablePath,
     pythonPath,
     port: manifest.defaultPort,
     env: manifest.launchEnv || {},

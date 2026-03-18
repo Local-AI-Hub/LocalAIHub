@@ -20,6 +20,7 @@ try {
 }
 
 const TEXT_FILE_EXTENSIONS = new Set(['.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log', '.html', '.xml', '.ini', '.rtf']);
+const ANIMATED_IMAGE_EXTENSIONS = new Set(['.gif', '.webp']);
 const MIME_TYPES = {
   '.aac': 'audio/aac',
   '.flac': 'audio/flac',
@@ -49,6 +50,216 @@ const KIND_EXTENSIONS = {
   [PORT_KIND_TEXT]: '.txt',
   [PORT_KIND_VIDEO]: '.mp4',
 };
+
+function detectAnimatedGif(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 14) {
+    return false;
+  }
+
+  const header = buffer.toString('ascii', 0, 6);
+  if (header !== 'GIF87a' && header !== 'GIF89a') {
+    return false;
+  }
+
+  let offset = 13;
+  const packed = buffer[10];
+  if ((packed & 0x80) !== 0) {
+    offset += 3 * (2 ** ((packed & 0x07) + 1));
+  }
+
+  let imageCount = 0;
+  while (offset < buffer.length) {
+    const blockId = buffer[offset];
+    if (blockId === 0x3b) {
+      break;
+    }
+
+    if (blockId === 0x2c) {
+      imageCount += 1;
+      if (imageCount > 1) {
+        return true;
+      }
+
+      offset += 10;
+      if (offset >= buffer.length) {
+        break;
+      }
+
+      const imagePacked = buffer[offset - 1];
+      if ((imagePacked & 0x80) !== 0) {
+        offset += 3 * (2 ** ((imagePacked & 0x07) + 1));
+      }
+
+      offset += 1;
+      while (offset < buffer.length) {
+        const blockSize = buffer[offset];
+        offset += 1;
+        if (blockSize === 0) {
+          break;
+        }
+        offset += blockSize;
+      }
+      continue;
+    }
+
+    if (blockId === 0x21) {
+      offset += 2;
+      while (offset < buffer.length) {
+        const blockSize = buffer[offset];
+        offset += 1;
+        if (blockSize === 0) {
+          break;
+        }
+        offset += blockSize;
+      }
+      continue;
+    }
+
+    break;
+  }
+
+  return false;
+}
+
+function detectAnimatedWebP(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 16) {
+    return false;
+  }
+
+  if (buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WEBP') {
+    return false;
+  }
+
+  let offset = 12;
+  while (offset + 8 <= buffer.length) {
+    const chunkId = buffer.toString('ascii', offset, offset + 4);
+    const chunkSize = buffer.readUInt32LE(offset + 4);
+    if (chunkId === 'ANIM') {
+      return true;
+    }
+
+    if (chunkId === 'VP8X' && offset + 9 <= buffer.length) {
+      const featureFlags = buffer[offset + 8];
+      if ((featureFlags & 0x02) !== 0) {
+        return true;
+      }
+    }
+
+    offset += 8 + chunkSize + (chunkSize % 2);
+  }
+
+  return false;
+}
+
+async function detectAnimatedImage(filePath, extension) {
+  if (!ANIMATED_IMAGE_EXTENSIONS.has(extension)) {
+    return false;
+  }
+
+  try {
+    const buffer = await fs.readFile(filePath);
+    if (extension === '.gif') {
+      return detectAnimatedGif(buffer);
+    }
+
+    if (extension === '.webp') {
+      return detectAnimatedWebP(buffer);
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
+}
+
+function getArtifactPreviewKind(kind, mimeType, isAnimated) {
+  if (kind === PORT_KIND_TEXT) {
+    return 'text';
+  }
+
+  if (kind === PORT_KIND_AUDIO) {
+    return 'audio';
+  }
+
+  if (kind === PORT_KIND_VIDEO) {
+    if (isAnimated && String(mimeType || '').toLowerCase().startsWith('image/')) {
+      return 'animated-image';
+    }
+
+    return String(mimeType || '').toLowerCase().startsWith('image/') ? 'image' : 'video';
+  }
+
+  if (kind === PORT_KIND_IMAGE) {
+    return isAnimated ? 'animated-image' : 'image';
+  }
+
+  const normalizedMimeType = String(mimeType || '').toLowerCase();
+  if (normalizedMimeType.startsWith('image/')) {
+    return isAnimated ? 'animated-image' : 'image';
+  }
+
+  if (normalizedMimeType.startsWith('video/')) {
+    return 'video';
+  }
+
+  if (normalizedMimeType.startsWith('audio/')) {
+    return 'audio';
+  }
+
+  return 'file';
+}
+
+function getArtifactAttachmentKind(mimeType) {
+  const normalizedMimeType = String(mimeType || '').toLowerCase();
+  if (normalizedMimeType.startsWith('image/')) {
+    return 'image';
+  }
+
+  if (normalizedMimeType.startsWith('video/')) {
+    return 'video';
+  }
+
+  return 'file';
+}
+
+function getArtifactFormatLabel(extension, mimeType, isAnimated) {
+  switch (extension) {
+    case '.gif':
+      return isAnimated ? 'Animated GIF' : 'GIF';
+    case '.webp':
+      return isAnimated ? 'Animated WebP' : 'WebP';
+    case '.png':
+      return 'PNG image';
+    case '.jpg':
+    case '.jpeg':
+      return 'JPEG image';
+    case '.mp4':
+      return 'MP4 video';
+    case '.webm':
+      return 'WebM video';
+    case '.mov':
+      return 'MOV video';
+    case '.mkv':
+      return 'MKV video';
+    default:
+      break;
+  }
+
+  const normalizedMimeType = String(mimeType || '').toLowerCase();
+  if (normalizedMimeType.startsWith('image/')) {
+    return isAnimated ? 'Animated image' : 'Image';
+  }
+
+  if (normalizedMimeType.startsWith('video/')) {
+    return 'Video';
+  }
+
+  if (normalizedMimeType.startsWith('audio/')) {
+    return 'Audio';
+  }
+
+  return '';
+}
 
 function sanitizeSegment(value, fallback = 'item') {
   const normalized = String(value || '')
@@ -123,6 +334,9 @@ function summarizeArtifact(artifact, limit = 180) {
   if (artifact.fileName) {
     details.push(artifact.fileName);
   }
+  if (artifact.formatLabel) {
+    details.push(artifact.formatLabel);
+  }
   if (artifact.width && artifact.height) {
     details.push(`${artifact.width}x${artifact.height}`);
   }
@@ -144,20 +358,27 @@ async function buildFileArtifact(filePath, options = {}) {
   const stat = await fs.stat(resolvedPath);
   const kind = options.kind || inferKindFromPath(resolvedPath);
   const extension = path.extname(resolvedPath).toLowerCase();
+  const mimeType = getMimeType(resolvedPath, kind);
+  const isAnimated = await detectAnimatedImage(resolvedPath, extension);
+  const previewKind = getArtifactPreviewKind(kind, mimeType, isAnimated);
   const artifact = {
     kind,
+    attachmentKind: getArtifactAttachmentKind(mimeType),
     displayName: String(options.displayName || path.basename(resolvedPath)).trim() || path.basename(resolvedPath),
     fileName: path.basename(resolvedPath),
     filePath: resolvedPath,
     fileUrl: pathToFileURL(resolvedPath).toString(),
     extension,
-    mimeType: getMimeType(resolvedPath, kind),
+    formatLabel: getArtifactFormatLabel(extension, mimeType, isAnimated),
+    isAnimated,
+    mimeType,
+    previewKind,
     previewText: '',
     role: options.role || 'artifact',
     sizeBytes: Number(stat.size || 0),
   };
 
-  if (kind === PORT_KIND_IMAGE && nativeImage) {
+  if ((previewKind === 'image' || previewKind === 'animated-image') && nativeImage) {
     try {
       const image = nativeImage.createFromPath(resolvedPath);
       const size = image.getSize();
@@ -298,6 +519,9 @@ async function describeArtifactForLlm(artifact) {
     artifact.fileName ? `File name: ${artifact.fileName}` : '',
     artifact.mimeType ? `MIME type: ${artifact.mimeType}` : '',
     artifact.extension ? `Extension: ${artifact.extension}` : '',
+    artifact.formatLabel ? `Format: ${artifact.formatLabel}` : '',
+    artifact.previewKind ? `Preview kind: ${artifact.previewKind}` : '',
+    artifact.isAnimated ? 'Animation: animated' : '',
     artifact.role ? `Role: ${artifact.role}` : '',
     artifact.filePath ? `Path: ${artifact.filePath}` : '',
     artifact.width && artifact.height ? `Dimensions: ${artifact.width}x${artifact.height}` : '',
