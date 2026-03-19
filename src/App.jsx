@@ -148,6 +148,7 @@ export default function App() {
   const [whisperModelName, setWhisperModelName] = useState('base');
   const [whisperTranscript, setWhisperTranscript] = useState('');
   const [whisperSegments, setWhisperSegments] = useState([]);
+  const [whisperResultInfo, setWhisperResultInfo] = useState(null);
   const [whisperNotice, setWhisperNotice] = useState('');
   const [aiderPanelOpen, setAiderPanelOpen] = useState(false);
   const [aiderBusy, setAiderBusy] = useState(false);
@@ -497,6 +498,9 @@ export default function App() {
 
     if (!result.data?.canceled && result.data?.filePath) {
       setWhisperFilePath(result.data.filePath);
+      setWhisperTranscript('');
+      setWhisperSegments([]);
+      setWhisperResultInfo(null);
       setWhisperNotice(`Ready to transcribe ${result.data.filePath.split(/[\\/]/).pop()}.`);
     }
   }
@@ -514,22 +518,34 @@ export default function App() {
     });
 
     if (!result?.ok) {
-      pushToast(result?.message || 'Local AI Hub could not transcribe that audio file.', 'error');
+      const message = result?.message || 'Local AI Hub could not transcribe that audio file.';
+      setWhisperNotice(message);
+      pushToast(message, 'error');
       setWhisperBusy(false);
       return;
     }
 
     setWhisperTranscript(result.data?.text || '');
     setWhisperSegments(result.data?.segments || []);
+    setWhisperResultInfo({
+      computeType: result.data?.computeType || '',
+      device: result.data?.device || '',
+      durationSeconds: result.data?.durationSeconds || 0,
+      language: result.data?.language || '',
+      model: result.data?.model || whisperModelName,
+      segmentCount: Array.isArray(result.data?.segments) ? result.data.segments.length : 0,
+    });
+    const completionMessage = result.data?.language
+      ? `Transcription finished. Detected language: ${result.data.language}.`
+      : 'Transcription finished.';
     setWhisperNotice(
-      result.data?.language
-        ? `Transcription finished. Detected language: ${result.data.language}.`
-        : 'Transcription finished.',
+      result.data?.runtimeNote
+        ? `${completionMessage} ${result.data.runtimeNote}`
+        : completionMessage,
     );
     pushToast('Whisper finished transcribing the selected file.', 'success');
     setWhisperBusy(false);
   }
-
   async function loadAiderRuntimeOutput(options = {}) {
     if (!aiderTool) {
       return;
@@ -1345,6 +1361,7 @@ export default function App() {
       setWhisperFilePath('');
       setWhisperTranscript('');
       setWhisperSegments([]);
+      setWhisperResultInfo(null);
       return;
     }
 
@@ -1565,6 +1582,7 @@ export default function App() {
                   onLaunch={(toolId) => runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId))}
                   onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
                   onTranscribe={transcribeWhisperAudio}
+                  resultInfo={whisperResultInfo}
                   segments={whisperSegments}
                   tool={whisperTool}
                   transcript={whisperTranscript}
@@ -1746,6 +1764,7 @@ export default function App() {
     </div>
   );
 }
+
 
 
 

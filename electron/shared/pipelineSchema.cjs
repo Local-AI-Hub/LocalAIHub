@@ -53,6 +53,7 @@ const PIPELINE_OPERATION_LABELS = Object.freeze({
   [PIPELINE_OPERATION_IDS.IMAGE_ANALYZE]: 'Image analysis',
   [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: 'Image generation',
   [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: 'Video generation',
+  [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: 'Audio generation',
   [PIPELINE_OPERATION_IDS.LLM_PROMPT]: 'Text response',
   [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: 'LLM validation',
   [PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE]: 'Transcription',
@@ -67,12 +68,17 @@ const MODEL_STEP_CLOUD_OPERATION_OPTIONS = Object.freeze([
     label: 'Image generation',
   },
   {
+    id: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+    label: 'Audio generation',
+  },
+  {
     id: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
     label: 'Video generation',
   },
 ]);
 const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
 const VIDEO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.VIDEO_GENERATE));
+const AUDIO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.AUDIO_GENERATE));
 const GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getGraphWorkflowToolIds());
 const RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getRunnableGraphWorkflowToolIds());
 const DEFAULT_GRAPH_WORKFLOW_TOOL_ID = RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS[0] || GRAPH_WORKFLOW_TOOL_IDS[0] || 'comfyui';
@@ -146,6 +152,11 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     inputPorts: [],
     outputPorts: [
       {
+        id: 'audio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Audio',
+      },
+      {
         id: 'video',
         kind: PORT_KIND_VIDEO,
         label: 'Video',
@@ -198,6 +209,11 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         label: 'Image',
       },
       {
+        id: 'audio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Audio',
+      },
+      {
         id: 'video',
         kind: PORT_KIND_VIDEO,
         label: 'Video',
@@ -215,6 +231,9 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       imageQuality: 'auto',
       imageBackground: 'auto',
       videoSize: '1280x720',
+      audioVoice: '',
+      audioMode: 'music',
+      durationSeconds: 8,
       negativePrompt: '',
       width: 832,
       height: 832,
@@ -344,6 +363,11 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         id: 'image',
         kind: PORT_KIND_IMAGE,
         label: 'Image',
+      },
+      {
+        id: 'audio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Audio',
       },
       {
         id: 'video',
@@ -794,9 +818,16 @@ function getModelStepOperationId(node) {
   }
 
   if (executionMode === 'localTool') {
-    return String(node?.config?.operationId || '').trim() === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-      ? PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-      : PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+    const requestedOperationId = String(node?.config?.operationId || '').trim();
+    if (requestedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+      return PIPELINE_OPERATION_IDS.VIDEO_GENERATE;
+    }
+
+    if (requestedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+      return PIPELINE_OPERATION_IDS.AUDIO_GENERATE;
+    }
+
+    return PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
   }
 
   const requestedOperationId = String(node?.config?.operationId || '').trim();
@@ -806,7 +837,15 @@ function getModelStepOperationId(node) {
 }
 
 function getOperationDrivenToolIdsForModelStepOperation(operationId) {
-  return operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? VIDEO_WORKFLOW_TOOL_IDS : IMAGE_WORKFLOW_TOOL_IDS;
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+    return VIDEO_WORKFLOW_TOOL_IDS;
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+    return AUDIO_WORKFLOW_TOOL_IDS;
+  }
+
+  return IMAGE_WORKFLOW_TOOL_IDS;
 }
 
 function getModelStepLocalToolId(node, contextMaps = {}) {
@@ -1661,10 +1700,18 @@ function resolveLlmNodeCapability(node, contextMaps = {}) {
   }
 
   if (executionMode === 'localTool') {
-    const effectiveToolId = getModelStepLocalToolId(node, contextMaps);
-    const toolIds = effectiveToolId ? [effectiveToolId] : getOperationDrivenToolIdsForModelStepOperation(operationId);
+    const selectedToolId = String(node?.config?.toolId || '').trim();
+    const supportedToolIds = getOperationDrivenToolIdsForModelStepOperation(operationId);
+    const effectiveToolId = selectedToolId && supportedToolIds.includes(selectedToolId)
+      ? selectedToolId
+      : pickAvailableToolId(supportedToolIds, contextMaps);
+    const toolIds = effectiveToolId ? [effectiveToolId] : supportedToolIds;
     const tool = effectiveToolId ? getContextToolEntry(effectiveToolId, contextMaps) : null;
-    const fallbackLabel = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? 'Wan2.1 WebUI' : 'Automatic1111 or Forge';
+    const fallbackLabel = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? 'Wan2.1 WebUI'
+      : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+        ? 'AudioCraft WebUI'
+        : 'Automatic1111 or Forge';
     return {
       capability: mergeCapabilityOperations(toolIds.map((toolId) => getContextToolOperation(toolId, operationId, contextMaps))),
       operationId,
@@ -1673,8 +1720,7 @@ function resolveLlmNodeCapability(node, contextMaps = {}) {
       targetLabel: tool?.name || fallbackLabel,
     };
   }
-
-  const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
   if (providerId) {
     const provider = getContextProviderEntry(providerId, contextMaps);
     return {
@@ -1978,7 +2024,27 @@ function getUnexpectedOutputConnectionMessage(node, supportedOutputKinds = [], g
 
 function getModelStepSupportState(node, capabilitySummary, contextMaps = {}, connectedKinds = []) {
   const model = String(node?.config?.model || '').trim();
-  if (!model || !capabilitySummary) {
+  if (!capabilitySummary) {
+    return {
+      status: 'unknown',
+      message: '',
+    };
+  }
+
+  if (!model) {
+    if (
+      node?.config?.executionMode === 'localTool'
+      && (
+        capabilitySummary.operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+        || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      )
+    ) {
+      return {
+        status: 'supported',
+        message: '',
+      };
+    }
+
     return {
       status: 'unknown',
       message: '',
@@ -2013,7 +2079,11 @@ function getModelStepSupportState(node, capabilitySummary, contextMaps = {}, con
             ? 'Selected model does not support image generation on ' + capabilitySummary.targetLabel + '. Choose a dedicated image model such as gpt-image-1 before running this step.'
             : capabilitySummary.operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
               ? 'Selected model does not support video generation on ' + capabilitySummary.targetLabel + '. Choose a Sora video model such as sora-2 before running this step.'
-              : 'Selected model does not support ' + getPipelineOperationLabel(capabilitySummary.operationId).toLowerCase() + ' on ' + capabilitySummary.targetLabel + '. Choose a compatible chat model before running this step.',
+              : capabilitySummary.operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                ? capabilitySummary.targetId === 'google'
+                  ? 'Selected model does not support speech generation on ' + capabilitySummary.targetLabel + '. Choose a Gemini TTS model such as gemini-2.5-flash-preview-tts before running this step.'
+                  : 'Selected model does not support speech generation on ' + capabilitySummary.targetLabel + '. Choose a compatible text-to-speech model before running this step.'
+                : 'Selected model does not support ' + getPipelineOperationLabel(capabilitySummary.operationId).toLowerCase() + ' on ' + capabilitySummary.targetLabel + '. Choose a compatible chat model before running this step.',
       };
     }
   }
@@ -2359,6 +2429,11 @@ function buildNodeIssue(node, tone, message, options = {}) {
     kind: options.kind || 'readiness',
   };
 }
+function parseProviderStatusTimestamp(value) {
+  const timestamp = Date.parse(String(value || '').trim());
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
 function getSelectedProviderStatus(providerId, contextMaps) {
   const provider = contextMaps.providersById[String(providerId || '').trim()] || null;
   if (!provider) {
@@ -2373,14 +2448,52 @@ function getSelectedProviderStatus(providerId, contextMaps) {
     return {
       provider,
       tone: 'error',
-      message: 'That cloud provider is not connected on this PC yet.',
+      message: 'That cloud provider is not connected on this PC yet. Save its API key first.',
+    };
+  }
+
+  const lastSuccessfulUseTimestamp = parseProviderStatusTimestamp(provider.lastSuccessfulUseAt);
+  const lastTestedTimestamp = parseProviderStatusTimestamp(provider.lastTestedAt);
+  const liveSuccessOutranksFailedTest = provider.lastTestSucceeded === false
+    && lastSuccessfulUseTimestamp
+    && (!lastTestedTimestamp || lastSuccessfulUseTimestamp >= lastTestedTimestamp);
+
+  if (liveSuccessOutranksFailedTest) {
+    return {
+      provider,
+      tone: 'info',
+      message: provider.name + ' completed a real provider request on this PC more recently than its last failed connection check. Local AI Hub will rely on that newer success for this step.',
+    };
+  }
+
+  if (provider.lastTestSucceeded === false) {
+    return {
+      provider,
+      tone: 'warn',
+      message: provider.name + ' has a saved API key, but the last connection check failed on this PC. Re-test the provider before relying on this step.',
+    };
+  }
+
+  if (!provider.lastTestedAt || provider.lastTestSucceeded !== true) {
+    if (lastSuccessfulUseTimestamp) {
+      return {
+        provider,
+        tone: 'info',
+        message: provider.name + ' completed a real provider request on this PC, even though it has not passed a saved connection check here yet.',
+      };
+    }
+
+    return {
+      provider,
+      tone: 'warn',
+      message: provider.name + ' has a saved API key, but it has not been validated on this PC yet.',
     };
   }
 
   return {
     provider,
     tone: 'info',
-    message: `${provider.name} will process this step outside your machine.`,
+    message: provider.name + ' will process this step outside your machine.',
   };
 }
 
@@ -2393,6 +2506,83 @@ function analyzeInputFileNode(node, summary) {
     return false;
   }
 
+  return true;
+}
+
+function canToolLikelyLaunch(tool) {
+  if (!tool || tool.launchSupported === false) {
+    return false;
+  }
+
+  if (tool.launchProfile?.kind === 'embedded') {
+    return Boolean(tool.launchProfile?.pythonPath || tool.externalPythonPath || tool.managedPythonPath || tool.pythonBootstrapPath || tool.installDir || tool.displayPath);
+  }
+
+  if (tool.launchProfile?.kind === 'python-script' || tool.launchProfile?.kind === 'python-module') {
+    return Boolean(tool.launchProfile?.pythonPath || tool.externalPythonPath || tool.managedPythonPath || tool.pythonBootstrapPath);
+  }
+
+  if (tool.launchProfile?.kind === 'binary') {
+    return Boolean(tool.launchProfile?.executable || tool.executablePath);
+  }
+
+  if (tool.launchProfile?.kind === 'batch') {
+    return Boolean(tool.launchProfile?.command);
+  }
+
+  if (tool.launchProfile?.kind === 'folder') {
+    return Boolean(tool.launchProfile?.path || tool.installDir || tool.displayPath);
+  }
+
+  return Boolean(tool.installDir || tool.displayPath || tool.appDir);
+}
+
+function analyzeWhisperNode(summary, contextMaps) {
+  const tool = contextMaps.toolsById.whisper || null;
+  if (!tool) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Install Whisper before using this transcription step in a pipeline.',
+    };
+    return false;
+  }
+
+  if (String(tool.status || '').toLowerCase() === 'error' && String(tool.lastError || '').trim()) {
+    summary.readiness = {
+      tone: 'error',
+      message: tool.lastError,
+    };
+    return false;
+  }
+
+  if (!canToolLikelyLaunch(tool)) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Whisper is installed, but Local AI Hub cannot find its Python environment yet. Run Repair or reinstall Whisper before using this transcription step.',
+    };
+    return false;
+  }
+
+  if (String(tool.status || '').toLowerCase() === 'running') {
+    summary.readiness = {
+      tone: 'info',
+      message: 'Whisper is ready for local transcription on this PC.',
+    };
+    return true;
+  }
+
+  if (String(tool.status || '').toLowerCase() === 'starting') {
+    summary.readiness = {
+      tone: 'warn',
+      message: 'Whisper is still starting. Local AI Hub will wait for it before this transcription step runs.',
+    };
+    return true;
+  }
+
+  summary.readiness = {
+    tone: 'warn',
+    message: 'Whisper is installed and Local AI Hub can start it automatically when this transcription step begins.',
+  };
   return true;
 }
 
@@ -2439,17 +2629,21 @@ function analyzeImageToolNode(node, summary, contextMaps) {
   return true;
 }
 
-function analyzeModelStepLocalToolNode(node, summary, contextMaps) {
+function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKinds = []) {
   const operationId = getModelStepOperationId(node);
   const selectedToolId = String(node.config?.toolId || '').trim();
   const supportedToolIds = getOperationDrivenToolIdsForModelStepOperation(operationId);
   const effectiveToolId = getModelStepLocalToolId(node, contextMaps);
   const installMessage = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
     ? 'Install Wan2.1 WebUI before using local video generation in a model step.'
-    : 'Install Automatic1111 or Forge before using the local image tool mode in a model step.';
+    : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+      ? 'Install AudioCraft WebUI before using local audio generation in a model step.'
+      : 'Install Automatic1111 or Forge before using the local image tool mode in a model step.';
   const selectionMessage = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
     ? 'Choose Wan2.1 WebUI for this local video model step. ComfyUI video workflows use the dedicated Graph Workflow step instead of this model-step mode.'
-    : 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.';
+    : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+      ? 'Choose AudioCraft WebUI for this local audio model step. RVC-style audio transformation is not wired into this model-step path yet, so keep this slice focused on generated-audio output.'
+      : 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.';
 
   if (selectedToolId && !supportedToolIds.includes(selectedToolId)) {
     summary.readiness = {
@@ -2474,6 +2668,31 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps) {
       message: installMessage,
     };
     return false;
+  }
+
+  if (!canToolLikelyLaunch(tool)) {
+    summary.readiness = {
+      tone: 'error',
+      message: tool.name + ' is installed, but Local AI Hub cannot find its local runtime yet. Run Repair or reinstall the tool before using this model step.',
+    };
+    return false;
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+    const audioMode = String(node.config?.audioMode || 'music').trim().toLowerCase();
+    if (connectedKinds.includes(PORT_KIND_AUDIO) && audioMode === 'sound') {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Sound mode currently accepts text prompts only in this first audio-output slice. Switch the step to Music mode if you want to guide generation with connected audio.',
+      };
+      return false;
+    }
+
+    summary.readiness = {
+      tone: 'info',
+      message: tool.name + ' will run this audio generation step through its dedicated local backend adapter. Music mode accepts text prompts and optional audio guidance, while Sound mode stays text-only in this pass.',
+    };
+    return true;
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
@@ -2728,13 +2947,14 @@ function analyzePipeline(definition = {}, context = {}) {
         } else {
           const unsupportedKinds = connectedKinds.filter((kind) => !(summary.capabilitySummary?.inputKinds || []).includes(kind));
           const outputConnectionMessage = getUnexpectedOutputConnectionMessage(node, summary.capabilitySummary?.outputKinds || [], graph);
+          const requiresExplicitModel = !(executionMode === 'localTool' && (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE));
           if (unsupportedKinds.length) {
             summary.readiness = {
               tone: 'error',
               message: (summary.capabilitySummary?.targetLabel || 'This target') + ' does not accept ' + formatPortKindList(unsupportedKinds) + ' here. This step currently supports ' + formatPortKindList(summary.capabilitySummary?.inputKinds || [PORT_KIND_TEXT]) + '.',
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-          } else if (!String(node.config?.model || '').trim()) {
+          } else if (requiresExplicitModel && !String(node.config?.model || '').trim()) {
             summary.readiness = {
               tone: 'error',
               message: 'Choose or enter a model for this model step.',
@@ -2774,32 +2994,47 @@ function analyzePipeline(definition = {}, context = {}) {
                 : modelSupport.status === 'unknown'
                   ? {
                       tone: 'warn',
-                      message: modelSupport.message,
+                      message: modelSupport.message || providerStatus.message,
                     }
-                  : operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                  : providerStatus.tone === 'warn'
                     ? {
-                        tone: 'info',
-                        message: (providerStatus.provider?.name || 'That provider') + ' will turn the connected text prompt into an image.',
+                        tone: 'warn',
+                        message: providerStatus.message,
                       }
-                    : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                      ? connectedKinds.includes(PORT_KIND_IMAGE)
-                        ? {
-                            tone: 'info',
-                            message: (providerStatus.provider?.name || 'That provider') + ' will use the connected image and your motion guidance to render a video.',
-                          }
-                        : {
-                            tone: 'info',
-                            message: (providerStatus.provider?.name || 'That provider') + ' will turn the connected prompt into a video artifact.',
-                          }
-                      : connectedKinds.includes(PORT_KIND_IMAGE)
-                        ? {
-                            tone: 'info',
-                            message: (providerStatus.provider?.name || 'That provider') + ' can read the connected image and return text.',
-                          }
-                        : {
-                            tone: 'info',
-                            message: (providerStatus.provider?.name || 'That provider') + ' will return text for this step.',
-                          };
+                    : providerStatus.provider?.lastSuccessfulUseAt && (providerStatus.provider?.lastTestSucceeded === false || !providerStatus.provider?.lastTestedAt)
+                      ? {
+                          tone: 'info',
+                          message: providerStatus.message,
+                        }
+                    : operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                      ? {
+                          tone: 'info',
+                          message: (providerStatus.provider?.name || 'That provider') + ' will turn the connected text prompt into an image.',
+                        }
+                      : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                        ? connectedKinds.includes(PORT_KIND_IMAGE)
+                          ? {
+                              tone: 'info',
+                              message: (providerStatus.provider?.name || 'That provider') + ' will use the connected image and your motion guidance to render a video.',
+                            }
+                          : {
+                              tone: 'info',
+                              message: (providerStatus.provider?.name || 'That provider') + ' will turn the connected prompt into a video artifact.',
+                            }
+                        : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                          ? {
+                              tone: 'info',
+                              message: (providerStatus.provider?.name || 'That provider') + ' will turn the connected text into a saved audio artifact for the Audio output port.',
+                            }
+                          : connectedKinds.includes(PORT_KIND_IMAGE)
+                            ? {
+                                tone: 'info',
+                                message: (providerStatus.provider?.name || 'That provider') + ' can read the connected image and return text.',
+                              }
+                            : {
+                                tone: 'info',
+                                message: (providerStatus.provider?.name || 'That provider') + ' will return text for this step.',
+                              };
               issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
             }
           } else if (executionMode === 'localTool') {
@@ -2810,7 +3045,7 @@ function analyzePipeline(definition = {}, context = {}) {
               };
               issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
             } else {
-              const ready = analyzeModelStepLocalToolNode(node, summary, contextMaps);
+              const ready = analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKinds);
               if (!ready || summary.readiness.tone === 'error') {
                 issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
               } else {
@@ -2880,12 +3115,11 @@ function analyzePipeline(definition = {}, context = {}) {
       }
 
       if (node.type === 'whisperTranscribe') {
-        if (!contextMaps.toolsById.whisper) {
-          summary.readiness = {
-            tone: 'error',
-            message: 'Install Whisper before using this transcription step in a pipeline.',
-          };
+        const ready = analyzeWhisperNode(summary, contextMaps);
+        if (!ready || summary.readiness.tone === 'error') {
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (summary.readiness.tone === 'warn') {
+          issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
         }
       }
 
@@ -2966,7 +3200,7 @@ function analyzePipeline(definition = {}, context = {}) {
                 message: 'Describe the pass and fail rules for this validation step.',
               };
               issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-            } else if (!String(node.config?.model || '').trim()) {
+            } else if (requiresExplicitModel && !String(node.config?.model || '').trim()) {
               summary.readiness = {
                 tone: 'error',
                 message: 'Choose or enter a model for this validator.',
@@ -3174,6 +3408,7 @@ module.exports = {
   PIPELINE_OPERATION_IDS,
   PIPELINE_PORT_KIND_LABELS,
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
+  AUDIO_WORKFLOW_TOOL_IDS,
   PORT_KIND_ANY,
   PORT_KIND_AUDIO,
   PORT_KIND_AUDIO_FILE,

@@ -17,6 +17,12 @@ const OPENAI_IMAGE_SIZES = new Set(['1024x1024', '1536x1024', '1024x1536', 'auto
 const OPENAI_IMAGE_QUALITIES = new Set(['auto', 'low', 'medium', 'high']);
 const OPENAI_IMAGE_BACKGROUNDS = new Set(['auto', 'opaque', 'transparent']);
 const OPENAI_VIDEO_SIZES = new Set(['1280x720', '720x1280']);
+const DEFAULT_GOOGLE_TTS_VOICE = 'Kore';
+const GOOGLE_TTS_WAVE_SAMPLE_RATE = 24000;
+const GOOGLE_TTS_WAVE_CHANNEL_COUNT = 1;
+const GOOGLE_TTS_WAVE_BIT_DEPTH = 16;
+
+let providerStateChangeSink = null;
 function createDefaultSettings() {
   return {
     version: PROVIDER_SETTINGS_VERSION,
@@ -62,6 +68,25 @@ async function updateProviderSettings(mutator) {
   const currentSettings = await readProviderSettings();
   const nextSettings = (await mutator(currentSettings)) || currentSettings;
   return writeProviderSettings(nextSettings);
+}
+
+function setProviderStateChangeSink(listener) {
+  providerStateChangeSink = typeof listener === 'function' ? listener : null;
+}
+
+async function notifyProviderStateChanged(details = {}) {
+  if (typeof providerStateChangeSink !== 'function') {
+    return;
+  }
+
+  try {
+    await providerStateChangeSink({
+      ...details,
+      providers: await listProviderConnections(),
+    });
+  } catch {
+    return;
+  }
 }
 
 function buildProviderHeaders(provider, apiKey, contentType = 'application/json') {
@@ -310,10 +335,93 @@ function selectPreferredModel(provider, models, savedModel) {
   return models[0].id;
 }
 
-function normalizeProviderSummary(provider, settingsEntry = {}, apiKey = '') {
-  const hasKey = Boolean(String(apiKey || '').trim());
+function parseProviderTimestamp(value) {
+  const timestamp = Date.parse(String(value || '').trim());
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function describeProviderUsageOperation(operationId) {
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+    return 'audio';
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+    return 'image';
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+    return 'video';
+  }
+
+  return 'text';
+}
+
+function buildProviderStatusMessage(provider, settingsEntry = {}, options = {}) {
+  const hasKey = options.hasKey === true;
   const lastTestSucceeded = settingsEntry.lastTestSucceeded === true;
   const lastTestFailed = settingsEntry.lastTestSucceeded === false;
+  const lastSuccessfulUseAt = String(settingsEntry.lastSuccessfulUseAt || '').trim();
+  const lastSuccessfulOperation = String(settingsEntry.lastSuccessfulOperation || '').trim();
+  const lastSuccessfulUseTimestamp = parseProviderTimestamp(lastSuccessfulUseAt);
+  const lastTestedTimestamp = parseProviderTimestamp(settingsEntry.lastTestedAt);
+  const liveSuccessOutranksFailedTest = Boolean(lastTestFailed && lastSuccessfulUseTimestamp && (!lastTestedTimestamp || lastSuccessfulUseTimestamp >= lastTestedTimestamp));
+  const usageLabel = describeProviderUsageOperation(lastSuccessfulOperation);
+
+  if (!hasKey) {
+    return {
+      libraryStatus: 'disconnected',
+      statusLabel: 'Not connected',
+      statusMessage: '',
+    };
+  }
+
+  if (liveSuccessOutranksFailedTest) {
+    return {
+      libraryStatus: 'connected',
+      statusLabel: 'Connected',
+      statusMessage: provider.name + ' completed a real ' + usageLabel + ' request on this PC more recently than its last failed connection check. Re-test the provider if you want to refresh the saved check history.',
+    };
+  }
+
+  if (lastTestFailed) {
+    return {
+      libraryStatus: 'attention',
+      statusLabel: 'Needs attention',
+      statusMessage: String(settingsEntry.lastTestMessage || '').trim() || (provider.name + ' has a saved API key, but the last connection check failed on this PC.'),
+    };
+  }
+
+  if (lastTestSucceeded) {
+    return {
+      libraryStatus: 'connected',
+      statusLabel: 'Connected',
+      statusMessage: String(settingsEntry.lastTestMessage || '').trim() || (provider.name + ' connection verified on this PC.'),
+    };
+  }
+
+  if (lastSuccessfulUseAt) {
+    return {
+      libraryStatus: 'connected',
+      statusLabel: 'Connected',
+      statusMessage: provider.name + ' completed a real ' + usageLabel + ' request on this PC, but it has not passed a saved connection check here yet.',
+    };
+  }
+
+  return {
+    libraryStatus: 'connected',
+    statusLabel: 'Key saved',
+    statusMessage: provider.name + ' has a saved API key, but it has not been validated on this PC yet.',
+  };
+}
+
+function normalizeProviderSummary(provider, settingsEntry = {}, apiKey = '') {
+  const hasKey = Boolean(String(apiKey || '').trim());
+  const lastTestSucceeded = settingsEntry.lastTestSucceeded === true
+    ? true
+    : settingsEntry.lastTestSucceeded === false
+      ? false
+      : undefined;
+  const status = buildProviderStatusMessage(provider, settingsEntry, { hasKey });
 
   return {
     ...provider,
@@ -321,16 +429,19 @@ function normalizeProviderSummary(provider, settingsEntry = {}, apiKey = '') {
     source: 'cloud',
     cloudBadge: 'Cloud',
     isConnected: hasKey,
-    libraryStatus: hasKey ? (lastTestFailed ? 'attention' : 'connected') : 'disconnected',
+    libraryStatus: status.libraryStatus,
     maskedKey: hasKey ? maskSecret(apiKey) : '',
     lastAvailableModelId: settingsEntry.lastAvailableModelId || '',
     lastConnectedAt: settingsEntry.lastConnectedAt || null,
+    lastSuccessfulOperation: settingsEntry.lastSuccessfulOperation || '',
+    lastSuccessfulUseAt: settingsEntry.lastSuccessfulUseAt || null,
     lastTestMessage: settingsEntry.lastTestMessage || '',
     lastTestSucceeded,
     lastTestedAt: settingsEntry.lastTestedAt || null,
     modelCount: Number(settingsEntry.modelCount || 0),
     selectedModel: settingsEntry.selectedModel || '',
-    statusLabel: hasKey ? (lastTestFailed ? 'Needs attention' : lastTestSucceeded ? 'Connected' : 'Key saved') : 'Not connected',
+    statusLabel: status.statusLabel,
+    statusMessage: status.statusMessage,
   };
 }
 
@@ -639,6 +750,114 @@ async function sendGoogleChat(provider, apiKey, payload) {
       role: 'assistant',
       content,
     },
+  };
+}
+
+function findGoogleInlineDataPart(parts) {
+  if (!Array.isArray(parts)) {
+    return null;
+  }
+
+  return (
+    parts.find((part) => {
+      const inlineData = part?.inlineData && typeof part.inlineData === 'object' ? part.inlineData : null;
+      const base64Data = String(inlineData?.data || '').trim();
+      return Boolean(base64Data);
+    }) || null
+  );
+}
+
+function buildWaveFileBufferFromPcm(pcmBuffer, options = {}) {
+  const sampleRate = Math.max(1, Number(options.sampleRate || GOOGLE_TTS_WAVE_SAMPLE_RATE) || GOOGLE_TTS_WAVE_SAMPLE_RATE);
+  const channelCount = Math.max(1, Number(options.channelCount || GOOGLE_TTS_WAVE_CHANNEL_COUNT) || GOOGLE_TTS_WAVE_CHANNEL_COUNT);
+  const bitDepth = Math.max(8, Number(options.bitDepth || GOOGLE_TTS_WAVE_BIT_DEPTH) || GOOGLE_TTS_WAVE_BIT_DEPTH);
+  const blockAlign = Math.max(1, channelCount * Math.ceil(bitDepth / 8));
+  const byteRate = sampleRate * blockAlign;
+  const dataLength = pcmBuffer.length;
+  const header = Buffer.alloc(44);
+
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataLength, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channelCount, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataLength, 40);
+
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+async function sendGoogleSpeechGeneration(provider, apiKey, payload) {
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw new Error('Enter text before generating speech.');
+  }
+
+  const model = String(payload.model || '').trim();
+  if (!model) {
+    throw new Error('Choose a Gemini speech model before generating audio.');
+  }
+
+  const voice = String(payload.voice || payload.voiceName || DEFAULT_GOOGLE_TTS_VOICE).trim() || DEFAULT_GOOGLE_TTS_VOICE;
+  const modelPath = model.startsWith('models/') ? model : 'models/' + model;
+  const response = await requestProviderJson(provider, apiKey, modelPath + ':generateContent', {
+    method: 'POST',
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: voice,
+            },
+          },
+        },
+      },
+    }),
+  });
+
+  const inlineAudioPart = findGoogleInlineDataPart(response?.candidates?.[0]?.content?.parts);
+  const inlineData = inlineAudioPart?.inlineData && typeof inlineAudioPart.inlineData === 'object' ? inlineAudioPart.inlineData : null;
+  const base64Data = String(inlineData?.data || '').trim();
+  if (!base64Data) {
+    throw new Error(provider.name + ' finished the request, but it did not return audio.');
+  }
+
+  const audioBuffer = Buffer.from(base64Data, 'base64');
+  if (!audioBuffer.length) {
+    throw new Error(provider.name + ' returned an empty audio file.');
+  }
+
+  const mimeType = String(inlineData?.mimeType || '').trim().toLowerCase();
+  const waveBuffer = mimeType === 'audio/wav' || mimeType === 'audio/x-wav'
+    ? audioBuffer
+    : buildWaveFileBufferFromPcm(audioBuffer, {
+        sampleRate: GOOGLE_TTS_WAVE_SAMPLE_RATE,
+        channelCount: GOOGLE_TTS_WAVE_CHANNEL_COUNT,
+        bitDepth: GOOGLE_TTS_WAVE_BIT_DEPTH,
+      });
+
+  return {
+    createdAt: new Date().toISOString(),
+    model,
+    audios: [
+      {
+        buffer: waveBuffer,
+        extension: '.wav',
+        mimeType: 'audio/wav',
+        sampleRate: GOOGLE_TTS_WAVE_SAMPLE_RATE,
+        channelCount: GOOGLE_TTS_WAVE_CHANNEL_COUNT,
+        bitDepth: GOOGLE_TTS_WAVE_BIT_DEPTH,
+        voice,
+      },
+    ],
   };
 }
 
@@ -964,6 +1183,32 @@ async function testProviderConnection(providerId) {
   }
 }
 
+async function recordProviderUsageSuccess(providerId, model, operationId) {
+  const normalizedProviderId = String(providerId || '').trim();
+  if (!normalizedProviderId) {
+    return;
+  }
+
+  const normalizedModel = String(model || '').trim();
+  const normalizedOperationId = normalizeProviderOperationId(operationId) || PIPELINE_OPERATION_IDS.LLM_PROMPT;
+  await updateProviderSettings((settings) => ({
+    ...settings,
+    providers: {
+      ...settings.providers,
+      [normalizedProviderId]: {
+        ...(settings.providers[normalizedProviderId] || {}),
+        lastSuccessfulOperation: normalizedOperationId,
+        lastSuccessfulUseAt: new Date().toISOString(),
+        ...(normalizedModel ? { selectedModel: normalizedModel } : {}),
+      },
+    },
+  }));
+  await notifyProviderStateChanged({
+    providerId: normalizedProviderId,
+    reason: 'usage-success',
+  });
+}
+
 async function chatWithProvider(providerId, payload = {}) {
   await initializeProviderRegistry();
   const provider = getProviderManifest(providerId);
@@ -996,16 +1241,7 @@ async function chatWithProvider(providerId, payload = {}) {
       result = await sendOpenAICompatibleChat(provider, apiKey, { model, messages });
     }
 
-    await updateProviderSettings((settings) => ({
-      ...settings,
-      providers: {
-        ...settings.providers,
-        [provider.id]: {
-          ...(settings.providers[provider.id] || {}),
-          selectedModel: model,
-        },
-      },
-    }));
+    await recordProviderUsageSuccess(provider.id, model, PIPELINE_OPERATION_IDS.LLM_PROMPT);
 
     return result;
   } catch (error) {
@@ -1045,20 +1281,17 @@ async function runProviderOperation(providerId, payload = {}) {
       result = await sendOpenAiImageGeneration(provider, apiKey, payload);
     } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
       result = await sendOpenAiVideoGeneration(provider, apiKey, payload);
+    } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+      if (provider.configuration?.protocol === 'google-gemini') {
+        result = await sendGoogleSpeechGeneration(provider, apiKey, payload);
+      } else {
+        throw new Error(provider.name + ' does not support cloud audio generation in Local AI Hub yet.');
+      }
     } else {
       throw new Error(provider.name + ' does not support that pipeline operation yet.');
     }
 
-    await updateProviderSettings((settings) => ({
-      ...settings,
-      providers: {
-        ...settings.providers,
-        [provider.id]: {
-          ...(settings.providers[provider.id] || {}),
-          selectedModel: model,
-        },
-      },
-    }));
+    await recordProviderUsageSuccess(provider.id, model, operationId);
 
     return result;
   } catch (error) {
@@ -1079,6 +1312,7 @@ module.exports = {
   readProviderSettings,
   runProviderOperation,
   saveProviderConnection,
+  setProviderStateChangeSink,
   testProviderConnection,
 };
 

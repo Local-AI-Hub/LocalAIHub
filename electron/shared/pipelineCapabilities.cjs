@@ -9,6 +9,7 @@ const PIPELINE_OPERATION_IDS = Object.freeze({
   IMAGE_ANALYZE: 'imageAnalyze',
   IMAGE_GENERATE: 'imageGenerate',
   VIDEO_GENERATE: 'videoGenerate',
+  AUDIO_GENERATE: 'audioGenerate',
   LLM_PROMPT: 'llmPrompt',
   VALIDATION_LLM: 'validationLlm',
   WHISPER_TRANSCRIBE: 'whisperTranscribe',
@@ -41,6 +42,11 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
     label: 'Operation-driven local tool',
     notes: 'Wan2.1 WebUI fits the sequential model-step pipeline for local video generation, but Local AI Hub runs it through a dedicated direct Python adapter instead of flattening graph-native tools into the same shape.',
+  }),
+  'audiocraft-webui': Object.freeze({
+    id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
+    label: 'Operation-driven local tool',
+    notes: 'AudioCraft WebUI fits the sequential model-step pipeline for generated audio, and Local AI Hub runs it through a dedicated direct Python adapter so prompt-to-audio artifacts stay typed and reusable inside the pipeline.',
   }),
   comfyui: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW,
@@ -76,6 +82,7 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
     operations: Object.freeze({
       [PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_AUDIO]),
+        notes: 'Runs locally through faster-whisper inside Local AI Hub and keeps transcript timing details attached to the result.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
     }),
@@ -115,6 +122,16 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
         notes: 'Runs a local Wan video request through a dedicated direct Python adapter. Text input produces text-to-video. Image input produces image-to-video when motion guidance is supplied in the step instruction box.',
         outputKinds: Object.freeze([MODALITY_VIDEO]),
+      }),
+    }),
+    targetType: 'tool',
+  }),
+  'audiocraft-webui': Object.freeze({
+    operations: Object.freeze({
+      [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_AUDIO]),
+        notes: 'Runs AudioCraft through a dedicated direct Python adapter. Text input produces generated audio. Audio input reuses the connected clip as music guidance in Music mode for this first audio-output pipeline slice.',
+        outputKinds: Object.freeze([MODALITY_AUDIO]),
       }),
     }),
     targetType: 'tool',
@@ -176,6 +193,11 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE]),
         notes: 'Gemini validation can review attached images, videos, and document-style files in the current provider path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
+      }),
+      [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT]),
+        notes: 'Gemini text-to-speech can turn text into a saved speech artifact when you choose a TTS-capable Gemini model.',
+        outputKinds: Object.freeze([MODALITY_AUDIO]),
       }),
     }),
     targetType: 'provider',
@@ -275,10 +297,26 @@ const PROVIDER_MODEL_CAPABILITY_RULES = Object.freeze({
       pattern: /^sora-2(?:-pro)?(?:-\d{4}-\d{2}-\d{2})?$/i,
     }),
   ]),
+  google: Object.freeze([
+    Object.freeze({
+      capabilityLabels: Object.freeze(['Speech generation']),
+      capabilitySource: 'explicit',
+      exclusive: true,
+      operations: Object.freeze({
+        [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
+          inputKinds: Object.freeze([MODALITY_TEXT]),
+          notes: 'Creates speech audio from text through Gemini text-to-speech.',
+          outputKinds: Object.freeze([MODALITY_AUDIO]),
+        }),
+      }),
+      pattern: /^models\/gemini-[a-z0-9.-]*tts$/i,
+    }),
+  ]),
 });
 
 const PROVIDER_MODEL_FALLBACK_OPERATION_IDS = Object.freeze({
   openai: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.VALIDATION_LLM]),
+  google: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.VALIDATION_LLM]),
 });
 
 function normalizeId(value) {

@@ -38,9 +38,9 @@ function ProviderCard({ provider, busyMap, onOpenChat, onOpenSettings }) {
                 <p className="mt-2 text-sm font-medium text-white break-all">{provider.selectedModel || provider.lastAvailableModelId || 'Choose in chat'}</p>
               </div>
             </div>
-            {provider.lastTestMessage ? (
+            {provider.statusMessage || provider.lastTestMessage ? (
               <div className="mt-5 rounded-3xl border border-white/10 bg-white/5 p-4 text-sm leading-6 text-slate-300">
-                {provider.lastTestMessage}
+                {provider.statusMessage || provider.lastTestMessage}
               </div>
             ) : null}
           </div>

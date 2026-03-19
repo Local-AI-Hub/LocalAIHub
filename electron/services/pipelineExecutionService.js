@@ -27,11 +27,13 @@ const {
   resolveSelectedImageTool,
 } = require('./workflowToolService');
 const { executeGraphWorkflowNode } = require('./graphWorkflowService');
+const { generateAudioWithLocalAudioTool } = require('./localAudioService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const { getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
   PIPELINE_OPERATION_IDS,
+  PORT_KIND_AUDIO,
   PORT_KIND_FILE,
   PORT_KIND_IMAGE,
   PORT_KIND_TEXT,
@@ -1168,6 +1170,75 @@ async function buildVideoGenerationRequest(node, inputArtifact) {
   throw new Error('This video generation step currently accepts text or image input only.');
 }
 
+async function buildAudioGenerationRequest(node, inputArtifact) {
+  if (!inputArtifact) {
+    throw new Error('This audio generation step did not receive any input.');
+  }
+
+  const audioMode = String(node.config?.audioMode || 'music').trim() === 'sound' ? 'sound' : 'music';
+  const durationSeconds = Math.max(1, Number(node.config?.durationSeconds || 8) || 8);
+  const instruction = String(node.config?.instruction || '').trim();
+
+  if (inputArtifact.kind === PORT_KIND_TEXT) {
+    const promptText = String(inputArtifact.text || '').trim();
+    if (!promptText) {
+      throw new Error('This audio generation step did not receive any text prompt.');
+    }
+
+    return {
+      audioMode,
+      durationSeconds,
+      prompt: instruction ? instruction + '\n\nPrompt:\n' + promptText : promptText,
+      sourceAudioArtifact: null,
+      sourceAudioPath: '',
+    };
+  }
+
+  if (inputArtifact.kind === PORT_KIND_AUDIO && inputArtifact.filePath) {
+    if (audioMode === 'sound') {
+      throw new Error('This audio generation step is set to Sound mode, which currently needs text input. Switch to Music mode to guide generation from an audio file.');
+    }
+
+    const sourceAudioPath = path.resolve(String(inputArtifact.filePath || '').trim());
+    if (!sourceAudioPath || !(await fs.pathExists(sourceAudioPath))) {
+      throw new Error('The source audio for this generation step could not be found anymore. Choose it again and rerun the pipeline.');
+    }
+
+    return {
+      audioMode,
+      durationSeconds,
+      prompt: instruction || 'Create music guided by the supplied audio.',
+      sourceAudioArtifact: inputArtifact,
+      sourceAudioPath,
+    };
+  }
+
+  throw new Error('This audio generation step currently accepts text input or a source audio file only.');
+}
+
+async function buildCloudAudioGenerationRequest(node, inputArtifact) {
+  if (!inputArtifact) {
+    throw new Error('This cloud audio step did not receive any input.');
+  }
+
+  if (inputArtifact.kind !== PORT_KIND_TEXT) {
+    throw new Error('This cloud audio step currently accepts text input only.');
+  }
+
+  const spokenText = String(inputArtifact.text || '').trim();
+  if (!spokenText) {
+    throw new Error('This cloud audio step did not receive any text to speak.');
+  }
+
+  const instruction = String(node.config?.instruction || '').trim();
+  const voice = String(node.config?.audioVoice || '').trim();
+  return {
+    prompt: instruction ? instruction + '\n\nSpeak this text exactly:\n' + spokenText : spokenText,
+    spokenText,
+    voice,
+  };
+}
+
 async function buildValidationMessages(node, artifact, contextMaps) {
   const systemPrompt = String(node.config?.systemPrompt || '').trim();
   const artifactDescription = await buildValidationArtifactDescription(artifact, contextMaps);
@@ -1338,6 +1409,70 @@ function buildValidationPreview(parsed, reviewContext) {
 
   return trimPreviewText(parts.filter(Boolean).join(' | '), 220);
 }
+
+function buildWhisperTranscriptArtifact(node, audioArtifact, result = {}) {
+  const segments = (Array.isArray(result?.segments) ? result.segments : [])
+    .map((segment) => ({
+      end: Number.isFinite(Number(segment?.end)) ? Math.round(Number(segment.end) * 100) / 100 : null,
+      start: Number.isFinite(Number(segment?.start)) ? Math.round(Number(segment.start) * 100) / 100 : null,
+      text: String(segment?.text || '').trim(),
+    }))
+    .filter((segment) => segment.text);
+  const durationSeconds = Number(result?.durationSeconds || 0);
+  const transcription = {
+    backend: 'whisper',
+    backendLabel: 'Whisper (faster-whisper)',
+    durationSeconds: Number.isFinite(durationSeconds) && durationSeconds > 0 ? Math.round(durationSeconds * 100) / 100 : null,
+    language: String(result?.language || '').trim() || 'unknown',
+    model: String(result?.model || node?.config?.model || DEFAULT_WHISPER_MODEL).trim() || DEFAULT_WHISPER_MODEL,
+    runtime: {
+      computeType: String(result?.computeType || '').trim(),
+      device: String(result?.device || '').trim(),
+    },
+    segmentCount: segments.length,
+    segments,
+    sourceAudio: audioArtifact ? {
+      displayName: audioArtifact.displayName || '',
+      fileName: audioArtifact.fileName || '',
+      filePath: audioArtifact.filePath || '',
+      fileUrl: audioArtifact.fileUrl || '',
+      formatLabel: audioArtifact.formatLabel || '',
+      kind: audioArtifact.kind || 'audio',
+      mimeType: audioArtifact.mimeType || '',
+      sizeBytes: Number(audioArtifact.sizeBytes || 0) || 0,
+      summary: audioArtifact.summary || '',
+    } : null,
+  };
+
+  if (!transcription.runtime.computeType && !transcription.runtime.device) {
+    delete transcription.runtime;
+  }
+
+  return createTextArtifact(String(result?.text || ''), {
+    displayName: node.label,
+    role: 'generated',
+    transcription,
+  });
+}
+
+function buildWhisperCompletionMessage(result = {}) {
+  const details = [];
+  const language = String(result?.language || '').trim();
+  if (language && language.toLowerCase() !== 'unknown') {
+    details.push('detected ' + language);
+  }
+
+  const device = String(result?.device || '').trim();
+  const computeType = String(result?.computeType || '').trim();
+  if (device) {
+    details.push('used ' + device + (computeType ? ' ' + computeType : ''));
+  }
+
+  return details.length
+    ? 'Whisper finished transcribing the audio file and ' + details.join(', ') + '.'
+    : 'Whisper finished transcribing the audio file.';
+}
+
 async function getInstalledToolOrThrow(contextMaps, toolId, message) {
   const normalizedToolId = String(toolId || '').trim().toLowerCase();
   const currentTool = await getResolvedToolState(normalizedToolId, {
@@ -1371,6 +1506,15 @@ async function getSelectedLocalVideoToolOrThrow(contextMaps, node, actionLabel) 
     contextMaps,
     selectedToolId,
     `Install Wan2.1 WebUI before using the ${actionLabel} step.`,
+  );
+}
+
+async function getSelectedLocalAudioToolOrThrow(contextMaps, node, actionLabel) {
+  const selectedToolId = String(node?.config?.toolId || 'audiocraft-webui').trim().toLowerCase() || 'audiocraft-webui';
+  return getInstalledToolOrThrow(
+    contextMaps,
+    selectedToolId,
+    `Install AudioCraft WebUI before using the ${actionLabel} step.`,
   );
 }
 async function buildValidationArtifactDescription(artifact, contextMaps) {
@@ -1796,7 +1940,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       throw new Error('This LLM step did not receive any input.');
     }
 
-    const requiresExplicitModel = !(executionMode === 'localTool' && operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE);
+    const requiresExplicitModel = !(executionMode === 'localTool'
+      && (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE || operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE));
     if (!model && requiresExplicitModel) {
       throw new Error('Choose or enter a model for the model step before running this pipeline.');
     }
@@ -1842,6 +1987,24 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     }
 
     if (executionMode === 'localTool') {
+      if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+        const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'local audio generation');
+        const audioRequest = await buildAudioGenerationRequest(node, promptArtifact);
+        reportProgress?.('Sending the request to ' + tool.name + ' for local audio generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
+        return generateAudioWithLocalAudioTool(tool, {
+          audioMode: audioRequest.audioMode,
+          displayName: node.label,
+          durationSeconds: audioRequest.durationSeconds,
+          model,
+          nodeLabel: node.label,
+          prompt: audioRequest.prompt,
+          reportProgress,
+          runDirectories: run.directories,
+          sourceAudioArtifact: audioRequest.sourceAudioArtifact,
+          sourceAudioPath: audioRequest.sourceAudioPath,
+        });
+      }
+
       if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
         const tool = await getSelectedLocalVideoToolOrThrow(contextMaps, node, 'local video generation');
         const videoRequest = await buildVideoGenerationRequest(node, promptArtifact);
@@ -1863,7 +2026,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       }
 
       if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-        throw new Error('Local AI Hub currently supports only image or video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
+        throw new Error('Local AI Hub currently supports audio, image, and video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
       }
 
       const prompt = buildImageGenerationPrompt(node, promptArtifact);
@@ -1911,6 +2074,51 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     }
 
     sourceLabel = provider.name;
+    if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+      const audioRequest = await buildCloudAudioGenerationRequest(node, promptArtifact);
+      reportProgress?.('Sending the text to ' + provider.name + ' for speech generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
+      const result = await runProviderOperation(providerId, {
+        model,
+        operationId,
+        prompt: audioRequest.prompt,
+        providerId,
+        voice: audioRequest.voice,
+      });
+      const generatedAudio = result?.audios?.[0] || null;
+      if (!generatedAudio?.buffer) {
+        throw new Error(sourceLabel + ' finished the request, but it did not return an audio file.');
+      }
+
+      const artifact = await saveBufferArtifact(run.directories, generatedAudio.buffer, {
+        audio: {
+          bitDepth: generatedAudio.bitDepth,
+          channelCount: generatedAudio.channelCount,
+          sampleRate: generatedAudio.sampleRate,
+        },
+        audioGeneration: {
+          backend: providerId,
+          backendLabel: provider.name,
+          mode: 'speech',
+          model,
+          prompt: audioRequest.spokenText,
+          voice: generatedAudio.voice || audioRequest.voice,
+        },
+        baseName: node.label + '-' + Date.now(),
+        displayName: node.label,
+        extension: String(generatedAudio.extension || '.wav').trim() || '.wav',
+        kind: PORT_KIND_AUDIO,
+        role: 'generated',
+      });
+      return {
+        destinationPath: artifact.filePath,
+        message: sourceLabel + ' generated speech and saved the intermediate file to ' + artifact.filePath + '.',
+        outputs: {
+          audio: artifact,
+        },
+        preview: summarizeArtifact(artifact),
+      };
+    }
+
     if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
       const prompt = buildImageGenerationPrompt(node, promptArtifact);
       reportProgress?.('Sending the prompt to ' + provider.name + ' for image generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
@@ -2028,12 +2236,9 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       throw new Error('Whisper finished, but it did not return any transcript text for this pipeline step.');
     }
 
-    const artifact = createTextArtifact(transcript, {
-      displayName: node.label,
-      role: 'generated',
-    });
+    const artifact = buildWhisperTranscriptArtifact(node, audioArtifact, result);
     return {
-      message: 'Whisper finished transcribing the audio file.',
+      message: buildWhisperCompletionMessage(result),
       outputs: {
         text: artifact,
       },

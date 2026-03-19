@@ -261,6 +261,228 @@ function getArtifactFormatLabel(extension, mimeType, isAnimated) {
   return '';
 }
 
+function formatTranscriptionLanguage(language) {
+  const normalized = String(language || '').trim();
+  if (!normalized || normalized.toLowerCase() === 'unknown') {
+    return '';
+  }
+
+  const commonLabels = {
+    de: 'German',
+    en: 'English',
+    es: 'Spanish',
+    fr: 'French',
+    hi: 'Hindi',
+    it: 'Italian',
+    ja: 'Japanese',
+    ko: 'Korean',
+    pt: 'Portuguese',
+    ru: 'Russian',
+    zh: 'Chinese',
+  };
+
+  return commonLabels[normalized.toLowerCase()]
+    || normalized
+      .replace(/[-_]+/g, ' ')
+      .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function buildTranscriptionSummary(transcription = {}, limit = 180) {
+  if (!transcription || typeof transcription !== 'object') {
+    return '';
+  }
+
+  const runtime = transcription.runtime && typeof transcription.runtime === 'object' ? transcription.runtime : null;
+  const sourceAudio = transcription.sourceAudio && typeof transcription.sourceAudio === 'object' ? transcription.sourceAudio : null;
+  const durationSeconds = Number(transcription.durationSeconds || 0);
+  const runtimeLabel = [String(runtime?.device || '').trim(), String(runtime?.computeType || '').trim()].filter(Boolean).join(' ');
+  const rawSegmentCount = Array.isArray(transcription.segments) ? transcription.segments.length : 0;
+  const segmentCount = Number(transcription.segmentCount || rawSegmentCount) || rawSegmentCount;
+  const parts = [
+    String(transcription.backendLabel || '').trim() || (String(transcription.backend || '').trim().toLowerCase() === 'whisper' ? 'Whisper transcript' : 'Transcript'),
+    formatTranscriptionLanguage(transcription.language),
+    String(transcription.model || '').trim(),
+    segmentCount > 0 ? segmentCount + ' segments' : '',
+    durationSeconds > 0 ? Math.round(durationSeconds * 10) / 10 + 's' : '',
+    runtimeLabel,
+    String(sourceAudio?.fileName || sourceAudio?.displayName || '').trim(),
+  ].filter(Boolean);
+
+  return trimPreviewText(parts.join(' | '), limit);
+}
+function formatDurationSummary(seconds) {
+  const numeric = Number(seconds || 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return '';
+  }
+
+  if (numeric >= 60) {
+    const minutes = Math.floor(numeric / 60);
+    const remainder = Math.round((numeric - minutes * 60) * 10) / 10;
+    return remainder > 0 ? `${minutes}m ${remainder}s` : `${minutes}m`;
+  }
+
+  return `${Math.round(numeric * 10) / 10}s`;
+}
+
+function buildAudioChannelLabel(channelCount) {
+  const numeric = Number(channelCount || 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return '';
+  }
+
+  if (numeric === 1) {
+    return 'Mono';
+  }
+
+  if (numeric === 2) {
+    return 'Stereo';
+  }
+
+  return numeric + ' channels';
+}
+
+function roundAudioMetric(value) {
+  const numeric = Number(value || 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+
+  return Math.round(numeric * 100) / 100;
+}
+
+function serializeAudioDetailsForUi(audio = null) {
+  if (!audio || typeof audio !== 'object') {
+    return null;
+  }
+
+  const durationSeconds = roundAudioMetric(audio.durationSeconds);
+  const sampleRate = Number(audio.sampleRate || 0) || 0;
+  const channelCount = Number(audio.channelCount || 0) || 0;
+  const bitDepth = Number(audio.bitDepth || 0) || 0;
+  if (!durationSeconds && !sampleRate && !channelCount && !bitDepth) {
+    return null;
+  }
+
+  return {
+    ...(bitDepth ? { bitDepth } : {}),
+    ...(channelCount ? { channelCount } : {}),
+    ...(durationSeconds ? { durationSeconds } : {}),
+    ...(sampleRate ? { sampleRate } : {}),
+  };
+}
+
+function serializeAudioSourceReference(reference = null) {
+  if (!reference || typeof reference !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    displayName: String(reference.displayName || '').trim(),
+    fileName: String(reference.fileName || '').trim(),
+    filePath: String(reference.filePath || '').trim(),
+    fileUrl: String(reference.fileUrl || '').trim(),
+    formatLabel: String(reference.formatLabel || '').trim(),
+    kind: String(reference.kind || '').trim(),
+    mimeType: String(reference.mimeType || '').trim(),
+    sizeBytes: Number(reference.sizeBytes || 0) || 0,
+    summary: String(reference.summary || '').trim(),
+  };
+
+  return Object.values(normalized).some(Boolean) ? normalized : null;
+}
+
+function serializeAudioGenerationForUi(generation = null) {
+  if (!generation || typeof generation !== 'object') {
+    return null;
+  }
+
+  const durationSeconds = roundAudioMetric(generation.durationSeconds);
+  const normalized = {
+    backend: String(generation.backend || '').trim(),
+    backendLabel: String(generation.backendLabel || '').trim(),
+    durationSeconds,
+    mode: String(generation.mode || '').trim(),
+    model: String(generation.model || '').trim(),
+    prompt: String(generation.prompt || '').trim(),
+    sourceAudio: serializeAudioSourceReference(generation.sourceAudio),
+    voice: String(generation.voice || '').trim(),
+    toolId: String(generation.toolId || '').trim(),
+    toolLabel: String(generation.toolLabel || '').trim(),
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
+async function readWaveAudioMetadata(filePath) {
+  if (path.extname(String(filePath || '')).toLowerCase() !== '.wav') {
+    return null;
+  }
+
+  let handle = null;
+  try {
+    handle = await require('fs').promises.open(filePath, 'r');
+    const stats = await handle.stat();
+    const byteLength = Math.min(Number(stats.size || 0), 65536);
+    if (byteLength < 44) {
+      return null;
+    }
+
+    const buffer = Buffer.alloc(byteLength);
+    await handle.read(buffer, 0, byteLength, 0);
+    if (buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WAVE') {
+      return null;
+    }
+
+    let offset = 12;
+    let channelCount = 0;
+    let sampleRate = 0;
+    let bitDepth = 0;
+    let dataSize = 0;
+    while (offset + 8 <= buffer.length) {
+      const chunkId = buffer.toString('ascii', offset, offset + 4);
+      const chunkSize = buffer.readUInt32LE(offset + 4);
+      const chunkOffset = offset + 8;
+      if (chunkId === 'fmt ' && chunkOffset + 16 <= buffer.length) {
+        channelCount = buffer.readUInt16LE(chunkOffset + 2);
+        sampleRate = buffer.readUInt32LE(chunkOffset + 4);
+        bitDepth = buffer.readUInt16LE(chunkOffset + 14);
+      }
+
+      if (chunkId === 'data') {
+        dataSize = chunkSize;
+        break;
+      }
+
+      offset = chunkOffset + chunkSize + (chunkSize % 2);
+    }
+
+    const bytesPerSample = bitDepth > 0 ? bitDepth / 8 : 0;
+    const durationSeconds = sampleRate > 0 && channelCount > 0 && bytesPerSample > 0 && dataSize > 0
+      ? roundAudioMetric(dataSize / sampleRate / channelCount / bytesPerSample)
+      : null;
+
+    return serializeAudioDetailsForUi({
+      bitDepth,
+      channelCount,
+      durationSeconds,
+      sampleRate,
+    });
+  } catch {
+    return null;
+  } finally {
+    if (handle) {
+      await handle.close().catch(() => null);
+    }
+  }
+}
+
+
 function sanitizeSegment(value, fallback = 'item') {
   const normalized = String(value || '')
     .trim()
@@ -327,7 +549,26 @@ function summarizeArtifact(artifact, limit = 180) {
   }
 
   if (artifact.kind === PORT_KIND_TEXT) {
-    return trimPreviewText(artifact.text || artifact.previewText || '', limit);
+    const transcriptionSummary = buildTranscriptionSummary(artifact.transcription, limit);
+    const textSummary = trimPreviewText(artifact.text || artifact.previewText || '', transcriptionSummary ? Math.max(48, Math.floor(limit / 2)) : limit);
+    return trimPreviewText([transcriptionSummary, textSummary].filter(Boolean).join(' | '), limit);
+  }
+
+  if (artifact.kind === PORT_KIND_AUDIO) {
+    const audio = artifact.audio && typeof artifact.audio === 'object' ? artifact.audio : null;
+    const generation = artifact.audioGeneration && typeof artifact.audioGeneration === 'object' ? artifact.audioGeneration : null;
+    const details = [
+      artifact.fileName || artifact.displayName || '',
+      artifact.formatLabel || '',
+      formatDurationSummary(audio?.durationSeconds || generation?.durationSeconds),
+      audio?.sampleRate ? `${audio.sampleRate} Hz` : '',
+      buildAudioChannelLabel(audio?.channelCount),
+      generation?.mode ? (generation.mode === 'sound' ? 'Sound generation' : generation.mode === 'speech' ? 'Speech generation' : 'Music generation') : '',
+      generation?.toolLabel || generation?.backendLabel || '',
+      generation?.voice ? `Voice ${generation.voice}` : '',
+      generation?.sourceAudio?.fileName ? `Guided by ${generation.sourceAudio.fileName}` : '',
+    ].filter(Boolean);
+    return trimPreviewText(details.join(' | '), limit);
   }
 
   const details = [];
@@ -391,6 +632,26 @@ async function buildFileArtifact(filePath, options = {}) {
     }
   }
 
+  if (kind === PORT_KIND_AUDIO || String(mimeType || '').toLowerCase().startsWith('audio/')) {
+    const detectedAudio = await readWaveAudioMetadata(resolvedPath);
+    const providedAudio = serializeAudioDetailsForUi(options.audio);
+    artifact.audio = detectedAudio || null;
+    if (providedAudio) {
+      artifact.audio = artifact.audio ? { ...artifact.audio, ...providedAudio } : providedAudio;
+    }
+
+    const audioGeneration = serializeAudioGenerationForUi(options.audioGeneration);
+    if (audioGeneration) {
+      artifact.audioGeneration = audioGeneration;
+      if (audioGeneration.durationSeconds && !artifact.audio?.durationSeconds) {
+        artifact.audio = {
+          ...(artifact.audio || {}),
+          durationSeconds: audioGeneration.durationSeconds,
+        };
+      }
+    }
+  }
+
   artifact.previewText = kind === PORT_KIND_FILE ? await readTextPreview(resolvedPath) : '';
   artifact.summary = summarizeArtifact(artifact);
   return artifact;
@@ -401,11 +662,21 @@ function createTextArtifact(text, options = {}) {
   const artifact = {
     kind: PORT_KIND_TEXT,
     displayName: String(options.displayName || 'Text').trim() || 'Text',
+    previewKind: 'text',
     previewText: trimPreviewText(normalizedText),
     role: options.role || 'artifact',
-    summary: trimPreviewText(normalizedText),
     text: normalizedText,
   };
+
+  if (options.transcription) {
+    artifact.transcription = serializeArtifactForUi(options.transcription);
+  }
+
+  if (Array.isArray(options.metadataPaths) && options.metadataPaths.length) {
+    artifact.metadataPaths = [...new Set(options.metadataPaths.map((entry) => String(entry || '').trim()).filter(Boolean))];
+  }
+
+  artifact.summary = summarizeArtifact(artifact);
   return artifact;
 }
 
@@ -433,6 +704,8 @@ async function saveBase64Artifact(runDirectories, base64Payload, options = {}) {
   const filePath = await nextAvailableFilePath(runDirectories.artifactsDir, options.baseName || options.displayName || 'artifact', extension);
   await fs.writeFile(filePath, Buffer.from(normalizeBase64Payload(base64Payload), 'base64'));
   return buildFileArtifact(filePath, {
+    audio: options.audio,
+    audioGeneration: options.audioGeneration,
     displayName: options.displayName,
     kind: options.kind,
     role: options.role || 'generated',
@@ -451,10 +724,69 @@ async function saveBufferArtifact(runDirectories, bufferPayload, options = {}) {
         : Buffer.from(bufferPayload || '');
   await fs.writeFile(filePath, buffer);
   return buildFileArtifact(filePath, {
+    audio: options.audio,
+    audioGeneration: options.audioGeneration,
     displayName: options.displayName,
     kind: options.kind,
     role: options.role || 'generated',
   });
+}
+
+async function saveTextArtifactMetadata(filePath, artifact) {
+  const transcription = artifact?.transcription || null;
+  if (!transcription) {
+    return [];
+  }
+
+  const metadataPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.transcription.json`);
+  const segments = Array.isArray(transcription.segments) ? transcription.segments : [];
+  await fs.writeJson(metadataPath, {
+    backend: String(transcription.backend || '').trim() || 'whisper',
+    backendLabel: String(transcription.backendLabel || '').trim() || 'Whisper (faster-whisper)',
+    durationSeconds: Number.isFinite(Number(transcription.durationSeconds)) && Number(transcription.durationSeconds) > 0
+      ? Math.round(Number(transcription.durationSeconds) * 100) / 100
+      : null,
+    language: String(transcription.language || '').trim() || 'unknown',
+    model: String(transcription.model || '').trim() || '',
+    runtime: transcription.runtime ? serializeArtifactForUi(transcription.runtime) : null,
+    segmentCount: Number(transcription.segmentCount || segments.length) || segments.length,
+    segments: serializeArtifactForUi(segments),
+    sourceAudio: transcription.sourceAudio
+      ? serializeArtifactForUi({
+          displayName: transcription.sourceAudio.displayName || '',
+          fileName: transcription.sourceAudio.fileName || '',
+          filePath: transcription.sourceAudio.filePath || '',
+          formatLabel: transcription.sourceAudio.formatLabel || '',
+          mimeType: transcription.sourceAudio.mimeType || '',
+          sizeBytes: Number(transcription.sourceAudio.sizeBytes || 0) || 0,
+        })
+      : null,
+    text: String(artifact.text || ''),
+  }, { spaces: 2 });
+
+  return [metadataPath];
+}
+
+
+async function saveAudioArtifactMetadata(filePath, artifact) {
+  const audio = serializeAudioDetailsForUi(artifact?.audio);
+  const audioGeneration = serializeAudioGenerationForUi(artifact?.audioGeneration);
+  if (!audio && !audioGeneration) {
+    return [];
+  }
+
+  const metadataPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.audio.json`);
+  await fs.writeJson(metadataPath, {
+    audio,
+    audioGeneration,
+    displayName: String(artifact?.displayName || '').trim(),
+    fileName: String(artifact?.fileName || '').trim(),
+    formatLabel: String(artifact?.formatLabel || '').trim(),
+    kind: String(artifact?.kind || PORT_KIND_AUDIO).trim() || PORT_KIND_AUDIO,
+    summary: String(artifact?.summary || '').trim(),
+  }, { spaces: 2 });
+
+  return [metadataPath];
 }
 
 async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
@@ -462,15 +794,19 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
   if (artifact.kind === PORT_KIND_TEXT) {
     const filePath = await nextAvailableFilePath(runDirectories.outputsDir, title, '.txt');
     await fs.writeFile(filePath, `${artifact.text || ''}\n`, 'utf8');
+    const metadataPaths = await saveTextArtifactMetadata(filePath, artifact);
     const savedArtifact = createTextArtifact(artifact.text || '', {
       displayName: title,
       role: 'output',
+      transcription: artifact.transcription,
+      metadataPaths,
     });
     savedArtifact.fileName = path.basename(filePath);
     savedArtifact.filePath = filePath;
     savedArtifact.fileUrl = pathToFileURL(filePath).toString();
     savedArtifact.mimeType = 'text/plain';
     savedArtifact.destinationPath = filePath;
+    savedArtifact.sourcePath = artifact.filePath || '';
     savedArtifact.summary = summarizeArtifact(savedArtifact);
     return savedArtifact;
   }
@@ -479,19 +815,32 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
   const extension = path.extname(sourcePath) || KIND_EXTENSIONS[artifact.kind] || '.bin';
   const filePath = await nextAvailableFilePath(runDirectories.outputsDir, title, extension);
   await fs.copy(sourcePath, filePath, { overwrite: true });
+
+  const metadataPaths = artifact.kind === PORT_KIND_AUDIO
+    ? await saveAudioArtifactMetadata(filePath, artifact)
+    : [];
+
   const savedArtifact = await buildFileArtifact(filePath, {
+    audio: artifact.audio,
+    audioGeneration: artifact.audioGeneration,
     displayName: title,
     kind: artifact.kind,
     role: 'output',
   });
+  if (metadataPaths.length) {
+    savedArtifact.metadataPaths = metadataPaths;
+  }
   savedArtifact.destinationPath = filePath;
   savedArtifact.sourcePath = sourcePath;
+  savedArtifact.summary = summarizeArtifact(savedArtifact);
   return savedArtifact;
 }
 
 function buildTerminalResult(node, artifact) {
   return {
     artifact: serializeArtifactForUi(artifact),
+    audio: artifact?.audio ? serializeArtifactForUi(artifact.audio) : null,
+    audioGeneration: artifact?.audioGeneration ? serializeArtifactForUi(artifact.audioGeneration) : null,
     destinationPath: artifact?.destinationPath || artifact?.filePath || '',
     filePath: artifact?.filePath || '',
     fileUrl: artifact?.fileUrl || '',
@@ -499,8 +848,10 @@ function buildTerminalResult(node, artifact) {
     nodeId: node.id,
     nodeLabel: node.label,
     previewText: summarizeArtifact(artifact),
+    supportingPaths: Array.isArray(artifact?.metadataPaths) ? [...artifact.metadataPaths] : [],
     textValue: artifact?.kind === PORT_KIND_TEXT ? String(artifact.text || '') : '',
     title: String(node.config?.title || node.label || 'Output').trim() || 'Output',
+    transcription: artifact?.transcription ? serializeArtifactForUi(artifact.transcription) : null,
   };
 }
 
@@ -510,7 +861,26 @@ async function describeArtifactForLlm(artifact) {
   }
 
   if (artifact.kind === PORT_KIND_TEXT) {
-    return `Type: text\nContent:\n${artifact.text || ''}`.trim();
+    const transcription = artifact.transcription || null;
+    if (!transcription) {
+      return `Type: text\nContent:\n${artifact.text || ''}`.trim();
+    }
+
+    const lines = [
+      'Type: text',
+      'Origin: audio transcription',
+      transcription.backendLabel ? `Backend: ${transcription.backendLabel}` : '',
+      transcription.model ? `Model: ${transcription.model}` : '',
+      transcription.language ? `Language: ${transcription.language}` : '',
+      transcription.segmentCount ? `Segments: ${transcription.segmentCount}` : '',
+      transcription.durationSeconds ? `Duration: ${transcription.durationSeconds} seconds` : '',
+      transcription.sourceAudio?.fileName ? `Source audio: ${transcription.sourceAudio.fileName}` : '',
+      transcription.sourceAudio?.filePath ? `Source path: ${transcription.sourceAudio.filePath}` : '',
+      '',
+      'Content:',
+      artifact.text || '',
+    ].filter((entry, index, entries) => entry || index === entries.length - 2);
+    return lines.join('\n').trim();
   }
 
   const lines = [
@@ -525,6 +895,17 @@ async function describeArtifactForLlm(artifact) {
     artifact.role ? `Role: ${artifact.role}` : '',
     artifact.filePath ? `Path: ${artifact.filePath}` : '',
     artifact.width && artifact.height ? `Dimensions: ${artifact.width}x${artifact.height}` : '',
+    artifact.audio?.durationSeconds ? `Duration: ${artifact.audio.durationSeconds} seconds` : '',
+    artifact.audio?.sampleRate ? `Sample rate: ${artifact.audio.sampleRate} Hz` : '',
+    artifact.audio?.channelCount ? `Channels: ${artifact.audio.channelCount}` : '',
+    artifact.audio?.bitDepth ? `Bit depth: ${artifact.audio.bitDepth}` : '',
+    artifact.audioGeneration?.backendLabel ? `Generated by: ${artifact.audioGeneration.backendLabel}` : '',
+    artifact.audioGeneration?.toolLabel ? `Tool: ${artifact.audioGeneration.toolLabel}` : '',
+    artifact.audioGeneration?.model ? `Model: ${artifact.audioGeneration.model}` : '',
+    artifact.audioGeneration?.mode ? `Generation mode: ${artifact.audioGeneration.mode}` : '',
+    artifact.audioGeneration?.prompt ? `Prompt: ${artifact.audioGeneration.prompt}` : '',
+    artifact.audioGeneration?.voice ? `Voice: ${artifact.audioGeneration.voice}` : '',
+    artifact.audioGeneration?.sourceAudio?.fileName ? `Guided by: ${artifact.audioGeneration.sourceAudio.fileName}` : '',
     artifact.sizeBytes ? `Size: ${artifact.sizeBytes} bytes` : '',
     artifact.previewText ? `Excerpt: ${artifact.previewText}` : '',
     artifact.summary ? `Summary: ${artifact.summary}` : '',

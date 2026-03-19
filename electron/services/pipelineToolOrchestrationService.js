@@ -1,4 +1,5 @@
 const { getLocalToolRequirement, getModelStepExecutionMode, getModelStepOperationId, PIPELINE_OPERATION_IDS } = require('../shared/pipelineSchema.cjs');
+const { getLocalAudioToolRuntimeMode, LOCAL_AUDIO_RUNTIME_MODE_IDS } = require('./localAudioService');
 const { getLocalVideoToolRuntimeMode, LOCAL_VIDEO_RUNTIME_MODE_IDS } = require('./localVideoService');
 const { isToolActive, isToolReady, launchToolFromUserAction, stopTool } = require('./processService');
 const { getResolvedToolState } = require('./toolStateService');
@@ -140,11 +141,20 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
       return null;
     }
 
-    if (node?.type === 'llmPrompt'
-      && getModelStepExecutionMode(node) === 'localTool'
-      && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-      && getLocalVideoToolRuntimeMode(requiredToolId) === LOCAL_VIDEO_RUNTIME_MODE_IDS.DIRECT_COMMAND) {
-      return null;
+    if (node?.type === 'llmPrompt' && getModelStepExecutionMode(node) === 'localTool') {
+      if (
+        getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+        && getLocalAudioToolRuntimeMode(requiredToolId) === LOCAL_AUDIO_RUNTIME_MODE_IDS.DIRECT_COMMAND
+      ) {
+        return null;
+      }
+
+      if (
+        getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+        && getLocalVideoToolRuntimeMode(requiredToolId) === LOCAL_VIDEO_RUNTIME_MODE_IDS.DIRECT_COMMAND
+      ) {
+        return null;
+      }
     }
 
     const tool = await resolveManagedTool(requiredToolId, contextMaps);

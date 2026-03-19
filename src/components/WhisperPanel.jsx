@@ -5,6 +5,78 @@ function fileNameFromPath(value) {
     .pop() || '';
 }
 
+function toFileUrl(filePath) {
+  const normalized = String(filePath || '').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  return encodeURI('file:///' + normalized.replace(/\\/g, '/').replace(/^\/+/, ''));
+}
+
+function formatDurationLabel(seconds) {
+  const numericSeconds = Number(seconds || 0);
+  if (!Number.isFinite(numericSeconds) || numericSeconds <= 0) {
+    return '';
+  }
+
+  if (numericSeconds >= 60) {
+    const minutes = Math.floor(numericSeconds / 60);
+    const remainder = Math.round((numericSeconds - minutes * 60) * 10) / 10;
+    return remainder > 0 ? `${minutes}m ${remainder}s` : `${minutes}m`;
+  }
+
+  return `${Math.round(numericSeconds * 10) / 10}s`;
+}
+
+function formatSegmentTime(seconds) {
+  const numericSeconds = Number(seconds || 0);
+  if (!Number.isFinite(numericSeconds) || numericSeconds < 0) {
+    return '0s';
+  }
+
+  return `${Math.round(numericSeconds * 10) / 10}s`;
+}
+
+function formatWhisperLanguage(language) {
+  const normalized = String(language || '').trim();
+  if (!normalized || normalized.toLowerCase() === 'unknown') {
+    return '';
+  }
+
+  const commonLabels = {
+    de: 'German',
+    en: 'English',
+    es: 'Spanish',
+    fr: 'French',
+    hi: 'Hindi',
+    it: 'Italian',
+    ja: 'Japanese',
+    ko: 'Korean',
+    pt: 'Portuguese',
+    ru: 'Russian',
+    zh: 'Chinese',
+  };
+
+  const lower = normalized.toLowerCase();
+  return commonLabels[lower] || normalized.toUpperCase();
+}
+
+function buildWhisperRuntimeLabel(resultInfo) {
+  if (!resultInfo) {
+    return '';
+  }
+
+  const runtimeLabel = [String(resultInfo.device || '').trim(), String(resultInfo.computeType || '').trim()].filter(Boolean).join(' ');
+  return [
+    formatWhisperLanguage(resultInfo.language),
+    String(resultInfo.model || '').trim(),
+    Number(resultInfo.segmentCount || 0) > 0 ? `${resultInfo.segmentCount} segments` : '',
+    formatDurationLabel(resultInfo.durationSeconds),
+    runtimeLabel,
+  ].filter(Boolean).join(' | ');
+}
+
 const MODEL_OPTIONS = [
   { id: 'tiny', label: 'Tiny' },
   { id: 'base', label: 'Base' },
@@ -24,12 +96,15 @@ export default function WhisperPanel({
   onLaunch,
   onStop,
   onTranscribe,
+  resultInfo,
   segments,
   tool,
   transcript,
 }) {
   const isRunning = tool?.status === 'running';
   const selectedFileName = fileNameFromPath(filePath);
+  const selectedFileUrl = toFileUrl(filePath);
+  const runtimeLabel = buildWhisperRuntimeLabel(resultInfo);
 
   return (
     <section className="panel p-6">
@@ -81,6 +156,7 @@ export default function WhisperPanel({
                 {selectedFileName || 'No audio file selected yet.'}
               </p>
               {filePath ? <p className="mt-2 break-all text-xs leading-5 text-slate-500">{filePath}</p> : null}
+              {selectedFileUrl ? <audio className="mt-4 w-full" controls src={selectedFileUrl} /> : null}
               <button className="ghost-button mt-4 w-full justify-center" disabled={busy} onClick={onChooseFile} type="button">
                 {selectedFileName ? 'Choose another file' : 'Choose audio file'}
               </button>
@@ -108,6 +184,7 @@ export default function WhisperPanel({
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Transcript</p>
                 <p className="text-xs uppercase tracking-[0.18em] text-slate-500">{modelName}</p>
               </div>
+              {runtimeLabel ? <p className="mt-3 text-xs leading-5 text-slate-400">{runtimeLabel}</p> : null}
               <textarea
                 className="store-input mt-4 min-h-[380px] resize-none"
                 readOnly
@@ -123,7 +200,7 @@ export default function WhisperPanel({
                   segments.map((segment, index) => (
                     <div key={`${segment.start}-${segment.end}-${index}`} className="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-3">
                       <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500">
-                        {segment.start}s to {segment.end}s
+                        {formatSegmentTime(segment.start)} to {formatSegmentTime(segment.end)}
                       </p>
                       <p className="mt-2 text-sm leading-6 text-slate-200">{segment.text}</p>
                     </div>

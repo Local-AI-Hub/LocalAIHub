@@ -56,9 +56,9 @@ export default function ConnectionsPanel({
               </button>
             </div>
 
-            {provider.lastTestMessage ? (
+            {provider.statusMessage || provider.lastTestMessage ? (
               <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 px-3 py-3 text-sm leading-6 text-slate-300">
-                {provider.lastTestMessage}
+                {provider.statusMessage || provider.lastTestMessage}
               </div>
             ) : null}
           </div>

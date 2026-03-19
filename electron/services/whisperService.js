@@ -38,11 +38,31 @@ function resolveWhisperModelName(value) {
   return WHISPER_MODEL_OPTIONS.includes(modelName) ? modelName : DEFAULT_WHISPER_MODEL;
 }
 
+function normalizeWhisperError(error) {
+  const message = String(error?.message || '').trim();
+  const normalized = message.toLowerCase();
+
+  if (normalized.includes("no module named 'av'") || /no module named ['\"]av['\"]/.test(normalized)) {
+    return new Error('Whisper is missing its bundled audio decoder. Repair or reinstall Whisper and try again.');
+  }
+
+  if (normalized.includes("no module named 'faster_whisper'") || /no module named ['\"]faster_whisper['\"]/.test(normalized)) {
+    return new Error('Whisper is missing the faster-whisper package. Repair or reinstall Whisper and try again.');
+  }
+
+  if (normalized.includes('cublas64_') || normalized.includes('cudnn')) {
+    return new Error('Whisper could not use NVIDIA acceleration because Windows is missing the CUDA libraries it needs. Repair or reinstall Whisper and try again.');
+  }
+
+  return error instanceof Error ? error : new Error(message || 'Local AI Hub could not transcribe that audio file with Whisper.');
+}
+
 async function resolveWhisperPython(tool) {
   const candidates = [
     tool?.launchProfile?.pythonPath,
     tool?.externalPythonPath,
     tool?.managedPythonPath,
+    tool?.pythonBootstrapPath,
   ].filter(Boolean);
 
   for (const candidate of candidates) {
@@ -63,6 +83,10 @@ async function resolveWhisperPython(tool) {
 }
 
 async function transcribeWithWhisper(tool, payload = {}) {
+  if (!tool) {
+    throw new Error('Install Whisper before starting local transcription.');
+  }
+
   const logger = createLogger('whisper', {
     toolId: tool?.id || 'whisper',
     model: resolveWhisperModelName(payload.model),
@@ -89,36 +113,63 @@ async function transcribeWithWhisper(tool, payload = {}) {
     pythonPath,
   });
 
-  const result = await runCommand(
-    pythonPath,
-    [helperPath, audioPath, modelName, cacheDir],
-    {
-      cwd: tool?.appDir || tool?.installDir || path.dirname(audioPath),
-      env: {
-        HF_HOME: cacheDir,
-        TRANSFORMERS_CACHE: cacheDir,
+  try {
+    const result = await runCommand(
+      pythonPath,
+      [helperPath, audioPath, modelName, cacheDir],
+      {
+        cwd: tool?.appDir || tool?.installDir || path.dirname(audioPath),
+        env: {
+          HF_HOME: cacheDir,
+          TRANSFORMERS_CACHE: cacheDir,
+        },
+        errorMessage: 'Local AI Hub could not transcribe that audio file with Whisper.',
       },
-      errorMessage: 'Local AI Hub could not transcribe that audio file with Whisper.',
-    },
-  );
+    );
 
-  const transcription = parseJsonLine(result.stdout);
-  if (!transcription?.text) {
-    throw new Error('Whisper finished, but it did not return any transcript text.');
+    const transcription = parseJsonLine(result.stdout);
+    if (!transcription?.text) {
+      throw new Error('Whisper finished, but it did not return any transcript text.');
+    }
+
+    if (String(transcription.runtimeNote || '').trim()) {
+      await logger.warn('Whisper transcription switched runtimes.', {
+        audioPath,
+        runtimeNote: transcription.runtimeNote,
+      });
+    }
+
+    await logger.info('Whisper transcription finished.', {
+      audioPath,
+      computeType: transcription.computeType || null,
+      detectedLanguage: transcription.language || null,
+      device: transcription.device || null,
+      durationSeconds: transcription.durationSeconds || null,
+      runtimeNote: transcription.runtimeNote || null,
+    });
+
+    return {
+      audioPath,
+      computeType: String(transcription.computeType || '').trim(),
+      device: String(transcription.device || '').trim(),
+      durationSeconds: Number.isFinite(Number(transcription.durationSeconds)) && Number(transcription.durationSeconds) > 0
+        ? Math.round(Number(transcription.durationSeconds) * 100) / 100
+        : null,
+      language: transcription.language || 'unknown',
+      model: modelName,
+      runtimeNote: String(transcription.runtimeNote || '').trim(),
+      segments: transcription.segments || [],
+      text: transcription.text,
+    };
+  } catch (error) {
+    const normalizedError = normalizeWhisperError(error);
+    await logger.error('Whisper transcription failed.', {
+      audioPath,
+      error,
+      normalizedMessage: normalizedError.message,
+    });
+    throw normalizedError;
   }
-
-  await logger.info('Whisper transcription finished.', {
-    audioPath,
-    detectedLanguage: transcription.language || null,
-  });
-
-  return {
-    audioPath,
-    language: transcription.language || 'unknown',
-    model: modelName,
-    segments: transcription.segments || [],
-    text: transcription.text,
-  };
 }
 
 module.exports = {

@@ -66,6 +66,7 @@ const {
   listProviderConnections,
   listProviderModels,
   saveProviderConnection,
+  setProviderStateChangeSink,
   testProviderConnection,
 } = require('./services/providerService');
 const { getStatisticsSnapshot, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
@@ -1489,6 +1490,15 @@ async function startApplication() {
   });
   setPipelineEventSink((payload) => {
     mainWindow?.webContents.send('pipelines:run-update', payload);
+  });
+  setProviderStateChangeSink((payload) => {
+    if (!Array.isArray(payload?.providers)) {
+      return;
+    }
+
+    sendAppStateUpdate({
+      providers: payload.providers,
+    });
   });
   tray = new Tray(createTrayIcon());
   tray.on('click', showWindow);

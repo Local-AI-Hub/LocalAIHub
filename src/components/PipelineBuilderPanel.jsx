@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 import {
+  AUDIO_WORKFLOW_TOOL_IDS,
   GRAPH_WORKFLOW_TOOL_IDS,
   IMAGE_WORKFLOW_TOOL_IDS,
   VIDEO_WORKFLOW_TOOL_IDS,
@@ -167,6 +168,52 @@ function getRetryLoopTargetOptions(nodes = [], graph, loopNodeId) {
   return (Array.isArray(nodes) ? nodes : []).filter((node) => node?.id !== loopNodeId && node?.type !== 'retryLoop' && !getPipelineNodeDefinition(node.type)?.terminal);
 }
 
+function formatAudioDurationLabel(value) {
+  const numeric = Number(value || 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return '';
+  }
+
+  if (numeric >= 60) {
+    const minutes = Math.floor(numeric / 60);
+    const seconds = Math.round((numeric - (minutes * 60)) * 10) / 10;
+    return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  }
+
+  return `${Math.round(numeric * 10) / 10}s`;
+}
+
+function buildAudioChannelFact(channelCount) {
+  const numeric = Number(channelCount || 0);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return '';
+  }
+
+  if (numeric === 1) {
+    return 'Mono';
+  }
+
+  if (numeric === 2) {
+    return 'Stereo';
+  }
+
+  return `${numeric} channels`;
+}
+
+function buildAudioFactLabels(artifact) {
+  const audio = artifact?.audio && typeof artifact.audio === 'object' ? artifact.audio : null;
+  const generation = artifact?.audioGeneration && typeof artifact.audioGeneration === 'object' ? artifact.audioGeneration : null;
+  const mode = String(generation?.mode || '').trim().toLowerCase();
+
+  return [
+    formatAudioDurationLabel(audio?.durationSeconds || generation?.durationSeconds),
+    audio?.sampleRate ? `${audio.sampleRate} Hz` : '',
+    buildAudioChannelFact(audio?.channelCount),
+    mode === 'music' ? 'Music mode' : mode === 'sound' ? 'Sound mode' : mode === 'speech' ? 'Speech mode' : '',
+    generation?.toolLabel || generation?.backendLabel || '',
+    generation?.voice ? `Voice ${generation.voice}` : '',
+  ].filter(Boolean);
+}
 function ArtifactFacts({ artifact, className = '' }) {
   if (!artifact) {
     return null;
@@ -211,7 +258,12 @@ function buildNodePreview(node, runState) {
   }
 
   if (node.type === 'llmPrompt') {
-    const localToolFallbackLabel = getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? 'Local video tool' : 'Local image tool';
+    const selectedOperationId = getSelectedModelStepOperationId(node);
+    const localToolFallbackLabel = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+      ? 'Local audio tool'
+      : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+        ? 'Local video tool'
+        : 'Local image tool';
     const modeLabel = node.config?.executionMode === 'ollama'
       ? 'Ollama'
       : node.config?.executionMode === 'localTool'
@@ -296,25 +348,18 @@ function getModelTargetConfig(node) {
 }
 
 function getSelectedModelStepOperationId(node) {
-  if (node?.config?.executionMode === 'ollama') {
-    return PIPELINE_OPERATION_IDS.LLM_PROMPT;
-  }
-
-  const requestedOperationId = String(node?.config?.operationId || '').trim();
-  if (requestedOperationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE || requestedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
-    return requestedOperationId;
-  }
-
-  return PIPELINE_OPERATION_IDS.LLM_PROMPT;
+  return pipelineShared.getModelStepOperationId(node);
 }
 
 function getModelStepOperationLabel(node) {
   const operationId = getSelectedModelStepOperationId(node);
-  return operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
-    ? 'Image generation'
-    : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-      ? 'Video generation'
-      : 'Text response';
+  return operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    ? 'Audio generation'
+    : operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+      ? 'Image generation'
+      : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+        ? 'Video generation'
+        : 'Text response';
 }
 
 function buildModelOptionDetail(model) {
@@ -432,10 +477,34 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
   }
 
   if (previewKind === 'audio' && artifact.fileUrl) {
+    const generation = artifact.audioGeneration && typeof artifact.audioGeneration === 'object' ? artifact.audioGeneration : null;
+    const sourceAudio = generation?.sourceAudio && typeof generation.sourceAudio === 'object' ? generation.sourceAudio : null;
     return (
       <div className={`space-y-3 ${className}`}>
         <audio className="w-full" controls src={artifact.fileUrl} />
         <p className="text-xs leading-5 text-slate-400">{artifact.summary || artifact.fileName || artifact.displayName}</p>
+        {generation ? (
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Generated audio</p>
+            <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.16em] text-slate-300">
+              {buildAudioFactLabels(artifact).map((label, index) => (
+                <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1" key={`${label}-${index}`}>
+                  {label}
+                </span>
+              ))}
+            </div>
+            {generation.model ? <input className="store-input mt-3" readOnly value={generation.model} /> : null}
+            {generation.prompt ? <textarea className="store-input mt-3 min-h-[120px] resize-none" readOnly value={generation.prompt} /> : null}
+          </div>
+        ) : null}
+        {sourceAudio ? (
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Source audio</p>
+            {sourceAudio.fileName || sourceAudio.displayName ? <p className="mt-2 text-sm text-slate-200">{sourceAudio.fileName || sourceAudio.displayName}</p> : null}
+            {sourceAudio.fileUrl ? <audio className="mt-3 w-full" controls src={sourceAudio.fileUrl} /> : null}
+            {!sourceAudio.fileUrl && sourceAudio.filePath ? <input className="store-input mt-3" readOnly value={sourceAudio.filePath} /> : null}
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -795,18 +864,66 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
   );
 }
 
-function ModelTargetFields({ allowLocalTool = false, connectedProviders, localImageTools = [], localVideoTools = [], modelOptions, modelsBusy, node, onRefreshModels, onUpdateNode, executionModeKey, providerIdKey }) {
+class PipelineInspectorErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidUpdate(prevProps) {
+    if (this.state.hasError && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false });
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="rounded-[24px] border border-amber-400/30 bg-amber-500/10 p-4 text-sm leading-6 text-amber-50">
+          <p className="text-[11px] uppercase tracking-[0.18em] text-amber-200">Inspector issue</p>
+          <p className="mt-2">
+            Local AI Hub hit a problem while showing this node. Select another node or reopen the pipeline if this keeps happening.
+          </p>
+          <button className="ghost-button mt-3" onClick={this.props.onClearSelection} type="button">
+            Clear selection
+          </button>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAudioTools = [], localImageTools = [], localVideoTools = [], modelOptions, modelsBusy, node, onRefreshModels, onUpdateNode, executionModeKey, providerIdKey }) {
   const executionMode = node.config?.[executionModeKey] === 'ollama'
     ? 'ollama'
     : allowLocalTool && node.config?.[executionModeKey] === 'localTool'
       ? 'localTool'
       : 'cloud';
   const selectedOperationId = node.type === 'llmPrompt' ? getSelectedModelStepOperationId(node) : PIPELINE_OPERATION_IDS.LLM_PROMPT;
-  const localToolOptions = selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? localVideoTools : localImageTools;
-  const localToolLabel = selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? 'Local video tool' : 'Local image tool';
-  const localToolEmptyLabel = selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? 'Choose Wan2.1 WebUI' : 'Choose Automatic1111 or Forge';
+  const localToolOptions = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    ? localAudioTools
+    : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? localVideoTools
+      : localImageTools;
+  const localToolLabel = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    ? 'Local audio tool'
+    : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? 'Local video tool'
+      : 'Local image tool';
+  const localToolEmptyLabel = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    ? 'Choose AudioCraft WebUI'
+    : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? 'Choose Wan2.1 WebUI'
+      : 'Choose Automatic1111 or Forge';
   const selectedLocalToolId = String(node.config?.toolId || localToolOptions[0]?.id || '').trim();
   const selectedLocalTool = localToolOptions.find((tool) => tool.id === selectedLocalToolId) || null;
+  const isLocalAudioMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE;
   const isLocalVideoMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE;
 
   return (
@@ -825,9 +942,19 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localIm
               const nextOperationId = currentNode.type === 'llmPrompt' && nextExecutionMode === 'ollama'
                 ? PIPELINE_OPERATION_IDS.LLM_PROMPT
                 : currentNode.type === 'llmPrompt' && nextExecutionMode === 'localTool'
-                  ? (currentOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? PIPELINE_OPERATION_IDS.VIDEO_GENERATE : PIPELINE_OPERATION_IDS.IMAGE_GENERATE)
-                  : currentOperationId;
-              const nextLocalToolOptions = nextOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? localVideoTools : localImageTools;
+                  ? (currentOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                    ? PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                    : currentOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                      ? PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                      : PIPELINE_OPERATION_IDS.IMAGE_GENERATE)
+                  : currentOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                    ? PIPELINE_OPERATION_IDS.LLM_PROMPT
+                    : currentOperationId;
+              const nextLocalToolOptions = nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                ? localAudioTools
+                : nextOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                  ? localVideoTools
+                  : localImageTools;
               const currentToolId = String(currentNode.config?.toolId || '').trim();
               const nextToolId = nextExecutionMode === 'localTool'
                 ? (nextLocalToolOptions.some((tool) => tool.id === currentToolId) ? currentToolId : nextLocalToolOptions[0]?.id || '')
@@ -911,9 +1038,11 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localIm
             </select>
           </div>
           <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-            {isLocalVideoMode
-              ? 'This mode runs a single local Wan video request inside the sequential pipeline. Use the Graph Workflow step when you want graph-native video generation through ComfyUI.'
-              : 'This mode runs a single Automatic1111 or Forge image request inside the current sequential pipeline. Use the Graph Workflow step when you need a graph-native tool such as ComfyUI.'}
+            {isLocalAudioMode
+              ? 'This mode runs a single AudioCraft request inside the sequential pipeline and returns a pipeline-usable audio artifact. Use Music mode for text-to-music or audio-guided generation in this slice.'
+              : isLocalVideoMode
+                ? 'This mode runs a single local Wan video request inside the sequential pipeline. Use the Graph Workflow step when you want graph-native video generation through ComfyUI.'
+                : 'This mode runs a single Automatic1111 or Forge image request inside the current sequential pipeline. Use the Graph Workflow step when you need a graph-native tool such as ComfyUI.'}
           </div>
         </div>
       ) : (
@@ -924,7 +1053,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localIm
 
       <div>
         <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`${node.id}-model`}>
-          {isLocalVideoMode ? 'Model folder override' : executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
+          {isLocalAudioMode ? 'Model override' : isLocalVideoMode ? 'Model folder override' : executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
         </label>
         <input
           className="store-input mt-3"
@@ -938,10 +1067,14 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localIm
               },
             }))
           }
-          placeholder={isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : 'Enter or pick a model'}
+          placeholder={isLocalAudioMode ? 'Optional AudioCraft model such as facebook/musicgen-melody' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : 'Enter or pick a model'}
           value={node.config?.model || ''}
         />
-        {isLocalVideoMode ? (
+        {isLocalAudioMode ? (
+          <p className="mt-3 text-xs leading-5 text-slate-500">
+            AudioCraft can use its built-in default models for this pass. Leave this blank unless you want to force a specific MusicGen or AudioGen model name.
+          </p>
+        ) : isLocalVideoMode ? (
           <p className="mt-3 text-xs leading-5 text-slate-500">
             Local AI Hub auto-detects Wan model folders from <code>models\\Wan-AI</code>. Leave this blank unless you need to force a specific installed model folder.
           </p>
@@ -954,16 +1087,20 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localIm
               {executionMode === 'ollama'
                 ? 'Loads local Ollama models.'
                 : executionMode === 'localTool'
-                  ? `Loads local checkpoints from ${selectedLocalTool?.name || 'the selected tool'}.`
+                  ? isLocalAudioMode
+                    ? 'AudioCraft uses built-in defaults in this first audio-output slice. Refresh is only needed for image checkpoints.'
+                    : `Loads local checkpoints from ${selectedLocalTool?.name || 'the selected tool'}.`
                   : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
                     ? 'Loads cloud image models for this provider step.'
-                    : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                      ? 'Loads cloud video models for this provider step.'
-                      : 'Loads models from the selected cloud provider.'}
+                    : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                      ? 'Loads cloud speech models for this provider step.'
+                      : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                        ? 'Loads cloud video models for this provider step.'
+                        : 'Loads models from the selected cloud provider.'}
             </span>
           </div>
         )}
-        {!isLocalVideoMode && modelOptions?.length ? (
+        {!isLocalVideoMode && !isLocalAudioMode && modelOptions?.length ? (
           <div className="mt-3 grid gap-2">
             {modelOptions.slice(0, 8).map((model) => (
               <button
@@ -1014,6 +1151,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
   const ollamaModelCapabilitiesByName = useMemo(() => collectOllamaModelCapabilities(modelOptionsByNodeId), [modelOptionsByNodeId]);
   const localToolModelsByToolId = useMemo(() => collectLocalToolModelsByToolId(modelOptionsByNodeId), [modelOptionsByNodeId]);
+
   const pipelineTools = useMemo(
     () => (Object.keys(ollamaModelCapabilitiesByName).length || Object.keys(localToolModelsByToolId).length
       ? tools.map((tool) => {
@@ -1047,8 +1185,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     [draft.nodes, graph, selectedNode],
   );
   const connectedProviders = useMemo(() => (providers || []).filter((provider) => provider.isConnected), [providers]);
-  const imageTools = useMemo(() => tools.filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
-  const videoTools = useMemo(() => tools.filter((tool) => VIDEO_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
+  const audioTools = useMemo(() => (tools || []).filter((tool) => AUDIO_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
+  const imageTools = useMemo(() => (tools || []).filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
+  const videoTools = useMemo(() => (tools || []).filter((tool) => VIDEO_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
   const graphWorkflowTools = useMemo(() => {
     const entries = [...(tools || []), ...(manifests || [])];
     const seenToolIds = new Set();
@@ -1594,13 +1733,39 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       }));
     } else if (executionMode === 'localTool') {
       const operationId = getSelectedModelStepOperationId(node);
+      if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+        const toolId = String(node.config?.toolId || audioTools[0]?.id || '').trim();
+        if (!toolId) {
+          setModelsBusyNodeId('');
+          onToast('Install AudioCraft WebUI before configuring local audio generation for this step.', 'error');
+          return;
+        }
+
+        setModelOptionsByNodeId((current) => ({
+          ...current,
+          [node.id]: [],
+        }));
+        setModelsBusyNodeId('');
+        if (!String(node.config?.toolId || '').trim()) {
+          updateNode(node.id, (currentNode) => ({
+            ...currentNode,
+            config: {
+              ...currentNode.config,
+              toolId,
+            },
+          }));
+        }
+        onToast('AudioCraft uses built-in MusicGen and AudioGen defaults in this first audio-output slice. Leave Model override blank unless you need to force a specific model name.', 'info');
+        return;
+      }
+
       if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
         setModelOptionsByNodeId((current) => ({
           ...current,
           [node.id]: [],
         }));
         setModelsBusyNodeId('');
-        onToast('Local AI Hub auto-detects Wan model folders from models\Wan-AI for this first video slice. Enter a model folder name only if you need to override the default.', 'info');
+        onToast('Local AI Hub auto-detects Wan model folders from models\\Wan-AI for this first video slice. Enter a model folder name only if you need to override the default.', 'info');
         return;
       }
 
@@ -1920,7 +2085,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Inspector</p>
             <p className="mt-2 text-lg font-semibold text-white">{selectedNode ? selectedNode.label : 'Select a node'}</p>
             {selectedNode ? (
-              <div className="mt-4 space-y-4">
+              <PipelineInspectorErrorBoundary onClearSelection={() => setSelectedNodeId('')} resetKey={selectedNode.id}>
+                <div className="mt-4 space-y-4">
                 <div>
                   <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="node-label">Node label</label>
                   <input className="store-input mt-3" id="node-label" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, label: event.target.value }))} value={selectedNode.label} />
@@ -1972,30 +2138,39 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                       >
                         <option value={PIPELINE_OPERATION_IDS.LLM_PROMPT}>Text response</option>
                         <option value={PIPELINE_OPERATION_IDS.IMAGE_GENERATE}>Image generation</option>
+                        {selectedNode.config?.executionMode !== 'ollama' ? <option value={PIPELINE_OPERATION_IDS.AUDIO_GENERATE}>Audio generation</option> : null}
                         <option value={PIPELINE_OPERATION_IDS.VIDEO_GENERATE}>Video generation</option>
                       </select>
                       <p className="mt-2 text-xs leading-5 text-slate-400">
                         {selectedNode.config?.executionMode === 'ollama'
                           ? 'Local Ollama mode currently returns text only.'
                           : selectedNode.config?.executionMode === 'localTool'
-                            ? getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                              ? 'Local video tool mode returns a video artifact from the Video output port. Use the Graph Workflow step for ComfyUI video workflows.'
-                              : 'Local image tool mode returns an image artifact from the Image output port.'
+                            ? getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                              ? 'Local audio tool mode returns a generated audio artifact from the Audio output port. Music mode can also use an upstream audio artifact as guidance in this slice.'
+                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                ? 'Local video tool mode returns a video artifact from the Video output port. Use the Graph Workflow step for ComfyUI video workflows.'
+                                : 'Local image tool mode returns an image artifact from the Image output port.'
                             : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
                               ? 'This step returns an image artifact from the Image output port.'
-                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                                ? 'This step returns a video artifact from the Video output port.'
-                                : 'This step returns a text artifact from the Text output port.'}
+                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                                ? 'This step returns a saved audio artifact from the Audio output port.'
+                                : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                  ? 'This step returns a video artifact from the Video output port.'
+                                  : 'This step returns a text artifact from the Text output port.'}
                       </p>
                     </div>
-                    <ModelTargetFields allowLocalTool connectedProviders={connectedProviders} executionModeKey="executionMode" localImageTools={imageTools} localVideoTools={videoTools} modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
+                    <ModelTargetFields allowLocalTool connectedProviders={connectedProviders} executionModeKey="executionMode" localAudioTools={audioTools} localImageTools={imageTools} localVideoTools={videoTools} modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
                     <div>
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-instruction">
                         {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
                           ? 'Prompt prefix / style guidance'
-                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                            ? 'Motion guidance / prompt shaping'
-                            : 'Task / instruction'}
+                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                            ? selectedNode.config?.executionMode === 'localTool'
+                              ? 'Prompt shaping / audio guidance'
+                              : 'Speech guidance / delivery hint'
+                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                              ? 'Motion guidance / prompt shaping'
+                              : 'Task / instruction'}
                       </label>
                       <textarea
                         className="store-input mt-3 min-h-[120px] resize-none"
@@ -2003,19 +2178,48 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))}
                         placeholder={getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
                           ? 'Optional style or scene guidance to prepend to the incoming prompt.'
-                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                            ? 'For text-to-video, this is optional extra guidance. For image-to-video, use this box for the motion prompt.'
-                            : 'Optional guidance to apply to the incoming text.'}
+                          : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                            ? selectedNode.config?.executionMode === 'localTool'
+                              ? 'Optional guidance for the generated audio. In Music mode, use this for mood, style, or instrumentation. With upstream audio, this can steer how the result evolves.'
+                              : 'Optional guidance for how the provider should speak the connected text, such as tone, pacing, or delivery style.'
+                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                              ? 'For text-to-video, this is optional extra guidance. For image-to-video, use this box for the motion prompt.'
+                              : 'Optional guidance to apply to the incoming text.'}
                         value={selectedNode.config?.instruction || ''}
                       />
-                      {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
+                      {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? (
+                        <p className="mt-2 text-xs leading-5 text-slate-400">
+                          {selectedNode.config?.executionMode === 'localTool'
+                            ? 'Text input becomes the base generation prompt. In Music mode, you can also connect an upstream audio artifact to guide the result. Sound mode stays text-only in this first shared audio-output slice.'
+                            : 'Text input becomes the spoken content for this cloud audio step. Use the instruction box for optional delivery guidance, and choose a provider voice below when the model supports it.'}
+                        </p>
+                      ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
                         <p className="mt-2 text-xs leading-5 text-slate-400">
                           Text input becomes the base video prompt. If this step is connected to an image, use this box for the motion prompt that should animate that image.
                         </p>
                       ) : null}
                     </div>
                     {selectedNode.config?.executionMode === 'localTool' ? (
-                      getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
+                      getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? (
+                        <div className="space-y-4">
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-mode">Audio mode</label>
+                            <select className="store-input mt-3" id="llm-local-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value } }))} value={selectedNode.config?.audioMode || 'music'}>
+                              <option value="music">Music</option>
+                              <option value="sound">Sound</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-duration">Duration (seconds)</label>
+                            <input className="store-input mt-3" id="llm-local-audio-duration" max="60" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} />
+                          </div>
+                          <p className="text-xs leading-5 text-slate-400">
+                            {selectedNode.config?.audioMode === 'sound'
+                              ? 'Sound mode runs AudioGen and currently accepts text prompts only. Use it for environmental or effect-style clips rather than melody-guided output.'
+                              : 'Music mode runs MusicGen. Connect text for text-to-music, or connect an audio artifact to guide melody and structure while keeping this instruction box as optional extra guidance.'}
+                          </p>
+                        </div>
+                      ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
                         <div className="space-y-4">
                           <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-video-size">Video size</label><select className="store-input mt-3" id="llm-local-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="832x480">832 x 480</option><option value="1280x720">1280 x 720</option></select></div>
                           <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-video-steps">Steps</label><input className="store-input mt-3" id="llm-local-video-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-video-seed">Seed</label><input className="store-input mt-3" id="llm-local-video-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
@@ -2029,6 +2233,20 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                           <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-local-negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for this local image step." value={selectedNode.config?.negativePrompt || ''} /></div>
                         </div>
                       )
+                    ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? (
+                      <div className="space-y-3">
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-audio-voice">Voice</label>
+                          <input
+                            className="store-input mt-3"
+                            id="llm-audio-voice"
+                            onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioVoice: event.target.value } }))}
+                            placeholder="Optional voice name such as Kore"
+                            value={selectedNode.config?.audioVoice || ''}
+                          />
+                        </div>
+                        <p className="text-xs leading-5 text-slate-400">Gemini speech models save the generated audio locally and keep it pipeline-usable. Leave voice blank to let Local AI Hub use the provider default.</p>
+                      </div>
                     ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? (
                       <div className="grid gap-3 sm:grid-cols-3">
                         <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-image-size">Image size</label><select className="store-input mt-3" id="llm-image-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div>
@@ -2044,7 +2262,6 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                     {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.LLM_PROMPT ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional persistent instruction for this step." value={selectedNode.config?.systemPrompt || ''} /></div> : null}
                   </div>
                 ) : null}
-
                 {selectedNode.type === 'whisperTranscribe' ? (
                   <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="whisper-model">Transcription model</label><select className="store-input mt-3" id="whisper-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} value={selectedNode.config?.model || 'base'}>{WHISPER_MODELS.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></div>
                 ) : null}
@@ -2453,7 +2670,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                 </div>
 
                 <button className="ghost-button w-full justify-center" onClick={() => removeNode(selectedNode.id)} type="button">Delete node</button>
-              </div>
+                </div>
+              </PipelineInspectorErrorBoundary>
             ) : <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">Select a node on the canvas to edit its settings and inspect its connections.</div>}
           </div>
 
@@ -2629,6 +2847,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     </section>
   );
 }
+
+
 
 
 
