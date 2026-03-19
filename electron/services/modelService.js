@@ -479,6 +479,11 @@ function getToolModelDirectories(tool) {
       Model: getOllamaModelsRoot(tool),
     };
   }
+  if (tool?.id === 'rvc') {
+    return {
+      'Audio / Speech': path.join(appDir, 'weights'),
+    };
+  }
   return {};
 }
 function sanitizePathSegment(value) {
@@ -670,6 +675,9 @@ async function listLocalOllamaModels(tool) {
   }
 }
 async function listDownloadedModels(tool) {
+  if (tool?.id === 'rvc') {
+    return listLocalFileModels(tool);
+  }
   if (!supportsModelManager(tool)) {
     return [];
   }
@@ -679,6 +687,9 @@ async function listDownloadedModels(tool) {
   return listLocalFileModels(tool);
 }
 async function countDownloadedModels(tool) {
+  if (tool?.id === 'rvc') {
+    return (await listLocalFileModels(tool)).length;
+  }
   if (!supportsModelManager(tool)) {
     return 0;
   }

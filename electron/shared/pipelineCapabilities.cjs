@@ -8,8 +8,10 @@ const PIPELINE_OPERATION_IDS = Object.freeze({
   GRAPH_WORKFLOW: 'graphWorkflow',
   IMAGE_ANALYZE: 'imageAnalyze',
   IMAGE_GENERATE: 'imageGenerate',
+  IMAGE_TRANSFORM: 'imageTransform',
   VIDEO_GENERATE: 'videoGenerate',
   AUDIO_GENERATE: 'audioGenerate',
+  AUDIO_TRANSFORM: 'audioTransform',
   LLM_PROMPT: 'llmPrompt',
   VALIDATION_LLM: 'validationLlm',
   WHISPER_TRANSCRIBE: 'whisperTranscribe',
@@ -38,6 +40,16 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
     label: 'Operation-driven local tool',
     notes: 'Forge exposes a simple WebUI API that fits the current sequential model-step pipeline for text-to-image generation.',
   }),
+  upscayl: Object.freeze({
+    id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
+    label: 'Operation-driven local tool',
+    notes: 'Upscayl fits the first local image-to-image transformation slice as a dedicated enhancement and upscaling adapter that keeps transformed-image lineage tied to the connected source image.',
+  }),
+  facefusion: Object.freeze({
+    id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
+    label: 'Operation-driven local tool',
+    notes: 'FaceFusion fits the first local image-to-image transformation slice as an image-only transformation adapter that keeps the target image and source face reference explicit inside the shared artifact flow.',
+  }),
   'wan21-webui': Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
     label: 'Operation-driven local tool',
@@ -48,6 +60,11 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
     label: 'Operation-driven local tool',
     notes: 'AudioCraft WebUI fits the sequential model-step pipeline for generated audio, and Local AI Hub runs it through a dedicated direct Python adapter so prompt-to-audio artifacts stay typed and reusable inside the pipeline.',
   }),
+  rvc: Object.freeze({
+    id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
+    label: 'Operation-driven local tool',
+    notes: 'RVC fits the sequential model-step pipeline for source-audio transformation, and Local AI Hub runs it through a dedicated direct Python adapter so transformed audio artifacts keep clear lineage back to the source clip.',
+  }),
   comfyui: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW,
     label: 'Graph-native workflow tool',
@@ -56,7 +73,7 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
   invokeai: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.GRAPH_NATIVE_WORKFLOW,
     label: 'Graph-native workflow tool',
-    notes: 'InvokeAI uses the dedicated graph workflow step with an imported workflow-or-graph contract and Local AI Hub submits the executable graph through InvokeAI\'s queue API.',
+    notes: "InvokeAI uses the dedicated graph workflow step with an imported workflow-or-graph contract and Local AI Hub submits the executable graph through InvokeAI's queue API.",
   }),
 });
 
@@ -116,6 +133,26 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
     }),
     targetType: 'tool',
   }),
+  upscayl: Object.freeze({
+    operations: Object.freeze({
+      [PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_IMAGE]),
+        notes: 'Runs Upscayl through a dedicated local adapter so enhancement and upscaling return a transformed image artifact with clear lineage back to the connected source image.',
+        outputKinds: Object.freeze([MODALITY_IMAGE]),
+      }),
+    }),
+    targetType: 'tool',
+  }),
+  facefusion: Object.freeze({
+    operations: Object.freeze({
+      [PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_IMAGE]),
+        notes: 'Runs FaceFusion through a dedicated local adapter for image-only face transformation in this pass. Connect the target image on the main input and a source face image on the Reference Image input.',
+        outputKinds: Object.freeze([MODALITY_IMAGE]),
+      }),
+    }),
+    targetType: 'tool',
+  }),
   'wan21-webui': Object.freeze({
     operations: Object.freeze({
       [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: Object.freeze({
@@ -131,6 +168,16 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
       [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_AUDIO]),
         notes: 'Runs AudioCraft through a dedicated direct Python adapter. Text input produces generated audio. Audio input reuses the connected clip as music guidance in Music mode for this first audio-output pipeline slice.',
+        outputKinds: Object.freeze([MODALITY_AUDIO]),
+      }),
+    }),
+    targetType: 'tool',
+  }),
+  rvc: Object.freeze({
+    operations: Object.freeze({
+      [PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_AUDIO]),
+        notes: 'Runs RVC through a dedicated direct Python adapter. The connected source clip stays first-class and the converted result keeps explicit lineage back to that source audio.',
         outputKinds: Object.freeze([MODALITY_AUDIO]),
       }),
     }),
@@ -161,6 +208,11 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
         notes: 'Video generation uses a Sora video model such as sora-2 or sora-2-pro. Image input also needs motion guidance in the step instruction box.',
         outputKinds: Object.freeze([MODALITY_VIDEO]),
+      }),
+      [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT]),
+        notes: 'Speech generation uses a dedicated OpenAI text-to-speech model such as gpt-4o-mini-tts, tts-1, or tts-1-hd.',
+        outputKinds: Object.freeze([MODALITY_AUDIO]),
       }),
     }),
     targetType: 'provider',
@@ -263,6 +315,12 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
+      [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT]),
+        notes: 'xAI text-to-speech beta turns text into a saved speech artifact through its provider-managed voice runtime. Model selection stays optional in this pass because xAI does not currently expose a separate TTS model list here.',
+        outputKinds: Object.freeze([MODALITY_AUDIO]),
+        requiresModel: false,
+      }),
     }),
     targetType: 'provider',
   }),
@@ -270,6 +328,19 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
 
 const PROVIDER_MODEL_CAPABILITY_RULES = Object.freeze({
   openai: Object.freeze([
+    Object.freeze({
+      capabilityLabels: Object.freeze(['Speech generation']),
+      capabilitySource: 'explicit',
+      exclusive: true,
+      operations: Object.freeze({
+        [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
+          inputKinds: Object.freeze([MODALITY_TEXT]),
+          notes: 'Creates speech audio from text through the OpenAI speech endpoint.',
+          outputKinds: Object.freeze([MODALITY_AUDIO]),
+        }),
+      }),
+      pattern: /^(gpt-4o-mini-tts|tts-1(?:-hd)?)$/i,
+    }),
     Object.freeze({
       capabilityLabels: Object.freeze(['Image generation']),
       capabilitySource: 'explicit',
@@ -455,6 +526,15 @@ function doesProviderModelSupportOperation(providerId, modelId, operationId) {
   return Boolean(getProviderModelCapabilities(providerId, modelId)?.operations?.[operationId]);
 }
 
+function doesProviderOperationRequireExplicitModel(providerId, operationId) {
+  const providerOperation = PROVIDER_PIPELINE_CAPABILITIES[normalizeId(providerId)]?.operations?.[operationId] || null;
+  if (!providerOperation) {
+    return true;
+  }
+
+  return providerOperation.requiresModel !== false;
+}
+
 function getToolIdsForPipelineOperation(operationId) {
   return Object.entries(TOOL_PIPELINE_CAPABILITIES)
     .filter(([, record]) => Boolean(record?.operations?.[operationId]))
@@ -514,6 +594,7 @@ module.exports = {
   PIPELINE_OPERATION_IDS,
   TOOL_PIPELINE_STRATEGY_IDS,
   doesProviderModelSupportOperation,
+  doesProviderOperationRequireExplicitModel,
   getGraphWorkflowToolIds,
   getOperationDrivenToolIdsForPipelineOperation,
   getProviderIdsForPipelineOperation,

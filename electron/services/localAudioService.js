@@ -18,15 +18,27 @@ const LOCAL_AUDIO_RUNTIME_MODE_IDS = Object.freeze({
 
 const LOCAL_AUDIO_TOOL_ADAPTERS = Object.freeze({
   'audiocraft-webui': Object.freeze({
+    helperScript: 'run_audiocraft_pipeline_task.py',
     label: 'AudioCraft WebUI',
+    runtimeMode: LOCAL_AUDIO_RUNTIME_MODE_IDS.DIRECT_COMMAND,
+  }),
+  rvc: Object.freeze({
+    helperScript: 'run_rvc_pipeline_task.py',
+    label: 'RVC',
     runtimeMode: LOCAL_AUDIO_RUNTIME_MODE_IDS.DIRECT_COMMAND,
   }),
 });
 
-function getHelperScriptPath() {
+function getHelperScriptPath(toolId) {
+  const adapter = LOCAL_AUDIO_TOOL_ADAPTERS[String(toolId || '').trim().toLowerCase()] || null;
+  const helperScript = String(adapter?.helperScript || '').trim();
+  if (!helperScript) {
+    return '';
+  }
+
   return app?.isPackaged
-    ? path.join(process.resourcesPath, 'helpers', 'run_audiocraft_pipeline_task.py')
-    : path.join(__dirname, '..', 'helpers', 'run_audiocraft_pipeline_task.py');
+    ? path.join(process.resourcesPath, 'helpers', helperScript)
+    : path.join(__dirname, '..', 'helpers', helperScript);
 }
 
 function firstNonEmptyLine(value) {
@@ -85,12 +97,12 @@ function sanitizeLabelSegment(value, fallback) {
     .replace(/^-|-$/g, '') || fallback;
 }
 
-function buildJsonRequestPath(runDirectories, nodeLabel) {
-  return path.join(runDirectories.artifactsDir, `${sanitizeLabelSegment(nodeLabel, 'audio-step')}-${Date.now()}.audiocraft-request.json`);
+function buildJsonRequestPath(runDirectories, nodeLabel, requestKind = 'audio-step') {
+  return path.join(runDirectories.artifactsDir, `${sanitizeLabelSegment(nodeLabel, 'audio-step')}-${Date.now()}.${requestKind}.json`);
 }
 
-function buildAudioOutputPath(runDirectories, nodeLabel) {
-  return path.join(runDirectories.artifactsDir, `${sanitizeLabelSegment(nodeLabel, 'audio-step')}-${Date.now()}.wav`);
+function buildAudioOutputPath(runDirectories, nodeLabel, suffix = 'wav') {
+  return path.join(runDirectories.artifactsDir, `${sanitizeLabelSegment(nodeLabel, 'audio-step')}-${Date.now()}.${suffix}`);
 }
 
 function parseCommandJson(stdout, toolLabel) {
@@ -111,11 +123,12 @@ function parseCommandJson(stdout, toolLabel) {
   }
 }
 
-async function runAudiocraftTask(tool, payload, reportProgress) {
+async function runLocalAudioTask(tool, payload, reportProgress, progressMessages = {}) {
+  const toolId = String(tool?.id || '').trim().toLowerCase();
   const toolLabel = getLocalAudioToolLabel(tool);
-  const helperScript = getHelperScriptPath();
-  if (!(await fs.pathExists(helperScript))) {
-    throw new Error('Local AI Hub is missing its AudioCraft helper script. Reinstall the app to restore it.');
+  const helperScript = getHelperScriptPath(toolId);
+  if (!helperScript || !(await fs.pathExists(helperScript))) {
+    throw new Error('Local AI Hub is missing its ' + toolLabel + ' helper script. Reinstall the app to restore it.');
   }
 
   const pythonPath = await resolveLocalAudioPythonPath(tool);
@@ -131,8 +144,8 @@ async function runAudiocraftTask(tool, payload, reportProgress) {
 
   await fs.writeJson(requestPath, payload, { spaces: 2 });
   reportProgress?.(
-    'Starting the local AudioCraft backend for this audio step.',
-    'Running ' + (payload.nodeLabel || 'this step') + ' with ' + toolLabel + '...',
+    progressMessages.start || ('Starting ' + toolLabel + ' for this audio step.'),
+    progressMessages.run || ('Running ' + (payload.nodeLabel || 'this step') + ' with ' + toolLabel + '...'),
   );
 
   const commandResult = await runCommand(pythonPath, [helperScript, requestPath], {
@@ -175,6 +188,29 @@ function buildSourceAudioReference(sourceAudioArtifact) {
   };
 }
 
+function buildVoiceModelReference(voiceModel, fallbackModel) {
+  if (voiceModel && typeof voiceModel === 'object') {
+    return {
+      fileName: String(voiceModel.fileName || '').trim(),
+      model: String(voiceModel.relativePath || voiceModel.fileName || voiceModel.name || voiceModel.id || fallbackModel || '').trim(),
+      name: String(voiceModel.name || voiceModel.fileName || voiceModel.id || fallbackModel || '').trim(),
+      path: String(voiceModel.path || '').trim(),
+      relativePath: String(voiceModel.relativePath || '').trim(),
+    };
+  }
+
+  const normalizedFallback = String(fallbackModel || '').trim();
+  return normalizedFallback
+    ? {
+        fileName: normalizedFallback,
+        model: normalizedFallback,
+        name: normalizedFallback,
+        path: '',
+        relativePath: '',
+      }
+    : null;
+}
+
 async function generateAudioWithAudiocraftTool(tool, options = {}) {
   const toolLabel = getLocalAudioToolLabel(tool);
   const runDirectories = options.runDirectories || null;
@@ -183,9 +219,9 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
   }
 
   const nodeLabel = String(options.nodeLabel || options.displayName || 'Audio step').trim() || 'Audio step';
-  const outputPath = buildAudioOutputPath(runDirectories, nodeLabel);
-  const requestPath = buildJsonRequestPath(runDirectories, nodeLabel);
-  const response = await runAudiocraftTask(tool, {
+  const outputPath = buildAudioOutputPath(runDirectories, nodeLabel, 'wav');
+  const requestPath = buildJsonRequestPath(runDirectories, nodeLabel, 'audiocraft-request');
+  const response = await runLocalAudioTask(tool, {
     audioMode: String(options.audioMode || 'music').trim() || 'music',
     durationSeconds: Math.max(1, Number(options.durationSeconds || 8) || 8),
     model: String(options.model || '').trim(),
@@ -195,7 +231,10 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
     requestPath,
     sourceAudioPath: String(options.sourceAudioPath || '').trim(),
     toolRoot: resolveLocalAudioToolRoot(tool),
-  }, options.reportProgress);
+  }, options.reportProgress, {
+    run: 'Running ' + nodeLabel + ' with ' + toolLabel + '...',
+    start: 'Starting the local AudioCraft backend for this audio step.',
+  });
 
   const finalOutputPath = path.resolve(String(response?.outputPath || outputPath).trim());
   if (!(await fs.pathExists(finalOutputPath))) {
@@ -232,10 +271,86 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
   };
 }
 
+async function generateAudioWithRvcTool(tool, options = {}) {
+  const toolLabel = getLocalAudioToolLabel(tool);
+  const runDirectories = options.runDirectories || null;
+  if (!runDirectories?.artifactsDir) {
+    throw new Error('Local AI Hub could not prepare a pipeline run folder for the transformed audio output.');
+  }
+
+  const sourceAudioPath = path.resolve(String(options.sourceAudioPath || '').trim());
+  if (!sourceAudioPath || !(await fs.pathExists(sourceAudioPath))) {
+    throw new Error('The source audio for this RVC step could not be found anymore. Choose it again and rerun the pipeline.');
+  }
+
+  const voiceModel = buildVoiceModelReference(options.voiceModel, options.model);
+  if (!voiceModel?.model) {
+    throw new Error('Choose an RVC voice model before running this audio transformation step.');
+  }
+
+  const nodeLabel = String(options.nodeLabel || options.displayName || 'Audio transform').trim() || 'Audio transform';
+  const outputPath = buildAudioOutputPath(runDirectories, nodeLabel, 'wav');
+  const requestPath = buildJsonRequestPath(runDirectories, nodeLabel, 'rvc-request');
+  const response = await runLocalAudioTask(tool, {
+    instruction: String(options.instruction || '').trim(),
+    model: voiceModel.model,
+    nodeLabel,
+    outputPath,
+    requestPath,
+    sourceAudioPath,
+    toolRoot: resolveLocalAudioToolRoot(tool),
+    voiceModelName: voiceModel.name,
+    voiceModelPath: voiceModel.path,
+    voiceModelRelativePath: voiceModel.relativePath,
+  }, options.reportProgress, {
+    run: 'Running ' + nodeLabel + ' with ' + toolLabel + '...',
+    start: 'Starting RVC for this audio transformation step.',
+  });
+
+  const finalOutputPath = path.resolve(String(response?.outputPath || outputPath).trim());
+  if (!(await fs.pathExists(finalOutputPath))) {
+    throw new Error(toolLabel + ' reported success, but the transformed audio file could not be found.');
+  }
+
+  const audioTransformation = {
+    backend: 'rvc',
+    backendLabel: 'RVC',
+    durationSeconds: Number(response?.durationSeconds || 0) || 0,
+    instruction: String(options.instruction || '').trim(),
+    model: String(response?.model || voiceModel.model || '').trim(),
+    sourceAudio: buildSourceAudioReference(options.sourceAudioArtifact),
+    targetVoice: String(response?.targetVoice || voiceModel.name || voiceModel.fileName || '').trim(),
+    toolId: String(tool?.id || '').trim() || 'rvc',
+    toolLabel,
+    transformationType: String(response?.transformationType || 'voice-conversion').trim() || 'voice-conversion',
+  };
+
+  const artifact = await buildFileArtifact(finalOutputPath, {
+    audioTransformation,
+    displayName: String(options.displayName || nodeLabel || 'Transformed audio').trim() || 'Transformed audio',
+    kind: PORT_KIND_AUDIO,
+    role: 'transformed',
+  });
+
+  return {
+    destinationPath: artifact.filePath,
+    message: String(response?.message || toolLabel + ' transformed the source audio locally and saved it to ' + artifact.filePath + '.').trim(),
+    metadata: response,
+    outputs: {
+      audio: artifact,
+    },
+    preview: summarizeArtifact(artifact),
+  };
+}
+
 async function generateAudioWithLocalAudioTool(tool, options = {}) {
   const toolId = String(tool?.id || '').trim().toLowerCase();
   if (toolId === 'audiocraft-webui') {
     return generateAudioWithAudiocraftTool(tool, options);
+  }
+
+  if (toolId === 'rvc') {
+    return generateAudioWithRvcTool(tool, options);
   }
 
   throw new Error((tool?.name || 'This local audio tool') + ' does not have a runnable local audio adapter in Local AI Hub yet.');

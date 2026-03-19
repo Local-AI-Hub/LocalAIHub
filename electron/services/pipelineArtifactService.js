@@ -419,6 +419,80 @@ function serializeAudioGenerationForUi(generation = null) {
   }) ? normalized : null;
 }
 
+function serializeAudioTransformationForUi(transformation = null) {
+  if (!transformation || typeof transformation !== 'object') {
+    return null;
+  }
+
+  const durationSeconds = roundAudioMetric(transformation.durationSeconds);
+  const normalized = {
+    backend: String(transformation.backend || '').trim(),
+    backendLabel: String(transformation.backendLabel || '').trim(),
+    durationSeconds,
+    instruction: String(transformation.instruction || '').trim(),
+    model: String(transformation.model || '').trim(),
+    sourceAudio: serializeAudioSourceReference(transformation.sourceAudio),
+    targetVoice: String(transformation.targetVoice || '').trim(),
+    toolId: String(transformation.toolId || '').trim(),
+    toolLabel: String(transformation.toolLabel || '').trim(),
+    transformationType: String(transformation.transformationType || '').trim(),
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
+function serializeImageSourceReference(reference = null) {
+  if (!reference || typeof reference !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    displayName: String(reference.displayName || '').trim(),
+    fileName: String(reference.fileName || '').trim(),
+    filePath: String(reference.filePath || '').trim(),
+    fileUrl: String(reference.fileUrl || '').trim(),
+    formatLabel: String(reference.formatLabel || '').trim(),
+    kind: String(reference.kind || '').trim(),
+    mimeType: String(reference.mimeType || '').trim(),
+    sizeBytes: Number(reference.sizeBytes || 0) || 0,
+    summary: String(reference.summary || '').trim(),
+  };
+
+  return Object.values(normalized).some(Boolean) ? normalized : null;
+}
+
+function serializeImageTransformationForUi(transformation = null) {
+  if (!transformation || typeof transformation !== 'object') {
+    return null;
+  }
+
+  const scale = Number(transformation.scale || 0) || 0;
+  const normalized = {
+    backend: String(transformation.backend || '').trim(),
+    backendLabel: String(transformation.backendLabel || '').trim(),
+    instruction: String(transformation.instruction || '').trim(),
+    model: String(transformation.model || '').trim(),
+    referenceImage: serializeImageSourceReference(transformation.referenceImage),
+    scale: scale > 0 ? scale : null,
+    sourceImage: serializeImageSourceReference(transformation.sourceImage),
+    toolId: String(transformation.toolId || '').trim(),
+    toolLabel: String(transformation.toolLabel || '').trim(),
+    transformationType: String(transformation.transformationType || '').trim(),
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
 async function readWaveAudioMetadata(filePath) {
   if (path.extname(String(filePath || '')).toLowerCase() !== '.wav') {
     return null;
@@ -557,16 +631,37 @@ function summarizeArtifact(artifact, limit = 180) {
   if (artifact.kind === PORT_KIND_AUDIO) {
     const audio = artifact.audio && typeof artifact.audio === 'object' ? artifact.audio : null;
     const generation = artifact.audioGeneration && typeof artifact.audioGeneration === 'object' ? artifact.audioGeneration : null;
+    const transformation = artifact.audioTransformation && typeof artifact.audioTransformation === 'object' ? artifact.audioTransformation : null;
     const details = [
       artifact.fileName || artifact.displayName || '',
       artifact.formatLabel || '',
-      formatDurationSummary(audio?.durationSeconds || generation?.durationSeconds),
+      formatDurationSummary(audio?.durationSeconds || generation?.durationSeconds || transformation?.durationSeconds),
       audio?.sampleRate ? `${audio.sampleRate} Hz` : '',
       buildAudioChannelLabel(audio?.channelCount),
+      transformation?.transformationType ? transformation.transformationType.replace(/-/g, ' ') : '',
+      transformation?.toolLabel || transformation?.backendLabel || '',
+      transformation?.targetVoice ? `Voice ${transformation.targetVoice}` : '',
+      transformation?.sourceAudio?.fileName ? `Source ${transformation.sourceAudio.fileName}` : '',
       generation?.mode ? (generation.mode === 'sound' ? 'Sound generation' : generation.mode === 'speech' ? 'Speech generation' : 'Music generation') : '',
       generation?.toolLabel || generation?.backendLabel || '',
       generation?.voice ? `Voice ${generation.voice}` : '',
       generation?.sourceAudio?.fileName ? `Guided by ${generation.sourceAudio.fileName}` : '',
+    ].filter(Boolean);
+    return trimPreviewText(details.join(' | '), limit);
+  }
+
+  if (artifact.kind === PORT_KIND_IMAGE) {
+    const transformation = artifact.imageTransformation && typeof artifact.imageTransformation === 'object' ? artifact.imageTransformation : null;
+    const details = [
+      artifact.fileName || artifact.displayName || '',
+      artifact.formatLabel || '',
+      artifact.width && artifact.height ? `${artifact.width}x${artifact.height}` : '',
+      transformation?.transformationType ? transformation.transformationType.replace(/-/g, ' ') : '',
+      transformation?.toolLabel || transformation?.backendLabel || '',
+      transformation?.scale ? `${transformation.scale}x scale` : '',
+      transformation?.sourceImage?.fileName ? `Target ${transformation.sourceImage.fileName}` : '',
+      transformation?.referenceImage?.fileName ? `Reference ${transformation.referenceImage.fileName}` : '',
+      artifact.sizeBytes ? `${Math.max(1, Math.round(artifact.sizeBytes / 1024))} KB` : '',
     ].filter(Boolean);
     return trimPreviewText(details.join(' | '), limit);
   }
@@ -650,6 +745,24 @@ async function buildFileArtifact(filePath, options = {}) {
         };
       }
     }
+
+    const audioTransformation = serializeAudioTransformationForUi(options.audioTransformation);
+    if (audioTransformation) {
+      artifact.audioTransformation = audioTransformation;
+      if (audioTransformation.durationSeconds && !artifact.audio?.durationSeconds) {
+        artifact.audio = {
+          ...(artifact.audio || {}),
+          durationSeconds: audioTransformation.durationSeconds,
+        };
+      }
+    }
+  }
+
+  if (kind === PORT_KIND_IMAGE || String(mimeType || '').toLowerCase().startsWith('image/')) {
+    const imageTransformation = serializeImageTransformationForUi(options.imageTransformation);
+    if (imageTransformation) {
+      artifact.imageTransformation = imageTransformation;
+    }
   }
 
   artifact.previewText = kind === PORT_KIND_FILE ? await readTextPreview(resolvedPath) : '';
@@ -706,7 +819,9 @@ async function saveBase64Artifact(runDirectories, base64Payload, options = {}) {
   return buildFileArtifact(filePath, {
     audio: options.audio,
     audioGeneration: options.audioGeneration,
+    audioTransformation: options.audioTransformation,
     displayName: options.displayName,
+    imageTransformation: options.imageTransformation,
     kind: options.kind,
     role: options.role || 'generated',
   });
@@ -726,7 +841,9 @@ async function saveBufferArtifact(runDirectories, bufferPayload, options = {}) {
   return buildFileArtifact(filePath, {
     audio: options.audio,
     audioGeneration: options.audioGeneration,
+    audioTransformation: options.audioTransformation,
     displayName: options.displayName,
+    imageTransformation: options.imageTransformation,
     kind: options.kind,
     role: options.role || 'generated',
   });
@@ -771,7 +888,8 @@ async function saveTextArtifactMetadata(filePath, artifact) {
 async function saveAudioArtifactMetadata(filePath, artifact) {
   const audio = serializeAudioDetailsForUi(artifact?.audio);
   const audioGeneration = serializeAudioGenerationForUi(artifact?.audioGeneration);
-  if (!audio && !audioGeneration) {
+  const audioTransformation = serializeAudioTransformationForUi(artifact?.audioTransformation);
+  if (!audio && !audioGeneration && !audioTransformation) {
     return [];
   }
 
@@ -779,11 +897,33 @@ async function saveAudioArtifactMetadata(filePath, artifact) {
   await fs.writeJson(metadataPath, {
     audio,
     audioGeneration,
+    audioTransformation,
     displayName: String(artifact?.displayName || '').trim(),
     fileName: String(artifact?.fileName || '').trim(),
     formatLabel: String(artifact?.formatLabel || '').trim(),
     kind: String(artifact?.kind || PORT_KIND_AUDIO).trim() || PORT_KIND_AUDIO,
     summary: String(artifact?.summary || '').trim(),
+  }, { spaces: 2 });
+
+  return [metadataPath];
+}
+
+async function saveImageArtifactMetadata(filePath, artifact) {
+  const imageTransformation = serializeImageTransformationForUi(artifact?.imageTransformation);
+  if (!imageTransformation) {
+    return [];
+  }
+
+  const metadataPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.image.json`);
+  await fs.writeJson(metadataPath, {
+    displayName: String(artifact?.displayName || '').trim(),
+    fileName: String(artifact?.fileName || '').trim(),
+    formatLabel: String(artifact?.formatLabel || '').trim(),
+    height: Number(artifact?.height || 0) || 0,
+    imageTransformation,
+    kind: String(artifact?.kind || PORT_KIND_IMAGE).trim() || PORT_KIND_IMAGE,
+    summary: String(artifact?.summary || '').trim(),
+    width: Number(artifact?.width || 0) || 0,
   }, { spaces: 2 });
 
   return [metadataPath];
@@ -818,12 +958,16 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
 
   const metadataPaths = artifact.kind === PORT_KIND_AUDIO
     ? await saveAudioArtifactMetadata(filePath, artifact)
-    : [];
+    : artifact.kind === PORT_KIND_IMAGE
+      ? await saveImageArtifactMetadata(filePath, artifact)
+      : [];
 
   const savedArtifact = await buildFileArtifact(filePath, {
     audio: artifact.audio,
     audioGeneration: artifact.audioGeneration,
+    audioTransformation: artifact.audioTransformation,
     displayName: title,
+    imageTransformation: artifact.imageTransformation,
     kind: artifact.kind,
     role: 'output',
   });
@@ -841,7 +985,9 @@ function buildTerminalResult(node, artifact) {
     artifact: serializeArtifactForUi(artifact),
     audio: artifact?.audio ? serializeArtifactForUi(artifact.audio) : null,
     audioGeneration: artifact?.audioGeneration ? serializeArtifactForUi(artifact.audioGeneration) : null,
+    audioTransformation: artifact?.audioTransformation ? serializeArtifactForUi(artifact.audioTransformation) : null,
     destinationPath: artifact?.destinationPath || artifact?.filePath || '',
+    imageTransformation: artifact?.imageTransformation ? serializeArtifactForUi(artifact.imageTransformation) : null,
     filePath: artifact?.filePath || '',
     fileUrl: artifact?.fileUrl || '',
     kind: artifact?.kind || PORT_KIND_FILE,
@@ -899,6 +1045,21 @@ async function describeArtifactForLlm(artifact) {
     artifact.audio?.sampleRate ? `Sample rate: ${artifact.audio.sampleRate} Hz` : '',
     artifact.audio?.channelCount ? `Channels: ${artifact.audio.channelCount}` : '',
     artifact.audio?.bitDepth ? `Bit depth: ${artifact.audio.bitDepth}` : '',
+    artifact.audioTransformation?.backendLabel ? `Transformed by: ${artifact.audioTransformation.backendLabel}` : '',
+    artifact.audioTransformation?.toolLabel ? `Transform tool: ${artifact.audioTransformation.toolLabel}` : '',
+    artifact.audioTransformation?.model ? `Transform model: ${artifact.audioTransformation.model}` : '',
+    artifact.audioTransformation?.transformationType ? `Transform type: ${artifact.audioTransformation.transformationType}` : '',
+    artifact.audioTransformation?.targetVoice ? `Target voice: ${artifact.audioTransformation.targetVoice}` : '',
+    artifact.audioTransformation?.instruction ? `Transform note: ${artifact.audioTransformation.instruction}` : '',
+    artifact.audioTransformation?.sourceAudio?.fileName ? `Source audio: ${artifact.audioTransformation.sourceAudio.fileName}` : '',
+    artifact.imageTransformation?.backendLabel ? `Image transformed by: ${artifact.imageTransformation.backendLabel}` : '',
+    artifact.imageTransformation?.toolLabel ? `Image transform tool: ${artifact.imageTransformation.toolLabel}` : '',
+    artifact.imageTransformation?.model ? `Image transform model: ${artifact.imageTransformation.model}` : '',
+    artifact.imageTransformation?.transformationType ? `Image transform type: ${artifact.imageTransformation.transformationType}` : '',
+    artifact.imageTransformation?.scale ? `Image transform scale: ${artifact.imageTransformation.scale}x` : '',
+    artifact.imageTransformation?.instruction ? `Image transform note: ${artifact.imageTransformation.instruction}` : '',
+    artifact.imageTransformation?.sourceImage?.fileName ? `Target image: ${artifact.imageTransformation.sourceImage.fileName}` : '',
+    artifact.imageTransformation?.referenceImage?.fileName ? `Reference image: ${artifact.imageTransformation.referenceImage.fileName}` : '',
     artifact.audioGeneration?.backendLabel ? `Generated by: ${artifact.audioGeneration.backendLabel}` : '',
     artifact.audioGeneration?.toolLabel ? `Tool: ${artifact.audioGeneration.toolLabel}` : '',
     artifact.audioGeneration?.model ? `Model: ${artifact.audioGeneration.model}` : '',

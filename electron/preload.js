@@ -38,6 +38,8 @@ contextBridge.exposeInMainWorld('localAIHub', {
   openLogsFolder: () => invoke('app:open-logs-folder'),
   openPath: (payload) => invoke('app:open-path', payload),
   openToolFolder: (toolId) => invoke('tools:open-folder', toolId),
+  inspectAiderProject: (projectDir) => invoke('aider:inspect-project', projectDir),
+  listAiderModels: (payload) => invoke('aider:list-models', payload),
   pickAiderProjectFolder: () => invoke('aider:pick-project-folder'),
   pickPipelineFile: (payload) => invoke('pipelines:pick-file', payload),
   pickStorageFolder: () => invoke('settings:pick-storage-folder'),
@@ -128,6 +130,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
     return () => ipcRenderer.removeListener('app:window-activity', listener);
   },
 });
+
 
 
 

@@ -5,7 +5,7 @@ const { ensureStorage, humanizeError } = require('./configService');
 const { getProviderSecret, maskSecret, setProviderSecret } = require('./credentialService');
 const { createLogger } = require('./logService');
 const { getProviderCatalog, getProviderManifest, initializeProviderRegistry, resolveProviderUrl } = require('./providerRegistry');
-const { PIPELINE_OPERATION_IDS, getProviderModelCapabilities } = require('../shared/pipelineCapabilities.cjs');
+const { PIPELINE_OPERATION_IDS, doesProviderOperationRequireExplicitModel, getProviderModelCapabilities } = require('../shared/pipelineCapabilities.cjs');
 
 const PROVIDER_SETTINGS_FILE = 'provider-connections.json';
 const PROVIDER_SETTINGS_VERSION = 1;
@@ -18,6 +18,8 @@ const OPENAI_IMAGE_QUALITIES = new Set(['auto', 'low', 'medium', 'high']);
 const OPENAI_IMAGE_BACKGROUNDS = new Set(['auto', 'opaque', 'transparent']);
 const OPENAI_VIDEO_SIZES = new Set(['1280x720', '720x1280']);
 const DEFAULT_GOOGLE_TTS_VOICE = 'Kore';
+const DEFAULT_OPENAI_TTS_VOICE = 'alloy';
+const DEFAULT_XAI_TTS_VOICE = 'eve';
 const GOOGLE_TTS_WAVE_SAMPLE_RATE = 24000;
 const GOOGLE_TTS_WAVE_CHANNEL_COUNT = 1;
 const GOOGLE_TTS_WAVE_BIT_DEPTH = 16;
@@ -861,6 +863,114 @@ async function sendGoogleSpeechGeneration(provider, apiKey, payload) {
   };
 }
 
+async function sendOpenAiSpeechGeneration(provider, apiKey, payload) {
+  if (provider.id !== 'openai') {
+    throw new Error(provider.name + ' does not support cloud audio generation in Local AI Hub yet.');
+  }
+
+  const spokenText = String(payload.spokenText || payload.prompt || '').trim();
+  if (!spokenText) {
+    throw new Error('Enter text before generating speech.');
+  }
+
+  const model = String(payload.model || '').trim();
+  if (!model) {
+    throw new Error('Choose an OpenAI speech model before generating audio.');
+  }
+
+  const voice = String(payload.voice || payload.voiceName || DEFAULT_OPENAI_TTS_VOICE).trim() || DEFAULT_OPENAI_TTS_VOICE;
+  const instructions = String(payload.instruction || '').trim();
+  const body = {
+    format: 'wav',
+    input: spokenText,
+    model,
+    voice,
+  };
+  if (instructions) {
+    body.instructions = instructions;
+  }
+
+  const response = await requestProviderBuffer(provider, apiKey, '/audio/speech', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+  if (!response.buffer.length) {
+    throw new Error(provider.name + ' returned an empty audio file.');
+  }
+
+  return {
+    createdAt: new Date().toISOString(),
+    model,
+    audios: [
+      {
+        buffer: response.buffer,
+        extension: '.wav',
+        mimeType: 'audio/wav',
+        voice,
+      },
+    ],
+  };
+}
+
+async function sendXaiSpeechGeneration(provider, apiKey, payload) {
+  if (provider.id !== 'xai') {
+    throw new Error(provider.name + ' does not support cloud audio generation in Local AI Hub yet.');
+  }
+
+  const spokenText = String(payload.spokenText || payload.prompt || '').trim();
+  if (!spokenText) {
+    throw new Error('Enter text before generating speech.');
+  }
+
+  const voice = String(payload.voice || payload.voiceName || DEFAULT_XAI_TTS_VOICE).trim() || DEFAULT_XAI_TTS_VOICE;
+  const response = await requestProviderBuffer(provider, apiKey, '/tts', {
+    method: 'POST',
+    body: JSON.stringify({
+      output_format: {
+        codec: 'wav',
+        sample_rate: 24000,
+      },
+      text: spokenText,
+      voice_id: voice,
+    }),
+  });
+
+  if (!response.buffer.length) {
+    throw new Error(provider.name + ' returned an empty audio file.');
+  }
+
+  return {
+    createdAt: new Date().toISOString(),
+    model: '',
+    audios: [
+      {
+        buffer: response.buffer,
+        extension: '.wav',
+        mimeType: 'audio/wav',
+        sampleRate: 24000,
+        voice,
+      },
+    ],
+  };
+}
+
+async function sendProviderSpeechGeneration(provider, apiKey, payload) {
+  if (provider.configuration?.protocol === 'google-gemini') {
+    return sendGoogleSpeechGeneration(provider, apiKey, payload);
+  }
+
+  if (provider.id === 'openai') {
+    return sendOpenAiSpeechGeneration(provider, apiKey, payload);
+  }
+
+  if (provider.id === 'xai') {
+    return sendXaiSpeechGeneration(provider, apiKey, payload);
+  }
+
+  throw new Error(provider.name + ' does not support cloud audio generation in Local AI Hub yet.');
+}
+
 async function sendOpenAiImageGeneration(provider, apiKey, payload) {
   if (provider.id !== 'openai') {
     throw new Error(provider.name + ' does not support cloud image generation in Local AI Hub yet.');
@@ -1271,7 +1381,7 @@ async function runProviderOperation(providerId, payload = {}) {
     mode: operationId,
   });
   const model = String(payload.model || '').trim();
-  if (!model) {
+  if (!model && doesProviderOperationRequireExplicitModel(provider.id, operationId)) {
     throw new Error('Choose a ' + provider.name + ' model before running this step.');
   }
 
@@ -1282,11 +1392,7 @@ async function runProviderOperation(providerId, payload = {}) {
     } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
       result = await sendOpenAiVideoGeneration(provider, apiKey, payload);
     } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
-      if (provider.configuration?.protocol === 'google-gemini') {
-        result = await sendGoogleSpeechGeneration(provider, apiKey, payload);
-      } else {
-        throw new Error(provider.name + ' does not support cloud audio generation in Local AI Hub yet.');
-      }
+      result = await sendProviderSpeechGeneration(provider, apiKey, payload);
     } else {
       throw new Error(provider.name + ' does not support that pipeline operation yet.');
     }

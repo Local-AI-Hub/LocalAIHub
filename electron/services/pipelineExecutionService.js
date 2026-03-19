@@ -28,9 +28,10 @@ const {
 } = require('./workflowToolService');
 const { executeGraphWorkflowNode } = require('./graphWorkflowService');
 const { generateAudioWithLocalAudioTool } = require('./localAudioService');
+const { generateImageWithLocalImageTool } = require('./localImageService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
-const { getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
+const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
   PIPELINE_OPERATION_IDS,
   PORT_KIND_AUDIO,
@@ -43,6 +44,7 @@ const {
   buildContextMaps,
   createUniqueId,
   getGraphWorkflowToolId,
+  getModelStepLocalToolId,
   getModelStepOperationId,
   getNodeTypeDefinition,
   getPortDefinition,
@@ -144,6 +146,29 @@ function collectSelectedLocalImageToolIds(definition = {}) {
   return selectedToolIds.size ? [...selectedToolIds] : ['automatic1111', 'forge'];
 }
 
+function collectSelectedLocalAudioTransformToolIds(definition = {}) {
+  const selectedToolIds = new Set();
+  let hasLocalAudioTransformStep = false;
+
+  for (const node of Array.isArray(definition?.nodes) ? definition.nodes : []) {
+    if (node?.type !== 'llmPrompt' || node?.config?.executionMode !== 'localTool' || getModelStepOperationId(node) !== PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+      continue;
+    }
+
+    hasLocalAudioTransformStep = true;
+    const toolId = String(node?.config?.toolId || '').trim().toLowerCase();
+    if (toolId) {
+      selectedToolIds.add(toolId);
+    }
+  }
+
+  if (!hasLocalAudioTransformStep) {
+    return [];
+  }
+
+  return selectedToolIds.size ? [...selectedToolIds] : ['rvc'];
+}
+
 function filterLocalImageCheckpointModels(models = []) {
   return (Array.isArray(models) ? models : []).filter((model) => {
     const modelType = String(model?.modelType || '').trim().toLowerCase();
@@ -175,7 +200,7 @@ function getDownloadedToolModelEntry(tool, model) {
   }
 
   return (Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : []).find((entry) => {
-    const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.path]
+    const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.relativePath, entry?.path]
       .map((value) => String(value || '').trim().toLowerCase())
       .filter(Boolean);
     return candidates.includes(normalizedModel);
@@ -233,10 +258,14 @@ async function buildPipelineContext(definition = {}) {
   }
 
   const selectedLocalImageToolIds = collectSelectedLocalImageToolIds(definition);
-  if (selectedLocalImageToolIds.length) {
+  const selectedLocalAudioTransformToolIds = collectSelectedLocalAudioTransformToolIds(definition);
+  if (selectedLocalImageToolIds.length || selectedLocalAudioTransformToolIds.length) {
     const downloadedModelsByToolId = {};
     for (const toolId of selectedLocalImageToolIds) {
       downloadedModelsByToolId[toolId] = filterLocalImageCheckpointModels(await listDownloadedModels(toolId).catch(() => []));
+    }
+    for (const toolId of selectedLocalAudioTransformToolIds) {
+      downloadedModelsByToolId[toolId] = await listDownloadedModels(toolId).catch(() => []);
     }
 
     toolEntries = attachDownloadedToolModels(toolEntries, downloadedModelsByToolId);
@@ -1216,6 +1245,62 @@ async function buildAudioGenerationRequest(node, inputArtifact) {
   throw new Error('This audio generation step currently accepts text input or a source audio file only.');
 }
 
+async function buildAudioTransformRequest(node, inputArtifact) {
+  if (!inputArtifact) {
+    throw new Error('This audio transformation step did not receive any source audio.');
+  }
+
+  if (inputArtifact.kind !== PORT_KIND_AUDIO || !inputArtifact.filePath) {
+    throw new Error('This audio transformation step currently accepts a source audio file only.');
+  }
+
+  const sourceAudioPath = path.resolve(String(inputArtifact.filePath || '').trim());
+  if (!sourceAudioPath || !(await fs.pathExists(sourceAudioPath))) {
+    throw new Error('The source audio for this transformation step could not be found anymore. Choose it again and rerun the pipeline.');
+  }
+
+  return {
+    instruction: String(node.config?.instruction || '').trim(),
+    sourceAudioArtifact: inputArtifact,
+    sourceAudioPath,
+  };
+}
+
+async function buildImageTransformRequest(node, inputArtifact, referenceArtifact) {
+  if (!inputArtifact) {
+    throw new Error('This image transformation step did not receive any source image.');
+  }
+
+  if (inputArtifact.kind !== PORT_KIND_IMAGE || !inputArtifact.filePath) {
+    throw new Error('This image transformation step currently accepts an image input only.');
+  }
+
+  const sourceImagePath = path.resolve(String(inputArtifact.filePath || '').trim());
+  if (!sourceImagePath || !(await fs.pathExists(sourceImagePath))) {
+    throw new Error('The source image for this transformation step could not be found anymore. Choose it again and rerun the pipeline.');
+  }
+
+  let referenceImagePath = '';
+  if (referenceArtifact) {
+    if (referenceArtifact.kind !== PORT_KIND_IMAGE || !referenceArtifact.filePath) {
+      throw new Error('The Reference Image input currently accepts an image file only.');
+    }
+
+    referenceImagePath = path.resolve(String(referenceArtifact.filePath || '').trim());
+    if (!referenceImagePath || !(await fs.pathExists(referenceImagePath))) {
+      throw new Error('The reference image for this transformation step could not be found anymore. Choose it again and rerun the pipeline.');
+    }
+  }
+
+  return {
+    instruction: String(node.config?.instruction || '').trim(),
+    referenceImageArtifact: referenceArtifact || null,
+    referenceImagePath,
+    sourceImageArtifact: inputArtifact,
+    sourceImagePath,
+  };
+}
+
 async function buildCloudAudioGenerationRequest(node, inputArtifact) {
   if (!inputArtifact) {
     throw new Error('This cloud audio step did not receive any input.');
@@ -1233,6 +1318,7 @@ async function buildCloudAudioGenerationRequest(node, inputArtifact) {
   const instruction = String(node.config?.instruction || '').trim();
   const voice = String(node.config?.audioVoice || '').trim();
   return {
+    instruction,
     prompt: instruction ? instruction + '\n\nSpeak this text exactly:\n' + spokenText : spokenText,
     spokenText,
     voice,
@@ -1510,13 +1596,32 @@ async function getSelectedLocalVideoToolOrThrow(contextMaps, node, actionLabel) 
 }
 
 async function getSelectedLocalAudioToolOrThrow(contextMaps, node, actionLabel) {
-  const selectedToolId = String(node?.config?.toolId || 'audiocraft-webui').trim().toLowerCase() || 'audiocraft-webui';
+  const operationId = getModelStepOperationId(node);
+  const fallbackToolId = operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM ? 'rvc' : 'audiocraft-webui';
+  const selectedToolId = String(getModelStepLocalToolId(node, contextMaps) || fallbackToolId).trim().toLowerCase() || fallbackToolId;
+  const installMessage = operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+    ? 'Install RVC before using the ' + actionLabel + ' step.'
+    : 'Install AudioCraft WebUI before using the ' + actionLabel + ' step.';
   return getInstalledToolOrThrow(
     contextMaps,
     selectedToolId,
-    `Install AudioCraft WebUI before using the ${actionLabel} step.`,
+    installMessage,
   );
 }
+
+async function getSelectedLocalImageToolOrThrow(contextMaps, node, actionLabel) {
+  const fallbackToolId = 'upscayl';
+  const selectedToolId = String(getModelStepLocalToolId(node, contextMaps) || fallbackToolId).trim().toLowerCase() || fallbackToolId;
+  const installMessage = selectedToolId === 'facefusion'
+    ? 'Install FaceFusion before using the ' + actionLabel + ' step.'
+    : 'Install Upscayl or FaceFusion before using the ' + actionLabel + ' step.';
+  return getInstalledToolOrThrow(
+    contextMaps,
+    selectedToolId,
+    installMessage,
+  );
+}
+
 async function buildValidationArtifactDescription(artifact, contextMaps) {
   let description = await describeArtifactForLlm(artifact);
 
@@ -1941,7 +2046,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     }
 
     const requiresExplicitModel = !(executionMode === 'localTool'
-      && (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE || operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE));
+      && (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE || operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM || operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM))
+      && (executionMode !== 'cloud' || doesProviderOperationRequireExplicitModel(String(node.config?.providerId || '').trim(), operationId));
     if (!model && requiresExplicitModel) {
       throw new Error('Choose or enter a model for the model step before running this pipeline.');
     }
@@ -1997,11 +2103,37 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           durationSeconds: audioRequest.durationSeconds,
           model,
           nodeLabel: node.label,
+          operationId,
           prompt: audioRequest.prompt,
           reportProgress,
           runDirectories: run.directories,
           sourceAudioArtifact: audioRequest.sourceAudioArtifact,
           sourceAudioPath: audioRequest.sourceAudioPath,
+        });
+      }
+
+      if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+        const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'local audio transformation');
+        const audioRequest = await buildAudioTransformRequest(node, promptArtifact);
+        if (!model) {
+          throw new Error('Choose an RVC voice model before running this audio transformation step.');
+        }
+        const selectedVoiceModel = getDownloadedToolModelEntry(tool, model);
+        if (Array.isArray(tool?.downloadedModels) && tool.downloadedModels.length && !selectedVoiceModel) {
+          throw new Error(tool.name + ' does not have the selected RVC voice model available locally. Refresh the local model list or choose a model file from the weights folder before running this step.');
+        }
+        reportProgress?.('Sending the source audio to ' + tool.name + ' for local audio transformation.', 'Running ' + node.label + ' with ' + tool.name + '...');
+        return generateAudioWithLocalAudioTool(tool, {
+          displayName: node.label,
+          instruction: audioRequest.instruction,
+          model,
+          nodeLabel: node.label,
+          operationId,
+          reportProgress,
+          runDirectories: run.directories,
+          sourceAudioArtifact: audioRequest.sourceAudioArtifact,
+          sourceAudioPath: audioRequest.sourceAudioPath,
+          voiceModel: selectedVoiceModel,
         });
       }
 
@@ -2025,8 +2157,27 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         });
       }
 
+      if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+        const tool = await getSelectedLocalImageToolOrThrow(contextMaps, node, 'local image transformation');
+        const referenceArtifact = getNodeInputArtifact(node.id, 'referenceImage', graph, run.resultsByNodeId, run);
+        const imageRequest = await buildImageTransformRequest(node, promptArtifact, referenceArtifact);
+        reportProgress?.('Sending the source image to ' + tool.name + ' for local image transformation.', 'Running ' + node.label + ' with ' + tool.name + '...');
+        return generateImageWithLocalImageTool(tool, {
+          displayName: node.label,
+          instruction: imageRequest.instruction,
+          nodeLabel: node.label,
+          operationId,
+          referenceImageArtifact: imageRequest.referenceImageArtifact,
+          referenceImagePath: imageRequest.referenceImagePath,
+          reportProgress,
+          runDirectories: run.directories,
+          sourceImageArtifact: imageRequest.sourceImageArtifact,
+          sourceImagePath: imageRequest.sourceImagePath,
+        });
+      }
+
       if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-        throw new Error('Local AI Hub currently supports audio, image, and video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
+        throw new Error('Local AI Hub currently supports audio generation, audio transformation, image generation, image transformation, and video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
       }
 
       const prompt = buildImageGenerationPrompt(node, promptArtifact);
@@ -2078,10 +2229,12 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       const audioRequest = await buildCloudAudioGenerationRequest(node, promptArtifact);
       reportProgress?.('Sending the text to ' + provider.name + ' for speech generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
       const result = await runProviderOperation(providerId, {
+        instruction: audioRequest.instruction,
         model,
         operationId,
         prompt: audioRequest.prompt,
         providerId,
+        spokenText: audioRequest.spokenText,
         voice: audioRequest.voice,
       });
       const generatedAudio = result?.audios?.[0] || null;
@@ -2620,6 +2773,8 @@ module.exports = {
   runPipeline,
   setPipelineEventSink,
 };
+
+
 
 
 

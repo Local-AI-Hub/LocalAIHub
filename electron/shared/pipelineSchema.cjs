@@ -1,4 +1,4 @@
-const {
+﻿const {
   PIPELINE_OPERATION_IDS,
   TOOL_PIPELINE_STRATEGY_IDS,
   getGraphWorkflowToolIds,
@@ -6,6 +6,7 @@ const {
   getProviderIdsForPipelineOperation,
   getProviderModelCapabilities,
   getProviderPipelineOperation,
+  doesProviderOperationRequireExplicitModel,
   getRunnableGraphWorkflowToolIds,
   getToolPipelineOperation,
   getToolPipelineStrategy,
@@ -52,8 +53,10 @@ const PIPELINE_OPERATION_LABELS = Object.freeze({
   [PIPELINE_OPERATION_IDS.GRAPH_WORKFLOW]: 'Graph workflow',
   [PIPELINE_OPERATION_IDS.IMAGE_ANALYZE]: 'Image analysis',
   [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: 'Image generation',
+  [PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM]: 'Image transform',
   [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: 'Video generation',
   [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: 'Audio generation',
+  [PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM]: 'Audio transform',
   [PIPELINE_OPERATION_IDS.LLM_PROMPT]: 'Text response',
   [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: 'LLM validation',
   [PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE]: 'Transcription',
@@ -77,8 +80,10 @@ const MODEL_STEP_CLOUD_OPERATION_OPTIONS = Object.freeze([
   },
 ]);
 const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
+const IMAGE_TRANSFORM_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM));
 const VIDEO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.VIDEO_GENERATE));
 const AUDIO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.AUDIO_GENERATE));
+const AUDIO_TRANSFORM_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM));
 const GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getGraphWorkflowToolIds());
 const RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getRunnableGraphWorkflowToolIds());
 const DEFAULT_GRAPH_WORKFLOW_TOOL_ID = RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS[0] || GRAPH_WORKFLOW_TOOL_IDS[0] || 'comfyui';
@@ -187,7 +192,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'llmPrompt',
     label: 'Model Step',
     category: 'AI Steps',
-    description: 'Sends compatible text or media to a model and returns the selected typed output.',
+    description: 'Sends compatible text or media to a model and returns the selected typed output. Local image transformation can also use an optional Reference Image input for source-image lineage.',
     inputPorts: [
       {
         id: 'prompt',
@@ -195,6 +200,12 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         allowedKinds: [PORT_KIND_TEXT, PORT_KIND_IMAGE],
         label: 'Input',
         required: true,
+      },
+      {
+        id: 'referenceImage',
+        kind: PORT_KIND_ANY,
+        dynamicOnly: true,
+        label: 'Reference Image',
       },
     ],
     outputPorts: [
@@ -683,6 +694,16 @@ function resolveDynamicInputKinds(node, port) {
     );
   }
 
+  if (node.type === 'llmPrompt' && port.id === 'referenceImage') {
+    const executionMode = getModelStepExecutionMode(node);
+    const operationId = getModelStepOperationId(node);
+    if (executionMode === 'localTool' && operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+      return [PORT_KIND_IMAGE];
+    }
+
+    return [];
+  }
+
   if (node.type === 'validation' && port.id === 'input' && node.config?.mode === 'llm') {
     const executionMode = node?.config?.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud';
     if (executionMode === 'ollama') {
@@ -711,6 +732,10 @@ function getPortAllowedKinds(port, options = {}) {
   const dynamicKinds = options?.direction === 'input'
     ? resolveDynamicInputKinds(options?.node || null, port)
     : [];
+  if (port.dynamicOnly) {
+    return dynamicKinds;
+  }
+
   if (dynamicKinds.length) {
     return dynamicKinds;
   }
@@ -827,6 +852,14 @@ function getModelStepOperationId(node) {
       return PIPELINE_OPERATION_IDS.AUDIO_GENERATE;
     }
 
+    if (requestedOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+      return PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM;
+    }
+
+    if (requestedOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+      return PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM;
+    }
+
     return PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
   }
 
@@ -843,6 +876,14 @@ function getOperationDrivenToolIdsForModelStepOperation(operationId) {
 
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
     return AUDIO_WORKFLOW_TOOL_IDS;
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+    return AUDIO_TRANSFORM_TOOL_IDS;
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+    return IMAGE_TRANSFORM_TOOL_IDS;
   }
 
   return IMAGE_WORKFLOW_TOOL_IDS;
@@ -2037,7 +2078,20 @@ function getModelStepSupportState(node, capabilitySummary, contextMaps = {}, con
       && (
         capabilitySummary.operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
         || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+        || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+        || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
       )
+    ) {
+      return {
+        status: 'supported',
+        message: '',
+      };
+    }
+
+    if (
+      capabilitySummary.targetKind === 'provider'
+      && capabilitySummary.targetId
+      && !doesProviderOperationRequireExplicitModel(capabilitySummary.targetId, capabilitySummary.operationId)
     ) {
       return {
         status: 'supported',
@@ -2052,6 +2106,13 @@ function getModelStepSupportState(node, capabilitySummary, contextMaps = {}, con
   }
 
   if (capabilitySummary.targetKind === 'tool' && capabilitySummary.targetId && capabilitySummary.targetId !== 'ollama') {
+    if (node?.config?.executionMode === 'localTool' && capabilitySummary.operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+      return {
+        status: 'supported',
+        message: '',
+      };
+    }
+
     const tool = getContextToolEntry(capabilitySummary.targetId, contextMaps);
     const downloadedModels = Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : [];
     if (!downloadedModels.length) {
@@ -2082,7 +2143,9 @@ function getModelStepSupportState(node, capabilitySummary, contextMaps = {}, con
               : capabilitySummary.operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                 ? capabilitySummary.targetId === 'google'
                   ? 'Selected model does not support speech generation on ' + capabilitySummary.targetLabel + '. Choose a Gemini TTS model such as gemini-2.5-flash-preview-tts before running this step.'
-                  : 'Selected model does not support speech generation on ' + capabilitySummary.targetLabel + '. Choose a compatible text-to-speech model before running this step.'
+                  : capabilitySummary.targetId === 'openai'
+                    ? 'Selected model does not support speech generation on ' + capabilitySummary.targetLabel + '. Choose an OpenAI TTS model such as gpt-4o-mini-tts, tts-1, or tts-1-hd before running this step.'
+                    : 'Selected model does not support speech generation on ' + capabilitySummary.targetLabel + '. Choose a compatible text-to-speech model before running this step.'
                 : 'Selected model does not support ' + getPipelineOperationLabel(capabilitySummary.operationId).toLowerCase() + ' on ' + capabilitySummary.targetLabel + '. Choose a compatible chat model before running this step.',
       };
     }
@@ -2629,7 +2692,7 @@ function analyzeImageToolNode(node, summary, contextMaps) {
   return true;
 }
 
-function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKinds = []) {
+function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKinds = [], referenceKinds = []) {
   const operationId = getModelStepOperationId(node);
   const selectedToolId = String(node.config?.toolId || '').trim();
   const supportedToolIds = getOperationDrivenToolIdsForModelStepOperation(operationId);
@@ -2638,12 +2701,20 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
     ? 'Install Wan2.1 WebUI before using local video generation in a model step.'
     : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
       ? 'Install AudioCraft WebUI before using local audio generation in a model step.'
-      : 'Install Automatic1111 or Forge before using the local image tool mode in a model step.';
+      : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+        ? 'Install RVC before using local audio transformation in a model step.'
+        : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+          ? 'Install Upscayl or FaceFusion before using local image transformation in a model step.'
+          : 'Install Automatic1111 or Forge before using the local image tool mode in a model step.';
   const selectionMessage = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
     ? 'Choose Wan2.1 WebUI for this local video model step. ComfyUI video workflows use the dedicated Graph Workflow step instead of this model-step mode.'
     : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
       ? 'Choose AudioCraft WebUI for this local audio model step. RVC-style audio transformation is not wired into this model-step path yet, so keep this slice focused on generated-audio output.'
-      : 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.';
+      : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+        ? 'Choose RVC for this local audio transformation step. Generated-audio tools stay on the dedicated audio-generation path.'
+        : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+          ? 'Choose Upscayl or FaceFusion for this local image transformation step. Automatic1111, Forge, and graph-native tools stay on the generation or Graph Workflow paths.'
+          : 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.';
 
   if (selectedToolId && !supportedToolIds.includes(selectedToolId)) {
     summary.readiness = {
@@ -2691,6 +2762,58 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
     summary.readiness = {
       tone: 'info',
       message: tool.name + ' will run this audio generation step through its dedicated local backend adapter. Music mode accepts text prompts and optional audio guidance, while Sound mode stays text-only in this pass.',
+    };
+    return true;
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+    const selectedModel = String(node.config?.model || '').trim();
+    if (!selectedModel) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Choose an RVC voice model before running this audio transformation step.',
+      };
+      return false;
+    }
+
+    const downloadedModels = Array.isArray(tool.downloadedModels) ? tool.downloadedModels : [];
+    const normalizedSelectedModel = selectedModel.toLowerCase();
+    const matchedModel = downloadedModels.find((entry) =>
+      [entry?.id, entry?.name, entry?.fileName, entry?.relativePath, entry?.path]
+        .map((value) => String(value || '').trim().toLowerCase())
+        .filter(Boolean)
+        .includes(normalizedSelectedModel)
+    ) || null;
+    if (downloadedModels.length && !matchedModel) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'The selected RVC voice model is not available locally. Refresh the local model list or pick a model file from the RVC weights folder.',
+      };
+      return false;
+    }
+
+    summary.readiness = {
+      tone: 'info',
+      message: tool.name + ' will transform the connected source audio through its dedicated local backend adapter. Choose a voice model from the RVC weights folder, and expect the cleanest results with a dry single-speaker voice clip. The index file stays optional in this first pass.',
+    };
+    return true;
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+    const referenceImageConnected = referenceKinds.includes(PORT_KIND_IMAGE);
+    if (tool.id === 'facefusion' && !referenceImageConnected) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'FaceFusion image mode needs a source face image on the Reference Image input in addition to the connected target image.',
+      };
+      return false;
+    }
+
+    summary.readiness = {
+      tone: 'info',
+      message: tool.id === 'facefusion'
+        ? tool.name + ' will transform the connected target image using the Reference Image input as the source face. This first pass stays image-only and keeps both source images attached to the saved result lineage.'
+        : tool.name + ' will enhance the connected image through its dedicated local backend adapter. This first pass keeps the main source image attached to the transformed result lineage and leaves advanced Upscayl tuning on the full tool surface.',
     };
     return true;
   }
@@ -2938,6 +3061,7 @@ function analyzePipeline(definition = {}, context = {}) {
         const executionMode = getModelStepExecutionMode(node);
         const operationId = getModelStepOperationId(node);
         const connectedKinds = getIncomingKindsForNodePort(node, 'prompt', graph);
+        const referenceKinds = getIncomingKindsForNodePort(node, 'referenceImage', graph);
         if (summary.capabilitySummary?.supported === false) {
           summary.readiness = {
             tone: 'error',
@@ -2947,7 +3071,11 @@ function analyzePipeline(definition = {}, context = {}) {
         } else {
           const unsupportedKinds = connectedKinds.filter((kind) => !(summary.capabilitySummary?.inputKinds || []).includes(kind));
           const outputConnectionMessage = getUnexpectedOutputConnectionMessage(node, summary.capabilitySummary?.outputKinds || [], graph);
-          const requiresExplicitModel = !(executionMode === 'localTool' && (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE));
+          const providerRequiresExplicitModel = executionMode === 'cloud'
+            ? doesProviderOperationRequireExplicitModel(String(node.config?.providerId || '').trim(), operationId)
+            : true;
+          const requiresExplicitModel = !(executionMode === 'localTool' && (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM || operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM))
+            && (executionMode !== 'cloud' || providerRequiresExplicitModel);
           if (unsupportedKinds.length) {
             summary.readiness = {
               tone: 'error',
@@ -3038,14 +3166,14 @@ function analyzePipeline(definition = {}, context = {}) {
               issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
             }
           } else if (executionMode === 'localTool') {
-            if (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256) {
+            if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE && (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256)) {
               summary.readiness = {
                 tone: 'error',
                 message: 'Use at least 256 by 256 for local image generation in a model step.',
               };
               issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
             } else {
-              const ready = analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKinds);
+              const ready = analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKinds, referenceKinds);
               if (!ready || summary.readiness.tone === 'error') {
                 issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
               } else {
@@ -3409,6 +3537,8 @@ module.exports = {
   PIPELINE_PORT_KIND_LABELS,
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
   AUDIO_WORKFLOW_TOOL_IDS,
+  AUDIO_TRANSFORM_TOOL_IDS,
+  IMAGE_TRANSFORM_TOOL_IDS,
   PORT_KIND_ANY,
   PORT_KIND_AUDIO,
   PORT_KIND_AUDIO_FILE,
@@ -3457,6 +3587,9 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
+
+
+
 
 
 

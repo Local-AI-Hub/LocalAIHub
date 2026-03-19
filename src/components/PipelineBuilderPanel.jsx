@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
@@ -32,6 +32,9 @@ const {
   getGraphWorkflowOutputNodeOptions,
   getPortDefinition,
   parseGraphWorkflowDefinitionText,
+  AUDIO_TRANSFORM_TOOL_IDS,
+  IMAGE_TRANSFORM_TOOL_IDS,
+  getModelStepOperationId,
   PIPELINE_OPERATION_IDS,
   PIPELINE_PORT_KIND_LABELS,
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
@@ -203,17 +206,31 @@ function buildAudioChannelFact(channelCount) {
 function buildAudioFactLabels(artifact) {
   const audio = artifact?.audio && typeof artifact.audio === 'object' ? artifact.audio : null;
   const generation = artifact?.audioGeneration && typeof artifact.audioGeneration === 'object' ? artifact.audioGeneration : null;
+  const transformation = artifact?.audioTransformation && typeof artifact.audioTransformation === 'object' ? artifact.audioTransformation : null;
   const mode = String(generation?.mode || '').trim().toLowerCase();
-
+  const transformationType = String(transformation?.transformationType || '').trim().toLowerCase();
   return [
-    formatAudioDurationLabel(audio?.durationSeconds || generation?.durationSeconds),
+    formatAudioDurationLabel(audio?.durationSeconds || generation?.durationSeconds || transformation?.durationSeconds),
     audio?.sampleRate ? `${audio.sampleRate} Hz` : '',
     buildAudioChannelFact(audio?.channelCount),
+    transformationType === 'voice-conversion' ? 'Voice conversion' : transformation?.transformationType ? transformation.transformationType : '',
     mode === 'music' ? 'Music mode' : mode === 'sound' ? 'Sound mode' : mode === 'speech' ? 'Speech mode' : '',
-    generation?.toolLabel || generation?.backendLabel || '',
-    generation?.voice ? `Voice ${generation.voice}` : '',
+    transformation?.toolLabel || transformation?.backendLabel || generation?.toolLabel || generation?.backendLabel || '',
+    transformation?.targetVoice ? `Voice ${transformation.targetVoice}` : generation?.voice ? `Voice ${generation.voice}` : '',
   ].filter(Boolean);
 }
+function buildImageFactLabels(artifact) {
+  const transformation = artifact?.imageTransformation && typeof artifact.imageTransformation === 'object' ? artifact.imageTransformation : null;
+  const transformationType = String(transformation?.transformationType || '').trim().toLowerCase();
+  return [
+    transformationType === 'upscale' ? 'Upscale' : transformationType === 'face-swap' ? 'Face swap' : transformation?.transformationType ? transformation.transformationType.replace(/-/g, ' ') : '',
+    transformation?.toolLabel || transformation?.backendLabel || '',
+    transformation?.scale ? `${transformation.scale}x scale` : '',
+    transformation?.sourceImage?.fileName ? `Target ${transformation.sourceImage.fileName}` : '',
+    transformation?.referenceImage?.fileName ? `Reference ${transformation.referenceImage.fileName}` : '',
+  ].filter(Boolean);
+}
+
 function ArtifactFacts({ artifact, className = '' }) {
   if (!artifact) {
     return null;
@@ -226,6 +243,7 @@ function ArtifactFacts({ artifact, className = '' }) {
     artifact.width && artifact.height ? `${artifact.width}x${artifact.height}` : '',
     formatFileSize(artifact.sizeBytes),
     artifact.fileName || '',
+    ...buildImageFactLabels(artifact),
   ].filter(Boolean);
 
   if (!facts.length) {
@@ -256,14 +274,17 @@ function buildNodePreview(node, runState) {
   if (node.type === 'imageInput' || node.type === 'audioInput' || node.type === 'videoInput' || node.type === 'fileInput') {
     return fileNameFromPath(node.config?.filePath || '') || 'No file selected yet.';
   }
-
   if (node.type === 'llmPrompt') {
     const selectedOperationId = getSelectedModelStepOperationId(node);
     const localToolFallbackLabel = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
       ? 'Local audio tool'
-      : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-        ? 'Local video tool'
-        : 'Local image tool';
+      : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+        ? 'Local audio transform tool'
+        : selectedOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+          ? 'Local image transform tool'
+          : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+            ? 'Local video tool'
+            : 'Local image tool';
     const modeLabel = node.config?.executionMode === 'ollama'
       ? 'Ollama'
       : node.config?.executionMode === 'localTool'
@@ -271,7 +292,6 @@ function buildNodePreview(node, runState) {
         : (node.config?.providerId || 'Cloud provider');
     return `${getModelStepOperationLabel(node)} | ${modeLabel}${node.config?.model ? ` | ${node.config.model}` : ''}`;
   }
-
   if (node.type === 'whisperTranscribe') {
     return `Model: ${node.config?.model || 'base'}`;
   }
@@ -348,18 +368,95 @@ function getModelTargetConfig(node) {
 }
 
 function getSelectedModelStepOperationId(node) {
-  return pipelineShared.getModelStepOperationId(node);
+  return getModelStepOperationId(node);
 }
 
 function getModelStepOperationLabel(node) {
   const operationId = getSelectedModelStepOperationId(node);
   return operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
     ? 'Audio generation'
-    : operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
-      ? 'Image generation'
-      : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-        ? 'Video generation'
-        : 'Text response';
+    : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+      ? 'Audio transform'
+      : operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+        ? 'Image generation'
+        : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+          ? 'Image transform'
+          : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+            ? 'Video generation'
+            : 'Text response';
+}
+
+function getCloudAudioModelPlaceholder(providerId) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (normalizedProviderId === 'xai') {
+    return 'Optional for xAI text-to-speech beta';
+  }
+
+  return 'Enter or pick a speech model';
+}
+
+function getCloudAudioModelRefreshHint(providerId) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (normalizedProviderId === 'google') {
+    return 'Loads Gemini speech models for this provider step.';
+  }
+
+  if (normalizedProviderId === 'openai') {
+    return 'Loads OpenAI speech models for this provider step.';
+  }
+
+  if (normalizedProviderId === 'xai') {
+    return "xAI's current TTS beta runs through a provider-managed speech runtime here. Leave Model blank unless xAI later exposes a selectable TTS model.";
+  }
+
+  return 'Loads cloud speech models for this provider step when the provider exposes them.';
+}
+
+function getCloudAudioModelHelp(providerId) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (normalizedProviderId === 'google') {
+    return 'Gemini speech uses TTS-capable Gemini models such as gemini-2.5-flash-preview-tts.';
+  }
+
+  if (normalizedProviderId === 'openai') {
+    return 'OpenAI speech uses dedicated TTS models such as gpt-4o-mini-tts, tts-1, or tts-1-hd.';
+  }
+
+  if (normalizedProviderId === 'xai') {
+    return 'xAI text-to-speech currently runs through a provider-managed speech runtime in this step, so model selection stays optional in this pass.';
+  }
+
+  return 'Choose a speech-capable model when the provider exposes one. Some providers may keep speech routing behind a provider-managed runtime instead.';
+}
+
+function getCloudAudioVoicePlaceholder(providerId) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (normalizedProviderId === 'openai') {
+    return 'Optional voice name such as alloy';
+  }
+
+  if (normalizedProviderId === 'xai') {
+    return 'Optional voice name such as eve';
+  }
+
+  return 'Optional voice name such as Kore';
+}
+
+function getCloudAudioVoiceHelp(providerId) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (normalizedProviderId === 'openai') {
+    return "OpenAI speech models save generated audio locally and keep it pipeline-usable. Leave voice blank to let Local AI Hub use OpenAI's default voice.";
+  }
+
+  if (normalizedProviderId === 'xai') {
+    return "xAI speech saves generated audio locally and keeps it pipeline-usable. Leave voice blank to use xAI's default voice, or enter one such as eve, ara, rex, sal, or leo.";
+  }
+
+  if (normalizedProviderId === 'google') {
+    return 'Gemini speech models save generated audio locally and keep it pipeline-usable. Leave voice blank to let Local AI Hub use the provider default.';
+  }
+
+  return 'Cloud speech providers save generated audio locally through the shared artifact path. Leave voice blank to use the provider default when available.';
 }
 
 function buildModelOptionDetail(model) {
@@ -468,21 +565,71 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
   }
 
   if ((previewKind === 'image' || previewKind === 'animated-image') && artifact.fileUrl) {
+    const transformation = artifact.imageTransformation && typeof artifact.imageTransformation === 'object' ? artifact.imageTransformation : null;
+    const sourceImage = transformation?.sourceImage && typeof transformation.sourceImage === 'object' ? transformation.sourceImage : null;
+    const referenceImage = transformation?.referenceImage && typeof transformation.referenceImage === 'object' ? transformation.referenceImage : null;
     return (
       <div className={`space-y-3 ${className}`}>
         <img alt={artifact.displayName || 'Pipeline image output'} className="max-h-[280px] w-full rounded-[24px] border border-white/10 bg-slate-950/40 object-contain" src={artifact.fileUrl} />
         {artifact.summary ? <p className="text-xs leading-5 text-slate-400">{artifact.summary}</p> : null}
+        {transformation ? (
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Transformed image</p>
+            <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.16em] text-slate-300">
+              {buildImageFactLabels(artifact).map((label, index) => (
+                <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1" key={`${label}-${index}`}>
+                  {label}
+                </span>
+              ))}
+            </div>
+            {transformation.model ? <input className="store-input mt-3" readOnly value={transformation.model} /> : null}
+            {transformation.instruction ? <textarea className="store-input mt-3 min-h-[120px] resize-none" readOnly value={transformation.instruction} /> : null}
+            {sourceImage ? (
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm leading-6 text-slate-300">
+                <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Target image</p>
+                {sourceImage.fileName || sourceImage.displayName ? <p className="mt-2">{sourceImage.fileName || sourceImage.displayName}</p> : null}
+                {sourceImage.filePath ? <input className="store-input mt-3" readOnly value={sourceImage.filePath} /> : null}
+              </div>
+            ) : null}
+            {referenceImage ? (
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm leading-6 text-slate-300">
+                <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Reference image</p>
+                {referenceImage.fileName || referenceImage.displayName ? <p className="mt-2">{referenceImage.fileName || referenceImage.displayName}</p> : null}
+                {referenceImage.filePath ? <input className="store-input mt-3" readOnly value={referenceImage.filePath} /> : null}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     );
   }
 
   if (previewKind === 'audio' && artifact.fileUrl) {
     const generation = artifact.audioGeneration && typeof artifact.audioGeneration === 'object' ? artifact.audioGeneration : null;
-    const sourceAudio = generation?.sourceAudio && typeof generation.sourceAudio === 'object' ? generation.sourceAudio : null;
+    const transformation = artifact.audioTransformation && typeof artifact.audioTransformation === 'object' ? artifact.audioTransformation : null;
+    const sourceAudio = transformation?.sourceAudio && typeof transformation.sourceAudio === 'object'
+      ? transformation.sourceAudio
+      : generation?.sourceAudio && typeof generation.sourceAudio === 'object'
+        ? generation.sourceAudio
+        : null;
     return (
       <div className={`space-y-3 ${className}`}>
         <audio className="w-full" controls src={artifact.fileUrl} />
         <p className="text-xs leading-5 text-slate-400">{artifact.summary || artifact.fileName || artifact.displayName}</p>
+        {transformation ? (
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Transformed audio</p>
+            <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.16em] text-slate-300">
+              {buildAudioFactLabels(artifact).map((label, index) => (
+                <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1" key={`${label}-${index}`}>
+                  {label}
+                </span>
+              ))}
+            </div>
+            {transformation.model ? <input className="store-input mt-3" readOnly value={transformation.model} /> : null}
+            {transformation.instruction ? <textarea className="store-input mt-3 min-h-[120px] resize-none" readOnly value={transformation.instruction} /> : null}
+          </div>
+        ) : null}
         {generation ? (
           <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
             <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Generated audio</p>
@@ -508,7 +655,6 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
       </div>
     );
   }
-
   if (previewKind === 'video' && artifact.fileUrl) {
     return (
       <div className={`space-y-3 ${className}`}>
@@ -899,31 +1045,46 @@ class PipelineInspectorErrorBoundary extends React.Component {
   }
 }
 
-function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAudioTools = [], localImageTools = [], localVideoTools = [], modelOptions, modelsBusy, node, onRefreshModels, onUpdateNode, executionModeKey, providerIdKey }) {
+function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAudioTools = [], localAudioTransformTools = [], localImageTools = [], localImageTransformTools = [], localVideoTools = [], modelOptions, modelsBusy, node, onRefreshModels, onUpdateNode, executionModeKey, providerIdKey }) {
   const executionMode = node.config?.[executionModeKey] === 'ollama'
     ? 'ollama'
     : allowLocalTool && node.config?.[executionModeKey] === 'localTool'
       ? 'localTool'
       : 'cloud';
   const selectedOperationId = node.type === 'llmPrompt' ? getSelectedModelStepOperationId(node) : PIPELINE_OPERATION_IDS.LLM_PROMPT;
+  const selectedCloudProviderId = String(node.config?.[providerIdKey] || '').trim().toLowerCase();
   const localToolOptions = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
     ? localAudioTools
-    : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-      ? localVideoTools
-      : localImageTools;
+    : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+      ? localAudioTransformTools
+      : selectedOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+        ? localImageTransformTools
+        : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+          ? localVideoTools
+          : localImageTools;
   const localToolLabel = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
     ? 'Local audio tool'
-    : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-      ? 'Local video tool'
-      : 'Local image tool';
+    : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+      ? 'Local audio transform tool'
+      : selectedOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+        ? 'Local image transform tool'
+        : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+          ? 'Local video tool'
+          : 'Local image tool';
   const localToolEmptyLabel = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
     ? 'Choose AudioCraft WebUI'
-    : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-      ? 'Choose Wan2.1 WebUI'
-      : 'Choose Automatic1111 or Forge';
+    : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+      ? 'Choose RVC'
+      : selectedOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+        ? 'Choose Upscayl or FaceFusion'
+        : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+          ? 'Choose Wan2.1 WebUI'
+          : 'Choose Automatic1111 or Forge';
   const selectedLocalToolId = String(node.config?.toolId || localToolOptions[0]?.id || '').trim();
   const selectedLocalTool = localToolOptions.find((tool) => tool.id === selectedLocalToolId) || null;
   const isLocalAudioMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE;
+  const isLocalAudioTransformMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM;
+  const isLocalImageTransformMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM;
   const isLocalVideoMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE;
 
   return (
@@ -944,17 +1105,25 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                 : currentNode.type === 'llmPrompt' && nextExecutionMode === 'localTool'
                   ? (currentOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                     ? PIPELINE_OPERATION_IDS.AUDIO_GENERATE
-                    : currentOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                      ? PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                      : PIPELINE_OPERATION_IDS.IMAGE_GENERATE)
-                  : currentOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                    : currentOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+                      ? PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+                      : currentOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+                        ? PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+                        : currentOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                          ? PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                          : PIPELINE_OPERATION_IDS.IMAGE_GENERATE)
+                  : currentOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE || currentOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM || currentOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
                     ? PIPELINE_OPERATION_IDS.LLM_PROMPT
                     : currentOperationId;
               const nextLocalToolOptions = nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                 ? localAudioTools
-                : nextOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                  ? localVideoTools
-                  : localImageTools;
+                : nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+                  ? localAudioTransformTools
+                  : nextOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+                    ? localImageTransformTools
+                    : nextOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                      ? localVideoTools
+                      : localImageTools;
               const currentToolId = String(currentNode.config?.toolId || '').trim();
               const nextToolId = nextExecutionMode === 'localTool'
                 ? (nextLocalToolOptions.some((tool) => tool.id === currentToolId) ? currentToolId : nextLocalToolOptions[0]?.id || '')
@@ -1040,9 +1209,13 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
           <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
             {isLocalAudioMode
               ? 'This mode runs a single AudioCraft request inside the sequential pipeline and returns a pipeline-usable audio artifact. Use Music mode for text-to-music or audio-guided generation in this slice.'
-              : isLocalVideoMode
-                ? 'This mode runs a single local Wan video request inside the sequential pipeline. Use the Graph Workflow step when you want graph-native video generation through ComfyUI.'
-                : 'This mode runs a single Automatic1111 or Forge image request inside the current sequential pipeline. Use the Graph Workflow step when you need a graph-native tool such as ComfyUI.'}
+              : isLocalAudioTransformMode
+                ? 'This mode runs a single source-audio transformation through RVC and returns a transformed audio artifact with source lineage. Use it for offline voice conversion from one saved audio clip to another in this first pass.'
+                : isLocalImageTransformMode
+                  ? 'This mode runs a single local image-to-image transformation and returns a transformed image artifact with source lineage. Use Upscayl for enhancement and upscaling, or FaceFusion when you also connect a Reference Image.'
+                  : isLocalVideoMode
+                    ? 'This mode runs a single local Wan video request inside the sequential pipeline. Use the Graph Workflow step when you want graph-native video generation through ComfyUI.'
+                    : 'This mode runs a single Automatic1111 or Forge image request inside the current sequential pipeline. Use the Graph Workflow step when you need a graph-native tool such as ComfyUI.'}
           </div>
         </div>
       ) : (
@@ -1053,7 +1226,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
 
       <div>
         <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`${node.id}-model`}>
-          {isLocalAudioMode ? 'Model override' : isLocalVideoMode ? 'Model folder override' : executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
+          {isLocalAudioMode ? 'Model override' : isLocalAudioTransformMode ? 'Voice model' : isLocalImageTransformMode ? 'Optional tool override' : isLocalVideoMode ? 'Model folder override' : executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
         </label>
         <input
           className="store-input mt-3"
@@ -1067,16 +1240,24 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
               },
             }))
           }
-          placeholder={isLocalAudioMode ? 'Optional AudioCraft model such as facebook/musicgen-melody' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : 'Enter or pick a model'}
+          placeholder={isLocalAudioMode ? 'Optional AudioCraft model such as facebook/musicgen-melody' : isLocalAudioTransformMode ? 'Enter or pick an RVC voice model file' : isLocalImageTransformMode ? 'Optional future override when this tool exposes one' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? getCloudAudioModelPlaceholder(selectedCloudProviderId) : 'Enter or pick a model'}
           value={node.config?.model || ''}
         />
         {isLocalAudioMode ? (
           <p className="mt-3 text-xs leading-5 text-slate-500">
             AudioCraft can use its built-in default models for this pass. Leave this blank unless you want to force a specific MusicGen or AudioGen model name.
           </p>
+        ) : isLocalAudioTransformMode ? (
+          <p className="mt-3 text-xs leading-5 text-slate-500">
+            Choose an RVC voice model from the local weights folder. Clean single-speaker source clips work best in this first pass, and advanced pitch or index controls stay on the full RVC surface for now.
+          </p>
+        ) : isLocalImageTransformMode ? (
+          <p className="mt-3 text-xs leading-5 text-slate-500">
+            Upscayl and FaceFusion use tool-managed defaults in this first shared image-transform pass. Leave this blank unless a future tool build exposes a direct override here.
+          </p>
         ) : isLocalVideoMode ? (
           <p className="mt-3 text-xs leading-5 text-slate-500">
-            Local AI Hub auto-detects Wan model folders from <code>models\\Wan-AI</code>. Leave this blank unless you need to force a specific installed model folder.
+            Local AI Hub auto-detects Wan model folders from <code>models\Wan-AI</code>. Leave this blank unless you need to force a specific installed model folder.
           </p>
         ) : (
           <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -1089,22 +1270,26 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                 : executionMode === 'localTool'
                   ? isLocalAudioMode
                     ? 'AudioCraft uses built-in defaults in this first audio-output slice. Refresh is only needed for image checkpoints.'
-                    : `Loads local checkpoints from ${selectedLocalTool?.name || 'the selected tool'}.`
+                    : isLocalAudioTransformMode
+                      ? `Loads local RVC voice models from ${selectedLocalTool?.name || 'the selected tool'}.`
+                      : isLocalImageTransformMode
+                        ? `${selectedLocalTool?.name || 'This tool'} uses tool-managed image transformation assets in this first pass, so refresh is not needed here.`
+                        : `Loads local checkpoints from ${selectedLocalTool?.name || 'the selected tool'}.`
                   : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
                     ? 'Loads cloud image models for this provider step.'
                     : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
-                      ? 'Loads cloud speech models for this provider step.'
+                      ? getCloudAudioModelRefreshHint(selectedCloudProviderId)
                       : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
                         ? 'Loads cloud video models for this provider step.'
                         : 'Loads models from the selected cloud provider.'}
             </span>
           </div>
         )}
-        {!isLocalVideoMode && !isLocalAudioMode && modelOptions?.length ? (
+        {!isLocalVideoMode && !isLocalAudioMode && !isLocalImageTransformMode && modelOptions?.length ? (
           <div className="mt-3 grid gap-2">
             {modelOptions.slice(0, 8).map((model) => (
               <button
-                className={`rounded-2xl border px-3 py-3 text-left text-sm transition ${node.config?.model === model.id ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/5 text-slate-300 hover:border-cyan-300/20 hover:bg-white/10'}`}
+                className={`rounded-2xl border px-3 py-3 text-left transition ${String(node.config?.model || '').trim().toLowerCase() === String(model.id || '').trim().toLowerCase() ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/20 hover:bg-white/10'}`}
                 key={model.id}
                 onClick={() =>
                   onUpdateNode(node.id, (currentNode) => ({
@@ -1117,17 +1302,21 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                 }
                 type="button"
               >
-                <div className="font-medium text-white">{model.label || model.name || model.id}</div>
-                {buildModelOptionDetail(model) ? <div className="mt-1 text-xs text-slate-400">{buildModelOptionDetail(model)}</div> : null}
+                <p className="text-sm font-medium text-white">{model.label || model.id}</p>
+                {buildModelOptionDetail(model) ? <p className="mt-1 text-xs leading-5 text-slate-400">{buildModelOptionDetail(model)}</p> : null}
               </button>
             ))}
           </div>
+        ) : null}
+        {executionMode === 'cloud' && selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? (
+          <p className="mt-3 text-xs leading-5 text-slate-500">
+            {getCloudAudioModelHelp(selectedCloudProviderId)}
+          </p>
         ) : null}
       </div>
     </>
   );
 }
-
 export default function PipelineBuilderPanel({ hardware, manifests, onToast, providers, tools }) {
   const [pipelines, setPipelines] = useState([]);
   const [draft, setDraft] = useState(() => createEmptyPipeline());
@@ -1185,8 +1374,10 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     [draft.nodes, graph, selectedNode],
   );
   const connectedProviders = useMemo(() => (providers || []).filter((provider) => provider.isConnected), [providers]);
-  const audioTools = useMemo(() => (tools || []).filter((tool) => AUDIO_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
+  const audioTools = useMemo(() => (tools || []).filter((tool) => AUDIO_WORKFLOW_TOOL_IDS.includes(tool.id) && !AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
+  const audioTransformTools = useMemo(() => (tools || []).filter((tool) => AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const imageTools = useMemo(() => (tools || []).filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
+  const imageTransformTools = useMemo(() => (tools || []).filter((tool) => IMAGE_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const videoTools = useMemo(() => (tools || []).filter((tool) => VIDEO_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
   const graphWorkflowTools = useMemo(() => {
     const entries = [...(tools || []), ...(manifests || [])];
@@ -1759,7 +1950,65 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
         return;
       }
 
-      if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+      if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+        const toolId = String(node.config?.toolId || audioTransformTools[0]?.id || '').trim();
+        if (!toolId) {
+          setModelsBusyNodeId('');
+          onToast('Install RVC before refreshing voice models for this audio transformation step.', 'error');
+          return;
+        }
+
+        const result = await window.localAIHub.listLocalModels(toolId);
+        if (!result?.ok) {
+          setModelsBusyNodeId('');
+          onToast(result?.message || 'Local AI Hub could not load local RVC voice models for that step.', 'error');
+          return;
+        }
+
+        models = (result.data || [])
+          .map((model) => ({
+            ...model,
+            id: String(model.relativePath || model.fileName || model.name || model.id || '').trim(),
+            label: model.name || model.fileName || model.relativePath || model.id,
+            detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
+            toolId,
+          }))
+          .filter((model) => model.id);
+
+        if (!String(node.config?.toolId || '').trim()) {
+          updateNode(node.id, (currentNode) => ({
+            ...currentNode,
+            config: {
+              ...currentNode.config,
+              toolId,
+            },
+          }));
+        }
+      } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+        const toolId = String(node.config?.toolId || imageTransformTools[0]?.id || '').trim();
+        if (!toolId) {
+          setModelsBusyNodeId('');
+          onToast('Install Upscayl or FaceFusion before configuring local image transformation for this step.', 'error');
+          return;
+        }
+
+        setModelOptionsByNodeId((current) => ({
+          ...current,
+          [node.id]: [],
+        }));
+        setModelsBusyNodeId('');
+        if (!String(node.config?.toolId || '').trim()) {
+          updateNode(node.id, (currentNode) => ({
+            ...currentNode,
+            config: {
+              ...currentNode.config,
+              toolId,
+            },
+          }));
+        }
+        onToast('Upscayl and FaceFusion use tool-managed defaults and assets in this first shared image-transform slice. Leave Optional tool override blank unless a future tool build exposes one here.', 'info');
+        return;
+      } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
         setModelOptionsByNodeId((current) => ({
           ...current,
           [node.id]: [],
@@ -1767,44 +2016,44 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
         setModelsBusyNodeId('');
         onToast('Local AI Hub auto-detects Wan model folders from models\\Wan-AI for this first video slice. Enter a model folder name only if you need to override the default.', 'info');
         return;
-      }
+      } else {
+        const toolId = String(node.config?.toolId || imageTools[0]?.id || '').trim();
+        if (!toolId) {
+          setModelsBusyNodeId('');
+          onToast('Install Automatic1111 or Forge before refreshing local image checkpoints for this step.', 'error');
+          return;
+        }
 
-      const toolId = String(node.config?.toolId || imageTools[0]?.id || '').trim();
-      if (!toolId) {
-        setModelsBusyNodeId('');
-        onToast('Install Automatic1111 or Forge before refreshing local image checkpoints for this step.', 'error');
-        return;
-      }
+        const result = await window.localAIHub.listLocalModels(toolId);
+        if (!result?.ok) {
+          setModelsBusyNodeId('');
+          onToast(result?.message || 'Local AI Hub could not load local checkpoints for that image tool.', 'error');
+          return;
+        }
 
-      const result = await window.localAIHub.listLocalModels(toolId);
-      if (!result?.ok) {
-        setModelsBusyNodeId('');
-        onToast(result?.message || 'Local AI Hub could not load local checkpoints for that image tool.', 'error');
-        return;
-      }
-
-      models = (result.data || [])
-        .filter((model) => {
-          const modelType = String(model?.modelType || '').trim().toLowerCase();
-          return modelType === 'checkpoint' || modelType === 'inpainting';
-        })
-        .map((model) => ({
-          ...model,
-          id: String(model.fileName || model.name || model.id || '').trim(),
-          label: model.name || model.fileName || model.id,
-          detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
-          toolId,
-        }))
-        .filter((model) => model.id);
-
-      if (!String(node.config?.toolId || '').trim()) {
-        updateNode(node.id, (currentNode) => ({
-          ...currentNode,
-          config: {
-            ...currentNode.config,
+        models = (result.data || [])
+          .filter((model) => {
+            const modelType = String(model?.modelType || '').trim().toLowerCase();
+            return modelType === 'checkpoint' || modelType === 'inpainting';
+          })
+          .map((model) => ({
+            ...model,
+            id: String(model.fileName || model.name || model.id || '').trim(),
+            label: model.name || model.fileName || model.id,
+            detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
             toolId,
-          },
-        }));
+          }))
+          .filter((model) => model.id);
+
+        if (!String(node.config?.toolId || '').trim()) {
+          updateNode(node.id, (currentNode) => ({
+            ...currentNode,
+            config: {
+              ...currentNode.config,
+              toolId,
+            },
+          }));
+        }
       }
     } else {
       const providerId = String(node.config?.[modelConfig.providerIdKey] || '').trim();
@@ -1822,6 +2071,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       }
 
       models = result.data?.models || [];
+      if (node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && providerId === 'xai' && !models.length) {
+        onToast('xAI text-to-speech currently runs through a provider-managed speech runtime in this step. Leave Model blank and choose a voice if you want to use xAI.', 'info');
+      }
       if (!String(node.config?.model || '').trim() && result.data?.selectedModel) {
         updateNode(node.id, (currentNode) => ({
           ...currentNode,
@@ -1848,7 +2100,6 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
     setModelsBusyNodeId('');
   }
-
   async function chooseNodeFile(nodeId, kind) {
     const result = await window.localAIHub.pickPipelineFile({ kind });
     if (!result?.ok) {
@@ -2125,20 +2376,39 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         disabled={selectedNode.config?.executionMode === 'ollama'}
                         id="llm-operation"
                         onChange={(event) =>
-                          updateNode(selectedNode.id, (currentNode) => ({
-                            ...currentNode,
-                            config: {
-                              ...currentNode.config,
-                              model: '',
-                              operationId: event.target.value,
-                            },
-                          }))
+                          updateNode(selectedNode.id, (currentNode) => {
+                            const nextOperationId = event.target.value;
+                            const nextLocalToolOptions = nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+                              ? audioTools
+                              : nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+                                ? audioTransformTools
+                                : nextOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+                                  ? imageTransformTools
+                                  : nextOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                    ? videoTools
+                                    : imageTools;
+                            const currentToolId = String(currentNode.config?.toolId || '').trim();
+                            const nextToolId = currentNode.config?.executionMode === 'localTool'
+                              ? (nextLocalToolOptions.some((tool) => tool.id === currentToolId) ? currentToolId : nextLocalToolOptions[0]?.id || '')
+                              : currentToolId;
+                            return {
+                              ...currentNode,
+                              config: {
+                                ...currentNode.config,
+                                model: '',
+                                operationId: nextOperationId,
+                                toolId: nextToolId,
+                              },
+                            };
+                          })
                         }
                         value={getSelectedModelStepOperationId(selectedNode)}
                       >
                         <option value={PIPELINE_OPERATION_IDS.LLM_PROMPT}>Text response</option>
                         <option value={PIPELINE_OPERATION_IDS.IMAGE_GENERATE}>Image generation</option>
+                        {selectedNode.config?.executionMode === 'localTool' ? <option value={PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM}>Image transform</option> : null}
                         {selectedNode.config?.executionMode !== 'ollama' ? <option value={PIPELINE_OPERATION_IDS.AUDIO_GENERATE}>Audio generation</option> : null}
+                        {selectedNode.config?.executionMode === 'localTool' ? <option value={PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM}>Audio transform</option> : null}
                         <option value={PIPELINE_OPERATION_IDS.VIDEO_GENERATE}>Video generation</option>
                       </select>
                       <p className="mt-2 text-xs leading-5 text-slate-400">
@@ -2147,19 +2417,25 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                           : selectedNode.config?.executionMode === 'localTool'
                             ? getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                               ? 'Local audio tool mode returns a generated audio artifact from the Audio output port. Music mode can also use an upstream audio artifact as guidance in this slice.'
-                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                                ? 'Local video tool mode returns a video artifact from the Video output port. Use the Graph Workflow step for ComfyUI video workflows.'
-                                : 'Local image tool mode returns an image artifact from the Image output port.'
+                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+                                ? 'Local audio transform tool mode returns a transformed audio artifact from the Audio output port and keeps the source-audio lineage visible after the run.'
+                                : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+                                  ? 'Local image transform mode returns a transformed image artifact from the Image output port. FaceFusion also expects a connected Reference Image in this first image-only pass.'
+                                  : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                    ? 'Local video tool mode returns a video artifact from the Video output port. Use the Graph Workflow step for ComfyUI video workflows.'
+                                    : 'Local image tool mode returns an image artifact from the Image output port.'
                             : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
                               ? 'This step returns an image artifact from the Image output port.'
                               : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                                 ? 'This step returns a saved audio artifact from the Audio output port.'
-                                : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                                  ? 'This step returns a video artifact from the Video output port.'
-                                  : 'This step returns a text artifact from the Text output port.'}
+                                : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+                                  ? 'Audio transform runs through the local-tool path and returns a saved transformed audio artifact from the Audio output port.'
+                                  : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                    ? 'This step returns a video artifact from the Video output port.'
+                                    : 'This step returns a text artifact from the Text output port.'}
                       </p>
                     </div>
-                    <ModelTargetFields allowLocalTool connectedProviders={connectedProviders} executionModeKey="executionMode" localAudioTools={audioTools} localImageTools={imageTools} localVideoTools={videoTools} modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
+                    <ModelTargetFields allowLocalTool connectedProviders={connectedProviders} executionModeKey="executionMode" localAudioTools={audioTools} localAudioTransformTools={audioTransformTools} localImageTools={imageTools} localImageTransformTools={imageTransformTools} localVideoTools={videoTools} modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
                     <div>
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-instruction">
                         {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
@@ -2168,9 +2444,13 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                             ? selectedNode.config?.executionMode === 'localTool'
                               ? 'Prompt shaping / audio guidance'
                               : 'Speech guidance / delivery hint'
-                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                              ? 'Motion guidance / prompt shaping'
-                              : 'Task / instruction'}
+                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+                              ? 'Transformation note'
+                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+                                ? 'Transformation note'
+                                : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                  ? 'Motion guidance / prompt shaping'
+                                  : 'Task / instruction'}
                       </label>
                       <textarea
                         className="store-input mt-3 min-h-[120px] resize-none"
@@ -2182,9 +2462,13 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                             ? selectedNode.config?.executionMode === 'localTool'
                               ? 'Optional guidance for the generated audio. In Music mode, use this for mood, style, or instrumentation. With upstream audio, this can steer how the result evolves.'
                               : 'Optional guidance for how the provider should speak the connected text, such as tone, pacing, or delivery style.'
-                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                              ? 'For text-to-video, this is optional extra guidance. For image-to-video, use this box for the motion prompt.'
-                              : 'Optional guidance to apply to the incoming text.'}
+                            : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+                              ? 'Optional note to save with this transformed audio result. Choose the source audio and RVC voice model through the connected input and local model field.'
+                              : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+                                ? 'Optional note to save with this transformed image result. The main image input becomes the target image, and FaceFusion also uses the Reference Image input in this first pass.'
+                                : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+                                  ? 'For text-to-video, this is optional extra guidance. For image-to-video, use this box for the motion prompt.'
+                                  : 'Optional guidance to apply to the incoming text.'}
                         value={selectedNode.config?.instruction || ''}
                       />
                       {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? (
@@ -2192,6 +2476,14 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                           {selectedNode.config?.executionMode === 'localTool'
                             ? 'Text input becomes the base generation prompt. In Music mode, you can also connect an upstream audio artifact to guide the result. Sound mode stays text-only in this first shared audio-output slice.'
                             : 'Text input becomes the spoken content for this cloud audio step. Use the instruction box for optional delivery guidance, and choose a provider voice below when the model supports it.'}
+                        </p>
+                      ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM ? (
+                        <p className="mt-2 text-xs leading-5 text-slate-400">
+                          Connect a source audio artifact to this step and choose an RVC voice model. This instruction box is saved with the transformed result as a plain-English note in this first pass.
+                        </p>
+                      ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM ? (
+                        <p className="mt-2 text-xs leading-5 text-slate-400">
+                          Connect the target image to the main input for every local image transform step. FaceFusion also needs a source-face image on the Reference Image input, while Upscayl uses only the main image input in this pass.
                         </p>
                       ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
                         <p className="mt-2 text-xs leading-5 text-slate-400">
@@ -2219,6 +2511,34 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                               : 'Music mode runs MusicGen. Connect text for text-to-music, or connect an audio artifact to guide melody and structure while keeping this instruction box as optional extra guidance.'}
                           </p>
                         </div>
+                      ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM ? (
+                        <div className="space-y-4">
+                          <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                            This step converts one saved audio artifact into another with RVC. Connect a source audio clip, choose a voice model, and run the step when RVC is installed and ready.
+                          </div>
+                          <p className="text-xs leading-5 text-slate-400">
+                            Keep source clips clean and single-speaker when possible. Advanced RVC controls such as pitch extraction, index rate, and protect tuning stay on the dedicated RVC surface for now.
+                          </p>
+                        </div>
+                      ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM ? (
+                        <div className="space-y-4">
+                          <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                            This step transforms one saved image into another through a local image tool. Connect the target image to the main input. Use Upscayl for enhancement or upscaling, and use FaceFusion when you also connect a Reference Image.
+                          </div>
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            <div className="rounded-[20px] border border-white/10 bg-slate-950/35 px-4 py-3 text-sm leading-6 text-slate-300">
+                              <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Upscayl</p>
+                              <p className="mt-2">Uses the main image input only and currently applies the tool-managed upscale path for this first shared image-transform slice.</p>
+                            </div>
+                            <div className="rounded-[20px] border border-white/10 bg-slate-950/35 px-4 py-3 text-sm leading-6 text-slate-300">
+                              <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">FaceFusion</p>
+                              <p className="mt-2">Uses the main image input as the target image and the Reference Image input as the source-face image in this image-only pass.</p>
+                            </div>
+                          </div>
+                          <p className="text-xs leading-5 text-slate-400">
+                            Advanced Upscayl model choices and broader FaceFusion controls stay on the dedicated tool surfaces for now. This step keeps the transformed image pipeline-usable with clear source-image lineage.
+                          </p>
+                        </div>
                       ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
                         <div className="space-y-4">
                           <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-video-size">Video size</label><select className="store-input mt-3" id="llm-local-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="832x480">832 x 480</option><option value="1280x720">1280 x 720</option></select></div>
@@ -2241,11 +2561,11 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                             className="store-input mt-3"
                             id="llm-audio-voice"
                             onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioVoice: event.target.value } }))}
-                            placeholder="Optional voice name such as Kore"
+                            placeholder={getCloudAudioVoicePlaceholder(selectedNode.config?.providerId)}
                             value={selectedNode.config?.audioVoice || ''}
                           />
                         </div>
-                        <p className="text-xs leading-5 text-slate-400">Gemini speech models save the generated audio locally and keep it pipeline-usable. Leave voice blank to let Local AI Hub use the provider default.</p>
+                        <p className="text-xs leading-5 text-slate-400">{getCloudAudioVoiceHelp(selectedNode.config?.providerId)}</p>
                       </div>
                     ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? (
                       <div className="grid gap-3 sm:grid-cols-3">
@@ -2847,6 +3167,20 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     </section>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

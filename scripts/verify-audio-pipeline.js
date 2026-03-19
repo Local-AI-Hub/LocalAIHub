@@ -121,7 +121,10 @@ function createPipelineExecutionService(tempRoot, toolEntries, options = {}) {
         getToolCatalog: () => toolEntries,
       },
       './modelService': {
-        listDownloadedModels: async () => [],
+        listDownloadedModels: async (toolOrId) => {
+        const normalizedToolId = typeof toolOrId === 'string' ? toolOrId : toolOrId?.id;
+        return toolsById[String(normalizedToolId || '').trim().toLowerCase()]?.downloadedModels || [];
+      },
       },
       './toolStateService': {
         buildMergedToolStateList: async () => toolEntries,
@@ -250,6 +253,33 @@ function createAudiocraftAudioGuidancePipeline(audioPath, audioMode = 'music') {
   };
 }
 
+function createRvcVoiceConversionPipeline(sourceAudioPath, overrides = {}) {
+  return {
+    id: 'rvc-voice-conversion-pipeline',
+    name: 'RVC Voice Conversion Pipeline',
+    nodes: [
+      { id: 'audio-input', type: 'audioInput', label: 'Source Audio', config: { filePath: sourceAudioPath } },
+      {
+        id: 'audio-transform',
+        type: 'llmPrompt',
+        label: 'Transform Audio',
+        config: {
+          executionMode: 'localTool',
+          operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM,
+          toolId: 'rvc',
+          instruction: 'Convert this clip into the selected voice while keeping it intelligible.',
+          model: Object.prototype.hasOwnProperty.call(overrides, 'model') ? overrides.model : 'voices/test-voice.pth',
+        },
+      },
+      { id: 'audio-output', type: 'audioOutput', label: 'Transformed Audio Output', config: { title: 'Transformed audio result' } },
+    ],
+    edges: [
+      { id: 'edge-source-audio', source: { nodeId: 'audio-input', portId: 'audio' }, target: { nodeId: 'audio-transform', portId: 'prompt' } },
+      { id: 'edge-audio-output', source: { nodeId: 'audio-transform', portId: 'audio' }, target: { nodeId: 'audio-output', portId: 'audio' } },
+    ],
+  };
+}
+
 function createCloudAudioPipeline(promptText, overrides = {}) {
   return {
     id: 'cloud-audio-pipeline',
@@ -291,6 +321,30 @@ function createGoogleProvider(overrides = {}) {
   };
 }
 
+function createOpenAiProvider(overrides = {}) {
+  return {
+    id: 'openai',
+    name: 'OpenAI (ChatGPT)',
+    isConnected: true,
+    lastTestSucceeded: true,
+    lastTestedAt: new Date('2026-03-18T12:00:00.000Z').toISOString(),
+    statusLabel: 'Connected',
+    ...overrides,
+  };
+}
+
+function createXaiProvider(overrides = {}) {
+  return {
+    id: 'xai',
+    name: 'xAI (Grok)',
+    isConnected: true,
+    lastTestSucceeded: true,
+    lastTestedAt: new Date('2026-03-18T12:00:00.000Z').toISOString(),
+    statusLabel: 'Connected',
+    ...overrides,
+  };
+}
+
 function createWhisperTool(overrides = {}) {
   return {
     id: 'whisper',
@@ -314,6 +368,51 @@ function createAudiocraftTool(overrides = {}) {
     launchSupported: overrides.launchSupported !== false,
     lastError: overrides.lastError || '',
     name: 'AudioCraft WebUI',
+    pythonBootstrapPath: overrides.pythonBootstrapPath || 'python',
+    status: overrides.status || 'stopped',
+    ...overrides,
+  };
+}
+
+function createRvcModel(overrides = {}) {
+  const modelPath = path.resolve(String(overrides.path || path.join(overrides.weightsRoot || overrides.appDir || overrides.installDir || process.cwd(), 'weights', 'voices', 'test-voice.pth')).trim());
+  const weightsRoot = path.resolve(String(overrides.weightsRoot || path.join(path.dirname(modelPath), '..')).trim());
+  const relativePath = String(overrides.relativePath || path.relative(weightsRoot, modelPath)).replace(/\\/g, '/');
+  const fileName = String(overrides.fileName || path.basename(modelPath)).trim();
+  const name = String(overrides.name || path.parse(fileName).name).trim();
+  const modelType = String(overrides.modelType || 'Audio / Speech').trim();
+  const modelId = overrides.id || ('rvc:' + modelType + ':' + relativePath.replace(/[\\/]+/g, ':'));
+  return {
+    downloaded: true,
+    fileName,
+    id: modelId,
+    modelType,
+    name,
+    path: modelPath,
+    relativePath,
+    sizeBytes: Number(overrides.sizeBytes || 0) || 0,
+    source: overrides.source || 'local',
+    toolId: overrides.toolId || 'rvc',
+    ...overrides,
+    fileName,
+    id: modelId,
+    modelType,
+    name,
+    path: modelPath,
+    relativePath,
+  };
+}
+
+function createRvcTool(overrides = {}) {
+  return {
+    id: 'rvc',
+    appDir: overrides.appDir || overrides.installDir || '',
+    downloadedModels: Array.isArray(overrides.downloadedModels) ? overrides.downloadedModels : [],
+    installDir: overrides.installDir || '',
+    launchProfile: overrides.launchProfile || { kind: 'python-script', pythonPath: 'python' },
+    launchSupported: overrides.launchSupported !== false,
+    lastError: overrides.lastError || '',
+    name: 'RVC',
     pythonBootstrapPath: overrides.pythonBootstrapPath || 'python',
     status: overrides.status || 'stopped',
     ...overrides,
@@ -395,17 +494,6 @@ function verifyAudiocraftReadinessStates(tempRoot, audioPath) {
   assert(readySummary.capabilitySummary.inputKinds.includes('text'), 'Expected AudioCraft capability summary to accept text input.');
   assert(readySummary.capabilitySummary.inputKinds.includes('audio'), 'Expected AudioCraft capability summary to accept audio guidance input.');
   assert(readySummary.capabilitySummary.outputKinds.includes('audio'), 'Expected AudioCraft capability summary to produce audio output.');
-
-  const unsupportedToolAnalysis = pipelineSchema.analyzePipeline({
-    ...createAudiocraftTextToAudioPipeline('Build a gentle ambient loop.'),
-    nodes: createAudiocraftTextToAudioPipeline('Build a gentle ambient loop.').nodes.map((node) =>
-      node.id === 'audio-generate'
-        ? { ...node, config: { ...node.config, toolId: 'rvc' } }
-        : node),
-  }, {
-    tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot })],
-  });
-  assert(unsupportedToolAnalysis.nodeSummaries['audio-generate'].readiness.message.includes('RVC-style audio transformation is not wired into this model-step path yet'), 'Expected the RVC selection state to stay honest about the bounded audio-output scope.');
 
   const soundModeAnalysis = pipelineSchema.analyzePipeline(createAudiocraftAudioGuidancePipeline(audioPath, 'sound'), {
     tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot })],
@@ -563,6 +651,99 @@ async function verifyAudiocraftGuidedPipelineRun(tempRoot, sourceAudioPath) {
   assert.strictEqual(sidecar.audioGeneration.sourceAudio.fileName, path.basename(sourceAudioPath), 'Expected the saved audio sidecar to preserve the routed source audio reference.');
 }
 
+function verifyRvcReadinessStates(tempRoot, audioPath) {
+  const readyModel = createRvcModel({ path: path.join(tempRoot, 'weights', 'voices', 'test-voice.pth') });
+  const missingAnalysis = pipelineSchema.analyzePipeline(createRvcVoiceConversionPipeline(audioPath), { tools: [] });
+  assert.strictEqual(missingAnalysis.nodeSummaries['audio-transform'].readiness.tone, 'error', 'Expected missing RVC readiness to fail.');
+  assert(missingAnalysis.nodeSummaries['audio-transform'].readiness.message.includes('Install RVC'), 'Expected missing RVC readiness to explain that RVC must be installed.');
+  const missingModelAnalysis = pipelineSchema.analyzePipeline(createRvcVoiceConversionPipeline(audioPath, { model: '' }), {
+    tools: [createRvcTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped', downloadedModels: [readyModel] })],
+  });
+  assert.strictEqual(missingModelAnalysis.nodeSummaries['audio-transform'].readiness.tone, 'error', 'Expected RVC readiness to require a selected voice model.');
+  assert(missingModelAnalysis.nodeSummaries['audio-transform'].readiness.message.includes('Choose an RVC voice model'), 'Expected missing RVC model readiness to explain that a voice model must be selected.');
+  const unavailableModelAnalysis = pipelineSchema.analyzePipeline(createRvcVoiceConversionPipeline(audioPath, { model: 'missing-voice.pth' }), {
+    tools: [createRvcTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped', downloadedModels: [readyModel] })],
+  });
+  assert.strictEqual(unavailableModelAnalysis.nodeSummaries['audio-transform'].readiness.tone, 'error', 'Expected unavailable RVC model readiness to fail.');
+  assert(unavailableModelAnalysis.nodeSummaries['audio-transform'].readiness.message.includes('not available locally'), 'Expected unavailable RVC model readiness to explain the local-model requirement.');
+  const readyAnalysis = pipelineSchema.analyzePipeline(createRvcVoiceConversionPipeline(audioPath), {
+    tools: [createRvcTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped', downloadedModels: [readyModel] })],
+  });
+  const readySummary = readyAnalysis.nodeSummaries['audio-transform'];
+  assert.strictEqual(readySummary.readiness.tone, 'info', 'Expected installed RVC readiness to be positive.');
+  assert(readySummary.readiness.message.includes('dry single-speaker voice clip'), 'Expected RVC readiness to explain the first-pass source-audio suitability guidance.');
+  assert.strictEqual(readySummary.capabilitySummary.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM, 'Expected the RVC model step to resolve to audio transform.');
+  assert(readySummary.capabilitySummary.inputKinds.includes('audio'), 'Expected RVC capability summary to accept audio input.');
+  assert(readySummary.capabilitySummary.outputKinds.includes('audio'), 'Expected RVC capability summary to produce audio output.');
+}
+
+async function verifyRvcPipelineRun(tempRoot, sourceAudioPath) {
+  const voiceModel = createRvcModel({ path: path.join(tempRoot, 'weights', 'voices', 'test-voice.pth') });
+  const toolEntries = [createRvcTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped', downloadedModels: [voiceModel] })];
+  const audioCalls = [];
+  const service = createPipelineExecutionService(tempRoot, toolEntries, {
+    generateAudioFixture: async ({ artifactService, request, tool }) => {
+      audioCalls.push({ request, tool });
+      const outputPath = path.join(request.runDirectories.artifactsDir, 'rvc-voice-conversion-result.wav');
+      await fsp.mkdir(path.dirname(voiceModel.path), { recursive: true });
+      await fsp.writeFile(outputPath, createWaveBuffer({ channelCount: 1, durationSeconds: 3, frequency: 280, sampleRate: 40000 }));
+      const artifact = await artifactService.buildFileArtifact(outputPath, {
+        audioTransformation: {
+          backend: 'rvc',
+          backendLabel: 'RVC',
+          durationSeconds: 3,
+          instruction: request.instruction,
+          model: request.voiceModel?.relativePath || request.model,
+          sourceAudio: request.sourceAudioArtifact ? {
+            displayName: request.sourceAudioArtifact.displayName,
+            fileName: request.sourceAudioArtifact.fileName,
+            filePath: request.sourceAudioArtifact.filePath,
+            fileUrl: request.sourceAudioArtifact.fileUrl,
+            formatLabel: request.sourceAudioArtifact.formatLabel,
+            kind: request.sourceAudioArtifact.kind,
+            mimeType: request.sourceAudioArtifact.mimeType,
+            sizeBytes: request.sourceAudioArtifact.sizeBytes,
+            summary: request.sourceAudioArtifact.summary,
+          } : null,
+          targetVoice: 'test-voice',
+          toolId: tool.id,
+          toolLabel: tool.name,
+          transformationType: 'voice-conversion',
+        },
+        displayName: request.displayName || request.nodeLabel || 'Transformed Audio',
+        kind: pipelineSchema.PORT_KIND_AUDIO,
+        role: 'transformed',
+      });
+      return {
+        destinationPath: artifact.filePath,
+        message: tool.name + ' transformed audio locally.',
+        outputs: { audio: artifact },
+        preview: artifactService.summarizeArtifact(artifact),
+      };
+    },
+  });
+
+  const completedRun = await runPipelineToCompletion(service, createRvcVoiceConversionPipeline(sourceAudioPath));
+  assert.strictEqual(completedRun.status, 'completed', 'Expected the RVC voice conversion pipeline to complete successfully.');
+  assert.strictEqual(audioCalls.length, 1, 'Expected the local audio adapter to run exactly once for the RVC pipeline.');
+  assert.strictEqual(audioCalls[0].request.sourceAudioPath, sourceAudioPath, 'Expected the RVC run to retain the upstream audio file path.');
+  assert.strictEqual(audioCalls[0].request.model, 'voices/test-voice.pth', 'Expected the RVC run to retain the selected voice model id.');
+  assert.strictEqual(audioCalls[0].request.voiceModel.relativePath, 'voices/test-voice.pth', 'Expected the RVC run to pass the resolved voice model metadata to the adapter.');
+
+  const result = completedRun.terminalResults[0];
+  assert.strictEqual(result.kind, 'audio', 'Expected the RVC pipeline to end with an audio artifact.');
+  assert.strictEqual(result.artifact.previewKind, 'audio', 'Expected the transformed audio artifact to stay on the audio preview path.');
+  assert.strictEqual(result.audioTransformation.transformationType, 'voice-conversion', 'Expected the terminal result to expose the voice conversion transform type.');
+  assert.strictEqual(result.audioTransformation.targetVoice, 'test-voice', 'Expected the terminal result to preserve the target voice label.');
+  assert.strictEqual(result.audioTransformation.sourceAudio.fileName, path.basename(sourceAudioPath), 'Expected the terminal result to preserve the source audio lineage.');
+  assert(result.supportingPaths.some((entry) => entry.endsWith('.audio.json')), 'Expected transformed audio outputs to save an audio metadata sidecar.');
+
+  const sidecarPath = result.supportingPaths.find((entry) => entry.endsWith('.audio.json'));
+  const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
+  assert.strictEqual(sidecar.audioTransformation.model, 'voices/test-voice.pth', 'Expected the saved transformed audio sidecar to preserve the selected voice model.');
+  assert.strictEqual(sidecar.audioTransformation.sourceAudio.fileName, path.basename(sourceAudioPath), 'Expected the saved transformed audio sidecar to preserve the source audio lineage.');
+}
+
 function verifyCloudAudioReadinessStates() {
   const missingProviderAnalysis = pipelineSchema.analyzePipeline(createCloudAudioPipeline('Say hello from Local AI Hub.'), { providers: [] });
   assert.strictEqual(missingProviderAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'error', 'Expected cloud audio readiness to fail when the provider is missing.');
@@ -597,6 +778,18 @@ function verifyCloudAudioReadinessStates() {
   assert.strictEqual(unsupportedModelAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'error', 'Expected unsupported cloud audio model selection to fail.');
   assert(unsupportedModelAnalysis.nodeSummaries['audio-generate'].readiness.message.includes('gemini-2.5-flash-preview-tts'), 'Expected unsupported cloud audio model readiness to suggest a Gemini TTS model.');
 
+  const openAiUnsupportedAnalysis = pipelineSchema.analyzePipeline(createCloudAudioPipeline('Say hello from Local AI Hub.', { model: 'gpt-4o', providerId: 'openai' }), {
+    providers: [createOpenAiProvider()],
+  });
+  assert.strictEqual(openAiUnsupportedAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'error', 'Expected unsupported OpenAI speech model selection to fail.');
+  assert(openAiUnsupportedAnalysis.nodeSummaries['audio-generate'].readiness.message.includes('gpt-4o-mini-tts'), 'Expected unsupported OpenAI speech readiness to suggest a compatible OpenAI TTS model.');
+
+  const xaiReadyAnalysis = pipelineSchema.analyzePipeline(createCloudAudioPipeline('Say hello from Local AI Hub.', { model: '', providerId: 'xai', audioVoice: 'eve' }), {
+    providers: [createXaiProvider()],
+  });
+  assert.strictEqual(xaiReadyAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'info', 'Expected xAI cloud speech readiness to stay positive without an explicit model.');
+  assert(xaiReadyAnalysis.nodeSummaries['audio-generate'].readiness.message.includes('saved audio artifact'), 'Expected xAI cloud speech readiness to keep the shared saved-audio artifact message.');
+
   const readyAnalysis = pipelineSchema.analyzePipeline(createCloudAudioPipeline('Say hello from Local AI Hub.'), {
     providers: [createGoogleProvider()],
   });
@@ -609,55 +802,64 @@ function verifyCloudAudioReadinessStates() {
 }
 
 async function verifyCloudAudioPipelineRun(tempRoot) {
-  const providerEntries = [createGoogleProvider()];
-  const providerCalls = [];
-  const service = createPipelineExecutionService(tempRoot, [], {
-    providerEntries,
-    runProviderOperationFixture: async (providerId, payload = {}) => {
-      providerCalls.push({ providerId, payload });
-      return {
-        createdAt: new Date('2026-03-18T12:00:00.000Z').toISOString(),
-        model: payload.model,
-        audios: [
-          {
-            buffer: createWaveBuffer({ durationSeconds: 2, sampleRate: 24000, frequency: 260 }),
-            extension: '.wav',
-            mimeType: 'audio/wav',
-            sampleRate: 24000,
-            channelCount: 1,
-            bitDepth: 16,
-            voice: payload.voice || 'Kore',
-          },
-        ],
-      };
-    },
-  });
+  const cases = [
+    { provider: createGoogleProvider(), providerId: 'google', model: 'models/gemini-2.5-flash-preview-tts', voice: 'Kore' },
+    { provider: createOpenAiProvider(), providerId: 'openai', model: 'gpt-4o-mini-tts', voice: 'alloy' },
+    { provider: createXaiProvider(), providerId: 'xai', model: '', voice: 'eve' },
+  ];
 
-  const completedRun = await runPipelineToCompletion(service, createCloudAudioPipeline('Say hello from Local AI Hub.'));
-  assert.strictEqual(completedRun.status, 'completed', 'Expected the cloud audio pipeline to complete successfully.');
-  assert.strictEqual(providerCalls.length, 1, 'Expected the provider-backed audio operation to run exactly once.');
-  assert.strictEqual(providerCalls[0].providerId, 'google', 'Expected the cloud audio pipeline to target Google (Gemini).');
-  assert.strictEqual(providerCalls[0].payload.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE, 'Expected the provider operation to stay on the audio generation boundary.');
-  assert(providerCalls[0].payload.prompt.includes('Speak this text exactly:'), 'Expected the outgoing cloud audio prompt to preserve the shared speech wrapper.');
-  assert(providerCalls[0].payload.prompt.includes('Say hello from Local AI Hub.'), 'Expected the outgoing cloud audio prompt to include the connected text.');
-  assert.strictEqual(providerCalls[0].payload.voice, 'Kore', 'Expected the outgoing cloud audio request to preserve the selected voice.');
+  for (const testCase of cases) {
+    const providerCalls = [];
+    const service = createPipelineExecutionService(tempRoot, [], {
+      providerEntries: [testCase.provider],
+      runProviderOperationFixture: async (providerId, payload = {}) => {
+        providerCalls.push({ providerId, payload });
+        return {
+          createdAt: new Date('2026-03-18T12:00:00.000Z').toISOString(),
+          model: payload.model,
+          audios: [
+            {
+              buffer: createWaveBuffer({ durationSeconds: 2, sampleRate: 24000, frequency: 260 }),
+              extension: '.wav',
+              mimeType: 'audio/wav',
+              sampleRate: 24000,
+              channelCount: 1,
+              bitDepth: 16,
+              voice: payload.voice || testCase.voice,
+            },
+          ],
+        };
+      },
+    });
 
-  const result = completedRun.terminalResults[0];
-  assert.strictEqual(result.kind, 'audio', 'Expected the cloud audio pipeline to end with an audio artifact.');
-  assert.strictEqual(result.artifact.previewKind, 'audio', 'Expected the cloud audio artifact to stay on the audio preview path.');
-  assert.strictEqual(result.audioGeneration.mode, 'speech', 'Expected the cloud audio terminal result to expose speech generation mode.');
-  assert.strictEqual(result.audioGeneration.backend, 'google', 'Expected the cloud audio terminal result to expose the provider id.');
-  assert.strictEqual(result.audioGeneration.backendLabel, 'Google (Gemini)', 'Expected the cloud audio terminal result to expose the provider label.');
-  assert.strictEqual(result.audioGeneration.voice, 'Kore', 'Expected the cloud audio terminal result to preserve the selected voice.');
-  assert.strictEqual(result.audio.sampleRate, 24000, 'Expected the cloud audio artifact to retain the sample rate metadata.');
-  assert(result.supportingPaths.some((entry) => entry.endsWith('.audio.json')), 'Expected cloud audio outputs to save an audio metadata sidecar.');
+    const completedRun = await runPipelineToCompletion(service, createCloudAudioPipeline('Say hello from Local AI Hub.', { providerId: testCase.providerId, model: testCase.model, audioVoice: testCase.voice }));
+    assert.strictEqual(completedRun.status, 'completed', 'Expected the cloud audio pipeline to complete successfully for ' + testCase.provider.name + '.');
+    assert.strictEqual(providerCalls.length, 1, 'Expected the provider-backed audio operation to run exactly once for ' + testCase.provider.name + '.');
+    assert.strictEqual(providerCalls[0].providerId, testCase.providerId, 'Expected the cloud audio pipeline to target ' + testCase.provider.name + '.');
+    assert.strictEqual(providerCalls[0].payload.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE, 'Expected the provider operation to stay on the audio generation boundary.');
+    assert(providerCalls[0].payload.prompt.includes('Speak this text exactly:'), 'Expected the outgoing cloud audio prompt to preserve the shared speech wrapper.');
+    assert(providerCalls[0].payload.prompt.includes('Say hello from Local AI Hub.'), 'Expected the outgoing cloud audio prompt to include the connected text.');
+    assert.strictEqual(providerCalls[0].payload.spokenText, 'Say hello from Local AI Hub.', 'Expected the shared cloud audio request to preserve the exact spoken text for ' + testCase.provider.name + '.');
+    assert.strictEqual(providerCalls[0].payload.instruction, 'Speak in a calm, friendly tone.', 'Expected the shared cloud audio request to keep delivery guidance separate for ' + testCase.provider.name + '.');
+    assert.strictEqual(providerCalls[0].payload.voice, testCase.voice, 'Expected the outgoing cloud audio request to preserve the selected voice for ' + testCase.provider.name + '.');
 
-  const sidecarPath = result.supportingPaths.find((entry) => entry.endsWith('.audio.json'));
-  assert(fs.existsSync(sidecarPath), 'Expected the cloud audio sidecar to exist on disk.');
-  const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
-  assert.strictEqual(sidecar.audioGeneration.mode, 'speech', 'Expected the saved cloud audio sidecar to preserve speech mode.');
-  assert.strictEqual(sidecar.audioGeneration.backendLabel, 'Google (Gemini)', 'Expected the saved cloud audio sidecar to preserve the provider label.');
-  assert.strictEqual(sidecar.audioGeneration.voice, 'Kore', 'Expected the saved cloud audio sidecar to preserve the voice.');
+    const result = completedRun.terminalResults[0];
+    assert.strictEqual(result.kind, 'audio', 'Expected the cloud audio pipeline to end with an audio artifact for ' + testCase.provider.name + '.');
+    assert.strictEqual(result.artifact.previewKind, 'audio', 'Expected the cloud audio artifact to stay on the audio preview path for ' + testCase.provider.name + '.');
+    assert.strictEqual(result.audioGeneration.mode, 'speech', 'Expected the cloud audio terminal result to expose speech generation mode for ' + testCase.provider.name + '.');
+    assert.strictEqual(result.audioGeneration.backend, testCase.providerId, 'Expected the cloud audio terminal result to expose the provider id for ' + testCase.provider.name + '.');
+    assert.strictEqual(result.audioGeneration.backendLabel, testCase.provider.name, 'Expected the cloud audio terminal result to expose the provider label for ' + testCase.provider.name + '.');
+    assert.strictEqual(result.audioGeneration.voice, testCase.voice, 'Expected the cloud audio terminal result to preserve the selected voice for ' + testCase.provider.name + '.');
+    assert.strictEqual(result.audio.sampleRate, 24000, 'Expected the cloud audio artifact to retain the sample rate metadata for ' + testCase.provider.name + '.');
+    assert(result.supportingPaths.some((entry) => entry.endsWith('.audio.json')), 'Expected cloud audio outputs to save an audio metadata sidecar for ' + testCase.provider.name + '.');
+
+    const sidecarPath = result.supportingPaths.find((entry) => entry.endsWith('.audio.json'));
+    assert(fs.existsSync(sidecarPath), 'Expected the cloud audio sidecar to exist on disk for ' + testCase.provider.name + '.');
+    const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
+    assert.strictEqual(sidecar.audioGeneration.mode, 'speech', 'Expected the saved cloud audio sidecar to preserve speech mode for ' + testCase.provider.name + '.');
+    assert.strictEqual(sidecar.audioGeneration.backendLabel, testCase.provider.name, 'Expected the saved cloud audio sidecar to preserve the provider label for ' + testCase.provider.name + '.');
+    assert.strictEqual(sidecar.audioGeneration.voice, testCase.voice, 'Expected the saved cloud audio sidecar to preserve the voice for ' + testCase.provider.name + '.');
+  }
 }
 
 async function main() {
@@ -670,11 +872,13 @@ async function main() {
 
   verifyWhisperReadinessStates(audioPath);
   verifyAudiocraftReadinessStates(tempRoot, audioPath);
+  verifyRvcReadinessStates(tempRoot, audioPath);
   verifyCloudAudioReadinessStates();
   await verifyWhisperPipelineRun(tempRoot, audioPath);
   await verifyAudioOutputRun(tempRoot, audioPath);
   await verifyAudiocraftTextPipelineRun(tempRoot);
   await verifyAudiocraftGuidedPipelineRun(tempRoot, audioPath);
+  await verifyRvcPipelineRun(tempRoot, audioPath);
   await verifyCloudAudioPipelineRun(tempRoot);
 
   console.log('Audio pipeline verification passed.');
@@ -684,3 +888,6 @@ main().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exitCode = 1;
 });
+
+
+

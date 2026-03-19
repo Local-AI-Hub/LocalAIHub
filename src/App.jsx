@@ -1591,17 +1591,11 @@ export default function App() {
 
               {aiderTool && aiderPanelOpen ? (
                 <AiderPanel
-                  busy={busyMap['launch:aider'] || busyMap['stop:aider'] || aiderBusy}
-                  draft={aiderDraft}
-                  notice={aiderNotice}
-                  onChangeDraft={setAiderDraft}
-                  onChooseProject={chooseAiderProjectFolder}
+                  connectedProviders={connectedProviders}
+                  ollamaTool={ollamaTool}
                   onHide={() => setAiderPanelOpen(false)}
-                  onLaunch={launchAiderTool}
-                  onSend={sendAiderInput}
-                  onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
-                  output={aiderOutput}
-                  projectDir={aiderProjectDir}
+                  pushToast={pushToast}
+                  runAction={runAction}
                   tool={aiderTool}
                 />
               ) : null}
@@ -1764,6 +1758,7 @@ export default function App() {
     </div>
   );
 }
+
 
 
 

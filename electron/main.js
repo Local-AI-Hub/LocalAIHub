@@ -44,6 +44,7 @@ const {
   updateToolInstallation,
 } = require('./services/installerService');
 const { listOllamaModels, chatWithOllama } = require('./services/ollamaService');
+const { buildAiderLaunchConfiguration, inspectAiderProject, listAiderLaunchModels } = require('./services/aiderService');
 const {
   disposeAllRuntimes,
   getRuntimeOutputSnapshot,
@@ -881,17 +882,34 @@ function registerIpcHandlers() {
       const launchOptions = {};
       if (tool.id === 'aider') {
         const projectDir = String(payload?.projectDir || tool.lastProjectDir || '').trim();
-        if (!projectDir) {
-          throw new Error('Choose a project folder for Aider before launching it.');
+        const aiderSession = payload?.aiderSession || {};
+        const aiderLaunch = await buildAiderLaunchConfiguration({
+          tool,
+          ollamaTool: toolLookup('ollama', state.tools),
+          providers: state.providers || [],
+          projectDir,
+          providerId: aiderSession.providerId || tool.aiderProviderId || '',
+          modelId: aiderSession.modelId || tool.aiderModelId || '',
+          initializeGit: aiderSession.initializeGit !== undefined ? aiderSession.initializeGit : tool.aiderInitializeGit !== false,
+        });
+
+        if (aiderLaunch.selection.requiresOllamaStart) {
+          const ollamaTool = toolLookup('ollama', state.tools);
+          if (!ollamaTool) {
+            throw new Error('Install or detect Ollama before launching an Ollama-backed Aider session.');
+          }
+
+          await launchToolFromUserAction(ollamaTool, {
+            launchContext: 'aider-session',
+            skipOpenInterface: true,
+          });
         }
 
-        launchOptions.launchProfileOverride = {
-          workingDir: projectDir,
-          allowExternalWorkingDir: true,
-        };
+        launchOptions.launchProfileOverride = aiderLaunch.launchProfileOverride;
+        launchOptions.successMessage = aiderLaunch.launchMessage;
         await upsertTool({
           id: tool.id,
-          lastProjectDir: projectDir,
+          ...aiderLaunch.persistedFields,
         });
       }
       const { nextState, nextTool } = await launchToolFromExplicitUserAction(tool, {
@@ -899,8 +917,8 @@ function registerIpcHandlers() {
         launchContext: 'ipc-launch',
       });
 
-      let message = `${nextTool.name} is starting.`;
-      if (String(nextTool.interfaceMode || '').startsWith('embedded-')) {
+      let message = launchOptions.successMessage || `${nextTool.name} is starting.`;
+      if (!launchOptions.successMessage && String(nextTool.interfaceMode || '').startsWith('embedded-')) {
         if (nextTool.interfaceMode === 'embedded-whisper') {
           message = `${nextTool.name} is ready. Local AI Hub opened its transcription view.`;
         } else if (nextTool.interfaceMode === 'embedded-chat') {
@@ -1167,6 +1185,22 @@ function registerIpcHandlers() {
         folderPath: result.filePaths?.[0] || '',
       };
     }, 'Local AI Hub could not open the project folder picker.'),
+  );
+
+  ipcMain.handle('aider:inspect-project', (_event, projectDir) =>
+    withPlainEnglishErrors(async () => inspectAiderProject(projectDir), 'Local AI Hub could not inspect that Aider project folder.'),
+  );
+
+  ipcMain.handle('aider:list-models', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      return listAiderLaunchModels({
+        providerId: payload?.providerId,
+        preferredModelId: payload?.preferredModelId,
+        ollamaTool: toolLookup('ollama', state.tools),
+        providers: state.providers || [],
+      });
+    }, 'Local AI Hub could not load models for that Aider provider.'),
   );
 
   ipcMain.handle('tools:get-runtime-output', (_event, toolId) =>
@@ -1575,4 +1609,10 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
+
+
+
+
+
+
 
