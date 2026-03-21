@@ -1,4 +1,4 @@
-﻿const {
+const {
   PIPELINE_OPERATION_IDS,
   TOOL_PIPELINE_STRATEGY_IDS,
   getGraphWorkflowToolIds,
@@ -23,7 +23,7 @@ const {
   parseGraphWorkflowDefinitionText,
 } = require('./graphWorkflowContracts.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 5;
+const PIPELINE_SCHEMA_VERSION = 7;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
@@ -32,15 +32,22 @@ const PORT_KIND_IMAGE = 'image';
 const PORT_KIND_AUDIO = 'audio';
 const PORT_KIND_VIDEO = 'video';
 const PORT_KIND_FILE = 'file';
+const PORT_KIND_COMPOSITION = 'composition';
+const PORT_KIND_COLLECTION = 'collection';
+const PORT_COLLECTION_KIND_PREFIX = PORT_KIND_COLLECTION + ':';
 const PORT_KIND_ANY = 'any';
 const PORT_KIND_PASSTHROUGH = 'passthrough';
 const PORT_KIND_AUDIO_FILE = PORT_KIND_AUDIO;
-const SUPPORTED_PORT_KINDS = Object.freeze([
+const COLLECTION_ITEM_PORT_KINDS = Object.freeze([
   PORT_KIND_TEXT,
   PORT_KIND_IMAGE,
   PORT_KIND_AUDIO,
   PORT_KIND_VIDEO,
   PORT_KIND_FILE,
+]);
+const SUPPORTED_PORT_KINDS = Object.freeze([
+  ...COLLECTION_ITEM_PORT_KINDS,
+  PORT_KIND_COMPOSITION,
 ]);
 const PIPELINE_PORT_KIND_LABELS = Object.freeze({
   [PORT_KIND_TEXT]: 'Text',
@@ -48,6 +55,8 @@ const PIPELINE_PORT_KIND_LABELS = Object.freeze({
   [PORT_KIND_AUDIO]: 'Audio',
   [PORT_KIND_VIDEO]: 'Video',
   [PORT_KIND_FILE]: 'File',
+  [PORT_KIND_COMPOSITION]: 'Composition',
+  [PORT_KIND_COLLECTION]: 'Collection',
 });
 const PIPELINE_OPERATION_LABELS = Object.freeze({
   [PIPELINE_OPERATION_IDS.GRAPH_WORKFLOW]: 'Graph workflow',
@@ -405,7 +414,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       {
         id: 'input',
         kind: PORT_KIND_ANY,
-        allowedKinds: SUPPORTED_PORT_KINDS,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        collectionBehavior: 'allow',
         label: 'Input',
         required: true,
       },
@@ -464,6 +474,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         id: 'branch',
         kind: PORT_KIND_ANY,
         allowedKinds: SUPPORTED_PORT_KINDS,
+        collectionBehavior: 'allow',
         label: 'Branches',
         required: true,
         allowMultipleConnections: true,
@@ -490,12 +501,14 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         id: 'complete',
         kind: PORT_KIND_ANY,
         allowedKinds: SUPPORTED_PORT_KINDS,
+        collectionBehavior: 'allow',
         label: 'Complete',
       },
       {
         id: 'retry',
         kind: PORT_KIND_ANY,
         allowedKinds: SUPPORTED_PORT_KINDS,
+        collectionBehavior: 'allow',
         label: 'Retry',
       },
     ],
@@ -512,6 +525,151 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       maxAttempts: 3,
       retryTerminationAction: 'fail',
       stopWhenRetryArtifactRepeats: false,
+    },
+  }),
+  collectionBuilder: Object.freeze({
+    type: 'collectionBuilder',
+    label: 'Collection Builder',
+    category: 'Flow',
+    description: 'Builds an ordered collection from compatible single artifacts and can extend an existing collection.',
+    inputPorts: [
+      {
+        id: 'items',
+        kind: PORT_KIND_ANY,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        label: 'Items',
+        required: true,
+        allowMultipleConnections: true,
+        minimumConnections: 1,
+      },
+      {
+        id: 'existing',
+        kind: PORT_KIND_ANY,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        collectionBehavior: 'only',
+        label: 'Existing Collection',
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_ANY,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        collectionBehavior: 'only',
+        label: 'Collection',
+      },
+    ],
+    configDefaults: {
+      insertionMode: 'append',
+    },
+  }),
+  collectionAccumulator: Object.freeze({
+    type: 'collectionAccumulator',
+    label: 'Accumulate Until Target',
+    category: 'Flow',
+    description: 'Keeps accepted same-type items from one or more validated branches across loop attempts until the target count is reached, then emits one ordered collection.',
+    inputPorts: [
+      {
+        id: 'item',
+        kind: PORT_KIND_ANY,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        label: 'Accepted Items',
+        required: true,
+        allowMultipleConnections: true,
+        minimumConnections: 1,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_ANY,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        collectionBehavior: 'only',
+        label: 'Collection',
+      },
+    ],
+    configDefaults: {
+      targetCount: 3,
+    },
+  }),
+  collectionOutput: Object.freeze({
+    type: 'collectionOutput',
+    label: 'Collection Output',
+    category: 'Outputs',
+    description: 'Shows the final ordered collection and saves a manifest plus its ordered items to the run folder.',
+    inputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_ANY,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        collectionBehavior: 'only',
+        label: 'Collection',
+        required: true,
+      },
+    ],
+    outputPorts: [],
+    terminal: true,
+    configDefaults: {
+      title: 'Collection result',
+    },
+  }),
+  mediaComposition: Object.freeze({
+    type: 'mediaComposition',
+    label: 'Media Composition',
+    category: 'Flow',
+    description: 'Builds a reusable media composition from an ordered image collection and an optional primary audio track.',
+    inputPorts: [
+      {
+        id: 'visuals',
+        kind: PORT_KIND_IMAGE,
+        collectionBehavior: 'only',
+        label: 'Visual Collection',
+        required: true,
+      },
+      {
+        id: 'audio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Primary Audio',
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'composition',
+        kind: PORT_KIND_COMPOSITION,
+        label: 'Composition',
+      },
+    ],
+    configDefaults: {
+      secondsPerItem: 4,
+    },
+  }),
+  mediaExport: Object.freeze({
+    type: 'mediaExport',
+    label: 'Media Export',
+    category: 'Flow',
+    description: 'Renders a saved media composition into a video artifact through the shared export path.',
+    inputPorts: [
+      {
+        id: 'composition',
+        kind: PORT_KIND_COMPOSITION,
+        label: 'Composition',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
+      },
+    ],
+    configDefaults: {
+      title: 'Composed video',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      fitMode: 'contain',
+      stopMode: 'shortest',
     },
   }),
   textOutput: Object.freeze({
@@ -661,6 +819,69 @@ function getSupportedPortKinds() {
   return [...SUPPORTED_PORT_KINDS];
 }
 
+function getPortCollectionBehavior(port) {
+  const behavior = String(port?.collectionBehavior || '').trim().toLowerCase();
+  return behavior === 'allow' || behavior === 'only' ? behavior : 'single';
+}
+
+function createCollectionPortKind(kind) {
+  const normalized = normalizePortKind(kind);
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.startsWith(PORT_COLLECTION_KIND_PREFIX)) {
+    return normalized;
+  }
+
+  if (normalized === PORT_KIND_ANY || normalized === PORT_KIND_PASSTHROUGH || normalized === PORT_KIND_COLLECTION || normalized === PORT_KIND_COMPOSITION) {
+    return '';
+  }
+
+  return PORT_COLLECTION_KIND_PREFIX + normalized;
+}
+
+function getCollectionItemKind(kind) {
+  const normalized = normalizePortKind(kind);
+  if (!normalized.startsWith(PORT_COLLECTION_KIND_PREFIX)) {
+    return '';
+  }
+
+  return normalizePortKind(normalized.slice(PORT_COLLECTION_KIND_PREFIX.length));
+}
+
+function isCollectionPortKind(kind) {
+  return Boolean(getCollectionItemKind(kind));
+}
+
+function formatPortKindLabel(kind) {
+  const normalized = normalizePortKind(kind);
+  if (isCollectionPortKind(normalized)) {
+    const itemKind = getCollectionItemKind(normalized);
+    return (PIPELINE_PORT_KIND_LABELS[itemKind] || itemKind || PIPELINE_PORT_KIND_LABELS[PORT_KIND_COLLECTION]) + ' Collection';
+  }
+
+  return PIPELINE_PORT_KIND_LABELS[normalized] || normalized;
+}
+
+function applyCollectionBehaviorToKinds(kinds = [], port) {
+  const normalizedKinds = [...new Set((kinds || []).map((entry) => normalizePortKind(entry)).filter(Boolean))]
+    .filter((kind) => !isCollectionPortKind(kind));
+  const behavior = getPortCollectionBehavior(port);
+  if (behavior === 'only') {
+    return normalizedKinds.map((kind) => createCollectionPortKind(kind)).filter(Boolean);
+  }
+
+  if (behavior === 'allow') {
+    return [
+      ...normalizedKinds,
+      ...normalizedKinds.map((kind) => createCollectionPortKind(kind)).filter(Boolean),
+    ];
+  }
+
+  return normalizedKinds;
+}
+
 function resolveDynamicInputKinds(node, port) {
   if (!node || !port) {
     return [];
@@ -732,28 +953,25 @@ function getPortAllowedKinds(port, options = {}) {
   const dynamicKinds = options?.direction === 'input'
     ? resolveDynamicInputKinds(options?.node || null, port)
     : [];
-  if (port.dynamicOnly) {
-    return dynamicKinds;
-  }
+  const baseKinds = port.dynamicOnly
+    ? dynamicKinds
+    : dynamicKinds.length
+      ? dynamicKinds
+      : Array.isArray(port.allowedKinds) && port.allowedKinds.length
+        ? [...new Set(port.allowedKinds.map((entry) => normalizePortKind(entry)).filter(Boolean))]
+        : (() => {
+            const kind = normalizePortKind(port.kind);
+            if (kind === PORT_KIND_ANY) {
+              return getSupportedPortKinds();
+            }
 
-  if (dynamicKinds.length) {
-    return dynamicKinds;
-  }
+            if (kind === PORT_KIND_PASSTHROUGH) {
+              return [];
+            }
 
-  if (Array.isArray(port.allowedKinds) && port.allowedKinds.length) {
-    return [...new Set(port.allowedKinds.map((entry) => normalizePortKind(entry)).filter(Boolean))];
-  }
-
-  const kind = normalizePortKind(port.kind);
-  if (kind === PORT_KIND_ANY) {
-    return getSupportedPortKinds();
-  }
-
-  if (kind === PORT_KIND_PASSTHROUGH) {
-    return [];
-  }
-
-  return kind ? [kind] : [];
+            return kind ? [kind] : [];
+          })();
+  return applyCollectionBehaviorToKinds(baseKinds, port);
 }
 
 function doesPortAllowMultipleConnections(port) {
@@ -1037,12 +1255,13 @@ function resolveOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) 
   }
 
   const normalizedKind = normalizePortKind(sourcePort.kind);
+  const explicitKinds = getPortAllowedKinds(sourcePort, { direction: 'output', node: sourceNode || null });
   if (normalizedKind && normalizedKind !== PORT_KIND_PASSTHROUGH && normalizedKind !== PORT_KIND_ANY) {
-    return [normalizedKind];
+    return explicitKinds.length ? explicitKinds : [normalizedKind];
   }
 
   if (normalizedKind === PORT_KIND_ANY) {
-    return getSupportedPortKinds();
+    return explicitKinds.length ? explicitKinds : getSupportedPortKinds();
   }
 
   if (!sourceNode || !graph) {
@@ -1193,6 +1412,49 @@ function getRetryLoopReentryDescriptor(graph, retryTargetNode, retryKinds = []) 
   };
 }
 
+function getRetryLoopAccumulatorCompleteSource(graph, loopNode) {
+  if (!graph || !loopNode?.id) {
+    return null;
+  }
+
+  const completeEdges = getIncomingEdgesForPortKey(graph, loopNode.id + ':complete');
+  if (completeEdges.length !== 1) {
+    return null;
+  }
+
+  const completeEdge = completeEdges[0];
+  const sourceNode = graph.nodeMap.get(completeEdge.source.nodeId) || null;
+  if (!sourceNode || sourceNode.type !== 'collectionAccumulator' || completeEdge.source.portId !== 'collection') {
+    return null;
+  }
+
+  return {
+    edge: completeEdge,
+    sourceNode,
+  };
+}
+
+function isRetryLoopAccumulatorCompleteCompatible(graph, loopNode, completeKinds = [], retryKinds = []) {
+  const accumulatorSource = getRetryLoopAccumulatorCompleteSource(graph, loopNode);
+  if (!accumulatorSource) {
+    return false;
+  }
+
+  const accumulatorItemKinds = getIncomingKindsForNodePort(accumulatorSource.sourceNode, 'item', graph)
+    .filter((kind) => !isCollectionPortKind(kind));
+  if (!accumulatorItemKinds.length || !retryKinds.length || !doesKindIntersect(accumulatorItemKinds, retryKinds)) {
+    return false;
+  }
+
+  return completeKinds.length > 0 && completeKinds.every((kind) => {
+    if (!isCollectionPortKind(kind)) {
+      return false;
+    }
+
+    return accumulatorItemKinds.includes(getCollectionItemKind(kind));
+  });
+}
+
 function addRetryLoopIssue(graph, nodeId, message) {
   if (!graph?.retryLoopIssuesByNodeId?.has(nodeId)) {
     graph.retryLoopIssuesByNodeId.set(nodeId, []);
@@ -1300,7 +1562,8 @@ function populateRetryLoopMetadata(graph) {
     const completeKinds = getIncomingKindsForPort(node, completePort, graph);
     const retryKinds = getIncomingKindsForPort(node, retryPort, graph);
     const retryEntry = getRetryLoopReentryDescriptor(graph, retryTargetNode, retryKinds);
-    if (completeKinds.length && retryKinds.length && !doesKindIntersect(completeKinds, retryKinds)) {
+    const accumulatorCompleteCompatible = Boolean(getRetryLoopAccumulatorCompleteSource(graph, node));
+    if (completeKinds.length && retryKinds.length && !doesKindIntersect(completeKinds, retryKinds) && !accumulatorCompleteCompatible) {
       addRetryLoopIssue(graph, node.id, 'The Complete and Retry branches must stay on the same artifact type so retries remain deterministic.');
     }
 
@@ -1405,7 +1668,7 @@ function getRetryLoopEntryMetadata(graph, nodeId) {
 
 function buildRetryLoopReadinessMessage(node, loopMeta) {
   const targetLabel = loopMeta?.retryTargetLabel || 'the selected retry target';
-  const baseMessage = 'This loop reruns from ' + targetLabel + ' until the Complete branch wins or attempt ' + loopMeta.maxAttempts + ' is reached.';
+  const baseMessage = 'This loop reruns from ' + targetLabel + ' until the Complete branch truly wins or attempt ' + loopMeta.maxAttempts + ' is reached.';
   const reentryMessage = loopMeta?.retryEntryMode === 'branchMerge'
     ? ' Later attempts feed the retry artifact back through ' + targetLabel + '.'
     : loopMeta?.retryEntryMode === 'inputPort'
@@ -1420,6 +1683,88 @@ function buildRetryLoopReadinessMessage(node, loopMeta) {
     ? ' It also stops early if the Retry branch produces the same artifact on consecutive attempts.'
     : '';
   return baseMessage + reentryMessage + terminationMessage + repeatedArtifactMessage;
+}
+
+function getCollectionAccumulatorTargetCount(node) {
+  return Number(node?.config?.targetCount || 0);
+}
+
+function addCollectionAccumulatorIssue(graph, nodeId, message) {
+  if (!graph?.collectionAccumulatorIssuesByNodeId?.has(nodeId)) {
+    graph.collectionAccumulatorIssuesByNodeId.set(nodeId, []);
+  }
+
+  graph.collectionAccumulatorIssuesByNodeId.get(nodeId).push(message);
+}
+
+function populateCollectionAccumulatorMetadata(graph) {
+  if (!graph) {
+    return;
+  }
+
+  const accumulatorNodes = graph.executionOrder
+    .map((nodeId) => graph.nodeMap.get(nodeId))
+    .filter((node) => node?.type === 'collectionAccumulator');
+
+  for (const node of accumulatorNodes) {
+    const itemEdges = getIncomingEdgesForPortKey(graph, node.id + ':item') || [];
+    if (!itemEdges.length) {
+      addCollectionAccumulatorIssue(graph, node.id, 'Connect one or more accepted items into this step before running it.');
+    }
+
+    const targetCount = getCollectionAccumulatorTargetCount(node);
+    if (!Number.isInteger(targetCount) || targetCount < 1) {
+      addCollectionAccumulatorIssue(graph, node.id, 'Enter a whole target count of at least 1 for this accumulation step.');
+    }
+
+    const itemKinds = getIncomingKindsForNodePort(node, 'item', graph)
+      .filter((kind) => !isCollectionPortKind(kind));
+    if (!itemKinds.length) {
+      addCollectionAccumulatorIssue(graph, node.id, 'Connect one or more same-type single artifacts into this accumulation step.');
+    }
+
+    const collectionEdges = (graph.outgoingEdgesByNode.get(node.id) || [])
+      .filter((edge) => edge.source.portId === 'collection');
+    const completeLoopEdges = collectionEdges.filter((edge) => {
+      const targetNode = graph.nodeMap.get(edge.target.nodeId) || null;
+      return targetNode?.type === 'retryLoop' && edge.target.portId === 'complete';
+    });
+    if (collectionEdges.length !== 1 || completeLoopEdges.length !== 1) {
+      addCollectionAccumulatorIssue(graph, node.id, 'Connect the Collection output directly to one Retry Loop Complete input so this step can keep collecting until the target is reached.');
+      continue;
+    }
+
+    const loopNode = graph.nodeMap.get(completeLoopEdges[0].target.nodeId) || null;
+    const loopMeta = loopNode ? graph.retryLoopsByNodeId.get(loopNode.id) || null : null;
+    if (!loopNode || !loopMeta) {
+      addCollectionAccumulatorIssue(graph, node.id, 'Fix the connected Retry Loop before running this accumulation step.');
+      continue;
+    }
+
+    if (itemKinds.length && loopMeta.retryKinds?.length && !doesKindIntersect(itemKinds, loopMeta.retryKinds)) {
+      addCollectionAccumulatorIssue(graph, node.id, 'This accumulation step must collect the same item type that the connected Retry Loop keeps retrying.');
+    }
+
+    if ((graph.collectionAccumulatorIssuesByNodeId.get(node.id) || []).length) {
+      continue;
+    }
+
+    graph.collectionAccumulatorsByNodeId.set(node.id, {
+      itemKinds,
+      loopLabel: loopNode.label,
+      loopNodeId: loopNode.id,
+      retryTargetLabel: loopMeta.retryTargetLabel,
+      retryTargetNodeId: loopMeta.retryTargetNodeId,
+      targetCount,
+    });
+  }
+}
+
+function buildCollectionAccumulatorReadinessMessage(node, meta) {
+  const targetCount = Number(meta?.targetCount || getCollectionAccumulatorTargetCount(node) || 1) || 1;
+  const itemLabel = formatPortKindList(meta?.itemKinds || []);
+  const loopLabel = meta?.loopLabel || 'the connected Retry Loop';
+  return 'This step keeps accepted ' + itemLabel + ' items from one or more upstream branches in order until it reaches ' + targetCount + ', then emits one ordered collection into ' + loopLabel + '. While it is still collecting, the connected loop keeps retrying without treating the stored collection state as a finished loop exit.';
 }
 
 function compareIssueSeverity(leftTone = 'neutral', rightTone = 'neutral') {
@@ -1518,7 +1863,7 @@ function uniqueKindList(values = []) {
 }
 
 function formatPortKindList(kinds = []) {
-  const labels = uniqueKindList(kinds).map((kind) => PIPELINE_PORT_KIND_LABELS[kind] || kind);
+  const labels = uniqueKindList(kinds).map((kind) => formatPortKindLabel(kind));
   if (!labels.length) {
     return 'nothing yet';
   }
@@ -2382,6 +2727,8 @@ function buildPipelineGraph(definition = {}) {
     retryLoopNodeIdsBySegmentNodeId: new Map(),
     retryLoopNodeIdsByTargetNodeId: new Map(),
     retryLoopsByNodeId: new Map(),
+    collectionAccumulatorIssuesByNodeId: new Map(),
+    collectionAccumulatorsByNodeId: new Map(),
     edges: validEdges,
   };
 
@@ -2412,6 +2759,7 @@ function buildPipelineGraph(definition = {}) {
   }
 
   populateRetryLoopMetadata(graph);
+  populateCollectionAccumulatorMetadata(graph);
   return graph;
 }
 
@@ -3456,6 +3804,103 @@ function analyzePipeline(definition = {}, context = {}) {
           };
         }
       }
+
+      if (node.type === 'collectionBuilder') {
+        const itemEdges = graph.incomingEdgesByPortKey.get(node.id + ':items') || [];
+        const itemKinds = getIncomingKindsForNodePort(node, 'items', graph).filter((kind) => !isCollectionPortKind(kind));
+        const existingKinds = getIncomingKindsForNodePort(node, 'existing', graph);
+        const existingItemKinds = uniqueKindList(existingKinds.map((kind) => getCollectionItemKind(kind)).filter(Boolean));
+        if (!itemEdges.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect at least one upstream item before running this collection builder.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!itemKinds.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect single artifacts that all share the same type before building a collection.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (existingItemKinds.length && !existingItemKinds.includes(itemKinds[0])) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'The Existing Collection input must use the same item type as the connected Items input.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          const orderLabel = String(node.config?.insertionMode || '').trim() === 'prepend' ? 'before' : 'after';
+          summary.readiness = {
+            tone: 'info',
+            message: 'This builder keeps the Items connections in order and places them ' + orderLabel + ' the existing collection when one is connected.',
+          };
+        }
+      }
+
+      if (node.type === 'collectionAccumulator') {
+        const accumulatorIssues = graph.collectionAccumulatorIssuesByNodeId.get(node.id) || [];
+        const accumulatorMeta = graph.collectionAccumulatorsByNodeId.get(node.id) || null;
+        if (accumulatorIssues.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: accumulatorIssues[0],
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (accumulatorMeta) {
+          summary.readiness = {
+            tone: 'info',
+            message: buildCollectionAccumulatorReadinessMessage(node, accumulatorMeta),
+          };
+        }
+      }
+
+      if (node.type === 'collectionOutput') {
+        const collectionKinds = getIncomingKindsForNodePort(node, 'collection', graph);
+        if (!collectionKinds.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a typed collection before running this output step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This output saves an ordered collection manifest and keeps the item order explicit in the run folder.',
+          };
+        }
+      }
+
+      if (node.type === 'mediaComposition') {
+        const visualKinds = getIncomingKindsForNodePort(node, 'visuals', graph);
+        if (!visualKinds.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect an ordered image collection before building this media composition.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step keeps the visual collection order explicit and can attach one primary audio track before export.',
+          };
+        }
+      }
+
+      if (node.type === 'mediaExport') {
+        const compositionKinds = getIncomingKindsForNodePort(node, 'composition', graph);
+        if (!compositionKinds.length) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a media composition before running this export step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This export renders the connected composition to a video artifact through the shared ffmpeg-backed export path.',
+          };
+        }
+      }
     }
 
     const compatibilityEntry = getCompatibilityEntry(node, contextMaps);
@@ -3542,12 +3987,18 @@ module.exports = {
   PORT_KIND_ANY,
   PORT_KIND_AUDIO,
   PORT_KIND_AUDIO_FILE,
+  PORT_KIND_COLLECTION,
+  PORT_KIND_COMPOSITION,
   PORT_KIND_FILE,
   PORT_KIND_IMAGE,
   PORT_KIND_PASSTHROUGH,
   PORT_KIND_TEXT,
   PORT_KIND_VIDEO,
   SUPPORTED_PORT_KINDS,
+  createCollectionPortKind,
+  formatPortKindLabel,
+  getCollectionItemKind,
+  isCollectionPortKind,
   VIDEO_WORKFLOW_TOOL_IDS,
   WHISPER_MODELS,
   analyzePipeline,
@@ -3587,6 +4038,8 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
+
+
 
 
 

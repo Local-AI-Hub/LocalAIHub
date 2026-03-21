@@ -13,9 +13,15 @@ const {
   buildFileArtifact,
   buildTerminalResult,
   copyArtifactToOutput,
+  createArtifactCollection,
+  createCompositionArtifact,
   createTextArtifact,
   describeArtifactForLlm,
   ensureRunDirectories,
+  isArtifactCollection,
+  isCompositionArtifact,
+  persistArtifactCollection,
+  persistCompositionArtifact,
   saveBase64Artifact,
   saveBufferArtifact,
   serializeArtifactForUi,
@@ -30,11 +36,13 @@ const { executeGraphWorkflowNode } = require('./graphWorkflowService');
 const { generateAudioWithLocalAudioTool } = require('./localAudioService');
 const { generateImageWithLocalImageTool } = require('./localImageService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
+const { exportCompositionArtifactToVideo } = require('./mediaCompositionService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
   PIPELINE_OPERATION_IDS,
   PORT_KIND_AUDIO,
+  PORT_KIND_COMPOSITION,
   PORT_KIND_FILE,
   PORT_KIND_IMAGE,
   PORT_KIND_TEXT,
@@ -293,6 +301,7 @@ function createInitialNodeStates(graph) {
   for (const node of graph.pipeline.nodes) {
     nodeStates[node.id] = {
       activeLoops: [],
+      collectionControl: null,
       destinationPath: '',
       finishedAt: null,
       history: [],
@@ -339,10 +348,35 @@ function createLoopStateRecords(graph) {
   return loopStates;
 }
 
+function createCollectionControlStateRecords(graph) {
+  const collectionControlStates = {};
+
+  for (const [nodeId, meta] of graph.collectionAccumulatorsByNodeId.entries()) {
+    const node = graph.nodeMap.get(nodeId) || null;
+    collectionControlStates[nodeId] = {
+      acceptedCount: 0,
+      collection: null,
+      itemKind: '',
+      items: [],
+      lastUpdatedAt: '',
+      loopLabel: meta.loopLabel || '',
+      loopNodeId: meta.loopNodeId || '',
+      message: 'Waiting for accepted items.',
+      nodeId,
+      nodeLabel: node?.label || '',
+      status: 'idle',
+      targetCount: Number(meta.targetCount || 1) || 1,
+    };
+  }
+
+  return collectionControlStates;
+}
+
 function createRunRecord(analysis, graph, runDirectories) {
   const runId = createUniqueId('run');
-  return {
+  const run = {
     cancelRequested: false,
+    collectionControlStates: createCollectionControlStateRecords(graph),
     currentNodeId: null,
     directories: runDirectories,
     executionOrder: [...analysis.executionOrder],
@@ -362,6 +396,12 @@ function createRunRecord(analysis, graph, runDirectories) {
     terminalNodeIds: [...analysis.terminalNodeIds],
     terminalResults: [],
   };
+
+  for (const nodeId of Object.keys(run.collectionControlStates || {})) {
+    syncNodeCollectionControlState(run, nodeId);
+  }
+
+  return run;
 }
 
 function serializeRun(run) {
@@ -534,6 +574,67 @@ function applyNodeLoopState(nodeState, loopState) {
   nodeState.loopPathLabel = loopState?.loopPathLabel || '';
 }
 
+function buildCollectionControlSnapshot(collectionState) {
+  if (!collectionState) {
+    return null;
+  }
+
+  return {
+    acceptedCount: Number(collectionState.acceptedCount || 0) || 0,
+    itemKind: String(collectionState.itemKind || '').trim(),
+    loopLabel: String(collectionState.loopLabel || '').trim(),
+    loopNodeId: String(collectionState.loopNodeId || '').trim(),
+    message: String(collectionState.message || '').trim(),
+    status: String(collectionState.status || 'idle').trim() || 'idle',
+    targetCount: Number(collectionState.targetCount || 0) || 0,
+  };
+}
+
+function applyNodeCollectionControlState(nodeState, collectionState) {
+  if (!nodeState) {
+    return;
+  }
+
+  nodeState.collectionControl = buildCollectionControlSnapshot(collectionState);
+}
+
+function syncNodeCollectionControlState(run, nodeId) {
+  if (!run || !nodeId) {
+    return;
+  }
+
+  applyNodeCollectionControlState(run.nodeStates?.[nodeId], run.collectionControlStates?.[nodeId] || null);
+}
+
+function resetCollectionControlStateForFreshPass(collectionState) {
+  if (!collectionState) {
+    return;
+  }
+
+  collectionState.acceptedCount = 0;
+  collectionState.collection = null;
+  collectionState.itemKind = '';
+  collectionState.items = [];
+  collectionState.lastUpdatedAt = '';
+  collectionState.message = 'Waiting for accepted items.';
+  collectionState.status = 'idle';
+}
+
+function resetCollectionControlStatesForLoop(run, graph, loopNodeId) {
+  if (!run?.collectionControlStates || !loopNodeId) {
+    return;
+  }
+
+  for (const [nodeId, collectionState] of Object.entries(run.collectionControlStates)) {
+    if (String(collectionState?.loopNodeId || '') !== String(loopNodeId)) {
+      continue;
+    }
+
+    resetCollectionControlStateForFreshPass(collectionState);
+    syncNodeCollectionControlState(run, nodeId);
+  }
+}
+
 function appendHistoryEntry(entries, entry, maxEntries = 12) {
   const history = Array.isArray(entries) ? [...entries] : [];
   history.push(entry);
@@ -613,6 +714,7 @@ function resetNestedLoopStatesForRetry(run, graph, loopNodeId) {
     }
 
     resetLoopStateForFreshPass(nestedLoopState);
+    resetCollectionControlStatesForLoop(run, graph, nestedLoopNodeId);
   }
 }
 
@@ -645,6 +747,7 @@ function resetLoopSegmentForRetry(run, graph, loopNodeId, nextAttempt) {
     nodeState.destinationPath = '';
     nodeState.validation = null;
     applyNodeLoopState(nodeState, getNodeLoopState(run, graph, segmentNodeId));
+    applyNodeCollectionControlState(nodeState, run.collectionControlStates?.[segmentNodeId] || null);
   }
 }
 
@@ -775,6 +878,56 @@ function createArtifactTerminationSignature(artifact) {
     String(artifact.height || ''),
     String(artifact.sizeBytes || ''),
   ];
+  if (isCompositionArtifact(artifact)) {
+    const trackSignature = (Array.isArray(artifact?.composition?.tracks) ? artifact.composition.tracks : [])
+      .map((track, index) => {
+        if (String(track?.kind || '').trim() === 'visual-sequence') {
+          return [
+            String(index),
+            String(track?.role || ''),
+            String(track?.itemDurationSeconds || ''),
+            (Array.isArray(track?.items) ? track.items : []).map((entry, itemIndex) => [
+              String(itemIndex),
+              String(entry?.itemId || ''),
+              String(entry?.summary || ''),
+              createArtifactTerminationSignature(entry?.artifact || null),
+            ].join('::')).join('|'),
+          ].join('::');
+        }
+
+        return [
+          String(index),
+          String(track?.role || ''),
+          createArtifactTerminationSignature(track?.artifact || null),
+        ].join('::');
+      })
+      .join('|');
+    return signatureParts.concat([
+      String(artifact?.composition?.recipeId || ''),
+      String(artifact?.composition?.exportKind || ''),
+      trackSignature,
+    ]).join('|');
+  }
+
+  if (isArtifactCollection(artifact)) {
+    const itemSignature = (Array.isArray(artifact.items) ? artifact.items : [])
+      .map((entry, index) => {
+        const itemArtifact = entry?.artifact || null;
+        return [
+          String(index),
+          String(entry?.itemId || ''),
+          String(entry?.summary || ''),
+          itemArtifact ? createArtifactTerminationSignature(itemArtifact) : '',
+        ].join('::');
+      })
+      .join('|');
+    return signatureParts.concat([
+      String(artifact.itemKind || ''),
+      String(artifact.itemCount || 0),
+      itemSignature,
+    ]).join('|');
+  }
+
   const filePath = String(artifact.filePath || '').trim();
   if (!filePath) {
     return signatureParts.join('|');
@@ -817,6 +970,55 @@ function createArtifactTerminationSignature(artifact) {
   return signatureParts.join('|');
 }
 
+function buildCollectionAccumulatorEntryKey(artifact, lineage, sourceRunCount = 0) {
+  const sourceNodeId = String(lineage?.sourceNodeId || '').trim();
+  const sourcePortId = String(lineage?.sourcePortId || '').trim();
+  const artifactSignature = createArtifactTerminationSignature(artifact);
+  const normalizedRunCount = Number(sourceRunCount || 0) || 0;
+  if (!sourceNodeId && !sourcePortId && !artifactSignature) {
+    return '';
+  }
+
+  return [sourceNodeId, sourcePortId, String(normalizedRunCount), artifactSignature].join('::');
+}
+
+function getRetryLoopAccumulatorCollectionState(node, graph, completeArtifact) {
+  if (!node?.id || !graph || !completeArtifact || !isArtifactCollection(completeArtifact)) {
+    return null;
+  }
+
+  const completeEdges = getIncomingEdgesForPortKey(graph, node.id + ':complete') || [];
+  if (completeEdges.length !== 1) {
+    return null;
+  }
+
+  const completeEdge = completeEdges[0];
+  const sourceNode = graph.nodeMap.get(completeEdge.source.nodeId) || null;
+  if (!sourceNode || sourceNode.type !== 'collectionAccumulator' || completeEdge.source.portId !== 'collection') {
+    return null;
+  }
+
+  const accumulation = completeArtifact.accumulation && typeof completeArtifact.accumulation === 'object'
+    ? completeArtifact.accumulation
+    : null;
+  const acceptedCount = Number(accumulation?.acceptedCount || completeArtifact.itemCount || 0) || 0;
+  const targetCount = Number(accumulation?.targetCount || acceptedCount || 1) || 1;
+  return {
+    acceptedCount,
+    nodeId: sourceNode.id,
+    nodeLabel: String(accumulation?.nodeLabel || sourceNode.label || 'Accumulate Until Target').trim() || 'Accumulate Until Target',
+    status: String(accumulation?.status || '').trim() || 'collecting',
+    targetCount,
+  };
+}
+
+function buildRetryLoopAccumulatorProgressMessage(loopNode, accumulatorState, suffix) {
+  if (!accumulatorState) {
+    return (loopNode?.label || 'Retry Loop') + (suffix ? ' ' + suffix : '.');
+  }
+
+  return accumulatorState.nodeLabel + ' is holding ' + accumulatorState.acceptedCount + ' of ' + accumulatorState.targetCount + ' accepted items' + (suffix ? ' ' + suffix : '.');
+}
 function finalizeRetryLoopTermination({ action, loopState, message, nodeLoopState, retryArtifact, maxAttempts }) {
   const completed = action === 'complete';
   loopState.carriedArtifact = null;
@@ -1862,7 +2064,11 @@ function executeBranchMergeNode(node, graph, run) {
 function executeRetryLoopNode(node, graph, run) {
   const completeArtifact = getNodeInputArtifact(node.id, 'complete', graph, run.resultsByNodeId, run);
   const retryArtifact = getNodeInputArtifact(node.id, 'retry', graph, run.resultsByNodeId, run);
-  if (completeArtifact && retryArtifact) {
+  const accumulatorCollectionState = getRetryLoopAccumulatorCollectionState(node, graph, completeArtifact);
+  const accumulatorCollecting = accumulatorCollectionState?.status === 'collecting';
+  const accumulatorEmitted = accumulatorCollectionState?.status === 'emitted';
+
+  if (completeArtifact && retryArtifact && !accumulatorCollecting && !accumulatorEmitted) {
     throw new Error('This Retry Loop node received both the Complete and Retry branches at the same time. Keep the loop exit and retry paths mutually exclusive.');
   }
 
@@ -1880,26 +2086,28 @@ function executeRetryLoopNode(node, graph, run) {
   const maxAttempts = Number(loopState.maxAttempts || loopMeta.maxAttempts || 1);
   const nodeLoopState = getNodeLoopState(run, graph, node.id);
   const terminationAction = resolveRetryLoopTerminationAction(loopMeta, node);
-  if (completeArtifact) {
+
+  if (completeArtifact && !accumulatorCollecting && (accumulatorEmitted || !retryArtifact)) {
     loopState.carriedArtifact = null;
     loopState.lastRetryArtifactSignature = '';
     loopState.status = 'completed';
+    const completedMessage = accumulatorEmitted && retryArtifact
+      ? node.label + ' completed because ' + accumulatorCollectionState.nodeLabel + ' reached ' + accumulatorCollectionState.acceptedCount + ' of ' + accumulatorCollectionState.targetCount + ' accepted items, so the live Retry branch was ignored.'
+      : currentAttempt > 1
+        ? node.label + ' exited the loop on attempt ' + currentAttempt + ' of ' + maxAttempts + '.'
+        : node.label + ' exited the loop on the first attempt.';
     recordLoopHistory(loopState, {
       activeLoops: nodeLoopState.activeLoops,
       attempt: currentAttempt,
       loopMaxAttempts: maxAttempts,
       loopPathLabel: nodeLoopState.loopPathLabel,
-      message: currentAttempt > 1
-        ? node.label + ' exited the loop on attempt ' + currentAttempt + ' of ' + maxAttempts + '.'
-        : node.label + ' exited the loop on the first attempt.',
+      message: completedMessage,
       preview: summarizeArtifact(completeArtifact),
       selectedBranch: 'complete',
       status: 'completed',
     });
     return {
-      message: currentAttempt > 1
-        ? node.label + ' exited the loop on attempt ' + currentAttempt + ' of ' + maxAttempts + '.'
-        : node.label + ' exited the loop on the first attempt.',
+      message: completedMessage,
       outputs: {
         result: completeArtifact,
       },
@@ -1915,6 +2123,90 @@ function executeRetryLoopNode(node, graph, run) {
     && loopState.lastRetryArtifactSignature
     && retrySignature === loopState.lastRetryArtifactSignature
   );
+
+  if (accumulatorCollecting) {
+    if (repeatedRetryArtifact) {
+      const repeatedMessage = buildRetryLoopAccumulatorProgressMessage(
+        node,
+        accumulatorCollectionState,
+        'but the Retry branch repeated the same artifact twice in a row. Adjust the loop or disable that stop rule before running it again.',
+      );
+      loopState.carriedArtifact = null;
+      loopState.lastRetryArtifactSignature = '';
+      loopState.status = 'failed';
+      recordLoopHistory(loopState, {
+        activeLoops: nodeLoopState.activeLoops,
+        attempt: currentAttempt,
+        loopMaxAttempts: maxAttempts,
+        loopPathLabel: nodeLoopState.loopPathLabel,
+        message: repeatedMessage,
+        preview: retryArtifact ? summarizeArtifact(retryArtifact) : summarizeArtifact(completeArtifact),
+        selectedBranch: 'retry-terminated',
+        status: 'failed',
+      });
+      throw new Error(repeatedMessage);
+    }
+
+    if (currentAttempt >= maxAttempts) {
+      const maxAttemptMessage = buildRetryLoopAccumulatorProgressMessage(
+        node,
+        accumulatorCollectionState,
+        'before ' + node.label + ' reached its ' + maxAttempts + '-attempt limit. Raise the loop limit or lower the target count before running it again.',
+      );
+      loopState.carriedArtifact = null;
+      loopState.lastRetryArtifactSignature = '';
+      loopState.status = 'failed';
+      recordLoopHistory(loopState, {
+        activeLoops: nodeLoopState.activeLoops,
+        attempt: currentAttempt,
+        loopMaxAttempts: maxAttempts,
+        loopPathLabel: nodeLoopState.loopPathLabel,
+        message: maxAttemptMessage,
+        preview: retryArtifact ? summarizeArtifact(retryArtifact) : summarizeArtifact(completeArtifact),
+        selectedBranch: 'collecting',
+        status: 'failed',
+      });
+      throw new Error(maxAttemptMessage);
+    }
+
+    const collectingMessage = retryArtifact
+      ? buildRetryLoopAccumulatorProgressMessage(
+          node,
+          accumulatorCollectionState,
+          'and the Retry branch is still active, so ' + node.label + ' is starting attempt ' + (currentAttempt + 1) + ' of ' + maxAttempts + ' from ' + loopMeta.retryTargetLabel + '.',
+        )
+      : buildRetryLoopAccumulatorProgressMessage(
+          node,
+          accumulatorCollectionState,
+          'so ' + node.label + ' is starting attempt ' + (currentAttempt + 1) + ' of ' + maxAttempts + ' from ' + loopMeta.retryTargetLabel + '.',
+        );
+    loopState.carriedArtifact = retryArtifact || null;
+    loopState.lastRetryArtifactSignature = retrySignature;
+    loopState.status = 'retrying';
+    recordLoopHistory(loopState, {
+      activeLoops: nodeLoopState.activeLoops,
+      attempt: currentAttempt,
+      loopMaxAttempts: maxAttempts,
+      loopPathLabel: nodeLoopState.loopPathLabel,
+      message: collectingMessage,
+      preview: retryArtifact ? summarizeArtifact(retryArtifact) : summarizeArtifact(completeArtifact),
+      selectedBranch: retryArtifact ? 'retry' : 'collecting',
+      status: 'retrying',
+    });
+    return {
+      message: collectingMessage,
+      outputs: {},
+      preview: retryArtifact ? summarizeArtifact(retryArtifact) : summarizeArtifact(completeArtifact),
+      selectedBranch: retryArtifact ? 'retry' : 'collecting',
+      loopControl: {
+        action: 'retry',
+        loopNodeId: node.id,
+        nextAttempt: currentAttempt + 1,
+        retryTargetNodeId: loopMeta.retryTargetNodeId,
+      },
+    };
+  }
+
   if (repeatedRetryArtifact) {
     const repeatedMessage = terminationAction === 'complete'
       ? node.label + ' stopped after attempt ' + currentAttempt + ' because the Retry branch produced the same artifact twice in a row, so Local AI Hub kept the latest retry artifact.'
@@ -1969,6 +2261,316 @@ function executeRetryLoopNode(node, graph, run) {
     },
   };
 }
+function buildCollectionLineageFromEntry(entry, graph) {
+  if (!entry?.edge) {
+    return null;
+  }
+
+  const sourceNode = graph.nodeMap.get(entry.edge.source.nodeId) || null;
+  const sourcePort = getPortDefinition(sourceNode?.type, 'output', entry.edge.source.portId) || null;
+  return {
+    sourceNodeId: sourceNode?.id || String(entry.edge.source.nodeId || '').trim(),
+    sourceNodeLabel: sourceNode?.label || '',
+    sourcePortId: String(entry.edge.source.portId || '').trim(),
+    sourcePortLabel: sourcePort?.label || '',
+  };
+}
+
+async function executeCollectionAccumulatorNode(node, graph, run) {
+  const itemEntries = getNodeInputArtifacts(node.id, 'item', graph, run.resultsByNodeId, run);
+  if (!itemEntries.length) {
+    throw new Error('This accumulation step did not receive any accepted items yet. Connect one or more validation pass branches here and try again.');
+  }
+
+  const acceptedItems = itemEntries.map((entry) => {
+    const itemArtifact = entry?.artifact || null;
+    if (!itemArtifact) {
+      return null;
+    }
+
+    if (isArtifactCollection(itemArtifact)) {
+      throw new Error('This first accumulation step only accepts single artifacts from accepted branches. Feed completed collections through Collection Builder or Collection Output instead.');
+    }
+
+    const itemKind = String(itemArtifact.kind || '').trim();
+    if (!itemKind) {
+      throw new Error('One accepted item for this accumulation step was missing its artifact type.');
+    }
+
+    const lineage = buildCollectionLineageFromEntry(entry, graph);
+    const sourceRunCount = Number(run.nodeStates?.[String(lineage?.sourceNodeId || '')]?.runCount || 0) || 0;
+    return {
+      artifact: itemArtifact,
+      entryKey: buildCollectionAccumulatorEntryKey(itemArtifact, lineage, sourceRunCount),
+      itemKind,
+      lineage,
+    };
+  }).filter(Boolean);
+
+  if (!acceptedItems.length) {
+    throw new Error('This accumulation step did not receive any accepted items yet. Connect one or more validation pass branches here and try again.');
+  }
+
+  const accumulationMeta = graph.collectionAccumulatorsByNodeId.get(node.id) || null;
+  const collectionState = run.collectionControlStates?.[node.id] || null;
+  if (!accumulationMeta || !collectionState) {
+    throw new Error('Local AI Hub could not prepare that accumulation step. Reopen the pipeline and try again.');
+  }
+
+  const targetCount = Number(collectionState.targetCount || accumulationMeta.targetCount || 0) || 0;
+  if (!Number.isInteger(targetCount) || targetCount < 1) {
+    throw new Error('Enter a whole target count of at least 1 for this accumulation step.');
+  }
+
+  const itemKind = acceptedItems[0].itemKind;
+  if (collectionState.itemKind && collectionState.itemKind !== itemKind) {
+    throw new Error('This accumulation step can only keep one artifact type in this pass. Keep every accepted item on the same artifact type.');
+  }
+
+  if (acceptedItems.some((entry) => entry.itemKind !== itemKind)) {
+    throw new Error('This accumulation step can only keep one artifact type in this pass. Keep every accepted item on the same artifact type.');
+  }
+
+  const acceptedEntryKeys = new Set(Array.isArray(collectionState.acceptedEntryKeys) ? collectionState.acceptedEntryKeys.filter(Boolean) : []);
+  const newAcceptedItems = acceptedItems.filter((entry) => !entry.entryKey || !acceptedEntryKeys.has(entry.entryKey));
+  const orderedItems = [
+    ...(Array.isArray(collectionState.items) ? collectionState.items : []),
+    ...newAcceptedItems.map((entry) => ({
+      artifact: entry.artifact,
+      lineage: entry.lineage,
+    })),
+  ];
+  const acceptedCount = orderedItems.length;
+  const newAcceptedCount = newAcceptedItems.length;
+  const collectionStatus = acceptedCount >= targetCount ? 'emitted' : 'collecting';
+  const collectionSnapshot = createArtifactCollection(orderedItems, {
+    accumulation: {
+      acceptedCount,
+      mode: 'until-target',
+      nodeId: node.id,
+      nodeLabel: node.label,
+      status: collectionStatus,
+      targetCount,
+    },
+    displayName: node.label,
+    role: 'generated',
+  });
+
+  collectionState.acceptedCount = acceptedCount;
+  collectionState.acceptedEntryKeys = [
+    ...acceptedEntryKeys,
+    ...newAcceptedItems.map((entry) => entry.entryKey).filter(Boolean),
+  ];
+  collectionState.collection = collectionSnapshot;
+  collectionState.itemKind = collectionSnapshot.itemKind;
+  collectionState.items = collectionSnapshot.items.map((entry) => ({
+    artifact: entry?.artifact || null,
+    itemId: String(entry?.itemId || '').trim(),
+    lineage: entry?.lineage || null,
+  }));
+  collectionState.lastUpdatedAt = new Date().toISOString();
+  collectionState.status = collectionStatus;
+
+  if (acceptedCount >= targetCount) {
+    const persistedCollection = await persistArtifactCollection(run.directories, collectionSnapshot, {
+      baseName: node.label,
+      displayName: node.label,
+      role: 'generated',
+      target: 'artifacts',
+    });
+    collectionState.collection = persistedCollection;
+    collectionState.items = persistedCollection.items.map((entry) => ({
+      artifact: entry?.artifact || null,
+      itemId: String(entry?.itemId || '').trim(),
+      lineage: entry?.lineage || null,
+    }));
+    collectionState.message = node.label + ' kept ' + newAcceptedCount + ' new accepted item' + (newAcceptedCount === 1 ? '' : 's') + ' this pass, reached ' + acceptedCount + ' of ' + targetCount + ', and emitted the ordered collection.';
+    syncNodeCollectionControlState(run, node.id);
+    return {
+      message: collectionState.message,
+      outputs: {
+        collection: persistedCollection,
+      },
+      preview: summarizeArtifact(persistedCollection),
+      selectedBranch: 'emitted',
+    };
+  }
+
+  collectionState.message = node.label + ' kept ' + newAcceptedCount + ' new accepted item' + (newAcceptedCount === 1 ? '' : 's') + ' this pass and is holding ' + acceptedCount + ' of ' + targetCount + ' while the loop keeps collecting.';
+  syncNodeCollectionControlState(run, node.id);
+  return {
+    message: collectionState.message,
+    outputs: {
+      collection: collectionSnapshot,
+    },
+    preview: summarizeArtifact(collectionSnapshot),
+    selectedBranch: 'collecting',
+  };
+}
+async function executeCollectionBuilderNode(node, graph, run) {
+  const itemEntries = getNodeInputArtifacts(node.id, 'items', graph, run.resultsByNodeId, run);
+  if (!itemEntries.length) {
+    throw new Error('This collection builder did not receive any items yet. Connect one or more upstream items and try again.');
+  }
+
+  const existingCollection = getNodeInputArtifact(node.id, 'existing', graph, run.resultsByNodeId, run);
+  if (existingCollection && !isArtifactCollection(existingCollection)) {
+    throw new Error('The Existing Collection input must receive a saved collection value, not a single artifact.');
+  }
+
+  const newItems = itemEntries.map((entry) => {
+    if (isArtifactCollection(entry?.artifact)) {
+      throw new Error('The Items input only accepts single artifacts. Connect an existing collection through the Existing Collection port instead.');
+    }
+
+    return {
+      artifact: entry.artifact,
+      lineage: buildCollectionLineageFromEntry(entry, graph),
+    };
+  });
+
+  const existingItems = Array.isArray(existingCollection?.items)
+    ? existingCollection.items.map((entry) => ({
+        artifact: entry?.artifact || null,
+        itemId: String(entry?.itemId || '').trim(),
+        lineage: entry?.lineage || null,
+      })).filter((entry) => entry.artifact)
+    : [];
+  const insertionMode = String(node.config?.insertionMode || '').trim() === 'prepend' ? 'prepend' : 'append';
+  const orderedNewItems = insertionMode === 'prepend' ? [...newItems].reverse() : newItems;
+  const orderedItems = insertionMode === 'prepend'
+    ? [...orderedNewItems, ...existingItems]
+    : [...existingItems, ...orderedNewItems];
+
+  const collection = createArtifactCollection(orderedItems, {
+    displayName: node.label,
+    role: 'generated',
+  });
+  const persistedCollection = await persistArtifactCollection(run.directories, collection, {
+    baseName: node.label,
+    displayName: node.label,
+    role: 'generated',
+    target: 'artifacts',
+  });
+  const actionMessage = existingItems.length
+    ? insertionMode === 'prepend'
+      ? 'Collection Builder placed the new items before the existing collection.'
+      : 'Collection Builder appended the new items to the existing collection.'
+    : 'Collection Builder created an ordered collection.';
+  return {
+    message: actionMessage,
+    outputs: {
+      collection: persistedCollection,
+    },
+    preview: summarizeArtifact(persistedCollection),
+  };
+}
+
+async function executeMediaCompositionNode(node, graph, run) {
+  const visualCollection = getNodeInputArtifact(node.id, 'visuals', graph, run.resultsByNodeId, run);
+  if (!isArtifactCollection(visualCollection)) {
+    throw new Error('This media composition step needs an ordered image collection on the Visual Collection input.');
+  }
+  if (String(visualCollection.itemKind || '').trim() !== PORT_KIND_IMAGE) {
+    throw new Error('This first media composition pass only accepts ordered image collections as the visual track input.');
+  }
+
+  const durationSeconds = Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4);
+  const visualItems = (Array.isArray(visualCollection.items) ? visualCollection.items : [])
+    .map((entry, index) => ({
+      artifact: entry?.artifact || null,
+      durationSeconds,
+      itemId: String(entry?.itemId || '').trim() || `visual-${index + 1}`,
+      lineage: entry?.lineage || null,
+      summary: String(entry?.summary || summarizeArtifact(entry?.artifact || null)).trim(),
+    }))
+    .filter((entry) => entry.artifact);
+  if (!visualItems.length) {
+    throw new Error('This media composition does not have any saved images to assemble yet.');
+  }
+
+  const audioArtifact = getNodeInputArtifact(node.id, 'audio', graph, run.resultsByNodeId, run);
+  if (audioArtifact && String(audioArtifact.kind || '').trim() !== PORT_KIND_AUDIO) {
+    throw new Error('The Primary Audio input needs one audio artifact when it is connected.');
+  }
+
+  const composition = createCompositionArtifact({
+    displayName: node.label,
+    exportKind: PORT_KIND_VIDEO,
+    recipeId: 'image-sequence-primary-audio',
+    recipeLabel: 'Image sequence with primary audio',
+    tracks: [
+      {
+        id: 'visual-track',
+        itemDurationSeconds: durationSeconds,
+        itemKind: PORT_KIND_IMAGE,
+        items: visualItems,
+        kind: 'visual-sequence',
+        role: 'primary-visual',
+        sourceCollection: {
+          directoryPath: String(visualCollection.directoryPath || '').trim(),
+          displayName: String(visualCollection.displayName || '').trim(),
+          itemCount: Number(visualCollection.itemCount || visualItems.length) || visualItems.length,
+          itemKind: String(visualCollection.itemKind || '').trim() || PORT_KIND_IMAGE,
+          manifestPath: String(visualCollection.manifestPath || '').trim(),
+          summary: String(visualCollection.summary || '').trim(),
+        },
+      },
+      ...(audioArtifact ? [{
+        artifact: audioArtifact,
+        id: 'audio-track',
+        kind: 'audio',
+        role: 'primary-audio',
+      }] : []),
+    ],
+  }, {
+    displayName: node.label,
+    role: 'generated',
+  });
+  const persistedComposition = await persistCompositionArtifact(run.directories, composition, {
+    baseName: node.label,
+    displayName: node.label,
+    role: 'generated',
+    target: 'artifacts',
+  });
+
+  return {
+    message: audioArtifact
+      ? 'Media Composition prepared the ordered images with the connected primary audio track.'
+      : 'Media Composition prepared the ordered images without a primary audio track yet.',
+    outputs: {
+      composition: persistedComposition,
+    },
+    preview: summarizeArtifact(persistedComposition),
+  };
+}
+
+async function executeMediaExportNode(node, graph, run, reportProgress) {
+  const compositionArtifact = getNodeInputArtifact(node.id, 'composition', graph, run.resultsByNodeId, run);
+  if (!isCompositionArtifact(compositionArtifact)) {
+    throw new Error('This media export step needs a saved media composition before it can render a video.');
+  }
+
+  const exportResult = await exportCompositionArtifactToVideo(compositionArtifact, {
+    fitMode: String(node.config?.fitMode || '').trim() === 'cover' ? 'cover' : 'contain',
+    fps: Math.max(1, Number(node.config?.fps || 0) || 30),
+    height: Math.max(16, Number(node.config?.height || 0) || 720),
+    reportProgress,
+    runDirectories: run.directories,
+    stopMode: String(node.config?.stopMode || '').trim() === 'visuals' ? 'visuals' : 'shortest',
+    title: String(node.config?.title || node.label || 'Composed video').trim() || 'Composed video',
+    width: Math.max(16, Number(node.config?.width || 0) || 1280),
+  });
+
+  return {
+    destinationPath: exportResult.artifact.filePath,
+    message: exportResult.message,
+    outputs: {
+      video: exportResult.artifact,
+    },
+    preview: summarizeArtifact(exportResult.artifact),
+  };
+}
 
 async function executeOutputNode(node, inputPortId, graph, run) {
   const artifact = getNodeInputArtifact(node.id, inputPortId, graph, run.resultsByNodeId, run);
@@ -1979,9 +2581,10 @@ async function executeOutputNode(node, inputPortId, graph, run) {
   const savedArtifact = await copyArtifactToOutput(artifact, run.directories, {
     title: String(node.config?.title || node.label || 'output').trim() || 'output',
   });
+  const destinationPath = savedArtifact.destinationPath || savedArtifact.directoryPath || savedArtifact.filePath || '';
   return {
-    destinationPath: savedArtifact.destinationPath || savedArtifact.filePath || '',
-    message: `${String(node.config?.title || node.label || 'Output').trim() || 'Output'} saved to ${savedArtifact.destinationPath || savedArtifact.filePath}.`,
+    destinationPath,
+    message: `${String(node.config?.title || node.label || 'Output').trim() || 'Output'} saved to ${destinationPath}.`,
     outputs: {
       [inputPortId]: savedArtifact,
     },
@@ -2486,12 +3089,32 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     return executeValidationNode(node, graph, run, contextMaps, reportProgress);
   }
 
+  if (node.type === 'collectionBuilder') {
+    return executeCollectionBuilderNode(node, graph, run);
+  }
+
+  if (node.type === 'collectionAccumulator') {
+    return executeCollectionAccumulatorNode(node, graph, run);
+  }
+
+  if (node.type === 'mediaComposition') {
+    return executeMediaCompositionNode(node, graph, run);
+  }
+
+  if (node.type === 'mediaExport') {
+    return executeMediaExportNode(node, graph, run, reportProgress);
+  }
+
   if (node.type === 'branchMerge') {
     return executeBranchMergeNode(node, graph, run);
   }
 
   if (node.type === 'retryLoop') {
     return executeRetryLoopNode(node, graph, run);
+  }
+
+  if (node.type === 'collectionOutput') {
+    return executeOutputNode(node, 'collection', graph, run);
   }
 
   if (node.type === 'textOutput') {
@@ -2607,6 +3230,7 @@ async function executeActiveRun(graph, context) {
       nodeState.validation = result.validation || null;
       nodeState.selectedBranch = result.selectedBranch || '';
       nodeState.destinationPath = result.destinationPath || '';
+      syncNodeCollectionControlState(activeRun, nodeId);
 
       if (result.terminalResult) {
         activeRun.terminalResults.push(result.terminalResult);
@@ -2773,6 +3397,21 @@ module.exports = {
   runPipeline,
   setPipelineEventSink,
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

@@ -1,6 +1,6 @@
 {
   "name": "local-ai-hub",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Windows desktop manager for local AI tools",
   "author": "Local AI Hub",
   "private": true,
@@ -18,19 +18,21 @@
     "sign:manifest": "node scripts/sign-tools-manifest.js",
     "verify:manifest": "node scripts/sign-tools-manifest.js --verify",
     "preview": "vite preview",
-    "verify:audio-pipeline": "node scripts/verify-audio-pipeline.js"
+    "verify:audio-pipeline": "node scripts/verify-audio-pipeline.js",
+    "verify:media-composition": "node scripts/verify-pipeline-media-composition.js"
   },
   "dependencies": {
+    "7zip-bin": "^5.2.0",
     "archiver": "^7.0.1",
     "electron-updater": "^6.3.9",
     "extract-zip": "^2.0.1",
+    "ffmpeg-static": "^5.3.0",
     "fs-extra": "^11.2.0",
     "keytar": "^7.9.0",
     "python-shell": "^5.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "systeminformation": "^5.24.7",
-    "7zip-bin": "^5.2.0"
+    "systeminformation": "^5.24.7"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.3",
@@ -101,6 +103,10 @@
       {
         "from": "node_modules/7zip-bin/win/x64/7za.exe",
         "to": "bin/7za.exe"
+      },
+      {
+        "from": "node_modules/ffmpeg-static/ffmpeg.exe",
+        "to": "bin/ffmpeg.exe"
       }
     ]
   }

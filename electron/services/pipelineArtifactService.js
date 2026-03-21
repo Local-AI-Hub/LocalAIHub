@@ -5,6 +5,8 @@ const { pathToFileURL } = require('url');
 const { ensureStorage, getAppPaths } = require('./configService');
 const {
   PORT_KIND_AUDIO,
+  PORT_KIND_COLLECTION,
+  PORT_KIND_COMPOSITION,
   PORT_KIND_FILE,
   PORT_KIND_IMAGE,
   PORT_KIND_TEXT,
@@ -617,9 +619,122 @@ async function ensureRunDirectories(runId) {
   };
 }
 
+function formatArtifactKindLabel(kind) {
+  switch (String(kind || '').trim()) {
+    case PORT_KIND_TEXT:
+      return 'Text';
+    case PORT_KIND_IMAGE:
+      return 'Image';
+    case PORT_KIND_AUDIO:
+      return 'Audio';
+    case PORT_KIND_VIDEO:
+      return 'Video';
+    case PORT_KIND_FILE:
+      return 'File';
+    case PORT_KIND_COLLECTION:
+      return 'Collection';
+    case PORT_KIND_COMPOSITION:
+      return 'Composition';
+    default:
+      return 'Artifact';
+  }
+}
+
+function isArtifactCollection(artifact) {
+  return artifact?.kind === PORT_KIND_COLLECTION && Array.isArray(artifact?.items);
+}
+
+function isCompositionArtifact(artifact) {
+  return artifact?.kind === PORT_KIND_COMPOSITION && artifact?.composition && Array.isArray(artifact?.composition?.tracks);
+}
+
+function normalizeCollectionLineage(lineage) {
+  if (!lineage || typeof lineage !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    sourceNodeId: String(lineage.sourceNodeId || '').trim(),
+    sourceNodeLabel: String(lineage.sourceNodeLabel || '').trim(),
+    sourcePortId: String(lineage.sourcePortId || '').trim(),
+    sourcePortLabel: String(lineage.sourcePortLabel || '').trim(),
+  };
+
+  return Object.values(normalized).some(Boolean) ? normalized : null;
+}
+
+function normalizeCollectionAccumulation(accumulation) {
+  if (!accumulation || typeof accumulation !== 'object') {
+    return null;
+  }
+
+  const targetCount = Number(accumulation.targetCount || 0);
+  const acceptedCount = Number(accumulation.acceptedCount || 0);
+  return {
+    acceptedCount: Math.max(0, acceptedCount || 0),
+    mode: String(accumulation.mode || 'until-target').trim() || 'until-target',
+    nodeId: String(accumulation.nodeId || '').trim(),
+    nodeLabel: String(accumulation.nodeLabel || '').trim(),
+    status: String(accumulation.status || '').trim() || 'collecting',
+    targetCount: Math.max(1, targetCount || acceptedCount || 1),
+  };
+}
+
+function buildCollectionItemId(artifact, index) {
+  const label = artifact?.displayName || artifact?.fileName || artifact?.kind || 'item';
+  return sanitizeSegment(label + '-' + String(index + 1).padStart(3, '0'), 'item-' + String(index + 1).padStart(3, '0'));
+}
+
+function getCompositionTracks(artifact) {
+  return Array.isArray(artifact?.composition?.tracks) ? artifact.composition.tracks.filter(Boolean) : [];
+}
+
+function getCompositionTrackByRole(artifact, role) {
+  return getCompositionTracks(artifact).find((track) => String(track?.role || '').trim() === role) || null;
+}
+
+function buildCompositionSummary(artifact, limit = 180) {
+  const visualTrack = getCompositionTrackByRole(artifact, 'primary-visual');
+  const audioTrack = getCompositionTrackByRole(artifact, 'primary-audio');
+  const visualItemCount = Number(visualTrack?.itemCount || visualTrack?.items?.length || 0) || 0;
+  const itemDurationSeconds = Number(visualTrack?.itemDurationSeconds || 0) || 0;
+  const parts = [
+    String(artifact?.composition?.recipeLabel || '').trim() || 'Media composition',
+    visualItemCount ? `${visualItemCount} image${visualItemCount === 1 ? '' : 's'}` : '',
+    itemDurationSeconds > 0 ? `${Math.round(itemDurationSeconds * 10) / 10}s each` : '',
+    audioTrack?.artifact?.fileName ? `Audio ${audioTrack.artifact.fileName}` : audioTrack ? 'Primary audio attached' : 'No audio track',
+  ].filter(Boolean);
+  return trimPreviewText(parts.join(' | '), limit);
+}
+
+function buildCollectionSummary(artifact, limit = 180) {
+  const items = Array.isArray(artifact?.items) ? artifact.items.filter(Boolean) : [];
+  const itemKindLabel = formatArtifactKindLabel(artifact?.itemKind || items[0]?.artifact?.kind || PORT_KIND_FILE);
+  const countLabel = items.length + ' ' + itemKindLabel.toLowerCase() + (items.length === 1 ? ' item' : ' items');
+  const itemPreview = items
+    .slice(0, 4)
+    .map((entry, index) => {
+      const itemArtifact = entry?.artifact || null;
+      const label = itemArtifact?.displayName || itemArtifact?.fileName || summarizeArtifact(itemArtifact, 64) || 'Item ' + (index + 1);
+      return (index + 1) + '. ' + trimPreviewText(label, 64);
+    })
+    .filter(Boolean)
+    .join(' | ');
+  const extraCount = items.length > 4 ? ' | +' + (items.length - 4) + ' more' : '';
+  return trimPreviewText([countLabel, itemPreview].filter(Boolean).join(' | ') + extraCount, limit);
+}
+
 function summarizeArtifact(artifact, limit = 180) {
   if (!artifact) {
     return '';
+  }
+
+  if (isCompositionArtifact(artifact)) {
+    return buildCompositionSummary(artifact, limit);
+  }
+
+  if (isArtifactCollection(artifact)) {
+    return buildCollectionSummary(artifact, limit);
   }
 
   if (artifact.kind === PORT_KIND_TEXT) {
@@ -666,6 +781,20 @@ function summarizeArtifact(artifact, limit = 180) {
     return trimPreviewText(details.join(' | '), limit);
   }
 
+  if (artifact.kind === PORT_KIND_VIDEO && artifact.compositionExport && typeof artifact.compositionExport === 'object') {
+    const exportProfile = artifact.compositionExport.exportProfile || null;
+    const visualTrack = artifact.compositionExport.visualTrack || null;
+    const details = [
+      artifact.fileName || artifact.displayName || '',
+      artifact.formatLabel || '',
+      exportProfile?.width && exportProfile?.height ? `${exportProfile.width}x${exportProfile.height}` : '',
+      exportProfile?.fps ? `${exportProfile.fps} fps` : '',
+      Number(visualTrack?.itemCount || 0) ? `${visualTrack.itemCount} image${visualTrack.itemCount === 1 ? '' : 's'}` : '',
+      artifact.compositionExport.audioTrack?.artifact?.fileName ? `Audio ${artifact.compositionExport.audioTrack.artifact.fileName}` : '',
+    ].filter(Boolean);
+    return trimPreviewText(details.join(' | '), limit);
+  }
+
   const details = [];
   if (artifact.fileName) {
     details.push(artifact.fileName);
@@ -687,6 +816,183 @@ function summarizeArtifact(artifact, limit = 180) {
 
 function serializeArtifactForUi(artifact) {
   return artifact ? JSON.parse(JSON.stringify(artifact)) : null;
+}
+
+function createArtifactCollection(items, options = {}) {
+  const sourceItems = Array.isArray(items) ? items : [];
+  const normalizedItems = sourceItems
+    .map((entry, index) => {
+      const itemArtifact = serializeArtifactForUi(entry?.artifact || entry);
+      if (!itemArtifact) {
+        return null;
+      }
+
+      return {
+        artifact: itemArtifact,
+        index,
+        itemId: String(entry?.itemId || buildCollectionItemId(itemArtifact, index)).trim() || buildCollectionItemId(itemArtifact, index),
+        lineage: normalizeCollectionLineage(entry?.lineage),
+        summary: summarizeArtifact(itemArtifact),
+      };
+    })
+    .filter(Boolean);
+
+  const itemKinds = [...new Set(normalizedItems.map((entry) => String(entry?.artifact?.kind || '').trim()).filter(Boolean))];
+  const itemKind = String(options.itemKind || itemKinds[0] || '').trim();
+  if (!itemKind) {
+    throw new Error('Local AI Hub could not build a collection without at least one item.');
+  }
+
+  if (itemKinds.length > 1 || itemKinds.some((kind) => kind !== itemKind)) {
+    throw new Error('This collection can only contain one artifact type in this pass. Connect only text, image, audio, video, or file items of the same kind.');
+  }
+
+  const collection = {
+    kind: PORT_KIND_COLLECTION,
+    itemKind,
+    displayName: String(options.displayName || formatArtifactKindLabel(itemKind) + ' Collection').trim() || (formatArtifactKindLabel(itemKind) + ' Collection'),
+    previewKind: 'collection',
+    role: options.role || 'artifact',
+    order: 'explicit',
+    itemCount: normalizedItems.length,
+    items: normalizedItems,
+  };
+
+  if (options.directoryPath) {
+    collection.directoryPath = String(options.directoryPath || '').trim();
+  }
+  if (options.manifestPath) {
+    collection.manifestPath = String(options.manifestPath || '').trim();
+    collection.filePath = collection.manifestPath;
+    collection.fileName = path.basename(collection.manifestPath);
+    collection.fileUrl = pathToFileURL(collection.manifestPath).toString();
+  }
+  if (options.destinationPath) {
+    collection.destinationPath = String(options.destinationPath || '').trim();
+  }
+  if (Array.isArray(options.metadataPaths) && options.metadataPaths.length) {
+    collection.metadataPaths = [...new Set(options.metadataPaths.map((entry) => String(entry || '').trim()).filter(Boolean))];
+  }
+  if (options.accumulation) {
+    collection.accumulation = normalizeCollectionAccumulation(options.accumulation);
+  }
+
+  collection.summary = summarizeArtifact(collection);
+  return collection;
+}
+
+function createCompositionArtifact(spec = {}, options = {}) {
+  const compositionSpec = spec && typeof spec === 'object' ? spec : {};
+  const sourceTracks = Array.isArray(compositionSpec.tracks) ? compositionSpec.tracks : [];
+  const normalizedTracks = sourceTracks
+    .map((track) => {
+      if (!track || typeof track !== 'object') {
+        return null;
+      }
+
+      const trackKind = String(track.kind || '').trim();
+      const trackRole = String(track.role || '').trim();
+      if (trackKind === 'visual-sequence') {
+        const items = (Array.isArray(track.items) ? track.items : [])
+          .map((entry, index) => {
+            const itemArtifact = serializeArtifactForUi(entry?.artifact || null);
+            if (!itemArtifact) {
+              return null;
+            }
+
+            return {
+              artifact: itemArtifact,
+              durationSeconds: Number(entry?.durationSeconds || track.itemDurationSeconds || 0) || 0,
+              index,
+              itemId: String(entry?.itemId || buildCollectionItemId(itemArtifact, index)).trim() || buildCollectionItemId(itemArtifact, index),
+              lineage: normalizeCollectionLineage(entry?.lineage),
+              summary: String(entry?.summary || summarizeArtifact(itemArtifact)).trim() || summarizeArtifact(itemArtifact),
+            };
+          })
+          .filter(Boolean);
+        if (!items.length) {
+          return null;
+        }
+
+        const sourceCollection = track.sourceCollection && typeof track.sourceCollection === 'object'
+          ? {
+              directoryPath: String(track.sourceCollection.directoryPath || '').trim(),
+              displayName: String(track.sourceCollection.displayName || '').trim(),
+              itemCount: Number(track.sourceCollection.itemCount || items.length) || items.length,
+              itemKind: String(track.sourceCollection.itemKind || track.itemKind || PORT_KIND_IMAGE).trim() || PORT_KIND_IMAGE,
+              manifestPath: String(track.sourceCollection.manifestPath || '').trim(),
+              summary: String(track.sourceCollection.summary || '').trim(),
+            }
+          : null;
+
+        return {
+          id: String(track.id || 'visual-track').trim() || 'visual-track',
+          itemCount: items.length,
+          itemDurationSeconds: Number(track.itemDurationSeconds || items[0]?.durationSeconds || 0) || 0,
+          itemKind: String(track.itemKind || PORT_KIND_IMAGE).trim() || PORT_KIND_IMAGE,
+          items,
+          kind: 'visual-sequence',
+          order: 'explicit',
+          role: trackRole || 'primary-visual',
+          sourceCollection,
+          summary: String(track.summary || '').trim(),
+        };
+      }
+
+      if (trackKind === 'audio') {
+        const audioArtifact = serializeArtifactForUi(track.artifact || null);
+        if (!audioArtifact) {
+          return null;
+        }
+
+        return {
+          artifact: audioArtifact,
+          id: String(track.id || 'audio-track').trim() || 'audio-track',
+          kind: 'audio',
+          role: trackRole || 'primary-audio',
+          summary: String(track.summary || summarizeArtifact(audioArtifact)).trim() || summarizeArtifact(audioArtifact),
+        };
+      }
+
+      return serializeArtifactForUi(track);
+    })
+    .filter(Boolean);
+
+  const composition = {
+    schemaVersion: 1,
+    exportKind: String(compositionSpec.exportKind || PORT_KIND_VIDEO).trim() || PORT_KIND_VIDEO,
+    recipeId: String(compositionSpec.recipeId || MEDIA_COMPOSITION_RECIPE_ID).trim() || MEDIA_COMPOSITION_RECIPE_ID,
+    recipeLabel: String(compositionSpec.recipeLabel || MEDIA_COMPOSITION_RECIPE_LABEL).trim() || MEDIA_COMPOSITION_RECIPE_LABEL,
+    tracks: normalizedTracks,
+  };
+
+  const artifact = {
+    kind: PORT_KIND_COMPOSITION,
+    composition,
+    displayName: String(options.displayName || compositionSpec.displayName || 'Media Composition').trim() || 'Media Composition',
+    previewKind: 'composition',
+    role: options.role || compositionSpec.role || 'artifact',
+    trackCount: normalizedTracks.length,
+  };
+
+  if (options.directoryPath) {
+    artifact.directoryPath = String(options.directoryPath || '').trim();
+  }
+  if (options.manifestPath) {
+    artifact.manifestPath = String(options.manifestPath || '').trim();
+    artifact.filePath = artifact.manifestPath;
+    artifact.fileName = path.basename(artifact.manifestPath);
+    artifact.fileUrl = pathToFileURL(artifact.manifestPath).toString();
+  }
+  if (options.destinationPath) {
+    artifact.destinationPath = String(options.destinationPath || '').trim();
+  }
+  if (Array.isArray(options.metadataPaths) && options.metadataPaths.length) {
+    artifact.metadataPaths = [...new Set(options.metadataPaths.map((entry) => String(entry || '').trim()).filter(Boolean))];
+  }
+
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
 }
 
 async function buildFileArtifact(filePath, options = {}) {
@@ -713,6 +1019,10 @@ async function buildFileArtifact(filePath, options = {}) {
     role: options.role || 'artifact',
     sizeBytes: Number(stat.size || 0),
   };
+
+  if (options.compositionExport && typeof options.compositionExport === 'object') {
+    artifact.compositionExport = serializeArtifactForUi(options.compositionExport);
+  }
 
   if ((previewKind === 'image' || previewKind === 'animated-image') && nativeImage) {
     try {
@@ -806,6 +1116,20 @@ async function nextAvailableFilePath(directoryPath, baseName, extension) {
     const filePath = path.join(directoryPath, fileName);
     if (!(await fs.pathExists(filePath))) {
       return filePath;
+    }
+
+    index += 1;
+  }
+}
+
+async function nextAvailableDirectoryPath(parentDirectoryPath, baseName) {
+  const safeBaseName = sanitizeSegment(baseName, 'collection');
+  let index = 0;
+  while (true) {
+    const directoryName = index === 0 ? safeBaseName : `${safeBaseName}-${index + 1}`;
+    const directoryPath = path.join(parentDirectoryPath, directoryName);
+    if (!(await fs.pathExists(directoryPath))) {
+      return directoryPath;
     }
 
     index += 1;
@@ -929,8 +1253,266 @@ async function saveImageArtifactMetadata(filePath, artifact) {
   return [metadataPath];
 }
 
+async function saveVideoArtifactMetadata(filePath, artifact) {
+  const compositionExport = artifact?.compositionExport && typeof artifact.compositionExport === 'object'
+    ? serializeArtifactForUi(artifact.compositionExport)
+    : null;
+  if (!compositionExport) {
+    return [];
+  }
+
+  const metadataPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.composition-export.json`);
+  await fs.writeJson(metadataPath, {
+    compositionExport,
+    displayName: String(artifact?.displayName || '').trim(),
+    fileName: String(artifact?.fileName || '').trim(),
+    formatLabel: String(artifact?.formatLabel || '').trim(),
+    kind: String(artifact?.kind || PORT_KIND_VIDEO).trim() || PORT_KIND_VIDEO,
+    summary: String(artifact?.summary || '').trim(),
+  }, { spaces: 2 });
+
+  return [metadataPath];
+}
+
+async function saveArtifactIntoDirectory(directoryPath, artifact, options = {}) {
+  const itemIndex = Number(options.itemIndex || 0) || 0;
+  const baseName = `${String(itemIndex + 1).padStart(3, '0')}-${sanitizeSegment(options.baseName || artifact?.displayName || artifact?.fileName || artifact?.kind || 'item', 'item')}`;
+  if (artifact.kind === PORT_KIND_TEXT) {
+    const filePath = await nextAvailableFilePath(directoryPath, baseName, '.txt');
+    await fs.writeFile(filePath, `${artifact.text || ''}\n`, 'utf8');
+    const metadataPaths = await saveTextArtifactMetadata(filePath, artifact);
+    const savedArtifact = createTextArtifact(artifact.text || '', {
+      displayName: artifact.displayName || options.baseName || 'Text',
+      role: options.role || artifact.role || 'artifact',
+      transcription: artifact.transcription,
+      metadataPaths,
+    });
+    savedArtifact.fileName = path.basename(filePath);
+    savedArtifact.filePath = filePath;
+    savedArtifact.fileUrl = pathToFileURL(filePath).toString();
+    savedArtifact.mimeType = 'text/plain';
+    savedArtifact.summary = summarizeArtifact(savedArtifact);
+    return savedArtifact;
+  }
+
+  const sourcePath = path.resolve(String(artifact?.filePath || '').trim());
+  if (!sourcePath) {
+    throw new Error('Local AI Hub could not save one of the collection items because its file path is missing.');
+  }
+
+  const extension = path.extname(sourcePath) || KIND_EXTENSIONS[artifact.kind] || '.bin';
+  const filePath = await nextAvailableFilePath(directoryPath, baseName, extension);
+  await fs.copy(sourcePath, filePath, { overwrite: true });
+
+  const metadataPaths = artifact.kind === PORT_KIND_AUDIO
+    ? await saveAudioArtifactMetadata(filePath, artifact)
+    : artifact.kind === PORT_KIND_IMAGE
+      ? await saveImageArtifactMetadata(filePath, artifact)
+      : artifact.kind === PORT_KIND_VIDEO
+        ? await saveVideoArtifactMetadata(filePath, artifact)
+        : [];
+
+  const savedArtifact = await buildFileArtifact(filePath, {
+    audio: artifact.audio,
+    audioGeneration: artifact.audioGeneration,
+    audioTransformation: artifact.audioTransformation,
+    compositionExport: artifact.compositionExport,
+    displayName: artifact.displayName || options.baseName || path.basename(filePath),
+    imageTransformation: artifact.imageTransformation,
+    kind: artifact.kind,
+    role: options.role || artifact.role || 'artifact',
+  });
+  if (metadataPaths.length) {
+    savedArtifact.metadataPaths = metadataPaths;
+  }
+  savedArtifact.sourcePath = sourcePath;
+  savedArtifact.summary = summarizeArtifact(savedArtifact);
+  return savedArtifact;
+}
+
+function buildCollectionManifestItem(entry, directoryPath) {
+  const artifact = entry?.artifact || null;
+  const metadataPaths = Array.isArray(artifact?.metadataPaths) ? artifact.metadataPaths : [];
+  return {
+    itemId: entry?.itemId || '',
+    index: Number(entry?.index || 0) || 0,
+    summary: String(entry?.summary || summarizeArtifact(artifact)).trim(),
+    lineage: entry?.lineage ? serializeArtifactForUi(entry.lineage) : null,
+    artifact: serializeArtifactForUi(artifact),
+    artifactPath: String(artifact?.filePath || '').trim(),
+    relativeArtifactPath: artifact?.filePath ? path.relative(directoryPath, artifact.filePath) : '',
+    metadataPaths: metadataPaths.map((value) => String(value || '').trim()).filter(Boolean),
+    relativeMetadataPaths: metadataPaths.map((value) => path.relative(directoryPath, value)).filter(Boolean),
+  };
+}
+
+function buildCompositionManifestTrack(track, directoryPath) {
+  if (String(track?.kind || '').trim() === 'visual-sequence') {
+    return {
+      id: String(track?.id || '').trim(),
+      itemCount: Number(track?.itemCount || track?.items?.length || 0) || 0,
+      itemDurationSeconds: Number(track?.itemDurationSeconds || 0) || 0,
+      itemKind: String(track?.itemKind || '').trim(),
+      kind: 'visual-sequence',
+      order: String(track?.order || 'explicit').trim() || 'explicit',
+      role: String(track?.role || '').trim(),
+      sourceCollection: track?.sourceCollection ? serializeArtifactForUi(track.sourceCollection) : null,
+      summary: String(track?.summary || '').trim(),
+      items: (Array.isArray(track?.items) ? track.items : []).map((entry) => ({
+        artifact: serializeArtifactForUi(entry?.artifact || null),
+        artifactPath: String(entry?.artifact?.filePath || '').trim(),
+        durationSeconds: Number(entry?.durationSeconds || 0) || 0,
+        index: Number(entry?.index || 0) || 0,
+        itemId: String(entry?.itemId || '').trim(),
+        lineage: entry?.lineage ? serializeArtifactForUi(entry.lineage) : null,
+        relativeArtifactPath: entry?.artifact?.filePath ? path.relative(directoryPath, entry.artifact.filePath) : '',
+        summary: String(entry?.summary || summarizeArtifact(entry?.artifact || null)).trim(),
+      })),
+    };
+  }
+
+  if (String(track?.kind || '').trim() === 'audio') {
+    const artifact = track?.artifact || null;
+    const metadataPaths = Array.isArray(artifact?.metadataPaths) ? artifact.metadataPaths : [];
+    return {
+      artifact: serializeArtifactForUi(artifact),
+      artifactPath: String(artifact?.filePath || '').trim(),
+      id: String(track?.id || '').trim(),
+      kind: 'audio',
+      metadataPaths: metadataPaths.map((value) => String(value || '').trim()).filter(Boolean),
+      relativeArtifactPath: artifact?.filePath ? path.relative(directoryPath, artifact.filePath) : '',
+      relativeMetadataPaths: metadataPaths.map((value) => path.relative(directoryPath, value)).filter(Boolean),
+      role: String(track?.role || '').trim(),
+      summary: String(track?.summary || summarizeArtifact(artifact)).trim(),
+    };
+  }
+
+  return serializeArtifactForUi(track);
+}
+
+async function persistCompositionArtifact(runDirectories, artifact, options = {}) {
+  const targetRoot = options.target === 'outputs' ? runDirectories.outputsDir : runDirectories.artifactsDir;
+  const directoryPath = await nextAvailableDirectoryPath(targetRoot, String(options.baseName || options.title || artifact?.displayName || 'composition') + '-composition');
+  await fs.ensureDir(directoryPath);
+
+  const manifestPath = path.join(directoryPath, 'manifest.json');
+  const savedComposition = createCompositionArtifact({
+    displayName: options.displayName || options.title || artifact?.displayName || 'Media Composition',
+    exportKind: artifact?.composition?.exportKind,
+    recipeId: artifact?.composition?.recipeId,
+    recipeLabel: artifact?.composition?.recipeLabel,
+    role: artifact?.role,
+    tracks: serializeArtifactForUi(artifact?.composition?.tracks || []),
+  }, {
+    destinationPath: options.target === 'outputs' ? directoryPath : '',
+    directoryPath,
+    displayName: options.displayName || options.title || artifact?.displayName || 'Media Composition',
+    manifestPath,
+    metadataPaths: [manifestPath],
+    role: options.role || artifact?.role || (options.target === 'outputs' ? 'output' : 'artifact'),
+  });
+
+  await fs.writeJson(manifestPath, {
+    composition: serializeArtifactForUi(savedComposition.composition),
+    displayName: savedComposition.displayName,
+    kind: PORT_KIND_COMPOSITION,
+    role: savedComposition.role,
+    schemaVersion: 1,
+    summary: savedComposition.summary,
+    trackCount: savedComposition.trackCount,
+    tracks: getCompositionTracks(savedComposition).map((track) => buildCompositionManifestTrack(track, directoryPath)),
+  }, { spaces: 2 });
+
+  return savedComposition;
+}
+
+async function persistArtifactCollection(runDirectories, artifact, options = {}) {
+  const targetRoot = options.target === 'outputs' ? runDirectories.outputsDir : runDirectories.artifactsDir;
+  const directoryPath = await nextAvailableDirectoryPath(targetRoot, String(options.baseName || options.title || artifact?.displayName || 'collection') + '-collection');
+  const itemsDirectoryPath = path.join(directoryPath, 'items');
+  await fs.ensureDir(directoryPath);
+  if (options.copyItems) {
+    await fs.ensureDir(itemsDirectoryPath);
+  }
+
+  const sourceItems = Array.isArray(artifact?.items) ? artifact.items : [];
+  const normalizedItems = [];
+  for (let index = 0; index < sourceItems.length; index += 1) {
+    const entry = sourceItems[index];
+    const itemArtifact = entry?.artifact || null;
+    if (!itemArtifact) {
+      continue;
+    }
+
+    const savedArtifact = options.copyItems
+      ? await saveArtifactIntoDirectory(itemsDirectoryPath, itemArtifact, {
+          baseName: itemArtifact.displayName || itemArtifact.fileName || artifact?.itemKind || 'item',
+          itemIndex: index,
+          role: options.itemRole || itemArtifact.role || 'artifact',
+        })
+      : serializeArtifactForUi(itemArtifact);
+    if (savedArtifact) {
+      savedArtifact.summary = summarizeArtifact(savedArtifact);
+    }
+    normalizedItems.push({
+      artifact: savedArtifact,
+      itemId: String(entry?.itemId || buildCollectionItemId(savedArtifact, index)).trim() || buildCollectionItemId(savedArtifact, index),
+      lineage: normalizeCollectionLineage(entry?.lineage),
+    });
+  }
+
+  const manifestPath = path.join(directoryPath, 'manifest.json');
+  const savedCollection = createArtifactCollection(normalizedItems, {
+    accumulation: artifact?.accumulation,
+    destinationPath: options.target === 'outputs' ? directoryPath : '',
+    directoryPath,
+    displayName: options.displayName || options.title || artifact?.displayName || 'Collection',
+    itemKind: artifact?.itemKind,
+    manifestPath,
+    metadataPaths: [manifestPath],
+    role: options.role || artifact?.role || (options.target === 'outputs' ? 'output' : 'artifact'),
+  });
+
+  await fs.writeJson(manifestPath, {
+    schemaVersion: 1,
+    kind: PORT_KIND_COLLECTION,
+    itemCount: savedCollection.itemCount,
+    itemKind: savedCollection.itemKind,
+    displayName: savedCollection.displayName,
+    order: savedCollection.order,
+    role: savedCollection.role,
+    summary: savedCollection.summary,
+    accumulation: savedCollection.accumulation ? serializeArtifactForUi(savedCollection.accumulation) : null,
+    items: savedCollection.items.map((entry) => buildCollectionManifestItem(entry, directoryPath)),
+  }, { spaces: 2 });
+
+  return savedCollection;
+}
+
 async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
   const title = String(options.title || artifact?.displayName || 'result').trim() || 'result';
+  if (isCompositionArtifact(artifact)) {
+    return persistCompositionArtifact(runDirectories, artifact, {
+      baseName: title,
+      displayName: title,
+      role: 'output',
+      target: 'outputs',
+      title,
+    });
+  }
+
+  if (isArtifactCollection(artifact)) {
+    return persistArtifactCollection(runDirectories, artifact, {
+      baseName: title,
+      copyItems: true,
+      displayName: title,
+      itemRole: 'output',
+      role: 'output',
+      target: 'outputs',
+      title,
+    });
+  }
+
   if (artifact.kind === PORT_KIND_TEXT) {
     const filePath = await nextAvailableFilePath(runDirectories.outputsDir, title, '.txt');
     await fs.writeFile(filePath, `${artifact.text || ''}\n`, 'utf8');
@@ -960,12 +1542,15 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     ? await saveAudioArtifactMetadata(filePath, artifact)
     : artifact.kind === PORT_KIND_IMAGE
       ? await saveImageArtifactMetadata(filePath, artifact)
-      : [];
+      : artifact.kind === PORT_KIND_VIDEO
+        ? await saveVideoArtifactMetadata(filePath, artifact)
+        : [];
 
   const savedArtifact = await buildFileArtifact(filePath, {
     audio: artifact.audio,
     audioGeneration: artifact.audioGeneration,
     audioTransformation: artifact.audioTransformation,
+    compositionExport: artifact.compositionExport,
     displayName: title,
     imageTransformation: artifact.imageTransformation,
     kind: artifact.kind,
@@ -981,20 +1566,30 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
 }
 
 function buildTerminalResult(node, artifact) {
+  const supportingPaths = [
+    ...(Array.isArray(artifact?.metadataPaths) ? artifact.metadataPaths : []),
+    ...((Array.isArray(artifact?.items)
+      ? artifact.items.flatMap((entry) => Array.isArray(entry?.artifact?.metadataPaths) ? entry.artifact.metadataPaths : [])
+      : [])),
+  ].map((entry) => String(entry || '').trim()).filter(Boolean);
   return {
     artifact: serializeArtifactForUi(artifact),
     audio: artifact?.audio ? serializeArtifactForUi(artifact.audio) : null,
     audioGeneration: artifact?.audioGeneration ? serializeArtifactForUi(artifact.audioGeneration) : null,
     audioTransformation: artifact?.audioTransformation ? serializeArtifactForUi(artifact.audioTransformation) : null,
-    destinationPath: artifact?.destinationPath || artifact?.filePath || '',
+    destinationPath: artifact?.destinationPath || artifact?.directoryPath || artifact?.filePath || '',
+    directoryPath: artifact?.directoryPath || '',
     imageTransformation: artifact?.imageTransformation ? serializeArtifactForUi(artifact.imageTransformation) : null,
     filePath: artifact?.filePath || '',
     fileUrl: artifact?.fileUrl || '',
+    itemCount: Number(artifact?.itemCount || 0) || 0,
+    itemKind: String(artifact?.itemKind || '').trim(),
     kind: artifact?.kind || PORT_KIND_FILE,
+    manifestPath: artifact?.manifestPath || '',
     nodeId: node.id,
     nodeLabel: node.label,
     previewText: summarizeArtifact(artifact),
-    supportingPaths: Array.isArray(artifact?.metadataPaths) ? [...artifact.metadataPaths] : [],
+    supportingPaths: [...new Set(supportingPaths)],
     textValue: artifact?.kind === PORT_KIND_TEXT ? String(artifact.text || '') : '',
     title: String(node.config?.title || node.label || 'Output').trim() || 'Output',
     transcription: artifact?.transcription ? serializeArtifactForUi(artifact.transcription) : null,
@@ -1004,6 +1599,28 @@ function buildTerminalResult(node, artifact) {
 async function describeArtifactForLlm(artifact) {
   if (!artifact) {
     return 'No artifact was available.';
+  }
+
+  if (isArtifactCollection(artifact)) {
+    const lines = [
+      'Type: ordered collection',
+      artifact.itemKind ? `Item type: ${artifact.itemKind}` : '',
+      Number(artifact.itemCount || 0) ? `Item count: ${artifact.itemCount}` : '',
+      artifact.displayName ? `Name: ${artifact.displayName}` : '',
+      artifact.summary ? `Summary: ${artifact.summary}` : '',
+      artifact.manifestPath ? `Manifest: ${artifact.manifestPath}` : '',
+      '',
+      'Items:',
+      ...(artifact.items || []).slice(0, 8).map((entry, index) => {
+        const itemArtifact = entry?.artifact || null;
+        const lineage = entry?.lineage || null;
+        const sourceLabel = lineage?.sourceNodeLabel || lineage?.sourceNodeId || '';
+        const itemSummary = summarizeArtifact(itemArtifact, 120) || itemArtifact?.displayName || itemArtifact?.fileName || 'Item ' + (index + 1);
+        return `${index + 1}. ${itemSummary}${sourceLabel ? ` (from ${sourceLabel})` : ''}`;
+      }),
+      (artifact.items || []).length > 8 ? `...and ${(artifact.items || []).length - 8} more items.` : '',
+    ].filter(Boolean);
+    return lines.join('\n').trim();
   }
 
   if (artifact.kind === PORT_KIND_TEXT) {
@@ -1078,14 +1695,36 @@ module.exports = {
   buildFileArtifact,
   buildTerminalResult,
   copyArtifactToOutput,
+  createArtifactCollection,
+  createCompositionArtifact,
   createTextArtifact,
   describeArtifactForLlm,
   ensureRunDirectories,
   inferKindFromPath,
+  isArtifactCollection,
+  isCompositionArtifact,
+  persistArtifactCollection,
+  persistCompositionArtifact,
   saveBase64Artifact,
   saveBufferArtifact,
   sanitizeSegment,
   serializeArtifactForUi,
   summarizeArtifact,
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

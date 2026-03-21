@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
@@ -61,8 +61,24 @@ function formatDateLabel(value) {
   }
 }
 
-function formatArtifactKindLabel(kind) {
-  return PIPELINE_PORT_KIND_LABELS[String(kind || '').trim()] || 'Artifact';
+function formatArtifactKindLabel(kind, itemKind = '') {
+  const normalizedKind = String(kind || '').trim();
+  const normalizedItemKind = String(itemKind || '').trim();
+  if (normalizedKind === 'collection') {
+    return normalizedItemKind
+      ? `${PIPELINE_PORT_KIND_LABELS[normalizedItemKind] || normalizedItemKind || 'Artifact'} Collection`
+      : 'Collection';
+  }
+
+  return PIPELINE_PORT_KIND_LABELS[normalizedKind] || 'Artifact';
+}
+
+function isCollectionArtifact(artifact) {
+  return artifact?.kind === 'collection' && Array.isArray(artifact?.items);
+}
+
+function getArtifactStoragePath(artifact) {
+  return artifact?.destinationPath || artifact?.directoryPath || artifact?.filePath || '';
 }
 
 function getArtifactPreviewKind(artifact) {
@@ -231,20 +247,69 @@ function buildImageFactLabels(artifact) {
   ].filter(Boolean);
 }
 
+function buildCollectionFactLabels(artifact) {
+  const itemCount = Number(artifact?.itemCount || artifact?.items?.length || 0) || 0;
+  return [
+    formatArtifactKindLabel('collection', artifact?.itemKind),
+    itemCount ? `${itemCount} items` : '',
+    'Ordered',
+    artifact?.manifestPath ? 'Manifest saved' : '',
+  ].filter(Boolean);
+}
+
+function buildCompositionFactLabels(artifact) {
+  const tracks = Array.isArray(artifact?.composition?.tracks) ? artifact.composition.tracks : [];
+  const visualTrack = tracks.find((track) => String(track?.role || '').trim() === 'primary-visual') || null;
+  const audioTrack = tracks.find((track) => String(track?.role || '').trim() === 'primary-audio') || null;
+  const itemCount = Number(visualTrack?.itemCount || visualTrack?.items?.length || 0) || 0;
+  return [
+    'Composition',
+    itemCount ? `${itemCount} images` : '',
+    Number(visualTrack?.itemDurationSeconds || 0) ? `${Math.round(Number(visualTrack.itemDurationSeconds) * 10) / 10}s each` : '',
+    audioTrack ? 'Primary audio' : 'No audio',
+    artifact?.manifestPath ? 'Manifest saved' : '',
+  ].filter(Boolean);
+}
+
+function buildVideoFactLabels(artifact) {
+  const exportProfile = artifact?.compositionExport && typeof artifact.compositionExport === 'object'
+    ? artifact.compositionExport.exportProfile || null
+    : null;
+  const visualTrack = artifact?.compositionExport && typeof artifact.compositionExport === 'object'
+    ? artifact.compositionExport.visualTrack || null
+    : null;
+  if (!exportProfile && !visualTrack) {
+    return [];
+  }
+
+  return [
+    'Composed video',
+    exportProfile?.fps ? `${exportProfile.fps} fps` : '',
+    exportProfile?.width && exportProfile?.height ? `${exportProfile.width}x${exportProfile.height}` : '',
+    Number(visualTrack?.itemCount || 0) ? `${visualTrack.itemCount} images` : '',
+    artifact?.compositionExport?.audioTrack?.artifact ? 'Primary audio' : 'Silent export',
+  ].filter(Boolean);
+}
+
 function ArtifactFacts({ artifact, className = '' }) {
   if (!artifact) {
     return null;
   }
 
-  const facts = [
-    formatArtifactKindLabel(artifact.kind),
-    artifact.formatLabel || '',
-    artifact.mimeType || '',
-    artifact.width && artifact.height ? `${artifact.width}x${artifact.height}` : '',
-    formatFileSize(artifact.sizeBytes),
-    artifact.fileName || '',
-    ...buildImageFactLabels(artifact),
-  ].filter(Boolean);
+  const facts = artifact?.kind === 'composition'
+    ? buildCompositionFactLabels(artifact)
+    : isCollectionArtifact(artifact)
+      ? buildCollectionFactLabels(artifact)
+      : [
+          formatArtifactKindLabel(artifact.kind, artifact.itemKind),
+          artifact.formatLabel || '',
+          artifact.mimeType || '',
+          artifact.width && artifact.height ? `${artifact.width}x${artifact.height}` : '',
+          formatFileSize(artifact.sizeBytes),
+          artifact.fileName || '',
+          ...buildImageFactLabels(artifact),
+          ...buildVideoFactLabels(artifact),
+        ].filter(Boolean);
 
   if (!facts.length) {
     return null;
@@ -322,6 +387,24 @@ function buildNodePreview(node, runState) {
     return node.config?.mode === 'llm'
       ? `${node.config?.llmExecutionMode === 'ollama' ? 'Ollama' : node.config?.providerId || 'Cloud validator'}${node.config?.model ? ` | ${node.config.model}` : ''}`
       : 'Pauses for a pass or fail decision';
+  }
+
+  if (node.type === 'collectionBuilder') {
+    return (node.config?.insertionMode || 'append') === 'prepend'
+      ? 'Builds an ordered collection and places new items before the existing collection'
+      : 'Builds an ordered collection and appends new items after the existing collection';
+  }
+
+  if (node.type === 'collectionAccumulator') {
+    return 'Target ' + Math.max(1, Number(node.config?.targetCount || 3) || 3) + ' | keeps accepted items from one or more branches until the collection is ready';
+  }
+
+  if (node.type === 'mediaComposition') {
+    return `${Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4)}s per image | ordered visual track`;
+  }
+
+  if (node.type === 'mediaExport') {
+    return `${node.config?.width || 1280}x${node.config?.height || 720} | ${node.config?.fps || 30} fps | ${node.config?.stopMode === 'visuals' ? 'keep full visual timing' : 'stop with shortest track'}`;
   }
 
   if (node.type === 'branchMerge') {
@@ -553,6 +636,85 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
 
   const previewKind = getArtifactPreviewKind(artifact);
 
+  if (previewKind === 'composition' && artifact?.composition) {
+    const tracks = Array.isArray(artifact.composition.tracks) ? artifact.composition.tracks : [];
+    const visualTrack = tracks.find((track) => String(track?.role || '').trim() === 'primary-visual') || null;
+    const audioTrack = tracks.find((track) => String(track?.role || '').trim() === 'primary-audio') || null;
+    const visualItems = Array.isArray(visualTrack?.items) ? visualTrack.items : [];
+    const visibleItems = compact ? visualItems.slice(0, 2) : visualItems.slice(0, 4);
+    return (
+      <div className={`space-y-3 ${className}`}>
+        <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+          <p className="text-sm font-medium text-white">{artifact.displayName || 'Media composition'}</p>
+          {artifact.summary ? <p className="mt-2 text-xs leading-5 text-slate-400">{artifact.summary}</p> : null}
+          {artifact.manifestPath ? <input className="store-input mt-3" readOnly value={artifact.manifestPath} /> : null}
+        </div>
+        {visualTrack ? (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Primary visual track</p>
+            <ArtifactFacts artifact={artifact} className="mt-3" />
+            {visualTrack?.sourceCollection?.displayName ? <p className="mt-3 text-sm text-slate-200">Source collection: {visualTrack.sourceCollection.displayName}</p> : null}
+            {visualTrack?.sourceCollection?.manifestPath ? <input className="store-input mt-3" readOnly value={visualTrack.sourceCollection.manifestPath} /> : null}
+          </div>
+        ) : null}
+        {visibleItems.map((entry, index) => {
+          const itemArtifact = entry?.artifact || null;
+          const lineage = entry?.lineage || null;
+          return (
+            <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4" key={entry?.itemId || `${index}-${itemArtifact?.fileName || itemArtifact?.displayName || 'visual'}`}>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-400">Visual item {index + 1}</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  {entry?.durationSeconds ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">{Math.round(Number(entry.durationSeconds) * 10) / 10}s</span> : null}
+                  {lineage?.sourceNodeLabel ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">From {lineage.sourceNodeLabel}</span> : null}
+                </div>
+              </div>
+              <ArtifactFacts artifact={itemArtifact} className="mt-3" />
+              <ArtifactPreview artifact={itemArtifact} className="mt-3" compact />
+            </div>
+          );
+        })}
+        {visualItems.length > visibleItems.length ? <p className="text-xs leading-5 text-slate-500">Showing {visibleItems.length} of {visualItems.length} visual items.</p> : null}
+        {audioTrack?.artifact ? (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Primary audio track</p>
+            <ArtifactFacts artifact={audioTrack.artifact} className="mt-3" />
+            <ArtifactPreview artifact={audioTrack.artifact} className="mt-3" compact />
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (previewKind === 'collection' && isCollectionArtifact(artifact)) {
+    const items = Array.isArray(artifact.items) ? artifact.items : [];
+    const visibleItems = compact ? items.slice(0, 3) : items.slice(0, 6);
+    return (
+      <div className={`space-y-3 ${className}`}>
+        <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+          <p className="text-sm font-medium text-white">{artifact.displayName || formatArtifactKindLabel('collection', artifact.itemKind)}</p>
+          {artifact.summary ? <p className="mt-2 text-xs leading-5 text-slate-400">{artifact.summary}</p> : null}
+          {artifact.manifestPath ? <input className="store-input mt-3" readOnly value={artifact.manifestPath} /> : null}
+        </div>
+        {visibleItems.map((entry, index) => {
+          const itemArtifact = entry?.artifact || null;
+          const lineage = entry?.lineage || null;
+          return (
+            <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4" key={entry?.itemId || `${index}-${itemArtifact?.fileName || itemArtifact?.displayName || 'item'}`}>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-400">Item {index + 1}</p>
+                {lineage?.sourceNodeLabel ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">From {lineage.sourceNodeLabel}</span> : null}
+              </div>
+              <ArtifactFacts artifact={itemArtifact} className="mt-3" />
+              <ArtifactPreview artifact={itemArtifact} className="mt-3" compact />
+            </div>
+          );
+        })}
+        {items.length > visibleItems.length ? <p className="text-xs leading-5 text-slate-500">Showing {visibleItems.length} of {items.length} ordered items.</p> : null}
+      </div>
+    );
+  }
+
   if (previewKind === 'text') {
     return (
       <textarea
@@ -656,10 +818,27 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
     );
   }
   if (previewKind === 'video' && artifact.fileUrl) {
+    const exportProfile = artifact.compositionExport && typeof artifact.compositionExport === 'object'
+      ? artifact.compositionExport.exportProfile || null
+      : null;
     return (
       <div className={`space-y-3 ${className}`}>
         <video className="max-h-[280px] w-full rounded-[24px] border border-white/10 bg-black/40" controls src={artifact.fileUrl} />
         <p className="text-xs leading-5 text-slate-400">{artifact.summary || artifact.fileName || artifact.displayName}</p>
+        {artifact.compositionExport ? (
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Composition export</p>
+            <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.16em] text-slate-300">
+              {buildVideoFactLabels(artifact).map((label, index) => (
+                <span className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1" key={`${label}-${index}`}>
+                  {label}
+                </span>
+              ))}
+            </div>
+            {artifact.compositionExport?.composition?.manifestPath ? <input className="store-input mt-3" readOnly value={artifact.compositionExport.composition.manifestPath} /> : null}
+            {exportProfile?.concatManifestPath ? <input className="store-input mt-3" readOnly value={exportProfile.concatManifestPath} /> : null}
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -820,21 +999,22 @@ function SavedPipelineRow({ active, pipeline, onClick }) {
 
 function ResultCard({ result, onOpenPath, onRevealPath }) {
   const artifact = result?.artifact || null;
+  const artifactPath = result.destinationPath || result.directoryPath || result.filePath || '';
   return (
     <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{result.title}</p>
-          <p className="mt-2 text-sm font-semibold text-white">{formatArtifactKindLabel(result.kind || artifact?.kind)}</p>
+          <p className="mt-2 text-sm font-semibold text-white">{formatArtifactKindLabel(result.kind || artifact?.kind, result.itemKind || artifact?.itemKind)}</p>
         </div>
-        {result.destinationPath ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">Saved</span> : null}
+        {artifactPath ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">Saved</span> : null}
       </div>
       <ArtifactFacts artifact={artifact} className="mt-4" />
       <div className="mt-4">
         <ArtifactPreview artifact={artifact} />
       </div>
-      {result.destinationPath ? <input className="store-input mt-4" readOnly value={result.destinationPath} /> : null}
-      <PathButtons onOpenPath={onOpenPath} onRevealPath={onRevealPath} path={result.destinationPath || result.filePath} />
+      {artifactPath ? <input className="store-input mt-4" readOnly value={artifactPath} /> : null}
+      <PathButtons onOpenPath={onOpenPath} onRevealPath={onRevealPath} path={artifactPath} />
     </div>
   );
 }
@@ -844,9 +1024,9 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
   }
 
   const artifact = pendingValidation.artifact || null;
-  const artifactLabel = formatArtifactKindLabel(artifact?.kind);
+  const artifactLabel = formatArtifactKindLabel(artifact?.kind, artifact?.itemKind);
   const artifactName = artifact?.displayName || artifact?.fileName || '';
-  const artifactPath = artifact?.filePath || '';
+  const artifactPath = getArtifactStoragePath(artifact);
   const attemptLabel = formatAttemptLabel(pendingValidation.iteration, pendingValidation.loopMaxAttempts);
   return (
     <div className="rounded-[26px] border border-violet-400/30 bg-violet-400/10 p-4 text-violet-50">
@@ -898,6 +1078,7 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
   const activeNodeState = runState?.currentNodeId ? runState.nodeStates?.[runState.currentNodeId] || null : null;
   const activeAttemptLabel = formatAttemptLabel(activeNodeState?.iteration, activeNodeState?.loopMaxAttempts);
   const loopStates = Object.values(runState?.loopStates || {});
+  const collectionControlStates = Object.values(runState?.collectionControlStates || {});
 
   if (!runState) {
     return (
@@ -926,10 +1107,19 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
               const attemptLabel = formatAttemptLabel(loopState.attempt, loopState.maxAttempts);
               return (
                 <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[11px] uppercase tracking-[0.16em] text-slate-200" key={loopState.loopNodeId}>
-                  {loopState.loopLabel}: {attemptLabel || 'Ready'}{loopState.status && loopState.status !== 'ready' ? ` | ${loopState.status}` : ''}
+                  {loopState.loopLabel}: {attemptLabel || 'Ready'}{loopState.status && loopState.status !== 'ready' ? ' | ' + loopState.status : ''}
                 </span>
               );
             })}
+          </div>
+        ) : null}
+        {collectionControlStates.length ? (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {collectionControlStates.map((collectionState) => (
+              <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[11px] uppercase tracking-[0.16em] text-slate-200" key={collectionState.nodeId}>
+                {collectionState.nodeLabel || collectionState.nodeId}: {collectionState.acceptedCount || 0}/{collectionState.targetCount || 0}{collectionState.status && collectionState.status !== 'idle' ? ' | ' + collectionState.status : ''}
+              </span>
+            ))}
           </div>
         ) : null}
         {loopStates.some((loopState) => Array.isArray(loopState.history) && loopState.history.length) ? (
@@ -979,6 +1169,11 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
                   {attemptLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">{attemptLabel}</p> : null}
                   {nodeState?.loopPathLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-500">Loop path: {nodeState.loopPathLabel}</p> : null}
                   {nodeState?.runCount > 1 ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-500">Ran {nodeState.runCount} times in this run</p> : null}
+                  {nodeState?.collectionControl ? (
+                    <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">
+                      Collection progress: {nodeState.collectionControl.acceptedCount || 0} of {nodeState.collectionControl.targetCount || 0}{nodeState.collectionControl.status ? ' | ' + nodeState.collectionControl.status : ''}{nodeState.collectionControl.itemKind ? ' | ' + formatArtifactKindLabel(nodeState.collectionControl.itemKind) : ''}
+                    </p>
+                  ) : null}
                   {nodeState?.preview ? <p className="mt-2 text-xs leading-5 text-slate-300">{nodeState.preview}</p> : null}
                   {nodeState?.selectedBranch ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">Routed to {nodeState.selectedBranch}</p> : null}
                   <ValidationResultSummary validation={nodeState?.validation} />
@@ -2960,9 +3155,134 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                   </div>
                 ) : null}
 
+                                {selectedNode.type === 'collectionBuilder' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-builder-order">When an existing collection is connected</label>
+                      <select
+                        className="store-input mt-3"
+                        id="collection-builder-order"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            insertionMode: event.target.value === 'prepend' ? 'prepend' : 'append',
+                          },
+                        }))}
+                        value={selectedNode.config?.insertionMode === 'prepend' ? 'prepend' : 'append'}
+                      >
+                        <option value="append">Append new items after it</option>
+                        <option value="prepend">Place new items before it</option>
+                      </select>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Connect one or more same-type single artifacts to the Items input in the order you want to keep. The optional Existing Collection input lets you extend a saved collection explicitly instead of relying on hidden automatic mapping.
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'collectionAccumulator' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-accumulator-target">Target accepted items</label>
+                      <input
+                        className="store-input mt-3"
+                        id="collection-accumulator-target"
+                        min="1"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            targetCount: Math.max(1, Number(event.target.value || 0) || 1),
+                          },
+                        }))}
+                        type="number"
+                        value={Math.max(1, Number(selectedNode.config?.targetCount || 3) || 3)}
+                      />
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Connect one or more accepted branches into this step, then connect its Collection output directly into a Retry Loop Complete input. While the target has not been reached yet, Local AI Hub preserves each accepted item in order and the connected Retry Loop keeps collecting without treating that stored state as a finished exit. Once the target count is reached, this step emits one real ordered collection onward.
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'mediaComposition' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-seconds">Seconds per image</label>
+                      <input
+                        className="store-input mt-3"
+                        id="media-composition-seconds"
+                        min="0.1"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            secondsPerItem: Number(event.target.value || 0) || 0,
+                          },
+                        }))}
+                        step="0.1"
+                        type="number"
+                        value={selectedNode.config?.secondsPerItem || 4}
+                      />
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Connect an ordered image collection to the Visual Collection input and optionally add one primary audio artifact. This step creates a reusable media composition manifest so export stays explicit instead of relying on a folder-path shortcut.
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'mediaExport' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-export-title">Export title</label>
+                      <input className="store-input mt-3" id="media-export-title" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, title: event.target.value } }))} value={selectedNode.config?.title || ''} />
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-export-width">Width</label>
+                        <input className="store-input mt-3" id="media-export-width" min="16" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 1280} />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-export-height">Height</label>
+                        <input className="store-input mt-3" id="media-export-height" min="16" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 720} />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-export-fps">FPS</label>
+                        <input className="store-input mt-3" id="media-export-fps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, fps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.fps || 30} />
+                      </div>
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-export-fit">Image fit</label>
+                        <select className="store-input mt-3" id="media-export-fit" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, fitMode: event.target.value === 'cover' ? 'cover' : 'contain' } }))} value={selectedNode.config?.fitMode === 'cover' ? 'cover' : 'contain'}>
+                          <option value="contain">Contain and pad</option>
+                          <option value="cover">Cover and crop</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-export-stop">When tracks differ</label>
+                        <select className="store-input mt-3" id="media-export-stop" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, stopMode: event.target.value === 'visuals' ? 'visuals' : 'shortest' } }))} value={selectedNode.config?.stopMode === 'visuals' ? 'visuals' : 'shortest'}>
+                          <option value="shortest">Stop when the shortest track ends</option>
+                          <option value="visuals">Keep the full visual timing</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      This first export recipe renders an ordered image track to MP4 and can attach one primary audio artifact. It is intentionally bounded, but the composition stays first-class and inspectable before export.
+                    </div>
+                  </div>
+                ) : null}
+
                 {selectedNode.type === 'branchMerge' ? (
                   <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
                     Connect compatible branches here. Local AI Hub waits for earlier branches to finish or skip, then forwards the single branch that still has an artifact. When this merge is the retry target for a Retry Loop, the first attempt uses the connected branch and later attempts can re-enter with the loop-carried retry artifact. If two unrelated live results arrive together, the run stops with a plain-English error so the merge stays explicit.
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'collectionOutput' ? (
+                  <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                    This output writes an ordered collection folder with a manifest and keeps each item in order so you can inspect or reuse the result later.
                   </div>
                 ) : null}
 
@@ -3167,6 +3487,17 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     </section>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
 
 
 
