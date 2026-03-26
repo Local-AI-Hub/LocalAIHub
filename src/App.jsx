@@ -132,6 +132,8 @@ export default function App() {
   const [settingsToolId, setSettingsToolId] = useState(null);
   const [cleanupPreview, setCleanupPreview] = useState(null);
   const [storageDraft, setStorageDraft] = useState('');
+  const [preferredInstallRootDraft, setPreferredInstallRootDraft] = useState('');
+  const [storeInstallRootDraft, setStoreInstallRootDraft] = useState('');
   const [closeBehaviorDraft, setCloseBehaviorDraft] = useState('exit');
   const [liveResourcePollingDraft, setLiveResourcePollingDraft] = useState(false);
   const [ollamaChatOpen, setOllamaChatOpen] = useState(false);
@@ -286,11 +288,23 @@ export default function App() {
     });
   }, [availableStoreTools, storeCategory, storeSearch]);
 
+  const managedLifecycleToolCount = useMemo(() => tools.filter((tool) => tool.lifecycleMode === 'managed').length, [tools]);
   const runningCount = useMemo(() => tools.filter((tool) => tool.status === 'running').length, [tools]);
   const runningUsageLabel = useMemo(
     () => formatUsage(currentResources?.vramUsedMb, currentResources?.vramTotalMb),
     [currentResources?.vramTotalMb, currentResources?.vramUsedMb],
   );
+  const migratableToolIds = useMemo(() => {
+    const migration = appState.storage?.legacyMigration;
+    if (!migration?.available || migration.dismissed) {
+      return new Set();
+    }
+
+    const toolEntries = migration.categories?.find((category) => category.id === 'tools')?.entries || [];
+    return new Set(toolEntries.map((entry) => entry.toolId).filter(Boolean));
+  }, [appState.storage?.legacyMigration]);
+  const savedPreferredInstallRoot = appState.storage?.preferredInstallRoot || appState.storage?.managedRoot || '';
+  const effectiveStoreInstallRoot = String(storeInstallRootDraft || savedPreferredInstallRoot || '').trim();
 
   function dismissToast(id) {
     setToasts((current) => current.filter((toast) => toast.id !== id));
@@ -826,10 +840,18 @@ export default function App() {
       return;
     }
 
+    const uninstallKind = tool.actionSemantics?.uninstallKind
+      || (tool.lifecycleMode === 'managed'
+        ? 'uninstall'
+        : tool.lifecycleMode === 'official-installer' && tool.installedByLocalAIHub
+          ? 'official-uninstall'
+          : 'remove-from-library');
     const confirmationMessage =
-      tool.source === 'managed'
-        ? `Uninstall ${tool.name} from Local AI Hub? This will delete its managed files from ${tool.installDir} and move it back to Store.`
-        : `Remove ${tool.name} from Local AI Hub? Its files will stay on this PC because Local AI Hub did not install them.`;
+      uninstallKind === 'uninstall'
+        ? `Uninstall ${tool.name} from Local AI Hub? This will delete the Local AI Hub-managed files from ${tool.installDir} and move it back to Store.`
+        : uninstallKind === 'official-uninstall'
+          ? `Uninstall ${tool.name}? Local AI Hub will run the official Windows uninstaller for this copy, wait for Apps & Features to stop reporting it, and only then move it out of Library. If Windows uninstall data is missing, Local AI Hub will only remove the files and shortcuts it still owns and clear stale Apps & Features data it can verify.`
+          : `Remove ${tool.name} from Local AI Hub? Its files will stay on this PC because Local AI Hub does not own this install location.`;
 
     if (!window.confirm(confirmationMessage)) {
       return;
@@ -841,22 +863,45 @@ export default function App() {
 
     await runAction(`uninstall:${tool.id}`, () => window.localAIHub.uninstallTool(tool.id));
   }
-
-  async function chooseStorageFolder() {
-    markBusy('settings:pick-folder', true);
+  async function chooseFolderIntoDraft(busyKey, applyDraft, errorMessage) {
+    markBusy(busyKey, true);
     try {
       const result = await window.localAIHub.pickStorageFolder();
       if (!result?.ok) {
-        pushToast(result?.message || 'Local AI Hub could not open the storage folder picker.', 'error');
+        pushToast(result?.message || errorMessage, 'error');
         return;
       }
 
       if (!result.data?.canceled && result.data?.folderPath) {
-        setStorageDraft(result.data.folderPath);
+        applyDraft(result.data.folderPath);
       }
     } finally {
-      markBusy('settings:pick-folder', false);
+      markBusy(busyKey, false);
     }
+  }
+
+  async function chooseStorageFolder() {
+    await chooseFolderIntoDraft(
+      'settings:pick-folder',
+      setStorageDraft,
+      'Local AI Hub could not open the storage folder picker.',
+    );
+  }
+
+  async function choosePreferredInstallFolder() {
+    await chooseFolderIntoDraft(
+      'settings:pick-preferred-install-folder',
+      setPreferredInstallRootDraft,
+      'Local AI Hub could not open the default install folder picker.',
+    );
+  }
+
+  async function chooseStoreInstallFolder() {
+    await chooseFolderIntoDraft(
+      'store:pick-install-folder',
+      setStoreInstallRootDraft,
+      'Local AI Hub could not open the install folder picker.',
+    );
   }
 
   async function saveStorageLocation(options = {}) {
@@ -869,8 +914,7 @@ export default function App() {
     let migrateExistingData = false;
     let migrationSourceRoot = options.migrationSourceRoot || null;
     if (!migrationSourceRoot && appState.managedDataPath && targetPath !== appState.managedDataPath) {
-      const managedToolCount = tools.filter((tool) => tool.source === 'managed').length;
-      if (managedToolCount > 0) {
+      if (managedLifecycleToolCount > 0) {
         migrateExistingData = window.confirm(
           `Move your existing managed Local AI Hub files from ${appState.managedDataPath} into ${targetPath} now? Click OK to move them, or Cancel to keep the current files where they are and use the new folder for future installs.`,
         );
@@ -888,6 +932,17 @@ export default function App() {
       setCleanupPreview(null);
     }
   }
+
+  async function savePreferredInstallRoot() {
+    const targetPath = String(preferredInstallRootDraft || '').trim();
+    if (!targetPath) {
+      pushToast('Choose a default install folder before saving it.', 'error');
+      return;
+    }
+
+    await runAction('settings:save-preferred-install-root', () => window.localAIHub.savePreferredInstallRoot(targetPath));
+  }
+
   async function saveCloseBehaviorPreference() {
     await runAction('settings:save-close-behavior', () => window.localAIHub.saveCloseBehavior(closeBehaviorDraft));
   }
@@ -1055,16 +1110,36 @@ export default function App() {
   async function installStoreTool(toolId) {
     const manifest = manifestMap[toolId];
     const subject = manifest?.name || 'This tool';
-    const preflightResult = await window.localAIHub.getToolInstallPreflight(toolId);
+    const installRoot = effectiveStoreInstallRoot;
+    if (!installRoot) {
+      pushToast('Choose an install folder before starting this install.', 'error');
+      return;
+    }
+
+    const preflightResult = await window.localAIHub.getToolInstallPreflight({
+      installRoot,
+      toolId,
+    });
     if (!preflightResult?.ok) {
       pushToast(preflightResult?.message || 'Local AI Hub could not check disk space for that install.', 'error');
       return;
     }
 
     const preflight = preflightResult.data;
+    if (preflight?.installRoot && preflight.installRoot !== storeInstallRootDraft) {
+      setStoreInstallRootDraft(preflight.installRoot);
+    }
+
     if (preflight?.blocked) {
       pushToast(buildBlockedDiskMessage(subject, preflight), 'error');
       return;
+    }
+
+    if (preflight?.installContract?.destinationControl === 'guided') {
+      const confirmed = window.confirm(`${preflight.destinationMessage} Continue and open the official installer?`);
+      if (!confirmed) {
+        return;
+      }
     }
 
     let lowDiskConfirmed = false;
@@ -1075,7 +1150,13 @@ export default function App() {
       }
     }
 
-    await runAction(`install:${toolId}`, () => window.localAIHub.installTool({ toolId, lowDiskConfirmed }));
+    await runAction(`install:${toolId}`, () =>
+      window.localAIHub.installTool({
+        installRoot: preflight?.installRoot || installRoot,
+        lowDiskConfirmed,
+        toolId,
+      }),
+    );
   }
 
   async function repairLibraryTool(tool) {
@@ -1408,6 +1489,14 @@ export default function App() {
   }, [appState.storage?.managedRoot]);
 
   useEffect(() => {
+    setPreferredInstallRootDraft(appState.storage?.preferredInstallRoot || appState.storage?.managedRoot || '');
+  }, [appState.storage?.managedRoot, appState.storage?.preferredInstallRoot]);
+
+  useEffect(() => {
+    setStoreInstallRootDraft(appState.storage?.preferredInstallRoot || appState.storage?.managedRoot || '');
+  }, [appState.storage?.managedRoot, appState.storage?.preferredInstallRoot]);
+
+  useEffect(() => {
     setCloseBehaviorDraft(appState.settings?.closeBehavior || 'exit');
   }, [appState.settings?.closeBehavior]);
 
@@ -1615,8 +1704,11 @@ export default function App() {
                   key={tool.id}
                   busyMap={busyMap}
                   launchProgress={launchProgressMap[tool.id]}
+                  migrationBusy={busyMap['settings:migrate-legacy']}
+                  migrationEligible={migratableToolIds.has(tool.id)}
                   onLaunch={(toolId) => runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId))}
                   onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
+                  onMigrateManagedData={migrateLegacyStorage}
                   onOpenInterface={openEmbeddedToolUi}
                   onRepair={() => repairLibraryTool(tool)}
                   onRestoreSnapshot={(toolId, snapshotFileName) =>
@@ -1679,6 +1771,38 @@ export default function App() {
                 </div>
               </div>
 
+              <div className="mt-6 grid gap-4 xl:grid-cols-[1.2fr,0.8fr]">
+                <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Next install location</p>
+                  <input
+                    className="store-input mt-4"
+                    onChange={(event) => setStoreInstallRootDraft(event.target.value)}
+                    placeholder={savedPreferredInstallRoot || 'D:\\LocalAIHub'}
+                    type="text"
+                    value={storeInstallRootDraft}
+                  />
+                  <div className="mt-4 flex flex-wrap gap-3">
+                    <button className="ghost-button" disabled={busyMap['store:pick-install-folder']} onClick={chooseStoreInstallFolder} type="button">
+                      {busyMap['store:pick-install-folder'] ? 'Opening...' : 'Browse folder'}
+                    </button>
+                    <button className="ghost-button" onClick={() => setStoreInstallRootDraft(savedPreferredInstallRoot)} type="button">
+                      Use saved default
+                    </button>
+                  </div>
+                  <p className="mt-4 text-sm leading-7 text-slate-300">
+                    Local AI Hub will use this folder for the next Store install. Direct-managed tools go there automatically. Tools that rely on an official installer may still ask you to confirm or change the final destination in the installer window.
+                  </p>
+                </div>
+
+                <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Saved default</p>
+                  <p className="mt-3 break-all text-sm font-medium text-white">{savedPreferredInstallRoot || 'Not available'}</p>
+                  <p className="mt-3 text-sm leading-7 text-slate-300">
+                    Managed storage currently lives at {appState.storage?.managedRoot || 'Not available'}. Change the saved default in Settings if you want every new Store install to start from a different drive.
+                  </p>
+                </div>
+              </div>
+
               <div className="mt-6 grid gap-4 2xl:grid-cols-2">
                 {storeTools.length ? (
                   storeTools.map((manifest) => (
@@ -1687,7 +1811,7 @@ export default function App() {
                       busy={busyMap[`install:${manifest.id}`]}
                       compatibility={evaluateCompatibility(manifest, appState.hardware)}
                       manifest={manifest}
-                      onInstall={(toolId) => installStoreTool(toolId)}
+                      onInstall={installStoreTool}
                       progress={progressMap[manifest.id]}
                     />
                   ))
@@ -1724,7 +1848,9 @@ export default function App() {
                 liveResourcePollingDraft={liveResourcePollingDraft}
                 onChangeCloseBehavior={setCloseBehaviorDraft}
                 onChangeLiveResourcePolling={setLiveResourcePollingDraft}
+                onChangePreferredInstallRootDraft={setPreferredInstallRootDraft}
                 onChangeStorageDraft={setStorageDraft}
+                onChoosePreferredInstallFolder={choosePreferredInstallFolder}
                 onChooseStorageFolder={chooseStorageFolder}
                 onDismissLegacyMigration={dismissLegacyMigration}
                 onMigrateLegacyStorage={migrateLegacyStorage}
@@ -1732,7 +1858,9 @@ export default function App() {
                 onRunCleanup={runCleanupNow}
                 onSaveCloseBehavior={saveCloseBehaviorPreference}
                 onSaveLiveResourcePolling={saveLiveResourcePollingPreference}
+                onSavePreferredInstallRoot={savePreferredInstallRoot}
                 onSaveStorageLocation={() => saveStorageLocation()}
+                preferredInstallRootDraft={preferredInstallRootDraft}
                 storage={appState.storage}
                 storageDraft={storageDraft}
               />
@@ -1758,8 +1886,4 @@ export default function App() {
     </div>
   );
 }
-
-
-
-
 

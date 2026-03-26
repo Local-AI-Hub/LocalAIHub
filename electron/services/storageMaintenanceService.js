@@ -1,7 +1,7 @@
 const path = require('path');
 const fs = require('fs-extra');
 
-const { getAppPaths, readConfig } = require('./configService');
+const { getAppPaths, normalizeOptionalDirectoryPath, readConfig } = require('./configService');
 const { assessDiskSpace, getDiskSnapshotForPath } = require('./hardwareService');
 
 const TEMP_FILE_PATTERNS = [/\.download$/i, /\.part$/i, /\.partial$/i, /\.tmp$/i, /\.temp$/i];
@@ -25,6 +25,20 @@ function normalizeInstallPathKey(targetPath) {
 function normalizeManagedRootPath(targetPath) {
   const resolvedPath = path.resolve(String(targetPath || ''));
   return path.basename(resolvedPath).toLowerCase() === 'app' ? path.dirname(resolvedPath) : resolvedPath;
+}
+
+function resolveTrackedToolsRoot(toolState) {
+  const installRoot = normalizeOptionalDirectoryPath(toolState?.installRoot || toolState?.requestedInstallRoot || '');
+  if (installRoot) {
+    return path.join(installRoot, 'tools');
+  }
+
+  const normalizedInstallDir = normalizeManagedRootPath(toolState?.installDir || toolState?.appDir || '');
+  if (normalizedInstallDir && path.basename(path.dirname(normalizedInstallDir)).toLowerCase() === 'tools') {
+    return path.dirname(normalizedInstallDir);
+  }
+
+  return getAppPaths().toolsRoot;
 }
 
 function normalizeAliasToken(value) {
@@ -119,7 +133,7 @@ async function listTrackedManagedInstallKeys() {
   const config = await readConfig();
   return new Set(
     Object.values(config.tools || {})
-      .filter((tool) => tool && (tool.source === 'managed' || tool.managedByLocalAIHub))
+      .filter((tool) => tool?.source === 'managed')
       .map((tool) => normalizeInstallPathKey(normalizeManagedRootPath(tool.installDir || tool.appDir || '')))
       .filter(Boolean),
   );
@@ -147,7 +161,7 @@ async function collectDuplicateToolFolders(toolState, manifest, toolsRoot, track
     }
 
     const nameLooksRelated = aliasTokens.has(normalizeAliasToken(entry.name));
-    if (!nameLooksRelated && !(await pathLooksLikeToolInstall(candidatePath, manifest))) {
+    if (!nameLooksRelated) {
       continue;
     }
 
@@ -195,8 +209,9 @@ async function collectTemporaryArtifacts(rootPath, reason, depthRemaining = 4) {
 }
 
 async function collectRepairArtifacts(toolState) {
-  const { downloadsRoot } = getAppPaths();
-  const managedTool = toolState?.source === 'managed' || toolState?.managedByLocalAIHub;
+  const installRoot = normalizeOptionalDirectoryPath(toolState?.installRoot || toolState?.requestedInstallRoot || '') || getAppPaths().managedRoot;
+  const downloadsRoot = path.join(installRoot, 'downloads');
+  const managedTool = toolState?.source === 'managed';
   const searchRoots = [
     managedTool ? toolState?.installDir : null,
     managedTool ? toolState?.appDir : null,
@@ -259,7 +274,7 @@ async function collectOrphanedToolFolders(toolsRoot, trackedManagedInstallKeys, 
 }
 
 async function inspectRepairCleanup(toolState, manifest) {
-  const { toolsRoot } = getAppPaths();
+  const toolsRoot = resolveTrackedToolsRoot(toolState);
   const trackedManagedInstallKeys = await listTrackedManagedInstallKeys();
   const duplicateFolders = await collectDuplicateToolFolders(toolState, manifest, toolsRoot, trackedManagedInstallKeys);
   const duplicatePaths = duplicateFolders.map((entry) => entry.path);
@@ -289,6 +304,64 @@ function isRetryableRemoveError(error) {
   return RETRYABLE_REMOVE_ERROR_CODES.has(errorCode);
 }
 
+function buildBusyRemovalMessage(targetPath, options = {}) {
+  const retryMessage = path.basename(targetPath) || targetPath;
+  if (options.preflight) {
+    const actionLabel = String(options.actionLabel || 'that action').trim();
+    return `Local AI Hub did not start ${actionLabel} because ${retryMessage} is still being used by Windows. Let the tool finish closing, then try again.`;
+  }
+
+  return `Local AI Hub could not finish cleanup because ${retryMessage} is still being used by Windows. Let the tool finish closing, then try again.`;
+}
+
+async function preflightPathRemoval(targetPath, logger, operationLabel, options = {}) {
+  if (!(await fs.pathExists(targetPath))) {
+    return;
+  }
+
+  const probePath = path.join(
+    path.dirname(targetPath),
+    `${path.basename(targetPath)}.__localaihub_remove_probe__${process.pid}_${Date.now()}`,
+  );
+  let originalMovedToProbe = false;
+
+  try {
+    await fs.move(targetPath, probePath);
+    originalMovedToProbe = true;
+    await fs.move(probePath, targetPath);
+    originalMovedToProbe = false;
+  } catch (error) {
+    if (originalMovedToProbe && (await fs.pathExists(probePath)) && !(await fs.pathExists(targetPath))) {
+      try {
+        await fs.move(probePath, targetPath);
+        originalMovedToProbe = false;
+      } catch (restoreError) {
+        await logger?.error?.('Local AI Hub could not restore an uninstall preflight probe.', {
+          operationLabel,
+          path: targetPath,
+          probePath,
+          error: restoreError,
+        });
+        throw new Error(`Local AI Hub could not safely prepare ${path.basename(targetPath) || targetPath} for uninstall. Close anything using it, then try again.`);
+      }
+    }
+
+    if (isRetryableRemoveError(error)) {
+      await logger?.warn?.('Cleanup target is still busy before removal started.', {
+        operationLabel,
+        path: targetPath,
+        error,
+      });
+      throw new Error(buildBusyRemovalMessage(targetPath, {
+        actionLabel: options.actionLabel || 'that action',
+        preflight: true,
+      }));
+    }
+
+    throw error;
+  }
+}
+
 async function removePathWithRetries(targetPath, logger, operationLabel) {
   let attempt = 0;
   let lastError = null;
@@ -304,8 +377,7 @@ async function removePathWithRetries(targetPath, logger, operationLabel) {
     } catch (error) {
       lastError = error;
       if (!isRetryableRemoveError(error) || attempt === REMOVE_RETRY_DELAYS_MS.length) {
-        const retryMessage = path.basename(targetPath) || targetPath;
-        throw new Error(`Local AI Hub could not finish cleanup because ${retryMessage} is still being used by Windows. Let the tool finish closing, then try again.`);
+        throw new Error(buildBusyRemovalMessage(targetPath));
       }
 
       await logger?.warn?.('Cleanup target is still busy. Retrying removal.', {
@@ -324,9 +396,10 @@ async function removePathWithRetries(targetPath, logger, operationLabel) {
   }
 }
 
-async function removeEntries(entries = [], logger, operationLabel) {
+async function removeEntries(entries = [], logger, operationLabel, options = {}) {
   let recoveredBytes = 0;
   let removedCount = 0;
+  const failedEntries = [];
 
   for (const entry of entries) {
     if (!(await fs.pathExists(entry.path))) {
@@ -334,18 +407,38 @@ async function removeEntries(entries = [], logger, operationLabel) {
     }
 
     const sizeBytes = Number(entry.sizeBytes || (await calculatePathSize(entry.path)) || 0);
-    await removePathWithRetries(entry.path, logger, operationLabel);
-    removedCount += 1;
-    recoveredBytes += sizeBytes;
-    await logger?.info?.('Removed a Local AI Hub cleanup target.', {
-      operationLabel,
-      path: entry.path,
-      reason: entry.reason,
-      sizeBytes,
-    });
+
+    try {
+      await removePathWithRetries(entry.path, logger, operationLabel);
+      removedCount += 1;
+      recoveredBytes += sizeBytes;
+      await logger?.info?.('Removed a Local AI Hub cleanup target.', {
+        operationLabel,
+        path: entry.path,
+        reason: entry.reason,
+        sizeBytes,
+      });
+    } catch (error) {
+      failedEntries.push({
+        ...entry,
+        error,
+        sizeBytes,
+      });
+      await logger?.warn?.('Local AI Hub skipped a cleanup target after removal failed.', {
+        operationLabel,
+        path: entry.path,
+        reason: entry.reason,
+        sizeBytes,
+        error,
+      });
+      if (!options.continueOnError) {
+        throw error;
+      }
+    }
   }
 
   return {
+    failedEntries,
     recoveredBytes,
     removedCount,
   };
@@ -356,15 +449,21 @@ async function applyRepairCleanup(cleanupPlan, options = {}) {
   const duplicateResult = await removeEntries(cleanupPlan.duplicateFolders, logger, 'duplicate-folders');
   const artifactResult = await removeEntries(cleanupPlan.temporaryArtifacts, logger, 'temporary-artifacts');
   const orphanResult = options.removeOrphanedToolFolders
-    ? await removeEntries(cleanupPlan.orphanedToolFolders, logger, 'orphaned-tool-folders')
-    : { recoveredBytes: 0, removedCount: 0 };
+    ? await removeEntries(cleanupPlan.orphanedToolFolders, logger, 'orphaned-tool-folders', {
+        continueOnError: options.continueOnOrphanRemoveError !== false,
+      })
+    : { failedEntries: [], recoveredBytes: 0, removedCount: 0 };
 
   return {
+    failedOrphanedToolFolderEntries: orphanResult.failedEntries,
+    failedOrphanedToolFolders: orphanResult.failedEntries.length,
     recoveredBytes: duplicateResult.recoveredBytes + artifactResult.recoveredBytes + orphanResult.recoveredBytes,
     removedDuplicateFolders: duplicateResult.removedCount,
     removedOrphanedToolFolders: orphanResult.removedCount,
     removedTemporaryArtifacts: artifactResult.removedCount,
-    skippedOrphanedToolFolders: options.removeOrphanedToolFolders ? 0 : cleanupPlan.orphanedToolFolders.length,
+    skippedOrphanedToolFolders: options.removeOrphanedToolFolders
+      ? orphanResult.failedEntries.length
+      : cleanupPlan.orphanedToolFolders.length,
   };
 }
 
@@ -383,5 +482,7 @@ module.exports = {
   inspectRepairCleanup,
   normalizeInstallPathKey,
   normalizeManagedRootPath,
+  preflightPathRemoval,
+  removePathWithRetries,
 };
 

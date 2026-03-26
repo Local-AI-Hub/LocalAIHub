@@ -174,10 +174,6 @@
       ],
       "pipInstalls": [
         {
-          "kind": "requirements",
-          "value": "requirements.txt"
-        },
-        {
           "kind": "path",
           "value": "."
         }
@@ -523,19 +519,15 @@
         "facefusion.ini",
         ".assets"
       ],
-      "pythonRequirementDetection": [
-        {
-          "kind": "pyproject",
-          "file": "pyproject.toml"
-        }
-      ],
+      "pythonRequirement": ">=3.12,<3.13",
       "pipInstalls": [
         {
           "kind": "python-script",
           "value": "install.py",
           "args": [
             "--onnxruntime",
-            "default"
+            "default",
+            "--skip-conda"
           ],
           "message": "Running the official FaceFusion setup script."
         }
@@ -593,8 +585,10 @@
       "kind": "installer-exe",
       "runtime": "binary",
       "downloadFileName": "gpt4all-installer-win64.exe",
-      "installSummary": "Downloads the latest GPT4All Windows installer so Local AI Hub can add an easy local chat app for low-end hardware.",
+      "installSummary": "Downloads the latest GPT4All Windows installer so Local AI Hub can launch the official setup flow and detect the finished app afterward.",
       "installerArgs": [],
+      "managedInstallSupported": false,
+      "materializationTimeoutMs": 900000,
       "configTargets": [],
       "externalExecutableCandidates": [
         "GPT4All.exe",
@@ -816,12 +810,12 @@
     "icon": "JN",
     "category": "LLM tools",
     "interfaceMode": "desktop-app",
-    "downloadUrl": "https://github.com/janhq/jan/releases/latest/download/jan.exe",
+    "downloadUrl": "https://github.com/janhq/jan/releases/download/v0.7.9/Jan_0.7.9_x64-setup.exe",
     "installInstructions": {
-      "kind": "single-file",
+      "kind": "installer-exe",
       "runtime": "binary",
-      "downloadFileName": "jan.exe",
-      "installSummary": "Downloads the latest Jan desktop executable into Local AI Hub for a polished local chat experience.",
+      "downloadFileName": "Jan_0.7.9_x64-setup.exe",
+      "installSummary": "Downloads the current Jan Windows installer and runs it into Local AI Hub-managed storage.",
       "configTargets": [],
       "externalExecutableCandidates": [
         "jan.exe",
@@ -832,7 +826,11 @@
         "recommendedVramMb": 4096,
         "minimumRamMb": 8192,
         "recommendedRamMb": 16384
-      }
+      },
+      "installerArgs": [
+        "/S",
+        "/D={appDir}"
+      ]
     },
     "launchCommand": "jan.exe",
     "detectionPaths": [
@@ -1049,12 +1047,12 @@
     "description": "A self-hosted coding assistant and GitHub Copilot alternative that integrates with VS Code and other editors as a local completion server.",
     "icon": "TB",
     "category": "Coding tools",
-    "downloadUrl": "https://github.com/TabbyML/tabby/releases/latest/download/tabby_x86_64-windows-msvc.zip",
+    "downloadUrl": "https://github.com/TabbyML/tabby/releases/download/v0.32.0/tabby_x86_64-windows-msvc-cpu.zip",
     "installInstructions": {
       "kind": "zip",
       "runtime": "binary",
-      "archiveName": "tabby_x86_64-windows-msvc.zip",
-      "installSummary": "Downloads the latest Windows Tabby server binary into Local AI Hub for self-hosted code completion and chat.",
+      "archiveName": "tabby_x86_64-windows-msvc-cpu.zip",
+      "installSummary": "Downloads the current Windows CPU Tabby server binary into Local AI Hub for self-hosted code completion and chat.",
       "configTargets": [
         "config.toml"
       ],

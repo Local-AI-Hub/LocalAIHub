@@ -3,6 +3,7 @@ const { resolveToolStatus } = require('./processService');
 const { listSnapshots } = require('./snapshotService');
 const { syncDiscoveredTools } = require('./toolDiscoveryService');
 const { getToolManifest, initializeToolRegistry } = require('./toolRegistry');
+const { allowsLocalSnapshots, normalizeToolLifecycle } = require('./toolLifecycleService');
 
 async function buildMergedToolStateList(options = {}) {
   if (!options.skipRegistryInit) {
@@ -19,18 +20,18 @@ async function buildMergedToolStateList(options = {}) {
       .sort((left, right) => String(left?.name || left?.id || '').localeCompare(String(right?.name || right?.id || '')))
       .map(async (tool) => {
         const manifest = getToolManifest(tool.id) || {};
-        const mergedTool = {
+        const mergedTool = normalizeToolLifecycle({
           ...manifest,
           ...tool,
           compatibility: manifest.installInstructions?.compatibility || manifest.compatibility || tool.compatibility || null,
-        };
+        }, manifest);
 
         return {
           ...mergedTool,
           status: options.resolveStatuses ? await resolveToolStatus(mergedTool) : mergedTool.status || 'stopped',
-          snapshots: options.includeSnapshots && mergedTool.source === 'managed' ? await listSnapshots(mergedTool.id) : [],
+          snapshots: options.includeSnapshots && allowsLocalSnapshots(mergedTool, manifest) ? await listSnapshots(mergedTool.id) : [],
           updateSupported:
-            mergedTool.source === 'managed' ||
+            mergedTool.lifecycleMode === 'managed' ||
             manifest.installInstructions?.kind === 'installer-exe' ||
             manifest.installInstructions?.kind === 'single-file' ||
             manifest.installInstructions?.runtime === 'binary',

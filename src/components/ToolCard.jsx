@@ -1,5 +1,24 @@
 import { formatTimestamp, statusClass } from '../lib/formatters';
 
+function installSourceLabel(tool) {
+  if (tool?.source === 'managed' && tool?.externalInstallDetected) {
+    return 'Managed copy + system install';
+  }
+
+  return tool?.source === 'managed' ? 'Local AI Hub install' : 'System install';
+}
+
+function externalInstallNote(tool) {
+  if (!(tool?.source === 'managed' && tool?.externalInstallDetected)) {
+    return null;
+  }
+
+  const externalPath = tool.externalInstallDisplayPath || tool.externalInstallDir;
+  return externalPath
+    ? `Windows or another installer also has this tool at ${externalPath}. Local AI Hub is using the managed copy shown here.`
+    : 'Windows or another installer also has a separate system install for this tool. Local AI Hub is using the managed copy shown here.';
+}
+
 function primaryAction(tool, busyMap, handlers) {
   if (tool.status === 'running' || tool.status === 'starting') {
     return {
@@ -63,13 +82,14 @@ export default function ToolCard({
                   : 'border-accent/40 bg-accent/10 text-accent'
               }`}
             >
-              {tool.source === 'managed' ? 'Local AI Hub install' : 'System install'}
+              {installSourceLabel(tool)}
             </span>
           </div>
           <p className="mt-3 text-sm text-slate-400">
             {tool.source === 'managed' ? 'Installed' : 'Detected'} {formatTimestamp(tool.installedAt || tool.detectedAt)}
           </p>
           <p className="mt-2 text-sm leading-6 text-slate-300">{tool.displayPath || tool.installDir}</p>
+          {externalInstallNote(tool) ? <p className="mt-2 text-xs leading-6 text-slate-400">{externalInstallNote(tool)}</p> : null}
         </div>
         <div className="flex flex-wrap gap-2">
           <button className={action.variant} disabled={action.disabled} onClick={action.onClick} type="button">

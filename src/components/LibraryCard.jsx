@@ -17,6 +17,142 @@ function embeddedActionLabel(tool) {
   return 'Open workspace';
 }
 
+function lifecycleMode(tool) {
+  return String(tool?.lifecycleMode || (tool?.source === 'managed' ? 'managed' : 'external'))
+    .trim()
+    .toLowerCase();
+}
+
+function actionSemantics(tool) {
+  if (tool?.actionSemantics) {
+    return tool.actionSemantics;
+  }
+
+  const mode = lifecycleMode(tool);
+  const uninstallKind = mode === 'managed'
+    ? 'uninstall'
+    : mode === 'official-installer' && tool?.installedByLocalAIHub
+      ? 'official-uninstall'
+      : 'remove-from-library';
+  const lifecycleClass = mode === 'managed'
+    ? 'managed-install'
+    : mode === 'official-installer' && tool?.installedByLocalAIHub
+      ? 'official-managed-install'
+      : mode === 'official-installer'
+        ? 'detected-official-install'
+        : 'detected-external-install';
+
+  return {
+    lifecycleClass,
+    repairKind: mode === 'managed' ? 'repair-managed' : tool?.installKind === 'installer-exe' ? 'repair-official' : 'repair-unavailable',
+    uninstallKind,
+    uninstallLabel:
+      uninstallKind === 'uninstall'
+        ? 'Uninstall'
+        : uninstallKind === 'official-uninstall'
+          ? 'Official Uninstall'
+          : 'Remove from Library',
+  };
+}
+
+function lifecycleClass(tool) {
+  return actionSemantics(tool).lifecycleClass;
+}
+
+function isOfficialInstallerTracked(tool) {
+  return actionSemantics(tool).uninstallKind === 'official-uninstall';
+}
+
+function installSourceLabel(tool) {
+  const toolLifecycleClass = lifecycleClass(tool);
+  if (toolLifecycleClass === 'managed-install' && tool?.externalInstallDetected) {
+    return 'Local AI Hub managed + separate detected install';
+  }
+
+  if (toolLifecycleClass === 'managed-install') {
+    return 'Local AI Hub managed install';
+  }
+
+  if (toolLifecycleClass === 'official-managed-install' && tool?.source === 'managed') {
+    return 'Official installer in Local AI Hub folder';
+  }
+
+  if (toolLifecycleClass === 'official-managed-install') {
+    return 'Official installer launched by Local AI Hub';
+  }
+
+  if (toolLifecycleClass === 'detected-official-install') {
+    return 'Detected official install';
+  }
+
+  return 'Detected on this PC';
+}
+
+function installLocationLabel(tool) {
+  const toolLifecycleClass = lifecycleClass(tool);
+  if (toolLifecycleClass === 'managed-install') {
+    return 'Managed location';
+  }
+
+  if (toolLifecycleClass === 'official-managed-install') {
+    return 'Install location';
+  }
+
+  return 'Detected location';
+}
+
+function locationDisplayPath(tool) {
+  return tool?.displayPath || tool?.installDir || tool?.windowsInstallLocation || 'Location not available';
+}
+
+function uninstallActionLabel(tool) {
+  return actionSemantics(tool).uninstallLabel || 'Remove from Library';
+}
+
+function uninstallBusyLabel(tool) {
+  const uninstallKind = actionSemantics(tool).uninstallKind;
+  if (uninstallKind === 'remove-from-library') {
+    return 'Removing...';
+  }
+
+  if (uninstallKind === 'official-uninstall') {
+    return 'Official uninstalling...';
+  }
+
+  return 'Uninstalling...';
+}
+
+function installNote(tool) {
+  const notes = [];
+  const mode = lifecycleMode(tool);
+
+  if (mode === 'managed' && tool?.externalInstallDetected) {
+    const externalPath = tool.externalInstallDisplayPath || tool.externalInstallDir;
+    notes.push(
+      externalPath
+        ? `Windows or another installer also has this tool at ${externalPath}. Local AI Hub is using the managed copy shown here.`
+        : 'Windows or another installer also has a separate system install for this tool. Local AI Hub is using the managed copy shown here.',
+    );
+  }
+
+  if (isOfficialInstallerTracked(tool)) {
+    if (tool?.windowsUninstallBrokenCount > 0 && !tool?.windowsUninstallDetected) {
+      notes.push('Windows uninstall data exists for this copy, but the official uninstaller is broken or missing. Local AI Hub can only remove the files and shortcuts it still owns until Repair recreates a working vendor uninstall path.');
+    } else if (tool?.windowsUninstallPathState === 'present-with-stale') {
+      notes.push('Local AI Hub found the working Windows uninstaller plus stale leftover Apps & Features data for another copy. It will run the official uninstaller, remove any Local AI Hub-owned leftovers it can, and clear stale dead entries when it can verify them safely.');
+    } else if (tool?.windowsUninstallPathState === 'stale') {
+      notes.push('Windows still has a broken Apps & Features entry for this copy. Local AI Hub will not let that stale metadata pretend the app is still installed, and Cleanup can clear it if it remains.');
+    } else if (tool?.windowsUninstallDetected) {
+      notes.push('Local AI Hub will use the official Windows uninstaller instead of deleting files directly. If Windows leaves a dead Apps & Features entry behind, Local AI Hub will report that honestly and Cleanup can clear it.');
+    } else {
+      notes.push('This copy came from an official installer. If Windows uninstall data is missing, Local AI Hub can only remove files and shortcuts it still owns and then reconcile any stale Apps & Features metadata it can verify.');
+    }
+  } else if (mode === 'official-installer') {
+    notes.push('This install was detected on your PC. Local AI Hub can launch it, but it does not own the uninstall lifecycle.');
+  }
+
+  return notes.length ? notes.join(' ') : null;
+}
 function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
   if (tool.status === 'running' || tool.status === 'starting') {
     return (
@@ -102,6 +238,8 @@ function areLibraryCardPropsEqual(prevProps, nextProps) {
     prevProps.updateInfo === nextProps.updateInfo &&
     prevProps.settingsOpen === nextProps.settingsOpen &&
     prevProps.runningUsageLabel === nextProps.runningUsageLabel &&
+    prevProps.migrationBusy === nextProps.migrationBusy &&
+    prevProps.migrationEligible === nextProps.migrationEligible &&
     busyKeys.every((key) => isBusy(prevProps.busyMap, key) === isBusy(nextProps.busyMap, key))
   );
 }
@@ -113,10 +251,13 @@ function LibraryCard({
   updateProgress,
   updateInfo,
   busyMap,
+  migrationBusy,
+  migrationEligible,
   runningUsageLabel,
   settingsOpen,
   onToggleSettings,
   onLaunch,
+  onMigrateManagedData,
   onOpenInterface,
   onStop,
   onRepair,
@@ -127,9 +268,11 @@ function LibraryCard({
   onUpdate,
 }) {
   const runningUsage = tool.status === 'running' ? runningUsageLabel : tool.status === 'starting' ? 'Starting up' : 'Idle';
-  const canRepair = tool.source === 'managed' || tool.installKind === 'installer-exe';
-  const canSnapshot = tool.source === 'managed';
+  const canRepair = actionSemantics(tool).repairKind !== 'repair-unavailable';
+  const canSnapshot = lifecycleMode(tool) === 'managed';
   const hasUpdate = Boolean(updateInfo?.updateAvailable);
+  const note = installNote(tool);
+  const uninstallLabel = uninstallActionLabel(tool);
 
   return (
     <article className="library-card">
@@ -147,7 +290,7 @@ function LibraryCard({
             <div className="mt-5 grid gap-3 md:grid-cols-3">
               <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Install source</p>
-                <p className="mt-2 text-sm font-medium text-white">{tool.source === 'managed' ? 'Local AI Hub managed' : 'Detected on this PC'}</p>
+                <p className="mt-2 text-sm font-medium text-white">{installSourceLabel(tool)}</p>
               </div>
               <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Current VRAM load</p>
@@ -182,7 +325,7 @@ function LibraryCard({
             onClick={() => onUninstall(tool)}
             type="button"
           >
-            {busyMap[`uninstall:${tool.id}`] ? 'Uninstalling...' : 'Uninstall'}
+            {busyMap[`uninstall:${tool.id}`] ? uninstallBusyLabel(tool) : uninstallLabel}
           </button>
         </div>
       </div>
@@ -220,9 +363,20 @@ function LibraryCard({
       {settingsOpen ? (
         <div className="mt-5 grid gap-4 xl:grid-cols-[0.8fr,1.2fr]">
           <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
-            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Settings</p>
+            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">{installLocationLabel(tool)}</p>
             <div className="mt-4 space-y-3 text-sm text-slate-300">
-              <p className="break-all leading-6">{tool.displayPath || tool.installDir}</p>
+              <p className="break-all leading-6">{locationDisplayPath(tool)}</p>
+              {note ? <p className="mt-3 text-xs leading-6 text-slate-400">{note}</p> : null}
+              {migrationEligible ? (
+                <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 p-3 text-sm leading-6 text-amber-50">
+                  This tool is still in an older Local AI Hub storage folder. Migrating will move all eligible managed folders into the current storage root.
+                </div>
+              ) : null}
+              {migrationEligible ? (
+                <button className="ghost-button w-full justify-center" disabled={migrationBusy} onClick={onMigrateManagedData} type="button">
+                  {migrationBusy ? 'Migrating...' : 'Migrate managed files'}
+                </button>
+              ) : null}
               <button className="ghost-button w-full justify-center" onClick={() => onOpenFolder(tool.id)} type="button">
                 Open folder
               </button>
@@ -278,7 +432,7 @@ function LibraryCard({
                 <p className="text-sm leading-6 text-slate-400">
                   {canSnapshot
                     ? 'No snapshots saved for this tool yet.'
-                    : 'Snapshots are only available for Local AI Hub-managed installs.'}
+                    : 'Snapshots are only available for tools that Local AI Hub manages directly.'}
                 </p>
               )}
             </div>

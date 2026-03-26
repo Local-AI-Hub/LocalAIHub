@@ -481,15 +481,29 @@ function expandDetectionPath(template) {
   return String(template || '').replace(/%([^%]+)%/g, (_match, name) => getEnvValueInsensitive(name) || '');
 }
 
-function getAllowedManagedInstallDirs(manifest, appPaths) {
+function getManagedRootCandidates(existingTool, appPaths) {
+  const trackedInstallDir = normalizeInstallDirCandidate(existingTool?.installDir || existingTool?.appDir || '');
+  const trackedInstallRoot = trackedInstallDir && path.basename(path.dirname(trackedInstallDir)).toLowerCase() === 'tools'
+    ? path.dirname(path.dirname(trackedInstallDir))
+    : null;
+
   return uniquePaths([
-    path.join(appPaths.toolsRoot, manifest.id),
-    ...(appPaths.legacyRoots || []).map((legacyRoot) => path.join(legacyRoot, 'tools', manifest.id)),
-  ]);
+    appPaths.managedRoot,
+    ...(appPaths.knownManagedRoots || []),
+    existingTool?.installRoot,
+    existingTool?.requestedInstallRoot,
+    trackedInstallRoot,
+  ].filter(Boolean));
 }
 
-function getAllowedManagedLocationKeys(manifest, appPaths) {
-  const locations = getAllowedManagedInstallDirs(manifest, appPaths);
+function getAllowedManagedInstallDirs(manifest, appPaths, existingTool = null) {
+  return uniquePaths(
+    getManagedRootCandidates(existingTool, appPaths).map((rootPath) => path.join(rootPath, 'tools', manifest.id)),
+  );
+}
+
+function getAllowedManagedLocationKeys(manifest, appPaths, existingTool = null) {
+  const locations = getAllowedManagedInstallDirs(manifest, appPaths, existingTool);
   return new Set(
     uniquePaths([
       ...locations,
@@ -498,25 +512,50 @@ function getAllowedManagedLocationKeys(manifest, appPaths) {
   );
 }
 
+function getToolLocationCandidates(tool) {
+  return uniquePaths([
+    normalizeInstallDirCandidate(tool?.installDir),
+    tool?.installDir,
+    tool?.appDir,
+    normalizeInstallDirCandidate(tool?.detectedPath),
+    normalizeInstallDirCandidate(tool?.displayPath),
+  ].filter(Boolean));
+}
+
 function toolUsesManagedInstallLocation(manifest, tool, appPaths) {
   if (!tool) {
     return false;
   }
 
-  if (tool.source === 'managed' || tool.managedByLocalAIHub) {
+  const allowedLocations = getAllowedManagedLocationKeys(manifest, appPaths, tool);
+  const candidates = getToolLocationCandidates(tool);
+  if (candidates.some((candidate) => allowedLocations.has(normalizePathKey(candidate)))) {
     return true;
   }
 
-  const allowedLocations = getAllowedManagedLocationKeys(manifest, appPaths);
+  return Boolean(tool.source === 'managed' && candidates.length === 0);
+}
+
+function detectedLocationIsManaged(manifest, detected, appPaths, existingTool = null) {
+  if (!detected) {
+    return false;
+  }
+
+  const allowedLocations = getAllowedManagedLocationKeys(manifest, appPaths, existingTool);
   const candidates = uniquePaths([
-    normalizeInstallDirCandidate(tool.installDir),
-    tool.installDir,
-    tool.appDir,
-    normalizeInstallDirCandidate(tool.detectedPath),
-    normalizeInstallDirCandidate(tool.displayPath),
+    normalizeInstallDirCandidate(detected.installDir),
+    normalizeInstallDirCandidate(detected.detectedPath),
   ].filter(Boolean));
 
   return candidates.some((candidate) => allowedLocations.has(normalizePathKey(candidate)));
+}
+
+function selectExternalInstallCandidate(manifest, detected, appPaths, existingTool = null) {
+  if (!detected || detectedLocationIsManaged(manifest, detected, appPaths, existingTool)) {
+    return null;
+  }
+
+  return detected;
 }
 
 async function managedInstallDirectoryExists(manifest, installDir, appPaths) {
@@ -820,8 +859,9 @@ async function discoverInstallLocation(manifest, existingTool, appPaths) {
 
   for (const discoverStep of discoverySteps) {
     const resolved = await discoverStep();
-    if (resolved) {
-      return resolved;
+    const externalCandidate = selectExternalInstallCandidate(manifest, resolved, appPaths, existingTool);
+    if (externalCandidate) {
+      return externalCandidate;
     }
   }
 
@@ -853,15 +893,15 @@ async function discoverTools(payload = {}) {
       ? [
           normalizeInstallDirCandidate(existingTool?.installDir),
           normalizeInstallDirCandidate(existingTool?.appDir),
-          ...getAllowedManagedInstallDirs(manifest, appPaths),
+          ...getAllowedManagedInstallDirs(manifest, appPaths, existingTool),
         ]
       : [];
 
     const managedInstallDir = await findManagedInstallCandidate(manifest, managedCandidates, appPaths);
-    const externalDetected =
-      ignoredToolIds.has(manifest.id) || managedInstallDir
-        ? null
-        : await discoverInstallLocation(manifest, existingTool, appPaths);
+    const detectedInstall = ignoredToolIds.has(manifest.id)
+      ? null
+      : await discoverInstallLocation(manifest, existingTool, appPaths);
+    const externalDetected = selectExternalInstallCandidate(manifest, detectedInstall, appPaths, existingTool);
 
     results[manifest.id] = {
       externalDetected,

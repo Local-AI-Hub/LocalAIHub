@@ -1,24 +1,41 @@
 const path = require('path');
 const fs = require('fs-extra');
+const { spawn } = require('child_process');
 const { open } = require('node:fs/promises');
 const { app } = require('electron');
 const extract = require('extract-zip');
 
 const { version: APP_VERSION } = require('../../package.json');
 
-const { getAppPaths, humanizeError, removeTool, setToolIgnored, upsertTool } = require('./configService');
+const { getAppPaths, humanizeError, normalizeOptionalDirectoryPath, readConfig, removeTool, setToolIgnored, upsertTool } = require('./configService');
 const { verifyDownloadedFileIntegrity } = require('./downloadIntegrityService');
 const { resolvePythonCommand, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { detectPythonRequirement, describePythonRequirement } = require('./pythonRequirementService');
 const { ensureManagedPythonRuntime } = require('./pythonRuntimeService');
-const { applyRepairCleanup, getDiskPreflight, inspectRepairCleanup } = require('./storageMaintenanceService');
+const { applyRepairCleanup, getDiskPreflight, inspectRepairCleanup, preflightPathRemoval, removePathWithRetries } = require('./storageMaintenanceService');
 const { syncDiscoveredTools } = require('./toolDiscoveryService');
 const { buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
+const { INSTALL_DESTINATION_CONTROL, getToolActionSemantics, isDirectManagedTool, isOfficialInstallerTool, normalizeToolLifecycle } = require('./toolLifecycleService');
+const {
+  enrichToolWithWindowsUninstall,
+  removeToolWindowsShortcuts,
+  removeWindowsUninstallEntry,
+  resolveToolUninstallContext,
+  runWindowsUninstaller,
+} = require('./windowsUninstallService');
 const { assertPathInside, assertSecureRemoteUrl, findManagedToolsRootForPath, resolveManagedToolPaths } = require('./pathSafetyService');
 
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const MIN_CACHE_BYTES = 1024;
+const PACKAGE_SIGNATURE_BYTES = 8;
+const PE_HEADER = Buffer.from([0x4d, 0x5a]);
+const SEVEN_ZIP_HEADER = Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
+const ZIP_HEADER = Buffer.from([0x50, 0x4b]);
+const INSTALLER_MATERIALIZATION_TIMEOUT_MS = 180000;
+const INSTALLER_MATERIALIZATION_POLL_MS = 1000;
+const OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS = 45000;
+const OFFICIAL_UNINSTALL_SETTLE_POLL_MS = 1000;
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -183,12 +200,15 @@ function buildRepairCleanupNotes(cleanupSummary) {
     );
   }
 
-  if (cleanupSummary.skippedOrphanedToolFolders > 0) {
+  if (cleanupSummary.failedOrphanedToolFolders > 0) {
+    notes.push(
+      `skipped ${cleanupSummary.failedOrphanedToolFolders} locked orphaned ${pluralize(cleanupSummary.failedOrphanedToolFolders, 'tool folder')} so repair could continue`,
+    );
+  } else if (cleanupSummary.skippedOrphanedToolFolders > 0) {
     notes.push(
       `left ${cleanupSummary.skippedOrphanedToolFolders} orphaned ${pluralize(cleanupSummary.skippedOrphanedToolFolders, 'tool folder')} untouched`,
     );
   }
-
   if (cleanupSummary.recoveredBytes > 0) {
     notes.push(`recovered ${formatBytes(cleanupSummary.recoveredBytes)} of disk space`);
   }
@@ -230,28 +250,35 @@ function buildRepairOutcomeMessage(toolName, notes = []) {
   return `Local AI Hub repaired ${toolName}: ${notes.join(', ')}.`;
 }
 
-async function getToolInstallPreflight(toolId) {
+async function getToolInstallPreflight(toolRequest) {
+  const payload = typeof toolRequest === 'string' ? { toolId: toolRequest } : toolRequest || {};
+  const toolId = String(payload.toolId || '').trim().toLowerCase();
   await initializeToolRegistry();
   const manifest = getToolManifest(toolId);
   if (!manifest) {
     throw new Error('Local AI Hub does not recognize that tool.');
   }
 
+  const installRoot = await resolvePreferredInstallRoot(payload.installRoot || null);
   const logger = createLogger('installer', {
     toolId,
     toolName: manifest.name,
     mode: 'preflight',
   });
-  const { archivePath } = buildManagedPaths(manifest);
+  const { archivePath } = buildManagedPaths(manifest, {
+    installRoot,
+  });
   const estimate = await estimateToolInstallRequirement(manifest, archivePath, logger);
-  const managedDataPath = getAppPaths().managedRoot;
-  const preflight = await getDiskPreflight(managedDataPath, estimate.requiredBytes);
+  const preflight = await getDiskPreflight(installRoot, estimate.requiredBytes);
 
   return {
     ...preflight,
+    destinationMessage: buildInstallerDestinationMessage(manifest, installRoot),
     estimateSource: estimate.source,
+    installContract: manifest.installContract,
+    installRoot,
     sizeKnown: estimate.sizeKnown,
-    targetPath: managedDataPath,
+    targetPath: installRoot,
     toolId,
     toolName: manifest.name,
   };
@@ -275,14 +302,52 @@ function assertSafePipInstallTarget(value) {
   return target;
 }
 
+async function resolvePreferredInstallRoot(requestedRoot = null) {
+  const normalizedRequestedRoot = normalizeOptionalDirectoryPath(requestedRoot);
+  if (normalizedRequestedRoot) {
+    return normalizedRequestedRoot;
+  }
+
+  const config = await readConfig().catch(() => null);
+  return normalizeOptionalDirectoryPath(config?.preferredInstallRoot) || getAppPaths().managedRoot;
+}
+
+function resolveStoredInstallRoot(toolState, fallbackRoot = null) {
+  return normalizeOptionalDirectoryPath(toolState?.installRoot || toolState?.requestedInstallRoot || fallbackRoot) || getAppPaths().managedRoot;
+}
+
+function buildPlannedInstallPaths(manifest, installRoot) {
+  const destinationRoot = normalizeOptionalDirectoryPath(installRoot) || getAppPaths().managedRoot;
+  const installDir = path.join(destinationRoot, 'tools', manifest.id);
+  return {
+    appDir: path.join(installDir, 'app'),
+    destinationRoot,
+    downloadCacheDir: path.join(destinationRoot, 'downloads', manifest.id),
+    installDir,
+  };
+}
+
+function buildInstallerDestinationMessage(manifest, installRoot) {
+  const plannedPaths = buildPlannedInstallPaths(manifest, installRoot);
+  if (manifest.installContract?.destinationControl === INSTALL_DESTINATION_CONTROL.GUIDED) {
+    return `${manifest.name}'s official installer decides the final app location. Local AI Hub will stage the installer under ${plannedPaths.downloadCacheDir} and ask you to choose or confirm the final destination in the installer window.`;
+  }
+
+  if (manifest.installContract?.lifecycleMode === 'official-installer') {
+    return `${manifest.name} will be installed by its official Windows installer. Local AI Hub will ask that installer to use ${plannedPaths.appDir} and will use the official uninstaller later instead of deleting files directly.`;
+  }
+
+  return `${manifest.name} will be installed directly into ${plannedPaths.installDir}.`;
+}
 function ensureManagedToolStatePaths(toolState) {
   if (!toolState?.id) {
     throw new Error('Local AI Hub could not validate the managed tool path.');
   }
 
-  const installRoot = toolState.installDir || toolState.appDir || '';
-  const toolsRootOverride = installRoot ? findManagedToolsRootForPath(installRoot) : null;
-  const managedRootOverride = toolsRootOverride ? path.dirname(toolsRootOverride) : null;
+  const persistedInstallRoot = normalizeOptionalDirectoryPath(toolState.installRoot || toolState.requestedInstallRoot);
+  const installPath = toolState.installDir || toolState.appDir || '';
+  const toolsRootOverride = installPath ? findManagedToolsRootForPath(installPath) : null;
+  const managedRootOverride = persistedInstallRoot || (toolsRootOverride ? path.dirname(toolsRootOverride) : null);
   const managedPaths = resolveManagedToolPaths(
     toolState.id,
     path.basename(toolState.venvDir || '.venv'),
@@ -313,6 +378,81 @@ function ensureManagedToolStatePaths(toolState) {
     appDir,
     venvDir,
   };
+}
+
+function isManagedToolState(toolState) {
+  return Boolean(toolState && (toolState.source === 'managed' || toolState.managedByLocalAIHub));
+}
+
+function finalizeManagedInstallResult(toolState, manifest, existingTool = null) {
+  const nextToolState = normalizeToolLifecycle(toolState, manifest);
+  if (!isManagedToolState(nextToolState)) {
+    return nextToolState;
+  }
+
+  if (isOfficialInstallerTool(nextToolState, manifest)) {
+    const existingPath = existingTool?.displayPath || existingTool?.installDir || existingTool?.detectedPath || null;
+    const installedPath = nextToolState.displayPath || nextToolState.installDir;
+    return {
+      ...nextToolState,
+      installActionMessage: existingPath && existingTool?.source === 'external'
+        ? `${manifest.name} now has an official-installer copy at ${installedPath}. Local AI Hub will track that copy honestly and leave the separate detected install at ${existingPath} alone.`
+        : `${manifest.name} was installed by its official installer at ${installedPath}. Local AI Hub asked the installer to use that folder and will use the official uninstaller later instead of deleting files directly.`,
+    };
+  }
+
+  if (existingTool?.source === 'external') {
+    return {
+      ...nextToolState,
+      installActionMessage: `${manifest.name} is now managed by Local AI Hub in ${nextToolState.installDir}. Any separate detected copy on this PC was left untouched.`,
+    };
+  }
+
+  return nextToolState;
+}
+
+async function attachWindowsUninstallMetadata(toolState, manifest, options = {}) {
+  const normalizedToolState = normalizeToolLifecycle(toolState, manifest);
+  if (manifest.installInstructions?.kind !== 'installer-exe') {
+    return normalizedToolState;
+  }
+
+  const uninstallContext = await resolveToolUninstallContext(normalizedToolState, manifest, {
+    refresh: Boolean(options.refresh),
+  }).catch(() => null);
+  return enrichToolWithWindowsUninstall(normalizedToolState, uninstallContext);
+}
+
+function buildManagedPlacementFailureMessage(manifest, installDir, detectedTool = null) {
+  const detectedPath = detectedTool?.displayPath || detectedTool?.installDir || detectedTool?.detectedPath || null;
+  if (detectedPath) {
+    return `${manifest.name} is still installed outside Local AI Hub at ${detectedPath}. Its installer did not place a managed copy in ${installDir}, so Local AI Hub kept it labeled as detected instead of managed.`;
+  }
+
+  return `${manifest.name} finished running, but Local AI Hub could not find its launcher files inside ${installDir}.`;
+}
+
+function buildRepairVerificationFailureMessage(manifest, repairedTool, expectedInstallDir) {
+  const detectedPath = repairedTool?.displayPath || repairedTool?.installDir || repairedTool?.detectedPath || null;
+  if (detectedPath && !isManagedToolState(repairedTool)) {
+    return `${manifest.name} is still attached to ${detectedPath}. Local AI Hub did not restore a managed copy inside ${expectedInstallDir}, so repair could not be confirmed as a managed repair.`;
+  }
+
+  return `${manifest.name} finished repairing, but Local AI Hub still could not find a working launcher afterward.`;
+}
+
+async function verifyRepairedToolState(manifest, expectedToolState, options = {}) {
+  const discoveredTools = await syncDiscoveredTools({ force: true });
+  const repairedTool = discoveredTools[expectedToolState.id];
+  if (!(await toolIsAvailable(repairedTool))) {
+    throw new Error(buildRepairVerificationFailureMessage(manifest, repairedTool, expectedToolState.installDir));
+  }
+
+  if (options.expectManaged && !isManagedToolState(repairedTool)) {
+    throw new Error(buildRepairVerificationFailureMessage(manifest, repairedTool, expectedToolState.installDir));
+  }
+
+  return options.expectManaged ? ensureManagedToolStatePaths(repairedTool) : repairedTool;
 }
 
 function buildManagedProcessEnv(toolState, extraEnv = {}, options = {}) {
@@ -410,6 +550,119 @@ async function hasUsableArchiveCache(archivePath, logger) {
   return true;
 }
 
+function buildPackageDownloadFailureMessage(response) {
+  const status = Number(response?.status || 0);
+
+  if (status === 404 || status === 410) {
+    return 'Local AI Hub could not find the installer package at the publisher download URL.';
+  }
+
+  if (status === 403) {
+    return 'Local AI Hub could not download the installer package because the source refused the request.';
+  }
+
+  if (status >= 500) {
+    return 'Local AI Hub could not download the installer package because the source is unavailable right now.';
+  }
+
+  return 'Local AI Hub could not download the installer package from the publisher.';
+}
+
+async function readFileSignature(filePath, bytes = PACKAGE_SIGNATURE_BYTES) {
+  const fileHandle = await open(filePath, 'r');
+  const buffer = Buffer.alloc(bytes);
+
+  try {
+    const result = await fileHandle.read(buffer, 0, bytes, 0);
+    return buffer.subarray(0, result.bytesRead);
+  } finally {
+    await fileHandle.close().catch(() => null);
+  }
+}
+
+function signatureStartsWith(signature, magic) {
+  return signature.length >= magic.length && magic.every((byte, index) => signature[index] === byte);
+}
+
+function isLikelyMarkupPayload(signature) {
+  const preview = signature.toString('utf8').trimStart().toLowerCase();
+  return preview.startsWith('<!doctype') || preview.startsWith('<html') || preview.startsWith('<?xml');
+}
+
+function inferDownloadedPackageKind(manifest, archivePath) {
+  const extension = path.extname(archivePath || '').toLowerCase();
+
+  if (extension === '.zip') {
+    return 'zip';
+  }
+
+  if (extension === '.7z') {
+    return '7z';
+  }
+
+  if (extension === '.exe') {
+    return 'exe';
+  }
+
+  if (manifest.installInstructions.kind === 'single-file' || manifest.installInstructions.kind === 'installer-exe') {
+    return 'exe';
+  }
+
+  return 'unknown';
+}
+
+function describeDownloadedPackageKind(packageKind) {
+  if (packageKind === 'zip') {
+    return 'a ZIP archive';
+  }
+
+  if (packageKind === '7z') {
+    return 'a 7-Zip archive';
+  }
+
+  if (packageKind === 'exe') {
+    return 'a Windows executable';
+  }
+
+  return 'a supported installer package';
+}
+
+async function validateDownloadedPackage(manifest, archivePath, logger) {
+  const stats = await fs.stat(archivePath).catch(() => null);
+  if (!stats?.size || stats.size < MIN_CACHE_BYTES) {
+    await fs.remove(archivePath).catch(() => null);
+    throw new Error('Local AI Hub downloaded the installer package, but the file was incomplete.');
+  }
+
+  const packageKind = inferDownloadedPackageKind(manifest, archivePath);
+  const signature = await readFileSignature(archivePath);
+  const validSignature =
+    packageKind === 'zip'
+      ? signatureStartsWith(signature, ZIP_HEADER)
+      : packageKind === '7z'
+        ? signatureStartsWith(signature, SEVEN_ZIP_HEADER)
+        : packageKind === 'exe'
+          ? signatureStartsWith(signature, PE_HEADER)
+          : true;
+
+  if (validSignature) {
+    return;
+  }
+
+  await logger.warn('Downloaded installer package did not match the expected file signature.', {
+    archivePath,
+    packageKind,
+    signatureHex: signature.toString('hex'),
+  });
+  await fs.remove(archivePath).catch(() => null);
+
+  if (isLikelyMarkupPayload(signature)) {
+    throw new Error(`Local AI Hub reached the download source, but it returned a web page instead of ${describeDownloadedPackageKind(packageKind)}.`);
+  }
+
+  throw new Error(`Local AI Hub downloaded the installer package, but the file did not look like ${describeDownloadedPackageKind(packageKind)}.`);
+}
+
 async function downloadFile(url, destination, onProgress, logger, toolId) {
   assertSecureRemoteUrl(url, 'installer download URL');
 
@@ -426,8 +679,12 @@ async function downloadFile(url, destination, onProgress, logger, toolId) {
   );
 
   const response = await fetchWithTimeout(url, logger);
-  if (!response.ok || !response.body) {
-    throw new Error('Local AI Hub could not download the installer package.');
+  if (!response.ok) {
+    throw new Error(buildPackageDownloadFailureMessage(response));
+  }
+
+  if (!response.body) {
+    throw new Error('Local AI Hub reached the download source, but it did not send the installer file.');
   }
 
   await fs.ensureDir(path.dirname(destination));
@@ -647,16 +904,16 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
     toolId: toolState.id,
     percent: 72,
     stage: 'dependencies',
-    message: 'Updating pip inside the virtual environment.',
+    message: 'Preparing pip, setuptools, and wheel inside the virtual environment.',
   });
 
-  await runCommand(pythonPath, ['-m', 'pip', 'install', '--upgrade', 'pip'], {
+  await runCommand(pythonPath, ['-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], {
     cwd: toolState.appDir,
     env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
-    errorMessage: 'Local AI Hub could not update pip in the tool environment.',
+    errorMessage: 'Local AI Hub could not prepare the tool environment.',
   });
 
-  await logger.info('pip was upgraded inside the tool environment.', {
+  await logger.info('The Python packaging tools were updated inside the tool environment.', {
     pythonPath,
   });
 
@@ -779,6 +1036,49 @@ async function resolveManagedPythonRuntime(appDir, manifest, logger, onProgress,
   };
 }
 
+function resolveLaunchProfileTargetPath(launchProfile) {
+  if (!launchProfile?.target) {
+    return null;
+  }
+
+  if (path.isAbsolute(launchProfile.target)) {
+    return launchProfile.target;
+  }
+
+  const baseDir = launchProfile.workingDir || '';
+  return baseDir ? path.resolve(baseDir, launchProfile.target) : null;
+}
+
+async function verifyManagedToolInstall(toolState, manifest, logger) {
+  const safeToolState = ensureManagedToolStatePaths(toolState);
+  const launchProfile = safeToolState.launchProfile || buildManagedLaunchProfile(safeToolState, manifest);
+
+  if (!(await toolIsAvailable({
+    ...safeToolState,
+    launchProfile,
+  }))) {
+    throw new Error(`${manifest.name} finished installing, but Local AI Hub still could not find a usable launcher in the managed tool folder.`);
+  }
+
+  if (getToolRuntime(manifest) === 'python' && safeToolState.venvDir) {
+    const pythonPath = path.join(safeToolState.venvDir, 'Scripts', 'python.exe');
+    if (!(await fs.pathExists(pythonPath))) {
+      throw new Error(`${manifest.name} finished installing, but its Python environment is missing.`);
+    }
+
+    await runCommand(pythonPath, ['-m', 'pip', 'check'], {
+      cwd: safeToolState.appDir,
+      env: buildManagedProcessEnv(safeToolState, {}, { requireVirtualEnv: true }),
+      errorMessage: `Local AI Hub installed ${manifest.name}, but its Python environment still has dependency conflicts.`,
+    });
+  }
+
+  return {
+    ...safeToolState,
+    launchProfile,
+  };
+}
+
 async function toolIsAvailable(toolState) {
   if (!toolState) {
     return false;
@@ -789,11 +1089,20 @@ async function toolIsAvailable(toolState) {
   }
 
   if ((toolState.launchProfile?.kind === 'python-script' || toolState.launchProfile?.kind === 'python-module') && toolState.launchProfile?.pythonPath) {
-    if (isBareCommand(toolState.launchProfile.pythonPath)) {
-      return toolState.installDir ? fs.pathExists(toolState.installDir) : true;
+    const pythonExists = isBareCommand(toolState.launchProfile.pythonPath)
+      ? toolState.installDir ? await fs.pathExists(toolState.installDir) : true
+      : await fs.pathExists(toolState.launchProfile.pythonPath);
+
+    if (!pythonExists) {
+      return false;
     }
 
-    return fs.pathExists(toolState.launchProfile.pythonPath);
+    if (toolState.launchProfile.kind === 'python-script') {
+      const targetPath = resolveLaunchProfileTargetPath(toolState.launchProfile);
+      return targetPath ? fs.pathExists(targetPath) : false;
+    }
+
+    return true;
   }
 
   if (toolState.launchProfile?.kind === 'embedded' && toolState.launchProfile?.pythonPath) {
@@ -815,7 +1124,9 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
   const runtime = pythonResolution?.runtime || null;
   const requirement = pythonResolution?.requirement || null;
   const managedRuntime = runtime?.source === 'managed' ? runtime : null;
-  const toolState = {
+  const toolsRoot = findManagedToolsRootForPath(installDir || appDir || '');
+  const installRoot = normalizeOptionalDirectoryPath(toolsRoot ? path.dirname(toolsRoot) : null) || getAppPaths().managedRoot;
+  const toolState = normalizeToolLifecycle({
     id: manifest.id,
     name: manifest.name,
     description: manifest.description,
@@ -825,6 +1136,9 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
     source: 'managed',
     managedByLocalAIHub: true,
     installDir,
+    installRoot,
+    installedByLocalAIHub: true,
+    requestedInstallRoot: installRoot,
     appDir,
     venvDir: getToolRuntime(manifest) === 'python' ? venvDir : null,
     executablePath:
@@ -847,7 +1161,7 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
     managedPythonVersion: managedRuntime?.versionString || null,
     managedPythonPath: managedRuntime?.pythonPath || null,
     managedPythonInstallDir: managedRuntime?.installDir || null,
-  };
+  }, manifest);
 
   toolState.launchProfile = buildManagedLaunchProfile(toolState, manifest);
   if (toolState.launchProfile?.kind === 'binary') {
@@ -855,11 +1169,19 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
   }
   return ensureManagedToolStatePaths(toolState);
 }
-function buildManagedPaths(manifest) {
-  const { downloadsRoot } = getAppPaths();
+function buildManagedPaths(manifest, options = {}) {
+  const installRoot = resolveStoredInstallRoot(options, getAppPaths().managedRoot);
   const managedPaths = resolveManagedToolPaths(
     manifest.id,
     manifest.installInstructions.venvFolder || '.venv',
+    {
+      managedRoot: installRoot,
+    },
+  );
+  const downloadsRoot = assertPathInside(
+    installRoot,
+    path.join(installRoot, 'downloads'),
+    'Local AI Hub refused to stage an installer outside the selected install root.',
   );
   const cacheFileName =
     manifest.installInstructions.downloadFileName ||
@@ -868,15 +1190,16 @@ function buildManagedPaths(manifest) {
   const archivePath = assertPathInside(
     downloadsRoot,
     path.join(downloadsRoot, manifest.id, cacheFileName),
-    'Local AI Hub refused to use a download cache path outside the downloads folder.',
+    'Local AI Hub refused to use a download cache path outside the selected install root.',
   );
 
   return {
     ...managedPaths,
     archivePath,
+    downloadsRoot,
+    installRoot,
   };
 }
-
 function deriveCacheFileName(downloadUrl, toolId) {
   try {
     const parsed = new URL(downloadUrl);
@@ -905,6 +1228,32 @@ function resolveInstallerArgs(manifest, installDir, appDir) {
     .filter(Boolean);
 }
 
+function expectsManagedInstallerResult(manifest) {
+  return manifest.installContract?.destinationControl !== INSTALL_DESTINATION_CONTROL.GUIDED;
+}
+
+function getInstallerMaterializationTimeout(manifest) {
+  const configuredTimeout = Number(manifest.installInstructions.materializationTimeoutMs || 0);
+  return configuredTimeout > 0 ? configuredTimeout : INSTALLER_MATERIALIZATION_TIMEOUT_MS;
+}
+
+function buildInstallerExpectationContext(manifest, paths) {
+  const managedToolState = createManagedToolState(
+    manifest,
+    paths.installDir,
+    paths.appDir,
+    paths.venvDir,
+    paths.archivePath,
+    null,
+  );
+  return {
+    expectedManagedExecutable:
+      managedToolState.launchProfile?.executable || managedToolState.executablePath || null,
+    detectionPaths: manifest.detectionPaths || [],
+    expectsManagedInstall: expectsManagedInstallerResult(manifest),
+  };
+}
+
 function quoteWindowsShellArgument(value) {
   const text = String(value || '');
   if (!text) {
@@ -920,6 +1269,98 @@ function isInstallerAccessError(error) {
   return code === 'EACCES' || code === 'EPERM' || /\b(EACCES|EPERM)\b/i.test(message);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createTrackedPromise(promise) {
+  const tracked = {
+    settled: false,
+    value: null,
+    error: null,
+  };
+
+  promise.then(
+    (value) => {
+      tracked.settled = true;
+      tracked.value = value;
+    },
+    (error) => {
+      tracked.settled = true;
+      tracked.error = error;
+    },
+  );
+
+  return tracked;
+}
+
+function spawnInstallerProcess(command, args = [], options = {}) {
+  return new Promise((resolve, reject) => {
+    let child;
+    let spawned = false;
+    let settleCompletion = null;
+    let rejectCompletion = null;
+    const completion = new Promise((resolveCompletion, rejectCompletionInner) => {
+      settleCompletion = resolveCompletion;
+      rejectCompletion = rejectCompletionInner;
+    });
+
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd,
+        env: {
+          ...process.env,
+          ...(options.env || {}),
+        },
+        windowsHide: true,
+        shell: Boolean(options.shell),
+        stdio: 'ignore',
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    child.once('spawn', () => {
+      spawned = true;
+      resolve({
+        pid: child.pid,
+        completion,
+      });
+    });
+
+    child.once('error', (error) => {
+      if (!spawned) {
+        reject(error);
+        return;
+      }
+
+      if (options.allowFailure) {
+        settleCompletion({
+          code: 1,
+          signal: null,
+          error,
+        });
+        return;
+      }
+
+      rejectCompletion(error);
+    });
+
+    child.once('exit', (code, signal) => {
+      if (code === 0 || options.allowFailure) {
+        settleCompletion({ code, signal });
+        return;
+      }
+
+      const failure = new Error(options.errorMessage || `${command} failed.`);
+      failure.code = code;
+      failure.signal = signal;
+      rejectCompletion(failure);
+    });
+  });
+}
+
 async function runInstallerExecutableFile(installerPath, installerArgs, logger, errorMessage) {
   const commandOptions = {
     cwd: path.dirname(installerPath),
@@ -927,9 +1368,10 @@ async function runInstallerExecutableFile(installerPath, installerArgs, logger, 
   };
 
   try {
-    await runCommand(installerPath, installerArgs, commandOptions);
+    const launchedProcess = await spawnInstallerProcess(installerPath, installerArgs, commandOptions);
     return {
       launchMethod: 'direct',
+      ...launchedProcess,
     };
   } catch (error) {
     if (!isInstallerAccessError(error)) {
@@ -942,14 +1384,15 @@ async function runInstallerExecutableFile(installerPath, installerArgs, logger, 
     });
 
     const commandLine = [quoteWindowsShellArgument(installerPath), ...installerArgs.map(quoteWindowsShellArgument)].join(' ');
-    await runCommand('cmd.exe', ['/d', '/s', '/c', commandLine], commandOptions);
+    const launchedProcess = await spawnInstallerProcess('cmd.exe', ['/d', '/s', '/c', commandLine], commandOptions);
     return {
       launchMethod: 'cmd-wrapper',
+      ...launchedProcess,
     };
   }
 }
 
-async function resolveInstalledExecutableToolState(manifest, installDir, appDir, venvDir, archivePath) {
+async function resolveInstalledExecutableToolState(manifest, installDir, appDir, venvDir, archivePath, logger, options = {}) {
   let toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
   if (await toolIsAvailable(toolState)) {
     return ensureManagedToolStatePaths(toolState);
@@ -958,14 +1401,136 @@ async function resolveInstalledExecutableToolState(manifest, installDir, appDir,
   const discoveredTools = await syncDiscoveredTools({ force: true });
   const detectedTool = discoveredTools[manifest.id];
   if (await toolIsAvailable(detectedTool)) {
-    toolState = {
+    toolState = normalizeToolLifecycle({
       ...detectedTool,
       downloadCachePath: archivePath,
-    };
-    return toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState;
+      installedByLocalAIHub: true,
+      requestedInstallRoot: normalizeOptionalDirectoryPath(path.dirname(path.dirname(installDir))) || null,
+    }, manifest);
+
+    if (isManagedToolState(toolState)) {
+      return ensureManagedToolStatePaths(toolState);
+    }
+
+    if (options.allowExternalResult) {
+      await logger.info('Installer finished and Local AI Hub detected the tool outside managed storage.', {
+        detectedPath: toolState.displayPath || toolState.installDir || toolState.detectedPath || null,
+        installDir,
+      });
+      return toolState;
+    }
+
+    await logger.warn('Installer completed, but the tool is still only detected outside Local AI Hub storage.', {
+      detectedPath: toolState.displayPath || toolState.installDir || toolState.detectedPath || null,
+      installDir,
+    });
   }
 
   return null;
+}
+
+async function logInstallerProcessCompletion(logger, installerRun, paths, trackedCompletion) {
+  if (trackedCompletion.error) {
+    await logger.warn('The official installer process exited with an error.', {
+      archivePath: paths.archivePath,
+      installDir: paths.installDir,
+      appDir: paths.appDir,
+      pid: installerRun.pid,
+      error: trackedCompletion.error,
+    });
+    return;
+  }
+
+  await logger.info('The official installer process exited.', {
+    archivePath: paths.archivePath,
+    installDir: paths.installDir,
+    appDir: paths.appDir,
+    pid: installerRun.pid,
+    exitCode: trackedCompletion.value?.code ?? 0,
+    exitSignal: trackedCompletion.value?.signal || null,
+  });
+}
+
+async function waitForInstallerMaterialization(manifest, paths, installerRun, logger) {
+  const trackedCompletion = createTrackedPromise(installerRun.completion);
+  const deadline = Date.now() + getInstallerMaterializationTimeout(manifest);
+  const expectationContext = buildInstallerExpectationContext(manifest, paths);
+  let completionLogged = false;
+
+  while (Date.now() <= deadline) {
+    const toolState = await resolveInstalledExecutableToolState(
+      manifest,
+      paths.installDir,
+      paths.appDir,
+      paths.venvDir,
+      paths.archivePath,
+      logger,
+      {
+        allowExternalResult: !expectsManagedInstallerResult(manifest),
+      },
+    );
+    if (toolState) {
+      if (trackedCompletion.settled && !completionLogged) {
+        await logInstallerProcessCompletion(logger, installerRun, paths, trackedCompletion);
+      }
+
+      return {
+        toolState,
+        trackedCompletion,
+        timedOut: false,
+      };
+    }
+
+    if (trackedCompletion.settled) {
+      if (!completionLogged) {
+        await logInstallerProcessCompletion(logger, installerRun, paths, trackedCompletion);
+        completionLogged = true;
+      }
+      break;
+    }
+
+    await sleep(INSTALLER_MATERIALIZATION_POLL_MS);
+  }
+
+  const finalToolState = await resolveInstalledExecutableToolState(
+    manifest,
+    paths.installDir,
+    paths.appDir,
+    paths.venvDir,
+    paths.archivePath,
+    logger,
+    {
+      allowExternalResult: !expectsManagedInstallerResult(manifest),
+    },
+  );
+  if (finalToolState) {
+    if (trackedCompletion.settled && !completionLogged) {
+      await logInstallerProcessCompletion(logger, installerRun, paths, trackedCompletion);
+    }
+
+    return {
+      toolState: finalToolState,
+      trackedCompletion,
+      timedOut: false,
+    };
+  }
+
+  if (!trackedCompletion.settled) {
+    await logger.warn('The installer process did not finish before Local AI Hub timed out waiting for the install to materialize.', {
+      archivePath: paths.archivePath,
+      installDir: paths.installDir,
+      appDir: paths.appDir,
+      pid: installerRun.pid,
+      timeoutMs: getInstallerMaterializationTimeout(manifest),
+      ...expectationContext,
+    });
+  }
+
+  return {
+    toolState: null,
+    trackedCompletion,
+    timedOut: !trackedCompletion.settled,
+  };
 }
 
 async function recoverExecutableInstallerPayload(manifest, archivePath, appDir, onProgress, logger) {
@@ -985,43 +1550,94 @@ async function recoverExecutableInstallerPayload(manifest, archivePath, appDir, 
 async function materializeExecutableInstallerTool(manifest, paths, options = {}) {
   const { appDir, archivePath, installDir, venvDir } = paths;
   const installerArgs = resolveInstallerArgs(manifest, installDir, appDir);
+  const expectManagedInstall = expectsManagedInstallerResult(manifest);
   const errorMessage = options.errorMessage || `Local AI Hub could not run the ${manifest.name} installer.`;
   let installerRunError = null;
   let launchMethod = null;
   let recoveredFromArchive = false;
+  let installerTimedOut = false;
 
   try {
+    await options.logger.info('Launching the official installer executable.', {
+      archivePath,
+      installDir,
+      appDir,
+      installerArgs,
+      expectsManagedInstall: expectManagedInstall,
+    });
     const installerRun = await runInstallerExecutableFile(archivePath, installerArgs, options.logger, errorMessage);
     launchMethod = installerRun.launchMethod;
-  } catch (error) {
-    installerRunError = error;
-    await options.logger.warn('Installer execution did not complete cleanly. Local AI Hub will try to recover the app files directly from the installer package.', {
+    await options.logger.info('The official installer process started.', {
       archivePath,
-      error,
+      installDir,
+      appDir,
+      launchMethod,
+      pid: installerRun.pid,
+      expectsManagedInstall: expectManagedInstall,
     });
-  }
 
-  let toolState = await resolveInstalledExecutableToolState(manifest, installDir, appDir, venvDir, archivePath);
-  if (!toolState) {
-    recoveredFromArchive = true;
-    launchMethod = 'archive-extract';
-    await recoverExecutableInstallerPayload(manifest, archivePath, appDir, options.onProgress, options.logger);
-    toolState = await resolveInstalledExecutableToolState(manifest, installDir, appDir, venvDir, archivePath);
-  }
-
-  if (!toolState) {
-    if (installerRunError) {
-      throw installerRunError;
+    const materializationResult = await waitForInstallerMaterialization(manifest, paths, installerRun, options.logger);
+    installerTimedOut = materializationResult.timedOut;
+    if (materializationResult.trackedCompletion.error) {
+      installerRunError = materializationResult.trackedCompletion.error;
     }
 
-    throw new Error(`${manifest.name} finished installing, but Local AI Hub could not find its launcher files afterward.`);
-  }
+    let toolState = materializationResult.toolState;
 
-  return {
-    launchMethod,
-    recoveredFromArchive,
-    toolState,
-  };
+    if (!toolState) {
+      const discoveredTools = await syncDiscoveredTools({ force: true });
+      const detectedTool = discoveredTools[manifest.id];
+      if (await toolIsAvailable(detectedTool) && !isManagedToolState(detectedTool)) {
+        if (!expectManagedInstall) {
+          return {
+            launchMethod,
+            recoveredFromArchive,
+            toolState: {
+              ...detectedTool,
+              downloadCachePath: archivePath,
+            },
+          };
+        }
+
+        throw new Error(buildManagedPlacementFailureMessage(manifest, installDir, detectedTool));
+      }
+
+      if (installerRunError) {
+        throw installerRunError;
+      }
+
+      if (installerTimedOut) {
+        throw new Error(`Local AI Hub launched the ${manifest.name} installer, but it did not finish or create a detectable install within ${Math.round(getInstallerMaterializationTimeout(manifest) / 1000)} seconds.`);
+      }
+
+      if (!expectManagedInstall) {
+        await options.logger.warn('The official installer closed without leaving a detectable external install.', {
+          archivePath,
+          installDir,
+          appDir,
+          ...buildInstallerExpectationContext(manifest, paths),
+        });
+        throw new Error(`Local AI Hub launched the ${manifest.name} installer, but it closed without leaving a detectable install in the expected external locations.`);
+      }
+
+      throw new Error(buildManagedPlacementFailureMessage(manifest, installDir));
+    }
+
+    return {
+      launchMethod,
+      recoveredFromArchive,
+      toolState,
+    };
+  } catch (error) {
+    installerRunError = error;
+    await options.logger.warn('Installer execution did not complete cleanly.', {
+      archivePath,
+      error,
+      timedOut: installerTimedOut,
+      expectsManagedInstall: expectManagedInstall,
+    });
+    throw installerRunError;
+  }
 }
 
 async function ensureCachedDownload(manifest, archivePath, logger, onProgress, toolId) {
@@ -1045,6 +1661,7 @@ async function ensureCachedDownload(manifest, archivePath, logger, onProgress, t
 
     try {
       await verifyCachedDownload(manifest, archivePath, logger);
+      await validateDownloadedPackage(manifest, archivePath, logger);
       return;
     } catch (error) {
       await logger.warn('Cached installer verification failed. Downloading a fresh copy.', {
@@ -1056,10 +1673,11 @@ async function ensureCachedDownload(manifest, archivePath, logger, onProgress, t
 
   await downloadFile(manifest.downloadUrl, archivePath, onProgress, logger, toolId);
   await verifyCachedDownload(manifest, archivePath, logger);
+  await validateDownloadedPackage(manifest, archivePath, logger);
 }
 
 async function installSingleFileTool(manifest, options, logger) {
-  const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest);
+  const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest, { installRoot: options.installRoot });
   const downloadFileName =
     manifest.installInstructions.downloadFileName ||
     path.basename(archivePath) ||
@@ -1095,7 +1713,11 @@ async function installSingleFileTool(manifest, options, logger) {
 
   await fs.copy(archivePath, destinationPath, { overwrite: true });
 
-  const toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
+  const toolState = await verifyManagedToolInstall(
+    createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null),
+    manifest,
+    logger,
+  );
   await upsertTool(toolState);
 
   await advanceStep(logger, options.onProgress, {
@@ -1109,12 +1731,14 @@ async function installSingleFileTool(manifest, options, logger) {
 }
 
 async function installExecutableInstallerTool(manifest, options, logger) {
-  const managedPaths = buildManagedPaths(manifest);
+  const managedPaths = buildManagedPaths(manifest, { installRoot: options.installRoot });
   const { appDir, archivePath, installDir } = managedPaths;
+  const expectManagedInstall = expectsManagedInstallerResult(manifest);
 
   await logger.info('Installer executable requested.', {
     archivePath,
     installDir,
+    expectsManagedInstall: expectManagedInstall,
   });
 
   await advanceStep(logger, options.onProgress, {
@@ -1132,7 +1756,9 @@ async function installExecutableInstallerTool(manifest, options, logger) {
     toolId: manifest.id,
     percent: 72,
     stage: 'installing',
-    message: `Running the official ${manifest.name} installer.`,
+    message: expectManagedInstall
+      ? `Running the official ${manifest.name} installer.`
+      : `Finish the official ${manifest.name} installer. Local AI Hub will detect it after setup finishes.`,
   });
 
   const materializedInstall = await materializeExecutableInstallerTool(manifest, managedPaths, {
@@ -1140,9 +1766,20 @@ async function installExecutableInstallerTool(manifest, options, logger) {
     logger,
     onProgress: options.onProgress,
   });
-  const toolState = materializedInstall.toolState;
+  const toolState =
+    materializedInstall.toolState.source === 'managed'
+      ? await verifyManagedToolInstall(materializedInstall.toolState, manifest, logger)
+      : normalizeToolLifecycle({
+          ...materializedInstall.toolState,
+          downloadCachePath: archivePath,
+          installedByLocalAIHub: true,
+          requestedInstallRoot: managedPaths.installRoot,
+        }, manifest);
 
-  await upsertTool(toolState);
+  const trackedToolState = await attachWindowsUninstallMetadata(toolState, manifest, {
+    refresh: true,
+  });
+  await upsertTool(trackedToolState);
   await logger.info('Installer executable materialized successfully.', {
     archivePath,
     installDir,
@@ -1157,10 +1794,10 @@ async function installExecutableInstallerTool(manifest, options, logger) {
     message: `${manifest.name} is ready.`,
   });
 
-  return toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState;
+  return trackedToolState.source === 'managed' ? ensureManagedToolStatePaths(trackedToolState) : trackedToolState;
 }
 async function installPipPackageTool(manifest, options, logger) {
-  const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest);
+  const { appDir, archivePath, installDir, venvDir } = buildManagedPaths(manifest, { installRoot: options.installRoot });
 
   await logger.info('Pip package install requested.', {
     installDir,
@@ -1202,6 +1839,8 @@ async function installPipPackageTool(manifest, options, logger) {
     pythonResolution.runtime,
   );
 
+  const verifiedToolState = await verifyManagedToolInstall(toolState, manifest, logger);
+
   await advanceStep(logger, options.onProgress, {
     toolId: manifest.id,
     percent: 98,
@@ -1209,7 +1848,7 @@ async function installPipPackageTool(manifest, options, logger) {
     message: `${manifest.name} is being registered in Local AI Hub.`,
   });
 
-  await upsertTool(toolState);
+  await upsertTool(verifiedToolState);
 
   await advanceStep(logger, options.onProgress, {
     toolId: manifest.id,
@@ -1218,7 +1857,7 @@ async function installPipPackageTool(manifest, options, logger) {
     message: `${manifest.name} is ready.`,
   });
 
-  return ensureManagedToolStatePaths(toolState);
+  return ensureManagedToolStatePaths(verifiedToolState);
 }
 
 async function installTool(toolId, options = {}) {
@@ -1232,7 +1871,8 @@ async function installTool(toolId, options = {}) {
     toolId,
     toolName: manifest.name,
   });
-  const managedPaths = buildManagedPaths(manifest);
+  const installRoot = await resolvePreferredInstallRoot(options.installRoot || null);
+  const managedPaths = buildManagedPaths(manifest, { installRoot });
   let existingTool = null;
   let rollbackManagedInstallOnFailure = true;
 
@@ -1240,29 +1880,33 @@ async function installTool(toolId, options = {}) {
     await setToolIgnored(toolId, false);
     const discoveredTools = await syncDiscoveredTools({ force: true });
     existingTool = discoveredTools[toolId];
-    rollbackManagedInstallOnFailure = !(existingTool?.source === 'managed' || existingTool?.managedByLocalAIHub);
+    rollbackManagedInstallOnFailure =
+      !(existingTool?.source === 'managed' || existingTool?.managedByLocalAIHub) &&
+      isDirectManagedTool({ source: 'managed' }, manifest);
     if (await toolIsAvailable(existingTool)) {
       const existingPath = existingTool.displayPath || existingTool.installDir;
-      const installActionMessage =
-        existingTool.source === 'managed'
-          ? `${manifest.name} is already installed inside Local AI Hub.`
-          : existingPath
-            ? `${manifest.name} is already on this PC. Local AI Hub will use the existing install at ${existingPath}.`
-            : `${manifest.name} is already on this PC. Local AI Hub will use the existing install it detected.`;
+      if (isManagedToolState(existingTool)) {
+        const installActionMessage = `${manifest.name} is already installed inside Local AI Hub.`;
 
-      await logger.info('Install request reused an existing tool installation.', {
+        await logger.info('Install request reused an existing managed tool installation.', {
+          existingPath,
+          source: existingTool.source,
+        });
+
+        return {
+          ...existingTool,
+          installActionMessage,
+          reusedExistingInstall: true,
+        };
+      }
+
+      await logger.info('Install request found a detected system install. Continuing with a managed install request.', {
         existingPath,
         source: existingTool.source,
       });
-
-      return {
-        ...existingTool,
-        installActionMessage,
-        reusedExistingInstall: true,
-      };
     }
 
-    const installPreflight = await getToolInstallPreflight(toolId);
+    const installPreflight = await getToolInstallPreflight({ toolId, installRoot });
     assertInstallPreflightApproved(installPreflight, Boolean(options.lowDiskConfirmed));
 
     const { archivePath, installDir } = managedPaths;
@@ -1270,26 +1914,36 @@ async function installTool(toolId, options = {}) {
     await logger.info('Install requested.', {
       installDir,
       archivePath,
+      installRoot,
       logsPath: await logger.getFilePath(),
     });
 
+    const installOptions = {
+      ...options,
+      installRoot,
+    };
+
     const installKind = manifest.installInstructions.kind || 'zip';
     if (installKind === 'single-file') {
-      const toolState = await installSingleFileTool(manifest, options, logger);
+      const toolState = await installSingleFileTool(manifest, installOptions, logger);
       await logger.info('Single-file install completed successfully.');
-      return ensureManagedToolStatePaths(toolState);
+      return finalizeManagedInstallResult(ensureManagedToolStatePaths(toolState), manifest, existingTool);
     }
 
     if (installKind === 'installer-exe') {
-      const toolState = await installExecutableInstallerTool(manifest, options, logger);
+      const toolState = await installExecutableInstallerTool(manifest, installOptions, logger);
       await logger.info('Installer-based install completed successfully.');
-      return toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState;
+      return finalizeManagedInstallResult(
+        toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState,
+        manifest,
+        existingTool,
+      );
     }
 
     if (installKind === 'pip-package') {
-      const toolState = await installPipPackageTool(manifest, options, logger);
+      const toolState = await installPipPackageTool(manifest, installOptions, logger);
       await logger.info('Pip package install completed successfully.');
-      return ensureManagedToolStatePaths(toolState);
+      return finalizeManagedInstallResult(ensureManagedToolStatePaths(toolState), manifest, existingTool);
     }
 
     const { appDir, venvDir } = managedPaths;
@@ -1347,10 +2001,12 @@ async function installTool(toolId, options = {}) {
       message: `${manifest.name} is being registered in Local AI Hub.`,
     });
 
-    await upsertTool(toolState);
+    const verifiedToolState = await verifyManagedToolInstall(toolState, manifest, logger);
+
+    await upsertTool(verifiedToolState);
     await logger.info('Tool registration completed.', {
       installDir,
-      launchProfile: toolState.launchProfile,
+      launchProfile: verifiedToolState.launchProfile,
     });
 
     await advanceStep(logger, options.onProgress, {
@@ -1361,7 +2017,7 @@ async function installTool(toolId, options = {}) {
     });
     await logger.info('Install completed successfully.');
 
-    return ensureManagedToolStatePaths(toolState);
+    return finalizeManagedInstallResult(ensureManagedToolStatePaths(verifiedToolState), manifest, existingTool);
   } catch (error) {
     const readableMessage = humanizeError(error, `Local AI Hub could not install ${manifest.name}.`);
     if (rollbackManagedInstallOnFailure) {
@@ -1427,15 +2083,20 @@ async function repairToolInstallation(toolState, options = {}) {
   });
 
   try {
-    const managedPaths = buildManagedPaths(manifest);
+    const installRoot = resolveStoredInstallRoot(toolState);
+    const managedPaths = buildManagedPaths(manifest, { installRoot });
     const installKind = manifest.installInstructions.kind || 'zip';
+    const lifecycleManaged = isDirectManagedTool(toolState, manifest);
+    const usesOfficialInstaller = isOfficialInstallerTool(toolState, manifest);
     if (toolState.source === 'managed') {
-      toolState = ensureManagedToolStatePaths(toolState);
+      toolState = ensureManagedToolStatePaths(normalizeToolLifecycle(toolState, manifest));
     }
 
     await logger.info('Repair requested.', {
       installDir: toolState.installDir,
       archivePath: toolState.downloadCachePath || managedPaths.archivePath,
+      installRoot,
+      lifecycleMode: toolState.lifecycleMode || null,
     });
 
     await advanceStep(logger, options.onProgress, {
@@ -1453,7 +2114,17 @@ async function repairToolInstallation(toolState, options = {}) {
     const repairNotes = buildRepairCleanupNotes(cleanupSummary);
     let runtimeChanged = false;
 
-    if (toolState.source !== 'managed') {
+    if (usesOfficialInstaller) {
+      const uninstallContext = await resolveToolUninstallContext(toolState, manifest, { refresh: true });
+      for (const staleEntry of uninstallContext?.staleEntries || []) {
+        await removeWindowsUninstallEntry(staleEntry.entry).catch(() => null);
+      }
+      if ((uninstallContext?.staleEntries || []).length > 0) {
+        repairNotes.push('cleared broken Windows uninstall entries');
+      }
+    }
+
+    if (!lifecycleManaged) {
       if (installKind !== 'installer-exe') {
         throw new Error('Local AI Hub can only repair external installs when the official installer can be rerun safely.');
       }
@@ -1461,7 +2132,7 @@ async function repairToolInstallation(toolState, options = {}) {
       const downloadCachePath = toolState.downloadCachePath || managedPaths.archivePath;
       await ensureCachedDownload(manifest, downloadCachePath, logger, options.onProgress, toolState.id);
 
-      await logger.info('External installer repair requested.', {
+      await logger.info('Official installer repair requested.', {
         installDir: toolState.installDir,
         archivePath: downloadCachePath,
       });
@@ -1473,37 +2144,69 @@ async function repairToolInstallation(toolState, options = {}) {
         message: `Running the ${manifest.name} installer again.`,
       });
 
-      await runInstallerExecutableFile(
-        downloadCachePath,
-        resolveInstallerArgs(manifest, toolState.installDir, toolState.appDir || toolState.installDir),
-        logger,
-        `Local AI Hub could not rerun the ${manifest.name} installer.`,
-      );
+      let repairedTool = null;
+      if (toolState.source === 'managed') {
+        const repairedInstaller = await materializeExecutableInstallerTool(
+          manifest,
+          {
+            appDir: toolState.appDir || managedPaths.appDir,
+            archivePath: downloadCachePath,
+            installDir: toolState.installDir || managedPaths.installDir,
+            venvDir: toolState.venvDir || managedPaths.venvDir,
+          },
+          {
+            errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
+            logger,
+            onProgress: options.onProgress,
+          },
+        );
+        repairedTool =
+          repairedInstaller.toolState.source === 'managed'
+            ? await verifyManagedToolInstall(repairedInstaller.toolState, manifest, logger)
+            : repairedInstaller.toolState;
+      } else {
+        await runInstallerExecutableFile(
+          downloadCachePath,
+          resolveInstallerArgs(
+            manifest,
+            toolState.installDir || managedPaths.installDir,
+            toolState.appDir || toolState.installDir || managedPaths.appDir,
+          ),
+          logger,
+          `Local AI Hub could not rerun the ${manifest.name} installer.`,
+        );
 
-      const discoveredTools = await syncDiscoveredTools({ force: true });
-      const repairedExternalTool = discoveredTools[toolState.id];
-      if (!(await toolIsAvailable(repairedExternalTool))) {
+        const discoveredTools = await syncDiscoveredTools({ force: true });
+        repairedTool = discoveredTools[toolState.id];
+      }
+
+      if (!(await toolIsAvailable(repairedTool))) {
         throw new Error(`Local AI Hub reran the ${manifest.name} installer, but it still could not find the launcher afterward.`);
       }
 
       repairNotes.push('reran the official installer');
-      const updatedExternalTool = {
-        ...repairedExternalTool,
+      const updatedExternalTool = normalizeToolLifecycle({
+        ...repairedTool,
         downloadCachePath,
+        installedByLocalAIHub: toolState.installedByLocalAIHub || toolState.source === 'managed',
         lastError: null,
         lastRepairMessage: buildRepairOutcomeMessage(manifest.name, repairNotes),
+        requestedInstallRoot: toolState.requestedInstallRoot || installRoot,
         status: 'stopped',
-      };
-      await upsertTool(updatedExternalTool);
+      }, manifest);
+      const trackedExternalTool = await attachWindowsUninstallMetadata(updatedExternalTool, manifest, {
+        refresh: true,
+      });
+      await upsertTool(trackedExternalTool);
 
       await advanceStep(logger, options.onProgress, {
         toolId: toolState.id,
         percent: 100,
         stage: 'complete',
-        message: updatedExternalTool.lastRepairMessage,
+        message: trackedExternalTool.lastRepairMessage,
       });
 
-      return updatedExternalTool;
+      return trackedExternalTool;
     }
 
     toolState.downloadCachePath = managedPaths.archivePath;
@@ -1632,30 +2335,51 @@ async function repairToolInstallation(toolState, options = {}) {
       );
     }
 
-    const updatedState = {
+    const updatedState = normalizeToolLifecycle({
       ...toolState,
       source: 'managed',
-      managedByLocalAIHub: true,
+      installRoot,
+      installedByLocalAIHub: true,
       lastError: null,
       lastRepairMessage: buildRepairOutcomeMessage(manifest.name, repairNotes),
+      requestedInstallRoot: toolState.requestedInstallRoot || installRoot,
       status: 'stopped',
-    };
+    }, manifest);
 
     updatedState.launchProfile = buildManagedLaunchProfile(updatedState, manifest);
-    await upsertTool(updatedState);
+    const verifiedUpdatedState = await verifyManagedToolInstall(updatedState, manifest, logger);
+    await upsertTool(verifiedUpdatedState);
+
+    const verifiedManagedTool = await verifyRepairedToolState(manifest, verifiedUpdatedState, {
+      expectManaged: true,
+    });
+    const finalManagedTool = {
+      ...verifiedManagedTool,
+      lastError: null,
+      lastRepairMessage: updatedState.lastRepairMessage,
+      status: 'stopped',
+    };
+    const trackedManagedTool =
+      installKind === 'installer-exe'
+        ? await attachWindowsUninstallMetadata(finalManagedTool, manifest, {
+            refresh: true,
+          })
+        : finalManagedTool;
+    await upsertTool(trackedManagedTool);
 
     await advanceStep(logger, options.onProgress, {
       toolId: toolState.id,
       percent: 100,
       stage: 'complete',
-      message: updatedState.lastRepairMessage,
+      message: trackedManagedTool.lastRepairMessage,
     });
     await logger.info('Repair completed successfully.', {
       runtimeChanged,
       cleanupSummary,
+      verifiedInstallDir: trackedManagedTool.installDir,
     });
 
-    return updatedState;
+    return trackedManagedTool;
   } catch (error) {
     const readableMessage = humanizeError(error, `Local AI Hub could not repair ${manifest.name}.`);
     await upsertTool({
@@ -1671,6 +2395,216 @@ async function repairToolInstallation(toolState, options = {}) {
     throw error;
   }
 }
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildUninstallFollowupNotes(options = {}) {
+  const notes = [];
+
+  if (options.clearedWindowsEntries > 0) {
+    notes.push(
+      `cleared ${options.clearedWindowsEntries} broken Windows uninstall ${pluralize(options.clearedWindowsEntries, 'entry')}`,
+    );
+  }
+
+  if (options.removedShortcutCount > 0) {
+    notes.push(
+      `removed ${options.removedShortcutCount} leftover Windows ${pluralize(options.removedShortcutCount, 'shortcut')}`,
+    );
+  }
+
+  if (options.deferredCleanupCount > 0) {
+    notes.push(
+      `left ${options.deferredCleanupCount} Local AI Hub cleanup ${pluralize(options.deferredCleanupCount, 'item')} for Cleanup because Windows was still finishing with ${options.deferredCleanupCount === 1 ? 'it' : 'them'}`,
+    );
+  }
+
+  return notes;
+}
+
+function appendUninstallFollowup(baseMessage, notes = [], options = {}) {
+  const normalizedBase = String(baseMessage || '').trim();
+  let nextMessage = normalizedBase;
+  if (notes.length) {
+    nextMessage = `${normalizedBase.replace(/[.\s]+$/, '')}. Local AI Hub also ${notes.join(' and ')}.`;
+  }
+
+  const remainingStaleWindowsEntries = Number(options.remainingStaleWindowsEntries || 0);
+  if (remainingStaleWindowsEntries > 0) {
+    const entryLabel = pluralize(
+      remainingStaleWindowsEntries,
+      'stale Windows Apps & Features entry',
+      'stale Windows Apps & Features entries',
+    );
+    const pronoun = remainingStaleWindowsEntries === 1 ? 'it' : 'they';
+    nextMessage = `${nextMessage.replace(/[.\s]+$/, '')}. Windows Apps & Features may still show ${remainingStaleWindowsEntries} ${entryLabel}. Run Cleanup if ${pronoun} stays there.`;
+  }
+
+  if (options.lingeringWindowsEntry) {
+    nextMessage = `${nextMessage.replace(/[.\s]+$/, '')}. Windows Apps & Features may still show a dead entry for this tool even though Local AI Hub could no longer detect a usable install. Run Cleanup if it stays there.`;
+  }
+
+  return nextMessage;
+}
+
+function countRemainingStaleWindowsEntries(context = {}) {
+  return Array.isArray(context?.staleEntries) ? context.staleEntries.length : 0;
+}
+
+function buildWindowsUninstallUnresolvedMessage(manifest, context = {}) {
+  if (context?.entry) {
+    return `${manifest.name} is still registered in Windows Apps & Features. Local AI Hub kept it in Library because the uninstall is not fully finished yet. Open Windows Apps & Features and finish the vendor uninstall, then try again.`;
+  }
+
+  if ((context?.staleEntries || []).length > 0) {
+    return `${manifest.name}'s files are gone, but Windows Apps & Features still has a stale uninstall entry. Local AI Hub kept it in Library until that entry can be cleared. Run Cleanup and then try again if the entry remains.`;
+  }
+
+  return `${manifest.name} still appears to be installed in Windows Apps & Features.`;
+}
+
+async function preflightOwnedInstallRemoval(toolState, logger, operationLabel, actionLabel = 'uninstall') {
+  const installDir = normalizeOptionalDirectoryPath(toolState?.installDir || '');
+  if (!installDir || !(await fs.pathExists(installDir))) {
+    return false;
+  }
+
+  await preflightPathRemoval(installDir, logger, operationLabel, {
+    actionLabel,
+  });
+  await logger?.info?.('Verified that a Local AI Hub-owned install directory is ready for uninstall.', {
+    operationLabel,
+    path: installDir,
+    toolId: toolState?.id || null,
+  });
+  return true;
+}
+
+async function removeOwnedInstallCopy(toolState, logger, operationLabel) {
+  const installDir = normalizeOptionalDirectoryPath(toolState?.installDir || '');
+  if (!installDir || !(await fs.pathExists(installDir))) {
+    return {
+      removedInstallDir: false,
+    };
+  }
+
+  await removePathWithRetries(installDir, logger, operationLabel);
+  await logger?.info?.('Removed a Local AI Hub-owned install directory.', {
+    operationLabel,
+    path: installDir,
+    toolId: toolState?.id || null,
+  });
+
+  return {
+    removedInstallDir: true,
+  };
+}
+
+async function cleanupOwnedToolArtifacts(toolState, logger, operationLabel, options = {}) {
+  const deferredCleanupEntries = [];
+  let installCleanup = {
+    removedInstallDir: false,
+  };
+
+  if (toolState?.source === 'managed') {
+    try {
+      installCleanup = await removeOwnedInstallCopy(toolState, logger, operationLabel);
+    } catch (error) {
+      const readableMessage = String(error?.message || '');
+      if (!options.allowBusyInstallDirFailure || !/still being used by Windows/i.test(readableMessage)) {
+        throw error;
+      }
+
+      const installDir = normalizeOptionalDirectoryPath(toolState?.installDir || '');
+      if (installDir) {
+        deferredCleanupEntries.push(installDir);
+      }
+      await logger?.warn?.('Local AI Hub left a managed install folder behind because Windows is still using it.', {
+        operationLabel,
+        path: installDir,
+        toolId: toolState?.id || null,
+        error,
+      });
+    }
+  }
+
+  const shortcutCleanup = await removeToolWindowsShortcuts(toolState, logger);
+
+  return {
+    deferredCleanupCount: deferredCleanupEntries.length,
+    deferredCleanupEntries,
+    removedInstallDir: Boolean(installCleanup?.removedInstallDir),
+    removedShortcutCount: shortcutCleanup.removedCount,
+    removedShortcutPaths: shortcutCleanup.removedPaths,
+  };
+}
+
+async function waitForOfficialUninstallOutcome(toolState, manifest, matchesTrackedExternalInstall, logger) {
+  const deadline = Date.now() + OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS;
+  let lastContext = null;
+  let lastDetectedTool = null;
+
+  while (Date.now() <= deadline) {
+    lastContext = await resolveToolUninstallContext(toolState, manifest, { refresh: true }).catch(() => null);
+    const discoveredTools = await syncDiscoveredTools({ force: true, persist: false });
+    lastDetectedTool = discoveredTools[toolState.id];
+
+    const detectedAvailable = await toolIsAvailable(lastDetectedTool);
+    const switchedToDetected = detectedAvailable && matchesTrackedExternalInstall(lastDetectedTool);
+    const vendorEntryStillPresent = Boolean(lastContext?.entry);
+
+    if (!vendorEntryStillPresent && (!detectedAvailable || switchedToDetected)) {
+      return {
+        complete: true,
+        detectedTool: lastDetectedTool,
+        switchedToDetected,
+        uninstallContext: lastContext,
+      };
+    }
+
+    if (Date.now() + OFFICIAL_UNINSTALL_SETTLE_POLL_MS > deadline) {
+      break;
+    }
+
+    await logger?.info?.('Waiting for the official Windows uninstaller to finish.', {
+      toolId: toolState?.id || null,
+      windowsUninstallKeyPath: lastContext?.entry?.keyPath || null,
+    });
+    await wait(OFFICIAL_UNINSTALL_SETTLE_POLL_MS);
+  }
+
+  if (!lastContext) {
+    lastContext = await resolveToolUninstallContext(toolState, manifest, { refresh: true }).catch(() => null);
+  }
+
+  if (!lastDetectedTool) {
+    const discoveredTools = await syncDiscoveredTools({ force: true, persist: false });
+    lastDetectedTool = discoveredTools[toolState.id];
+  }
+
+  const detectedAvailable = await toolIsAvailable(lastDetectedTool);
+
+  return {
+    complete: false,
+    detectedTool: lastDetectedTool,
+    switchedToDetected: detectedAvailable && matchesTrackedExternalInstall(lastDetectedTool),
+    uninstallContext: lastContext,
+  };
+}
+
+async function getPostUninstallDetection(toolState, matchesTrackedExternalInstall) {
+  const discoveredTools = await syncDiscoveredTools({ force: true, persist: false });
+  const detectedTool = discoveredTools[toolState.id];
+  const detectedAvailable = await toolIsAvailable(detectedTool);
+
+  return {
+    detectedAvailable,
+    detectedTool,
+    switchedToDetected: detectedAvailable && matchesTrackedExternalInstall(detectedTool),
+  };
+}
+
 async function uninstallTool(toolState) {
   await initializeToolRegistry();
   const manifest = getToolManifest(toolState?.id);
@@ -1678,41 +2612,288 @@ async function uninstallTool(toolState) {
     throw new Error('Local AI Hub could not find the tool definition for uninstall.');
   }
 
+  let safeToolState = normalizeToolLifecycle(toolState, manifest);
+  if (safeToolState.source === 'managed') {
+    safeToolState = ensureManagedToolStatePaths(safeToolState);
+  }
+
+  const actionSemantics = getToolActionSemantics(safeToolState, manifest, {
+    installedByLocalAIHub: safeToolState.installedByLocalAIHub,
+    lifecycleMode: safeToolState.lifecycleMode,
+  });
   const logger = createLogger('installer', {
-    toolId: toolState.id,
+    toolId: safeToolState.id,
     toolName: manifest.name,
     mode: 'uninstall',
   });
+  const normalizeComparablePath = (value) => {
+    const normalized = normalizeOptionalDirectoryPath(value);
+    return normalized ? normalized.toLowerCase() : '';
+  };
+  const matchesTrackedExternalInstall = (detectedTool) => {
+    const expectedExternalPath = normalizeComparablePath(
+      safeToolState.externalInstallDir || safeToolState.externalInstallDisplayPath || '',
+    );
+    const detectedPath = normalizeComparablePath(
+      detectedTool?.installDir || detectedTool?.displayPath || detectedTool?.detectedPath || '',
+    );
+    return Boolean(expectedExternalPath) && Boolean(detectedPath) && expectedExternalPath === detectedPath;
+  };
+  const clearStaleEntries = async (entries = []) => {
+    let clearedCount = 0;
+    const failedEntries = [];
+
+    for (const staleEntry of entries) {
+      try {
+        await removeWindowsUninstallEntry(staleEntry.entry);
+        clearedCount += 1;
+      } catch (error) {
+        failedEntries.push(staleEntry);
+        await logger.warn('Local AI Hub could not remove a stale Windows uninstall entry.', {
+          error,
+          keyPath: staleEntry?.entry?.keyPath || null,
+        });
+      }
+    }
+
+    return {
+      clearedCount,
+      failedEntries,
+    };
+  };
+  const reconcileWindowsUninstallState = async () => {
+    const refreshedContext = await resolveToolUninstallContext(safeToolState, manifest, { refresh: true }).catch(() => null);
+    const staleCleanup = await clearStaleEntries(refreshedContext?.staleEntries || []);
+    const finalContext = await resolveToolUninstallContext(safeToolState, manifest, { refresh: true }).catch(() => null);
+    return {
+      clearedWindowsEntries: staleCleanup.clearedCount,
+      failedEntries: staleCleanup.failedEntries,
+      uninstallContext: finalContext,
+    };
+  };
 
   try {
-    if (toolState.source === 'managed') {
-      const safeToolState = ensureManagedToolStatePaths(toolState);
-      await logger.info('Managed uninstall requested.', {
+    const uninstallContext =
+      actionSemantics.ownsInstallFiles || manifest.installInstructions.kind === 'installer-exe'
+        ? await resolveToolUninstallContext(safeToolState, manifest, { refresh: true }).catch(() => null)
+        : null;
+    const hadBrokenWindowsEntries = Boolean(
+      (uninstallContext?.staleEntries || []).length || (uninstallContext?.brokenEntries || []).length,
+    );
+    const preflightWindowsReconciliation =
+      actionSemantics.uninstallKind === 'remove-from-library'
+        ? null
+        : await reconcileWindowsUninstallState();
+    const preflightClearedWindowsEntries = preflightWindowsReconciliation?.clearedWindowsEntries || 0;
+    const preflightUninstallContext = preflightWindowsReconciliation?.uninstallContext || uninstallContext;
+    const buildResultMessage = (baseMessage, artifactCleanup = null, windowsReconciliation = null, options = {}) =>
+      appendUninstallFollowup(
+        baseMessage,
+        buildUninstallFollowupNotes({
+          clearedWindowsEntries: preflightClearedWindowsEntries + Number(windowsReconciliation?.clearedWindowsEntries || 0),
+          deferredCleanupCount: Number(artifactCleanup?.deferredCleanupCount || 0),
+          removedShortcutCount: Number(artifactCleanup?.removedShortcutCount || 0),
+        }),
+        {
+          lingeringWindowsEntry: Boolean(options.lingeringWindowsEntry),
+          remainingStaleWindowsEntries: countRemainingStaleWindowsEntries(
+            windowsReconciliation?.uninstallContext || preflightUninstallContext,
+          ),
+        },
+      );
+
+    if (actionSemantics.uninstallKind === 'uninstall') {
+      await logger.info('Direct Local AI Hub-managed uninstall requested.', {
         installDir: safeToolState.installDir,
       });
-      await fs.remove(safeToolState.installDir).catch(() => null);
-      await removeTool(toolState.id);
-      await setToolIgnored(toolState.id, false);
+
+      await preflightOwnedInstallRemoval(safeToolState, logger, 'managed-uninstall-preflight', 'uninstall');
+      if (preflightUninstallContext?.entry) {
+        throw new Error(buildWindowsUninstallUnresolvedMessage(manifest, preflightUninstallContext));
+      }
+
+      await removeOwnedInstallCopy(safeToolState, logger, 'managed-uninstall');
+      const shortcutCleanup = await removeToolWindowsShortcuts(safeToolState, logger);
+
+      await removeTool(safeToolState.id);
+      await setToolIgnored(safeToolState.id, false);
       return {
-        ...toolState,
-        status: 'stopped',
+        ...safeToolState,
         lastError: null,
-        uninstallMessage: `${manifest.name} was uninstalled and moved back to Store.`,
+        status: 'stopped',
+        uninstallMessage: buildResultMessage(`${manifest.name} was uninstalled and moved back to Store.`, { removedShortcutCount: shortcutCleanup.removedCount }),
+      };
+    }
+
+    if (actionSemantics.uninstallKind === 'official-uninstall') {
+      await logger.info('Official-installer uninstall requested.', {
+        installDir: safeToolState.installDir || null,
+        windowsUninstallKeyPath: preflightUninstallContext?.entry?.keyPath || uninstallContext?.entry?.keyPath || null,
+      });
+
+      const workingUninstallEntry = preflightUninstallContext?.entry || uninstallContext?.entry || null;
+      if (workingUninstallEntry) {
+        await runWindowsUninstaller(workingUninstallEntry, logger, manifest.name);
+        const uninstallOutcome = await waitForOfficialUninstallOutcome(
+          safeToolState,
+          manifest,
+          matchesTrackedExternalInstall,
+          logger,
+        );
+
+        if (!uninstallOutcome.complete) {
+          throw new Error(
+            `${manifest.name} still appears to be installed after its official Windows uninstall finished. Open Windows Apps & Features to check whether the installer reported a problem.`,
+          );
+        }
+
+        const artifactCleanup = await cleanupOwnedToolArtifacts(safeToolState, logger, 'official-uninstall-cleanup', {
+          allowBusyInstallDirFailure: true,
+        });
+        const windowsReconciliation = await reconcileWindowsUninstallState();
+        const postUninstallDetection = await getPostUninstallDetection(safeToolState, matchesTrackedExternalInstall);
+        const lingeringWindowsEntry = Boolean(windowsReconciliation.uninstallContext?.entry);
+
+        if (lingeringWindowsEntry && postUninstallDetection.detectedAvailable && !postUninstallDetection.switchedToDetected) {
+          throw new Error(buildWindowsUninstallUnresolvedMessage(manifest, windowsReconciliation.uninstallContext));
+        }
+
+        await removeTool(safeToolState.id);
+        await setToolIgnored(safeToolState.id, false);
+
+        if (postUninstallDetection.switchedToDetected || uninstallOutcome.switchedToDetected) {
+          const detectedTool = postUninstallDetection.switchedToDetected ? postUninstallDetection.detectedTool : uninstallOutcome.detectedTool;
+          const detectedPath =
+            detectedTool?.displayPath ||
+            detectedTool?.installDir ||
+            detectedTool?.detectedPath ||
+            'another detected install';
+          return {
+            ...safeToolState,
+            lastError: null,
+            status: 'stopped',
+            uninstallMessage: buildResultMessage(
+              `${manifest.name}'s official uninstall finished. A separate install at ${detectedPath} is still available, so Local AI Hub switched back to showing it as a detected install.`,
+              artifactCleanup,
+              windowsReconciliation,
+              {
+                lingeringWindowsEntry,
+              },
+            ),
+          };
+        }
+
+        return {
+          ...safeToolState,
+          lastError: null,
+          status: 'stopped',
+          uninstallMessage: buildResultMessage(
+            artifactCleanup.deferredCleanupCount > 0
+              ? `${manifest.name}'s official uninstall finished, but Local AI Hub could not remove every leftover file yet.`
+              : `${manifest.name} was uninstalled with its official Windows uninstaller.`,
+            artifactCleanup,
+            windowsReconciliation,
+            {
+              lingeringWindowsEntry,
+            },
+          ),
+        };
+      }
+
+      if (safeToolState.source === 'managed') {
+        await preflightOwnedInstallRemoval(safeToolState, logger, 'official-uninstall-fallback-preflight', 'official uninstall');
+        const artifactCleanup = await cleanupOwnedToolArtifacts(safeToolState, logger, 'official-uninstall-fallback');
+        const windowsReconciliation = await reconcileWindowsUninstallState();
+        const postUninstallDetection = await getPostUninstallDetection(safeToolState, matchesTrackedExternalInstall);
+        const lingeringWindowsEntry = Boolean(windowsReconciliation.uninstallContext?.entry);
+
+        if (postUninstallDetection.detectedAvailable && !postUninstallDetection.switchedToDetected) {
+          throw new Error(buildWindowsUninstallUnresolvedMessage(manifest, windowsReconciliation.uninstallContext || preflightUninstallContext));
+        }
+
+        await removeTool(safeToolState.id);
+        await setToolIgnored(safeToolState.id, false);
+
+        if (postUninstallDetection.switchedToDetected) {
+          const detectedPath =
+            postUninstallDetection.detectedTool?.displayPath ||
+            postUninstallDetection.detectedTool?.installDir ||
+            postUninstallDetection.detectedTool?.detectedPath ||
+            'another detected install';
+          return {
+            ...safeToolState,
+            lastError: null,
+            status: 'stopped',
+            uninstallMessage: buildResultMessage(
+              `${manifest.name}'s Windows uninstall data was not usable, so Local AI Hub removed the Local AI Hub-owned files it still controlled and switched back to a separate detected install at ${detectedPath}.`,
+              artifactCleanup,
+              windowsReconciliation,
+              {
+                lingeringWindowsEntry,
+              },
+            ),
+          };
+        }
+
+        const baseMessage = hadBrokenWindowsEntries
+          ? `${manifest.name}'s Windows uninstall entry was broken, so Local AI Hub removed the remaining app files it still owned instead of claiming the official uninstaller ran.`
+          : `${manifest.name}'s Windows uninstall data was missing, so Local AI Hub only removed the app files and shortcuts it still owned.`;
+
+        return {
+          ...safeToolState,
+          lastError: null,
+          status: 'stopped',
+          uninstallMessage: buildResultMessage(baseMessage, artifactCleanup, windowsReconciliation, {
+            lingeringWindowsEntry,
+          }),
+        };
+      }
+
+      const windowsReconciliation = preflightWindowsReconciliation || (await reconcileWindowsUninstallState());
+      const postUninstallDetection = await getPostUninstallDetection(safeToolState, matchesTrackedExternalInstall);
+      const lingeringWindowsEntry = Boolean(windowsReconciliation.uninstallContext?.entry);
+
+      if (postUninstallDetection.detectedAvailable) {
+        if (lingeringWindowsEntry) {
+          throw new Error(buildWindowsUninstallUnresolvedMessage(manifest, windowsReconciliation.uninstallContext));
+        }
+
+        throw new Error(
+          `Local AI Hub could not find a working Windows uninstall entry for ${manifest.name}. Reinstall it or remove it from Windows Apps & Features, then try again.`,
+        );
+      }
+
+      await removeTool(safeToolState.id);
+      await setToolIgnored(safeToolState.id, false);
+      return {
+        ...safeToolState,
+        lastError: null,
+        status: 'stopped',
+        uninstallMessage: buildResultMessage(
+          windowsReconciliation.clearedWindowsEntries > 0
+            ? `${manifest.name} is already gone. Local AI Hub cleared the stale Windows uninstall entry and removed it from Library.`
+            : `${manifest.name} is already gone, so Local AI Hub removed it from Library.`,
+          null,
+          windowsReconciliation,
+          {
+            lingeringWindowsEntry,
+          },
+        ),
       };
     }
 
     await logger.info('External install was removed from Local AI Hub tracking only.', {
-      installDir: toolState.installDir || null,
-      displayPath: toolState.displayPath || null,
+      installDir: safeToolState.installDir || null,
+      displayPath: safeToolState.displayPath || null,
     });
-    await removeTool(toolState.id);
-    await setToolIgnored(toolState.id, true);
+    await removeTool(safeToolState.id);
+    await setToolIgnored(safeToolState.id, true);
     return {
-      ...toolState,
-      status: 'stopped',
+      ...safeToolState,
       lastError: null,
+      status: 'stopped',
       uninstallMessage:
-        `${manifest.name} was removed from Local AI Hub. Its files were not deleted because Local AI Hub did not install them.`,
+        `${manifest.name} was removed from Local AI Hub. Its files were not deleted because Local AI Hub does not own that install.`,
     };
   } catch (error) {
     await logger.error('Uninstall failed.', {
@@ -1722,7 +2903,6 @@ async function uninstallTool(toolState) {
     throw error;
   }
 }
-
 async function extractArchiveToDirectory(archivePath, targetDirectory, logger) {
   const extractionRoot = `${targetDirectory}__extract`;
   await logger.info('Extracting update archive into a staging folder.', {
@@ -1805,9 +2985,14 @@ async function updateToolInstallation(toolState, options = {}) {
   });
 
   try {
+    const installOptions = {
+      ...options,
+      installRoot,
+    };
+
     const installKind = manifest.installInstructions.kind || 'zip';
     const runtimeKind = getToolRuntime(manifest);
-    const managedPaths = buildManagedPaths(manifest);
+    const managedPaths = buildManagedPaths(manifest, { installRoot: resolveStoredInstallRoot(toolState) });
     const isManagedInstall = toolState.source === 'managed';
     const safeToolState = isManagedInstall ? ensureManagedToolStatePaths(toolState) : { ...toolState };
 
@@ -1992,11 +3177,11 @@ async function updateToolInstallation(toolState, options = {}) {
     };
 
     if (isManagedInstall) {
-      updatedState = ensureManagedToolStatePaths({
+      updatedState = ensureManagedToolStatePaths(normalizeToolLifecycle({
         ...updatedState,
         source: 'managed',
-        managedByLocalAIHub: true,
-      });
+        installedByLocalAIHub: updatedState.installedByLocalAIHub !== false,
+      }, manifest));
     }
 
     await upsertTool(updatedState);

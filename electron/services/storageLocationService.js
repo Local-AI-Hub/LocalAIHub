@@ -2,16 +2,18 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const {
-  buildManagedPathMappings,
   buildManagedSubdirectoryPaths,
   ensureStorage,
   getAppPaths,
   normalizeDirectoryPath,
+  normalizeOptionalDirectoryPath,
   readConfig,
   updateConfig,
 } = require('./configService');
 const { detectStorageSnapshot, findDiskForPath } = require('./hardwareService');
 const { runBackgroundTask } = require('./backgroundTaskService');
+const { getToolManifest, initializeToolRegistry } = require('./toolRegistry');
+const { isDirectManagedTool, normalizeToolLifecycle } = require('./toolLifecycleService');
 
 const MIGRATABLE_DIRECTORY_LABELS = {
   downloads: 'Installer downloads',
@@ -68,7 +70,32 @@ async function directoryHasChildren(targetPath) {
   return entries.length > 0;
 }
 
-async function buildMigrationEntries(sourceRoot, targetRoot, directoryName) {
+function normalizeTrackedInstallDir(targetPath) {
+  const normalizedPath = normalizeOptionalDirectoryPath(targetPath || '');
+  if (!normalizedPath) {
+    return '';
+  }
+
+  return path.basename(normalizedPath).toLowerCase() === 'app' ? path.dirname(normalizedPath) : normalizedPath;
+}
+
+async function buildTrackedToolMap() {
+  await initializeToolRegistry();
+  const config = await readConfig();
+  return Object.fromEntries(
+    Object.entries(config?.tools || {}).map(([toolId, toolState]) => {
+      const manifest = getToolManifest(toolId) || null;
+      const normalizedToolState = manifest ? normalizeToolLifecycle(toolState, manifest) : toolState;
+      return [toolId, {
+        manifest,
+        toolState: normalizedToolState,
+        installKey: normalizePathKey(normalizeTrackedInstallDir(normalizedToolState?.installDir || normalizedToolState?.appDir || '')),
+      }];
+    }),
+  );
+}
+
+async function buildMigrationEntries(sourceRoot, targetRoot, directoryName, trackedTools = null) {
   const sourceDirectories = buildManagedSubdirectoryPaths(sourceRoot);
   const targetDirectories = buildManagedSubdirectoryPaths(targetRoot);
   const sourcePath = sourceDirectories[`${directoryName}Root`];
@@ -83,6 +110,8 @@ async function buildMigrationEntries(sourceRoot, targetRoot, directoryName) {
 
   if (directoryName === 'tools') {
     const entries = await fs.readdir(sourcePath, { withFileTypes: true }).catch(() => []);
+    const trackedInstallMap = trackedTools || (await buildTrackedToolMap());
+    const trackedInstallEntries = Object.values(trackedInstallMap || {});
     const results = [];
 
     for (const entry of entries) {
@@ -91,12 +120,21 @@ async function buildMigrationEntries(sourceRoot, targetRoot, directoryName) {
       }
 
       const entryPath = path.join(sourcePath, entry.name);
+      const trackedTool =
+        trackedInstallEntries.find((candidate) => candidate.installKey === normalizePathKey(entryPath))
+        || trackedInstallMap[String(entry.name || '').trim().toLowerCase()]
+        || null;
+      if (!trackedTool?.manifest || !trackedTool?.toolState || !isDirectManagedTool(trackedTool.toolState, trackedTool.manifest)) {
+        continue;
+      }
+
       results.push({
         categoryId: directoryName,
-        label: entry.name,
+        label: trackedTool.toolState.name || entry.name,
         sizeBytes: await calculatePathSize(entryPath),
         sourcePath: entryPath,
         targetPath: path.join(targetPath, entry.name),
+        toolId: trackedTool.manifest.id,
       });
     }
 
@@ -128,9 +166,10 @@ async function inspectManagedDataMigration(options = {}) {
     };
   }
 
+  const trackedTools = await buildTrackedToolMap();
   const categoryEntries = [];
   for (const directoryName of ['tools', 'downloads', 'snapshots', 'models', 'runtimes', 'logs']) {
-    const entries = await buildMigrationEntries(sourceRoot, targetRoot, directoryName);
+    const entries = await buildMigrationEntries(sourceRoot, targetRoot, directoryName, trackedTools);
     if (!entries.length) {
       continue;
     }
@@ -191,21 +230,22 @@ async function persistManagedRoot(targetRoot, options = {}) {
   const normalizedTargetRoot = normalizeDirectoryPath(targetRoot);
   const managedDataRoot = pathsMatch(normalizedTargetRoot, paths.defaultManagedRoot) ? null : normalizedTargetRoot;
   const migrationSourceRoot = options.migrationSourceRoot ? normalizeDirectoryPath(options.migrationSourceRoot) : null;
+  const pathMappings = Array.isArray(options.pathMappings) ? options.pathMappings : [];
 
   return updateConfig((config) => ({
     ...config,
     managedDataRoot,
+    dismissedManagedMigrationRoots: (config.dismissedManagedMigrationRoots || []).filter(
+      (entry) => normalizePathKey(entry) !== normalizePathKey(normalizedTargetRoot),
+    ),
     managedDataRootHistory: [
       ...(config.managedDataRootHistory || []),
       paths.managedRoot,
       normalizedTargetRoot,
       migrationSourceRoot,
     ].filter(Boolean),
-    dismissedManagedMigrationRoots: (config.dismissedManagedMigrationRoots || []).filter(
-      (entry) => normalizePathKey(entry) !== normalizePathKey(normalizedTargetRoot),
-    ),
   }), {
-    pathMappings: migrationSourceRoot ? buildManagedPathMappings(migrationSourceRoot, normalizedTargetRoot) : [],
+    pathMappings,
   });
 }
 
@@ -237,6 +277,7 @@ async function setManagedDataRoot(targetRoot, options = {}) {
     fs.ensureDir(nextManagedPaths.logsRoot),
   ]);
 
+  let pathMappings = [];
   if (migrationSourceRoot && !pathsMatch(migrationSourceRoot, normalizedTargetRoot)) {
     const migration = await inspectManagedDataMigration({
       sourceRoot: migrationSourceRoot,
@@ -246,12 +287,17 @@ async function setManagedDataRoot(targetRoot, options = {}) {
     for (const category of migration.categories) {
       for (const entry of category.entries) {
         await moveEntryWithMerge(entry.sourcePath, entry.targetPath);
+        pathMappings.push({
+          from: entry.sourcePath,
+          to: entry.targetPath,
+        });
       }
     }
   }
 
   return persistManagedRoot(normalizedTargetRoot, {
     migrationSourceRoot,
+    pathMappings,
   });
 }
 
@@ -305,6 +351,7 @@ async function getStorageOverview() {
     configRoot: paths.configRoot,
     currentDisk,
     customManagedRoot: Boolean(config.managedDataRoot),
+    customPreferredInstallRoot: Boolean(config.preferredInstallRoot),
     defaultManagedRoot: paths.defaultManagedRoot,
     executablePath: paths.executablePath,
     legacyMigration: {
@@ -314,6 +361,7 @@ async function getStorageOverview() {
     localAppDataRoot: paths.localRoot,
     managedRoot: paths.managedRoot,
     knownManagedRoots: paths.knownManagedRoots,
+    preferredInstallRoot: normalizeOptionalDirectoryPath(config.preferredInstallRoot) || paths.preferredInstallRoot || paths.managedRoot,
     drives: (disks || []).map((disk) => ({
       ...disk,
       isInstallDrive: Boolean(paths.appInstallDir) && normalizePathKey(paths.appInstallDir).startsWith(normalizePathKey(disk.mount)),

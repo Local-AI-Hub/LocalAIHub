@@ -9,8 +9,12 @@ let nextRequestId = 0;
 const pendingRequests = new Map();
 const logger = createLogger('background-worker');
 
+function isPackagedElectronApp() {
+  return Boolean(app?.isPackaged);
+}
+
 function getWorkerModulePath() {
-  return app.isPackaged
+  return isPackagedElectronApp()
     ? path.join(process.resourcesPath, 'app.asar', 'electron', 'helpers', 'background_worker.js')
     : path.join(__dirname, '..', 'helpers', 'background_worker.js');
 }
@@ -52,7 +56,7 @@ function attachWorkerListeners(worker) {
 
     logger.error('The background worker crashed.', {
       error,
-      packaged: app.isPackaged,
+      packaged: isPackagedElectronApp(),
       workerModulePath: getWorkerModulePath(),
     }).catch(() => null);
 
@@ -66,7 +70,7 @@ function attachWorkerListeners(worker) {
     if (code !== 0) {
       logger.error('The background worker exited unexpectedly.', {
         code,
-        packaged: app.isPackaged,
+        packaged: isPackagedElectronApp(),
         pendingRequests: pendingRequests.size,
         workerModulePath: getWorkerModulePath(),
       }).catch(() => null);

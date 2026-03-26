@@ -1,3 +1,4 @@
+const os = require('os');
 const path = require('path');
 const fs = require('fs-extra');
 const { open } = require('node:fs/promises');
@@ -367,6 +368,169 @@ async function collectManagedPythonCandidates(installDir, runtime) {
   };
 }
 
+function parseInstallerLogTargetDirs(logContents) {
+  const targetDirMatches = [...String(logContents || '').matchAll(/Setting string variable 'TargetDir' to value '([^']+)'/g)];
+  return uniqueResolvedPaths(targetDirMatches.map((match) => match[1]));
+}
+
+function installerLogShowsModifyWithoutActions(logContents) {
+  const actionMatch = String(logContents || '').match(/Plan begin, \d+ packages, action: (\w+)/i);
+  if (!actionMatch || String(actionMatch[1] || '').toLowerCase() !== 'modify') {
+    return false;
+  }
+
+  const plannedExecutions = [...String(logContents || '').matchAll(/execute:\s*(\w+)/g)].map((match) => match[1]);
+  return plannedExecutions.length > 0 && plannedExecutions.every((value) => value === 'None');
+}
+
+async function findLatestPythonInstallerLog(runtime, installStartedAt, logger) {
+  const tempDir = os.tmpdir();
+  const logPrefix = `Python ${runtime.versionString} (64-bit)_`;
+  let entries = [];
+
+  try {
+    entries = await fs.readdir(tempDir, { withFileTypes: true });
+  } catch (error) {
+    await logger.warn('Local AI Hub could not inspect the temp folder for Python installer logs.', {
+      error,
+      tempDir,
+    });
+    return null;
+  }
+
+  const matchingLogs = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.startsWith(logPrefix) || !entry.name.endsWith('.log')) {
+      continue;
+    }
+
+    const logPath = path.join(tempDir, entry.name);
+    const stats = await fs.stat(logPath).catch(() => null);
+    if (!stats) {
+      continue;
+    }
+
+    if (Number.isFinite(installStartedAt) && stats.mtimeMs + 1000 < installStartedAt) {
+      continue;
+    }
+
+    matchingLogs.push({
+      logPath,
+      mtimeMs: stats.mtimeMs,
+    });
+  }
+
+  matchingLogs.sort((left, right) => right.mtimeMs - left.mtimeMs);
+  if (matchingLogs.length === 0) {
+    return null;
+  }
+
+  await logger.info('Found a Python installer log for runtime materialization checks.', {
+    runtimeVersion: runtime.versionString,
+    installerLogPath: matchingLogs[0].logPath,
+  });
+  return matchingLogs[0].logPath;
+}
+
+async function materializeManagedRuntimeFromInstallerLog(runtime, installDir, installStartedAt, logger, onProgress, toolId, toolName) {
+  const installerLogPath = await findLatestPythonInstallerLog(runtime, installStartedAt, logger);
+  if (!installerLogPath) {
+    return null;
+  }
+
+  const logContents = await fs.readFile(installerLogPath, 'utf8').catch(() => '');
+  if (!installerLogShowsModifyWithoutActions(logContents)) {
+    return null;
+  }
+
+  const exactRequirement = {
+    kind: 'specifier',
+    specifier: `==${runtime.versionString}`,
+  };
+  const minorRequirement = buildMinorCompatibleRequirement(runtime);
+  const targetInstallDirKey = path.resolve(installDir).toLowerCase();
+  const sourceInstallDirs = parseInstallerLogTargetDirs(logContents).filter(
+    (sourceInstallDir) => path.resolve(sourceInstallDir).toLowerCase() !== targetInstallDirKey,
+  );
+
+  for (const sourceInstallDir of sourceInstallDirs) {
+    const pythonPath = path.join(sourceInstallDir, 'python.exe');
+    if (!(await fs.pathExists(pythonPath))) {
+      continue;
+    }
+
+    try {
+      const metadata = await inspectPythonExecutable(pythonPath);
+      const detected = {
+        installDir: sourceInstallDir,
+        pythonPath,
+        version: metadata.version,
+        versionString: metadata.versionString,
+      };
+      const exactMatch = isCompatibleRuntime(detected, exactRequirement);
+      const minorMatch = isCompatibleRuntime(detected, minorRequirement) || versionsShareMajorMinor(metadata.version, runtime.version);
+
+      if (!exactMatch && !minorMatch) {
+        continue;
+      }
+
+      await advance(logger, onProgress, {
+        toolId,
+        percent: 61,
+        stage: 'runtime',
+        message: `Copying Python ${metadata.versionString} into Local AI Hub.`,
+      }, {
+        installDir,
+        installerLogPath,
+        sourceInstallDir,
+      });
+
+      await fs.ensureDir(path.dirname(installDir));
+      await fs.remove(installDir).catch(() => null);
+      await fs.copy(sourceInstallDir, installDir, {
+        overwrite: true,
+      });
+
+      const verified = await verifyManagedRuntime(runtime, installDir, logger, {
+        logMissing: false,
+      });
+      if (!verified) {
+        await fs.remove(installDir).catch(() => null);
+        throw new Error('Local AI Hub found a matching Python installation on this PC, but could not materialize the managed runtime copy.');
+      }
+
+      await logger.info('Managed Python runtime was materialized from the installer log source path.', {
+        runtimeVersion: verified.versionString,
+        installDir,
+        installerLogPath,
+        pythonPath: verified.pythonPath,
+        sourceInstallDir,
+      });
+
+      await advance(logger, onProgress, {
+        toolId,
+        percent: 64,
+        stage: 'runtime',
+        message: `Python ${verified.versionString} is ready for ${toolName}.`,
+      }, {
+        installerLogPath,
+        source: 'installer-log-copy',
+        sourceInstallDir,
+      });
+
+      return verified;
+    } catch (error) {
+      await logger.warn('Local AI Hub could not materialize the managed runtime from the installer log source path.', {
+        error,
+        installerLogPath,
+        sourceInstallDir,
+      });
+    }
+  }
+
+  return null;
+}
+
 async function verifyManagedRuntime(runtime, installDir, logger, options = {}) {
   const { candidates, candidateRoots } = await collectManagedPythonCandidates(installDir, runtime);
   if (candidates.length === 0) {
@@ -526,6 +690,7 @@ async function installManagedRuntime(runtime, installDir, installerPath, logger,
     'Include_pip=1',
     'SimpleInstall=1',
   ];
+  const installStartedAt = Date.now();
 
   await runCommand(installerPath, args, {
     errorMessage: 'Local AI Hub could not install the required Python runtime.',
@@ -538,6 +703,19 @@ async function installManagedRuntime(runtime, installDir, installerPath, logger,
   });
 
   await sleep(POST_INSTALL_STABILIZATION_MS);
+
+  const materializedFromInstallerLog = await materializeManagedRuntimeFromInstallerLog(
+    runtime,
+    installDir,
+    installStartedAt,
+    logger,
+    onProgress,
+    toolId,
+    toolName,
+  );
+  if (materializedFromInstallerLog) {
+    return materializedFromInstallerLog;
+  }
 
   const verified = await waitForManagedRuntime(runtime, installDir, logger);
   if (!verified) {
@@ -581,6 +759,7 @@ async function ensureManagedPythonRuntime(requirement, options) {
     });
     return existing;
   }
+
 
   if (!(await hasUsableInstaller(installerPath, options.logger))) {
     await downloadPythonInstaller(runtime, installerPath, options.logger, options.onProgress, options.toolId, options.toolName);

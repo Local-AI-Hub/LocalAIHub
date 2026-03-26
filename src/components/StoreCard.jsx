@@ -2,6 +2,23 @@ import { memo } from 'react';
 import { progressWidth } from '../lib/formatters';
 import { compatibilityClass, describeRequirements } from '../lib/tool-ui';
 
+function installMethodLabel(manifest) {
+  if (manifest?.installContract?.lifecycleMode === 'official-installer') {
+    return manifest?.installContract?.destinationControl === 'guided'
+      ? 'Official installer (guided)'
+      : 'Official installer';
+  }
+
+  return 'Direct Local AI Hub install';
+}
+
+function installPlanText(manifest) {
+  return manifest?.installContract?.locationSummary || manifest.installSummary;
+}
+
+function installButtonLabel(manifest) {
+  return manifest?.installContract?.lifecycleMode === 'official-installer' ? 'Official Install' : 'Install';
+}
 function StoreCard({ manifest, compatibility, progress, busy, onInstall }) {
   return (
     <article className="store-card">
@@ -13,20 +30,21 @@ function StoreCard({ manifest, compatibility, progress, busy, onInstall }) {
               <h3 className="text-2xl font-semibold text-white">{manifest.name}</h3>
               <span className="status-pill border-white/10 bg-white/5 text-slate-300">{manifest.category}</span>
               <span className={`status-pill ${compatibilityClass(compatibility.tone)}`}>{compatibility.label}</span>
+              <span className="status-pill border-amber-300/20 bg-amber-300/10 text-amber-100">{installMethodLabel(manifest)}</span>
             </div>
             <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-300">{manifest.description}</p>
           </div>
         </div>
 
         <button className="primary-button" disabled={busy} onClick={() => onInstall(manifest.id)} type="button">
-          {busy ? 'Installing...' : 'Install'}
+          {busy ? 'Installing...' : installButtonLabel(manifest)}
         </button>
       </div>
 
       <div className="mt-5 grid gap-4 lg:grid-cols-[1.2fr,0.8fr]">
         <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
           <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Install plan</p>
-          <p className="mt-3 text-sm leading-6 text-slate-300">{manifest.installSummary}</p>
+          <p className="mt-3 text-sm leading-6 text-slate-300">{installPlanText(manifest)}</p>
         </div>
         <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
           <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Hardware fit</p>

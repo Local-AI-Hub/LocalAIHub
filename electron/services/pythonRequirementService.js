@@ -89,6 +89,46 @@ function versionSatisfiesSpecifier(version, specifier) {
   });
 }
 
+function normalizeDetectedSpecifier(value) {
+  return String(value || '').trim().replace(/^['"]|['"]$/g, '');
+}
+
+function detectClassifiedPythonMinors(content, strategy) {
+  const supportedMinors = [...content.matchAll(/Programming Language :: Python :: 3\.(\d+)/g)]
+    .map((match) => Number.parseInt(match[1], 10))
+    .filter((value) => Number.isFinite(value));
+
+  if (!supportedMinors.length) {
+    return null;
+  }
+
+  return {
+    kind: 'minor-list',
+    source: strategy.file,
+    supportedMinors: [...new Set(supportedMinors)].sort((left, right) => left - right),
+  };
+}
+
+function detectPoetryPythonRequirement(content, strategy) {
+  const poetrySectionMatch = content.match(/\[tool\.poetry\.dependencies\]([\s\S]*?)(?:\n\s*\[|$)/i);
+  const poetrySection = poetrySectionMatch?.[1] || '';
+  const pythonMatch = poetrySection.match(/^[ \t]*python\s*=\s*["']([^"']+)["']/im);
+  if (!pythonMatch?.[1]) {
+    return null;
+  }
+
+  const specifier = normalizeDetectedSpecifier(pythonMatch[1]);
+  if (!specifier || !/[<>!=~]/.test(specifier)) {
+    return null;
+  }
+
+  return {
+    kind: 'specifier',
+    source: strategy.file,
+    specifier,
+  };
+}
+
 function describePythonRequirement(requirement) {
   if (!requirement) {
     return 'a compatible Python 3 version';
@@ -104,15 +144,25 @@ function describePythonRequirement(requirement) {
 
 function detectPyprojectRequirement(content, strategy) {
   const match = content.match(/requires-python\s*=\s*["']([^"']+)["']/i);
-  if (!match) {
-    throw new Error('Local AI Hub could not find a requires-python entry in the tool metadata.');
+  if (match?.[1]) {
+    return {
+      kind: 'specifier',
+      source: strategy.file,
+      specifier: normalizeDetectedSpecifier(match[1]),
+    };
   }
 
-  return {
-    kind: 'specifier',
-    source: strategy.file,
-    specifier: match[1].trim(),
-  };
+  const poetryRequirement = detectPoetryPythonRequirement(content, strategy);
+  if (poetryRequirement) {
+    return poetryRequirement;
+  }
+
+  const classifierRequirement = detectClassifiedPythonMinors(content, strategy);
+  if (classifierRequirement) {
+    return classifierRequirement;
+  }
+
+  throw new Error('Local AI Hub could not find a Python requirement in pyproject.toml.');
 }
 
 function detectAutomatic1111Requirement(content, strategy) {
@@ -135,26 +185,6 @@ function detectAutomatic1111Requirement(content, strategy) {
     source: strategy.file,
     supportedMinors,
   };
-}
-
-function detectClassifiedPythonMinors(content, strategy) {
-  const supportedMinors = [...content.matchAll(/Programming Language :: Python :: 3\.(\d+)/g)]
-    .map((match) => Number.parseInt(match[1], 10))
-    .filter((value) => Number.isFinite(value));
-
-  if (!supportedMinors.length) {
-    return null;
-  }
-
-  return {
-    kind: 'minor-list',
-    source: strategy.file,
-    supportedMinors: [...new Set(supportedMinors)].sort((left, right) => left - right),
-  };
-}
-
-function normalizeDetectedSpecifier(value) {
-  return String(value || '').trim().replace(/^['"]|['"]$/g, '');
 }
 
 function detectSetupCfgRequirement(content, strategy) {

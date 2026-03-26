@@ -24,7 +24,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   getPipeline: (pipelineId) => invoke('pipelines:get', pipelineId),
   getRepairPreview: (toolId) => invoke('tools:get-repair-preview', toolId),
   getStatistics: () => invoke('settings:get-statistics'),
-  getToolInstallPreflight: (toolId) => invoke('tools:get-install-preflight', toolId),
+  getToolInstallPreflight: (payload) => invoke('tools:get-install-preflight', payload),
   getToolRuntimeOutput: (toolId) => invoke('tools:get-runtime-output', toolId),
   getWindowActivity: () => invoke('app:get-window-activity'),
   installTool: (payload) => invoke('tools:install', payload),
@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   runPipeline: (payload) => invoke('pipelines:run', payload),
   saveCloseBehavior: (closeBehavior) => invoke('settings:save-close-behavior', closeBehavior),
   saveLiveResourcePolling: (enabled) => invoke('settings:save-live-resource-polling', enabled),
+  savePreferredInstallRoot: (targetPath) => invoke('settings:save-preferred-install-root', targetPath),
   saveModelSettings: (payload) => invoke('models:save-settings', payload),
   savePipeline: (payload) => invoke('pipelines:save', payload),
   saveProviderKey: (payload) => invoke('providers:save-key', payload),
@@ -130,8 +131,4 @@ contextBridge.exposeInMainWorld('localAIHub', {
     return () => ipcRenderer.removeListener('app:window-activity', listener);
   },
 });
-
-
-
-
 

@@ -4,7 +4,7 @@ const { app } = require('electron');
 
 const { sanitizeUserMessage } = require('./redactionService');
 
-const CONFIG_VERSION = 3;
+const CONFIG_VERSION = 4;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
 const LEGACY_APP_DATA_DIR_NAMES = ['NestAI'];
 const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'runtimes', 'logs'];
@@ -299,6 +299,7 @@ function createDefaultConfig() {
     closeBehavior: 'exit',
     liveResourcePolling: false,
     managedDataRoot: null,
+    preferredInstallRoot: null,
     managedDataRootHistory: [],
     dismissedManagedMigrationRoots: [],
     tools: {},
@@ -322,6 +323,7 @@ function normalizeConfig(config, options = {}) {
       closeBehavior: normalizeCloseBehavior(config?.closeBehavior),
       liveResourcePolling: Boolean(config?.liveResourcePolling),
       managedDataRoot: normalizeOptionalDirectoryPath(config?.managedDataRoot),
+      preferredInstallRoot: normalizeOptionalDirectoryPath(config?.preferredInstallRoot),
       managedDataRootHistory: normalizePathList([
         ...(config?.managedDataRootHistory || []),
         config?.managedDataRoot,
@@ -367,6 +369,7 @@ function getStorageRoots(configOverride = null) {
   const storedConfig = configOverride || readStoredConfigSnapshotSync(configFile) || null;
   const configuredManagedRoot = normalizeOptionalDirectoryPath(storedConfig?.managedDataRoot);
   const managedRoot = configuredManagedRoot || defaultManagedRoot;
+  const preferredInstallRoot = normalizeOptionalDirectoryPath(storedConfig?.preferredInstallRoot);
   const legacyConfigRoots = buildLegacyConfigRoots(appDataRoot, localAppDataRoot).filter(
     (entry) => entry !== root && entry !== localRoot,
   );
@@ -377,6 +380,7 @@ function getStorageRoots(configOverride = null) {
     appInstallDir,
     defaultManagedRoot,
     managedRoot,
+    preferredInstallRoot,
     ...managedDataRootHistory,
     ...legacyConfigRoots,
   ]);
@@ -389,11 +393,12 @@ function getStorageRoots(configOverride = null) {
     executablePath,
     knownManagedRoots,
     legacyConfigRoots,
-    legacyRoots: normalizePathList([root, localRoot, appInstallDir, ...legacyConfigRoots, ...managedDataRootHistory]),
+    legacyRoots: normalizePathList([root, localRoot, appInstallDir, preferredInstallRoot, ...legacyConfigRoots, ...managedDataRootHistory]),
     localAppDataRoot,
     localRoot,
     managedDataRootHistory,
     managedRoot,
+    preferredInstallRoot,
     root,
   };
 }
@@ -713,6 +718,7 @@ module.exports = {
   humanizeError,
   markFirstLaunchComplete,
   normalizeDirectoryPath,
+  normalizeOptionalDirectoryPath,
   normalizePathList,
   readConfig,
   removeTool,
@@ -722,7 +728,4 @@ module.exports = {
   upsertTool,
   writeConfig,
 };
-
-
-
 

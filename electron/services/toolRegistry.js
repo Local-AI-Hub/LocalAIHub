@@ -4,6 +4,7 @@ const fs = require('fs-extra');
 const { getLoadedToolManifest, loadToolManifest } = require('./manifestService');
 const { assertSafeCommandString, assertSecureRemoteUrl, sanitizeManifestId } = require('./pathSafetyService');
 const { getToolPipelineCapabilities } = require('../shared/pipelineCapabilities.cjs');
+const { getManifestInstallContract } = require('./toolLifecycleService');
 
 let cachedToolDefinitions = null;
 let cachedToolManifestKey = '';
@@ -227,6 +228,41 @@ function normalizeToolDefinition(tool) {
   const externalLaunchCommand = tool.externalLaunchCommand
     ? assertSafeCommandString(tool.externalLaunchCommand, `${toolId} external launch command`)
     : launchCommand;
+  const normalizedInstallInstructions = {
+    kind: installInstructions.kind || 'zip',
+    runtime: installInstructions.runtime || 'binary',
+    archiveName: deriveArchiveName(tool.downloadUrl, installInstructions.archiveName),
+    downloadFileName: installInstructions.downloadFileName || null,
+    installSummary: installInstructions.installSummary || 'Downloads and configures this tool inside Local AI Hub.',
+    venvFolder: installInstructions.venvFolder || '.venv',
+    pythonRequirement: installInstructions.pythonRequirement || null,
+    configTargets: installInstructions.configTargets || [],
+    pythonRequirementDetection: installInstructions.pythonRequirementDetection || [],
+    pipInstalls: installInstructions.pipInstalls || [],
+    installerArgs: installInstructions.installerArgs || [],
+    managedInstallSupported: installInstructions.managedInstallSupported !== false,
+    materializationTimeoutMs: Number(installInstructions.materializationTimeoutMs) > 0
+      ? Number(installInstructions.materializationTimeoutMs)
+      : null,
+    externalPythonCandidates: mergeUnique([
+      ...(defaultExternalCandidates.externalPythonCandidates || []),
+      ...(installInstructions.externalPythonCandidates || []),
+    ]),
+    externalExecutableCandidates: mergeUnique([
+      ...(defaultExternalCandidates.externalExecutableCandidates || []),
+      ...(installInstructions.externalExecutableCandidates || []),
+    ]),
+    externalBatchCandidates: mergeUnique([
+      ...(defaultExternalCandidates.externalBatchCandidates || []),
+      ...(installInstructions.externalBatchCandidates || []),
+    ]),
+    compatibility: installInstructions.compatibility || null,
+  };
+  const installContract = getManifestInstallContract({
+    ...tool,
+    id: toolId,
+    installInstructions: normalizedInstallInstructions,
+  });
 
   return {
     id: toolId,
@@ -238,32 +274,8 @@ function normalizeToolDefinition(tool) {
     interfaceMode: tool.interfaceMode || 'external-browser',
     launchEnv: tool.launchEnv || {},
     externalLaunchEnv: tool.externalLaunchEnv || tool.launchEnv || {},
-    installInstructions: {
-      kind: installInstructions.kind || 'zip',
-      runtime: installInstructions.runtime || 'binary',
-      archiveName: deriveArchiveName(tool.downloadUrl, installInstructions.archiveName),
-      downloadFileName: installInstructions.downloadFileName || null,
-      installSummary: installInstructions.installSummary || 'Downloads and configures this tool inside Local AI Hub.',
-      venvFolder: installInstructions.venvFolder || '.venv',
-      pythonRequirement: installInstructions.pythonRequirement || null,
-      configTargets: installInstructions.configTargets || [],
-      pythonRequirementDetection: installInstructions.pythonRequirementDetection || [],
-      pipInstalls: installInstructions.pipInstalls || [],
-      installerArgs: installInstructions.installerArgs || [],
-      externalPythonCandidates: mergeUnique([
-        ...(defaultExternalCandidates.externalPythonCandidates || []),
-        ...(installInstructions.externalPythonCandidates || []),
-      ]),
-      externalExecutableCandidates: mergeUnique([
-        ...(defaultExternalCandidates.externalExecutableCandidates || []),
-        ...(installInstructions.externalExecutableCandidates || []),
-      ]),
-      externalBatchCandidates: mergeUnique([
-        ...(defaultExternalCandidates.externalBatchCandidates || []),
-        ...(installInstructions.externalBatchCandidates || []),
-      ]),
-      compatibility: installInstructions.compatibility || null,
-    },
+    installContract,
+    installInstructions: normalizedInstallInstructions,
     launchCommand,
     externalLaunchCommand,
     defaultPort: tool.defaultPort || null,
@@ -319,6 +331,7 @@ function getToolCatalog() {
     interfaceMode: tool.interfaceMode,
     installSummary: tool.installInstructions.installSummary,
     installKind: tool.installInstructions.kind,
+    installContract: tool.installContract,
     downloadUrl: tool.downloadUrl,
     compatibility: tool.installInstructions.compatibility,
     pipelineCapabilities: tool.pipelineCapabilities,
@@ -644,11 +657,4 @@ module.exports = {
   initializeToolRegistry,
   tokenizeCommand,
 };
-
-
-
-
-
-
-
 

@@ -200,6 +200,24 @@ async function fetchRemoteManifest() {
   };
 }
 
+async function syncBundledManifestCache(logger) {
+  try {
+    const bundledManifestPath = getBundledManifestPath();
+    const bundledSignaturePath = getBundledManifestSignaturePath();
+    const [rawManifestText, rawSignatureText] = await Promise.all([
+      readTextFile(bundledManifestPath),
+      readTextFile(bundledSignaturePath),
+    ]);
+
+    verifySignedManifest(rawManifestText, rawSignatureText);
+    await writeCachedManifest(rawManifestText, rawSignatureText);
+  } catch (error) {
+    await logger.warn('The bundled tool manifest was loaded, but Local AI Hub could not refresh its local manifest cache.', {
+      error,
+    });
+  }
+}
+
 async function ensureManifestSeed(logger) {
   if (loadedManifest) {
     return loadedManifest;
@@ -217,6 +235,7 @@ async function ensureManifestSeed(logger) {
       verified: true,
       warning: null,
     };
+    await syncBundledManifestCache(logger);
     return loadedManifest;
   } catch (error) {
     await logger.warn('The bundled tool manifest could not be loaded or verified.', {
@@ -345,4 +364,3 @@ module.exports = {
   getRemoteManifestUrl,
   loadToolManifest,
 };
-

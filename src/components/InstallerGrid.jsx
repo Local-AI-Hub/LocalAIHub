@@ -1,5 +1,36 @@
 import { progressWidth } from '../lib/formatters';
 
+function stateBadgeLabel(toolState) {
+  if (!toolState) {
+    return 'Available';
+  }
+
+  if (toolState.source === 'managed' && toolState.externalInstallDetected) {
+    return 'Managed copy + system install';
+  }
+
+  return toolState.source === 'managed' ? 'Managed by Local AI Hub' : 'Detected on system';
+}
+
+function locationLabel(toolState) {
+  if (!toolState) {
+    return 'Managed install plan';
+  }
+
+  return toolState.source === 'managed' ? 'Managed location' : 'Detected location';
+}
+
+function externalInstallNote(toolState) {
+  if (!(toolState?.source === 'managed' && toolState?.externalInstallDetected)) {
+    return null;
+  }
+
+  const externalPath = toolState.externalInstallDisplayPath || toolState.externalInstallDir;
+  return externalPath
+    ? `Windows or another installer also has this tool at ${externalPath}. Local AI Hub uses the managed copy shown here.`
+    : 'Windows or another installer also has a separate system install for this tool. Local AI Hub uses the managed copy shown here.';
+}
+
 function resolveAction(toolState, busyMap, handlers, tool) {
   if (!toolState) {
     return {
@@ -21,12 +52,9 @@ function resolveAction(toolState, busyMap, handlers, tool) {
 
   if (toolState.source === 'external') {
     return {
-      label: 'Open',
-      disabled: Boolean(busyMap[`launch:${tool.id}`] || busyMap[`folder:${tool.id}`]),
-      onClick: () =>
-        toolState.launchSupported === false
-          ? handlers.onOpenFolder(tool.id)
-          : handlers.onLaunch(tool.id),
+      label: busyMap[`install:${tool.id}`] ? 'Installing...' : 'Install managed copy',
+      disabled: Boolean(busyMap[`install:${tool.id}`]),
+      onClick: () => handlers.onInstall(tool.id),
       variant: 'primary-button',
     };
   }
@@ -59,7 +87,7 @@ export default function InstallerGrid({
           </h2>
         </div>
         <p className="max-w-xl text-sm leading-6 text-slate-400">
-          Local AI Hub checks for existing installs first, then falls back to its own managed install path only when the tool is not already present.
+          Detected tools stay usable, but Install always tries to place a managed copy in your selected Local AI Hub storage folder when the tool supports that layout.
         </p>
       </div>
 
@@ -89,11 +117,7 @@ export default function InstallerGrid({
                           : 'border-white/10 bg-white/5 text-slate-300'
                       }`}
                     >
-                      {toolState
-                        ? toolState.source === 'managed'
-                          ? 'Managed by Local AI Hub'
-                          : 'Detected on system'
-                        : 'Available'}
+                      {stateBadgeLabel(toolState)}
                     </span>
                   </div>
                   <p className="mt-3 text-sm leading-6 text-slate-300">{tool.description}</p>
@@ -106,11 +130,19 @@ export default function InstallerGrid({
 
               <div className="mt-5 rounded-2xl border border-white/10 bg-slate-950/25 p-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">
-                  {toolState ? 'Location' : 'Install plan'}
+                  {locationLabel(toolState)}
                 </p>
                 <p className="mt-2 text-sm leading-6 text-slate-300">
                   {toolState ? toolState.displayPath || toolState.installDir : tool.installSummary}
                 </p>
+                {externalInstallNote(toolState) ? (
+                  <p className="mt-2 text-xs leading-6 text-slate-400">{externalInstallNote(toolState)}</p>
+                ) : null}
+                {toolState?.source === 'external' ? (
+                  <p className="mt-2 text-xs leading-6 text-slate-400">
+                    Installing a managed copy leaves this detected install where it is and asks Local AI Hub to place a separate managed copy in your selected storage folder.
+                  </p>
+                ) : null}
               </div>
 
               {progress && (
@@ -131,4 +163,3 @@ export default function InstallerGrid({
     </section>
   );
 }
-

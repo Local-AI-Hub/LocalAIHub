@@ -39,7 +39,9 @@ export default function SettingsPanel({
   liveResourcePollingDraft,
   onChangeCloseBehavior,
   onChangeLiveResourcePolling,
+  onChangePreferredInstallRootDraft,
   onChangeStorageDraft,
+  onChoosePreferredInstallFolder,
   onChooseStorageFolder,
   onDismissLegacyMigration,
   onMigrateLegacyStorage,
@@ -47,11 +49,15 @@ export default function SettingsPanel({
   onRunCleanup,
   onSaveCloseBehavior,
   onSaveLiveResourcePolling,
+  onSavePreferredInstallRoot,
   onSaveStorageLocation,
+  preferredInstallRootDraft,
   storage,
   storageDraft,
 }) {
   const legacyMigration = storage?.legacyMigration;
+  const currentPreferredInstallRoot = storage?.preferredInstallRoot || storage?.managedRoot || '';
+  const usingManagedStorageAsDefault = !storage?.customPreferredInstallRoot || currentPreferredInstallRoot === storage?.managedRoot;
 
   return (
     <section className="space-y-5">
@@ -59,17 +65,17 @@ export default function SettingsPanel({
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Storage</p>
-            <h3 className="mt-3 text-3xl font-semibold text-white">Choose where Local AI Hub keeps large files</h3>
+            <h3 className="mt-3 text-3xl font-semibold text-white">Choose where Local AI Hub keeps large files and starts new installs</h3>
             <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
-              Tool installs, snapshots, model downloads, repair caches, and managed runtimes now live in your selected storage folder. Small config files and credentials stay in AppData.
+              Snapshots, model downloads, cleanup caches, and the main Local AI Hub data root live in your selected storage folder. You can also set a separate default install folder for new Store installs so they prefer another drive when a tool supports it. Migration only moves direct Local AI Hub-managed folders between Local AI Hub roots, not third-party installs that Windows or another installer keeps elsewhere.
             </p>
           </div>
           <button className="ghost-button" disabled={busyMap['settings:pick-folder']} onClick={onChooseStorageFolder} type="button">
-            {busyMap['settings:pick-folder'] ? 'Opening...' : 'Browse folder'}
+            {busyMap['settings:pick-folder'] ? 'Opening...' : 'Browse storage folder'}
           </button>
         </div>
 
-        <div className="mt-6 grid gap-4 xl:grid-cols-[1.4fr,1fr]">
+        <div className="mt-6 grid gap-4 xl:grid-cols-[1.05fr,1.05fr,0.9fr]">
           <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Managed storage folder</p>
             <input
@@ -104,7 +110,58 @@ export default function SettingsPanel({
           </div>
 
           <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Default tool install folder</p>
+                <p className="mt-3 text-sm leading-7 text-slate-300">
+                  New Store installs start here by default. Direct Local AI Hub installs use it automatically. Official installers use it when they accept a destination, otherwise Local AI Hub will tell you to confirm the final folder in the installer window.
+                </p>
+              </div>
+              <span className="status-pill border-white/10 bg-white/5 text-slate-300">
+                {usingManagedStorageAsDefault ? 'Following managed storage' : 'Custom default'}
+              </span>
+            </div>
+            <input
+              className="store-input mt-4"
+              onChange={(event) => onChangePreferredInstallRootDraft(event.target.value)}
+              placeholder={storage?.managedRoot || 'D:\\LocalAIHub'}
+              type="text"
+              value={preferredInstallRootDraft}
+            />
+            <div className="mt-4 flex flex-wrap gap-3">
+              <button
+                className="primary-button"
+                disabled={busyMap['settings:save-preferred-install-root']}
+                onClick={onSavePreferredInstallRoot}
+                type="button"
+              >
+                {busyMap['settings:save-preferred-install-root'] ? 'Saving...' : 'Save default install folder'}
+              </button>
+              <button
+                className="ghost-button"
+                disabled={busyMap['settings:pick-preferred-install-folder']}
+                onClick={onChoosePreferredInstallFolder}
+                type="button"
+              >
+                {busyMap['settings:pick-preferred-install-folder'] ? 'Opening...' : 'Browse folder'}
+              </button>
+              <button className="ghost-button" onClick={() => onChangePreferredInstallRootDraft(storage?.managedRoot || '')} type="button">
+                Use managed storage folder
+              </button>
+            </div>
+            <div className="mt-5 space-y-3 text-sm text-slate-300">
+              <p>
+                <span className="text-slate-500">Current default:</span> {currentPreferredInstallRoot || 'Not available'}
+              </p>
+              <p>
+                <span className="text-slate-500">Managed storage folder:</span> {storage?.managedRoot || 'Not available'}
+              </p>
+            </div>
+          </div>
+
+          <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Drive space</p>
+            <p className="mt-3 text-sm leading-7 text-slate-300">Click a drive to fill the managed storage folder field with a suggested Local AI Hub root on that drive.</p>
             <div className="mt-4 space-y-3">
               {(storage?.drives || []).map((drive) => {
                 const suggestedRoot = buildSuggestedRoot(drive.mount);
@@ -207,7 +264,7 @@ export default function SettingsPanel({
               <p className="text-xs uppercase tracking-[0.22em] text-amber-100/80">Migration available</p>
               <h4 className="mt-3 text-2xl font-semibold text-white">Older Local AI Hub files are still in another Local AI Hub folder</h4>
               <p className="mt-3 max-w-3xl text-sm leading-7 text-amber-50/90">
-                Local AI Hub found {legacyMigration.toolCount || 0} managed tool folder{legacyMigration.toolCount === 1 ? '' : 's'} and other large files in {legacyMigration.sourceRoot}. You can move them into {legacyMigration.targetRoot} so future installs, repairs, and app upgrades keep using one stable storage location.
+                Local AI Hub found {legacyMigration.toolCount || 0} managed tool folder{legacyMigration.toolCount === 1 ? '' : 's'} and other large files in {legacyMigration.sourceRoot}. You can move them into {legacyMigration.targetRoot} so future installs, repairs, and app upgrades keep using one stable storage location. Detected third-party installs stay in their original folders until you install a managed copy.
               </p>
               <p className="mt-3 text-sm text-amber-100/80">Estimated data to move: {formatBytes(legacyMigration.totalBytes)}</p>
             </div>
@@ -259,11 +316,7 @@ export default function SettingsPanel({
               Local AI Hub did not find duplicate installs or approved leftover files in the scanned storage folders.
             </div>
           )
-        ) : (
-          <div className="mt-6 rounded-3xl border border-dashed border-white/15 bg-white/5 p-6 text-sm leading-7 text-slate-400">
-            Run a preview to see exactly what Local AI Hub would delete, grouped by category and file path, before anything is removed.
-          </div>
-        )}
+        ) : null}
       </div>
     </section>
   );

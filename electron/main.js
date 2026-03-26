@@ -766,7 +766,7 @@ async function withPlainEnglishErrors(handler, fallbackMessage) {
 
 function registerIpcHandlers() {
   ipcMain.handle('app:bootstrap', () =>
-    withPlainEnglishErrors(() => buildAppState({ forceDiscovery: true, refreshManifest: true }), 'Local AI Hub could not load the app state.'),
+    withPlainEnglishErrors(() => buildAppState({ forceDiscovery: true }), 'Local AI Hub could not load the app state.'),
   );
 
   ipcMain.handle('app:refresh', () =>
@@ -849,6 +849,7 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const tool = await installTool(toolId, {
+        installRoot: payload?.installRoot || null,
         lowDiskConfirmed: Boolean(payload?.lowDiskConfirmed),
         onProgress: (progressPayload) => sendInstallProgress(progressPayload),
       });
@@ -862,8 +863,8 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not install that tool.'),
   );
 
-  ipcMain.handle('tools:get-install-preflight', (_event, toolId) =>
-    withPlainEnglishErrors(async () => getToolInstallPreflight(toolId), 'Local AI Hub could not check disk space for that install.'),
+  ipcMain.handle('tools:get-install-preflight', (_event, payload) =>
+    withPlainEnglishErrors(async () => getToolInstallPreflight(payload), 'Local AI Hub could not check disk space for that install.'),
   );
 
   ipcMain.handle('tools:launch', (_event, payload) =>
@@ -1041,12 +1042,32 @@ function registerIpcHandlers() {
       });
       invalidateDiscoveryCache();
       return {
-        message: `Large Local AI Hub files will now use ${normalizedTargetPath}.`,
+        message: `Large Local AI Hub data will now use ${normalizedTargetPath}. Direct Local AI Hub-managed tool folders can move there when you choose migration, but official-installer apps stay in their current Windows install location until you reinstall them.`,
         state: await buildAppState({ forceDiscovery: true }),
       };
     }, 'Local AI Hub could not save the new storage folder.'),
   );
 
+  ipcMain.handle('settings:save-preferred-install-root', (_event, targetPath) =>
+    withPlainEnglishErrors(async () => {
+      const requestedPath = String(targetPath || '').trim();
+      if (!requestedPath) {
+        throw new Error('Choose a default install folder before saving it.');
+      }
+
+      const parsedPath = path.parse(requestedPath);
+      const normalizedTargetPath = requestedPath === parsedPath.root ? path.join(requestedPath, 'LocalAIHub') : requestedPath;
+      await updateConfig((config) => ({
+        ...config,
+        preferredInstallRoot: normalizedTargetPath,
+      }));
+      invalidateDiscoveryCache();
+      return {
+        message: `New store installs will default to ${normalizedTargetPath}. Tools that use an external official installer may still ask you to confirm or change the final destination.`,
+        state: await buildAppState({ forceDiscovery: true }),
+      };
+    }, 'Local AI Hub could not save the default install folder.'),
+  );
   ipcMain.handle('settings:dismiss-legacy-migration', (_event, sourceRoot) =>
     withPlainEnglishErrors(async () => {
       await dismissManagedDataMigration(sourceRoot);
@@ -1097,9 +1118,16 @@ function registerIpcHandlers() {
   ipcMain.handle('settings:run-cleanup', () =>
     withPlainEnglishErrors(async () => {
       const cleanupSummary = await runCleanup();
+      const removedCount = cleanupSummary.removedEntries?.length || 0;
+      const failedCount = cleanupSummary.failedEntries?.length || 0;
+      const message = failedCount
+        ? removedCount
+          ? `Cleanup removed ${removedCount} leftover item${removedCount === 1 ? '' : 's'}, but ${failedCount} item${failedCount === 1 ? ' is' : 's are'} still being used by Windows. Close any app or File Explorer window using those folders, then run Cleanup again.`
+          : cleanupSummary.failedEntries[0]?.message || 'Cleanup could not remove those leftover files because Windows is still using them.'
+        : 'Cleanup finished.';
       return {
         cleanupSummary,
-        message: 'Cleanup finished.',
+        message,
         state: await buildAppState({ forceDiscovery: true }),
       };
     }, 'Local AI Hub could not remove those leftover files.'),
@@ -1403,8 +1431,8 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
-      if (tool.source !== 'managed') {
-        throw new Error('Local AI Hub snapshots are only available for tools it manages itself.');
+      if (tool.lifecycleMode !== 'managed') {
+        throw new Error('Local AI Hub snapshots are only available for tools it manages directly. Official-installer and detected installs can stay in Library, but Local AI Hub will not snapshot them.');
       }
       const snapshot = await saveSnapshot(tool);
       await notify('Local AI Hub snapshot saved', `${tool.name} snapshot ${snapshot.fileName} is ready.`);
@@ -1419,8 +1447,8 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup(payload.toolId, state.tools);
-      if (tool.source !== 'managed') {
-        throw new Error('Local AI Hub can only restore snapshots for tools it installed itself.');
+      if (tool.lifecycleMode !== 'managed') {
+        throw new Error('Local AI Hub can only restore snapshots for tools it manages directly.');
       }
       await restoreSnapshot(tool, payload.snapshotFileName);
       return {
@@ -1538,7 +1566,7 @@ async function startApplication() {
   tray.on('click', showWindow);
   registerIpcHandlers();
   configureAutoUpdates({ onUpdateReady: sendUpdateReadyNotification });
-  await initializeToolRegistry({ refreshRemote: true });
+  await initializeToolRegistry();
   await initializeProviderRegistry();
   const initialState = await buildAppState({ forceDiscovery: true });
   await updateTrayMenu();
@@ -1609,7 +1637,6 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
-
 
 
 
