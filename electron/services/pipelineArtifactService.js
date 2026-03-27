@@ -696,13 +696,16 @@ function getCompositionTrackByRole(artifact, role) {
 function buildCompositionSummary(artifact, limit = 180) {
   const visualTrack = getCompositionTrackByRole(artifact, 'primary-visual');
   const audioTrack = getCompositionTrackByRole(artifact, 'primary-audio');
+  const backgroundMusicTrack = getCompositionTrackByRole(artifact, 'background-music');
   const visualItemCount = Number(visualTrack?.itemCount || visualTrack?.items?.length || 0) || 0;
   const itemDurationSeconds = Number(visualTrack?.itemDurationSeconds || 0) || 0;
   const parts = [
     String(artifact?.composition?.recipeLabel || '').trim() || 'Media composition',
     visualItemCount ? `${visualItemCount} image${visualItemCount === 1 ? '' : 's'}` : '',
     itemDurationSeconds > 0 ? `${Math.round(itemDurationSeconds * 10) / 10}s each` : '',
-    audioTrack?.artifact?.fileName ? `Audio ${audioTrack.artifact.fileName}` : audioTrack ? 'Primary audio attached' : 'No audio track',
+    audioTrack?.artifact?.fileName ? `Narration ${audioTrack.artifact.fileName}` : audioTrack ? 'Primary audio attached' : '',
+    backgroundMusicTrack?.artifact?.fileName ? `Music ${backgroundMusicTrack.artifact.fileName}` : backgroundMusicTrack ? 'Background music attached' : '',
+    !audioTrack && !backgroundMusicTrack ? 'No audio tracks' : '',
   ].filter(Boolean);
   return trimPreviewText(parts.join(' | '), limit);
 }
@@ -784,13 +787,16 @@ function summarizeArtifact(artifact, limit = 180) {
   if (artifact.kind === PORT_KIND_VIDEO && artifact.compositionExport && typeof artifact.compositionExport === 'object') {
     const exportProfile = artifact.compositionExport.exportProfile || null;
     const visualTrack = artifact.compositionExport.visualTrack || null;
+    const audioMix = artifact.compositionExport.audioMix || null;
     const details = [
       artifact.fileName || artifact.displayName || '',
       artifact.formatLabel || '',
       exportProfile?.width && exportProfile?.height ? `${exportProfile.width}x${exportProfile.height}` : '',
       exportProfile?.fps ? `${exportProfile.fps} fps` : '',
       Number(visualTrack?.itemCount || 0) ? `${visualTrack.itemCount} image${visualTrack.itemCount === 1 ? '' : 's'}` : '',
-      artifact.compositionExport.audioTrack?.artifact?.fileName ? `Audio ${artifact.compositionExport.audioTrack.artifact.fileName}` : '',
+      artifact.compositionExport.audioTrack?.artifact?.fileName ? `Narration ${artifact.compositionExport.audioTrack.artifact.fileName}` : '',
+      artifact.compositionExport.backgroundMusicTrack?.artifact?.fileName ? `Music ${artifact.compositionExport.backgroundMusicTrack.artifact.fileName}` : '',
+      audioMix?.mode === 'mixed-with-background-music' ? 'Mixed audio' : '',
     ].filter(Boolean);
     return trimPreviewText(details.join(' | '), limit);
   }
@@ -1711,20 +1717,3 @@ module.exports = {
   serializeArtifactForUi,
   summarizeArtifact,
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

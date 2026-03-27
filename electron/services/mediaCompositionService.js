@@ -19,6 +19,8 @@ const { runCommand } = require('./commandService');
 const { buildFileArtifact, isCompositionArtifact, serializeArtifactForUi, summarizeArtifact } = require('./pipelineArtifactService');
 const { PORT_KIND_VIDEO } = require('../shared/pipelineSchema.cjs');
 
+const DEFAULT_BACKGROUND_MUSIC_VOLUME = 0.22;
+
 function sanitizeSegment(value, fallback = 'composition') {
   const normalized = String(value || '')
     .trim()
@@ -55,12 +57,20 @@ function getCompositionTracks(artifact) {
   return Array.isArray(artifact?.composition?.tracks) ? artifact.composition.tracks : [];
 }
 
+function getCompositionTrackByRole(artifact, role) {
+  return getCompositionTracks(artifact).find((track) => String(track?.role || '').trim() === role) || null;
+}
+
 function getPrimaryVisualTrack(artifact) {
-  return getCompositionTracks(artifact).find((track) => String(track?.role || '').trim() === 'primary-visual') || null;
+  return getCompositionTrackByRole(artifact, 'primary-visual');
 }
 
 function getPrimaryAudioTrack(artifact) {
-  return getCompositionTracks(artifact).find((track) => String(track?.role || '').trim() === 'primary-audio') || null;
+  return getCompositionTrackByRole(artifact, 'primary-audio');
+}
+
+function getBackgroundMusicTrack(artifact) {
+  return getCompositionTrackByRole(artifact, 'background-music');
 }
 
 function formatConcatPath(value) {
@@ -105,12 +115,58 @@ function buildVideoFilter(width, height, fitMode) {
   return `scale=${numericWidth}:${numericHeight}:force_original_aspect_ratio=decrease,pad=${numericWidth}:${numericHeight}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p`;
 }
 
-function buildCompositionExportMetadata(compositionArtifact, visualTrack, audioTrack, exportProfile) {
-  const audioArtifact = audioTrack?.artifact || null;
+function calculateVisualDurationSeconds(visualTrack) {
+  const items = Array.isArray(visualTrack?.items) ? visualTrack.items : [];
+  return items.reduce((total, entry) => total + Math.max(0, Number(entry?.durationSeconds || visualTrack?.itemDurationSeconds || 0) || 0), 0);
+}
+
+function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visualDurationSeconds) {
+  const primaryAudioArtifact = primaryAudioTrack?.artifact || null;
+  const backgroundMusicArtifact = backgroundMusicTrack?.artifact || null;
+  const hasPrimaryAudio = Boolean(primaryAudioArtifact?.filePath);
+  const hasBackgroundMusic = Boolean(backgroundMusicArtifact?.filePath);
+  const shouldLoopBackgroundMusic = hasBackgroundMusic && (hasPrimaryAudio || stopMode === 'visuals');
+
+  let mode = 'silent';
+  if (hasPrimaryAudio && hasBackgroundMusic) {
+    mode = 'mixed-with-background-music';
+  } else if (hasPrimaryAudio) {
+    mode = 'primary-audio-only';
+  } else if (hasBackgroundMusic) {
+    mode = 'background-music-only';
+  }
+
+  return {
+    backgroundMusicArtifact,
+    backgroundMusicTrack,
+    hasBackgroundMusic,
+    hasPrimaryAudio,
+    mode,
+    outputDurationSeconds: stopMode === 'visuals' && visualDurationSeconds > 0 ? Math.round(visualDurationSeconds * 1000) / 1000 : null,
+    primaryAudioArtifact,
+    primaryAudioTrack,
+    shouldLoopBackgroundMusic,
+    stopMode,
+  };
+}
+
+function buildAudioMixMetadata(audioPlan) {
+  return {
+    backgroundMusicLooping: audioPlan.hasBackgroundMusic ? audioPlan.shouldLoopBackgroundMusic : false,
+    backgroundMusicVolume: audioPlan.mode === 'mixed-with-background-music' ? DEFAULT_BACKGROUND_MUSIC_VOLUME : (audioPlan.hasBackgroundMusic ? 1 : 0),
+    mode: audioPlan.mode,
+    outputDurationSeconds: audioPlan.outputDurationSeconds || null,
+    stopMode: audioPlan.stopMode,
+  };
+}
+
+function buildCompositionExportMetadata(compositionArtifact, visualTrack, audioPlan, exportProfile) {
+  const audioArtifact = audioPlan.primaryAudioArtifact;
+  const backgroundMusicArtifact = audioPlan.backgroundMusicArtifact;
   return {
     schemaVersion: 1,
-    recipeId: String(compositionArtifact?.composition?.recipeId || '').trim() || 'image-sequence-primary-audio',
-    recipeLabel: String(compositionArtifact?.composition?.recipeLabel || '').trim() || 'Image sequence with primary audio',
+    recipeId: String(compositionArtifact?.composition?.recipeId || '').trim() || 'image-sequence-optional-audio-bed',
+    recipeLabel: String(compositionArtifact?.composition?.recipeLabel || '').trim() || 'Image sequence with optional narration and background music',
     composition: serializeArtifactForUi({
       displayName: compositionArtifact?.displayName || '',
       manifestPath: compositionArtifact?.manifestPath || '',
@@ -126,9 +182,16 @@ function buildCompositionExportMetadata(compositionArtifact, visualTrack, audioT
     audioTrack: audioArtifact
       ? serializeArtifactForUi({
           artifact: audioArtifact,
-          summary: audioTrack?.summary || summarizeArtifact(audioArtifact),
+          summary: audioPlan.primaryAudioTrack?.summary || summarizeArtifact(audioArtifact),
         })
       : null,
+    backgroundMusicTrack: backgroundMusicArtifact
+      ? serializeArtifactForUi({
+          artifact: backgroundMusicArtifact,
+          summary: audioPlan.backgroundMusicTrack?.summary || summarizeArtifact(backgroundMusicArtifact),
+        })
+      : null,
+    audioMix: buildAudioMixMetadata(audioPlan),
   };
 }
 
@@ -175,16 +238,22 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
 
   const concatManifestPath = await writeConcatManifest(exportDirectoryPath, visualTrack);
   const outputPath = path.join(exportDirectoryPath, `${sanitizeSegment(title, 'composed-video')}.mp4`);
-  const audioTrack = getPrimaryAudioTrack(compositionArtifact);
-  const audioArtifact = audioTrack?.artifact || null;
+  const stopMode = String(options.stopMode || '').trim() === 'visuals' ? 'visuals' : 'shortest';
+  const visualDurationSeconds = calculateVisualDurationSeconds(visualTrack);
+  const audioPlan = buildAudioPlan(
+    getPrimaryAudioTrack(compositionArtifact),
+    getBackgroundMusicTrack(compositionArtifact),
+    stopMode,
+    visualDurationSeconds,
+  );
   const exportProfile = {
     width: Math.max(16, Number(options.width || 0) || 1280),
     height: Math.max(16, Number(options.height || 0) || 720),
     fps: Math.max(1, Number(options.fps || 0) || 30),
     fitMode: String(options.fitMode || '').trim() === 'cover' ? 'cover' : 'contain',
-    stopMode: String(options.stopMode || '').trim() === 'visuals' ? 'visuals' : 'shortest',
+    stopMode,
     videoCodec: 'libx264',
-    audioCodec: audioArtifact ? 'aac' : 'none',
+    audioCodec: audioPlan.hasPrimaryAudio || audioPlan.hasBackgroundMusic ? 'aac' : 'none',
     container: 'mp4',
     pixelFormat: 'yuv420p',
     concatManifestPath,
@@ -205,9 +274,28 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     '-i',
     concatManifestPath,
   ];
-  if (audioArtifact?.filePath) {
-    args.push('-i', audioArtifact.filePath);
+
+  if (audioPlan.primaryAudioArtifact?.filePath) {
+    args.push('-i', audioPlan.primaryAudioArtifact.filePath);
   }
+
+  if (audioPlan.backgroundMusicArtifact?.filePath) {
+    if (audioPlan.shouldLoopBackgroundMusic) {
+      args.push('-stream_loop', '-1');
+    }
+    args.push('-i', audioPlan.backgroundMusicArtifact.filePath);
+  }
+
+  const backgroundMusicInputIndex = audioPlan.hasPrimaryAudio ? 2 : 1;
+  let audioMapTarget = '';
+  if (audioPlan.mode === 'mixed-with-background-music') {
+    args.push(
+      '-filter_complex',
+      `[1:a]aresample=async=1:first_pts=0[primary];[${backgroundMusicInputIndex}:a]aresample=async=1:first_pts=0,volume=${DEFAULT_BACKGROUND_MUSIC_VOLUME}[music];[primary][music]amix=inputs=2:duration=longest:dropout_transition=2[aout]`,
+    );
+    audioMapTarget = '[aout]';
+  }
+
   args.push(
     '-vf',
     buildVideoFilter(exportProfile.width, exportProfile.height, exportProfile.fitMode),
@@ -219,10 +307,23 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     exportProfile.pixelFormat,
     '-movflags',
     '+faststart',
+    '-map',
+    '0:v:0',
   );
-  if (audioArtifact?.filePath) {
+
+  if (audioMapTarget) {
+    args.push('-map', audioMapTarget);
+  } else if (audioPlan.hasPrimaryAudio) {
+    args.push('-map', '1:a:0');
+  } else if (audioPlan.hasBackgroundMusic) {
+    args.push('-map', `${backgroundMusicInputIndex}:a:0`);
+  }
+
+  if (audioPlan.hasPrimaryAudio || audioPlan.hasBackgroundMusic) {
     args.push('-c:a', exportProfile.audioCodec);
-    if (exportProfile.stopMode === 'shortest') {
+    if (audioPlan.outputDurationSeconds) {
+      args.push('-t', String(audioPlan.outputDurationSeconds));
+    } else if (exportProfile.stopMode === 'shortest') {
       args.push('-shortest');
     }
   } else {
@@ -238,7 +339,7 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     throw new Error(failureLine || 'Local AI Hub could not render the media composition to video.');
   }
 
-  const compositionExport = buildCompositionExportMetadata(compositionArtifact, visualTrack, audioTrack, exportProfile);
+  const compositionExport = buildCompositionExportMetadata(compositionArtifact, visualTrack, audioPlan, exportProfile);
   const metadataPath = await writeCompositionExportMetadata(outputPath, compositionExport);
   const artifact = await buildFileArtifact(outputPath, {
     compositionExport,
@@ -249,11 +350,17 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
   artifact.metadataPaths = [metadataPath];
   artifact.summary = summarizeArtifact(artifact);
 
+  const message = audioPlan.mode === 'mixed-with-background-music'
+    ? `Media Export rendered a video from ${visualItems.length} images with narration mixed over background music.`
+    : audioPlan.mode === 'primary-audio-only'
+      ? `Media Export rendered a video from ${visualItems.length} images with ${audioPlan.primaryAudioArtifact.fileName} as the primary audio track.`
+      : audioPlan.mode === 'background-music-only'
+        ? `Media Export rendered a video from ${visualItems.length} images with ${audioPlan.backgroundMusicArtifact.fileName} as the soundtrack.`
+        : `Media Export rendered a silent video from ${visualItems.length} images.`;
+
   return {
     artifact,
-    message: audioArtifact?.fileName
-      ? `Media Export rendered a video from ${visualItems.length} images with ${audioArtifact.fileName} as the primary audio track.`
-      : `Media Export rendered a silent video from ${visualItems.length} images.`,
+    message,
     metadataPath,
   };
 }

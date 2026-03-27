@@ -617,7 +617,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'mediaComposition',
     label: 'Media Composition',
     category: 'Flow',
-    description: 'Builds a reusable media composition from an ordered image collection and an optional primary audio track.',
+    description: 'Builds a reusable media composition from an ordered image collection with optional narration and optional background music.',
     inputPorts: [
       {
         id: 'visuals',
@@ -630,6 +630,11 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         id: 'audio',
         kind: PORT_KIND_AUDIO,
         label: 'Primary Audio',
+      },
+      {
+        id: 'backgroundMusic',
+        kind: PORT_KIND_AUDIO,
+        label: 'Background Music',
       },
     ],
     outputPorts: [
@@ -3881,7 +3886,7 @@ function analyzePipeline(definition = {}, context = {}) {
         } else {
           summary.readiness = {
             tone: 'info',
-            message: 'This step keeps the visual collection order explicit and can attach one primary audio track before export.',
+            message: 'This step keeps the visual collection order explicit and can attach one primary audio track plus one optional background music track before export.',
           };
         }
       }
@@ -4038,14 +4043,3 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
-
-
-
-
-
-
-
-
-
-
-

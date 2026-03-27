@@ -34,6 +34,7 @@ const SEVEN_ZIP_HEADER = Buffer.from([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]);
 const ZIP_HEADER = Buffer.from([0x50, 0x4b]);
 const INSTALLER_MATERIALIZATION_TIMEOUT_MS = 180000;
 const INSTALLER_MATERIALIZATION_POLL_MS = 1000;
+const GUIDED_INSTALLER_LAUNCH_SETTLE_MS = 1500;
 const OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS = 45000;
 const OFFICIAL_UNINSTALL_SETTLE_POLL_MS = 1000;
 
@@ -292,10 +293,11 @@ function isBareCommand(token) {
 }
 
 const SAFE_PIP_PACKAGE_PATTERN = /^[A-Za-z0-9._+\-[\],=<>!~]+$/;
+const SAFE_PIP_VCS_TARGET_PATTERN = /^git\+https:\/\/[A-Za-z0-9./:@_#?=&%-]+$/i;
 
 function assertSafePipInstallTarget(value) {
   const target = String(value || '').trim();
-  if (!target || !SAFE_PIP_PACKAGE_PATTERN.test(target)) {
+  if (!target || (!SAFE_PIP_PACKAGE_PATTERN.test(target) && !SAFE_PIP_VCS_TARGET_PATTERN.test(target))) {
     throw new Error('Local AI Hub refused to install an unsafe Python package target.');
   }
 
@@ -477,6 +479,95 @@ function buildManagedProcessEnv(toolState, extraEnv = {}, options = {}) {
     XDG_CACHE_HOME: cacheDir,
     ...(options.requireVirtualEnv ? { PIP_REQUIRE_VIRTUALENV: '1' } : {}),
   };
+}
+
+async function resolveCudaToolkitDetails() {
+  const envRoots = [process.env.CUDA_HOME, process.env.CUDA_PATH]
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean);
+
+  for (const root of envRoots) {
+    const resolvedRoot = path.resolve(root);
+    const nvccPath = path.join(resolvedRoot, 'bin', 'nvcc.exe');
+    if (await fs.pathExists(nvccPath)) {
+      return {
+        cudaHome: resolvedRoot,
+        nvccPath,
+        source: 'environment',
+      };
+    }
+  }
+
+  const commonCudaRoot = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'NVIDIA GPU Computing Toolkit', 'CUDA');
+  if (await fs.pathExists(commonCudaRoot)) {
+    const versionEntries = await fs.readdir(commonCudaRoot).catch(() => []);
+    const versionRoots = versionEntries
+      .map((entry) => path.join(commonCudaRoot, entry))
+      .sort()
+      .reverse();
+
+    for (const candidateRoot of versionRoots) {
+      const nvccPath = path.join(candidateRoot, 'bin', 'nvcc.exe');
+      if (await fs.pathExists(nvccPath)) {
+        return {
+          cudaHome: candidateRoot,
+          nvccPath,
+          source: 'common-install-path',
+        };
+      }
+    }
+  }
+
+  const whereResult = await runCommand('where.exe', ['nvcc.exe'], {
+    allowFailure: true,
+  });
+  if (whereResult.code === 0) {
+    const nvccPath = String(whereResult.stdout || '')
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .find(Boolean);
+    if (nvccPath && (await fs.pathExists(nvccPath))) {
+      return {
+        cudaHome: path.dirname(path.dirname(nvccPath)),
+        nvccPath,
+        source: 'path',
+      };
+    }
+  }
+
+  return null;
+}
+
+async function resolveInstallPreflightContext(manifest, logger) {
+  const checks = Array.isArray(manifest?.installInstructions?.preflightChecks)
+    ? manifest.installInstructions.preflightChecks
+    : [];
+  const env = {};
+
+  for (const check of checks) {
+    if (!check || check.kind !== 'cuda-toolkit') {
+      continue;
+    }
+
+    const cudaToolkit = await resolveCudaToolkitDetails();
+    if (!cudaToolkit) {
+      throw new Error(
+        check.message
+          || `${manifest.name} needs the NVIDIA CUDA toolkit to build its Windows dependencies, but this PC does not currently expose nvcc or CUDA_HOME.`,
+      );
+    }
+
+    env.CUDA_HOME = cudaToolkit.cudaHome;
+    env.CUDA_PATH = cudaToolkit.cudaHome;
+
+    await logger.info('Install preflight confirmed a usable CUDA toolkit.', {
+      cudaHome: cudaToolkit.cudaHome,
+      nvccPath: cudaToolkit.nvccPath,
+      source: cudaToolkit.source,
+    });
+  }
+
+  return { env };
 }
 
 async function verifyCachedDownload(manifest, archivePath, logger) {
@@ -867,6 +958,8 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
     fs.ensureDir(path.join(stateRoot, 'pycache')),
   ]);
 
+  const preflightContext = await resolveInstallPreflightContext(manifest, logger);
+
   await advanceStep(
     logger,
     onProgress,
@@ -900,6 +993,7 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
     venvDir: toolState.venvDir,
   });
 
+  const packagingBootstrapPackages = resolvePackagingBootstrapPackages(manifest);
   await advanceStep(logger, onProgress, {
     toolId: toolState.id,
     percent: 72,
@@ -907,13 +1001,14 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
     message: 'Preparing pip, setuptools, and wheel inside the virtual environment.',
   });
 
-  await runCommand(pythonPath, ['-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], {
+  await runCommand(pythonPath, ['-m', 'pip', 'install', '--upgrade', ...packagingBootstrapPackages], {
     cwd: toolState.appDir,
-    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+    env: buildManagedProcessEnv(toolState, preflightContext.env, { requireVirtualEnv: true }),
     errorMessage: 'Local AI Hub could not prepare the tool environment.',
   });
 
   await logger.info('The Python packaging tools were updated inside the tool environment.', {
+    bootstrapPackages: packagingBootstrapPackages,
     pythonPath,
   });
 
@@ -921,18 +1016,21 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
   for (let index = 0; index < instructions.length; index += 1) {
     const instruction = instructions[index];
     const baseProgress = 78 + Math.round((index / Math.max(1, instructions.length)) * 14);
-    const baseEnv = buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true });
-    let args = ['-m', 'pip', 'install'];
+    const templateContext = resolveInstructionTemplateContext(toolState, pythonPath);
+    const pipArgs = resolveInstructionList(instruction.pipArgs, templateContext);
+    const instructionEnv = resolveInstructionEnv(instruction, templateContext);
+    const baseEnv = buildManagedProcessEnv(toolState, { ...preflightContext.env, ...instructionEnv }, { requireVirtualEnv: true });
+    let args = ['-m', 'pip', 'install', ...pipArgs];
     let command = pythonPath;
-    let errorMessage = `Local AI Hub could not install ${manifest.name} dependencies.`;
+    let errorMessage = instruction.errorMessage || `Local AI Hub could not install ${manifest.name} dependencies.`;
     let installTarget = instruction.value;
-    let message = `Installing ${manifest.name} dependencies.`;
+    let message = instruction.message || `Installing ${manifest.name} dependencies.`;
     let workingDir = toolState.appDir;
 
     if (instruction.kind === 'requirements') {
       const requirementsPath = assertPathInside(
         toolState.appDir,
-        path.join(toolState.appDir, instruction.value),
+        path.resolve(toolState.appDir, resolveInstructionText(instruction.value, templateContext)),
         'Local AI Hub refused to install dependencies from outside the tool folder.',
       );
       if (!(await fs.pathExists(requirementsPath))) {
@@ -941,19 +1039,20 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
         });
         continue;
       }
-      installTarget = requirementsPath;
-      args = [...args, '-r', requirementsPath];
+
+      installTarget = await buildFilteredRequirementsPath(toolState, requirementsPath, instruction, logger, index);
+      args = [...args, '-r', installTarget];
     } else if (instruction.kind === 'path') {
       installTarget = assertPathInside(
         toolState.appDir,
-        path.resolve(toolState.appDir, instruction.value),
+        path.resolve(toolState.appDir, resolveInstructionText(instruction.value, templateContext)),
         'Local AI Hub refused to install a Python package path outside the tool folder.',
       );
       args = [...args, installTarget];
     } else if (instruction.kind === 'python-script') {
       const scriptPath = assertPathInside(
         toolState.appDir,
-        path.resolve(toolState.appDir, instruction.value),
+        path.resolve(toolState.appDir, resolveInstructionText(instruction.value, templateContext)),
         'Local AI Hub refused to run a setup script outside the tool folder.',
       );
       if (!(await fs.pathExists(scriptPath))) {
@@ -963,20 +1062,20 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
         continue;
       }
 
-      const scriptArgs = Array.isArray(instruction.args) ? instruction.args.map((value) => String(value)) : [];
+      const scriptArgs = resolveInstructionList(instruction.args, templateContext);
       installTarget = scriptPath;
       args = [scriptPath, ...scriptArgs];
       message = instruction.message || `Running the ${manifest.name} setup script.`;
-      errorMessage = `Local AI Hub could not finish the ${manifest.name} setup script.`;
+      errorMessage = instruction.errorMessage || `Local AI Hub could not finish the ${manifest.name} setup script.`;
       workingDir = instruction.workingDir
         ? assertPathInside(
             toolState.appDir,
-            path.resolve(toolState.appDir, instruction.workingDir),
+            path.resolve(toolState.appDir, resolveInstructionText(instruction.workingDir, templateContext)),
             'Local AI Hub refused to use a setup working folder outside the tool directory.',
           )
         : toolState.appDir;
     } else {
-      installTarget = assertSafePipInstallTarget(instruction.value);
+      installTarget = assertSafePipInstallTarget(resolveInstructionText(instruction.value, templateContext));
       args = [...args, installTarget];
     }
 
@@ -991,17 +1090,23 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
       },
       {
         installTarget,
+        pipArgs: pipArgs.length ? pipArgs : undefined,
       },
     );
 
-    await runCommand(command, args, {
-      cwd: workingDir,
-      env: baseEnv,
-      errorMessage,
-    });
+    try {
+      await runCommand(command, args, {
+        cwd: workingDir,
+        env: baseEnv,
+        errorMessage,
+      });
+    } catch (error) {
+      throw buildDependencyInstallFailure(manifest, error, errorMessage);
+    }
 
     await logger.info('Dependency installation step finished.', {
       installTarget,
+      pipArgs: pipArgs.length ? pipArgs : undefined,
     });
   }
 }
@@ -1228,6 +1333,130 @@ function resolveInstallerArgs(manifest, installDir, appDir) {
     .filter(Boolean);
 }
 
+function resolveInstructionTemplateContext(toolState, pythonPath = null) {
+  const sitePackagesDir = toolState?.venvDir ? path.join(toolState.venvDir, 'Lib', 'site-packages') : null;
+  return {
+    appDir: toolState?.appDir || null,
+    installDir: toolState?.installDir || null,
+    pythonPath: pythonPath || null,
+    sitePackagesDir,
+    torchConfigDir: sitePackagesDir ? path.join(sitePackagesDir, 'torch', 'share', 'cmake', 'Torch') : null,
+    torchPackageDir: sitePackagesDir ? path.join(sitePackagesDir, 'torch') : null,
+    venvDir: toolState?.venvDir || null,
+  };
+}
+
+function resolveInstructionText(value, templateContext) {
+  return replaceInstallerTemplate(value, templateContext);
+}
+
+function resolveInstructionList(values = [], templateContext) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return values
+    .map((value) => resolveInstructionText(value, templateContext))
+    .filter((value) => String(value || '').trim());
+}
+
+function resolveInstructionEnv(instruction, templateContext) {
+  const entries = Object.entries(instruction?.env || {});
+  if (!entries.length) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    entries
+      .map(([key, value]) => [String(key || '').trim(), resolveInstructionText(value, templateContext)])
+      .filter(([key]) => key),
+  );
+}
+
+function resolvePackagingBootstrapPackages(manifest) {
+  const configuredPackages = Array.isArray(manifest?.installInstructions?.packagingBootstrapPackages)
+    ? manifest.installInstructions.packagingBootstrapPackages.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+
+  return configuredPackages.length ? configuredPackages : ['pip', 'setuptools', 'wheel'];
+}
+
+function buildDependencyInstallFailure(manifest, error, fallbackMessage) {
+  const combinedOutput = `${error?.stderr || ''}
+${error?.stdout || ''}`.toLowerCase();
+  let message = fallbackMessage;
+
+  if (combinedOutput.includes('please use pip<24.1') || (combinedOutput.includes('omegaconf') && combinedOutput.includes('invalid metadata'))) {
+    message = `${manifest.name} still relies on older Python package metadata, so this install needs pip 24.0 or older.`;
+  } else if (combinedOutput.includes('flash_attn') && (combinedOutput.includes('cuda_home environment variable is not set') || combinedOutput.includes('nvcc was not found'))) {
+    message = `${manifest.name} needs the NVIDIA CUDA toolkit to build flash_attn on Windows, but this PC does not currently expose nvcc or CUDA_HOME.`;
+  } else if (combinedOutput.includes('failed to build') && combinedOutput.includes('flash_attn')) {
+    message = `${manifest.name} could not build flash_attn on this Windows setup. Local AI Hub stopped before claiming the install was ready.`;
+  } else if (combinedOutput.includes("cannot import 'scikit_build_core.build'")) {
+    message = `${manifest.name} could not build torchmcubes because the scikit-build-core backend was not available in the tool environment.`;
+  } else if (combinedOutput.includes('torchmcubes') && (combinedOutput.includes('torchconfig.cmake') || combinedOutput.includes('could not find a package configuration file provided by "torch"'))) {
+    message = `${manifest.name} could not build its torchmcubes extension because the build step could not find PyTorch's CMake files.`;
+  }
+  if (message == fallbackMessage) {
+    return error;
+  }
+
+  const wrapped = new Error(message);
+  wrapped.code = error?.code;
+  wrapped.stdout = error?.stdout;
+  wrapped.stderr = error?.stderr;
+  wrapped.cause = error;
+  return wrapped;
+}
+
+async function buildFilteredRequirementsPath(toolState, requirementsPath, instruction, logger, index) {
+  const excludePatterns = Array.isArray(instruction?.excludePatterns)
+    ? instruction.excludePatterns.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  if (!excludePatterns.length) {
+    return requirementsPath;
+  }
+
+  const compiledPatterns = excludePatterns.map((pattern) => new RegExp(pattern, 'i'));
+  const raw = await fs.readFile(requirementsPath, 'utf8');
+  const lineEnding = raw.includes('\r\n') ? '\r\n' : '\n';
+  const keptLines = [];
+  const removedLines = [];
+
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      keptLines.push(line);
+      continue;
+    }
+
+    if (compiledPatterns.some((pattern) => pattern.test(trimmed))) {
+      removedLines.push(trimmed);
+      continue;
+    }
+
+    keptLines.push(line);
+  }
+
+  if (!removedLines.length) {
+    return requirementsPath;
+  }
+
+  const filteredDir = path.join(toolState.installDir, '.localaihub', 'install');
+  const filteredPath = path.join(
+    filteredDir,
+    `${path.basename(requirementsPath, path.extname(requirementsPath))}.filtered-${index + 1}${path.extname(requirementsPath)}`,
+  );
+  await fs.ensureDir(filteredDir);
+  await fs.writeFile(filteredPath, `${keptLines.join(lineEnding)}${lineEnding}`, 'utf8');
+  await logger.warn('Removed requirement entries before installation.', {
+    filteredPath,
+    removedRequirements: removedLines,
+    requirementsPath,
+  });
+  return filteredPath;
+}
+
 function expectsManagedInstallerResult(manifest) {
   return manifest.installContract?.destinationControl !== INSTALL_DESTINATION_CONTROL.GUIDED;
 }
@@ -1312,7 +1541,7 @@ function spawnInstallerProcess(command, args = [], options = {}) {
           ...process.env,
           ...(options.env || {}),
         },
-        windowsHide: true,
+        windowsHide: options.windowsHide !== false,
         shell: Boolean(options.shell),
         stdio: 'ignore',
       });
@@ -1361,10 +1590,11 @@ function spawnInstallerProcess(command, args = [], options = {}) {
   });
 }
 
-async function runInstallerExecutableFile(installerPath, installerArgs, logger, errorMessage) {
+async function runInstallerExecutableFile(installerPath, installerArgs, logger, errorMessage, options = {}) {
   const commandOptions = {
     cwd: path.dirname(installerPath),
     errorMessage,
+    windowsHide: options.windowsHide !== false,
   };
 
   try {
@@ -1730,6 +1960,79 @@ async function installSingleFileTool(manifest, options, logger) {
   return ensureManagedToolStatePaths(toolState);
 }
 
+function buildGuidedInstallerHandoffMessage(manifest) {
+  return `Local AI Hub launched ${manifest.name}'s official installer. Finish setup there and Local AI Hub will detect it automatically when setup closes.`;
+}
+
+function trackGuidedInstallerHandoff(manifest, managedPaths, installerRun, logger, options = {}) {
+  void installerRun.completion
+    .then(async (result) => {
+      await logger.info('The guided official installer process exited.', {
+        appDir: managedPaths.appDir,
+        archivePath: managedPaths.archivePath,
+        exitCode: result?.code ?? 0,
+        exitSignal: result?.signal || null,
+        installDir: managedPaths.installDir,
+        launchMethod: installerRun.launchMethod,
+        pid: installerRun.pid,
+      });
+
+      const discoveredTools = await syncDiscoveredTools({ force: true }).catch(() => ({}));
+      const detectedTool = discoveredTools[manifest.id];
+      if (!(await toolIsAvailable(detectedTool))) {
+        await logger.warn('The guided official installer closed without leaving a detectable install.', {
+          appDir: managedPaths.appDir,
+          archivePath: managedPaths.archivePath,
+          detectionPaths: manifest.detectionPaths || [],
+          installDir: managedPaths.installDir,
+          pid: installerRun.pid,
+        });
+        return;
+      }
+
+      const trackedToolState = await attachWindowsUninstallMetadata(
+        normalizeToolLifecycle({
+          ...detectedTool,
+          downloadCachePath: managedPaths.archivePath,
+          installedByLocalAIHub: true,
+          requestedInstallRoot: managedPaths.installRoot,
+        }, manifest),
+        manifest,
+        { refresh: true },
+      );
+      await upsertTool(trackedToolState);
+      await logger.info('Guided official installer detection succeeded after the installer closed.', {
+        detectedPath: trackedToolState.displayPath || trackedToolState.installDir || trackedToolState.detectedPath || null,
+        pid: installerRun.pid,
+      });
+      await advanceStep(logger, options.onProgress, {
+        toolId: manifest.id,
+        percent: 100,
+        stage: 'complete',
+        message: `${manifest.name} is ready.`,
+      }, {
+        detectedPath: trackedToolState.displayPath || trackedToolState.installDir || trackedToolState.detectedPath || null,
+        pid: installerRun.pid,
+      });
+      if (typeof options.onCompleted === 'function') {
+        await options.onCompleted({
+          manifest,
+          toolState: trackedToolState,
+        });
+      }
+    })
+    .catch(async (error) => {
+      await logger.warn('The guided official installer process exited with an error.', {
+        appDir: managedPaths.appDir,
+        archivePath: managedPaths.archivePath,
+        error,
+        installDir: managedPaths.installDir,
+        launchMethod: installerRun.launchMethod,
+        pid: installerRun.pid,
+      });
+    });
+}
+
 async function installExecutableInstallerTool(manifest, options, logger) {
   const managedPaths = buildManagedPaths(manifest, { installRoot: options.installRoot });
   const { appDir, archivePath, installDir } = managedPaths;
@@ -1748,8 +2051,11 @@ async function installExecutableInstallerTool(manifest, options, logger) {
     message: `Preparing ${manifest.name}.`,
   });
 
-  await fs.ensureDir(installDir);
-  await fs.ensureDir(appDir);
+  if (expectManagedInstall) {
+    await fs.ensureDir(installDir);
+    await fs.ensureDir(appDir);
+  }
+
   await ensureCachedDownload(manifest, archivePath, logger, options.onProgress, manifest.id);
 
   await advanceStep(logger, options.onProgress, {
@@ -1760,6 +2066,67 @@ async function installExecutableInstallerTool(manifest, options, logger) {
       ? `Running the official ${manifest.name} installer.`
       : `Finish the official ${manifest.name} installer. Local AI Hub will detect it after setup finishes.`,
   });
+
+  if (!expectManagedInstall) {
+    const installerRun = await runInstallerExecutableFile(
+      archivePath,
+      resolveInstallerArgs(manifest, installDir, appDir),
+      logger,
+      `Local AI Hub could not run the ${manifest.name} installer.`,
+      { windowsHide: false },
+    );
+    const trackedLaunch = createTrackedPromise(installerRun.completion);
+    await sleep(GUIDED_INSTALLER_LAUNCH_SETTLE_MS);
+
+    if (trackedLaunch.settled && trackedLaunch.error) {
+      await logger.warn('The guided official installer exited before Local AI Hub could confirm the handoff.', {
+        appDir,
+        archivePath,
+        error: trackedLaunch.error,
+        installDir,
+        launchMethod: installerRun.launchMethod,
+        pid: installerRun.pid,
+      });
+      const launchError = new Error(`Local AI Hub tried to open ${manifest.name}'s official installer, but it exited before the setup window stayed open.`);
+      launchError.cause = trackedLaunch.error;
+      throw launchError;
+    }
+
+    if (trackedLaunch.settled && Number.isInteger(trackedLaunch.value?.code) && trackedLaunch.value.code > 0) {
+      await logger.warn('The guided official installer exited too quickly to complete the handoff.', {
+        appDir,
+        archivePath,
+        exitCode: trackedLaunch.value.code,
+        exitSignal: trackedLaunch.value?.signal || null,
+        installDir,
+        launchMethod: installerRun.launchMethod,
+        pid: installerRun.pid,
+      });
+      const launchError = new Error(`Local AI Hub tried to open ${manifest.name}'s official installer, but it exited immediately with code ${trackedLaunch.value.code}.`);
+      launchError.code = trackedLaunch.value.code;
+      throw launchError;
+    }
+
+    await logger.info('Guided official installer handoff started.', {
+      appDir,
+      archivePath,
+      installDir,
+      launchMethod: installerRun.launchMethod,
+      pid: installerRun.pid,
+    });
+    await setToolIgnored(manifest.id, false);
+    trackGuidedInstallerHandoff(manifest, managedPaths, installerRun, logger, {
+      onCompleted: options.onGuidedInstallerComplete,
+      onProgress: options.onProgress,
+    });
+
+    return {
+      handoffPending: true,
+      id: manifest.id,
+      installActionMessage: buildGuidedInstallerHandoffMessage(manifest),
+      name: manifest.name,
+    };
+  }
 
   const materializedInstall = await materializeExecutableInstallerTool(manifest, managedPaths, {
     errorMessage: `Local AI Hub could not run the ${manifest.name} installer.`,
@@ -1932,6 +2299,11 @@ async function installTool(toolId, options = {}) {
 
     if (installKind === 'installer-exe') {
       const toolState = await installExecutableInstallerTool(manifest, installOptions, logger);
+      if (toolState?.handoffPending) {
+        await logger.info('Installer-based install was handed off to the vendor setup flow.');
+        return toolState;
+      }
+
       await logger.info('Installer-based install completed successfully.');
       return finalizeManagedInstallResult(
         toolState.source === 'managed' ? ensureManagedToolStatePaths(toolState) : toolState,
@@ -3210,4 +3582,3 @@ module.exports = {
   uninstallTool,
   updateToolInstallation,
 };
-

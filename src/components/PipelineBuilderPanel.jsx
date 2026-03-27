@@ -261,12 +261,20 @@ function buildCompositionFactLabels(artifact) {
   const tracks = Array.isArray(artifact?.composition?.tracks) ? artifact.composition.tracks : [];
   const visualTrack = tracks.find((track) => String(track?.role || '').trim() === 'primary-visual') || null;
   const audioTrack = tracks.find((track) => String(track?.role || '').trim() === 'primary-audio') || null;
+  const backgroundMusicTrack = tracks.find((track) => String(track?.role || '').trim() === 'background-music') || null;
   const itemCount = Number(visualTrack?.itemCount || visualTrack?.items?.length || 0) || 0;
+  const audioLabel = audioTrack && backgroundMusicTrack
+    ? 'Narration + music'
+    : audioTrack
+      ? 'Primary audio'
+      : backgroundMusicTrack
+        ? 'Background music'
+        : 'No audio';
   return [
     'Composition',
     itemCount ? `${itemCount} images` : '',
     Number(visualTrack?.itemDurationSeconds || 0) ? `${Math.round(Number(visualTrack.itemDurationSeconds) * 10) / 10}s each` : '',
-    audioTrack ? 'Primary audio' : 'No audio',
+    audioLabel,
     artifact?.manifestPath ? 'Manifest saved' : '',
   ].filter(Boolean);
 }
@@ -278,16 +286,27 @@ function buildVideoFactLabels(artifact) {
   const visualTrack = artifact?.compositionExport && typeof artifact.compositionExport === 'object'
     ? artifact.compositionExport.visualTrack || null
     : null;
+  const audioMix = artifact?.compositionExport && typeof artifact.compositionExport === 'object'
+    ? artifact.compositionExport.audioMix || null
+    : null;
   if (!exportProfile && !visualTrack) {
     return [];
   }
+
+  const audioLabel = audioMix?.mode === 'mixed-with-background-music'
+    ? 'Narration + music'
+    : audioMix?.mode === 'background-music-only'
+      ? 'Background music'
+      : artifact?.compositionExport?.audioTrack?.artifact
+        ? 'Primary audio'
+        : 'Silent export';
 
   return [
     'Composed video',
     exportProfile?.fps ? `${exportProfile.fps} fps` : '',
     exportProfile?.width && exportProfile?.height ? `${exportProfile.width}x${exportProfile.height}` : '',
     Number(visualTrack?.itemCount || 0) ? `${visualTrack.itemCount} images` : '',
-    artifact?.compositionExport?.audioTrack?.artifact ? 'Primary audio' : 'Silent export',
+    audioLabel,
   ].filter(Boolean);
 }
 
@@ -400,11 +419,11 @@ function buildNodePreview(node, runState) {
   }
 
   if (node.type === 'mediaComposition') {
-    return `${Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4)}s per image | ordered visual track`;
+    return `${Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4)}s per image | optional narration + music`;
   }
 
   if (node.type === 'mediaExport') {
-    return `${node.config?.width || 1280}x${node.config?.height || 720} | ${node.config?.fps || 30} fps | ${node.config?.stopMode === 'visuals' ? 'keep full visual timing' : 'stop with shortest track'}`;
+    return `${node.config?.width || 1280}x${node.config?.height || 720} | ${node.config?.fps || 30} fps | ${node.config?.stopMode === 'visuals' ? 'keep visuals and extend music if needed' : 'stop with the shortest narration or visual track'}`;
   }
 
   if (node.type === 'branchMerge') {
@@ -640,6 +659,7 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
     const tracks = Array.isArray(artifact.composition.tracks) ? artifact.composition.tracks : [];
     const visualTrack = tracks.find((track) => String(track?.role || '').trim() === 'primary-visual') || null;
     const audioTrack = tracks.find((track) => String(track?.role || '').trim() === 'primary-audio') || null;
+    const backgroundMusicTrack = tracks.find((track) => String(track?.role || '').trim() === 'background-music') || null;
     const visualItems = Array.isArray(visualTrack?.items) ? visualTrack.items : [];
     const visibleItems = compact ? visualItems.slice(0, 2) : visualItems.slice(0, 4);
     return (
@@ -680,6 +700,14 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
             <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Primary audio track</p>
             <ArtifactFacts artifact={audioTrack.artifact} className="mt-3" />
             <ArtifactPreview artifact={audioTrack.artifact} className="mt-3" compact />
+          </div>
+        ) : null}
+        {backgroundMusicTrack?.artifact ? (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Background music track</p>
+            <p className="mt-2 text-xs leading-5 text-slate-400">Exports mix this track under narration at a fixed 22% level in this first pass. If no primary narration track is attached, it becomes the soundtrack instead.</p>
+            <ArtifactFacts artifact={backgroundMusicTrack.artifact} className="mt-3" />
+            <ArtifactPreview artifact={backgroundMusicTrack.artifact} className="mt-3" compact />
           </div>
         ) : null}
       </div>
@@ -835,6 +863,17 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
                 </span>
               ))}
             </div>
+            {artifact.compositionExport?.audioMix ? (
+              <p className="mt-3 text-xs leading-5 text-slate-400">
+                {artifact.compositionExport.audioMix.mode === 'mixed-with-background-music'
+                  ? 'Background music was mixed beneath narration at a fixed 22% level for this export.'
+                  : artifact.compositionExport.audioMix.mode === 'background-music-only'
+                    ? 'This export used the connected background music track as the soundtrack because no primary narration track was attached.'
+                    : artifact.compositionExport.audioMix.mode === 'primary-audio-only'
+                      ? 'This export used only the primary audio track.'
+                      : 'This export did not include audio.'}
+              </p>
+            ) : null}
             {artifact.compositionExport?.composition?.manifestPath ? <input className="store-input mt-3" readOnly value={artifact.compositionExport.composition.manifestPath} /> : null}
             {exportProfile?.concatManifestPath ? <input className="store-input mt-3" readOnly value={exportProfile.concatManifestPath} /> : null}
           </div>
@@ -976,6 +1015,97 @@ function PathButtons({ path, onOpenPath, onRevealPath }) {
   );
 }
 
+function PipelineOutputRow({ busy, onDelete, onOpenPath, onRevealPath, output }) {
+  const artifact = output?.artifact || null;
+  const outputPath = output?.outputPath || getArtifactStoragePath(artifact);
+  return (
+    <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Pipeline output</p>
+          <p className="mt-2 text-sm font-semibold text-white">{output?.outputLabel || artifact?.displayName || artifact?.fileName || 'Saved output'}</p>
+          <p className="mt-2 text-xs leading-5 text-slate-400">
+            Saved {formatDateLabel(output?.savedAt)}{output?.runId ? ` | ${output.runId}` : ''}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {output?.isDirectory ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">Folder output</span> : null}
+          {artifact?.kind ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">{formatArtifactKindLabel(artifact.kind, artifact.itemKind)}</span> : null}
+        </div>
+      </div>
+      <ArtifactFacts artifact={artifact} className="mt-4" />
+      <div className="mt-4">
+        <ArtifactPreview artifact={artifact} compact />
+      </div>
+      {outputPath ? <input className="store-input mt-4" readOnly value={outputPath} /> : null}
+      {artifact?.summary ? <p className="mt-3 text-xs leading-5 text-slate-400">{artifact.summary}</p> : null}
+      <div className="mt-3 flex flex-wrap gap-3">
+        <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => onOpenPath(outputPath, false)} type="button">
+          Open
+        </button>
+        <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => onRevealPath(outputPath)} type="button">
+          Show in folder
+        </button>
+        <button className="ghost-button px-3 py-1.5 text-xs text-rose-100" disabled={busy} onClick={() => onDelete(output)} type="button">
+          {busy ? 'Deleting...' : 'Delete'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PipelineOutputsPanel({ busyPath, expanded, loading, onDelete, onOpenPath, onRefresh, onRevealPath, onToggleExpanded, outputs }) {
+  const outputCount = Array.isArray(outputs) ? outputs.length : 0;
+  const outputCountLabel = `${outputCount} saved output${outputCount === 1 ? '' : 's'}`;
+
+  return (
+    <div className="panel p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline outputs</p>
+          <p className="mt-2 text-lg font-semibold text-white">Manage saved outputs any time</p>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-300">
+            {expanded
+              ? 'Local AI Hub scans known pipeline output folders and lets you open or delete saved results here. This stays intentionally scoped to pipeline outputs, not a general media library.'
+              : `${outputCountLabel}. Expand this section when you want to browse or clean up earlier pipeline results.`}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
+          {expanded ? (
+            <button className="ghost-button px-3 py-1.5 text-xs" disabled={loading} onClick={onRefresh} type="button">
+              {loading ? 'Refreshing...' : 'Refresh list'}
+            </button>
+          ) : null}
+          <button className="ghost-button px-3 py-1.5 text-xs" onClick={onToggleExpanded} type="button">
+            {expanded ? 'Collapse outputs' : 'Expand outputs'}
+          </button>
+        </div>
+      </div>
+      {expanded ? (
+        <div className="mt-4 space-y-3">
+          {outputCount ? (
+            outputs.map((output) => (
+              <PipelineOutputRow
+                busy={busyPath === output.outputPath}
+                key={output.id}
+                onDelete={onDelete}
+                onOpenPath={onOpenPath}
+                onRevealPath={onRevealPath}
+                output={output}
+              />
+            ))
+          ) : (
+            <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">
+              {loading
+                ? 'Scanning saved pipeline outputs...'
+                : "No saved pipeline outputs were found in Local AI Hub's known output folders yet."}
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 function SavedPipelineRow({ active, pipeline, onClick }) {
   return (
     <button
@@ -1529,9 +1659,14 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const [dirty, setDirty] = useState(false);
   const [modelOptionsByNodeId, setModelOptionsByNodeId] = useState({});
   const [modelsBusyNodeId, setModelsBusyNodeId] = useState('');
+  const [pipelineOutputs, setPipelineOutputs] = useState([]);
+  const [outputsLoading, setOutputsLoading] = useState(false);
+  const [outputsBusyPath, setOutputsBusyPath] = useState('');
+  const [pipelineOutputsExpanded, setPipelineOutputsExpanded] = useState(false);
   const canvasRef = useRef(null);
   const dragRef = useRef(null);
   const notifiedRunStateRef = useRef('');
+  const outputRefreshKeyRef = useRef('');
 
   const ollamaModelCapabilitiesByName = useMemo(() => collectOllamaModelCapabilities(modelOptionsByNodeId), [modelOptionsByNodeId]);
   const localToolModelsByToolId = useMemo(() => collectLocalToolModelsByToolId(modelOptionsByNodeId), [modelOptionsByNodeId]);
@@ -1742,6 +1877,26 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     return savedPipelines;
   }
 
+  async function loadPipelineOutputs(options = {}) {
+    if (!options.silent) {
+      setOutputsLoading(true);
+    }
+
+    const result = await window.localAIHub.listPipelineOutputs();
+    if (!result?.ok) {
+      setOutputsLoading(false);
+      if (!options.silent) {
+        onToast(result?.message || 'Local AI Hub could not load the saved pipeline outputs.', 'error');
+      }
+      return [];
+    }
+
+    const nextOutputs = result.data?.outputs || [];
+    setPipelineOutputs(nextOutputs);
+    setOutputsLoading(false);
+    return nextOutputs;
+  }
+
   async function loadSavedPipeline(pipelineId, options = {}) {
     if (!pipelineId) {
       return;
@@ -1776,6 +1931,31 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
   }
 
+  async function handleDeleteOutput(output) {
+    const outputPath = output?.outputPath || getArtifactStoragePath(output?.artifact || null);
+    if (!outputPath) {
+      return;
+    }
+
+    const outputLabel = output?.outputLabel || output?.fileName || 'this pipeline output';
+    const confirmed = window.confirm(`Delete ${outputLabel} from Local AI Hub's pipeline outputs?\n\n${outputPath}\n\nThis removes it from disk.`);
+    if (!confirmed) {
+      return;
+    }
+
+    setOutputsBusyPath(outputPath);
+    const result = await window.localAIHub.deletePipelineOutput({ path: outputPath });
+    setOutputsBusyPath('');
+    if (!result?.ok) {
+      onToast(result?.message || 'Local AI Hub could not delete that pipeline output.', 'error');
+      return;
+    }
+
+    setPipelineOutputs((current) => current.filter((entry) => entry.id !== output.id));
+    onToast(result.data?.message || `${outputLabel} was deleted.`, 'success');
+    await loadPipelineOutputs({ silent: true });
+  }
+
   useEffect(() => {
     let disposed = false;
     const unsubscribe = window.localAIHub.onPipelineRunUpdate((payload) => {
@@ -1794,13 +1974,21 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     });
 
     async function loadInitialState() {
-      const [savedPipelines, activeRunResult] = await Promise.all([
+      setOutputsLoading(true);
+      const [savedPipelines, activeRunResult, pipelineOutputsResult] = await Promise.all([
         refreshPipelineList(),
         window.localAIHub.getActivePipelineRun(),
+        window.localAIHub.listPipelineOutputs(),
       ]);
       if (disposed) {
         return;
       }
+      if (pipelineOutputsResult?.ok) {
+        setPipelineOutputs(pipelineOutputsResult.data?.outputs || []);
+      } else if (pipelineOutputsResult?.message) {
+        onToast(pipelineOutputsResult.message, 'error');
+      }
+      setOutputsLoading(false);
 
       if (activeRunResult?.ok) {
         const historicalRun = activeRunResult.data?.run || null;
@@ -1850,6 +2038,20 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       notifiedRunStateRef.current = `${runState.runId}:${runState.status}`;
     }
   }, [onToast, runState]);
+
+  useEffect(() => {
+    if (!runState?.runId || !['completed', 'failed', 'cancelled'].includes(runState.status)) {
+      return;
+    }
+
+    const refreshKey = `${runState.runId}:${runState.status}`;
+    if (outputRefreshKeyRef.current === refreshKey) {
+      return;
+    }
+
+    outputRefreshKeyRef.current = refreshKey;
+    loadPipelineOutputs({ silent: true });
+  }, [runState?.runId, runState?.status]);
 
   useEffect(() => {
     setValidationComment('');
@@ -3227,7 +3429,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                       />
                     </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Connect an ordered image collection to the Visual Collection input and optionally add one primary audio artifact. This step creates a reusable media composition manifest so export stays explicit instead of relying on a folder-path shortcut.
+                      Connect an ordered image collection to the Visual Collection input and optionally add one primary audio artifact plus one background music artifact. Connecting or disconnecting the Background Music input is the explicit include control in this first pass, and export mixes music under narration at a fixed 22% level when both are present.
                     </div>
                   </div>
                 ) : null}
@@ -3269,7 +3471,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                       </div>
                     </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      This first export recipe renders an ordered image track to MP4 and can attach one primary audio artifact. It is intentionally bounded, but the composition stays first-class and inspectable before export.
+                      This first export recipe renders an ordered image track to MP4 and can use one primary narration track plus one optional background music track. Background music mixes at a fixed 22% level under narration in this pass, or becomes the soundtrack when narration is absent, so the result stays explicit without pretending to be a full audio mixer.
                     </div>
                   </div>
                 ) : null}
@@ -3483,47 +3685,22 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
               />
             </div>
           </div>
+
+          <PipelineOutputsPanel
+            busyPath={outputsBusyPath}
+            expanded={pipelineOutputsExpanded}
+            loading={outputsLoading}
+            onDelete={handleDeleteOutput}
+            onOpenPath={openPath}
+            onRefresh={() => loadPipelineOutputs()}
+            onRevealPath={(pathValue) => openPath(pathValue, true)}
+            onToggleExpanded={() => setPipelineOutputsExpanded((current) => !current)}
+            outputs={pipelineOutputs}
+          />
       </div>
     </section>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

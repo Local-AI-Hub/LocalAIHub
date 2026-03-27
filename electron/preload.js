@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   completeFirstLaunch: () => invoke('app:complete-first-launch'),
   deleteModel: (payload) => invoke('models:delete', payload),
   deletePipeline: (pipelineId) => invoke('pipelines:delete', pipelineId),
+  deletePipelineOutput: (payload) => invoke('pipelines:delete-output', payload),
   disconnectProvider: (providerId) => invoke('providers:disconnect', providerId),
   dismissLegacyMigration: (sourceRoot) => invoke('settings:dismiss-legacy-migration', sourceRoot),
   downloadModel: (payload) => invoke('models:download', payload),
@@ -32,6 +33,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   listLocalModels: (toolId) => invoke('models:list-local', { toolId }),
   listOllamaModels: (options) => invoke('ollama:list-models', options),
   listPipelines: () => invoke('pipelines:list'),
+  listPipelineOutputs: () => invoke('pipelines:list-outputs'),
   listProviderModels: (providerId) => invoke('providers:list-models', providerId),
   listProviders: () => invoke('providers:list'),
   listSnapshots: (toolId) => invoke('snapshots:list', toolId),
@@ -131,4 +133,3 @@ contextBridge.exposeInMainWorld('localAIHub', {
     return () => ipcRenderer.removeListener('app:window-activity', listener);
   },
 });
-

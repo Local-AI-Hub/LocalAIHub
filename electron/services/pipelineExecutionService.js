@@ -2494,11 +2494,16 @@ async function executeMediaCompositionNode(node, graph, run) {
     throw new Error('The Primary Audio input needs one audio artifact when it is connected.');
   }
 
+  const backgroundMusicArtifact = getNodeInputArtifact(node.id, 'backgroundMusic', graph, run.resultsByNodeId, run);
+  if (backgroundMusicArtifact && String(backgroundMusicArtifact.kind || '').trim() !== PORT_KIND_AUDIO) {
+    throw new Error('The Background Music input needs one audio artifact when it is connected.');
+  }
+
   const composition = createCompositionArtifact({
     displayName: node.label,
     exportKind: PORT_KIND_VIDEO,
-    recipeId: 'image-sequence-primary-audio',
-    recipeLabel: 'Image sequence with primary audio',
+    recipeId: 'image-sequence-optional-audio-bed',
+    recipeLabel: 'Image sequence with optional narration and background music',
     tracks: [
       {
         id: 'visual-track',
@@ -2522,6 +2527,13 @@ async function executeMediaCompositionNode(node, graph, run) {
         kind: 'audio',
         role: 'primary-audio',
       }] : []),
+      ...(backgroundMusicArtifact ? [{
+        artifact: backgroundMusicArtifact,
+        id: 'background-music-track',
+        kind: 'audio',
+        role: 'background-music',
+        summary: 'Background music track',
+      }] : []),
     ],
   }, {
     displayName: node.label,
@@ -2535,9 +2547,13 @@ async function executeMediaCompositionNode(node, graph, run) {
   });
 
   return {
-    message: audioArtifact
-      ? 'Media Composition prepared the ordered images with the connected primary audio track.'
-      : 'Media Composition prepared the ordered images without a primary audio track yet.',
+    message: audioArtifact && backgroundMusicArtifact
+      ? 'Media Composition prepared the ordered images with primary narration and background music.'
+      : audioArtifact
+        ? 'Media Composition prepared the ordered images with the connected primary audio track.'
+        : backgroundMusicArtifact
+          ? 'Media Composition prepared the ordered images with background music and no primary narration yet.'
+          : 'Media Composition prepared the ordered images without any audio tracks yet.',
     outputs: {
       composition: persistedComposition,
     },
@@ -3397,37 +3413,3 @@ module.exports = {
   runPipeline,
   setPipelineEventSink,
 };
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

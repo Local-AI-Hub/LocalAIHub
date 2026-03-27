@@ -239,6 +239,8 @@ function normalizeToolDefinition(tool) {
     configTargets: installInstructions.configTargets || [],
     pythonRequirementDetection: installInstructions.pythonRequirementDetection || [],
     pipInstalls: installInstructions.pipInstalls || [],
+    packagingBootstrapPackages: installInstructions.packagingBootstrapPackages || [],
+    preflightChecks: installInstructions.preflightChecks || [],
     installerArgs: installInstructions.installerArgs || [],
     managedInstallSupported: installInstructions.managedInstallSupported !== false,
     materializationTimeoutMs: Number(installInstructions.materializationTimeoutMs) > 0

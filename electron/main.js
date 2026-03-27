@@ -78,6 +78,7 @@ const { configureAutoUpdates, isUpdateReady, restartToInstallUpdate } = require(
 const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
 const { cancelPipelineRun, getActiveRunSnapshot, resumePipelineValidation, runPipeline, setPipelineEventSink } = require('./services/pipelineExecutionService');
 const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./services/pipelineStoreService');
+const { deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
 
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
@@ -407,6 +408,14 @@ function sendAppStateUpdate(payload) {
   }
 
   mainWindow?.webContents.send('app:state-updated', payload);
+}
+
+async function refreshOpenAppState(options = {}) {
+  const state = await buildAppState(options);
+  sendAppStateUpdate(state);
+  await updateHealthMonitor({ hasRunningTools: state.tools.some((tool) => tool.status === 'running') }).catch(() => null);
+  await updateTrayMenu().catch(() => null);
+  return state;
 }
 
 async function buildAppState(options = {}) {
@@ -851,6 +860,10 @@ function registerIpcHandlers() {
       const tool = await installTool(toolId, {
         installRoot: payload?.installRoot || null,
         lowDiskConfirmed: Boolean(payload?.lowDiskConfirmed),
+        onGuidedInstallerComplete: async () => {
+          invalidateDiscoveryCache();
+          await refreshOpenAppState({ forceDiscovery: true });
+        },
         onProgress: (progressPayload) => sendInstallProgress(progressPayload),
       });
       invalidateDiscoveryCache();
@@ -1519,6 +1532,16 @@ function registerIpcHandlers() {
       run: resumePipelineValidation(payload?.runId, payload || {}),
     }), 'Local AI Hub could not continue that validation step.'),
   );
+
+  ipcMain.handle('pipelines:list-outputs', () =>
+    withPlainEnglishErrors(async () => ({
+      outputs: await listPipelineOutputs(),
+    }), 'Local AI Hub could not load the saved pipeline outputs.'),
+  );
+
+  ipcMain.handle('pipelines:delete-output', (_event, payload) =>
+    withPlainEnglishErrors(async () => deletePipelineOutput(payload?.path), 'Local AI Hub could not delete that pipeline output.'),
+  );
 }
 
 async function startApplication() {
@@ -1637,8 +1660,6 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
-
-
 
 
 

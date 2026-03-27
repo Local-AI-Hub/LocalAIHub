@@ -591,6 +591,8 @@
       "materializationTimeoutMs": 900000,
       "configTargets": [],
       "externalExecutableCandidates": [
+        "bin\\chat.exe",
+        "chat.exe",
         "GPT4All.exe",
         "gpt4all.exe"
       ],
@@ -603,6 +605,11 @@
     },
     "launchCommand": "\"GPT4All.exe\"",
     "detectionPaths": [
+      "%LOCALAPPDATA%\\nomic.ai\\GPT4All\\bin\\chat.exe",
+      "%LOCALAPPDATA%\\Programs\\GPT4All\\bin\\chat.exe",
+      "%APPDATA%\\GPT4All\\bin\\chat.exe",
+      "%PROGRAMFILES%\\GPT4All\\bin\\chat.exe",
+      "%ProgramFiles(x86)%\\GPT4All\\bin\\chat.exe",
       "%LOCALAPPDATA%\\nomic.ai\\GPT4All\\GPT4All.exe",
       "%LOCALAPPDATA%\\Programs\\GPT4All\\GPT4All.exe",
       "%APPDATA%\\GPT4All\\GPT4All.exe",
@@ -615,12 +622,14 @@
         "gpt4all"
       ],
       "markerPaths": [
+        "bin\\chat.exe",
         "GPT4All.exe",
         "gpt4all.exe"
       ],
       "pathExecutables": [],
       "pythonModules": []
-    }
+    },
+    "externalLaunchCommand": "\"chat.exe\""
   },
   {
     "id": "text-generation-webui",
@@ -776,7 +785,12 @@
         "recommendedVramMb": 8192,
         "minimumRamMb": 16384,
         "recommendedRamMb": 32768
-      }
+      },
+      "packagingBootstrapPackages": [
+        "pip<24.1",
+        "setuptools",
+        "wheel"
+      ]
     },
     "launchCommand": "python infer-web.py --listen --port {port}",
     "externalLaunchCommand": "go-web.bat",
@@ -875,8 +889,25 @@
       ],
       "pipInstalls": [
         {
+          "kind": "package",
+          "value": "torch>=2.4.0",
+          "message": "Installing PyTorch before Wan2.1 WebUI dependencies."
+        },
+        {
+          "kind": "package",
+          "value": "flash_attn",
+          "pipArgs": [
+            "--no-build-isolation"
+          ],
+          "message": "Installing flash_attn the way the upstream Wan2.1 install guide recommends."
+        },
+        {
           "kind": "requirements",
-          "value": "requirements.txt"
+          "value": "requirements.txt",
+          "excludePatterns": [
+            "^flash_attn\\b"
+          ],
+          "message": "Installing Wan2.1 WebUI dependencies."
         }
       ],
       "externalPythonCandidates": [
@@ -890,7 +921,13 @@
         "recommendedVramMb": 16384,
         "minimumRamMb": 32768,
         "recommendedRamMb": 65536
-      }
+      },
+      "preflightChecks": [
+        {
+          "kind": "cuda-toolkit",
+          "message": "Wan2.1 WebUI needs the NVIDIA CUDA toolkit to build flash_attn on Windows. This PC does not currently expose nvcc or CUDA_HOME, so Local AI Hub stopped before attempting a broken install."
+        }
+      ]
     },
     "launchCommand": "python gradio/app.py --server-name 127.0.0.1 --server-port {port}",
     "defaultPort": 7860,
@@ -1110,8 +1147,29 @@
       ],
       "pipInstalls": [
         {
+          "kind": "package",
+          "value": "torch>=2.4.0",
+          "message": "Installing PyTorch before TripoSR / Trellis dependencies."
+        },
+        {
           "kind": "requirements",
-          "value": "requirements.txt"
+          "value": "requirements.txt",
+          "excludePatterns": [
+            "^git\\+https://github\\.com/tatsy/torchmcubes\\.git\\b"
+          ],
+          "message": "Installing TripoSR / Trellis dependencies."
+        },
+        {
+          "kind": "package",
+          "value": "git+https://github.com/tatsy/torchmcubes.git",
+          "pipArgs": [
+            "--no-build-isolation"
+          ],
+          "env": {
+            "CMAKE_PREFIX_PATH": "{torchPackageDir}",
+            "Torch_DIR": "{torchConfigDir}"
+          },
+          "message": "Installing the torchmcubes extension after PyTorch is ready."
         }
       ],
       "externalPythonCandidates": [
@@ -1125,7 +1183,16 @@
         "recommendedVramMb": 12288,
         "minimumRamMb": 16384,
         "recommendedRamMb": 32768
-      }
+      },
+      "packagingBootstrapPackages": [
+        "pip",
+        "setuptools",
+        "wheel",
+        "scikit-build-core>=0.10",
+        "pybind11>=2.10",
+        "cmake",
+        "ninja"
+      ]
     },
     "launchCommand": "python gradio_app.py --server-name 127.0.0.1 --server-port {port}",
     "defaultPort": 7860,

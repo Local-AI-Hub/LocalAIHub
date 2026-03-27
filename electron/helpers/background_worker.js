@@ -761,6 +761,8 @@ async function buildCommonSearchRoots(appPaths) {
     path.join(oneDrive || '', 'Desktop'),
     getEnvValueInsensitive('PUBLIC'),
     path.join(getEnvValueInsensitive('PUBLIC') || '', 'Documents'),
+    appPaths.managedRoot,
+    ...(appPaths.knownManagedRoots || []),
     appPaths.toolsRoot,
     ...(appPaths.legacyRoots || []).map((legacyRoot) => path.join(legacyRoot, 'tools')),
   ].filter(Boolean);
