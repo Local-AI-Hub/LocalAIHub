@@ -119,7 +119,20 @@
       "pipInstalls": [
         {
           "kind": "requirements",
-          "value": "requirements_versions.txt"
+          "value": "requirements_versions.txt",
+          "excludePatterns": [
+            "^torch\\b",
+            "^torchvision\\b",
+            "^torchaudio\\b"
+          ]
+        },
+        {
+          "kind": "package",
+          "value": "git+https://github.com/openai/CLIP.git@d50d76daa670286dd6cacf3bcd80b5e4823fc8e1#egg=clip",
+          "pipArgs": [
+            "--no-build-isolation"
+          ],
+          "message": "Installing CLIP the way the upstream launcher expects."
         }
       ],
       "externalPythonCandidates": [
@@ -137,17 +150,18 @@
         "recommendedRamMb": 32768
       }
     },
-    "launchCommand": "python webui.py --listen --api --port {port}",
+    "launchCommand": "python launch.py --listen --api --port {port}",
     "externalLaunchCommand": "webui.bat --listen --api --port {port}",
     "defaultPort": 7860,
-    "healthCheckPath": "/",
+    "healthCheckPath": "/sdapi/v1/cmd-flags",
     "detectionPaths": [
       "%USERPROFILE%\\stable-diffusion-webui\\webui.py",
       "%USERPROFILE%\\Documents\\stable-diffusion-webui\\webui.py",
       "%USERPROFILE%\\Downloads\\stable-diffusion-webui\\webui.py",
       "%LOCALAPPDATA%\\stable-diffusion-webui\\webui.py",
       "%APPDATA%\\stable-diffusion-webui\\webui.py"
-    ]
+    ],
+    "startupTimeoutMs": 600000
   },
   {
     "id": "invokeai",
@@ -236,7 +250,20 @@
       "pipInstalls": [
         {
           "kind": "requirements",
-          "value": "requirements_versions.txt"
+          "value": "requirements_versions.txt",
+          "excludePatterns": [
+            "^torch\\b",
+            "^torchvision\\b",
+            "^torchaudio\\b"
+          ]
+        },
+        {
+          "kind": "package",
+          "value": "git+https://github.com/openai/CLIP.git@d50d76daa670286dd6cacf3bcd80b5e4823fc8e1#egg=clip",
+          "pipArgs": [
+            "--no-build-isolation"
+          ],
+          "message": "Installing CLIP the way the upstream launcher expects."
         }
       ],
       "externalPythonCandidates": [
@@ -256,7 +283,7 @@
         "recommendedRamMb": 32768
       }
     },
-    "launchCommand": "python webui.py --listen --api --port {port}",
+    "launchCommand": "python launch.py --listen --api --port {port}",
     "externalLaunchCommand": "webui-user.bat --listen --api --port {port}",
     "defaultPort": 7860,
     "healthCheckPath": "/",
@@ -266,7 +293,8 @@
       "%USERPROFILE%\\Downloads\\stable-diffusion-webui-forge\\webui.py",
       "%LOCALAPPDATA%\\stable-diffusion-webui-forge\\webui.py",
       "%APPDATA%\\stable-diffusion-webui-forge\\webui.py"
-    ]
+    ],
+    "startupTimeoutMs": 600000
   },
   {
     "id": "lmstudio",
@@ -280,6 +308,7 @@
       "kind": "installer-exe",
       "runtime": "binary",
       "downloadFileName": "LM-Studio-Setup.exe",
+      "updateViaArchiveExtraction": true,
       "installSummary": "Downloads the latest LM Studio Windows installer and runs it into a Local AI Hub-managed folder.",
       "installerArgs": [
         "/S",
@@ -302,6 +331,9 @@
       "%PROGRAMFILES%\\LM Studio\\LM Studio.exe",
       "%ProgramFiles(x86)%\\LM Studio\\LM Studio.exe",
       "%APPDATA%\\LM Studio\\LM Studio.exe"
+    ],
+    "processNames": [
+      "LM Studio.exe"
     ]
   },
   {
@@ -347,8 +379,8 @@
         "recommendedRamMb": 16384
       }
     },
-    "launchCommand": "python -m open_webui serve --host 127.0.0.1 --port {port}",
-    "externalLaunchCommand": "python -m open_webui serve --host 127.0.0.1 --port {port}",
+    "launchCommand": "..\\.venv\\Scripts\\open-webui.exe serve --host 127.0.0.1 --port {port}",
+    "externalLaunchCommand": "..\\.venv\\Scripts\\open-webui.exe serve --host 127.0.0.1 --port {port}",
     "defaultPort": 3000,
     "healthCheckPath": "/",
     "detectionPaths": [
@@ -474,8 +506,8 @@
         "recommendedRamMb": 24576
       }
     },
-    "launchCommand": "python_embeded\\python.exe -s Fooocus\\launch.py --listen 127.0.0.1 --port {port} --disable-in-browser",
-    "externalLaunchCommand": "python_embeded\\python.exe -s Fooocus\\launch.py --listen 127.0.0.1 --port {port} --disable-in-browser",
+    "launchCommand": "python_embeded\\python.exe -s Fooocus\\entry_with_update.py --listen 127.0.0.1 --port {port} --disable-in-browser",
+    "externalLaunchCommand": "python_embeded\\python.exe -s Fooocus\\entry_with_update.py --listen 127.0.0.1 --port {port} --disable-in-browser",
     "defaultPort": 7865,
     "healthCheckPath": "/",
     "detectionPaths": [
@@ -653,7 +685,12 @@
       "pipInstalls": [
         {
           "kind": "requirements",
-          "value": "requirements.txt"
+          "value": "requirements/full/requirements.txt"
+        },
+        {
+          "kind": "package",
+          "value": "pyyaml",
+          "message": "Installing PyYAML for Text Generation WebUI."
         }
       ],
       "externalPythonCandidates": [
@@ -672,8 +709,8 @@
         "recommendedRamMb": 32768
       }
     },
-    "launchCommand": "python server.py --listen --port {port}",
-    "externalLaunchCommand": "start_windows.bat --listen --port {port}",
+    "launchCommand": "python server.py --listen --listen-port {port}",
+    "externalLaunchCommand": "start_windows.bat --listen --listen-port {port}",
     "defaultPort": 7860,
     "healthCheckPath": "/",
     "detectionPaths": [
@@ -990,15 +1027,15 @@
         "recommendedRamMb": 32768
       }
     },
-    "launchCommand": "python app.py --host 127.0.0.1 --port {port}",
+    "launchCommand": "python demos\\musicgen_app.py --listen 127.0.0.1 --server_port {port}",
     "defaultPort": 7860,
     "healthCheckPath": "/",
     "detectionPaths": [
-      "%USERPROFILE%\\audiocraft\\app.py",
-      "%USERPROFILE%\\Documents\\audiocraft\\app.py",
-      "%USERPROFILE%\\Downloads\\audiocraft\\app.py",
-      "%LOCALAPPDATA%\\audiocraft\\app.py",
-      "%APPDATA%\\audiocraft\\app.py"
+      "%USERPROFILE%\\audiocraft\\requirements.txt",
+      "%USERPROFILE%\\Documents\\audiocraft\\requirements.txt",
+      "%USERPROFILE%\\Downloads\\audiocraft\\requirements.txt",
+      "%LOCALAPPDATA%\\audiocraft\\requirements.txt",
+      "%APPDATA%\\audiocraft\\requirements.txt"
     ],
     "discovery": {
       "folderNames": [
@@ -1007,7 +1044,7 @@
         "audiocraft-main"
       ],
       "markerPaths": [
-        "app.py",
+        "demos\\musicgen_app.py",
         "requirements.txt"
       ],
       "pathExecutables": [],
@@ -1262,6 +1299,9 @@
       ],
       "pathExecutables": [],
       "pythonModules": []
-    }
+    },
+    "processNames": [
+      "Upscayl.exe"
+    ]
   }
 ]

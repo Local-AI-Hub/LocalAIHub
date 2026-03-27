@@ -80,6 +80,116 @@ function compareVersionStrings(left, right) {
   return compareVersions(leftSegments, rightSegments);
 }
 
+function normalizeLooseToken(value) {
+  return String(value || '').replace(/[^a-z0-9]+/gi, '').toLowerCase();
+}
+
+function normalizeAssetNameForMatch(fileName) {
+  const parsed = path.parse(String(fileName || '').toLowerCase());
+  const baseName = parsed.name
+    .replace(/v?\d+(?:[._-]\d+){1,4}/g, '')
+    .replace(/[^a-z0-9]+/g, '');
+  return `${baseName}${parsed.ext.toLowerCase()}`;
+}
+
+function getManifestCandidateDownloadNames(manifest) {
+  const installInstructions = manifest?.installInstructions || {};
+  const candidates = [
+    installInstructions.downloadFileName,
+    installInstructions.archiveName,
+  ];
+
+  try {
+    candidates.push(path.basename(new URL(manifest?.downloadUrl || '').pathname));
+  } catch {
+    // Keep the manifest-specified file names only.
+  }
+
+  return [...new Set(candidates.map((entry) => String(entry || '').trim()).filter(Boolean))];
+}
+
+function selectGitHubReleaseAsset(releasePayload, manifest) {
+  const assets = Array.isArray(releasePayload?.assets)
+    ? releasePayload.assets.filter((asset) => asset?.browser_download_url && asset?.name)
+    : [];
+  if (!assets.length) {
+    return null;
+  }
+
+  const candidateNames = getManifestCandidateDownloadNames(manifest);
+  const exactMatch = assets.find((asset) =>
+    candidateNames.some((candidate) => String(asset.name || '').toLowerCase() === candidate.toLowerCase()),
+  );
+  if (exactMatch) {
+    return exactMatch;
+  }
+
+  const normalizedCandidates = new Set(candidateNames.map(normalizeAssetNameForMatch).filter(Boolean));
+  const normalizedMatches = assets.filter((asset) => normalizedCandidates.has(normalizeAssetNameForMatch(asset.name)));
+  if (normalizedMatches.length === 1) {
+    return normalizedMatches[0];
+  }
+
+  const expectedExtensions = [...new Set(candidateNames.map((candidate) => path.extname(candidate).toLowerCase()).filter(Boolean))];
+  const identityTokens = new Set([manifest?.id, manifest?.name].map(normalizeLooseToken).filter(Boolean));
+  const extensionMatches = assets.filter((asset) => {
+    const assetExt = path.extname(String(asset.name || '')).toLowerCase();
+    const assetToken = normalizeLooseToken(path.parse(String(asset.name || '')).name);
+    const hasIdentityMatch = [...identityTokens].some((token) => assetToken.includes(token));
+    return (!expectedExtensions.length || expectedExtensions.includes(assetExt)) && hasIdentityMatch;
+  });
+  if (extensionMatches.length === 1) {
+    return extensionMatches[0];
+  }
+
+  return null;
+}
+
+function deriveDownloadFileNameFromUrl(url, fallback = '') {
+  try {
+    const segments = new URL(url).pathname.split('/').filter(Boolean);
+    for (let index = segments.length - 1; index >= 0; index -= 1) {
+      const segment = segments[index];
+      if (/\.(zip|7z|exe)$/i.test(segment)) {
+        return segment;
+      }
+    }
+  } catch {
+    // Fall through to the provided fallback name.
+  }
+
+  return String(fallback || '').trim();
+}
+
+function buildGitHubReleaseDownload(manifest, releasePayload) {
+  const matchedAsset = selectGitHubReleaseAsset(releasePayload, manifest);
+  if (matchedAsset) {
+    return {
+      downloadFileName: matchedAsset.name,
+      downloadResolutionError: '',
+      downloadUrl: matchedAsset.browser_download_url,
+    };
+  }
+
+  const releaseVersion = normalizeVersion(releasePayload?.tag_name || releasePayload?.name || '') || 'latest';
+  const candidateNames = getManifestCandidateDownloadNames(manifest);
+  const expectedPackageLabel = candidateNames.length
+    ? candidateNames.map((candidate) => `"${candidate}"`).join(' or ')
+    : 'the Windows package Local AI Hub manages';
+  const attachedAssetCount = Array.isArray(releasePayload?.assets)
+    ? releasePayload.assets.filter((asset) => asset?.browser_download_url && asset?.name).length
+    : 0;
+  const downloadResolutionError = attachedAssetCount === 0
+    ? `The latest ${manifest?.name || 'tool'} GitHub release (${releaseVersion}) only publishes source archives and does not attach a downloadable package that matches ${expectedPackageLabel}.`
+    : `The latest ${manifest?.name || 'tool'} GitHub release (${releaseVersion}) does not publish a downloadable package that matches ${expectedPackageLabel}.`;
+
+  return {
+    downloadFileName: '',
+    downloadResolutionError,
+    downloadUrl: '',
+  };
+}
+
 async function fetchJson(url, options = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs || REQUEST_TIMEOUT_MS);
@@ -281,6 +391,7 @@ async function detectRemoteVersionFromGitHubArchive(manifest) {
     return null;
   }
 
+  const defaultDownloadFileName = deriveDownloadFileNameFromUrl(manifest.downloadUrl, getManifestCandidateDownloadNames(manifest)[0] || '');
   const refPath = buildGitHubRefUrlParts(archiveRef.ref);
   const releaseUrl = `https://github.com/${archiveRef.owner}/${archiveRef.repo}/tree/${refPath}`;
   const sourceLabel = archiveRef.refKind === 'heads' ? 'GitHub branch' : 'GitHub tag archive';
@@ -293,6 +404,8 @@ async function detectRemoteVersionFromGitHubArchive(manifest) {
     if (availableVersion) {
       return {
         availableVersion,
+        downloadFileName: defaultDownloadFileName,
+        downloadUrl: manifest.downloadUrl,
         releaseUrl,
         sourceLabel,
       };
@@ -301,6 +414,8 @@ async function detectRemoteVersionFromGitHubArchive(manifest) {
 
   return {
     availableVersion: '',
+    downloadFileName: defaultDownloadFileName,
+    downloadUrl: manifest.downloadUrl,
     releaseUrl,
     sourceLabel,
   };
@@ -377,6 +492,7 @@ async function detectInstalledVersion(tool, manifest) {
   const pipPackageName = derivePipPackageName(manifest);
 
   const candidateReaders = [
+    () => Promise.resolve(normalizeVersion(tool?.installedVersion || '')),
     () => readPipShowVersion(pythonPath, pipPackageName),
     () => readExecutableVersion(tool?.launchProfile?.executable || tool?.executablePath || ''),
     () => readExecutableVersion(tool?.installDir ? path.join(tool.installDir, path.basename(tool.launchProfile?.executable || tool.executablePath || '')) : ''),
@@ -404,6 +520,9 @@ async function detectRemoteVersion(manifest) {
     const version = normalizeVersion(payload?.info?.version || '');
     return {
       availableVersion: version,
+      downloadFileName: '',
+      downloadResolutionError: '',
+      downloadUrl: '',
       releaseUrl: `https://pypi.org/project/${pipPackageName}/`,
       sourceLabel: 'PyPI',
     };
@@ -422,8 +541,13 @@ async function detectRemoteVersion(manifest) {
           Accept: 'application/vnd.github+json',
         },
       });
+      const releaseVersion = normalizeVersion(releasePayload?.tag_name || releasePayload?.name || '');
+      const releaseDownload = buildGitHubReleaseDownload(manifest, releasePayload);
       return {
-        availableVersion: normalizeVersion(releasePayload?.tag_name || releasePayload?.name || ''),
+        availableVersion: releaseVersion,
+        downloadFileName: releaseDownload.downloadFileName,
+        downloadResolutionError: releaseDownload.downloadResolutionError || '',
+        downloadUrl: releaseDownload.downloadUrl,
         releaseUrl: releasePayload?.html_url || `https://github.com/${githubRepo.owner}/${githubRepo.repo}/releases`,
         sourceLabel: 'GitHub release',
       };
@@ -436,6 +560,8 @@ async function detectRemoteVersion(manifest) {
       const firstTag = Array.isArray(tagsPayload) ? tagsPayload[0] : null;
       return {
         availableVersion: normalizeVersion(firstTag?.name || ''),
+        downloadFileName: '',
+        downloadUrl: '',
         releaseUrl: `https://github.com/${githubRepo.owner}/${githubRepo.repo}/tags`,
         sourceLabel: 'GitHub tag',
       };
@@ -445,6 +571,9 @@ async function detectRemoteVersion(manifest) {
   const finalUrl = await resolveFinalUrl(manifest.downloadUrl).catch(() => manifest.downloadUrl);
   return {
     availableVersion: normalizeVersion(finalUrl),
+    downloadFileName: deriveDownloadFileNameFromUrl(finalUrl, getManifestCandidateDownloadNames(manifest)[0] || ''),
+    downloadResolutionError: '',
+    downloadUrl: finalUrl,
     releaseUrl: finalUrl,
     sourceLabel: 'Official download',
   };
@@ -482,6 +611,9 @@ async function refreshInstalledToolUpdates(tools = []) {
           availableVersion: remoteVersion.availableVersion || '',
           checkedAt: new Date().toISOString(),
           currentVersion: currentVersion || '',
+          downloadFileName: remoteVersion.downloadFileName || '',
+          downloadResolutionError: remoteVersion.downloadResolutionError || '',
+          downloadUrl: remoteVersion.downloadUrl || '',
           releaseUrl: remoteVersion.releaseUrl || '',
           sourceLabel: remoteVersion.sourceLabel || '',
           status:
@@ -524,6 +656,17 @@ async function refreshInstalledToolUpdates(tools = []) {
   }
 }
 
+async function getCachedToolUpdateEntry(toolId) {
+  const normalizedToolId = String(toolId || '').trim().toLowerCase();
+  if (!normalizedToolId) {
+    return null;
+  }
+
+  const cache = await readToolUpdates();
+  const entry = cache.tools?.[normalizedToolId];
+  return entry && typeof entry === 'object' ? entry : null;
+}
+
 async function getToolUpdateSnapshot(tools = []) {
   const cache = await readToolUpdates();
   const entries = (tools || []).map((tool) => ({
@@ -546,6 +689,7 @@ async function getToolUpdateSnapshot(tools = []) {
 }
 
 module.exports = {
+  getCachedToolUpdateEntry,
   getToolUpdateSnapshot,
   refreshInstalledToolUpdates,
 };

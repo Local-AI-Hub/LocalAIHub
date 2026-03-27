@@ -466,7 +466,7 @@ async function discoverInstallLocation(manifest, existingTool, logger) {
 
   for (const discoverStep of discoverySteps) {
     const resolved = await discoverStep();
-    const externalCandidate = selectExternalInstallCandidate(manifest, resolved, existingTool);
+    const externalCandidate = await selectExternalInstallCandidate(manifest, resolved, existingTool);
     if (externalCandidate) {
       return externalCandidate;
     }
@@ -573,8 +573,13 @@ function detectedLocationIsManaged(manifest, detected, existingTool = null) {
   return candidates.some((candidate) => allowedLocations.has(normalizePathKey(candidate)));
 }
 
-function selectExternalInstallCandidate(manifest, detected, existingTool = null) {
+async function selectExternalInstallCandidate(manifest, detected, existingTool = null) {
   if (!detected || detectedLocationIsManaged(manifest, detected, existingTool)) {
+    return null;
+  }
+
+  const launchProfile = buildExternalLaunchProfile(manifest, detected.installDir, detected.detectedPath || null);
+  if (!(await launchProfileExists(launchProfile, detected.installDir))) {
     return null;
   }
 
@@ -598,6 +603,45 @@ async function managedInstallDirectoryExists(manifest, installDir) {
   return false;
 }
 
+function isBareCommand(command) {
+  return Boolean(command) && !path.isAbsolute(command) && !/[\\/]/.test(command);
+}
+
+async function launchProfileExists(launchProfile, fallbackDir = null) {
+  if (!launchProfile) {
+    return false;
+  }
+
+  if (launchProfile.kind === 'binary' && launchProfile.executable) {
+    return fileExists(launchProfile.executable);
+  }
+
+  if ((launchProfile.kind === 'python-script' || launchProfile.kind === 'python-module') && launchProfile.pythonPath) {
+    if (!isBareCommand(launchProfile.pythonPath) && !(await fileExists(launchProfile.pythonPath))) {
+      return false;
+    }
+
+    if (launchProfile.kind === 'python-script') {
+      const targetPath = resolveLaunchProfileTargetPath(launchProfile);
+      return targetPath ? fileExists(targetPath) : false;
+    }
+
+    return true;
+  }
+
+  if (launchProfile.kind === 'embedded' && launchProfile.pythonPath) {
+    return isBareCommand(launchProfile.pythonPath)
+      ? Boolean(fallbackDir && await pathExists(fallbackDir))
+      : fileExists(launchProfile.pythonPath);
+  }
+
+  if (launchProfile.kind === 'batch' && launchProfile.command) {
+    return fileExists(launchProfile.command);
+  }
+
+  return Boolean(fallbackDir && await pathExists(fallbackDir));
+}
+
 function resolveLaunchProfileTargetPath(launchProfile) {
   if (!launchProfile?.target) {
     return null;
@@ -616,32 +660,7 @@ async function managedToolLauncherExists(tool) {
     return false;
   }
 
-  if (tool.launchProfile?.kind === 'binary' && tool.launchProfile?.executable) {
-    return fileExists(tool.launchProfile.executable);
-  }
-
-  if ((tool.launchProfile?.kind === 'python-script' || tool.launchProfile?.kind === 'python-module') && tool.launchProfile?.pythonPath) {
-    if (!(await fileExists(tool.launchProfile.pythonPath))) {
-      return false;
-    }
-
-    if (tool.launchProfile.kind === 'python-script') {
-      const targetPath = resolveLaunchProfileTargetPath(tool.launchProfile);
-      return targetPath ? fileExists(targetPath) : false;
-    }
-
-    return true;
-  }
-
-  if (tool.launchProfile?.kind === 'embedded' && tool.launchProfile?.pythonPath) {
-    return fileExists(tool.launchProfile.pythonPath);
-  }
-
-  if (tool.launchProfile?.kind === 'batch' && tool.launchProfile?.command) {
-    return fileExists(tool.launchProfile.command);
-  }
-
-  return false;
+  return launchProfileExists(tool.launchProfile, tool.installDir || tool.appDir || null);
 }
 
 function buildManagedToolState(existingTool, manifest, installDir = existingTool?.installDir) {
@@ -731,6 +750,37 @@ function buildRecoveredManagedToolState(manifest, existingTool = {}, installDir)
   };
 }
 
+function buildManagedRecoveryStateFromBrokenExternal(existingTool, manifest) {
+  const nextState = buildMissingManagedToolState(existingTool || {}, manifest);
+  const firstSeenAt = existingTool?.installedAt || existingTool?.detectedAt || new Date().toISOString();
+  return {
+    ...nextState,
+    detectedAt: existingTool?.detectedAt || firstSeenAt,
+    installedAt: firstSeenAt,
+    lastError: existingTool?.lastError || nextState.lastError,
+    status: 'error',
+  };
+}
+
+async function brokenExternalToolNeedsManagedRecovery(existingTool, manifest, externalDetected = null) {
+  if (
+    !existingTool ||
+    externalDetected ||
+    manifest?.installContract?.lifecycleMode !== 'managed' ||
+    existingTool?.source !== 'external' ||
+    !/run repair or reinstall it\./i.test(String(existingTool?.lastError || ''))
+  ) {
+    return false;
+  }
+
+  const installDir = existingTool.installDir || existingTool.appDir || '';
+  const launchProfile = buildExternalLaunchProfile(
+    manifest,
+    installDir,
+    existingTool.detectedPath || existingTool.externalPythonPath || null,
+  );
+  return !(await launchProfileExists(launchProfile, installDir || null));
+}
 async function discoverManagedRelocation(existingTool, manifest, logger) {
   const candidates = uniquePaths([
     normalizeInstallDirCandidate(existingTool?.installDir),
@@ -810,6 +860,7 @@ async function performDiscoveryScan(options = {}) {
     const existingTool = config.tools[manifest.id];
     const result = discoveryResults?.[manifest.id] || {};
     const trackedManagedTool = existingTool?.source === 'managed' || existingTool?.managedByLocalAIHub;
+    const brokenManagedRecovery = await brokenExternalToolNeedsManagedRecovery(existingTool, manifest, result.externalDetected);
 
     if (result.shouldTreatAsManaged) {
       if (trackedManagedTool && result.managedInstallDir) {
@@ -842,6 +893,22 @@ async function performDiscoveryScan(options = {}) {
         buildBrokenManagedToolState(existingTool, manifest, result.managedInstallDir),
         result.externalDetected,
       );
+      continue;
+    }
+
+    if (brokenManagedRecovery) {
+      if (result.managedInstallDir) {
+        const recoveredManagedTool = buildRecoveredManagedToolState(manifest, existingTool, result.managedInstallDir);
+        if (await managedToolLauncherExists(recoveredManagedTool)) {
+          nextTools[manifest.id] = recoveredManagedTool;
+          continue;
+        }
+
+        nextTools[manifest.id] = buildBrokenManagedToolState(existingTool, manifest, result.managedInstallDir);
+        continue;
+      }
+
+      nextTools[manifest.id] = buildManagedRecoveryStateFromBrokenExternal(existingTool || {}, manifest);
       continue;
     }
 

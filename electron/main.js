@@ -49,6 +49,7 @@ const {
   disposeAllRuntimes,
   getRuntimeOutputSnapshot,
   isToolActive,
+  isToolRuntimeSettling,
   launchToolFromUserAction,
   prepareToolForMaintenance,
   sendInputToTool,
@@ -693,16 +694,23 @@ async function checkRunningToolsHealth() {
     await initializeToolRegistry();
     const config = await readConfig();
     const activeRunningTools = [];
+    const mergedTools = await buildMergedToolStateList({
+      config,
+      includeSnapshots: false,
+      resolveStatuses: false,
+      skipRegistryInit: true,
+      syncDiscovered: false,
+    });
 
-    for (const storedTool of Object.values(config.tools || {})) {
-      if (storedTool.status !== 'running') {
+    for (const mergedTool of mergedTools) {
+      if (mergedTool.status !== 'running') {
         continue;
       }
 
-      const mergedTool = {
-        ...(getToolManifest(storedTool.id) || {}),
-        ...storedTool,
-      };
+      if (isToolRuntimeSettling(mergedTool.id)) {
+        continue;
+      }
+
       const active = await isToolActive(mergedTool).catch(() => false);
       if (active) {
         activeRunningTools.push(mergedTool);
@@ -882,70 +890,76 @@ function registerIpcHandlers() {
 
   ipcMain.handle('tools:launch', (_event, payload) =>
     withPlainEnglishErrors(async () => {
-      const toolId = typeof payload === 'string' ? payload : payload?.toolId;
-      const state = await buildAppState();
-      const tool = toolLookup(toolId, state.tools);
-      if (tool.launchSupported === false) {
-        await shell.openPath(tool.installDir);
-        return {
-          message: `${tool.name}'s folder is open.`,
-          state,
-        };
-      }
+      try {
+        const toolId = typeof payload === 'string' ? payload : payload?.toolId;
+        const state = await buildAppState();
+        const tool = toolLookup(toolId, state.tools);
+        if (tool.launchSupported === false) {
+          await shell.openPath(tool.installDir);
+          return {
+            message: `${tool.name}'s folder is open.`,
+            state,
+          };
+        }
 
-      const launchOptions = {};
-      if (tool.id === 'aider') {
-        const projectDir = String(payload?.projectDir || tool.lastProjectDir || '').trim();
-        const aiderSession = payload?.aiderSession || {};
-        const aiderLaunch = await buildAiderLaunchConfiguration({
-          tool,
-          ollamaTool: toolLookup('ollama', state.tools),
-          providers: state.providers || [],
-          projectDir,
-          providerId: aiderSession.providerId || tool.aiderProviderId || '',
-          modelId: aiderSession.modelId || tool.aiderModelId || '',
-          initializeGit: aiderSession.initializeGit !== undefined ? aiderSession.initializeGit : tool.aiderInitializeGit !== false,
-        });
+        const launchOptions = {};
+        if (tool.id === 'aider') {
+          const projectDir = String(payload?.projectDir || tool.lastProjectDir || '').trim();
+          const aiderSession = payload?.aiderSession || {};
+          const aiderLaunch = await buildAiderLaunchConfiguration({
+            tool,
+            ollamaTool: toolLookup('ollama', state.tools),
+            providers: state.providers || [],
+            projectDir,
+            providerId: aiderSession.providerId || tool.aiderProviderId || '',
+            modelId: aiderSession.modelId || tool.aiderModelId || '',
+            initializeGit: aiderSession.initializeGit !== undefined ? aiderSession.initializeGit : tool.aiderInitializeGit !== false,
+          });
 
-        if (aiderLaunch.selection.requiresOllamaStart) {
-          const ollamaTool = toolLookup('ollama', state.tools);
-          if (!ollamaTool) {
-            throw new Error('Install or detect Ollama before launching an Ollama-backed Aider session.');
+          if (aiderLaunch.selection.requiresOllamaStart) {
+            const ollamaTool = toolLookup('ollama', state.tools);
+            if (!ollamaTool) {
+              throw new Error('Install or detect Ollama before launching an Ollama-backed Aider session.');
+            }
+
+            await launchToolFromUserAction(ollamaTool, {
+              launchContext: 'aider-session',
+              skipOpenInterface: true,
+            });
           }
 
-          await launchToolFromUserAction(ollamaTool, {
-            launchContext: 'aider-session',
-            skipOpenInterface: true,
+          launchOptions.launchProfileOverride = aiderLaunch.launchProfileOverride;
+          launchOptions.successMessage = aiderLaunch.launchMessage;
+          await upsertTool({
+            id: tool.id,
+            ...aiderLaunch.persistedFields,
           });
         }
-
-        launchOptions.launchProfileOverride = aiderLaunch.launchProfileOverride;
-        launchOptions.successMessage = aiderLaunch.launchMessage;
-        await upsertTool({
-          id: tool.id,
-          ...aiderLaunch.persistedFields,
+        const { nextState, nextTool } = await launchToolFromExplicitUserAction(tool, {
+          ...launchOptions,
+          launchContext: 'ipc-launch',
         });
-      }
-      const { nextState, nextTool } = await launchToolFromExplicitUserAction(tool, {
-        ...launchOptions,
-        launchContext: 'ipc-launch',
-      });
 
-      let message = launchOptions.successMessage || `${nextTool.name} is starting.`;
-      if (!launchOptions.successMessage && String(nextTool.interfaceMode || '').startsWith('embedded-')) {
-        if (nextTool.interfaceMode === 'embedded-whisper') {
-          message = `${nextTool.name} is ready. Local AI Hub opened its transcription view.`;
-        } else if (nextTool.interfaceMode === 'embedded-chat') {
-          message = `${nextTool.name} is starting. Local AI Hub opened its chat view.`;
-        } else if (nextTool.interfaceMode === 'embedded-terminal') {
-          message = `${nextTool.name} is ready. Local AI Hub opened its built-in console.`;
+        let message = launchOptions.successMessage || `${nextTool.name} is starting.`;
+        if (!launchOptions.successMessage && String(nextTool.interfaceMode || '').startsWith('embedded-')) {
+          if (nextTool.interfaceMode === 'embedded-whisper') {
+            message = `${nextTool.name} is ready. Local AI Hub opened its transcription view.`;
+          } else if (nextTool.interfaceMode === 'embedded-chat') {
+            message = `${nextTool.name} is starting. Local AI Hub opened its chat view.`;
+          } else if (nextTool.interfaceMode === 'embedded-terminal') {
+            message = `${nextTool.name} is ready. Local AI Hub opened its built-in console.`;
+          }
         }
-      }
 
-      return {
-        message,
-        state: nextState,
-      };
+        return {
+          message,
+          state: nextState,
+        };
+      } catch (error) {
+        invalidateDiscoveryCache();
+        await refreshOpenAppState({ forceDiscovery: true }).catch(() => null);
+        throw error;
+      }
     }, 'Local AI Hub could not start that tool.'),
   );
 
@@ -1660,6 +1674,7 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
+
 
 
 

@@ -7,7 +7,8 @@ const { PythonShell } = require('python-shell');
 const { getAppPaths, humanizeError, upsertTool } = require('./configService');
 const { killProcessTree, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
-const { attemptAutomaticLaunchRecovery } = require('./runtimeRecoveryService');
+const { attemptAutomaticLaunchRecovery, diagnoseLaunchFailure, selectPyTorchRepairCandidates } = require('./runtimeRecoveryService');
+const { getNvidiaRuntimeDetails, detectHardwareSnapshot } = require('./hardwareService');
 const { assertLoopbackUrl, assertPathInside } = require('./pathSafetyService');
 
 const runtimes = new Map();
@@ -23,8 +24,16 @@ const STARTUP_DOWNLOAD_CARRY_LIMIT = 256;
 const DOWNLOAD_KEYWORD_PATTERN = /\b(download(?:ing|ed)?|fetch(?:ing|ed)?|retriev(?:e|ing|ed)?|pull(?:ing|ed)?|sync(?:ing|ed)?|cache(?:ing|d)?|checkpoint|weights?)\b/i;
 const DOWNLOAD_SOURCE_PATTERN = /(https?:\/\/|huggingface|civitai|modelscope|\.safetensors\b|\.ckpt\b|\.pth\b|\.bin\b|\.onnx\b|\.gguf\b|\.pt\b)/i;
 const DOWNLOAD_PROGRESS_PATTERN = /(?:^|[\s|])(\d{1,3})%(?=\s|\||$)/g;
+const MANAGED_STABLE_DIFFUSION_TOOL_IDS = new Set(['automatic1111', 'forge']);
+const MANAGED_STABLE_DIFFUSION_CLIP_PACKAGE = '--no-build-isolation git+https://github.com/openai/CLIP.git@d50d76daa670286dd6cacf3bcd80b5e4823fc8e1#egg=clip';
+const MANAGED_STABLE_DIFFUSION_REPO_URL = 'https://github.com/w-e-w/stablediffusion.git';
+const MANAGED_STABLE_DIFFUSION_NUMPY_PIN = 'numpy==1.26.2';
+const MANAGED_STABLE_DIFFUSION_SKIMAGE_PIN = 'scikit-image==0.21.0';
+const MANAGED_STABLE_DIFFUSION_SETUPTOOLS_PIN = 'setuptools==69.5.1';
+const MANAGED_FORGE_PYDANTIC_PIN = 'pydantic==2.8.2';
 let runtimeEventSink = null;
 const pendingStartupMonitors = new Map();
+const runtimeExitSettlingToolIds = new Set();
 
 function getHelperScriptPath() {
   return app.isPackaged
@@ -92,6 +101,10 @@ function getRuntimeOutputSnapshot(toolId) {
   };
 }
 
+function isToolRuntimeSettling(toolId) {
+  return runtimeExitSettlingToolIds.has(toolId);
+}
+
 function sendInputToTool(toolId, input, options = {}) {
   const runtime = runtimes.get(toolId);
   if (!runtime?.process || runtime.process.exitCode !== null || runtime.stopping) {
@@ -116,8 +129,13 @@ function sleep(ms) {
   });
 }
 
-function buildStartupDownloadMessage(toolName) {
-  return `${toolName || 'This tool'} is downloading required files on first launch. This may take several minutes.`;
+function buildStartupDownloadMessage(runtimeState) {
+  const toolName = runtimeState?.startupDownload?.toolName || 'This tool';
+  if (runtimeState?.launchConfirmed && !toolUsesLocalUrl(runtimeState)) {
+    return `${toolName} is finishing its own first-run setup in its own window. Local AI Hub already launched the app.`;
+  }
+
+  return `${toolName} is downloading required files on first launch. This may take several minutes.`;
 }
 
 function createStartupDownloadState(toolState) {
@@ -155,6 +173,33 @@ function getManagedToolRoot(toolState) {
   return basePath ? path.resolve(basePath) : null;
 }
 
+function getManagedToolStateRoot(toolState) {
+  const managedRoot = getManagedToolRoot(toolState);
+  return managedRoot ? path.join(managedRoot, '.localaihub') : null;
+}
+
+async function ensureManagedStableDiffusionConstraintFile(toolState) {
+  if (!MANAGED_STABLE_DIFFUSION_TOOL_IDS.has(toolState?.id)) {
+    return null;
+  }
+
+  const stateRoot = getManagedToolStateRoot(toolState);
+  if (!stateRoot) {
+    return null;
+  }
+
+  const constraintLines = ['numpy<2'];
+  if (toolState.id === 'forge') {
+    constraintLines.push(MANAGED_FORGE_PYDANTIC_PIN);
+  }
+
+  const constraintsDir = path.join(stateRoot, 'pip');
+  const constraintPath = path.join(constraintsDir, 'stable-diffusion-constraints.txt');
+  await fs.ensureDir(constraintsDir);
+  await fs.writeFile(constraintPath, `${constraintLines.join('\n')}\n`, 'utf8');
+  return constraintPath;
+}
+
 function ensureManagedRuntimePath(toolState, candidatePath, label) {
   if (!candidatePath) {
     return candidatePath;
@@ -181,13 +226,28 @@ async function buildLaunchRuntimeEnv(toolState, extraEnv = {}) {
     };
   }
 
-  const stateRoot = path.join(managedRoot, '.localaihub');
+  const stateRoot = getManagedToolStateRoot(toolState);
   const cacheDir = path.join(stateRoot, 'cache');
   const tempDir = path.join(stateRoot, 'tmp');
   const pycacheDir = path.join(stateRoot, 'pycache');
   const hfCacheDir = path.join(cacheDir, 'huggingface');
   const transformersCacheDir = path.join(cacheDir, 'transformers');
   const ollamaModelsDir = toolState.id === 'ollama' ? path.join(getAppPaths().modelsRoot, 'ollama') : null;
+  const openWebUiDataDir = toolState.id === 'openwebui' ? path.join(toolState.appDir || managedRoot, 'data') : null;
+  const openWebUiFrontendDirCandidate = toolState.id === 'openwebui'
+    ? path.join(managedRoot, '.venv', 'Lib', 'site-packages', 'open_webui', 'frontend')
+    : null;
+  const openWebUiFrontendDir = openWebUiFrontendDirCandidate && await fs.pathExists(openWebUiFrontendDirCandidate)
+    ? openWebUiFrontendDirCandidate
+    : null;
+  const openWebUiPythonEnv = toolState.id === 'openwebui'
+    ? {
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONLEGACYWINDOWSSTDIO: '1',
+        PYTHONUTF8: '1',
+        ...(openWebUiFrontendDir ? { FRONTEND_BUILD_DIR: openWebUiFrontendDir } : {}),
+      }
+    : {};
 
   await Promise.all([
     fs.ensureDir(cacheDir),
@@ -196,6 +256,7 @@ async function buildLaunchRuntimeEnv(toolState, extraEnv = {}) {
     fs.ensureDir(hfCacheDir),
     fs.ensureDir(transformersCacheDir),
     ollamaModelsDir ? fs.ensureDir(ollamaModelsDir) : Promise.resolve(),
+    openWebUiDataDir ? fs.ensureDir(openWebUiDataDir) : Promise.resolve(),
   ]);
 
   return {
@@ -215,9 +276,291 @@ async function buildLaunchRuntimeEnv(toolState, extraEnv = {}) {
     HF_HOME: hfCacheDir,
     TRANSFORMERS_CACHE: transformersCacheDir,
     ...(ollamaModelsDir ? { OLLAMA_MODELS: ollamaModelsDir } : {}),
+    ...(openWebUiDataDir ? { DATA_DIR: openWebUiDataDir } : {}),
+    ...openWebUiPythonEnv,
   };
 }
 
+function isManagedStableDiffusionLaunch(toolState, launchProfile) {
+  return Boolean(
+    toolState
+    && MANAGED_STABLE_DIFFUSION_TOOL_IDS.has(toolState.id)
+    && (toolState.managedByLocalAIHub || toolState.source === 'managed')
+    && (launchProfile?.kind === 'python-script' || launchProfile?.kind === 'python-module')
+  );
+}
+
+async function inspectManagedTorchRuntime(launchProfile) {
+  if (!launchProfile?.pythonPath) {
+    return null;
+  }
+
+  const inspectionSnippet = [
+    'import importlib.util',
+    'import json',
+    "info = {'installed': False, 'version': None, 'cudaAvailable': False, 'cudaVersion': None, 'importError': None}",
+    "spec = importlib.util.find_spec('torch')",
+    "info['installed'] = bool(spec)",
+    'if spec is not None:',
+    '    try:',
+    '        import torch',
+    "        info['version'] = getattr(torch, '__version__', None)",
+    "        info['cudaAvailable'] = bool(torch.cuda.is_available())",
+    "        info['cudaVersion'] = getattr(torch.version, 'cuda', None)",
+    '    except Exception as exc:',
+    "        info['importError'] = str(exc)",
+    'print(json.dumps(info))',
+  ].join('\n');
+
+  const result = await runCommand(launchProfile.pythonPath, ['-c', inspectionSnippet], {
+    allowFailure: true,
+    cwd: launchProfile.workingDir,
+    env: {
+      ...process.env,
+      PYTHONNOUSERSITE: '1',
+    },
+  });
+
+  if (result.code !== 0) {
+    return null;
+  }
+
+  const payload = String(result.stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse()
+    .find((line) => line.startsWith('{'));
+
+  if (!payload) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+async function inspectManagedStableDiffusionPythonEnvironment(launchProfile) {
+  if (!launchProfile?.pythonPath) {
+    return null;
+  }
+
+  const inspectionSnippet = [
+    'import importlib.util',
+    'import json',
+    "info = {'pkgResourcesInstalled': False, 'xformersInstalled': False, 'numpyVersion': None, 'numpyImportError': None, 'skimageInstalled': False, 'skimageVersion': None, 'skimageImportError': None, 'pydanticVersion': None, 'pydanticImportError': None}",
+    "info['pkgResourcesInstalled'] = bool(importlib.util.find_spec('pkg_resources'))",
+    "info['xformersInstalled'] = bool(importlib.util.find_spec('xformers'))",
+    "skimage_spec = importlib.util.find_spec('skimage')",
+    "info['skimageInstalled'] = bool(skimage_spec)",
+    'try:',
+    '    import numpy',
+    "    info['numpyVersion'] = getattr(numpy, '__version__', None)",
+    'except Exception as exc:',
+    "    info['numpyImportError'] = str(exc)",
+    'if skimage_spec is not None:',
+    '    try:',
+    '        import skimage',
+    "        info['skimageVersion'] = getattr(skimage, '__version__', None)",
+    '    except Exception as exc:',
+    "        info['skimageImportError'] = str(exc)",
+    'try:',
+    '    import pydantic',
+    "    info['pydanticVersion'] = getattr(pydantic, '__version__', None)",
+    'except Exception as exc:',
+    "    info['pydanticImportError'] = str(exc)",
+    'print(json.dumps(info))',
+  ].join('\n');
+
+  const result = await runCommand(launchProfile.pythonPath, ['-c', inspectionSnippet], {
+    allowFailure: true,
+    cwd: launchProfile.workingDir,
+    env: {
+      ...process.env,
+      PIP_DISABLE_PIP_VERSION_CHECK: '1',
+      PYTHONNOUSERSITE: '1',
+    },
+  });
+
+  if (result.code !== 0) {
+    return null;
+  }
+
+  const payload = String(result.stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse()
+    .find((line) => line.startsWith('{') && line.endsWith('}'));
+
+  if (!payload) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+function needsManagedStableDiffusionDependencyRepair(toolState, pythonEnvironment) {
+  if (!pythonEnvironment) {
+    return false;
+  }
+
+  const numpyMajor = Number.parseInt(String(pythonEnvironment.numpyVersion || '').split('.')[0], 10);
+  const forgeNeedsPydanticRepair = toolState?.id === 'forge'
+    && (
+      Boolean(pythonEnvironment.pydanticImportError)
+      || String(pythonEnvironment.pydanticVersion || '').trim() !== '2.8.2'
+    );
+  return (
+    !pythonEnvironment.pkgResourcesInstalled
+    || (Number.isFinite(numpyMajor) && numpyMajor >= 2)
+    || !pythonEnvironment.skimageInstalled
+    || Boolean(pythonEnvironment.skimageImportError)
+    || forgeNeedsPydanticRepair
+  );
+}
+
+async function repairManagedStableDiffusionPythonEnvironment(toolState, launchProfile, logger, constraintPath, pythonEnvironment) {
+  const packages = [
+    MANAGED_STABLE_DIFFUSION_SETUPTOOLS_PIN,
+    MANAGED_STABLE_DIFFUSION_NUMPY_PIN,
+    MANAGED_STABLE_DIFFUSION_SKIMAGE_PIN,
+    ...(toolState?.id === 'forge' ? [MANAGED_FORGE_PYDANTIC_PIN] : []),
+  ];
+
+  await logger.info('Repairing managed Stable Diffusion Python packages before launch.', {
+    packages,
+    pythonEnvironment,
+  });
+
+  await runCommand(
+    launchProfile.pythonPath,
+    [
+      '-m',
+      'pip',
+      'install',
+      '--upgrade',
+      '--force-reinstall',
+      '--no-cache-dir',
+      '--prefer-binary',
+      ...packages,
+    ],
+    {
+      cwd: launchProfile.workingDir,
+      env: {
+        ...process.env,
+        PIP_DISABLE_PIP_VERSION_CHECK: '1',
+        PYTHONNOUSERSITE: '1',
+        ...(constraintPath ? { PIP_CONSTRAINT: constraintPath } : {}),
+      },
+      errorMessage: `Local AI Hub could not repair ${toolState.name}'s managed Python packages before launch.`,
+    },
+  );
+
+  const repairedEnvironment = await inspectManagedStableDiffusionPythonEnvironment(launchProfile);
+  if (needsManagedStableDiffusionDependencyRepair(toolState, repairedEnvironment)) {
+    throw new Error(`${toolState.name} still has missing or incompatible Python packages after Local AI Hub repaired its managed runtime.`);
+  }
+}
+
+async function prepareManagedStableDiffusionLaunchProfile(toolState, launchProfile) {
+  if (!isManagedStableDiffusionLaunch(toolState, launchProfile)) {
+    return launchProfile;
+  }
+
+  const constraintPath = await ensureManagedStableDiffusionConstraintFile(toolState);
+  const logger = createRuntimeLogger(toolState, launchProfile, {
+    launchContext: 'prelaunch-runtime-check',
+  });
+  const pythonEnvironment = await inspectManagedStableDiffusionPythonEnvironment(launchProfile);
+  if (needsManagedStableDiffusionDependencyRepair(toolState, pythonEnvironment)) {
+    await repairManagedStableDiffusionPythonEnvironment(toolState, launchProfile, logger, constraintPath, pythonEnvironment);
+  }
+
+  const managedStableDiffusionEnv = {
+    ...(launchProfile.env || {}),
+    CLIP_PACKAGE: MANAGED_STABLE_DIFFUSION_CLIP_PACKAGE,
+    ...(constraintPath ? { PIP_CONSTRAINT: constraintPath } : {}),
+    ...(toolState.id === 'automatic1111' ? { STABLE_DIFFUSION_REPO: MANAGED_STABLE_DIFFUSION_REPO_URL } : {}),
+  };
+
+  const [hardwareSnapshot, nvidia] = await Promise.all([
+    detectHardwareSnapshot().catch(() => null),
+    getNvidiaRuntimeDetails().catch(() => null),
+  ]);
+  const hardware = {
+    ...hardwareSnapshot,
+    ...(nvidia || {}),
+    nvidiaSmiAvailable: Boolean(nvidia?.nvidiaSmiAvailable || hardwareSnapshot?.nvidiaSmiAvailable),
+  };
+  const args = [...(launchProfile.args || [])];
+  const automatic1111NeedsMedvram =
+    toolState.id === 'automatic1111'
+    && !args.includes('--medvram')
+    && !args.includes('--lowvram')
+    && (
+      (Number(hardware?.vramMb || 0) > 0 && Number(hardware.vramMb) <= Math.max(6144, Number(toolState?.compatibility?.minimumVramMb || 0)))
+      || (
+        Number(hardware?.systemRamMb || 0) > 0
+        && Number(toolState?.compatibility?.minimumRamMb || 0) > 0
+        && Number(hardware.systemRamMb) <= Number(toolState.compatibility.minimumRamMb)
+      )
+    );
+
+  if (automatic1111NeedsMedvram) {
+    args.unshift('--medvram');
+    await logger.info('Applying Automatic1111 low-VRAM launch mode.', {
+      gpuModel: hardware?.gpuModel || null,
+      systemRamMb: hardware?.systemRamMb || null,
+      vramMb: hardware?.vramMb || null,
+    });
+  }
+
+  const preferredBuild = selectPyTorchRepairCandidates(hardware)[0];
+  if (!preferredBuild) {
+    return {
+      ...launchProfile,
+      args,
+      env: managedStableDiffusionEnv,
+    };
+  }
+
+  const torchRuntime = await inspectManagedTorchRuntime(launchProfile);
+  const needsCudaBootstrap =
+    !torchRuntime
+    || !torchRuntime.installed
+    || Boolean(torchRuntime.importError)
+    || !torchRuntime.cudaAvailable
+    || !torchRuntime.cudaVersion;
+
+  if (!needsCudaBootstrap) {
+    return {
+      ...launchProfile,
+      args,
+      env: managedStableDiffusionEnv,
+    };
+  }
+
+  if (!args.includes('--reinstall-torch')) {
+    args.unshift('--reinstall-torch');
+  }
+
+  return {
+    ...launchProfile,
+    args,
+    env: {
+      ...managedStableDiffusionEnv,
+      TORCH_INDEX_URL: preferredBuild.indexUrl,
+    },
+  };
+}
 function resolveLaunchProfile(toolState, launchProfile) {
   if (!launchProfile) {
     return null;
@@ -365,6 +708,148 @@ function collectMeaningfulFailureText(toolState, output) {
   return lines.slice(-30).join('\n');
 }
 
+function getCombinedRuntimeOutput(runtimeState) {
+  return `${runtimeState?.stdoutLogBuffer || runtimeState?.stdoutBuffer || ''}\n${runtimeState?.stderrLogBuffer || runtimeState?.stderrBuffer || ''}`.trim();
+}
+
+function outputMentionsExpectedUrl(toolState, output) {
+  const normalizedOutput = String(output || '').toLowerCase();
+  return getExpectedLocalMarkers(toolState).some((marker) => normalizedOutput.includes(marker));
+}
+
+function getWindowsExitDescription(code) {
+  switch (code >>> 0) {
+    case 3221225477:
+      return 'a native access violation';
+    default:
+      return '';
+  }
+}
+
+function shouldPreferExitCodeContext(message, failureText) {
+  const normalized = `${message || ''}\n${failureText || ''}`.toLowerCase();
+  return (
+    (normalized.includes('warnings.warn(') || normalized.includes('futurewarning:'))
+    && !/(traceback|error:|exception|assertionerror|modulenotfounderror|filenotfounderror|runtimeerror|valueerror|permissionerror)/.test(normalized)
+  );
+}
+
+function hasStructuredPythonFailure(output) {
+  return /(traceback|error:|exception|assertionerror|modulenotfounderror|filenotfounderror|runtimeerror|valueerror|permissionerror)/i.test(String(output || ''));
+}
+
+function buildAutomatic1111NativeCrashMessage(toolState, runtimeState, exitContext) {
+  if (toolState?.id !== 'automatic1111' || exitContext.unsignedExitCode !== 3221225477) {
+    return '';
+  }
+
+  const combinedOutput = getCombinedRuntimeOutput(runtimeState);
+  if (hasStructuredPythonFailure(combinedOutput)) {
+    return '';
+  }
+
+  const loadedWeights = /Loading weights \[/i.test(combinedOutput);
+  const creatingModelFromConfig = /Creating model from config:/i.test(combinedOutput);
+  const lowVramProfileActive = /Launching Web UI with arguments:.*--(?:med|low)vram\b/i.test(combinedOutput);
+  const xformersUnavailable = /No module 'xformers'\. Proceeding without it\./i.test(combinedOutput) || /no module 'xformers'\. Processing without/i.test(combinedOutput);
+  const stageMessage = exitContext.reachedLocalUrl
+    ? `${toolState.name} finished its bootstrap work, answered its local API, and then a native Windows component crashed while the runtime was bringing up the web UI and first model load.`
+    : creatingModelFromConfig
+      ? `${toolState.name} loaded its checkpoint and began constructing its Stable Diffusion model, then a native Windows component crashed before the local API became available.`
+      : loadedWeights
+        ? `${toolState.name} loaded its checkpoint and then a native Windows component crashed before it could finish constructing the Stable Diffusion model and local API.`
+        : `${toolState.name} hit a native Windows crash during Automatic1111 startup before its local API became available.`;
+  const lowVramMessage = lowVramProfileActive
+    ? 'Local AI Hub had already applied its general Automatic1111 low-VRAM launch mode for this run, so the remaining failure is beyond the broad launch-profile adjustment Local AI Hub can safely make. '
+    : '';
+  const xformersMessage = xformersUnavailable
+    ? 'The captured output already shows that Automatic1111 had fallen back away from xformers, so this is not an xformers-enabled launch path. '
+    : '';
+
+  return `${stageMessage} ${lowVramMessage}${xformersMessage}Local AI Hub did not capture a Python traceback, so this points to Automatic1111's native CUDA or PyTorch runtime stack on this machine rather than its install or first-run download state. Windows reported exit code ${exitContext.unsignedExitCode} (${exitContext.hexExitCode}), which usually means ${exitContext.exitDescription}. Open the logs folder for the full launch details.`;
+}
+
+function buildFooocusNativeCrashMessage(toolState, runtimeState, exitContext) {
+  if (toolState?.id !== 'fooocus' || exitContext.unsignedExitCode !== 3221225477) {
+    return '';
+  }
+
+  const combinedOutput = getCombinedRuntimeOutput(runtimeState);
+  if (hasStructuredPythonFailure(combinedOutput)) {
+    return '';
+  }
+
+  const reachedCudaStartup = /device:\s*cuda:/i.test(combinedOutput) || /vae dtype:/i.test(combinedOutput);
+  const stageMessage = exitContext.reachedLocalUrl
+    ? `${toolState.name} reached its local URL and then a native Windows component inside Fooocus crashed.`
+    : reachedCudaStartup
+      ? `${toolState.name} finished its initial CUDA startup steps and then a native Windows component inside Fooocus crashed before the web UI became available.`
+      : `${toolState.name} hit a native Windows crash before its web UI became available.`;
+
+  return `${stageMessage} Local AI Hub did not receive a Python traceback, so this points to Fooocus's embedded runtime rather than its install or library state. Windows reported exit code ${exitContext.unsignedExitCode} (${exitContext.hexExitCode}), which usually means ${exitContext.exitDescription}. Open the logs folder for the full launch details.`;
+}
+function buildExitCodeContextMessage(toolState, runtimeState) {
+  const exitCode = Number(runtimeState?.process?.exitCode);
+  if (!Number.isFinite(exitCode) || exitCode === 0) {
+    return '';
+  }
+
+  const unsignedExitCode = exitCode >>> 0;
+  const hexExitCode = `0x${unsignedExitCode.toString(16).toUpperCase().padStart(8, '0')}`;
+  const combinedOutput = getCombinedRuntimeOutput(runtimeState);
+  const reachedLocalUrl = outputMentionsExpectedUrl(toolState, combinedOutput);
+  const exitDescription = getWindowsExitDescription(unsignedExitCode);
+  const automatic1111NativeCrashMessage = buildAutomatic1111NativeCrashMessage(toolState, runtimeState, {
+    unsignedExitCode,
+    hexExitCode,
+    reachedLocalUrl,
+    exitDescription,
+  });
+  if (automatic1111NativeCrashMessage) {
+    return automatic1111NativeCrashMessage;
+  }
+
+  const fooocusNativeCrashMessage = buildFooocusNativeCrashMessage(toolState, runtimeState, {
+    unsignedExitCode,
+    hexExitCode,
+    reachedLocalUrl,
+    exitDescription,
+  });
+  if (fooocusNativeCrashMessage) {
+    return fooocusNativeCrashMessage;
+  }
+  const stageVerb = exitDescription ? 'crashed' : 'stopped';
+  const stageMessage = reachedLocalUrl
+    ? `${toolState.name} reached its local URL and then ${stageVerb}`
+    : `${toolState.name} ${stageVerb} before it finished starting`;
+  const reasonMessage = exitDescription
+    ? `Windows reported exit code ${unsignedExitCode} (${hexExitCode}), which usually means ${exitDescription}.`
+    : `Windows reported exit code ${unsignedExitCode} (${hexExitCode}).`;
+  return `${stageMessage}. ${reasonMessage} Open the logs folder for the full launch details.`;
+}
+
+function buildConcreteLaunchFailureMessage(toolState, runtimeState, fallbackMessage) {
+  const combinedOutput = getCombinedRuntimeOutput(runtimeState);
+  const failureText = collectMeaningfulFailureText(toolState, combinedOutput);
+  if (!failureText) {
+    return buildExitCodeContextMessage(toolState, runtimeState) || fallbackMessage;
+  }
+
+  const diagnosis = diagnoseLaunchFailure(toolState, failureText);
+  if (diagnosis?.recognized && diagnosis.summary) {
+    return diagnosis.summary;
+  }
+
+  if (shouldPreferExitCodeContext(diagnosis?.summary || '', failureText)) {
+    const exitCodeMessage = buildExitCodeContextMessage(toolState, runtimeState);
+    if (exitCodeMessage) {
+      return exitCodeMessage;
+    }
+  }
+
+  return diagnosis?.summary || humanizeError(failureText, fallbackMessage);
+}
+
 async function probeUrl(url) {
   if (!url) {
     return false;
@@ -455,6 +940,27 @@ async function getRunningProcessNames(processNames = []) {
   return matches;
 }
 
+async function waitForNamedProcesses(processNames = [], timeoutMs = SUCCESS_CONFIRM_TIMEOUT_MS) {
+  const normalizedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Number(timeoutMs) : SUCCESS_CONFIRM_TIMEOUT_MS;
+  const deadline = Date.now() + normalizedTimeoutMs;
+
+  while (Date.now() <= deadline) {
+    const runningProcessNames = await getRunningProcessNames(processNames);
+    if (runningProcessNames.length > 0) {
+      return runningProcessNames;
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      break;
+    }
+
+    await sleep(Math.min(500, remainingMs));
+  }
+
+  return [];
+}
+
 async function isToolActive(toolState) {
   if (!toolState) {
     return false;
@@ -509,6 +1015,17 @@ async function openToolInterface(toolState) {
   }
 
   const launchUrl = assertLoopbackUrl(toolState.launchUrl, 'tool URL');
+  const shouldBypassInterfaceProbe = toolState.id === 'automatic1111'
+    && Boolean(toolState.healthUrl)
+    && String(toolState.healthUrl).trim() !== String(toolState.launchUrl).trim();
+
+  if (shouldBypassInterfaceProbe) {
+    // Automatic1111 can answer its API before its heavy Gradio root page is safe to probe.
+    await sleep(1500);
+    await shell.openExternal(launchUrl).catch(() => null);
+    return;
+  }
+
   const ready = await waitForToolReady(
     {
       ...toolState,
@@ -595,7 +1112,7 @@ function emitLaunchProgress(runtimeState) {
     toolId: runtimeState.toolId,
     active: Boolean(state.active),
     detail: state.active ? state.detail || null : null,
-    message: buildStartupDownloadMessage(state.toolName),
+    message: buildStartupDownloadMessage(runtimeState),
     percent: Number.isFinite(state.percent) ? state.percent : null,
   };
   const signature = JSON.stringify(payload);
@@ -626,7 +1143,7 @@ function clearLaunchProgress(runtimeState) {
 
 function analyzeStartupDownloadOutput(runtimeState, stream, content) {
   const state = runtimeState?.startupDownload;
-  if (!state) {
+  if (!state || runtimeState?.launchConfirmed) {
     return;
   }
 
@@ -847,7 +1364,9 @@ async function monitorPendingLaunch(toolState, runtimeState = null, options = {}
           await stopRuntimeProcess(toolState.id, runtimeState);
         }
 
-        const message = buildPendingStartupFailureMessage(toolState, target);
+        const message = runtimeState?.process?.exitCode === null
+          ? buildPendingStartupFailureMessage(toolState, target)
+          : buildConcreteLaunchFailureMessage(toolState, runtimeState, buildPendingStartupFailureMessage(toolState, target));
         await persistToolRuntimeState(toolState, 'error', {
           lastError: message,
           lastRepairMessage: null,
@@ -935,8 +1454,13 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger, option
         };
       }
 
+      const timeoutMessage = `${toolState.name} did not answer on ${target} before Local AI Hub's startup check finished. Open the logs folder for the full launch details.`;
+      const launchFailureMessage = !processStillRunning && runningProcessNames.length === 0
+        ? buildConcreteLaunchFailureMessage(toolState, runtimeState, timeoutMessage)
+        : timeoutMessage;
+
       await stopRuntimeProcess(toolState.id, runtimeState);
-      throw new Error(`${toolState.name} did not answer on ${target} before Local AI Hub's startup check finished. Open the logs folder for the full launch details.`);
+      throw new Error(launchFailureMessage);
     }
 
     await logger.info('Tool answered on its expected local URL.', {
@@ -960,9 +1484,13 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger, option
     };
   }
 
-  const runningProcessNames = await getRunningProcessNames(toolState.processNames);
+  const runningProcessNames = runtimeState.launchedViaShell
+    ? await waitForNamedProcesses(toolState.processNames)
+    : await getRunningProcessNames(toolState.processNames);
   if (runningProcessNames.length > 0) {
-    await logger.info('Tool launch was confirmed by an active process after the launcher exited.', {
+    await logger.info(runtimeState.launchedViaShell
+      ? 'Tool launch was confirmed by an active process after Windows opened the app.'
+      : 'Tool launch was confirmed by an active process after the launcher exited.', {
       runningProcessNames,
     });
     runtimeState.launchConfirmed = true;
@@ -972,15 +1500,23 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger, option
     };
   }
 
-  throw new Error(`${toolState.name} stopped before Local AI Hub could confirm that it launched.`);
+  throw new Error(runtimeState.launchedViaShell
+    ? `${toolState.name} did not leave a running app process after Windows tried to open it.`
+    : `${toolState.name} stopped before Local AI Hub could confirm that it launched.`);
 }
 async function confirmLaunchAfterExit(toolState, runtimeState = null) {
   if (toolUsesLocalUrl(toolState)) {
+    const confirmationTimeoutMs = runtimeState?.launchConfirmed
+      ? SUCCESS_CONFIRM_TIMEOUT_MS
+      : Math.min(
+          Math.max(SUCCESS_CONFIRM_TIMEOUT_MS, getStartupTimeoutMs(toolState, SUCCESS_CONFIRM_TIMEOUT_MS)),
+          60000,
+        );
+
     return {
       running: await waitForToolReady(
         toolState,
-        Math.max(SUCCESS_CONFIRM_TIMEOUT_MS, getStartupTimeoutMs(toolState, SUCCESS_CONFIRM_TIMEOUT_MS)),
-        runtimeState,
+        confirmationTimeoutMs,
       ),
       runningProcessNames: [],
     };
@@ -1001,133 +1537,155 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
   runtimeState.exitHandled = true;
   pendingStartupMonitors.delete(toolState.id);
   clearLaunchProgress(runtimeState);
-  clearRuntime(toolState.id, runtimeState);
+  runtimeExitSettlingToolIds.add(toolState.id);
 
-  const logger = runtimeState.logger || createRuntimeLogger(toolState, runtimeState.launchProfile || toolState.launchProfile, runtimeOptions);
-  const combinedOutput = `${runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || ''}\n${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
+  try {
+    clearRuntime(toolState.id, runtimeState);
 
-  if (runtimeState.stopping) {
-    await logger.info('Tool runtime stopped by Local AI Hub.', {
-      exitCode: code,
-      signal,
-    });
-    await upsertTool({
-      id: toolState.id,
-      status: 'stopped',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    emitToolState(toolState.id, {
-      status: 'stopped',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    return;
-  }
+    const logger = runtimeState.logger || createRuntimeLogger(toolState, runtimeState.launchProfile || toolState.launchProfile, runtimeOptions);
+    const combinedOutput = `${runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || ''}
+${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
 
-  const launchState = runtimeState.launchConfirmed ? { running: false, runningProcessNames: [] } : await confirmLaunchAfterExit(toolState, runtimeState);
-  if (!runtimeState.launchConfirmed && launchState.running) {
-    await logger.info('Launch process exited after the tool became available.', {
-      exitCode: code,
-      signal,
-      runningProcessNames: launchState.runningProcessNames || [],
-    });
-    await upsertTool({
-      id: toolState.id,
-      status: 'running',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    emitToolState(toolState.id, {
-      status: 'running',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    return;
-  }
-
-  const wasRunning = Boolean(runtimeState.launchConfirmed);
-  const isClean = code === 0 || signal === 'SIGTERM';
-  if (!wasRunning && isClean) {
-    await logger.info('Tool process exited cleanly.', {
-      exitCode: code,
-      signal,
-      stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
-      stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
-    });
-    await upsertTool({
-      id: toolState.id,
-      status: 'stopped',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    emitToolState(toolState.id, {
-      status: 'stopped',
-      lastError: null,
-      lastRepairMessage: null,
-    });
-    return;
-  }
-
-  const failureText = collectMeaningfulFailureText(toolState, combinedOutput);
-  if (isClean && wasRunning) {
-    await logger.warn('Tool exited after it had already been confirmed running.', {
-      exitCode: code,
-      signal,
-      stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
-      stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
-    });
-  } else {
-    await logger.error('Tool process exited unexpectedly.', {
-      exitCode: code,
-      signal,
-      launchProfile: buildLaunchCommandSummary(runtimeState.launchProfile || toolState.launchProfile || null),
-      stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
-      stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
-    });
-  }
-
-  const recoveryResult = runtimeOptions.autoRecoveryAttempted
-    ? { handled: false, recovered: false, userMessage: null }
-    : await attemptAutomaticLaunchRecovery(toolState, failureText || runtimeState.stderrLogBuffer || '', {
-        logger,
-        retryLaunch: async (nextToolState) => {
-          await launchToolInternal(nextToolState, {
-            autoRecoveryAttempted: true,
-            launchContext: 'automatic-recovery',
-          });
-        },
+    if (runtimeState.stopping) {
+      await logger.info('Tool runtime stopped by Local AI Hub.', {
+        exitCode: code,
+        signal,
       });
+      await upsertTool({
+        id: toolState.id,
+        status: 'stopped',
+        lastError: null,
+        lastRepairMessage: null,
+      });
+      emitToolState(toolState.id, {
+        status: 'stopped',
+        lastError: null,
+        lastRepairMessage: null,
+      });
+      return;
+    }
 
-  if (recoveryResult?.recovered) {
-    return;
+    const launchState = await confirmLaunchAfterExit(toolState, runtimeState);
+    if (launchState.running) {
+      await logger.info(runtimeState.launchConfirmed
+        ? 'Launcher process exited, but the tool is still available.'
+        : 'Launch process exited after the tool became available.', {
+        exitCode: code,
+        signal,
+        runningProcessNames: launchState.runningProcessNames || [],
+      });
+      await upsertTool({
+        id: toolState.id,
+        status: 'running',
+        lastError: null,
+        lastRepairMessage: null,
+      });
+      emitToolState(toolState.id, {
+        status: 'running',
+        lastError: null,
+        lastRepairMessage: null,
+      });
+      return;
+    }
+
+    const wasRunning = Boolean(runtimeState.launchConfirmed);
+    const isClean = code === 0 || signal === 'SIGTERM';
+    if (!wasRunning && isClean) {
+      await logger.info('Tool process exited cleanly.', {
+        exitCode: code,
+        signal,
+        stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
+        stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
+      });
+      await upsertTool({
+        id: toolState.id,
+        status: 'stopped',
+        lastError: null,
+        lastRepairMessage: null,
+      });
+      emitToolState(toolState.id, {
+        status: 'stopped',
+        lastError: null,
+        lastRepairMessage: null,
+      });
+      return;
+    }
+
+    const failureText = collectMeaningfulFailureText(toolState, combinedOutput);
+    if (isClean && wasRunning) {
+      await logger.warn('Tool exited after it had already been confirmed running.', {
+        exitCode: code,
+        signal,
+        stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
+        stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
+      });
+    } else {
+      await logger.error('Tool process exited unexpectedly.', {
+        exitCode: code,
+        signal,
+        launchProfile: buildLaunchCommandSummary(runtimeState.launchProfile || toolState.launchProfile || null),
+        stdout: runtimeState.stdoutLogBuffer || runtimeState.stdoutBuffer || '',
+        stderr: runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || '',
+      });
+    }
+
+    const recoveryResult = runtimeOptions.autoRecoveryAttempted
+      ? { handled: false, recovered: false, userMessage: null }
+      : await attemptAutomaticLaunchRecovery(toolState, failureText || runtimeState.stderrLogBuffer || '', {
+          logger,
+          retryLaunch: async (nextToolState) => {
+            await launchToolInternal(nextToolState, {
+              autoRecoveryAttempted: true,
+              launchContext: 'automatic-recovery',
+            });
+          },
+        });
+
+    if (recoveryResult?.recovered) {
+      return;
+    }
+
+    let message = recoveryResult?.userMessage;
+    if (message && shouldPreferExitCodeContext(message, failureText)) {
+      message = buildExitCodeContextMessage(toolState, runtimeState) || message;
+    }
+
+    if (!message) {
+      message = buildExitCodeContextMessage(toolState, runtimeState);
+    }
+
+    if (!message && toolUsesLocalUrl(toolState) && !wasRunning) {
+      const target = toolState.healthUrl || toolState.launchUrl || `http://127.0.0.1:${toolState.defaultPort}`;
+      message = `${toolState.name} stopped before it became available on ${target}. Open the logs folder for the full launch details.`;
+    }
+
+    if (!message) {
+      const fallbackMessage = wasRunning
+        ? `${toolState.name} stopped unexpectedly while it was running.`
+        : `${toolState.name} stopped unexpectedly.`;
+      message = humanizeError(failureText || fallbackMessage, fallbackMessage);
+    }
+
+    if (!wasRunning && runtimeState.startupCheckPending) {
+      runtimeState.startupFailureMessage = message;
+      return;
+    }
+
+    await upsertTool({
+      id: toolState.id,
+      status: 'error',
+      lastError: message,
+      lastRepairMessage: null,
+    });
+    emitToolState(toolState.id, {
+      status: 'error',
+      lastError: message,
+      lastRepairMessage: null,
+    });
+    emitUnexpectedStop(toolState, message);
+  } finally {
+    runtimeExitSettlingToolIds.delete(toolState.id);
   }
-
-  let message = recoveryResult?.userMessage;
-  if (!message && toolUsesLocalUrl(toolState) && !wasRunning) {
-    const target = toolState.healthUrl || toolState.launchUrl || `http://127.0.0.1:${toolState.defaultPort}`;
-    message = `${toolState.name} stopped before it became available on ${target}. Open the logs folder for the full launch details.`;
-  }
-
-  if (!message) {
-    const fallbackMessage = wasRunning
-      ? `${toolState.name} stopped unexpectedly while it was running.`
-      : `${toolState.name} stopped unexpectedly.`;
-    message = humanizeError(failureText || fallbackMessage, fallbackMessage);
-  }
-
-  await upsertTool({
-    id: toolState.id,
-    status: 'error',
-    lastError: message,
-    lastRepairMessage: null,
-  });
-  emitToolState(toolState.id, {
-    status: 'error',
-    lastError: message,
-    lastRepairMessage: null,
-  });
-  emitUnexpectedStop(toolState, message);
 }
 
 function attachRuntimeHandlers(toolState, runtimeState, runtimeOptions = {}) {
@@ -1194,6 +1752,8 @@ async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}
     kind: 'python',
     toolId: toolState.id,
     toolName: toolState.name,
+    launchUrl: toolState.launchUrl || null,
+    healthUrl: toolState.healthUrl || null,
     process: shellInstance.childProcess,
     shell: shellInstance,
     logger,
@@ -1221,6 +1781,32 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
     launch: buildLaunchCommandSummary(safeLaunchProfile),
   });
 
+  if (getToolInterfaceMode(toolState) === 'desktop-app') {
+    const launchError = await shell.openPath(safeLaunchProfile.executable);
+    if (launchError) {
+      throw new Error(launchError);
+    }
+
+    return {
+      kind: 'binary-shell',
+      toolId: toolState.id,
+      toolName: toolState.name,
+      launchUrl: toolState.launchUrl || null,
+      healthUrl: toolState.healthUrl || null,
+      process: null,
+      logger,
+      launchProfile: safeLaunchProfile,
+      startupDownload: createStartupDownloadState(toolState),
+      stdoutBuffer: '',
+      stderrBuffer: '',
+      stdoutLogBuffer: '',
+      stderrLogBuffer: '',
+      stopping: false,
+      exitHandled: false,
+      launchedViaShell: true,
+    };
+  }
+
   const child = spawn(safeLaunchProfile.executable, safeLaunchProfile.args || [], {
     cwd: safeLaunchProfile.workingDir || path.dirname(safeLaunchProfile.executable),
     windowsHide: true,
@@ -1231,6 +1817,8 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
     kind: 'binary',
     toolId: toolState.id,
     toolName: toolState.name,
+    launchUrl: toolState.launchUrl || null,
+    healthUrl: toolState.healthUrl || null,
     process: child,
     logger,
     launchProfile: safeLaunchProfile,
@@ -1269,6 +1857,8 @@ async function launchBatchProfile(toolState, launchProfile, runtimeOptions = {})
     kind: 'batch',
     toolId: toolState.id,
     toolName: toolState.name,
+    launchUrl: toolState.launchUrl || null,
+    healthUrl: toolState.healthUrl || null,
     process: child,
     logger,
     launchProfile: safeLaunchProfile,
@@ -1383,10 +1973,12 @@ async function launchToolInternal(toolState, options = {}) {
     };
   }
 
-  const launchProfile = resolveLaunchProfile(toolState, mergeLaunchProfiles(toolState.launchProfile, options.launchProfileOverride));
+  let launchProfile = resolveLaunchProfile(toolState, mergeLaunchProfiles(toolState.launchProfile, options.launchProfileOverride));
   if (!launchProfile) {
     throw new Error(`${toolState.name} does not have a launch profile yet.`);
   }
+
+  launchProfile = await prepareManagedStableDiffusionLaunchProfile(toolState, launchProfile);
 
   if (launchProfile.kind === 'embedded') {
     await persistToolRuntimeState(toolState, 'running', {
@@ -1406,9 +1998,9 @@ async function launchToolInternal(toolState, options = {}) {
     return toolState;
   }
 
-  try {
-    let runtimeState = null;
+  let runtimeState = null;
 
+  try {
     if (launchProfile.kind === 'python-script' || launchProfile.kind === 'python-module') {
       runtimeState = await launchPythonProfile(toolState, launchProfile, options);
     } else if (launchProfile.kind === 'binary') {
@@ -1424,7 +2016,15 @@ async function launchToolInternal(toolState, options = {}) {
       lastRepairMessage: null,
     });
 
-    const launchResult = await waitForLaunchConfirmation(toolState, runtimeState, runtimeState.logger, options);
+    runtimeState.startupCheckPending = true;
+    let launchResult = null;
+    try {
+      launchResult = await waitForLaunchConfirmation(toolState, runtimeState, runtimeState.logger, options);
+    } finally {
+      if (runtimeState) {
+        runtimeState.startupCheckPending = false;
+      }
+    }
     if (launchResult.status === 'starting') {
       monitorPendingLaunch(toolState, runtimeState, {
         launchContext: options.launchContext,
@@ -1452,7 +2052,7 @@ async function launchToolInternal(toolState, options = {}) {
       lastError: null,
     };
   } catch (error) {
-    const message = humanizeError(error, `${toolState.name} could not start.`);
+    const message = runtimeState?.startupFailureMessage || humanizeError(error, `${toolState.name} could not start.`);
     await persistToolRuntimeState(toolState, 'error', {
       lastError: message,
       lastRepairMessage: null,
@@ -1558,6 +2158,7 @@ module.exports = {
   getRunningToolIds,
   getRuntimeOutputSnapshot,
   isToolActive,
+  isToolRuntimeSettling,
   isToolReady,
   launchToolFromUserAction,
   prepareToolForMaintenance,
@@ -1566,4 +2167,3 @@ module.exports = {
   setRuntimeEventSink,
   stopTool,
 };
-

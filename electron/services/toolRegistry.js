@@ -568,6 +568,12 @@ function buildLaunchProfileFromCommand(command, context = {}) {
 
 function buildManagedLaunchProfile(toolState, manifest) {
   const baseDir = toolState.appDir || toolState.installDir;
+  const launchToken = tokenizeCommand(manifest.launchCommand)[0] || '';
+  const normalizedLaunchToken = launchToken.toLowerCase();
+  const usesPythonLauncher =
+    normalizedLaunchToken === 'python'
+    || normalizedLaunchToken === 'py'
+    || normalizedLaunchToken.endsWith('python.exe');
   const pythonPath =
     manifest.installInstructions.runtime === 'python'
       ? path.join(toolState.venvDir, 'Scripts', 'python.exe')
@@ -578,7 +584,7 @@ function buildManagedLaunchProfile(toolState, manifest) {
 
   return buildLaunchProfileFromCommand(manifest.launchCommand, {
     baseDir,
-    workingDir: executablePath ? path.dirname(executablePath) : baseDir,
+    workingDir: usesPythonLauncher ? baseDir : executablePath ? path.dirname(executablePath) : baseDir,
     executablePath,
     pythonPath,
     port: manifest.defaultPort,

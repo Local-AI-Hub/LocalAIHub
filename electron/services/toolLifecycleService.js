@@ -1,4 +1,4 @@
-const path = require('path');
+﻿const path = require('path');
 
 const { normalizeDirectoryPath } = require('./configService');
 const { findManagedToolsRootForPath } = require('./pathSafetyService');
@@ -98,17 +98,22 @@ function isToolInManagedLocation(toolState, manifest) {
 }
 
 function inferLifecycleMode(toolState, manifest) {
-  const normalizedValue = String(toolState?.lifecycleMode || '').trim().toLowerCase();
-  if (Object.values(INSTALL_LIFECYCLE).includes(normalizedValue)) {
-    return normalizedValue;
-  }
-
   if (toolState?.source === 'managed' && usesInstallerExecutable(manifest)) {
     return INSTALL_LIFECYCLE.OFFICIAL_INSTALLER;
   }
 
-  if (toolState?.source === 'managed' || toolState?.managedByLocalAIHub || isToolInManagedLocation(toolState, manifest)) {
+  if (
+    toolState?.source === 'managed' ||
+    toolState?.managedByLocalAIHub ||
+    (!usesInstallerExecutable(manifest) && toolState?.installedByLocalAIHub === true) ||
+    isToolInManagedLocation(toolState, manifest)
+  ) {
     return INSTALL_LIFECYCLE.MANAGED;
+  }
+
+  const normalizedValue = String(toolState?.lifecycleMode || '').trim().toLowerCase();
+  if (Object.values(INSTALL_LIFECYCLE).includes(normalizedValue)) {
+    return normalizedValue;
   }
 
   if (usesInstallerExecutable(manifest)) {
@@ -117,7 +122,6 @@ function inferLifecycleMode(toolState, manifest) {
 
   return INSTALL_LIFECYCLE.EXTERNAL;
 }
-
 function inferInstalledByLocalAIHub(toolState, manifest) {
   if (typeof toolState?.installedByLocalAIHub === 'boolean') {
     return toolState.installedByLocalAIHub;
@@ -264,3 +268,5 @@ module.exports = {
   normalizeToolLifecycle,
   usesInstallerExecutable,
 };
+
+

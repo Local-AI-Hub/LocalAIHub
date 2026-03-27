@@ -9,12 +9,13 @@ const { version: APP_VERSION } = require('../../package.json');
 
 const { getAppPaths, humanizeError, normalizeOptionalDirectoryPath, readConfig, removeTool, setToolIgnored, upsertTool } = require('./configService');
 const { verifyDownloadedFileIntegrity } = require('./downloadIntegrityService');
-const { resolvePythonCommand, runCommand } = require('./commandService');
+const { compareVersions, resolvePythonCommand, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { detectPythonRequirement, describePythonRequirement } = require('./pythonRequirementService');
 const { ensureManagedPythonRuntime } = require('./pythonRuntimeService');
 const { applyRepairCleanup, getDiskPreflight, inspectRepairCleanup, preflightPathRemoval, removePathWithRetries } = require('./storageMaintenanceService');
 const { syncDiscoveredTools } = require('./toolDiscoveryService');
+const { getCachedToolUpdateEntry, refreshInstalledToolUpdates } = require('./toolUpdateService');
 const { buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
 const { INSTALL_DESTINATION_CONTROL, getToolActionSemantics, isDirectManagedTool, isOfficialInstallerTool, normalizeToolLifecycle } = require('./toolLifecycleService');
 const {
@@ -37,6 +38,7 @@ const INSTALLER_MATERIALIZATION_POLL_MS = 1000;
 const GUIDED_INSTALLER_LAUNCH_SETTLE_MS = 1500;
 const OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS = 45000;
 const OFFICIAL_UNINSTALL_SETTLE_POLL_MS = 1000;
+const VERSION_PATTERN = /v?(\d+(?:\.\d+){1,3})/i;
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -295,6 +297,107 @@ function isBareCommand(token) {
 const SAFE_PIP_PACKAGE_PATTERN = /^[A-Za-z0-9._+\-[\],=<>!~]+$/;
 const SAFE_PIP_VCS_TARGET_PATTERN = /^git\+https:\/\/[A-Za-z0-9./:@_#?=&%-]+$/i;
 
+function extractVersionSegments(versionText) {
+  const match = String(versionText || '').match(VERSION_PATTERN);
+  if (!match?.[1]) {
+    return [];
+  }
+
+  return match[1].split('.').map((entry) => Number.parseInt(entry, 10)).filter(Number.isFinite);
+}
+
+function normalizeVersionText(versionText) {
+  const match = String(versionText || '').match(VERSION_PATTERN);
+  return match?.[1] || '';
+}
+
+function compareVersionText(left, right) {
+  const leftSegments = extractVersionSegments(left);
+  const rightSegments = extractVersionSegments(right);
+  if (!leftSegments.length || !rightSegments.length) {
+    return 0;
+  }
+
+  return compareVersions(leftSegments, rightSegments);
+}
+
+function isPinnedGitHubReleaseAsset(downloadUrl) {
+  return /github\.com\/[^/]+\/[^/]+\/releases\/download\//i.test(String(downloadUrl || ''))
+    && !/github\.com\/[^/]+\/[^/]+\/releases\/latest\/download\//i.test(String(downloadUrl || ''));
+}
+
+function resolveUpdateManifest(manifest, updateEntry) {
+  const downloadUrl = String(updateEntry?.downloadUrl || '').trim();
+  const downloadFileName = path.basename(String(updateEntry?.downloadFileName || '').trim());
+  const downloadResolutionError = String(updateEntry?.downloadResolutionError || '').trim();
+  if (downloadUrl) {
+    return {
+      ...manifest,
+      downloadUrl: assertSecureRemoteUrl(downloadUrl, `${manifest.name} update download URL`),
+      installInstructions: downloadFileName
+        ? {
+            ...manifest.installInstructions,
+            archiveName: downloadFileName,
+            downloadFileName,
+          }
+        : manifest.installInstructions,
+    };
+  }
+
+  if (downloadResolutionError) {
+    throw new Error(downloadResolutionError);
+  }
+
+  if (updateEntry?.availableVersion && isPinnedGitHubReleaseAsset(manifest.downloadUrl)) {
+    throw new Error(`${manifest.name} has an available update to ${updateEntry.availableVersion}, but Local AI Hub could not resolve the matching release download yet.`);
+  }
+
+  return manifest;
+}
+
+function resolveUpdateDownloadCachePath(toolState, managedPaths, updateEntry) {
+  const downloadFileName = path.basename(String(updateEntry?.downloadFileName || '').trim());
+  if (!downloadFileName) {
+    return toolState.downloadCachePath || managedPaths.archivePath;
+  }
+
+  const downloadsDir = path.dirname(managedPaths.archivePath);
+  return assertPathInside(
+    downloadsDir,
+    path.join(downloadsDir, downloadFileName),
+    'Local AI Hub refused to place the update download outside the managed downloads folder.',
+  );
+}
+
+async function readExecutableProductVersion(targetPath) {
+  if (!targetPath || !(await fs.pathExists(targetPath))) {
+    return '';
+  }
+
+  const escapedPath = String(targetPath).replace(/'/g, "''");
+  const result = await runCommand('powershell.exe', ['-NoProfile', '-Command', `(Get-Item -LiteralPath '${escapedPath}').VersionInfo.ProductVersion`], {
+    allowFailure: true,
+  }).catch(() => null);
+
+  return normalizeVersionText(result?.stdout || '');
+}
+
+async function readInstalledBinaryVersion(toolState) {
+  return normalizeVersionText(toolState?.installedVersion || '')
+    || await readExecutableProductVersion(toolState?.launchProfile?.executable || toolState?.executablePath || '');
+}
+
+function buildIncompleteUpdateVersionMessage(manifest, expectedVersion, detectedVersion = '', previousVersion = '') {
+  if (detectedVersion) {
+    return `Local AI Hub ran the ${manifest.name} updater, but Windows still reports version ${detectedVersion} instead of ${expectedVersion}.`;
+  }
+
+  if (previousVersion) {
+    return `Local AI Hub ran the ${manifest.name} updater, but it still appears to be on version ${previousVersion} instead of ${expectedVersion}.`;
+  }
+
+  return `Local AI Hub ran the ${manifest.name} updater, but it could not verify that version ${expectedVersion} was installed.`;
+}
 function assertSafePipInstallTarget(value) {
   const target = String(value || '').trim();
   if (!target || (!SAFE_PIP_PACKAGE_PATTERN.test(target) && !SAFE_PIP_VCS_TARGET_PATTERN.test(target))) {
@@ -1156,7 +1259,7 @@ function resolveLaunchProfileTargetPath(launchProfile) {
 
 async function verifyManagedToolInstall(toolState, manifest, logger) {
   const safeToolState = ensureManagedToolStatePaths(toolState);
-  const launchProfile = safeToolState.launchProfile || buildManagedLaunchProfile(safeToolState, manifest);
+  const launchProfile = buildManagedLaunchProfile(safeToolState, manifest);
 
   if (!(await toolIsAvailable({
     ...safeToolState,
@@ -1870,6 +1973,137 @@ async function materializeExecutableInstallerTool(manifest, paths, options = {})
   }
 }
 
+async function updateExecutableInstallerTool(manifest, paths, options = {}) {
+  const { appDir, archivePath, installDir, venvDir } = paths;
+  const installerArgs = resolveInstallerArgs(manifest, installDir, appDir);
+  const expectManagedInstall = options.expectManagedInstall !== false;
+  const errorMessage = options.errorMessage || `Local AI Hub could not run the ${manifest.name} updater.`;
+  const expectedVersion = normalizeVersionText(options.expectedVersion || '');
+  const previousVersion = normalizeVersionText(options.previousVersion || '');
+  const updateViaArchiveExtraction =
+    expectManagedInstall
+    && Boolean(manifest?.installInstructions?.updateViaArchiveExtraction)
+    && path.extname(archivePath).toLowerCase() === '.exe';
+  let recoveredFromArchive = updateViaArchiveExtraction;
+
+  if (updateViaArchiveExtraction) {
+    await options.logger.info('Applying the managed update directly from the downloaded package.', {
+      archivePath,
+      installDir,
+      appDir,
+      expectedVersion: expectedVersion || null,
+      previousVersion: previousVersion || null,
+    });
+    await extractArchive(archivePath, appDir, options.logger);
+  } else {
+    await options.logger.info('Launching the official update installer executable.', {
+      archivePath,
+      installDir,
+      appDir,
+      installerArgs,
+      expectsManagedInstall: expectManagedInstall,
+      expectedVersion: expectedVersion || null,
+      previousVersion: previousVersion || null,
+    });
+
+    const installerRun = await runInstallerExecutableFile(archivePath, installerArgs, options.logger, errorMessage);
+    const trackedCompletion = createTrackedPromise(installerRun.completion);
+
+    await options.logger.info('The official update installer process started.', {
+      archivePath,
+      installDir,
+      appDir,
+      launchMethod: installerRun.launchMethod,
+      pid: installerRun.pid,
+      expectsManagedInstall: expectManagedInstall,
+      expectedVersion: expectedVersion || null,
+      previousVersion: previousVersion || null,
+    });
+
+    await installerRun.completion.catch(() => null);
+    await logInstallerProcessCompletion(options.logger, installerRun, paths, trackedCompletion);
+
+    let installerRunError = trackedCompletion.error;
+
+    if (installerRunError && expectManagedInstall && path.extname(archivePath).toLowerCase() === '.exe') {
+      await options.logger.warn('The official update installer exited unsuccessfully. Trying to recover the managed app directly from the downloaded package.', {
+        archivePath,
+        installDir,
+        appDir,
+        error: installerRunError,
+      });
+
+      try {
+        await extractArchive(archivePath, appDir, options.logger);
+        recoveredFromArchive = true;
+        installerRunError = null;
+        await options.logger.info('Managed update files were recovered directly from the downloaded package after the installer exited.', {
+          archivePath,
+          installDir,
+          appDir,
+        });
+      } catch (recoveryError) {
+        await options.logger.warn('Direct archive recovery after the updater exit did not succeed.', {
+          archivePath,
+          installDir,
+          appDir,
+          error: recoveryError,
+        });
+      }
+    }
+
+    if (installerRunError) {
+      const exitCode = Number(installerRunError.code);
+      if (Number.isFinite(exitCode)) {
+        const invocationError = new Error(`The ${manifest.name} updater exited with code ${exitCode} after Local AI Hub passed its managed-install arguments.`);
+        invocationError.code = exitCode;
+        throw invocationError;
+      }
+
+      throw installerRunError;
+    }
+
+    if (!recoveredFromArchive) {
+      await sleep(GUIDED_INSTALLER_LAUNCH_SETTLE_MS);
+    }
+  }
+
+  const toolState = await resolveInstalledExecutableToolState(
+    manifest,
+    installDir,
+    appDir,
+    venvDir,
+    archivePath,
+    options.logger,
+    {
+      allowExternalResult: !expectManagedInstall,
+    },
+  );
+
+  if (!toolState) {
+    if (!expectManagedInstall) {
+      throw new Error(`Local AI Hub launched the ${manifest.name} updater, but it closed without leaving a detectable install in the expected external locations.`);
+    }
+
+    throw new Error(buildManagedPlacementFailureMessage(manifest, installDir));
+  }
+
+  const detectedVersion = await readInstalledBinaryVersion(toolState);
+  if (expectedVersion) {
+    if (detectedVersion) {
+      if (compareVersionText(detectedVersion, expectedVersion) < 0) {
+        throw new Error(buildIncompleteUpdateVersionMessage(manifest, expectedVersion, detectedVersion, previousVersion));
+      }
+    } else if (previousVersion && compareVersionText(previousVersion, expectedVersion) < 0) {
+      throw new Error(buildIncompleteUpdateVersionMessage(manifest, expectedVersion, '', previousVersion));
+    }
+  }
+
+  return {
+    detectedVersion,
+    toolState,
+  };
+}
 async function ensureCachedDownload(manifest, archivePath, logger, onProgress, toolId) {
   assertSecureRemoteUrl(manifest.downloadUrl, `${manifest.name} download URL`);
 
@@ -3089,6 +3323,24 @@ async function uninstallTool(toolState) {
 
       await removeTool(safeToolState.id);
       await setToolIgnored(safeToolState.id, false);
+      const postUninstallDetection = await getPostUninstallDetection(safeToolState, matchesTrackedExternalInstall);
+      if (postUninstallDetection.detectedAvailable) {
+        const detectedPath =
+          postUninstallDetection.detectedTool?.displayPath ||
+          postUninstallDetection.detectedTool?.installDir ||
+          postUninstallDetection.detectedTool?.detectedPath ||
+          'another detected install';
+        return {
+          ...safeToolState,
+          lastError: null,
+          status: 'stopped',
+          uninstallMessage: buildResultMessage(
+            `${manifest.name}'s Local AI Hub-managed copy was removed. A separate install at ${detectedPath} is still available, so Local AI Hub switched back to showing it as a detected install.`,
+            { removedShortcutCount: shortcutCleanup.removedCount },
+          ),
+        };
+      }
+
       return {
         ...safeToolState,
         lastError: null,
@@ -3357,22 +3609,28 @@ async function updateToolInstallation(toolState, options = {}) {
   });
 
   try {
-    const installOptions = {
-      ...options,
-      installRoot,
-    };
-
+    const installRoot = resolveStoredInstallRoot(toolState, options.installRoot || null);
     const installKind = manifest.installInstructions.kind || 'zip';
     const runtimeKind = getToolRuntime(manifest);
-    const managedPaths = buildManagedPaths(manifest, { installRoot: resolveStoredInstallRoot(toolState) });
+    const managedPaths = buildManagedPaths(manifest, { installRoot });
     const isManagedInstall = toolState.source === 'managed';
     const safeToolState = isManagedInstall ? ensureManagedToolStatePaths(toolState) : { ...toolState };
+    let updateEntry = await getCachedToolUpdateEntry(toolState.id).catch(() => null);
+
+    if (updateEntry?.availableVersion && isPinnedGitHubReleaseAsset(manifest.downloadUrl) && !String(updateEntry.downloadUrl || '').trim()) {
+      await refreshInstalledToolUpdates([safeToolState]).catch(() => null);
+      updateEntry = await getCachedToolUpdateEntry(toolState.id).catch(() => null);
+    }
+
+    const expectedVersion = normalizeVersionText(updateEntry?.availableVersion || '');
+    const previousVersion = normalizeVersionText(safeToolState.installedVersion || updateEntry?.currentVersion || '');
+    const downloadManifest = resolveUpdateManifest(manifest, updateEntry);
 
     if (!isManagedInstall && runtimeKind === 'python') {
       throw new Error('Local AI Hub can update externally installed Python tools after they are reinstalled into Local AI Hub-managed storage.');
     }
 
-    const downloadCachePath = safeToolState.downloadCachePath || managedPaths.archivePath;
+    const downloadCachePath = resolveUpdateDownloadCachePath(safeToolState, managedPaths, updateEntry);
 
     await advanceStep(logger, options.onProgress, {
       toolId: safeToolState.id,
@@ -3383,13 +3641,14 @@ async function updateToolInstallation(toolState, options = {}) {
 
     if (installKind !== 'pip-package') {
       await fs.remove(downloadCachePath).catch(() => null);
-      await ensureCachedDownload(manifest, downloadCachePath, logger, options.onProgress, safeToolState.id);
+      await ensureCachedDownload(downloadManifest, downloadCachePath, logger, options.onProgress, safeToolState.id);
     }
 
     let updatedState = {
       ...safeToolState,
       downloadCachePath,
     };
+    let resolvedInstalledVersion = '';
 
     if (installKind === 'single-file') {
       const downloadFileName = manifest.installInstructions.downloadFileName || path.basename(downloadCachePath) || `${manifest.id}.exe`;
@@ -3410,6 +3669,7 @@ async function updateToolInstallation(toolState, options = {}) {
         appDir: targetDirectory,
         executablePath: destinationPath,
       };
+      resolvedInstalledVersion = normalizeVersionText(updatedState.installedVersion || expectedVersion || '');
     } else if (installKind === 'installer-exe') {
       const installDir = safeToolState.installDir || managedPaths.installDir;
       const appDir = safeToolState.appDir || safeToolState.installDir || managedPaths.appDir;
@@ -3421,44 +3681,28 @@ async function updateToolInstallation(toolState, options = {}) {
         message: `Running the latest ${manifest.name} installer.`,
       });
 
-      if (isManagedInstall) {
-        const materializedUpdate = await materializeExecutableInstallerTool(
-          manifest,
-          {
-            appDir,
-            archivePath: downloadCachePath,
-            installDir,
-            venvDir: safeToolState.venvDir || managedPaths.venvDir,
-          },
-          {
-            errorMessage: `Local AI Hub could not run the ${manifest.name} updater.`,
-            logger,
-            onProgress: options.onProgress,
-          },
-        );
-        updatedState = {
-          ...updatedState,
-          ...materializedUpdate.toolState,
-          downloadCachePath,
-        };
-      } else {
-        await runInstallerExecutableFile(
-          downloadCachePath,
-          resolveInstallerArgs(manifest, installDir, appDir),
+      const materializedUpdate = await updateExecutableInstallerTool(
+        downloadManifest,
+        {
+          appDir,
+          archivePath: downloadCachePath,
+          installDir,
+          venvDir: safeToolState.venvDir || managedPaths.venvDir,
+        },
+        {
+          errorMessage: `Local AI Hub could not run the ${manifest.name} updater.`,
+          expectManagedInstall: isManagedInstall,
+          expectedVersion,
           logger,
-          `Local AI Hub could not run the ${manifest.name} updater.`,
-        );
-
-        const discoveredTools = await syncDiscoveredTools({ force: true });
-        const refreshedTool = discoveredTools[safeToolState.id];
-        if (await toolIsAvailable(refreshedTool)) {
-          updatedState = {
-            ...safeToolState,
-            ...refreshedTool,
-            downloadCachePath,
-          };
-        }
-      }
+          previousVersion,
+        },
+      );
+      updatedState = {
+        ...updatedState,
+        ...materializedUpdate.toolState,
+        downloadCachePath,
+      };
+      resolvedInstalledVersion = normalizeVersionText(materializedUpdate.detectedVersion || updatedState.installedVersion || '');
     } else if (installKind === 'pip-package') {
       const pythonResolution = await resolveManagedPythonRuntime(
         safeToolState.appDir || managedPaths.appDir,
@@ -3487,6 +3731,7 @@ async function updateToolInstallation(toolState, options = {}) {
       });
 
       await installPythonDependencies(updatedState, manifest, options.onProgress, logger, pythonResolution.runtime);
+      resolvedInstalledVersion = normalizeVersionText(updatedState.installedVersion || expectedVersion || '');
     } else {
       const targetDirectory = safeToolState.appDir || safeToolState.installDir || managedPaths.appDir;
       await advanceStep(logger, options.onProgress, {
@@ -3522,6 +3767,8 @@ async function updateToolInstallation(toolState, options = {}) {
         }
         await installPythonDependencies(updatedState, manifest, options.onProgress, logger, pythonResolution.runtime);
       }
+
+      resolvedInstalledVersion = normalizeVersionText(updatedState.installedVersion || expectedVersion || '');
     }
 
     if (isManagedInstall && runtimeKind !== 'python' && installKind !== 'pip-package') {
@@ -3541,6 +3788,7 @@ async function updateToolInstallation(toolState, options = {}) {
 
     updatedState = {
       ...updatedState,
+      ...(resolvedInstalledVersion ? { installedVersion: resolvedInstalledVersion } : {}),
       downloadCachePath,
       lastError: null,
       lastRepairMessage: null,
@@ -3557,6 +3805,7 @@ async function updateToolInstallation(toolState, options = {}) {
     }
 
     await upsertTool(updatedState);
+    await refreshInstalledToolUpdates([updatedState]).catch(() => null);
 
     await advanceStep(logger, options.onProgress, {
       toolId: safeToolState.id,
@@ -3567,9 +3816,24 @@ async function updateToolInstallation(toolState, options = {}) {
 
     return updatedState;
   } catch (error) {
+    const readableMessage = humanizeError(error, `Local AI Hub could not update ${manifest.name}.`);
+    const failedState = toolState?.source === 'managed'
+      ? ensureManagedToolStatePaths(toolState)
+      : { ...(toolState || {}) };
+
+    if (failedState?.id) {
+      await upsertTool({
+        ...failedState,
+        lastError: readableMessage,
+        lastUpdateMessage: null,
+        status: failedState.status === 'running' ? 'running' : 'error',
+      }).catch(() => null);
+      await refreshInstalledToolUpdates([failedState]).catch(() => null);
+    }
+
     await logger.error('Update failed.', {
       error,
-      readableMessage: humanizeError(error, `Local AI Hub could not update ${manifest.name}.`),
+      readableMessage,
     });
     throw error;
   }

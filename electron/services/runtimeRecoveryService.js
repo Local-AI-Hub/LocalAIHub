@@ -70,6 +70,7 @@ function probeUrl(url) {
     return Promise.resolve(false);
   }
 
+
   return fetch(url, { method: 'GET' })
     .then((response) => Boolean(response))
     .catch(() => false);
@@ -97,10 +98,114 @@ function summarizeUnknownFailure(toolState, stderrText) {
   return `${toolState.name} stopped before it finished starting. Local AI Hub could not match the error automatically. The tool reported: ${lastLine}. Open the logs folder for the full details.`;
 }
 
+function formatMemoryGb(megabytes) {
+  const value = Number(megabytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '';
+  }
+
+  return `${Math.round((value / 1024) * 10) / 10} GB`;
+}
 function diagnoseLaunchFailure(toolState, stderrText, hardware) {
   const stderr = String(stderrText || '');
   const normalized = stderr.toLowerCase();
   const gpuModel = hardware?.gpuModel || 'your GPU';
+
+  if (/No module named open_webui\.__main__/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'openwebui-main-entrypoint',
+      action: 'none',
+      summary: `${toolState.name} is being launched with the wrong Python entrypoint. Local AI Hub needs to start open_webui.main or the open-webui console script instead of python -m open_webui.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'openwebui' && /UnicodeEncodeError:/i.test(stderr) && /charmap codec can't encode/i.test(stderr) && /open_webui\\main\.py/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'openwebui-console-encoding',
+      action: 'none',
+      summary: `${toolState.name} hit a Windows console encoding error while printing its startup banner. Local AI Hub needs to run Open WebUI with UTF-8 Python stdio on this PC.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'openwebui' && /Frontend build directory not found at/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'openwebui-frontend-build-dir',
+      action: 'none',
+      summary: `${toolState.name} started its Python server, but it is still pointing at the wrong frontend asset folder. Local AI Hub needs to launch the packaged install with Open WebUI's installed frontend directory, not the default venv build path.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'openwebui' && /BertModel LOAD REPORT/i.test(stderr) && /can be ignored when loading from different task\/architecture/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'openwebui-wrong-serve-entrypoint',
+      action: 'none',
+      summary: `${toolState.name} initialized part of its embedding stack and then exited before starting its local web server. Local AI Hub needs to launch the open-webui serve entrypoint instead of importing open_webui.main directly.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'automatic1111' && /Stable diffusion model failed to load/i.test(stderr) && (/OutOfMemoryError/i.test(stderr) || /DefaultCPUAllocator: not enough memory/i.test(stderr))) {
+    return {
+      recognized: true,
+      id: 'automatic1111-model-load-oom',
+      action: 'none',
+      summary: `${toolState.name} brought up its web UI, but the first Stable Diffusion model load ran out of GPU or system memory on this machine.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'automatic1111' && /MemoryError/i.test(stderr) && /(window\.gradio_config|gradio\\templates\\frontend\\index\.html|gradio\\routes\.py|toorjson)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'automatic1111-gradio-memoryerror',
+      action: 'none',
+      summary: `${toolState.name} started its Python web server, but Gradio ran out of memory while rendering the first page. This is a real runtime memory failure on this machine, not an install or CUDA bootstrap error.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'automatic1111'
+    && /Loading weights \[/i.test(stderr)
+    && /Running on local URL:/i.test(stderr)
+    && !/(Traceback|MemoryError|Exception|AssertionError|RuntimeError|ValueError|OutOfMemoryError|Stable diffusion model failed to load)/i.test(stderr)) {
+    const lowVramProfileActive = /Launching Web UI with arguments:.*--(?:med|low)vram\b/i.test(stderr);
+    const lowVramMessage = lowVramProfileActive
+      ? ' Local AI Hub had already applied its general Automatic1111 low-VRAM launch mode for this run, so the remaining failure is beyond the broad launch-profile adjustment Local AI Hub can safely make.'
+      : '';
+
+    return {
+      recognized: true,
+      id: 'automatic1111-native-post-bind-crash',
+      action: 'none',
+      summary: `${toolState.name} finished its bootstrap work, answered its local API, and then the Windows process died without a Python traceback.${lowVramMessage} The captured output already shows xformers was unavailable, so this points to Automatic1111's remaining native CUDA or PyTorch runtime stack on this machine rather than its install or first-run download state.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'automatic1111'
+    && /Loading weights \[/i.test(stderr)
+    && !/Running on local URL:/i.test(stderr)
+    && !/(Traceback|MemoryError|Exception|AssertionError|RuntimeError|ValueError|OutOfMemoryError|Stable diffusion model failed to load)/i.test(stderr)) {
+    const lowVramProfileActive = /Launching Web UI with arguments:.*--(?:med|low)vram\b/i.test(stderr);
+    const lowVramMessage = lowVramProfileActive
+      ? ' Local AI Hub had already applied its general Automatic1111 low-VRAM launch mode for this run, so the remaining failure is beyond the broad launch-profile adjustment Local AI Hub can safely make.'
+      : '';
+
+    return {
+      recognized: true,
+      id: 'automatic1111-native-pre-bind-crash',
+      action: 'none',
+      summary: `${toolState.name} loaded its Stable Diffusion checkpoint and then the Windows process died before its local API came up.${lowVramMessage} The captured output already shows xformers was unavailable, so this points to Automatic1111's remaining native CUDA or PyTorch runtime stack on this machine rather than its install or first-run download state.`,
+      repairingMessage: null,
+    };
+  }
 
   if (/torch not compiled with cuda enabled/i.test(stderr)) {
     return {
@@ -144,6 +249,74 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
     };
   }
 
+  if (/torch is not able to use gpu; add --skip-torch-cuda-test/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'torch-cuda-check-failed',
+      action: hardware?.nvidiaSmiAvailable ? 'repair-pytorch-cuda' : 'none',
+      summary: hardware?.nvidiaSmiAvailable
+        ? `${toolState.name} has a PyTorch build that still cannot reach ${gpuModel}.`
+        : `${toolState.name} requires NVIDIA CUDA support, but this PC does not currently expose a working NVIDIA CUDA runtime.`,
+      repairingMessage: hardware?.nvidiaSmiAvailable
+        ? `Local AI Hub is reinstalling a CUDA-enabled PyTorch build for ${gpuModel}.`
+        : null,
+    };
+  }
+
+  if (/your device does not support the current version of torch\/cuda/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'torch-cuda-build-mismatch',
+      action: hardware?.nvidiaSmiAvailable ? 'repair-pytorch-cuda' : 'none',
+      summary: hardware?.nvidiaSmiAvailable
+        ? `${toolState.name} is using a Torch/CUDA build that does not match ${gpuModel}.`
+        : `${toolState.name} requires an NVIDIA CUDA build that this PC does not currently provide.`,
+      repairingMessage: hardware?.nvidiaSmiAvailable
+        ? `Local AI Hub is reinstalling a compatible CUDA-enabled PyTorch build for ${gpuModel}.`
+        : null,
+    };
+  }
+
+  if (toolState?.id === 'automatic1111' && /Couldn't clone Stable Diffusion/i.test(stderr) && /repository not found/i.test(stderr) && /Stability-AI\/stablediffusion\.git/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'automatic1111-stable-diffusion-repo-missing',
+      action: 'none',
+      summary: `${toolState.name} is still trying to clone the retired Stability-AI/stablediffusion.git bootstrap repository. Local AI Hub needs to launch it with the maintained replacement Stable Diffusion repo URL instead.`,
+      repairingMessage: null,
+    };
+  }
+
+  if ((toolState?.id === 'automatic1111' || toolState?.id === 'forge') && /couldn't install clip/i.test(stderr) && /pkg_resources/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'clip-bootstrap-build-failure',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} could not bootstrap its CLIP dependency. The upstream launch step fell back to building CLIP, and that build failed before pkg_resources was available.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with the trusted CLIP bootstrap path.`,
+    };
+  }
+
+  if (toolState?.id === 'fooocus' && /memoryerror/i.test(stderr) && /(window\.gradio_config|gradio_config|toorjson|gradio\\templates\\frontend\\index\.html)/i.test(stderr)) {
+    const systemRamGb = formatMemoryGb(hardware?.systemRamMb);
+    const minimumRamGb = formatMemoryGb(toolState?.compatibility?.minimumRamMb);
+    const belowMinimumRam = Number(hardware?.systemRamMb || 0) > 0
+      && Number(toolState?.compatibility?.minimumRamMb || 0) > 0
+      && Number(hardware.systemRamMb) < Number(toolState.compatibility.minimumRamMb);
+    const memoryContext = systemRamGb ? ` This PC currently reports about ${systemRamGb} of system RAM.` : '';
+    const minimumContext = minimumRamGb ? ` Local AI Hub lists Fooocus with a ${minimumRamGb} minimum RAM floor.` : '';
+
+    return {
+      recognized: true,
+      id: 'fooocus-gradio-memoryerror',
+      action: 'none',
+      summary: belowMinimumRam
+        ? `${toolState.name} reached its local URL, but Gradio ran out of memory while rendering the first page. Fooocus hit MemoryError while serializing window.gradio_config.${memoryContext}${minimumContext} This is a real runtime memory limit on this machine, not an install or library-state problem.`
+        : `${toolState.name} reached its local URL, but Gradio ran out of memory while rendering the first page. Fooocus hit MemoryError while serializing window.gradio_config.${memoryContext} This points to a real runtime memory failure inside Fooocus, not an install or library-state problem.`,
+      repairingMessage: null,
+    };
+  }
+
   const missingModule = stderr.match(/ModuleNotFoundError:\s+No module named ['"]([^'"]+)['"]/i);
   if (missingModule && missingModule[1] && missingModule[1].toLowerCase() !== 'torch') {
     return {
@@ -152,6 +325,47 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       action: 'repair-python-environment',
       summary: `${toolState.name} is missing the Python package "${missingModule[1]}".`,
       repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment automatically.`,
+    };
+  }
+
+  if (/numpy\.dtype size changed/i.test(stderr) || /skimage\._shared\.geometry/i.test(stderr) || /A module that was compiled using NumPy 1\.x cannot be run in\s*NumPy 2/i.test(stderr) || /_ARRAY_API not found/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'python-binary-mismatch',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} has compiled Python packages that no longer match the NumPy 1.x runtime it needs.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment automatically.`,
+    };
+  }
+
+  if (toolState?.id === 'forge' && /FieldInfo' object has no attribute 'in_'/i.test(stderr) && /fastapi\\dependencies\\utils\.py/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'forge-pydantic-fastapi-mismatch',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} has a FastAPI or Gradio dependency stack that drifted away from Forge's pinned Pydantic build.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s pinned web UI dependencies automatically.`,
+    };
+  }
+
+  const missingPath = stderr.match(/FileNotFoundError:\s+\[Errno 2\]\s+No such file or directory:\s+['"]([^'"]+)['"]/i);
+  if (missingPath && missingPath[1]) {
+    return {
+      recognized: true,
+      id: 'missing-launch-path',
+      action: 'none',
+      summary: `${toolState.name} is pointing at a file that is missing on this PC: ${missingPath[1]}. Run Repair or reinstall it.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (/Couldn't find Stable Diffusion in any of:/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'missing-stable-diffusion-layout',
+      action: 'none',
+      summary: `${toolState.name} is missing the Stable Diffusion source folders that its upstream launcher expects. Local AI Hub should launch this tool through its bootstrap step or rebuild its install.`,
+      repairingMessage: null,
     };
   }
 
@@ -459,5 +673,5 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
 module.exports = {
   attemptAutomaticLaunchRecovery,
   diagnoseLaunchFailure,
+  selectPyTorchRepairCandidates,
 };
-

@@ -550,8 +550,129 @@ function detectedLocationIsManaged(manifest, detected, appPaths, existingTool = 
   return candidates.some((candidate) => allowedLocations.has(normalizePathKey(candidate)));
 }
 
+function tokenizeCommand(command) {
+  const matches = String(command || '').match(/"[^"]*"|'[^']*'|[^\s]+/g) || [];
+  return matches.map((token) => token.replace(/^['"']|['"']$/g, ''));
+}
+
+function isBareCommand(command) {
+  return Boolean(command) && !path.isAbsolute(command) && !/[\\/]/.test(command);
+}
+
+function firstExistingRelativePath(basePath, relativePaths = []) {
+  return relativePaths.find((relativePath) => fs.existsSync(path.join(basePath, relativePath))) || null;
+}
+
+function resolvePythonLaunchTarget(tokens = []) {
+  for (let index = 1; index < tokens.length; index += 1) {
+    const token = String(tokens[index] || '').trim();
+    if (!token) {
+      continue;
+    }
+
+    if (token === '-m') {
+      return {
+        kind: 'module',
+        target: String(tokens[index + 1] || '').trim() || null,
+      };
+    }
+
+    if (token === '-c') {
+      return {
+        kind: 'command',
+        target: null,
+      };
+    }
+
+    if (token.startsWith('-')) {
+      if ((token === '-W' || token === '-X') && tokens[index + 1]) {
+        index += 1;
+      }
+      continue;
+    }
+
+    return {
+      kind: 'script',
+      target: token,
+    };
+  }
+
+  return {
+    kind: 'none',
+    target: null,
+  };
+}
+
+function detectedCandidateHasRequiredLaunchArtifacts(manifest, detected) {
+  const installDir = normalizeInstallDirCandidate(detected?.installDir) || detected?.installDir || '';
+  const launchCommand = String(manifest?.externalLaunchCommand || manifest?.launchCommand || '').trim();
+  if (!installDir || !launchCommand) {
+    return false;
+  }
+
+  const tokens = tokenizeCommand(launchCommand);
+  if (tokens.length === 0) {
+    return false;
+  }
+
+  const head = String(tokens[0] || '').toLowerCase();
+  if (head.startsWith('embedded://')) {
+    return true;
+  }
+
+  if (head === 'python' || head === 'py' || head.endsWith('python.exe')) {
+    const relativePythonPath = firstExistingRelativePath(installDir, manifest?.installInstructions?.externalPythonCandidates || []);
+    const pythonPath =
+      detected?.pythonPath ||
+      (detected?.detectedPath && /python(?:\.exe)?$/i.test(path.basename(detected.detectedPath)) ? detected.detectedPath : null) ||
+      (relativePythonPath ? path.join(installDir, relativePythonPath) : null) ||
+      (isBareCommand(tokens[0]) ? tokens[0] : null);
+    if (!pythonPath || (!isBareCommand(pythonPath) && !fs.existsSync(pythonPath))) {
+      return false;
+    }
+
+    const pythonLaunch = resolvePythonLaunchTarget(tokens);
+    if (pythonLaunch.kind === 'module' || pythonLaunch.kind === 'command') {
+      return true;
+    }
+
+    if (!pythonLaunch.target) {
+      return false;
+    }
+
+    const targetPath = path.isAbsolute(pythonLaunch.target)
+      ? pythonLaunch.target
+      : path.join(installDir, pythonLaunch.target);
+    return fs.existsSync(targetPath);
+  }
+
+  if (/\.(bat|cmd)$/i.test(tokens[0])) {
+    if (detected?.detectedPath && /\.(bat|cmd)$/i.test(detected.detectedPath) && fs.existsSync(detected.detectedPath)) {
+      return true;
+    }
+
+    const relativeBatchPath = firstExistingRelativePath(installDir, [tokens[0], ...(manifest?.installInstructions?.externalBatchCandidates || [])]);
+    return Boolean(relativeBatchPath && fs.existsSync(path.join(installDir, relativeBatchPath)));
+  }
+
+  if (detected?.detectedPath && fs.existsSync(detected.detectedPath)) {
+    return true;
+  }
+
+  const relativeExecutablePath = firstExistingRelativePath(installDir, [tokens[0], ...(manifest?.installInstructions?.externalExecutableCandidates || [])]);
+  if (relativeExecutablePath) {
+    return fs.existsSync(path.join(installDir, relativeExecutablePath));
+  }
+
+  return Boolean(!/[\\/]/.test(tokens[0]) && fs.existsSync(installDir));
+}
+
 function selectExternalInstallCandidate(manifest, detected, appPaths, existingTool = null) {
   if (!detected || detectedLocationIsManaged(manifest, detected, appPaths, existingTool)) {
+    return null;
+  }
+
+  if (!detectedCandidateHasRequiredLaunchArtifacts(manifest, detected)) {
     return null;
   }
 
