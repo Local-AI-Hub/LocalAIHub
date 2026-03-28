@@ -1,6 +1,6 @@
 {
   "name": "local-ai-hub",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Windows desktop manager for local AI tools",
   "author": "Local AI Hub",
   "private": true,
@@ -114,4 +114,3 @@
     ]
   }
 }
-
