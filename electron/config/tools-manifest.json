@@ -56,7 +56,40 @@
       "%USERPROFILE%\\Downloads\\ComfyUI\\main.py",
       "%LOCALAPPDATA%\\ComfyUI\\main.py",
       "%APPDATA%\\ComfyUI\\main.py"
-    ]
+    ],
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        },
+        {
+          "id": "civitai",
+          "label": "CivitAI"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "all",
+        "taskType": "image-generation"
+      },
+      "targetLayout": {
+        "basePath": "app-dir",
+        "directories": {
+          "Checkpoint": "models/checkpoints",
+          "LoRA": "models/loras",
+          "VAE": "models/vae",
+          "Embedding": "models/embeddings",
+          "ControlNet": "models/controlnet",
+          "Hypernetwork": "models/hypernetworks",
+          "GGUF": "models/gguf",
+          "Upscaler": "models/upscale_models",
+          "Audio / Speech": "models/audio",
+          "Inpainting": "models/checkpoints"
+        }
+      }
+    }
   },
   {
     "id": "ollama",
@@ -90,7 +123,27 @@
       "%LOCALAPPDATA%\\Programs\\Ollama\\ollama.exe",
       "%PROGRAMFILES%\\Ollama\\ollama.exe",
       "%ProgramFiles(x86)%\\Ollama\\ollama.exe"
-    ]
+    ],
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "ollama",
+          "label": "Ollama Library"
+        }
+      ],
+      "defaults": {
+        "source": "ollama",
+        "modelType": "all",
+        "taskType": "all"
+      },
+      "targetLayout": {
+        "basePath": "ollama-models-root",
+        "directories": {
+          "Model": ""
+        }
+      }
+    }
   },
   {
     "id": "automatic1111",
@@ -161,7 +214,40 @@
       "%LOCALAPPDATA%\\stable-diffusion-webui\\webui.py",
       "%APPDATA%\\stable-diffusion-webui\\webui.py"
     ],
-    "startupTimeoutMs": 600000
+    "startupTimeoutMs": 600000,
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        },
+        {
+          "id": "civitai",
+          "label": "CivitAI"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "all",
+        "taskType": "image-generation"
+      },
+      "targetLayout": {
+        "basePath": "app-dir",
+        "directories": {
+          "Checkpoint": "models/Stable-diffusion",
+          "LoRA": "models/Lora",
+          "VAE": "models/VAE",
+          "Embedding": "embeddings",
+          "ControlNet": "models/ControlNet",
+          "Hypernetwork": "models/hypernetworks",
+          "GGUF": "models/GGUF",
+          "Upscaler": "models/ESRGAN",
+          "Audio / Speech": "models/Audio",
+          "Inpainting": "models/Stable-diffusion"
+        }
+      }
+    }
   },
   {
     "id": "invokeai",
@@ -294,7 +380,40 @@
       "%LOCALAPPDATA%\\stable-diffusion-webui-forge\\webui.py",
       "%APPDATA%\\stable-diffusion-webui-forge\\webui.py"
     ],
-    "startupTimeoutMs": 600000
+    "startupTimeoutMs": 600000,
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        },
+        {
+          "id": "civitai",
+          "label": "CivitAI"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "all",
+        "taskType": "image-generation"
+      },
+      "targetLayout": {
+        "basePath": "app-dir",
+        "directories": {
+          "Checkpoint": "models/Stable-diffusion",
+          "LoRA": "models/Lora",
+          "VAE": "models/VAE",
+          "Embedding": "embeddings",
+          "ControlNet": "models/ControlNet",
+          "Hypernetwork": "models/hypernetworks",
+          "GGUF": "models/GGUF",
+          "Upscaler": "models/ESRGAN",
+          "Audio / Speech": "models/Audio",
+          "Inpainting": "models/Stable-diffusion"
+        }
+      }
+    }
   },
   {
     "id": "lmstudio",
@@ -334,7 +453,38 @@
     ],
     "processNames": [
       "LM Studio.exe"
-    ]
+    ],
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        },
+        {
+          "id": "tabby",
+          "label": "Tabby Model Registry"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "gguf",
+        "taskType": "text-generation"
+      },
+      "allowedModelTypes": [
+        "gguf"
+      ],
+      "allowedTaskTypes": [
+        "text-generation"
+      ],
+      "targetLayout": {
+        "basePath": "lmstudio-models-root",
+        "repositoryScoped": true,
+        "directories": {
+          "GGUF": ""
+        }
+      }
+    }
   },
   {
     "id": "openwebui",
@@ -473,7 +623,39 @@
       "%USERPROFILE%\\Downloads\\koboldcpp.exe",
       "%LOCALAPPDATA%\\koboldcpp\\koboldcpp.exe",
       "%APPDATA%\\koboldcpp\\koboldcpp.exe"
-    ]
+    ],
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        },
+        {
+          "id": "tabby",
+          "label": "Tabby Model Registry"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "gguf",
+        "taskType": "text-generation"
+      },
+      "allowedModelTypes": [
+        "gguf"
+      ],
+      "allowedTaskTypes": [
+        "text-generation"
+      ],
+      "targetLayout": {
+        "basePath": "managed-models-root",
+        "baseSubdirectory": "koboldcpp",
+        "repositoryScoped": true,
+        "directories": {
+          "GGUF": ""
+        }
+      }
+    }
   },
   {
     "id": "fooocus",
@@ -1093,7 +1275,7 @@
         "recommendedRamMb": 16384
       }
     },
-    "launchCommand": "..\\.venv\\Scripts\\aider.exe",
+    "launchCommand": "python -m aider",
     "externalLaunchCommand": "python -m aider",
     "detectionPaths": [
       "PATH:aider.exe"

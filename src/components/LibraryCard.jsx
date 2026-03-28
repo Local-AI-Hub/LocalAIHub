@@ -257,6 +257,7 @@ function LibraryCard({
   settingsOpen,
   onToggleSettings,
   onLaunch,
+  onOpenKoboldSetup,
   onMigrateManagedData,
   onOpenInterface,
   onStop,
@@ -306,6 +307,11 @@ function LibraryCard({
 
         <div className="flex flex-wrap items-center gap-3">
           <PrimaryAction busyMap={busyMap} onLaunch={onLaunch} onOpenInterface={onOpenInterface} onStop={onStop} tool={tool} />
+          {tool.id === 'koboldcpp' ? (
+            <button className="ghost-button" onClick={onOpenKoboldSetup} type="button">
+              {tool.launchSelectionStatus?.actionLabel || 'Change model'}
+            </button>
+          ) : null}
           {String(tool.interfaceMode || '').startsWith('embedded-') && tool.interfaceMode !== 'embedded-terminal' ? (
             <button className="ghost-button" onClick={() => onOpenInterface(tool.id)} type="button">
               {embeddedActionLabel(tool)}
@@ -444,4 +450,3 @@ function LibraryCard({
 }
 
 export default memo(LibraryCard, areLibraryCardPropsEqual);
-

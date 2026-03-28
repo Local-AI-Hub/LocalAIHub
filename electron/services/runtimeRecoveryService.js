@@ -151,6 +151,51 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
     };
   }
 
+  if (toolState?.id === 'koboldcpp') {
+    const missingSplitMatch = stderr.match(/gguf_init_from_file: failed to open GGUF file '([^']+\.gguf)' \(No such file or directory\)/i);
+    if (missingSplitMatch && /failed to load GGUF split/i.test(stderr)) {
+      const missingSplitPath = missingSplitMatch[1];
+      const missingSplitFile = path.basename(missingSplitPath);
+      return {
+        recognized: true,
+        id: 'koboldcpp-missing-gguf-split',
+        action: 'none',
+        summary: `${toolState.name} received the selected GGUF file, but the model is incomplete on disk. KoboldCpp also needs ${missingSplitFile} in the same folder, and that split file is missing. Choose a complete GGUF or re-download the full split model before launching again.`,
+        repairingMessage: null,
+      };
+    }
+
+    const modelLoadFailureMatch = stderr.match(/gpttype_load_model:\s*error:\s*failed to load model '([^']+)'/i);
+    if (modelLoadFailureMatch) {
+      const reportedModelValue = String(modelLoadFailureMatch[1] || '').trim();
+      const looksLikeFilesystemPath = /^[a-z]:\\/i.test(reportedModelValue) || /[\\/]/.test(reportedModelValue);
+      const placeholderValue = /^(a local path|local path|path to (?:a )?local model|path to (?:a )?gguf)$/i.test(reportedModelValue);
+      const memoryLoadFailure = /cudaMalloc failed: out of memory/i.test(stderr)
+        || /failed to allocate compute (?:pp )?buffers/i.test(stderr)
+        || /failed to initialize the context: failed to allocate/i.test(stderr)
+        || /failed to allocate CUDA0 buffer/i.test(stderr);
+
+      if (memoryLoadFailure && looksLikeFilesystemPath) {
+        return {
+          recognized: true,
+          id: 'koboldcpp-model-load-oom',
+          action: 'none',
+          summary: `${toolState.name} received the selected GGUF file at ${reportedModelValue}, but the model ran out of available GPU memory while KoboldCpp was creating its compute buffers. Choose a smaller GGUF, reduce KoboldCpp's memory use, or switch to a lighter runtime mode before launching again.`,
+          repairingMessage: null,
+        };
+      }
+
+      if (reportedModelValue && (!looksLikeFilesystemPath || placeholderValue)) {
+        return {
+          recognized: true,
+          id: 'koboldcpp-invalid-model-value',
+          action: 'none',
+          summary: `${toolState.name} was asked to load "${reportedModelValue}", but that is not a usable filesystem path to a GGUF on this PC. Local AI Hub passed an invalid model value to KoboldCpp instead of the saved file path. Re-save the model selection and try again.`,
+          repairingMessage: null,
+        };
+      }
+    }
+  }
   if (toolState?.id === 'automatic1111' && /Stable diffusion model failed to load/i.test(stderr) && (/OutOfMemoryError/i.test(stderr) || /DefaultCPUAllocator: not enough memory/i.test(stderr))) {
     return {
       recognized: true,
@@ -345,6 +390,17 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       action: 'repair-python-environment',
       summary: `${toolState.name} has a FastAPI or Gradio dependency stack that drifted away from Forge's pinned Pydantic build.`,
       repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s pinned web UI dependencies automatically.`,
+    };
+  }
+
+  const missingManagedPython = stderr.match(/No Python at ['"]*([^'"\r\n]+python\.exe)['"]*/i);
+  if (missingManagedPython?.[1] && toolState?.source === 'managed') {
+    return {
+      recognized: true,
+      id: 'managed-python-bootstrap-missing',
+      action: 'repair-python-environment',
+      summary: `${toolState.name}'s managed Python environment still points at ${missingManagedPython[1]}, but that Python install is no longer present on this PC. Local AI Hub needs to rebuild the environment with one of its managed Python runtimes.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment because its previous base Python install is missing.`,
     };
   }
 
@@ -616,24 +672,31 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
       status: 'stopped',
     });
 
+    let retryLaunchResult = null;
     if (typeof options.retryLaunch === 'function') {
-      await options.retryLaunch({
+      retryLaunchResult = await options.retryLaunch({
         ...refreshedTool,
         lastRepairMessage: repairMessage,
       });
     }
 
-    const ready = await waitForToolReady({
+    const readyTarget = {
       ...refreshedTool,
       launchUrl: refreshedTool.launchUrl || toolState.launchUrl,
       healthUrl: refreshedTool.healthUrl || toolState.healthUrl,
-    });
+    };
+    const usesLocalUrl = Boolean(readyTarget.launchUrl || readyTarget.healthUrl);
+    const ready = usesLocalUrl
+      ? await waitForToolReady(readyTarget)
+      : retryLaunchResult?.status === 'running';
 
     if (!ready) {
       return {
         handled: true,
         recovered: false,
-        userMessage: `${toolState.name} was repaired and retried, but it still did not answer on its local port. Open the logs folder for the full launch output.`,
+        userMessage: usesLocalUrl
+          ? `${toolState.name} was repaired and retried, but it still did not answer on its local port. Open the logs folder for the full launch output.`
+          : `${toolState.name} was repaired and retried, but it still did not stay running. Open the logs folder for the full launch output.`,
       };
     }
 

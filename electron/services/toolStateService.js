@@ -7,6 +7,7 @@ const { resolveToolStatus } = require('./processService');
 const { listSnapshots } = require('./snapshotService');
 const { syncDiscoveredTools } = require('./toolDiscoveryService');
 const { buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
+const { hydrateKoboldCppToolState } = require('./koboldCppService');
 const { allowsLocalSnapshots, normalizeToolLifecycle } = require('./toolLifecycleService');
 
 function refreshManagedLaunchState(tool, manifest) {
@@ -108,13 +109,14 @@ async function buildMergedToolStateList(options = {}) {
         }, manifest);
         const recoveredTool = await recoverBrokenManagedToolState(normalizedTool, manifest);
         const mergedTool = refreshManagedLaunchState(recoveredTool, manifest);
+        const hydratedTool = await hydrateKoboldCppToolState(mergedTool);
 
         return {
-          ...mergedTool,
-          status: options.resolveStatuses ? await resolveToolStatus(mergedTool) : mergedTool.status || 'stopped',
-          snapshots: options.includeSnapshots && allowsLocalSnapshots(mergedTool, manifest) ? await listSnapshots(mergedTool.id) : [],
+          ...hydratedTool,
+          status: options.resolveStatuses ? await resolveToolStatus(hydratedTool) : hydratedTool.status || 'stopped',
+          snapshots: options.includeSnapshots && allowsLocalSnapshots(hydratedTool, manifest) ? await listSnapshots(hydratedTool.id) : [],
           updateSupported:
-            mergedTool.lifecycleMode === 'managed' ||
+            hydratedTool.lifecycleMode === 'managed' ||
             manifest.installInstructions?.kind === 'installer-exe' ||
             manifest.installInstructions?.kind === 'single-file' ||
             manifest.installInstructions?.runtime === 'binary',

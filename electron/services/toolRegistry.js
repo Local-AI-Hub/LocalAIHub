@@ -291,6 +291,7 @@ function normalizeToolDefinition(tool) {
     launchUrl,
     healthUrl: buildHealthUrl(tool, launchUrl),
     startupTimeoutMs: Number(tool.startupTimeoutMs) > 0 ? Number(tool.startupTimeoutMs) : null,
+    modelManager: tool.modelManager && typeof tool.modelManager === 'object' ? tool.modelManager : null,
     pipelineCapabilities: getToolPipelineCapabilities(toolId),
     processNames: tool.processNames || deriveProcessNames({
       ...tool,
@@ -336,6 +337,7 @@ function getToolCatalog() {
     installContract: tool.installContract,
     downloadUrl: tool.downloadUrl,
     compatibility: tool.installInstructions.compatibility,
+    modelManager: tool.modelManager,
     pipelineCapabilities: tool.pipelineCapabilities,
   }));
 }

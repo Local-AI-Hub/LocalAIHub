@@ -14,6 +14,7 @@ const { assessDiskSpace, detectHardwareSnapshot, detectStorageSnapshot, findDisk
 const { createLogger } = require('./logService');
 const { buildOllamaUnavailableMessage, finishOllamaSession, listOllamaModels, prepareOllamaSession } = require('./ollamaService');
 const { assertLoopbackUrl, assertSecureRemoteUrl } = require('./pathSafetyService');
+const { getToolManifest } = require('./toolRegistry');
 const APP_USER_AGENT = `LocalAIHub/${APP_VERSION}`;
 const MODEL_SETTINGS_FILE = 'model-manager.settings.json';
 const MODEL_DOWNLOAD_BUFFER_LIMIT = 10 * 1024 * 1024;
@@ -27,7 +28,6 @@ const CIVITAI_MODELS_URL = 'https://civitai.com/api/v1/models';
 const MODEL_FILE_PATTERN = /\.(safetensors|ckpt|pt|pth|bin|gguf)$/i;
 const IMAGE_FILE_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
 const README_FILE_PATTERN = /(?:^|\/)README\.md$/i;
-const MODEL_MANAGER_TOOL_IDS = new Set(['ollama', 'comfyui', 'automatic1111', 'forge', 'lmstudio']);
 const HUGGING_FACE_FILE_SIZE_CACHE = new Map();
 const HUGGING_FACE_PREVIEW_CACHE = new Map();
 const OLLAMA_FAMILY_CACHE = new Map();
@@ -106,8 +106,52 @@ const MODEL_TYPE_PROFILES = {
   },
   inpainting: { civitaiTypes: ['Checkpoint'], hfPipelineTags: ['image-to-image'], searchTerms: ['inpainting'] },
 };
+function getModelManagerConfig(tool) {
+  const directConfig = tool?.modelManager && typeof tool.modelManager === 'object' ? tool.modelManager : null;
+  const manifestConfig = !directConfig && tool?.id ? getToolManifest(tool.id)?.modelManager || null : null;
+  const config = directConfig || manifestConfig;
+  if (!config || config.enabled === false) {
+    return null;
+  }
+  return config;
+}
+function getModelManagerSourceOptions(tool) {
+  const config = getModelManagerConfig(tool);
+  if (!Array.isArray(config?.sources)) {
+    return [];
+  }
+  return config.sources
+    .map((entry) => ({
+      id: String(entry?.id || '').trim(),
+      label: String(entry?.label || entry?.id || '').trim(),
+    }))
+    .filter((entry) => entry.id && entry.label);
+}
+function getAllowedModelManagerValues(values = []) {
+  return [...new Set((values || []).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))];
+}
+function coerceAllowedValue(value, allowedValues, fallbackValue) {
+  if (!allowedValues.length) {
+    return value || fallbackValue;
+  }
+  return allowedValues.includes(value) ? value : allowedValues[0] || fallbackValue;
+}
+function getModelManagerDefaults(tool) {
+  const config = getModelManagerConfig(tool);
+  const sourceOptions = getModelManagerSourceOptions(tool);
+  const firstSourceId = sourceOptions[0]?.id || 'huggingface';
+  const requestedSource = String(config?.defaults?.source || firstSourceId).trim();
+  return {
+    modelType: normalizeModelTypeFilter(config?.defaults?.modelType || 'all'),
+    source: sourceOptions.some((entry) => entry.id === requestedSource) ? requestedSource : firstSourceId,
+    taskType: normalizeTaskTypeFilter(config?.defaults?.taskType || (firstSourceId === 'ollama' ? 'all' : 'image-generation')),
+  };
+}
+function getModelManagerTargetLayout(tool) {
+  return getModelManagerConfig(tool)?.targetLayout || null;
+}
 function supportsModelManager(tool) {
-  return MODEL_MANAGER_TOOL_IDS.has(tool?.id);
+  return Boolean(getModelManagerConfig(tool));
 }
 function mergeUniqueStrings(values = []) {
   return [...new Set((values || []).filter(Boolean))];
@@ -303,6 +347,9 @@ function getManagedModelRoot(tool, directoryName) {
   }
   return path.join(getAppPaths().modelsRoot, directoryName);
 }
+function getSharedManagedModelRoot(directoryName) {
+  return path.join(getAppPaths().modelsRoot, sanitizePathSegment(directoryName) || 'models');
+}
 function getOllamaModelsRoot(tool = null) {
   const managedRoot = getManagedModelRoot(tool, 'ollama');
   if (managedRoot) {
@@ -316,17 +363,55 @@ function getOllamaModelsRoot(tool = null) {
 function getLmStudioModelsRoot(tool = null) {
   return getManagedModelRoot(tool, 'lmstudio') || path.join(process.env.USERPROFILE || '', '.lmstudio', 'models');
 }
+function resolveModelManagerBasePath(tool, targetLayout) {
+  const basePath = String(targetLayout?.basePath || '').trim().toLowerCase();
+  if (basePath === 'app-dir') {
+    return tool?.appDir || tool?.installDir || '';
+  }
+  if (basePath === 'ollama-models-root') {
+    return getOllamaModelsRoot(tool);
+  }
+  if (basePath === 'lmstudio-models-root') {
+    return getLmStudioModelsRoot(tool);
+  }
+  if (basePath === 'managed-models-root') {
+    return getSharedManagedModelRoot(targetLayout?.baseSubdirectory || tool?.id || 'models');
+  }
+  return '';
+}
+function buildModelDirectoriesFromTargetLayout(tool, targetLayout) {
+  const baseRoot = resolveModelManagerBasePath(tool, targetLayout);
+  if (!baseRoot) {
+    return {};
+  }
+  const directoryEntries = Object.entries(targetLayout?.directories || {}).filter(([modelType]) => Boolean(modelType));
+  return Object.fromEntries(
+    directoryEntries.map(([modelType, relativePath]) => {
+      const segments = splitRelativePathSegments(relativePath);
+      return [modelType, segments.length ? path.join(baseRoot, ...segments) : baseRoot];
+    }),
+  );
+}
 function normalizeBrowseOptions(options = {}, tool) {
+  const defaults = getModelManagerDefaults(tool);
+  const sourceOptions = getModelManagerSourceOptions(tool);
+  const sourceIds = sourceOptions.map((entry) => entry.id);
+  const allowedModelTypes = getAllowedModelManagerValues(getModelManagerConfig(tool)?.allowedModelTypes);
+  const allowedTaskTypes = getAllowedModelManagerValues(getModelManagerConfig(tool)?.allowedTaskTypes);
   const sort = String(options.sort || 'most-downloaded').trim().toLowerCase();
+  const defaultSource = sourceIds.includes(defaults.source) ? defaults.source : sourceIds[0] || defaults.source || 'huggingface';
+  const defaultModelType = coerceAllowedValue(defaults.modelType, allowedModelTypes, defaults.modelType);
+  const defaultTaskType = coerceAllowedValue(defaults.taskType, allowedTaskTypes, defaults.taskType);
+  const requestedSource = String(options.source || defaultSource).trim();
   return {
     cursor: String(options.cursor || '').trim() || null,
     limit: Number(options.limit) > 0 ? Math.min(REMOTE_PAGE_SIZE, Number(options.limit)) : REMOTE_PAGE_SIZE,
-    modelType: normalizeModelTypeFilter(options.modelType),
+    modelType: coerceAllowedValue(normalizeModelTypeFilter(options.modelType || defaultModelType), allowedModelTypes, defaultModelType),
     page: Math.max(1, Number(options.page) || 1),
     query: String(options.query || '').trim(),
     sort: HF_SORT_MAP[sort] || CIVITAI_SORT_MAP[sort] ? sort : 'most-downloaded',
-    source: String(options.source || (tool?.id === 'ollama' ? 'ollama' : 'huggingface')).trim(),
-    taskType: normalizeTaskTypeFilter(options.taskType || (tool?.id === 'ollama' ? 'all' : 'image-generation')),
+    source: sourceIds.length && sourceIds.includes(requestedSource) ? requestedSource : defaultSource,
+    taskType: coerceAllowedValue(normalizeTaskTypeFilter(options.taskType || defaultTaskType), allowedTaskTypes, defaultTaskType),
   };
 }
 async function loadHardwareContext() {
@@ -437,49 +522,12 @@ function attachHardwareHints(item, tool, hardwareContext) {
   };
 }
 function getToolModelDirectories(tool) {
+  const targetLayout = getModelManagerTargetLayout(tool);
+  if (targetLayout) {
+    return buildModelDirectoriesFromTargetLayout(tool, targetLayout);
+  }
   const appDir = tool?.appDir || tool?.installDir || '';
-  if (!appDir && !['ollama', 'lmstudio'].includes(tool?.id)) {
-    return {};
-  }
-  if (tool?.id === 'comfyui') {
-    return {
-      Checkpoint: path.join(appDir, 'models', 'checkpoints'),
-      LoRA: path.join(appDir, 'models', 'loras'),
-      VAE: path.join(appDir, 'models', 'vae'),
-      Embedding: path.join(appDir, 'models', 'embeddings'),
-      ControlNet: path.join(appDir, 'models', 'controlnet'),
-      Hypernetwork: path.join(appDir, 'models', 'hypernetworks'),
-      GGUF: path.join(appDir, 'models', 'gguf'),
-      Upscaler: path.join(appDir, 'models', 'upscale_models'),
-      'Audio / Speech': path.join(appDir, 'models', 'audio'),
-      Inpainting: path.join(appDir, 'models', 'checkpoints'),
-    };
-  }
-  if (tool?.id === 'automatic1111' || tool?.id === 'forge') {
-    return {
-      Checkpoint: path.join(appDir, 'models', 'Stable-diffusion'),
-      LoRA: path.join(appDir, 'models', 'Lora'),
-      VAE: path.join(appDir, 'models', 'VAE'),
-      Embedding: path.join(appDir, 'embeddings'),
-      ControlNet: path.join(appDir, 'models', 'ControlNet'),
-      Hypernetwork: path.join(appDir, 'models', 'hypernetworks'),
-      GGUF: path.join(appDir, 'models', 'GGUF'),
-      Upscaler: path.join(appDir, 'models', 'ESRGAN'),
-      'Audio / Speech': path.join(appDir, 'models', 'Audio'),
-      Inpainting: path.join(appDir, 'models', 'Stable-diffusion'),
-    };
-  }
-  if (tool?.id === 'lmstudio') {
-    return {
-      GGUF: getLmStudioModelsRoot(tool),
-    };
-  }
-  if (tool?.id === 'ollama') {
-    return {
-      Model: getOllamaModelsRoot(tool),
-    };
-  }
-  if (tool?.id === 'rvc') {
+  if (tool?.id === 'rvc' && appDir) {
     return {
       'Audio / Speech': path.join(appDir, 'weights'),
     };
@@ -513,13 +561,15 @@ function getCatalogRepositoryId(item = null) {
 function getTargetDirectory(tool, modelType, item = null) {
   const directories = getToolModelDirectories(tool);
   const normalizedType = normalizeModelType(modelType);
-  if (tool?.id === 'lmstudio') {
+  const targetDirectory = directories[normalizedType] || directories.Checkpoint || directories.Model || null;
+  const targetLayout = getModelManagerTargetLayout(tool);
+  if (targetDirectory && targetLayout?.repositoryScoped) {
     const repositorySegments = splitRelativePathSegments(getCatalogRepositoryId(item) || String(item?.name || ''));
     if (repositorySegments.length >= 2) {
-      return path.join(getLmStudioModelsRoot(tool), repositorySegments[0], repositorySegments[1]);
+      return path.join(targetDirectory, repositorySegments[0], repositorySegments[1]);
     }
   }
-  return directories[normalizedType] || directories.Checkpoint || directories.Model || null;
+  return targetDirectory;
 }
 function resolveModelDestination(tool, payload = {}) {
   const targetDirectory = getTargetDirectory(tool, payload.modelType, payload);
@@ -1482,7 +1532,7 @@ async function browseRemoteModels(tool, options = {}) {
     source: browseOptions.source,
   });
   if (!supportsModelManager(tool)) {
-    throw new Error('Local AI Hub can only browse models for Ollama, ComfyUI, Forge, Automatic1111, and LM Studio.');
+    throw new Error('This tool does not have Model Manager browsing enabled yet.');
   }
   const settings = await readModelSettingsInternal();
   const publicSettings = {
@@ -2551,5 +2601,5 @@ module.exports = {
   listDownloadedModels,
   readModelSettings,
   saveModelManagerSettings,
-  supportsModelManager,
+  supportsModelManager
 };

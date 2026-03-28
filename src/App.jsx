@@ -3,6 +3,7 @@ import AiderPanel from './components/AiderPanel';
 import CloudChatPanel from './components/CloudChatPanel';
 import ConnectionsPanel from './components/ConnectionsPanel';
 import HardwareGate from './components/HardwareGate';
+import KoboldCppSetupDialog from './components/KoboldCppSetupDialog';
 import LibraryCard from './components/LibraryCard';
 import ModelManager from './components/ModelManager';
 import OllamaChatPanel from './components/OllamaChatPanel';
@@ -158,6 +159,17 @@ export default function App() {
   const [aiderNotice, setAiderNotice] = useState('');
   const [aiderOutput, setAiderOutput] = useState('');
   const [aiderProjectDir, setAiderProjectDir] = useState('');
+  const [koboldSetupOpen, setKoboldSetupOpen] = useState(false);
+  const [koboldSetupLoading, setKoboldSetupLoading] = useState(false);
+  const [koboldSetupSaving, setKoboldSetupSaving] = useState(false);
+  const [koboldSetupData, setKoboldSetupData] = useState({
+    candidates: [],
+    launchSelection: null,
+    launchSelectionStatus: null,
+  });
+  const [koboldSelectedModelPath, setKoboldSelectedModelPath] = useState('');
+  const [koboldSetupNotice, setKoboldSetupNotice] = useState('');
+  const [koboldAutoLaunchAfterSave, setKoboldAutoLaunchAfterSave] = useState(false);
   const [statisticsData, setStatisticsData] = useState(null);
   const [statisticsManualBusy, setStatisticsManualBusy] = useState(false);
   const statisticsRefreshInFlightRef = useRef(false);
@@ -232,10 +244,28 @@ export default function App() {
 
   const tools = useMemo(
     () =>
-      (appState.tools || []).map((tool) => ({
-        ...manifestMap[tool.id],
-        ...tool,
-      })),
+      (appState.tools || []).map((tool) => {
+        const mergedTool = {
+          ...manifestMap[tool.id],
+          ...tool,
+        };
+
+        if (mergedTool.id === 'koboldcpp' && mergedTool.launchSelectionStatus?.required) {
+          const launchSummary = mergedTool.launchSelectionStatus.ready
+            ? `Current launch model: ${mergedTool.launchSelectionStatus.fileName}.`
+            : mergedTool.launchSelectionStatus.incomplete
+              ? `Saved launch model incomplete: ${mergedTool.launchSelectionStatus.fileName}.`
+              : mergedTool.launchSelectionStatus.missing
+                ? `Saved launch model missing: ${mergedTool.launchSelectionStatus.fileName}.`
+                : 'Choose a GGUF model in Local AI Hub before first launch.';
+          return {
+            ...mergedTool,
+            description: `${manifestMap[tool.id]?.description || mergedTool.description || ''} ${launchSummary}`.trim(),
+          };
+        }
+
+        return mergedTool;
+      }),
     [appState.tools, manifestMap],
   );
 
@@ -243,6 +273,7 @@ export default function App() {
   const ollamaTool = toolMap.ollama || null;
   const whisperTool = toolMap.whisper || null;
   const aiderTool = toolMap.aider || null;
+  const koboldTool = toolMap.koboldcpp || null;
   const providers = useMemo(() => appState.providers || [], [appState.providers]);
   const providerMap = useMemo(() => Object.fromEntries(providers.map((provider) => [provider.id, provider])), [providers]);
   const connectedProviders = useMemo(() => providers.filter((provider) => provider.isConnected), [providers]);
@@ -355,6 +386,168 @@ export default function App() {
     setCloudNotice('');
     setCloudModelsLoading(false);
     setCloudChatBusy(false);
+  }
+
+  function getPreferredKoboldCandidatePath(setup = {}) {
+    if (setup.launchSelectionStatus?.ready && setup.launchSelection?.filePath) {
+      return setup.launchSelection.filePath;
+    }
+
+    return setup.candidates?.find((candidate) => candidate.launchReady)?.filePath || '';
+  }
+
+  function applyKoboldSetupState(setup = {}) {
+    setKoboldSetupData(setup);
+    setKoboldSelectedModelPath(getPreferredKoboldCandidatePath(setup));
+  }
+
+  function getKoboldSetupNoticeFromStatus(status) {
+    if (status?.incomplete) {
+      return 'The saved GGUF is only part of a split model. Choose a complete GGUF or re-download the full split set before launching KoboldCpp.';
+    }
+
+    if (status?.missing) {
+      return 'The saved GGUF file is missing. Choose another model to launch KoboldCpp.';
+    }
+
+    return 'Choose a GGUF model before launching KoboldCpp for the first time.';
+  }
+
+  async function loadKoboldSetupState(toolId = 'koboldcpp', options = {}) {
+    if (options.setup && typeof options.setup === 'object') {
+      applyKoboldSetupState(options.setup);
+      return options.setup;
+    }
+
+    setKoboldSetupLoading(true);
+    try {
+      const result = await window.localAIHub.getKoboldCppSetup({ toolId });
+      if (!result?.ok) {
+        pushToast(result?.message || 'Local AI Hub could not load KoboldCpp setup.', 'error');
+        return null;
+      }
+
+      const setup = result.data || {};
+      applyKoboldSetupState(setup);
+      return setup;
+    } finally {
+      setKoboldSetupLoading(false);
+    }
+  }
+
+  async function openKoboldSetup(options = {}) {
+    if (!koboldTool) {
+      pushToast('Install or detect KoboldCpp before opening its model setup.', 'error');
+      return;
+    }
+
+    setKoboldSetupNotice(options.notice || '');
+    setKoboldAutoLaunchAfterSave(Boolean(options.autoLaunch));
+    setKoboldSetupOpen(true);
+    await loadKoboldSetupState(options.toolId || koboldTool.id, {
+      setup: options.setup,
+    });
+  }
+
+  function closeKoboldSetup() {
+    if (koboldSetupSaving) {
+      return;
+    }
+
+    setKoboldSetupOpen(false);
+    setKoboldAutoLaunchAfterSave(false);
+    setKoboldSetupNotice('');
+  }
+
+  async function pickKoboldModelFile() {
+    const result = await window.localAIHub.pickKoboldCppModel({
+      toolId: 'koboldcpp',
+      currentPath: koboldSelectedModelPath || koboldSetupData.launchSelection?.filePath || '',
+    });
+    if (!result?.ok) {
+      pushToast(result?.message || 'Local AI Hub could not open the KoboldCpp model picker.', 'error');
+      return;
+    }
+
+    if (!result.data?.canceled && result.data?.filePath) {
+      setKoboldSelectedModelPath(result.data.filePath);
+      setKoboldSetupNotice('Local AI Hub will save this GGUF file and reuse it for future launches.');
+    }
+  }
+
+  async function saveKoboldSetup() {
+    if (!koboldSelectedModelPath) {
+      pushToast('Choose a GGUF model file before saving KoboldCpp setup.', 'error');
+      return;
+    }
+
+    setKoboldSetupSaving(true);
+    try {
+      const result = await window.localAIHub.saveKoboldCppSetup({
+        toolId: 'koboldcpp',
+        modelPath: koboldSelectedModelPath,
+      });
+      applyStateResponse(result);
+      const setup = result.data?.setup || null;
+      if (setup) {
+        setKoboldSetupData(setup);
+        setKoboldSelectedModelPath(getPreferredKoboldCandidatePath(setup) || koboldSelectedModelPath);
+      }
+
+      if (koboldAutoLaunchAfterSave) {
+        setKoboldSetupOpen(false);
+        setKoboldAutoLaunchAfterSave(false);
+        setKoboldSetupNotice('');
+        await launchLibraryTool('koboldcpp', { skipKoboldSetup: true });
+      } else {
+        setKoboldSetupNotice('KoboldCpp is ready to launch with this GGUF file.');
+      }
+    } catch (error) {
+      pushToast(error.message || 'Local AI Hub could not save KoboldCpp setup.', 'error');
+    } finally {
+      setKoboldSetupSaving(false);
+    }
+  }
+
+  async function launchLibraryTool(toolId, options = {}) {
+    const tool = toolMap[toolId] || null;
+    if (!tool) {
+      pushToast('Local AI Hub could not find that installed tool.', 'error');
+      return false;
+    }
+
+    if (toolId === 'koboldcpp' && !options.skipKoboldSetup) {
+      const liveSetupResult = await window.localAIHub.getKoboldCppSetup({ toolId });
+      if (!liveSetupResult?.ok) {
+        pushToast(liveSetupResult?.message || 'Local AI Hub could not load KoboldCpp setup.', 'error');
+        return false;
+      }
+
+      const liveSetup = liveSetupResult.data || {};
+      const launchStatus = liveSetup.launchSelectionStatus || null;
+      if (!launchStatus?.ready) {
+        await openKoboldSetup({
+          autoLaunch: true,
+          notice: getKoboldSetupNoticeFromStatus(launchStatus),
+          setup: liveSetup,
+        });
+        return false;
+      }
+    }
+
+    return runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId));
+  }
+
+  function toggleLibraryToolSettings(toolId) {
+    if (toolId === 'koboldcpp') {
+      openKoboldSetup({
+        autoLaunch: false,
+        notice: 'Choose the GGUF file Local AI Hub should use for future KoboldCpp launches.',
+      });
+      return;
+    }
+
+    setSettingsToolId((current) => (current === toolId ? null : toolId));
   }
 
   function toolIdFromActionKey(key) {
@@ -1289,7 +1482,7 @@ export default function App() {
         onAction: () => {
           setActiveTab('library');
           if (payload.canRelaunch) {
-            runAction(`launch:${payload.toolId}`, () => window.localAIHub.launchTool(payload.toolId));
+            launchLibraryTool(payload.toolId);
           }
         },
       });
@@ -1706,7 +1899,13 @@ export default function App() {
                   launchProgress={launchProgressMap[tool.id]}
                   migrationBusy={busyMap['settings:migrate-legacy']}
                   migrationEligible={migratableToolIds.has(tool.id)}
-                  onLaunch={(toolId) => runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId))}
+                  onLaunch={launchLibraryTool}
+                  onOpenKoboldSetup={() =>
+                    openKoboldSetup({
+                      autoLaunch: false,
+                      notice: 'Choose the GGUF file Local AI Hub should use for future KoboldCpp launches.',
+                    })
+                  }
                   onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
                   onMigrateManagedData={migrateLegacyStorage}
                   onOpenInterface={openEmbeddedToolUi}
@@ -1716,7 +1915,7 @@ export default function App() {
                   }
                   onSaveSnapshot={(toolId) => runAction(`snapshot:${toolId}`, () => window.localAIHub.saveSnapshot(toolId))}
                   onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
-                  onToggleSettings={(toolId) => setSettingsToolId((current) => (current === toolId ? null : toolId))}
+                  onToggleSettings={toggleLibraryToolSettings}
                   onUninstall={uninstallLibraryTool}
                   onUpdate={updateLibraryTool}
                   progress={progressMap[tool.id]}
@@ -1744,6 +1943,24 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+              ) : null}
+
+              {koboldSetupOpen && koboldTool ? (
+                <KoboldCppSetupDialog
+                  busy={koboldSetupLoading || koboldSetupSaving || busyMap['launch:koboldcpp']}
+                  candidates={koboldSetupData.candidates || []}
+                  confirmLabel={koboldAutoLaunchAfterSave ? 'Save and launch' : 'Save selection'}
+                  loading={koboldSetupLoading}
+                  notice={koboldSetupNotice}
+                  onBrowse={pickKoboldModelFile}
+                  onClose={closeKoboldSetup}
+                  onOpenFolder={() => runAction('folder:koboldcpp', () => window.localAIHub.openToolFolder('koboldcpp'))}
+                  onRefresh={() => loadKoboldSetupState(koboldTool.id)}
+                  onSave={saveKoboldSetup}
+                  onSelectModel={setKoboldSelectedModelPath}
+                  selectedModelPath={koboldSelectedModelPath}
+                  selectionStatus={koboldSetupData.launchSelectionStatus || koboldTool.launchSelectionStatus}
+                />
               ) : null}
             </section>
           ) : activeTab === 'store' ? (
@@ -1886,4 +2103,3 @@ export default function App() {
     </div>
   );
 }
-

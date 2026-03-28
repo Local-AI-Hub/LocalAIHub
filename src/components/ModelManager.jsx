@@ -1,25 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
-const MODEL_MANAGER_TOOL_IDS = ['ollama', 'comfyui', 'automatic1111', 'forge', 'lmstudio'];
-const SOURCE_OPTIONS = {
-  ollama: [{ id: 'ollama', label: 'Ollama Library' }],
-  comfyui: [
-    { id: 'huggingface', label: 'Hugging Face' },
-    { id: 'civitai', label: 'CivitAI' },
-  ],
-  automatic1111: [
-    { id: 'huggingface', label: 'Hugging Face' },
-    { id: 'civitai', label: 'CivitAI' },
-  ],
-  forge: [
-    { id: 'huggingface', label: 'Hugging Face' },
-    { id: 'civitai', label: 'CivitAI' },
-  ],
-  lmstudio: [
-    { id: 'huggingface', label: 'Hugging Face' },
-    { id: 'tabby', label: 'Tabby Model Registry' },
-  ],
-};
+const DEFAULT_SOURCE_OPTIONS = [{ id: 'huggingface', label: 'Hugging Face' }];
 const MODEL_TYPE_OPTIONS = [
   { id: 'all', label: 'All types' },
   { id: 'checkpoint', label: 'Checkpoint' },
@@ -52,25 +33,58 @@ const EMPTY_PAGINATION = {
   nextCursor: null,
   nextPage: null,
 };
-function getToolDefaults(toolId) {
-  if (toolId === 'ollama') {
-    return {
-      modelType: 'all',
-      source: 'ollama',
-      taskType: 'all',
-    };
+function getModelManagerConfig(tool) {
+  const config = tool?.modelManager;
+  if (!config || config.enabled === false) {
+    return null;
   }
-  if (toolId === 'lmstudio') {
-    return {
-      modelType: 'gguf',
-      source: 'huggingface',
-      taskType: 'text-generation',
-    };
+  return config;
+}
+function normalizeOptionIds(values = []) {
+  return [...new Set((values || []).map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))];
+}
+function filterDeclaredOptions(options, declaredValues = []) {
+  const allowedIds = normalizeOptionIds(declaredValues);
+  if (!allowedIds.length) {
+    return options;
   }
+  return options.filter((option) => allowedIds.includes(option.id));
+}
+function getModelManagerSources(tool) {
+  const config = getModelManagerConfig(tool);
+  if (!Array.isArray(config?.sources)) {
+    return DEFAULT_SOURCE_OPTIONS;
+  }
+  const sources = config.sources
+    .map((entry) => ({
+      id: String(entry?.id || '').trim(),
+      label: String(entry?.label || entry?.id || '').trim(),
+    }))
+    .filter((entry) => entry.id && entry.label);
+  return sources.length ? sources : DEFAULT_SOURCE_OPTIONS;
+}
+function getToolModelTypeOptions(tool) {
+  return filterDeclaredOptions(MODEL_TYPE_OPTIONS, getModelManagerConfig(tool)?.allowedModelTypes);
+}
+function getToolTaskOptions(tool, sourceId) {
+  if (!['huggingface', 'tabby'].includes(sourceId)) {
+    return [];
+  }
+  return filterDeclaredOptions(TASK_OPTIONS, getModelManagerConfig(tool)?.allowedTaskTypes);
+}
+function getToolDefaults(tool) {
+  const config = getModelManagerConfig(tool);
+  const sourceOptions = getModelManagerSources(tool);
+  const modelTypeOptions = getToolModelTypeOptions(tool);
+  const taskOptions = filterDeclaredOptions(TASK_OPTIONS, config?.allowedTaskTypes);
+  const firstSourceId = sourceOptions[0]?.id || 'huggingface';
+  const requestedSource = String(config?.defaults?.source || firstSourceId).trim();
+  const requestedModelType = String(config?.defaults?.modelType || modelTypeOptions[0]?.id || 'all').trim().toLowerCase();
+  const requestedTaskType = String(config?.defaults?.taskType || taskOptions[0]?.id || (firstSourceId === 'ollama' ? 'all' : 'image-generation')).trim().toLowerCase();
   return {
-    modelType: 'all',
-    source: 'huggingface',
-    taskType: 'image-generation',
+    modelType: modelTypeOptions.some((entry) => entry.id === requestedModelType) ? requestedModelType : modelTypeOptions[0]?.id || 'all',
+    source: sourceOptions.some((entry) => entry.id === requestedSource) ? requestedSource : firstSourceId,
+    taskType: taskOptions.some((entry) => entry.id === requestedTaskType) ? requestedTaskType : taskOptions[0]?.id || (firstSourceId === 'ollama' ? 'all' : 'image-generation'),
   };
 }
 function normalizeMatchKey(value) {
@@ -238,9 +252,9 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
   );
 }
 export default function ModelManager({ tools, onToast }) {
-  const modelTools = useMemo(() => (tools || []).filter((tool) => MODEL_MANAGER_TOOL_IDS.includes(tool.id)), [tools]);
+  const modelTools = useMemo(() => (tools || []).filter((tool) => getModelManagerConfig(tool)), [tools]);
   const [selectedToolId, setSelectedToolId] = useState(modelTools[0]?.id || '');
-  const [selectedSource, setSelectedSource] = useState(getToolDefaults(modelTools[0]?.id).source);
+  const [selectedSource, setSelectedSource] = useState(getToolDefaults(modelTools[0]).source);
   const [search, setSearch] = useState('');
   const [browseLoading, setBrowseLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -251,17 +265,22 @@ export default function ModelManager({ tools, onToast }) {
   const [civitaiApiKeyDraft, setCivitaiApiKeyDraft] = useState('');
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
   const [pagination, setPagination] = useState(EMPTY_PAGINATION);
-  const [modelType, setModelType] = useState(getToolDefaults(modelTools[0]?.id).modelType);
+  const [modelType, setModelType] = useState(getToolDefaults(modelTools[0]).modelType);
   const [sort, setSort] = useState('most-downloaded');
-  const [taskType, setTaskType] = useState(getToolDefaults(modelTools[0]?.id).taskType);
+  const [taskType, setTaskType] = useState(getToolDefaults(modelTools[0]).taskType);
   const [deleteBusyId, setDeleteBusyId] = useState(null);
   const browseRequestIdRef = useRef(0);
   const selectedTool = modelTools.find((tool) => tool.id === selectedToolId) || null;
-  const sourceOptions = SOURCE_OPTIONS[selectedTool?.id || 'ollama'] || [{ id: 'ollama', label: 'Ollama Library' }];
-  const taskOptionsVisible = ['huggingface', 'tabby'].includes(selectedSource) && selectedToolId !== 'ollama';
-  const filterOptionsVisible = selectedToolId !== 'ollama';
+  const sourceOptions = getModelManagerSources(selectedTool);
+  const modelTypeOptions = getToolModelTypeOptions(selectedTool);
+  const taskOptions = getToolTaskOptions(selectedTool, selectedSource);
+  const taskFilteringEnabled = ['huggingface', 'tabby'].includes(selectedSource);
+  const taskOptionsVisible = taskFilteringEnabled && taskOptions.length > 1;
+  const effectiveTaskType = taskFilteringEnabled ? (taskOptions.length ? taskType : getToolDefaults(selectedTool).taskType) : 'all';
+  const filterOptionsVisible = selectedSource !== 'ollama' && modelTypeOptions.length > 1;
   function applyToolDefaults(toolId) {
-    const defaults = getToolDefaults(toolId);
+    const tool = modelTools.find((entry) => entry.id === toolId) || null;
+    const defaults = getToolDefaults(tool);
     setSelectedToolId(toolId);
     setSelectedSource(defaults.source);
     setModelType(defaults.modelType);
@@ -319,7 +338,7 @@ export default function ModelManager({ tools, onToast }) {
       query,
       sort,
       source,
-      taskType: taskOptionsVisible ? taskType : 'all',
+      taskType: effectiveTaskType,
       toolId,
     });
     if (!result?.ok) {
@@ -376,27 +395,39 @@ export default function ModelManager({ tools, onToast }) {
   }, []);
   useEffect(() => {
     const nextToolId = modelTools[0]?.id || '';
-    if (!selectedToolId && nextToolId) {
+    const hasSelectedTool = modelTools.some((tool) => tool.id === selectedToolId);
+    if (!hasSelectedTool && nextToolId) {
       applyToolDefaults(nextToolId);
     }
   }, [modelTools, selectedToolId]);
   useEffect(() => {
-    if (!selectedToolId) {
+    if (!selectedToolId || !selectedTool) {
       browseRequestIdRef.current += 1;
       setRemoteItems([]);
       setLocalModels([]);
       setPagination(EMPTY_PAGINATION);
       return;
     }
-    const supportedSources = SOURCE_OPTIONS[selectedToolId] || [];
+    const defaults = getToolDefaults(selectedTool);
+    const supportedSources = getModelManagerSources(selectedTool);
     const hasSelectedSource = supportedSources.some((entry) => entry.id === selectedSource);
     if (!hasSelectedSource) {
-      setSelectedSource(getToolDefaults(selectedToolId).source);
+      setSelectedSource(defaults.source);
+      return;
+    }
+    const supportedModelTypes = getToolModelTypeOptions(selectedTool);
+    if (supportedModelTypes.length && !supportedModelTypes.some((entry) => entry.id === modelType)) {
+      setModelType(defaults.modelType);
+      return;
+    }
+    const supportedTaskTypes = getToolTaskOptions(selectedTool, selectedSource);
+    if (supportedTaskTypes.length && !supportedTaskTypes.some((entry) => entry.id === taskType)) {
+      setTaskType(defaults.taskType);
       return;
     }
     setPagination(EMPTY_PAGINATION);
     browse({ page: 1, cursor: null });
-  }, [selectedToolId, selectedSource, modelType, sort, taskType]);
+  }, [selectedTool, selectedToolId, selectedSource, modelType, sort, taskType]);
   async function handleDownload(item) {
     const subject = item?.name || item?.fileName || 'This model';
     const preflightResult = await window.localAIHub.getModelDownloadPreflight({
@@ -480,7 +511,7 @@ export default function ModelManager({ tools, onToast }) {
         <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Model Manager</p>
         <h3 className="mt-3 text-3xl font-semibold text-white">Install a supported tool first.</h3>
         <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-slate-300">
-          Model downloads are available once Ollama, ComfyUI, Forge, Automatic1111, or LM Studio is installed or detected on this PC.
+          Model downloads are available once a supported model tool is installed or detected on this PC.
         </p>
       </section>
     );
@@ -513,7 +544,7 @@ export default function ModelManager({ tools, onToast }) {
             </select>
             {filterOptionsVisible ? (
               <select className="store-input min-w-[220px]" onChange={(event) => setModelType(event.target.value)} value={modelType}>
-                {MODEL_TYPE_OPTIONS.map((option) => (
+                {modelTypeOptions.map((option) => (
                   <option key={option.id} value={option.id}>
                     {option.label}
                   </option>
@@ -522,7 +553,7 @@ export default function ModelManager({ tools, onToast }) {
             ) : null}
             {taskOptionsVisible ? (
               <select className="store-input min-w-[220px]" onChange={(event) => setTaskType(event.target.value)} value={taskType}>
-                {TASK_OPTIONS.map((option) => (
+                {taskOptions.map((option) => (
                   <option key={option.id} value={option.id}>
                     {option.label}
                   </option>
@@ -544,7 +575,7 @@ export default function ModelManager({ tools, onToast }) {
                   browse({ page: 1, cursor: null, query: event.currentTarget.value });
                 }
               }}
-              placeholder={selectedToolId === 'ollama' ? 'Search Ollama models' : 'Search remote catalogs'}
+              placeholder={selectedSource === 'ollama' ? 'Search Ollama models' : 'Search remote catalogs'}
               type="search"
               value={search}
             />

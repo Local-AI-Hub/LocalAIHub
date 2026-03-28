@@ -33,6 +33,11 @@ const {
   saveModelManagerSettings,
   supportsModelManager,
 } = require('./services/modelService');
+const {
+  buildKoboldCppLaunchConfiguration,
+  getKoboldCppSetup,
+  saveKoboldCppLaunchSelection,
+} = require('./services/koboldCppService');
 const { invalidateDiscoveryCache, syncDiscoveredTools } = require('./services/toolDiscoveryService');
 const { detectHardwareSnapshot, getLiveResourceUsage } = require('./services/hardwareService');
 const {
@@ -935,6 +940,12 @@ function registerIpcHandlers() {
             ...aiderLaunch.persistedFields,
           });
         }
+        if (tool.id === 'koboldcpp') {
+          const koboldLaunch = await buildKoboldCppLaunchConfiguration(tool);
+          launchOptions.launchProfileOverride = koboldLaunch.launchProfileOverride;
+          launchOptions.successMessage = koboldLaunch.launchMessage;
+        }
+
         const { nextState, nextTool } = await launchToolFromExplicitUserAction(tool, {
           ...launchOptions,
           launchContext: 'ipc-launch',
@@ -1348,6 +1359,71 @@ function registerIpcHandlers() {
         localModels,
       };
     }, 'Local AI Hub could not delete that model.'),
+  );
+
+  ipcMain.handle('koboldcpp:get-setup', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const toolId = typeof payload === 'string' ? payload : payload?.toolId || 'koboldcpp';
+      const tool = toolLookup(toolId, state.tools);
+      if (tool.id !== 'koboldcpp') {
+        throw new Error('Only KoboldCpp uses this Local AI Hub model setup flow.');
+      }
+
+      return getKoboldCppSetup(tool);
+    }, 'Local AI Hub could not load KoboldCpp setup.'),
+  );
+
+  ipcMain.handle('koboldcpp:pick-model', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const toolId = typeof payload === 'string' ? payload : payload?.toolId || 'koboldcpp';
+      const tool = toolLookup(toolId, state.tools);
+      if (tool.id !== 'koboldcpp') {
+        throw new Error('Only KoboldCpp uses this Local AI Hub model picker.');
+      }
+
+      const requestedPath = String(payload?.currentPath || tool.launchSelection?.filePath || '').trim();
+      const defaultPath = requestedPath
+        ? path.extname(requestedPath)
+          ? path.dirname(requestedPath)
+          : requestedPath
+        : getAppPaths().modelsRoot;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: 'Choose a GGUF model for KoboldCpp',
+        defaultPath,
+        properties: ['openFile'],
+        filters: [
+          { name: 'GGUF models', extensions: ['gguf'] },
+          { name: 'All files', extensions: ['*'] },
+        ],
+      });
+
+      return {
+        canceled: Boolean(result.canceled),
+        filePath: result.filePaths?.[0] || '',
+      };
+    }, 'Local AI Hub could not open the KoboldCpp model picker.'),
+  );
+
+  ipcMain.handle('koboldcpp:save-setup', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const toolId = typeof payload === 'string' ? payload : payload?.toolId || 'koboldcpp';
+      const tool = toolLookup(toolId, state.tools);
+      if (tool.id !== 'koboldcpp') {
+        throw new Error('Only KoboldCpp uses this Local AI Hub model setup flow.');
+      }
+
+      const savedSetup = await saveKoboldCppLaunchSelection(tool, payload || {});
+      const nextState = await buildAppState();
+      const nextTool = toolLookup(tool.id, nextState.tools);
+      return {
+        message: savedSetup.message,
+        setup: await getKoboldCppSetup(nextTool),
+        state: nextState,
+      };
+    }, 'Local AI Hub could not save the KoboldCpp model selection.'),
   );
 
   ipcMain.handle('whisper:pick-audio-file', () =>

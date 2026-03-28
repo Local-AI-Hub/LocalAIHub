@@ -7,6 +7,7 @@ const { PythonShell } = require('python-shell');
 const { getAppPaths, humanizeError, upsertTool } = require('./configService');
 const { killProcessTree, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
+const { buildOllamaAllocationFailureMessage, isOllamaAllocationFailureMessage } = require('./ollamaFailureService');
 const { attemptAutomaticLaunchRecovery, diagnoseLaunchFailure, selectPyTorchRepairCandidates } = require('./runtimeRecoveryService');
 const { getNvidiaRuntimeDetails, detectHardwareSnapshot } = require('./hardwareService');
 const { assertLoopbackUrl, assertPathInside } = require('./pathSafetyService');
@@ -31,6 +32,15 @@ const MANAGED_STABLE_DIFFUSION_NUMPY_PIN = 'numpy==1.26.2';
 const MANAGED_STABLE_DIFFUSION_SKIMAGE_PIN = 'scikit-image==0.21.0';
 const MANAGED_STABLE_DIFFUSION_SETUPTOOLS_PIN = 'setuptools==69.5.1';
 const MANAGED_FORGE_PYDANTIC_PIN = 'pydantic==2.8.2';
+const AIDER_WAITING_FOR_INPUT_MS = 2500;
+const AIDER_AUTO_SETTLE_MIN_TURN_MS = 12000;
+const AIDER_AUTO_SETTLE_MIN_IDLE_AFTER_FILE_CHANGE_MS = 4000;
+const AIDER_AUTO_SETTLE_REPEAT_THRESHOLD = 2;
+const AIDER_OUTPUT_AFTER_CHANGE_THRESHOLD = 2400;
+const AIDER_REPEAT_SIGNATURE_MIN_LENGTH = 120;
+const AIDER_MAX_CHANGED_FILES = 12;
+const AIDER_STARTUP_SETTLE_MS = 1500;
+const AIDER_STARTUP_RECOVERY_WAIT_MS = 10 * 60 * 1000;
 let runtimeEventSink = null;
 const pendingStartupMonitors = new Map();
 const runtimeExitSettlingToolIds = new Set();
@@ -92,12 +102,43 @@ function setRuntimeEventSink(listener) {
   runtimeEventSink = typeof listener === 'function' ? listener : null;
 }
 
+function snapshotRuntimeSessionState(sessionState) {
+  if (!sessionState) {
+    return null;
+  }
+
+  return {
+    ...sessionState,
+    changedFiles: [...(sessionState.changedFiles || [])],
+  };
+}
+
+function emitRuntimeSessionState(runtimeState) {
+  const sessionState = snapshotRuntimeSessionState(runtimeState?.sessionState);
+  if (!sessionState) {
+    return;
+  }
+
+  const signature = JSON.stringify(sessionState);
+  if (runtimeState.lastSessionStateSignature === signature) {
+    return;
+  }
+
+  runtimeState.lastSessionStateSignature = signature;
+  emitRuntimeEvent({
+    type: 'session-state',
+    toolId: runtimeState.toolId,
+    sessionState,
+  });
+}
+
 function getRuntimeOutputSnapshot(toolId) {
   const runtime = runtimes.get(toolId);
   return {
     toolId,
     stdout: runtime?.stdoutBuffer || '',
     stderr: runtime?.stderrBuffer || '',
+    sessionState: snapshotRuntimeSessionState(runtime?.sessionState),
   };
 }
 
@@ -105,8 +146,7 @@ function isToolRuntimeSettling(toolId) {
   return runtimeExitSettlingToolIds.has(toolId);
 }
 
-function sendInputToTool(toolId, input, options = {}) {
-  const runtime = runtimes.get(toolId);
+function writeRuntimeInput(runtime, input, options = {}) {
   if (!runtime?.process || runtime.process.exitCode !== null || runtime.stopping) {
     throw new Error('Local AI Hub could not send input because that tool is not running right now.');
   }
@@ -121,12 +161,431 @@ function sendInputToTool(toolId, input, options = {}) {
   }
 
   runtime.process.stdin.write(options.appendNewline === false ? text : `${text}\n`, 'utf8');
+  return text;
+}
+
+function sendInputToTool(toolId, input, options = {}) {
+  const runtime = runtimes.get(toolId);
+  const text = writeRuntimeInput(runtime, input, options);
+  noteRuntimeInput(runtime, text, options);
 }
 
 function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+function stripAnsiText(value) {
+  return String(value || '').replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function buildAiderStartingMessage(projectDir) {
+  return `Aider is starting in ${projectDir || 'the selected project folder'}.`;
+}
+
+function buildAiderRespondingMessage(sessionState) {
+  const changedFileCount = Number(sessionState?.changedFileCount || 0);
+  if (changedFileCount > 0) {
+    return `Aider is still responding after changing ${changedFileCount} file${changedFileCount === 1 ? '' : 's'}. Local AI Hub will move it back to waiting when this turn settles.`;
+  }
+
+  return 'Aider is working on your last instruction.';
+}
+
+function buildAiderWaitingMessage(sessionState) {
+  const changedFileCount = Number(sessionState?.changedFileCount || 0);
+  if (changedFileCount > 0) {
+    return `Aider is waiting for your next instruction. It changed ${changedFileCount} file${changedFileCount === 1 ? '' : 's'} in this turn.`;
+  }
+
+  return 'Aider is waiting for your next instruction.';
+}
+
+function shouldTrackAiderSession(toolState) {
+  return toolState?.id === 'aider';
+}
+
+function isAiderOllamaSession(runtimeState) {
+  if (runtimeState?.toolId !== 'aider') {
+    return false;
+  }
+
+  const args = Array.isArray(runtimeState?.launchProfile?.args) ? runtimeState.launchProfile.args : [];
+  const modelFlagIndex = args.findIndex((entry) => entry === '--model');
+  if (modelFlagIndex >= 0) {
+    return String(args[modelFlagIndex + 1] || '').startsWith('ollama_chat/');
+  }
+
+  return Boolean(runtimeState?.launchProfile?.env?.OLLAMA_API_BASE);
+}
+
+function detectAiderHardFailureMessage(runtimeState) {
+  if (!isAiderOllamaSession(runtimeState)) {
+    return '';
+  }
+
+  const combinedOutput = stripAnsiText(`${runtimeState?.stdoutBuffer || ''}\n${runtimeState?.stderrBuffer || ''}`);
+  if (!combinedOutput.trim()) {
+    return '';
+  }
+
+  if (isOllamaAllocationFailureMessage(combinedOutput)) {
+    return buildOllamaAllocationFailureMessage({
+      context: 'aider-turn',
+      runtimePolicy: runtimeState?.launchProfile?.localAIHubAiderRuntimePolicy || null,
+    });
+  }
+
+  const normalizedOutput = combinedOutput.toLowerCase();
+  const looksLikeHardOllama500 = (normalizedOutput.includes('ollama_chatexception') || normalizedOutput.includes('ollamaexception'))
+    && (normalizedOutput.includes('returned 500') || normalizedOutput.includes('internalservererror'))
+    && /(memory|allocate|allocation|out of memory)/i.test(combinedOutput);
+  if (looksLikeHardOllama500) {
+    return buildOllamaAllocationFailureMessage({
+      context: 'aider-turn',
+      runtimePolicy: runtimeState?.launchProfile?.localAIHubAiderRuntimePolicy || null,
+    });
+  }
+
+  return '';
+}
+
+async function maybeStopAiderForHardFailure(toolState, runtimeState) {
+  if (!shouldTrackAiderSession(toolState) || runtimeState?.hardFailureMessage || runtimeState?.stopping || runtimeState?.exitHandled) {
+    return;
+  }
+
+  const message = detectAiderHardFailureMessage(runtimeState);
+  if (!message) {
+    return;
+  }
+
+  runtimeState.hardFailureMessage = message;
+  clearAiderWaitingTimer(runtimeState);
+  if (runtimeState.sessionState) {
+    runtimeState.sessionState.phase = 'error';
+    runtimeState.sessionState.waitingForUser = false;
+    runtimeState.sessionState.activeTurn = false;
+    runtimeState.sessionState.message = message;
+    emitRuntimeSessionState(runtimeState);
+  }
+
+  await stopRuntimeProcess(toolState.id, runtimeState, {
+    sessionMessage: message,
+  });
+}
+
+function clearAiderWaitingTimer(runtimeState) {
+  if (runtimeState?.aiderWaitingTimer) {
+    clearTimeout(runtimeState.aiderWaitingTimer);
+    runtimeState.aiderWaitingTimer = null;
+  }
+}
+
+function normalizeRelativeRuntimePath(rootPath, candidatePath) {
+  const normalizedRoot = String(rootPath || '').trim();
+  const normalizedCandidate = String(candidatePath || '').trim();
+  if (!normalizedRoot || !normalizedCandidate) {
+    return '';
+  }
+
+  const relativePath = path.relative(normalizedRoot, normalizedCandidate);
+  if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    return '';
+  }
+
+  return relativePath;
+}
+
+function shouldIgnoreAiderChangedPath(relativePath) {
+  const segments = String(relativePath || '')
+    .split(/[\\/]+/)
+    .map((segment) => segment.trim().toLowerCase())
+    .filter(Boolean);
+
+  return segments.some((segment) => [
+    '.git',
+    '.localaihub',
+    '.venv',
+    '__pycache__',
+    'build',
+    'coverage',
+    'dist',
+    'node_modules',
+    'venv',
+  ].includes(segment));
+}
+
+function createAiderSessionState(toolState, launchProfile) {
+  const projectDir = launchProfile?.workingDir || toolState?.lastProjectDir || '';
+  return {
+    kind: 'aider',
+    phase: 'starting',
+    message: buildAiderStartingMessage(projectDir),
+    waitingForUser: false,
+    activeTurn: false,
+    projectDir,
+    changedFiles: [],
+    changedFileCount: 0,
+    autoSettleAttempted: false,
+    autoSettleTriggered: false,
+  };
+}
+
+function recordAiderChangedFile(runtimeState, candidatePath) {
+  if (!runtimeState?.sessionState?.activeTurn) {
+    return;
+  }
+
+  const projectDir = runtimeState.sessionState.projectDir;
+  const relativePath = normalizeRelativeRuntimePath(projectDir, candidatePath);
+  if (!relativePath || shouldIgnoreAiderChangedPath(relativePath)) {
+    return;
+  }
+
+  const normalizedPath = relativePath.split(path.sep).join('/');
+  const existingFiles = new Set(runtimeState.sessionState.changedFiles || []);
+  if (!existingFiles.has(normalizedPath)) {
+    runtimeState.sessionState.changedFiles = [normalizedPath, ...(runtimeState.sessionState.changedFiles || [])]
+      .slice(0, AIDER_MAX_CHANGED_FILES);
+  }
+
+  runtimeState.sessionState.changedFileCount = Math.max(
+    Number(runtimeState.sessionState.changedFileCount || 0),
+    runtimeState.sessionState.changedFiles.length,
+  );
+  runtimeState.aiderLastFileChangeAt = Date.now();
+  runtimeState.aiderOutputSinceLastFileChange = 0;
+
+  if (runtimeState.sessionState.phase === 'responding') {
+    const changedFileCount = Number(runtimeState.sessionState.changedFileCount || 0);
+    runtimeState.sessionState.message = changedFileCount === 1
+      ? `Aider changed ${normalizedPath}. Local AI Hub is waiting for the turn to settle.`
+      : `Aider has changed ${changedFileCount} files in this turn. Local AI Hub is waiting for the turn to settle.`;
+  }
+
+  emitRuntimeSessionState(runtimeState);
+}
+
+function startAiderProjectWatcher(runtimeState) {
+  const projectDir = runtimeState?.sessionState?.projectDir;
+  if (!projectDir || runtimeState?.aiderProjectWatcher) {
+    return;
+  }
+
+  try {
+    const watcher = fs.watch(projectDir, { recursive: true }, (_eventType, fileName) => {
+      if (!fileName) {
+        return;
+      }
+
+      const nextPath = path.resolve(projectDir, String(fileName));
+      recordAiderChangedFile(runtimeState, nextPath);
+    });
+
+    if (typeof watcher?.on === 'function') {
+      watcher.on('error', () => null);
+    }
+
+    runtimeState.aiderProjectWatcher = watcher;
+  } catch {
+    runtimeState.aiderProjectWatcher = null;
+  }
+}
+
+function buildAiderOutputSignature(runtimeState) {
+  const combinedOutput = stripAnsiText(`${runtimeState?.stdoutBuffer || ''}\n${runtimeState?.stderrBuffer || ''}`);
+  const lines = combinedOutput
+    .split(/\r?\n/)
+    .map((line) => line.toLowerCase().replace(/\s+/g, ' ').replace(/\d+/g, '#').trim())
+    .filter(Boolean)
+    .filter((line) => !line.startsWith('> '));
+
+  return lines.slice(-8).join('\n').slice(-1200);
+}
+
+function updateAiderRepeatHeuristic(runtimeState) {
+  const nextSignature = buildAiderOutputSignature(runtimeState);
+  if (nextSignature.length < AIDER_REPEAT_SIGNATURE_MIN_LENGTH) {
+    return;
+  }
+
+  if (nextSignature === runtimeState.aiderRepeatSignature) {
+    runtimeState.aiderRepeatCount += 1;
+    return;
+  }
+
+  runtimeState.aiderRepeatSignature = nextSignature;
+  runtimeState.aiderRepeatCount = 0;
+}
+
+function scheduleAiderWaitingState(runtimeState) {
+  if (!runtimeState?.sessionState?.activeTurn) {
+    return;
+  }
+
+  clearAiderWaitingTimer(runtimeState);
+  runtimeState.aiderWaitingTimer = setTimeout(() => {
+    if (!runtimeState?.sessionState?.activeTurn || runtimeState?.stopping || runtimeState?.exitHandled) {
+      return;
+    }
+
+    runtimeState.sessionState.phase = 'waiting';
+    runtimeState.sessionState.waitingForUser = true;
+    runtimeState.sessionState.activeTurn = false;
+    runtimeState.sessionState.message = buildAiderWaitingMessage(runtimeState.sessionState);
+    emitRuntimeSessionState(runtimeState);
+  }, AIDER_WAITING_FOR_INPUT_MS);
+}
+
+function maybeAutoSettleAiderSession(runtimeState) {
+  const sessionState = runtimeState?.sessionState;
+  if (!sessionState?.activeTurn || sessionState.waitingForUser || sessionState.autoSettleAttempted) {
+    return;
+  }
+
+  if (Number(sessionState.changedFileCount || 0) === 0) {
+    return;
+  }
+
+  if (!Number(runtimeState.aiderLastUserInputAt) || !Number(runtimeState.aiderLastFileChangeAt)) {
+    return;
+  }
+
+  const now = Date.now();
+  if (now - runtimeState.aiderLastUserInputAt < AIDER_AUTO_SETTLE_MIN_TURN_MS) {
+    return;
+  }
+
+  if (now - runtimeState.aiderLastFileChangeAt < AIDER_AUTO_SETTLE_MIN_IDLE_AFTER_FILE_CHANGE_MS) {
+    return;
+  }
+
+  const looksRepetitive = runtimeState.aiderRepeatCount >= AIDER_AUTO_SETTLE_REPEAT_THRESHOLD
+    && runtimeState.aiderOutputSinceLastFileChange >= AIDER_OUTPUT_AFTER_CHANGE_THRESHOLD;
+  if (!looksRepetitive) {
+    return;
+  }
+
+  sendInputToTool(runtimeState.toolId, '/ask', {
+    autoGenerated: true,
+    source: 'localaihub-aider-auto-settle',
+  });
+}
+
+function trackAiderRuntimeOutput(runtimeState, content) {
+  if (!runtimeState?.sessionState || !shouldTrackAiderSession({ id: runtimeState.toolId })) {
+    return;
+  }
+
+  if (!stripAnsiText(content).replace(/\s+/g, '')) {
+    return;
+  }
+
+  if (runtimeState.sessionState.activeTurn && runtimeState.sessionState.phase !== 'settling') {
+    runtimeState.sessionState.phase = 'responding';
+    runtimeState.sessionState.waitingForUser = false;
+    runtimeState.sessionState.message = buildAiderRespondingMessage(runtimeState.sessionState);
+  }
+
+  runtimeState.aiderLastOutputAt = Date.now();
+  if (Number(runtimeState.aiderLastFileChangeAt) > 0) {
+    runtimeState.aiderOutputSinceLastFileChange += String(content || '').length;
+  }
+
+  updateAiderRepeatHeuristic(runtimeState);
+  scheduleAiderWaitingState(runtimeState);
+  maybeAutoSettleAiderSession(runtimeState);
+  emitRuntimeSessionState(runtimeState);
+}
+
+function noteRuntimeInput(runtimeState, _text, options = {}) {
+  if (!runtimeState?.sessionState || !shouldTrackAiderSession({ id: runtimeState.toolId })) {
+    return;
+  }
+
+  clearAiderWaitingTimer(runtimeState);
+
+  if (options.autoGenerated) {
+    runtimeState.sessionState.phase = 'settling';
+    runtimeState.sessionState.waitingForUser = false;
+    runtimeState.sessionState.activeTurn = true;
+    runtimeState.sessionState.autoSettleAttempted = true;
+    runtimeState.sessionState.autoSettleTriggered = true;
+    runtimeState.sessionState.message = 'Aider already changed files and kept repeating itself, so Local AI Hub asked it to settle and wait for you. Review the console to confirm the result.';
+    emitRuntimeSessionState(runtimeState);
+    return;
+  }
+
+  runtimeState.aiderLastUserInputAt = Date.now();
+  runtimeState.aiderLastOutputAt = 0;
+  runtimeState.aiderLastFileChangeAt = 0;
+  runtimeState.aiderRepeatSignature = '';
+  runtimeState.aiderRepeatCount = 0;
+  runtimeState.aiderOutputSinceLastFileChange = 0;
+  runtimeState.sessionState.phase = 'responding';
+  runtimeState.sessionState.waitingForUser = false;
+  runtimeState.sessionState.activeTurn = true;
+  runtimeState.sessionState.changedFiles = [];
+  runtimeState.sessionState.changedFileCount = 0;
+  runtimeState.sessionState.autoSettleAttempted = false;
+  runtimeState.sessionState.autoSettleTriggered = false;
+  runtimeState.sessionState.message = buildAiderRespondingMessage(runtimeState.sessionState);
+  emitRuntimeSessionState(runtimeState);
+}
+
+function initializeRuntimeSessionTracking(toolState, runtimeState) {
+  if (!runtimeState || !shouldTrackAiderSession(toolState)) {
+    return;
+  }
+
+  runtimeState.sessionState = createAiderSessionState(toolState, runtimeState.launchProfile || toolState.launchProfile);
+  runtimeState.lastSessionStateSignature = '';
+  runtimeState.aiderWaitingTimer = null;
+  runtimeState.aiderProjectWatcher = null;
+  runtimeState.aiderLastUserInputAt = 0;
+  runtimeState.aiderLastOutputAt = 0;
+  runtimeState.aiderLastFileChangeAt = 0;
+  runtimeState.aiderRepeatSignature = '';
+  runtimeState.aiderRepeatCount = 0;
+  runtimeState.aiderOutputSinceLastFileChange = 0;
+  startAiderProjectWatcher(runtimeState);
+  emitRuntimeSessionState(runtimeState);
+}
+
+function markRuntimeSessionReady(runtimeState) {
+  if (!runtimeState?.sessionState) {
+    return;
+  }
+
+  clearAiderWaitingTimer(runtimeState);
+  runtimeState.sessionState.phase = 'waiting';
+  runtimeState.sessionState.waitingForUser = true;
+  runtimeState.sessionState.activeTurn = false;
+  runtimeState.sessionState.message = buildAiderWaitingMessage(runtimeState.sessionState);
+  emitRuntimeSessionState(runtimeState);
+}
+
+function markRuntimeSessionStopped(runtimeState, message = 'Aider stopped. Launch it again to continue coding.') {
+  if (!runtimeState?.sessionState) {
+    return;
+  }
+
+  clearAiderWaitingTimer(runtimeState);
+  runtimeState.sessionState.phase = 'stopped';
+  runtimeState.sessionState.waitingForUser = false;
+  runtimeState.sessionState.activeTurn = false;
+  runtimeState.sessionState.message = message;
+  emitRuntimeSessionState(runtimeState);
+}
+
+function disposeRuntimeSessionTracking(runtimeState) {
+  clearAiderWaitingTimer(runtimeState);
+
+  if (runtimeState?.aiderProjectWatcher) {
+    runtimeState.aiderProjectWatcher.close();
+    runtimeState.aiderProjectWatcher = null;
+  }
 }
 
 function buildStartupDownloadMessage(runtimeState) {
@@ -1202,7 +1661,7 @@ function analyzeStartupDownloadOutput(runtimeState, stream, content) {
   emitLaunchProgress(runtimeState);
 }
 
-function appendRuntimeOutput(runtimeState, key, chunk) {
+function appendRuntimeOutput(toolState, runtimeState, key, chunk) {
   const content = typeof chunk === 'string' ? chunk : chunk?.toString?.() || '';
   runtimeState[key] = trimBufferedOutput(`${runtimeState[key] || ''}${content}`, OUTPUT_BUFFER_LIMIT);
 
@@ -1210,6 +1669,8 @@ function appendRuntimeOutput(runtimeState, key, chunk) {
   runtimeState[logKey] = trimBufferedOutput(`${runtimeState[logKey] || ''}${content}`, OUTPUT_LOG_LIMIT);
 
   analyzeStartupDownloadOutput(runtimeState, key === 'stderrBuffer' ? 'stderr' : 'stdout', content);
+  trackAiderRuntimeOutput(runtimeState, content);
+  maybeStopAiderForHardFailure(toolState, runtimeState).catch(() => null);
   emitRuntimeEvent({
     type: 'output',
     toolId: runtimeState.toolId,
@@ -1293,6 +1754,54 @@ async function waitForRuntimeExit(runtimeState, timeoutMs = PROCESS_SHUTDOWN_WAI
   });
 }
 
+function initializeRuntimeStartupOutcome(runtimeState) {
+  if (!runtimeState || runtimeState.startupOutcomePromise) {
+    return;
+  }
+
+  runtimeState.startupOutcome = null;
+  runtimeState.startupOutcomeSettled = false;
+  runtimeState.startupOutcomePromise = new Promise((resolve) => {
+    runtimeState.resolveStartupOutcome = resolve;
+  });
+}
+
+function settleRuntimeStartupOutcome(runtimeState, outcome = {}) {
+  if (!runtimeState || runtimeState.startupOutcomeSettled) {
+    return;
+  }
+
+  runtimeState.startupOutcomeSettled = true;
+  runtimeState.startupOutcome = outcome;
+  if (typeof runtimeState.resolveStartupOutcome === 'function') {
+    runtimeState.resolveStartupOutcome(outcome);
+    runtimeState.resolveStartupOutcome = null;
+  }
+}
+
+async function waitForRuntimeStartupOutcome(runtimeState, timeoutMs = AIDER_STARTUP_RECOVERY_WAIT_MS) {
+  if (!runtimeState?.startupOutcomePromise) {
+    return null;
+  }
+
+  if (runtimeState.startupOutcomeSettled) {
+    return runtimeState.startupOutcome;
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(runtimeState.startupOutcome || null), timeoutMs);
+    runtimeState.startupOutcomePromise
+      .then((outcome) => {
+        clearTimeout(timer);
+        resolve(outcome || null);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(runtimeState.startupOutcome || null);
+      });
+  });
+}
+
 async function waitForNamedProcessesToStop(processNames = [], timeoutMs = PROCESS_SHUTDOWN_WAIT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1315,16 +1824,21 @@ function buildPendingStartupFailureMessage(toolState, target) {
   return `${toolState.name} is still not answering on ${target}. Local AI Hub stopped waiting in the background. Open the logs folder for the full launch details.`;
 }
 
-async function stopRuntimeProcess(toolId, runtimeState) {
+async function stopRuntimeProcess(toolId, runtimeState, options = {}) {
   pendingStartupMonitors.delete(toolId);
+  const sessionMessage = options.sessionMessage || runtimeState?.hardFailureMessage || 'Aider stopped. Launch it again to continue coding.';
 
   if (!runtimeState?.process?.pid) {
+    markRuntimeSessionStopped(runtimeState, sessionMessage);
+    disposeRuntimeSessionTracking(runtimeState);
     clearLaunchProgress(runtimeState);
     clearRuntime(toolId, runtimeState);
     return;
   }
 
   runtimeState.stopping = true;
+  markRuntimeSessionStopped(runtimeState, sessionMessage);
+  disposeRuntimeSessionTracking(runtimeState);
   clearLaunchProgress(runtimeState);
   await killProcessTree(runtimeState.process.pid).catch(() => null);
   await waitForRuntimeExit(runtimeState).catch(() => false);
@@ -1473,6 +1987,10 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger, option
     };
   }
 
+  if (toolState?.id === 'aider' && runtimeState.process?.exitCode === null && !runtimeState.stopping) {
+    await waitForRuntimeExit(runtimeState, AIDER_STARTUP_SETTLE_MS);
+  }
+
   if (runtimeState.process?.exitCode === null && !runtimeState.stopping) {
     await logger.info('Tool process started without a local URL health check.', {
       pid: runtimeState.process?.pid || null,
@@ -1537,6 +2055,15 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
   runtimeState.exitHandled = true;
   pendingStartupMonitors.delete(toolState.id);
   clearLaunchProgress(runtimeState);
+  markRuntimeSessionStopped(
+    runtimeState,
+    runtimeState.hardFailureMessage
+      ? runtimeState.hardFailureMessage
+      : runtimeState.stopping
+        ? 'Aider stopped. Launch it again to continue coding.'
+        : 'Aider stopped. Review the console and launch it again when you want to continue.',
+  );
+  disposeRuntimeSessionTracking(runtimeState);
   runtimeExitSettlingToolIds.add(toolState.id);
 
   try {
@@ -1547,6 +2074,32 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
 ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
 
     if (runtimeState.stopping) {
+      if (runtimeState.hardFailureMessage) {
+        await logger.warn('Tool runtime was stopped by Local AI Hub after a hard runtime failure.', {
+          exitCode: code,
+          signal,
+          hardFailureMessage: runtimeState.hardFailureMessage,
+        });
+        await upsertTool({
+          id: toolState.id,
+          status: 'error',
+          lastError: runtimeState.hardFailureMessage,
+          lastRepairMessage: null,
+        });
+        emitToolState(toolState.id, {
+          status: 'error',
+          lastError: runtimeState.hardFailureMessage,
+          lastRepairMessage: null,
+        });
+        settleRuntimeStartupOutcome(runtimeState, {
+          status: 'error',
+          recovered: false,
+          message: runtimeState.hardFailureMessage,
+        });
+        emitUnexpectedStop(toolState, runtimeState.hardFailureMessage);
+        return;
+      }
+
       await logger.info('Tool runtime stopped by Local AI Hub.', {
         exitCode: code,
         signal,
@@ -1561,6 +2114,9 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
         status: 'stopped',
         lastError: null,
         lastRepairMessage: null,
+      });
+      settleRuntimeStartupOutcome(runtimeState, {
+        status: 'stopped',
       });
       return;
     }
@@ -1585,6 +2141,9 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
         lastError: null,
         lastRepairMessage: null,
       });
+      settleRuntimeStartupOutcome(runtimeState, {
+        status: 'running',
+      });
       return;
     }
 
@@ -1607,6 +2166,9 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
         status: 'stopped',
         lastError: null,
         lastRepairMessage: null,
+      });
+      settleRuntimeStartupOutcome(runtimeState, {
+        status: 'stopped',
       });
       return;
     }
@@ -1634,7 +2196,7 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
       : await attemptAutomaticLaunchRecovery(toolState, failureText || runtimeState.stderrLogBuffer || '', {
           logger,
           retryLaunch: async (nextToolState) => {
-            await launchToolInternal(nextToolState, {
+            return launchToolInternal(nextToolState, {
               autoRecoveryAttempted: true,
               launchContext: 'automatic-recovery',
             });
@@ -1642,6 +2204,11 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
         });
 
     if (recoveryResult?.recovered) {
+      settleRuntimeStartupOutcome(runtimeState, {
+        status: 'running',
+        recovered: true,
+        message: recoveryResult.userMessage || null,
+      });
       return;
     }
 
@@ -1668,6 +2235,11 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
 
     if (!wasRunning && runtimeState.startupCheckPending) {
       runtimeState.startupFailureMessage = message;
+      settleRuntimeStartupOutcome(runtimeState, {
+        status: 'error',
+        recovered: false,
+        message,
+      });
       return;
     }
 
@@ -1682,6 +2254,11 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
       lastError: message,
       lastRepairMessage: null,
     });
+    settleRuntimeStartupOutcome(runtimeState, {
+      status: 'error',
+      recovered: false,
+      message,
+    });
     emitUnexpectedStop(toolState, message);
   } finally {
     runtimeExitSettlingToolIds.delete(toolState.id);
@@ -1692,11 +2269,11 @@ function attachRuntimeHandlers(toolState, runtimeState, runtimeOptions = {}) {
   const child = runtimeState.process;
 
   child.stdout?.on('data', (chunk) => {
-    appendRuntimeOutput(runtimeState, 'stdoutBuffer', chunk);
+    appendRuntimeOutput(toolState, runtimeState, 'stdoutBuffer', chunk);
   });
 
   child.stderr?.on('data', (chunk) => {
-    appendRuntimeOutput(runtimeState, 'stderrBuffer', chunk);
+    appendRuntimeOutput(toolState, runtimeState, 'stderrBuffer', chunk);
   });
 
   child.on('close', (code, signal) => {
@@ -1704,7 +2281,7 @@ function attachRuntimeHandlers(toolState, runtimeState, runtimeOptions = {}) {
   });
 
   child.on('error', (error) => {
-    appendRuntimeOutput(runtimeState, 'stderrBuffer', error?.message || String(error));
+    appendRuntimeOutput(toolState, runtimeState, 'stderrBuffer', error?.message || String(error));
     handleRuntimeExit(toolState, runtimeState, 1, null, runtimeOptions).catch(() => null);
   });
 
@@ -1767,6 +2344,8 @@ async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}
     exitHandled: false,
   });
 
+  initializeRuntimeStartupOutcome(runtimeState);
+  initializeRuntimeSessionTracking(toolState, runtimeState);
   return attachRuntimeHandlers(toolState, runtimeState, runtimeOptions);
 }
 
@@ -1831,6 +2410,8 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
     exitHandled: false,
   });
 
+  initializeRuntimeStartupOutcome(runtimeState);
+  initializeRuntimeSessionTracking(toolState, runtimeState);
   return attachRuntimeHandlers(toolState, runtimeState, runtimeOptions);
 }
 
@@ -1871,6 +2452,8 @@ async function launchBatchProfile(toolState, launchProfile, runtimeOptions = {})
     exitHandled: false,
   });
 
+  initializeRuntimeStartupOutcome(runtimeState);
+  initializeRuntimeSessionTracking(toolState, runtimeState);
   return attachRuntimeHandlers(toolState, runtimeState, runtimeOptions);
 }
 
@@ -1929,6 +2512,7 @@ async function launchToolInternal(toolState, options = {}) {
       lastError: null,
       lastRepairMessage: null,
     });
+    markRuntimeSessionReady(runtime);
     if (!options.skipOpenInterface) {
       openToolInterface(toolState).catch(() => null);
     }
@@ -2041,6 +2625,7 @@ async function launchToolInternal(toolState, options = {}) {
       lastError: null,
       lastRepairMessage: null,
     });
+    markRuntimeSessionReady(runtimeState);
 
     if (!options.skipOpenInterface) {
       openToolInterface(toolState).catch(() => null);
@@ -2052,7 +2637,21 @@ async function launchToolInternal(toolState, options = {}) {
       lastError: null,
     };
   } catch (error) {
-    const message = runtimeState?.startupFailureMessage || humanizeError(error, `${toolState.name} could not start.`);
+    let startupOutcome = null;
+    if (toolState.id === 'aider' && runtimeState) {
+      startupOutcome = await waitForRuntimeStartupOutcome(runtimeState);
+      if (startupOutcome?.recovered && startupOutcome.status === 'running') {
+        return {
+          ...toolState,
+          status: 'running',
+          lastError: null,
+        };
+      }
+    }
+
+    const message = startupOutcome?.message
+      || runtimeState?.startupFailureMessage
+      || humanizeError(error, `${toolState.name} could not start.`);
     await persistToolRuntimeState(toolState, 'error', {
       lastError: message,
       lastRepairMessage: null,

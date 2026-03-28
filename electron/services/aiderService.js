@@ -5,9 +5,26 @@ const { runCommand } = require('./commandService');
 const { getProviderSecret } = require('./credentialService');
 const { listDownloadedModels } = require('./modelService');
 const { listOllamaModels } = require('./ollamaService');
+const { detectHardwareSnapshot } = require('./hardwareService');
 
 const SUPPORTED_PROVIDER_PROTOCOLS = new Set(['openai-compatible', 'anthropic', 'google-gemini']);
 const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
+const AIDER_OLLAMA_RUNTIME_PROFILES = [
+  {
+    id: 'low-vram',
+    maxVramMb: 6144,
+    maxSystemRamMb: 16384,
+    maxContextTokens: 3072,
+    mapTokens: 1024,
+  },
+  {
+    id: 'constrained',
+    maxVramMb: 8192,
+    maxSystemRamMb: 24576,
+    maxContextTokens: 4096,
+    mapTokens: 2048,
+  },
+];
 
 function normalizeProviderId(value) {
   return String(value || '').trim().toLowerCase();
@@ -31,6 +48,107 @@ function getProviderProtocol(provider) {
 
 function getOllamaBaseUrl(tool) {
   return trimTrailingSlash(tool?.launchUrl || DEFAULT_OLLAMA_BASE_URL) || DEFAULT_OLLAMA_BASE_URL;
+}
+
+function escapeYamlSingleQuotedString(value) {
+  return String(value || '').replace(/'/g, "''");
+}
+
+function resolveAiderOllamaRuntimeProfile(hardware = null) {
+  const vramMb = Number(hardware?.vramMb || 0);
+  const systemRamMb = Number(hardware?.systemRamMb || 0);
+
+  for (const profile of AIDER_OLLAMA_RUNTIME_PROFILES) {
+    const matchesVram = vramMb > 0 && vramMb <= profile.maxVramMb;
+    const matchesSystemRam = systemRamMb > 0 && systemRamMb <= profile.maxSystemRamMb;
+    if (matchesVram || matchesSystemRam) {
+      return profile;
+    }
+  }
+
+  return null;
+}
+
+function buildAiderOllamaRuntimePolicyNote(profile) {
+  if (!profile) {
+    return '';
+  }
+
+  return `Local AI Hub applied its safer Ollama coding profile on this PC by capping Aider's Ollama context to ${profile.maxContextTokens} tokens and repo map to ${profile.mapTokens} tokens.`;
+}
+
+function getAiderLocalStateDir(tool) {
+  return path.join(tool?.appDir || tool?.installDir || process.cwd(), '.localaihub');
+}
+
+function buildAiderOllamaModelSettingsYaml(modelName, profile) {
+  return [
+    `- name: '${escapeYamlSingleQuotedString(modelName)}'`,
+    '  extra_params:',
+    `    num_ctx: ${profile.maxContextTokens}`,
+    '',
+  ].join('\n');
+}
+
+async function ensureAiderOllamaModelSettingsFile(tool, modelName, profile) {
+  const settingsDir = path.join(getAiderLocalStateDir(tool), 'aider');
+  await fs.ensureDir(settingsDir);
+
+  const safeModelName = String(modelName || '')
+    .trim()
+    .replace(/[^a-z0-9._-]+/gi, '_')
+    .replace(/^_+|_+$/g, '') || 'ollama';
+  const settingsPath = path.join(settingsDir, `ollama-${safeModelName}-model-settings.yml`);
+  const nextContent = buildAiderOllamaModelSettingsYaml(modelName, profile);
+  const currentContent = await fs.readFile(settingsPath, 'utf8').catch(() => '');
+
+  if (currentContent !== nextContent) {
+    await fs.writeFile(settingsPath, nextContent, 'utf8');
+  }
+
+  return settingsPath;
+}
+
+function extractModelParameterSize(modelName) {
+  const match = String(modelName || '').toLowerCase().match(/(\d+(?:\.\d+)?)\s*b\b/);
+  return match ? Number(match[1]) : null;
+}
+
+function summarizeOllamaAiderSuitability(modelName, capabilityLabels = []) {
+  const normalizedName = String(modelName || '').trim().toLowerCase();
+  const parameterSize = extractModelParameterSize(normalizedName);
+  const looksMiniFamily = /(mini|tiny|nano|small)\b/.test(normalizedName);
+  const looksEmbeddingOnly = capabilityLabels.includes('embedding') && !capabilityLabels.includes('vision');
+
+  if (looksEmbeddingOnly) {
+    return {
+      state: 'caution',
+      note: "Aider uses Ollama's chat adapter. This model looks embedding-focused, so coding chat may not work.",
+    };
+  }
+
+  if ((Number.isFinite(parameterSize) && parameterSize > 0 && parameterSize < 5) || (looksMiniFamily && (!Number.isFinite(parameterSize) || parameterSize < 7))) {
+    return {
+      state: 'warning',
+      note: 'This looks like a very small local model. It may repeat itself, miss edits, or keep looping after it already changed a file. Use it only for light experiments, not serious Aider coding work.',
+    };
+  }
+
+  if ((Number.isFinite(parameterSize) && parameterSize >= 5 && parameterSize < 8) || looksMiniFamily) {
+    return {
+      state: 'caution',
+      note: 'This looks like a smaller local chat model. It may handle simple Aider prompts, but real edit sessions can still loop or stop short. A stronger coding-oriented model is recommended when possible.',
+    };
+  }
+
+  return {
+    state: 'supported',
+    note: '',
+  };
+}
+
+function joinCompatibilityNotes(parts = []) {
+  return parts.map((part) => String(part || '').trim()).filter(Boolean).join(' ');
 }
 
 function getSupportedAiderProviders({ ollamaTool, providers = [] }) {
@@ -86,21 +204,18 @@ function buildOllamaAiderModelEntry(model, ollamaTool, options = {}) {
   const capabilityLabels = Array.isArray(model?.capabilityLabels)
     ? model.capabilityLabels.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean)
     : [];
-  const appearsEmbeddingOnly = capabilityLabels.includes('embedding') && !capabilityLabels.includes('vision');
-  const compatibilityState = appearsEmbeddingOnly ? 'caution' : 'supported';
-  const compatibilityNote = appearsEmbeddingOnly
-    ? 'Aider uses Ollama\'s chat adapter. This model looks like an embedding-focused model, so coding chat may not work.'
-    : options.fromLibraryState
-      ? 'Local AI Hub is showing installed Ollama models from disk and will start Ollama when you launch Aider.'
-      : 'Uses Ollama\'s local chat API through Aider\'s ollama_chat adapter.';
+  const suitability = summarizeOllamaAiderSuitability(modelName, capabilityLabels);
+  const sourceNote = options.fromLibraryState
+    ? 'Local AI Hub is showing installed Ollama models from disk and will start Ollama when you launch Aider.'
+    : "Uses Ollama's local chat API through Aider's ollama_chat adapter.";
 
   return {
     id: modelName,
     label: modelName,
     detail: model?.detail || null,
     aiderModel: `ollama_chat/${modelName}`,
-    compatibilityState,
-    compatibilityNote,
+    compatibilityState: suitability.state,
+    compatibilityNote: joinCompatibilityNotes([suitability.note, sourceNote]),
     env: {
       OLLAMA_API_BASE: getOllamaBaseUrl(ollamaTool),
     },
@@ -389,6 +504,22 @@ async function buildAiderLaunchConfiguration({ tool, ollamaTool, providers = [],
     'utf-8',
   ];
 
+  let runtimePolicy = null;
+  if (selection.modelEntry.aiderModel.startsWith('ollama_chat/')) {
+    const hardwareSnapshot = await detectHardwareSnapshot().catch(() => null);
+    const profile = resolveAiderOllamaRuntimeProfile(hardwareSnapshot);
+    if (profile) {
+      const modelSettingsFile = await ensureAiderOllamaModelSettingsFile(tool, selection.modelEntry.aiderModel, profile);
+      args.push('--model-settings-file', modelSettingsFile, '--map-tokens', String(profile.mapTokens));
+      runtimePolicy = {
+        kind: 'ollama-low-memory',
+        maxContextTokens: profile.maxContextTokens,
+        mapTokens: profile.mapTokens,
+        note: buildAiderOllamaRuntimePolicyNote(profile),
+      };
+    }
+  }
+
   if (resolvedProjectInfo.hasGitRepo) {
     args.push('--git', '--no-gitignore');
   } else {
@@ -414,10 +545,14 @@ async function buildAiderLaunchConfiguration({ tool, ollamaTool, providers = [],
       },
       workingDir: resolvedProjectInfo.projectDir,
       allowExternalWorkingDir: true,
+      localAIHubAiderRuntimePolicy: runtimePolicy,
     },
-    launchMessage: resolvedProjectInfo.hasGitRepo
-      ? `Aider is running in ${resolvedProjectInfo.projectDir} with ${selection.modelEntry.label} from ${selection.providerLabel}.`
-      : `Aider is running in ${resolvedProjectInfo.projectDir} without git, using ${selection.modelEntry.label} from ${selection.providerLabel}.`,
+    launchMessage: (() => {
+      const baseMessage = resolvedProjectInfo.hasGitRepo
+        ? `Aider is running in ${resolvedProjectInfo.projectDir} with ${selection.modelEntry.label} from ${selection.providerLabel}.`
+        : `Aider is running in ${resolvedProjectInfo.projectDir} without git, using ${selection.modelEntry.label} from ${selection.providerLabel}.`;
+      return runtimePolicy?.note ? `${baseMessage} ${runtimePolicy.note}` : baseMessage;
+    })(),
   };
 }
 

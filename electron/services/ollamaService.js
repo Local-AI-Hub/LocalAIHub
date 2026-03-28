@@ -1,4 +1,5 @@
 const { createLogger } = require('./logService');
+const { buildOllamaAllocationFailureMessage, isOllamaAllocationFailureMessage } = require('./ollamaFailureService');
 const { launchToolFromUserAction, stopTool } = require('./processService');
 const { getResolvedToolState } = require('./toolStateService');
 
@@ -98,6 +99,11 @@ async function requestOllama(toolState, endpoint, options = {}) {
         payload?.error ||
         payload?.message ||
         (typeof payload?.raw === 'string' ? payload.raw.trim() : '');
+      if (response.status === 500 && isOllamaAllocationFailureMessage(apiMessage)) {
+        throw new Error(buildOllamaAllocationFailureMessage({
+          modelName: options.modelName,
+        }));
+      }
       const detail = apiMessage ? ` ${apiMessage}` : '';
       throw new Error(`${toolState?.name || 'Ollama'} returned ${response.status}.${detail}`.trim());
     }
@@ -336,6 +342,7 @@ async function chatWithOllama(toolState, payload = {}) {
       messages,
       stream: false,
     }),
+    modelName: model,
     timeoutMessage: (toolState?.name || 'Ollama') + ' is taking too long to answer. If this PC is struggling with ' + model + ', try a smaller model or give it more time to finish loading.',
     timeoutMs: CHAT_REQUEST_TIMEOUT_MS,
   });

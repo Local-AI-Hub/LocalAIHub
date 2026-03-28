@@ -2,6 +2,45 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 const CONSOLE_OUTPUT_LIMIT = 48000;
 const AIDER_SUPPORTED_PROVIDER_PROTOCOLS = new Set(['openai-compatible', 'anthropic', 'google-gemini']);
+function getModelNoteClasses(compatibilityState) {
+  if (compatibilityState === 'warning') {
+    return 'border-rose-400/35 bg-rose-500/10 text-rose-100';
+  }
+
+  if (compatibilityState === 'caution') {
+    return 'border-amber-400/35 bg-amber-500/10 text-amber-100';
+  }
+
+  return 'border-white/10 bg-slate-950/30 text-slate-300';
+}
+
+function getSessionBadge(sessionState, status) {
+  if (status === 'error') {
+    return { label: 'Error', tone: 'text-rose-200' };
+  }
+
+  if (status !== 'running') {
+    return { label: 'Idle', tone: 'text-slate-500' };
+  }
+
+  if (sessionState?.phase === 'starting') {
+    return { label: 'Starting', tone: 'text-cyan-200' };
+  }
+
+  if (sessionState?.phase === 'responding') {
+    return { label: 'Working', tone: 'text-cyan-200' };
+  }
+
+  if (sessionState?.phase === 'settling') {
+    return { label: 'Settling', tone: 'text-amber-200' };
+  }
+
+  if (sessionState?.phase === 'waiting') {
+    return { label: 'Waiting', tone: 'text-emerald-200' };
+  }
+
+  return { label: 'Live', tone: 'text-cyan-200' };
+}
 
 function trimConsoleOutput(value) {
   const text = String(value || '');
@@ -76,9 +115,11 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
   const [initializeGit, setInitializeGit] = useState(true);
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
+  const [sessionState, setSessionState] = useState(null);
   const outputRef = useRef(null);
   const isRunning = tool?.status === 'running';
   const projectLabel = fileNameFromPath(projectDir);
+  const sessionBadge = getSessionBadge(sessionState, tool?.status);
 
   const providerOptions = useMemo(() => buildProviderOptions(ollamaTool, connectedProviders), [connectedProviders, ollamaTool]);
   const selectedProvider = useMemo(
@@ -101,6 +142,7 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
 
   useEffect(() => {
     if (!tool) {
+      setSessionState(null);
       return;
     }
 
@@ -121,10 +163,11 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
 
   useEffect(() => {
     if (!tool || !isRunning) {
+      setSessionState(null);
       return;
     }
 
-    setNotice((current) => current || `Aider is running in ${projectDir || tool.lastProjectDir || 'the selected project folder'}.`);
+    setNotice((current) => current || sessionState?.message || `Aider is running in ${projectDir || tool.lastProjectDir || 'the selected project folder'}.`);
 
     window.localAIHub.getToolRuntimeOutput(tool.id).then((result) => {
       if (!result?.ok) {
@@ -132,12 +175,25 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
       }
 
       setOutput(combineRuntimeOutput(result.data));
+      setSessionState(result.data?.sessionState || null);
     });
-  }, [isRunning, projectDir, tool]);
+  }, [isRunning, projectDir, sessionState?.message, tool]);
 
   useEffect(() => {
     const unsubscribeRuntimeOutput = window.localAIHub.onRuntimeOutput((payload) => {
-      if (payload?.toolId !== 'aider' || typeof payload.chunk !== 'string') {
+      if (payload?.toolId !== 'aider') {
+        return;
+      }
+
+      if (payload?.type === 'session-state') {
+        setSessionState(payload.sessionState || null);
+        if (payload.sessionState?.message) {
+          setNotice(payload.sessionState.message);
+        }
+        return;
+      }
+
+      if (typeof payload.chunk !== 'string') {
         return;
       }
 
@@ -164,6 +220,20 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
 
     loadModels({ providerId, silent: true, preserveNotice: Boolean(projectStatus?.message) });
   }, [isRunning, providerId]);
+
+  useEffect(() => {
+    if (!isRunning || !sessionState?.message) {
+      return;
+    }
+
+    setNotice(sessionState.message);
+  }, [isRunning, sessionState?.message]);
+
+  useEffect(() => {
+    if (tool?.status === 'error' && tool?.lastError) {
+      setNotice(tool.lastError);
+    }
+  }, [tool?.lastError, tool?.status]);
 
   useEffect(() => {
     if (isRunning) {
@@ -296,6 +366,7 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
     }
 
     setOutput('');
+    setSessionState(null);
     setBusy(true);
     const launched = await runAction('launch:aider', () =>
       window.localAIHub.launchTool({
@@ -313,6 +384,7 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
       const runtimeOutput = await window.localAIHub.getToolRuntimeOutput('aider');
       if (runtimeOutput?.ok) {
         setOutput(combineRuntimeOutput(runtimeOutput.data));
+        setSessionState(runtimeOutput.data?.sessionState || null);
       }
     }
     setBusy(false);
@@ -326,6 +398,7 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
     setBusy(true);
     const stopped = await runAction(`stop:${tool.id}`, () => window.localAIHub.stopTool(tool.id));
     if (stopped) {
+      setSessionState(null);
       setNotice('Aider stopped. Launch it again to continue coding.');
     }
     setBusy(false);
@@ -357,7 +430,7 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
     }
 
     setDraft('');
-    setNotice(`Sent a command to ${tool?.name || 'Aider'}.`);
+    setNotice('Aider is working on your last instruction.');
     setSending(false);
   }
 
@@ -483,9 +556,9 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
                 ))}
               </select>
               {selectedModel ? (
-                <div className="mt-3 space-y-2 text-xs leading-5 text-slate-400">
+                <div className={`mt-3 rounded-[18px] border p-3 text-xs leading-5 ${getModelNoteClasses(selectedModel.compatibilityState)}`}>
                   <p>{selectedModel.compatibilityNote}</p>
-                  {selectedModel.detail ? <p>{selectedModel.detail}</p> : null}
+                  {selectedModel.detail ? <p className="mt-2 text-white/75">{selectedModel.detail}</p> : null}
                 </div>
               ) : (
                 <p className="mt-3 text-xs leading-5 text-slate-400">Choose a provider and refresh models before launching Aider.</p>
@@ -498,6 +571,17 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
                   ? 'Aider is running. Type a prompt below to continue the session.'
                   : 'Choose a project folder, provider, and model before launching Aider.')}
             </p>
+            {isRunning && sessionState?.changedFileCount ? (
+              <p className="mt-3 text-xs leading-5 text-slate-400">
+                Changed this turn: {(sessionState.changedFiles || []).slice(0, 3).join(', ')}
+                {sessionState.changedFileCount > (sessionState.changedFiles || []).length ? ' and more.' : '.'}
+              </p>
+            ) : null}
+            {isRunning && sessionState?.autoSettleTriggered ? (
+              <p className="mt-3 text-xs leading-5 text-amber-200">
+                Local AI Hub sent <span className="font-mono text-[11px]">/ask</span> after Aider had already changed files and kept repeating itself. Review the console before you continue.
+              </p>
+            ) : null}
           </div>
         </aside>
 
@@ -505,7 +589,7 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
           <div className="rounded-[26px] border border-white/10 bg-white/5 p-4">
             <div className="flex items-center justify-between gap-3">
               <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Console output</p>
-              <p className="text-xs uppercase tracking-[0.18em] text-slate-500">{isRunning ? 'Live' : 'Idle'}</p>
+              <p className={`text-xs uppercase tracking-[0.18em] ${sessionBadge.tone}`}>{sessionBadge.label}</p>
             </div>
             <pre
               ref={outputRef}
