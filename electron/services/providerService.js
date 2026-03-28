@@ -151,6 +151,11 @@ async function requestProviderJson(provider, apiKey, endpoint, options = {}) {
     return payload;
   } catch (error) {
     if (error.name === 'AbortError') {
+      const timeoutMessage = String(options.timeoutMessage || '').trim();
+      if (timeoutMessage) {
+        throw new Error(timeoutMessage);
+      }
+
       throw new Error(`${provider.name} did not answer before Local AI Hub's connection check timed out.`);
     }
 
@@ -544,6 +549,15 @@ function normalizeChatMessages(messages = []) {
     : [];
 }
 
+function getProviderChatTimeoutMs(payload = {}) {
+  const timeoutMs = Number(payload.timeoutMs || 0);
+  return timeoutMs > 0 ? timeoutMs : REQUEST_TIMEOUT_MS;
+}
+
+function getProviderChatTimeoutMessage(provider, payload = {}) {
+  return String(payload.timeoutMessage || '').trim() || (provider.name + ' did not answer before Local AI Hub timed out waiting for this response.');
+}
+
 function extractTextParts(value) {
   if (typeof value === 'string') {
     return value.trim();
@@ -649,6 +663,8 @@ async function sendOpenAICompatibleChat(provider, apiKey, payload) {
       })),
       stream: false,
     }),
+    timeoutMessage: getProviderChatTimeoutMessage(provider, payload),
+    timeoutMs: getProviderChatTimeoutMs(payload),
   });
 
   const content = extractTextParts(response?.choices?.[0]?.message?.content || response?.choices?.[0]?.text || response?.output_text || '');
@@ -691,6 +707,8 @@ async function sendAnthropicChat(provider, apiKey, payload) {
       messages: conversation,
       ...(systemMessages.length ? { system: systemMessages.join('\n\n') } : {}),
     }),
+    timeoutMessage: getProviderChatTimeoutMessage(provider, payload),
+    timeoutMs: getProviderChatTimeoutMs(payload),
   });
 
   const content = extractTextParts(response?.content || '');
@@ -738,6 +756,8 @@ async function sendGoogleChat(provider, apiKey, payload) {
           }
         : {}),
     }),
+    timeoutMessage: getProviderChatTimeoutMessage(provider, payload),
+    timeoutMs: getProviderChatTimeoutMs(payload),
   });
 
   const content = extractTextParts(response?.candidates?.[0]?.content?.parts || '');
@@ -1342,13 +1362,19 @@ async function chatWithProvider(providerId, payload = {}) {
   }
 
   try {
+    const chatRequest = {
+      messages,
+      model,
+      timeoutMessage: payload.timeoutMessage,
+      timeoutMs: payload.timeoutMs,
+    };
     let result = null;
     if (provider.configuration?.protocol === 'anthropic') {
-      result = await sendAnthropicChat(provider, apiKey, { model, messages });
+      result = await sendAnthropicChat(provider, apiKey, chatRequest);
     } else if (provider.configuration?.protocol === 'google-gemini') {
-      result = await sendGoogleChat(provider, apiKey, { model, messages });
+      result = await sendGoogleChat(provider, apiKey, chatRequest);
     } else {
-      result = await sendOpenAICompatibleChat(provider, apiKey, { model, messages });
+      result = await sendOpenAICompatibleChat(provider, apiKey, chatRequest);
     }
 
     await recordProviderUsageSuccess(provider.id, model, PIPELINE_OPERATION_IDS.LLM_PROMPT);

@@ -3,12 +3,17 @@ const fs = require('fs-extra');
 const { pathToFileURL } = require('url');
 
 const { ensureStorage, getAppPaths } = require('./configService');
+const { DEFAULT_PLANNING_SCHEMA_ID, getPlanningSchemaDefinition } = require('../shared/planningSchema.cjs');
 const {
   PORT_KIND_AUDIO,
   PORT_KIND_COLLECTION,
   PORT_KIND_COMPOSITION,
   PORT_KIND_FILE,
   PORT_KIND_IMAGE,
+  PORT_KIND_PLANNING_PACKET,
+  PORT_KIND_PLAN,
+  PORT_KIND_PREVIEW,
+  PORT_KIND_AUDIT,
   PORT_KIND_TEXT,
   PORT_KIND_VIDEO,
   trimPreviewText,
@@ -49,6 +54,10 @@ const KIND_EXTENSIONS = {
   [PORT_KIND_AUDIO]: '.wav',
   [PORT_KIND_FILE]: '.bin',
   [PORT_KIND_IMAGE]: '.png',
+  [PORT_KIND_PLANNING_PACKET]: '.packet.json',
+  [PORT_KIND_PLAN]: '.plan.json',
+  [PORT_KIND_PREVIEW]: '.preview.json',
+  [PORT_KIND_AUDIT]: '.audit.json',
   [PORT_KIND_TEXT]: '.txt',
   [PORT_KIND_VIDEO]: '.mp4',
 };
@@ -181,6 +190,22 @@ function getArtifactPreviewKind(kind, mimeType, isAnimated) {
 
   if (kind === PORT_KIND_AUDIO) {
     return 'audio';
+  }
+
+  if (kind === PORT_KIND_PLANNING_PACKET) {
+    return 'planning-packet';
+  }
+
+  if (kind === PORT_KIND_PLAN) {
+    return 'plan';
+  }
+
+  if (kind === PORT_KIND_PREVIEW) {
+    return 'preview';
+  }
+
+  if (kind === PORT_KIND_AUDIT) {
+    return 'audit';
   }
 
   if (kind === PORT_KIND_VIDEO) {
@@ -631,6 +656,14 @@ function formatArtifactKindLabel(kind) {
       return 'Video';
     case PORT_KIND_FILE:
       return 'File';
+    case PORT_KIND_PLANNING_PACKET:
+      return 'Planning Packet';
+    case PORT_KIND_PLAN:
+      return 'Plan';
+    case PORT_KIND_PREVIEW:
+      return 'Preview';
+    case PORT_KIND_AUDIT:
+      return 'Audit';
     case PORT_KIND_COLLECTION:
       return 'Collection';
     case PORT_KIND_COMPOSITION:
@@ -644,8 +677,91 @@ function isArtifactCollection(artifact) {
   return artifact?.kind === PORT_KIND_COLLECTION && Array.isArray(artifact?.items);
 }
 
+function isPlanningPacketArtifact(artifact) {
+  return artifact?.kind === PORT_KIND_PLANNING_PACKET && isRecord(artifact?.packet);
+}
+
+function isPlanArtifact(artifact) {
+  return artifact?.kind === PORT_KIND_PLAN && isRecord(artifact?.plan);
+}
+
+function isPreviewArtifact(artifact) {
+  return artifact?.kind === PORT_KIND_PREVIEW && isRecord(artifact?.preview);
+}
+
+function isAuditArtifact(artifact) {
+  return artifact?.kind === PORT_KIND_AUDIT && isRecord(artifact?.audit);
+}
+
 function isCompositionArtifact(artifact) {
   return artifact?.kind === PORT_KIND_COMPOSITION && artifact?.composition && Array.isArray(artifact?.composition?.tracks);
+}
+
+function isRecord(value) {
+  return Boolean(value) && !Array.isArray(value) && typeof value === 'object';
+}
+
+function buildPlanningListSummary(values = [], limit = 3) {
+  const entries = (Array.isArray(values) ? values : []).map((entry) => String(entry || '').trim()).filter(Boolean);
+  if (!entries.length) {
+    return '';
+  }
+
+  const visible = entries.slice(0, limit);
+  const extraCount = entries.length > visible.length ? ' | +' + (entries.length - visible.length) + ' more' : '';
+  return trimPreviewText(visible.join(' | ') + extraCount, 120);
+}
+
+function buildPlanningPacketSummary(artifact, limit = 180) {
+  const packet = artifact?.packet && typeof artifact.packet === 'object' ? artifact.packet : {};
+  const sourceCount = Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts.length : 0;
+  const parts = [
+    packet.schemaLabel || getPlanningSchemaDefinition(packet.schemaId || DEFAULT_PLANNING_SCHEMA_ID)?.label || 'Planning packet',
+    sourceCount ? sourceCount + ' source' + (sourceCount === 1 ? '' : 's') : '',
+    packet.goal || '',
+    buildPlanningListSummary(packet.constraints),
+  ].filter(Boolean);
+  return trimPreviewText(parts.join(' | '), limit);
+}
+
+function buildPlanSummary(artifact, limit = 180) {
+  const plan = artifact?.plan && typeof artifact.plan === 'object' ? artifact.plan : {};
+  const schema = getPlanningSchemaDefinition(plan.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+  const scenes = Array.isArray(plan.scenes) ? plan.scenes : [];
+  const overview = plan.overview && typeof plan.overview === 'object' ? plan.overview : {};
+  const parts = [
+    schema?.label || 'Plan',
+    scenes.length ? scenes.length + ' scene' + (scenes.length === 1 ? '' : 's') : '',
+    overview.viewerTakeaway || '',
+    scenes[0]?.sceneConcept || '',
+  ].filter(Boolean);
+  return trimPreviewText(parts.join(' | '), limit);
+}
+
+function buildPreviewSummary(artifact, limit = 180) {
+  const preview = artifact?.preview && typeof artifact.preview === 'object' ? artifact.preview : {};
+  const scenes = Array.isArray(preview.scenes) ? preview.scenes : [];
+  const parts = [
+    preview.schemaLabel || 'Preview',
+    scenes.length ? scenes.length + ' scene' + (scenes.length === 1 ? '' : 's') : '',
+    scenes[0]?.summary || scenes[0]?.promptPreview || '',
+    preview.limitationNote ? 'Review before generation' : '',
+  ].filter(Boolean);
+  return trimPreviewText(parts.join(' | '), limit);
+}
+
+function buildAuditSummary(artifact, limit = 180) {
+  const audit = artifact?.audit && typeof artifact.audit === 'object' ? artifact.audit : {};
+  const findings = Array.isArray(audit.findings) ? audit.findings : [];
+  const summary = audit.summary && typeof audit.summary === 'object' ? audit.summary : {};
+  const totalFlagCount = Number(summary.errorCount || 0) + Number(summary.warningCount || 0) + Number(summary.infoCount || 0);
+  const parts = [
+    audit.schemaLabel || 'Audit',
+    audit.sceneCount ? audit.sceneCount + ' scene' + (audit.sceneCount === 1 ? '' : 's') : '',
+    totalFlagCount ? totalFlagCount + ' finding' + (totalFlagCount === 1 ? '' : 's') : 'No findings',
+    findings[0]?.title || '',
+  ].filter(Boolean);
+  return trimPreviewText(parts.join(' | '), limit);
 }
 
 function normalizeCollectionLineage(lineage) {
@@ -738,6 +854,22 @@ function summarizeArtifact(artifact, limit = 180) {
 
   if (isArtifactCollection(artifact)) {
     return buildCollectionSummary(artifact, limit);
+  }
+
+  if (isPlanningPacketArtifact(artifact)) {
+    return buildPlanningPacketSummary(artifact, limit);
+  }
+
+  if (isPlanArtifact(artifact)) {
+    return buildPlanSummary(artifact, limit);
+  }
+
+  if (isPreviewArtifact(artifact)) {
+    return buildPreviewSummary(artifact, limit);
+  }
+
+  if (isAuditArtifact(artifact)) {
+    return buildAuditSummary(artifact, limit);
   }
 
   if (artifact.kind === PORT_KIND_TEXT) {
@@ -1109,6 +1241,115 @@ function createTextArtifact(text, options = {}) {
   return artifact;
 }
 
+function createPlanningPacketArtifact(packet, options = {}) {
+  const schema = getPlanningSchemaDefinition(packet?.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+  const artifact = {
+    kind: PORT_KIND_PLANNING_PACKET,
+    displayName: String(options.displayName || packet?.title || schema?.label || 'Planning Packet').trim() || 'Planning Packet',
+    packet: serializeArtifactForUi(packet) || {},
+    previewKind: 'planning-packet',
+    role: options.role || 'artifact',
+  };
+
+  if (Array.isArray(options.metadataPaths) && options.metadataPaths.length) {
+    artifact.metadataPaths = [...new Set(options.metadataPaths.map((entry) => String(entry || '').trim()).filter(Boolean))];
+  }
+
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
+}
+
+function createPlanArtifact(plan, options = {}) {
+  const schema = getPlanningSchemaDefinition(plan?.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+  const artifact = {
+    kind: PORT_KIND_PLAN,
+    displayName: String(options.displayName || plan?.title || schema?.label || 'Plan').trim() || 'Plan',
+    plan: serializeArtifactForUi(plan) || {},
+    previewKind: 'plan',
+    role: options.role || 'artifact',
+    sceneCount: Array.isArray(plan?.scenes) ? plan.scenes.length : 0,
+    schemaId: String(plan?.schemaId || schema?.id || DEFAULT_PLANNING_SCHEMA_ID).trim() || DEFAULT_PLANNING_SCHEMA_ID,
+    schemaLabel: String(schema?.label || 'Plan').trim() || 'Plan',
+  };
+
+  if (options.planner) {
+    artifact.planner = serializeArtifactForUi(options.planner);
+  }
+
+  if (options.sourcePacket) {
+    artifact.sourcePacket = serializeArtifactForUi(options.sourcePacket);
+  }
+
+  if (Array.isArray(options.metadataPaths) && options.metadataPaths.length) {
+    artifact.metadataPaths = [...new Set(options.metadataPaths.map((entry) => String(entry || '').trim()).filter(Boolean))];
+  }
+
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
+}
+
+function createPreviewArtifact(preview, options = {}) {
+  const schema = getPlanningSchemaDefinition(preview?.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+  const artifact = {
+    kind: PORT_KIND_PREVIEW,
+    displayName: String(options.displayName || preview?.planTitle || preview?.schemaLabel || 'Preview').trim() || 'Preview',
+    preview: serializeArtifactForUi(preview) || {},
+    previewKind: 'preview',
+    role: options.role || 'artifact',
+    sceneCount: Number(preview?.sceneCount || preview?.scenes?.length || 0) || 0,
+    schemaId: String(preview?.schemaId || schema?.id || DEFAULT_PLANNING_SCHEMA_ID).trim() || DEFAULT_PLANNING_SCHEMA_ID,
+    schemaLabel: String(preview?.schemaLabel || schema?.label || 'Preview').trim() || 'Preview',
+  };
+
+  if (options.sourcePlan) {
+    artifact.sourcePlan = serializeArtifactForUi(options.sourcePlan);
+  }
+
+  if (options.sourcePacket) {
+    artifact.sourcePacket = serializeArtifactForUi(options.sourcePacket);
+  }
+
+  if (Array.isArray(options.metadataPaths) && options.metadataPaths.length) {
+    artifact.metadataPaths = [...new Set(options.metadataPaths.map((entry) => String(entry || '').trim()).filter(Boolean))];
+  }
+
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
+}
+
+function createAuditArtifact(audit, options = {}) {
+  const schema = getPlanningSchemaDefinition(audit?.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+  const artifact = {
+    kind: PORT_KIND_AUDIT,
+    audit: serializeArtifactForUi(audit) || {},
+    displayName: String(options.displayName || audit?.planTitle || audit?.schemaLabel || 'Audit').trim() || 'Audit',
+    findingCount: Array.isArray(audit?.findings) ? audit.findings.length : 0,
+    previewKind: 'audit',
+    role: options.role || 'artifact',
+    sceneCount: Number(audit?.sceneCount || 0) || 0,
+    schemaId: String(audit?.schemaId || schema?.id || DEFAULT_PLANNING_SCHEMA_ID).trim() || DEFAULT_PLANNING_SCHEMA_ID,
+    schemaLabel: String(audit?.schemaLabel || schema?.label || 'Audit').trim() || 'Audit',
+  };
+
+  if (options.sourcePlan) {
+    artifact.sourcePlan = serializeArtifactForUi(options.sourcePlan);
+  }
+
+  if (options.sourcePreview) {
+    artifact.sourcePreview = serializeArtifactForUi(options.sourcePreview);
+  }
+
+  if (options.sourcePacket) {
+    artifact.sourcePacket = serializeArtifactForUi(options.sourcePacket);
+  }
+
+  if (Array.isArray(options.metadataPaths) && options.metadataPaths.length) {
+    artifact.metadataPaths = [...new Set(options.metadataPaths.map((entry) => String(entry || '').trim()).filter(Boolean))];
+  }
+
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
+}
 function normalizeBase64Payload(value) {
   return String(value || '').replace(/^data:[^;]+;base64,/, '').trim();
 }
@@ -1519,9 +1760,64 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     });
   }
 
+  if (isPlanningPacketArtifact(artifact) || isPlanArtifact(artifact) || isPreviewArtifact(artifact) || isAuditArtifact(artifact)) {
+    const extension = isPlanArtifact(artifact)
+      ? '.plan.json'
+      : isPlanningPacketArtifact(artifact)
+        ? '.packet.json'
+        : isPreviewArtifact(artifact)
+          ? '.preview.json'
+          : '.audit.json';
+    const filePath = await nextAvailableFilePath(runDirectories.outputsDir, title, extension);
+    const payload = isPlanArtifact(artifact)
+      ? artifact.plan || {}
+      : isPlanningPacketArtifact(artifact)
+        ? artifact.packet || {}
+        : isPreviewArtifact(artifact)
+          ? artifact.preview || {}
+          : artifact.audit || {};
+    await fs.writeJson(filePath, payload, { spaces: 2 });
+
+    const savedArtifact = isPlanArtifact(artifact)
+      ? createPlanArtifact(payload, {
+          displayName: title,
+          planner: artifact.planner,
+          role: 'output',
+          sourcePacket: artifact.sourcePacket,
+        })
+      : isPlanningPacketArtifact(artifact)
+        ? createPlanningPacketArtifact(payload, {
+            displayName: title,
+            role: 'output',
+          })
+        : isPreviewArtifact(artifact)
+          ? createPreviewArtifact(payload, {
+              displayName: title,
+              role: 'output',
+              sourcePacket: artifact.sourcePacket,
+              sourcePlan: artifact.sourcePlan,
+            })
+          : createAuditArtifact(payload, {
+              displayName: title,
+              role: 'output',
+              sourcePacket: artifact.sourcePacket,
+              sourcePlan: artifact.sourcePlan,
+              sourcePreview: artifact.sourcePreview,
+            });
+
+    savedArtifact.fileName = path.basename(filePath);
+    savedArtifact.filePath = filePath;
+    savedArtifact.fileUrl = pathToFileURL(filePath).toString();
+    savedArtifact.mimeType = 'application/json';
+    savedArtifact.destinationPath = filePath;
+    savedArtifact.sourcePath = artifact.filePath || '';
+    savedArtifact.summary = summarizeArtifact(savedArtifact);
+    return savedArtifact;
+  }
+
   if (artifact.kind === PORT_KIND_TEXT) {
     const filePath = await nextAvailableFilePath(runDirectories.outputsDir, title, '.txt');
-    await fs.writeFile(filePath, `${artifact.text || ''}\n`, 'utf8');
+    await fs.writeFile(filePath, String(artifact.text || '') + '\n', 'utf8');
     const metadataPaths = await saveTextArtifactMetadata(filePath, artifact);
     const savedArtifact = createTextArtifact(artifact.text || '', {
       displayName: title,
@@ -1607,14 +1903,125 @@ async function describeArtifactForLlm(artifact) {
     return 'No artifact was available.';
   }
 
+  if (isPlanningPacketArtifact(artifact)) {
+    const packet = artifact.packet || {};
+    const sourceArtifacts = Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts : [];
+    const lines = [
+      'Type: planning packet',
+      packet.schemaLabel ? 'Schema: ' + packet.schemaLabel : '',
+      packet.goal ? 'Goal: ' + packet.goal : '',
+      packet.sourceSummary ? 'Source summary: ' + packet.sourceSummary : '',
+      Array.isArray(packet.constraints) && packet.constraints.length ? 'Constraints: ' + packet.constraints.join(' | ') : '',
+      Array.isArray(packet.stylePolicy) && packet.stylePolicy.length ? 'Style or policy: ' + packet.stylePolicy.join(' | ') : '',
+      Array.isArray(packet.availableTools) && packet.availableTools.length ? 'Available tools: ' + packet.availableTools.join(' | ') : '',
+      packet.readiness?.hardwareSummary ? 'Hardware: ' + packet.readiness.hardwareSummary : '',
+      Array.isArray(packet.readiness?.notes) && packet.readiness.notes.length ? 'Readiness notes: ' + packet.readiness.notes.join(' | ') : '',
+      packet.desiredOutput?.shapeSummary ? 'Desired output: ' + packet.desiredOutput.shapeSummary : '',
+      Array.isArray(packet.riskNotes) && packet.riskNotes.length ? 'Risk notes: ' + packet.riskNotes.join(' | ') : '',
+      Array.isArray(packet.uncertaintyFlags) && packet.uncertaintyFlags.length ? 'Uncertainty flags: ' + packet.uncertaintyFlags.join(' | ') : '',
+      packet.workingNotes ? 'Working notes: ' + packet.workingNotes : '',
+      sourceArtifacts.length ? 'Source artifacts:' : '',
+      ...sourceArtifacts.slice(0, 8).map((sourceArtifact, index) => {
+        const excerpt = String(sourceArtifact?.textExcerpt || '').trim();
+        const summary = String(sourceArtifact?.summary || '').trim();
+        const label = String(sourceArtifact?.displayName || sourceArtifact?.fileName || sourceArtifact?.kind || ('Source ' + (index + 1))).trim();
+        const details = [summary, excerpt ? 'Excerpt: ' + excerpt : ''].filter(Boolean).join(' | ');
+        return (index + 1) + '. ' + label + (details ? ' | ' + details : '');
+      }),
+      sourceArtifacts.length > 8 ? '...and ' + (sourceArtifacts.length - 8) + ' more sources.' : '',
+    ].filter(Boolean);
+    return lines.join('\n').trim();
+  }
+
+  if (isPlanArtifact(artifact)) {
+    const plan = artifact.plan || {};
+    const overview = plan.overview && typeof plan.overview === 'object' ? plan.overview : {};
+    const scenes = Array.isArray(plan.scenes) ? plan.scenes : [];
+    const lines = [
+      'Type: plan',
+      plan.schemaId ? 'Schema: ' + plan.schemaId : '',
+      plan.title ? 'Title: ' + plan.title : '',
+      overview.meaningIntent ? 'Overview meaning: ' + overview.meaningIntent : '',
+      overview.viewerTakeaway ? 'Overview takeaway: ' + overview.viewerTakeaway : '',
+      overview.narrativeArc ? 'Narrative arc: ' + overview.narrativeArc : '',
+      overview.toneStrategy ? 'Tone strategy: ' + overview.toneStrategy : '',
+      Array.isArray(overview.continuityNotes) && overview.continuityNotes.length ? 'Continuity notes: ' + overview.continuityNotes.join(' | ') : '',
+      Array.isArray(overview.riskNotes) && overview.riskNotes.length ? 'Risk notes: ' + overview.riskNotes.join(' | ') : '',
+      scenes.length ? 'Scenes:' : '',
+      ...scenes.slice(0, 8).map((scene, index) => {
+        const sceneLabel = String(scene?.sourceSpanLabel || scene?.sceneId || ('Scene ' + (index + 1))).trim() || ('Scene ' + (index + 1));
+        const sceneSummary = [scene?.sceneConcept, scene?.treatmentApproach, scene?.visualPromptDraft ? 'Prompt: ' + scene.visualPromptDraft : '']
+          .filter(Boolean)
+          .join(' | ');
+        return (index + 1) + '. ' + sceneLabel + (sceneSummary ? ' | ' + sceneSummary : '');
+      }),
+      scenes.length > 8 ? '...and ' + (scenes.length - 8) + ' more scenes.' : '',
+      Array.isArray(plan.openQuestions) && plan.openQuestions.length ? 'Open questions:' : '',
+      ...(Array.isArray(plan.openQuestions) ? plan.openQuestions.slice(0, 6).map((entry, index) => (index + 1) + '. ' + entry) : []),
+    ].filter(Boolean);
+    return lines.join('\n').trim();
+  }
+
+  if (isPreviewArtifact(artifact)) {
+    const preview = artifact.preview || {};
+    const overview = preview.overview && typeof preview.overview === 'object' ? preview.overview : {};
+    const scenes = Array.isArray(preview.scenes) ? preview.scenes : [];
+    const lines = [
+      'Type: preview',
+      preview.schemaId ? 'Schema: ' + preview.schemaId : '',
+      preview.planTitle ? 'Plan title: ' + preview.planTitle : '',
+      preview.previewMode ? 'Mode: ' + preview.previewMode : '',
+      preview.limitationNote ? 'Boundary: ' + preview.limitationNote : '',
+      overview.viewerTakeaway ? 'Overview takeaway: ' + overview.viewerTakeaway : '',
+      overview.narrativeArc ? 'Narrative arc: ' + overview.narrativeArc : '',
+      scenes.length ? 'Scenes:' : '',
+      ...scenes.slice(0, 8).map((scene, index) => {
+        const sceneLabel = String(scene?.sourceSpanLabel || scene?.sceneId || ('Scene ' + (index + 1))).trim() || ('Scene ' + (index + 1));
+        const sceneSummary = [scene?.summary, scene?.promptPreview ? 'Prompt: ' + scene.promptPreview : '', scene?.promptReadiness ? 'Readiness: ' + scene.promptReadiness : '']
+          .filter(Boolean)
+          .join(' | ');
+        return (index + 1) + '. ' + sceneLabel + (sceneSummary ? ' | ' + sceneSummary : '');
+      }),
+      scenes.length > 8 ? '...and ' + (scenes.length - 8) + ' more scenes.' : '',
+      Array.isArray(preview.openQuestions) && preview.openQuestions.length ? 'Open questions:' : '',
+      ...(Array.isArray(preview.openQuestions) ? preview.openQuestions.slice(0, 6).map((entry, index) => (index + 1) + '. ' + entry) : []),
+    ].filter(Boolean);
+    return lines.join('\n').trim();
+  }
+
+  if (isAuditArtifact(artifact)) {
+    const audit = artifact.audit || {};
+    const summary = audit.summary && typeof audit.summary === 'object' ? audit.summary : {};
+    const findings = Array.isArray(audit.findings) ? audit.findings : [];
+    const lines = [
+      'Type: audit',
+      audit.schemaId ? 'Schema: ' + audit.schemaId : '',
+      audit.planTitle ? 'Plan title: ' + audit.planTitle : '',
+      audit.limitationNote ? 'Boundary: ' + audit.limitationNote : '',
+      audit.structuralValidation?.summary ? 'Structural summary: ' + audit.structuralValidation.summary : '',
+      audit.previewCoverage?.connected ? 'Preview coverage: connected' : 'Preview coverage: plan only',
+      Number(summary.errorCount || 0) || Number(summary.warningCount || 0) || Number(summary.infoCount || 0)
+        ? 'Finding counts: ' + Number(summary.errorCount || 0) + ' error, ' + Number(summary.warningCount || 0) + ' warning, ' + Number(summary.infoCount || 0) + ' info'
+        : 'Finding counts: no findings',
+      Array.isArray(audit.heuristicsUsed) && audit.heuristicsUsed.length ? 'Heuristics: ' + audit.heuristicsUsed.join(' | ') : '',
+      findings.length ? 'Findings:' : '',
+      ...findings.slice(0, 8).map((finding, index) => {
+        const detail = [finding?.title, finding?.detail, finding?.approximate ? 'Approximate heuristic' : ''].filter(Boolean).join(' | ');
+        return (index + 1) + '. ' + (finding?.severity || 'info') + (finding?.sceneLabel ? ' | ' + finding.sceneLabel : '') + (detail ? ' | ' + detail : '');
+      }),
+      findings.length > 8 ? '...and ' + (findings.length - 8) + ' more findings.' : '',
+    ].filter(Boolean);
+    return lines.join('\n').trim();
+  }
+
   if (isArtifactCollection(artifact)) {
     const lines = [
       'Type: ordered collection',
-      artifact.itemKind ? `Item type: ${artifact.itemKind}` : '',
-      Number(artifact.itemCount || 0) ? `Item count: ${artifact.itemCount}` : '',
-      artifact.displayName ? `Name: ${artifact.displayName}` : '',
-      artifact.summary ? `Summary: ${artifact.summary}` : '',
-      artifact.manifestPath ? `Manifest: ${artifact.manifestPath}` : '',
+      artifact.itemKind ? 'Item type: ' + artifact.itemKind : '',
+      Number(artifact.itemCount || 0) ? 'Item count: ' + artifact.itemCount : '',
+      artifact.displayName ? 'Name: ' + artifact.displayName : '',
+      artifact.summary ? 'Summary: ' + artifact.summary : '',
+      artifact.manifestPath ? 'Manifest: ' + artifact.manifestPath : '',
       '',
       'Items:',
       ...(artifact.items || []).slice(0, 8).map((entry, index) => {
@@ -1622,9 +2029,9 @@ async function describeArtifactForLlm(artifact) {
         const lineage = entry?.lineage || null;
         const sourceLabel = lineage?.sourceNodeLabel || lineage?.sourceNodeId || '';
         const itemSummary = summarizeArtifact(itemArtifact, 120) || itemArtifact?.displayName || itemArtifact?.fileName || 'Item ' + (index + 1);
-        return `${index + 1}. ${itemSummary}${sourceLabel ? ` (from ${sourceLabel})` : ''}`;
+        return (index + 1) + '. ' + itemSummary + (sourceLabel ? ' (from ' + sourceLabel + ')' : '');
       }),
-      (artifact.items || []).length > 8 ? `...and ${(artifact.items || []).length - 8} more items.` : '',
+      (artifact.items || []).length > 8 ? '...and ' + ((artifact.items || []).length - 8) + ' more items.' : '',
     ].filter(Boolean);
     return lines.join('\n').trim();
   }
@@ -1632,19 +2039,19 @@ async function describeArtifactForLlm(artifact) {
   if (artifact.kind === PORT_KIND_TEXT) {
     const transcription = artifact.transcription || null;
     if (!transcription) {
-      return `Type: text\nContent:\n${artifact.text || ''}`.trim();
+      return ('Type: text\nContent:\n' + (artifact.text || '')).trim();
     }
 
     const lines = [
       'Type: text',
       'Origin: audio transcription',
-      transcription.backendLabel ? `Backend: ${transcription.backendLabel}` : '',
-      transcription.model ? `Model: ${transcription.model}` : '',
-      transcription.language ? `Language: ${transcription.language}` : '',
-      transcription.segmentCount ? `Segments: ${transcription.segmentCount}` : '',
-      transcription.durationSeconds ? `Duration: ${transcription.durationSeconds} seconds` : '',
-      transcription.sourceAudio?.fileName ? `Source audio: ${transcription.sourceAudio.fileName}` : '',
-      transcription.sourceAudio?.filePath ? `Source path: ${transcription.sourceAudio.filePath}` : '',
+      transcription.backendLabel ? 'Backend: ' + transcription.backendLabel : '',
+      transcription.model ? 'Model: ' + transcription.model : '',
+      transcription.language ? 'Language: ' + transcription.language : '',
+      transcription.segmentCount ? 'Segments: ' + transcription.segmentCount : '',
+      transcription.durationSeconds ? 'Duration: ' + transcription.durationSeconds + ' seconds' : '',
+      transcription.sourceAudio?.fileName ? 'Source audio: ' + transcription.sourceAudio.fileName : '',
+      transcription.sourceAudio?.filePath ? 'Source path: ' + transcription.sourceAudio.filePath : '',
       '',
       'Content:',
       artifact.text || '',
@@ -1653,46 +2060,46 @@ async function describeArtifactForLlm(artifact) {
   }
 
   const lines = [
-    `Type: ${artifact.kind}`,
-    artifact.displayName ? `Name: ${artifact.displayName}` : '',
-    artifact.fileName ? `File name: ${artifact.fileName}` : '',
-    artifact.mimeType ? `MIME type: ${artifact.mimeType}` : '',
-    artifact.extension ? `Extension: ${artifact.extension}` : '',
-    artifact.formatLabel ? `Format: ${artifact.formatLabel}` : '',
-    artifact.previewKind ? `Preview kind: ${artifact.previewKind}` : '',
+    'Type: ' + artifact.kind,
+    artifact.displayName ? 'Name: ' + artifact.displayName : '',
+    artifact.fileName ? 'File name: ' + artifact.fileName : '',
+    artifact.mimeType ? 'MIME type: ' + artifact.mimeType : '',
+    artifact.extension ? 'Extension: ' + artifact.extension : '',
+    artifact.formatLabel ? 'Format: ' + artifact.formatLabel : '',
+    artifact.previewKind ? 'Preview kind: ' + artifact.previewKind : '',
     artifact.isAnimated ? 'Animation: animated' : '',
-    artifact.role ? `Role: ${artifact.role}` : '',
-    artifact.filePath ? `Path: ${artifact.filePath}` : '',
-    artifact.width && artifact.height ? `Dimensions: ${artifact.width}x${artifact.height}` : '',
-    artifact.audio?.durationSeconds ? `Duration: ${artifact.audio.durationSeconds} seconds` : '',
-    artifact.audio?.sampleRate ? `Sample rate: ${artifact.audio.sampleRate} Hz` : '',
-    artifact.audio?.channelCount ? `Channels: ${artifact.audio.channelCount}` : '',
-    artifact.audio?.bitDepth ? `Bit depth: ${artifact.audio.bitDepth}` : '',
-    artifact.audioTransformation?.backendLabel ? `Transformed by: ${artifact.audioTransformation.backendLabel}` : '',
-    artifact.audioTransformation?.toolLabel ? `Transform tool: ${artifact.audioTransformation.toolLabel}` : '',
-    artifact.audioTransformation?.model ? `Transform model: ${artifact.audioTransformation.model}` : '',
-    artifact.audioTransformation?.transformationType ? `Transform type: ${artifact.audioTransformation.transformationType}` : '',
-    artifact.audioTransformation?.targetVoice ? `Target voice: ${artifact.audioTransformation.targetVoice}` : '',
-    artifact.audioTransformation?.instruction ? `Transform note: ${artifact.audioTransformation.instruction}` : '',
-    artifact.audioTransformation?.sourceAudio?.fileName ? `Source audio: ${artifact.audioTransformation.sourceAudio.fileName}` : '',
-    artifact.imageTransformation?.backendLabel ? `Image transformed by: ${artifact.imageTransformation.backendLabel}` : '',
-    artifact.imageTransformation?.toolLabel ? `Image transform tool: ${artifact.imageTransformation.toolLabel}` : '',
-    artifact.imageTransformation?.model ? `Image transform model: ${artifact.imageTransformation.model}` : '',
-    artifact.imageTransformation?.transformationType ? `Image transform type: ${artifact.imageTransformation.transformationType}` : '',
-    artifact.imageTransformation?.scale ? `Image transform scale: ${artifact.imageTransformation.scale}x` : '',
-    artifact.imageTransformation?.instruction ? `Image transform note: ${artifact.imageTransformation.instruction}` : '',
-    artifact.imageTransformation?.sourceImage?.fileName ? `Target image: ${artifact.imageTransformation.sourceImage.fileName}` : '',
-    artifact.imageTransformation?.referenceImage?.fileName ? `Reference image: ${artifact.imageTransformation.referenceImage.fileName}` : '',
-    artifact.audioGeneration?.backendLabel ? `Generated by: ${artifact.audioGeneration.backendLabel}` : '',
-    artifact.audioGeneration?.toolLabel ? `Tool: ${artifact.audioGeneration.toolLabel}` : '',
-    artifact.audioGeneration?.model ? `Model: ${artifact.audioGeneration.model}` : '',
-    artifact.audioGeneration?.mode ? `Generation mode: ${artifact.audioGeneration.mode}` : '',
-    artifact.audioGeneration?.prompt ? `Prompt: ${artifact.audioGeneration.prompt}` : '',
-    artifact.audioGeneration?.voice ? `Voice: ${artifact.audioGeneration.voice}` : '',
-    artifact.audioGeneration?.sourceAudio?.fileName ? `Guided by: ${artifact.audioGeneration.sourceAudio.fileName}` : '',
-    artifact.sizeBytes ? `Size: ${artifact.sizeBytes} bytes` : '',
-    artifact.previewText ? `Excerpt: ${artifact.previewText}` : '',
-    artifact.summary ? `Summary: ${artifact.summary}` : '',
+    artifact.role ? 'Role: ' + artifact.role : '',
+    artifact.filePath ? 'Path: ' + artifact.filePath : '',
+    artifact.width && artifact.height ? 'Dimensions: ' + artifact.width + 'x' + artifact.height : '',
+    artifact.audio?.durationSeconds ? 'Duration: ' + artifact.audio.durationSeconds + ' seconds' : '',
+    artifact.audio?.sampleRate ? 'Sample rate: ' + artifact.audio.sampleRate + ' Hz' : '',
+    artifact.audio?.channelCount ? 'Channels: ' + artifact.audio.channelCount : '',
+    artifact.audio?.bitDepth ? 'Bit depth: ' + artifact.audio.bitDepth : '',
+    artifact.audioTransformation?.backendLabel ? 'Transformed by: ' + artifact.audioTransformation.backendLabel : '',
+    artifact.audioTransformation?.toolLabel ? 'Transform tool: ' + artifact.audioTransformation.toolLabel : '',
+    artifact.audioTransformation?.model ? 'Transform model: ' + artifact.audioTransformation.model : '',
+    artifact.audioTransformation?.transformationType ? 'Transform type: ' + artifact.audioTransformation.transformationType : '',
+    artifact.audioTransformation?.targetVoice ? 'Target voice: ' + artifact.audioTransformation.targetVoice : '',
+    artifact.audioTransformation?.instruction ? 'Transform note: ' + artifact.audioTransformation.instruction : '',
+    artifact.audioTransformation?.sourceAudio?.fileName ? 'Source audio: ' + artifact.audioTransformation.sourceAudio.fileName : '',
+    artifact.imageTransformation?.backendLabel ? 'Image transformed by: ' + artifact.imageTransformation.backendLabel : '',
+    artifact.imageTransformation?.toolLabel ? 'Image transform tool: ' + artifact.imageTransformation.toolLabel : '',
+    artifact.imageTransformation?.model ? 'Image transform model: ' + artifact.imageTransformation.model : '',
+    artifact.imageTransformation?.transformationType ? 'Image transform type: ' + artifact.imageTransformation.transformationType : '',
+    artifact.imageTransformation?.scale ? 'Image transform scale: ' + artifact.imageTransformation.scale + 'x' : '',
+    artifact.imageTransformation?.instruction ? 'Image transform note: ' + artifact.imageTransformation.instruction : '',
+    artifact.imageTransformation?.sourceImage?.fileName ? 'Target image: ' + artifact.imageTransformation.sourceImage.fileName : '',
+    artifact.imageTransformation?.referenceImage?.fileName ? 'Reference image: ' + artifact.imageTransformation.referenceImage.fileName : '',
+    artifact.audioGeneration?.backendLabel ? 'Generated by: ' + artifact.audioGeneration.backendLabel : '',
+    artifact.audioGeneration?.toolLabel ? 'Tool: ' + artifact.audioGeneration.toolLabel : '',
+    artifact.audioGeneration?.model ? 'Model: ' + artifact.audioGeneration.model : '',
+    artifact.audioGeneration?.mode ? 'Generation mode: ' + artifact.audioGeneration.mode : '',
+    artifact.audioGeneration?.prompt ? 'Prompt: ' + artifact.audioGeneration.prompt : '',
+    artifact.audioGeneration?.voice ? 'Voice: ' + artifact.audioGeneration.voice : '',
+    artifact.audioGeneration?.sourceAudio?.fileName ? 'Guided by: ' + artifact.audioGeneration.sourceAudio.fileName : '',
+    artifact.sizeBytes ? 'Size: ' + artifact.sizeBytes + ' bytes' : '',
+    artifact.previewText ? 'Excerpt: ' + artifact.previewText : '',
+    artifact.summary ? 'Summary: ' + artifact.summary : '',
   ].filter(Boolean);
   return lines.join('\n');
 }
@@ -1703,12 +2110,20 @@ module.exports = {
   copyArtifactToOutput,
   createArtifactCollection,
   createCompositionArtifact,
+  createPlanArtifact,
+  createPlanningPacketArtifact,
+  createPreviewArtifact,
+  createAuditArtifact,
   createTextArtifact,
   describeArtifactForLlm,
   ensureRunDirectories,
   inferKindFromPath,
   isArtifactCollection,
   isCompositionArtifact,
+  isPlanArtifact,
+  isPlanningPacketArtifact,
+  isPreviewArtifact,
+  isAuditArtifact,
   persistArtifactCollection,
   persistCompositionArtifact,
   saveBase64Artifact,
@@ -1717,3 +2132,4 @@ module.exports = {
   serializeArtifactForUi,
   summarizeArtifact,
 };
+

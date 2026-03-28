@@ -48,7 +48,7 @@ const {
   uninstallTool,
   updateToolInstallation,
 } = require('./services/installerService');
-const { listOllamaModels, chatWithOllama } = require('./services/ollamaService');
+const { listOllamaModels, chatWithOllama, finishOllamaSession, prepareOllamaSession } = require('./services/ollamaService');
 const { buildAiderLaunchConfiguration, inspectAiderProject, listAiderLaunchModels } = require('./services/aiderService');
 const {
   disposeAllRuntimes,
@@ -895,6 +895,7 @@ function registerIpcHandlers() {
 
   ipcMain.handle('tools:launch', (_event, payload) =>
     withPlainEnglishErrors(async () => {
+      let releaseLaunchSupportRuntime = null;
       try {
         const toolId = typeof payload === 'string' ? payload : payload?.toolId;
         const state = await buildAppState();
@@ -920,19 +921,27 @@ function registerIpcHandlers() {
             modelId: aiderSession.modelId || tool.aiderModelId || '',
             initializeGit: aiderSession.initializeGit !== undefined ? aiderSession.initializeGit : tool.aiderInitializeGit !== false,
           });
-
-          if (aiderLaunch.selection.requiresOllamaStart) {
+          if (aiderLaunch.selection.modelEntry.aiderModel.startsWith('ollama_chat/')) {
             const ollamaTool = toolLookup('ollama', state.tools);
             if (!ollamaTool) {
               throw new Error('Install or detect Ollama before launching an Ollama-backed Aider session.');
             }
-
-            await launchToolFromUserAction(ollamaTool, {
+            const ollamaSession = await prepareOllamaSession(ollamaTool, {
+              autoStart: true,
               launchContext: 'aider-session',
-              skipOpenInterface: true,
             });
+            if (ollamaSession.startedByLocalAIHub) {
+              let ollamaSessionReleased = false;
+              releaseLaunchSupportRuntime = async () => {
+                if (ollamaSessionReleased) {
+                  return;
+                }
+                ollamaSessionReleased = true;
+                await finishOllamaSession(ollamaSession);
+              };
+              launchOptions.onStopCleanup = releaseLaunchSupportRuntime;
+            }
           }
-
           launchOptions.launchProfileOverride = aiderLaunch.launchProfileOverride;
           launchOptions.successMessage = aiderLaunch.launchMessage;
           await upsertTool({
@@ -950,7 +959,7 @@ function registerIpcHandlers() {
           ...launchOptions,
           launchContext: 'ipc-launch',
         });
-
+        releaseLaunchSupportRuntime = null;
         let message = launchOptions.successMessage || `${nextTool.name} is starting.`;
         if (!launchOptions.successMessage && String(nextTool.interfaceMode || '').startsWith('embedded-')) {
           if (nextTool.interfaceMode === 'embedded-whisper') {
@@ -967,6 +976,9 @@ function registerIpcHandlers() {
           state: nextState,
         };
       } catch (error) {
+        if (typeof releaseLaunchSupportRuntime === 'function') {
+          await releaseLaunchSupportRuntime().catch(() => null);
+        }
         invalidateDiscoveryCache();
         await refreshOpenAppState({ forceDiscovery: true }).catch(() => null);
         throw error;
@@ -1750,8 +1762,3 @@ app.on('browser-window-focus', () => {
 app.on('browser-window-blur', () => {
   broadcastWindowActivity(true);
 });
-
-
-
-
-

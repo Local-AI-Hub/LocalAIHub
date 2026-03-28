@@ -15,6 +15,10 @@ const {
   copyArtifactToOutput,
   createArtifactCollection,
   createCompositionArtifact,
+  createPlanArtifact,
+  createPlanningPacketArtifact,
+  createPreviewArtifact,
+  createAuditArtifact,
   createTextArtifact,
   describeArtifactForLlm,
   ensureRunDirectories,
@@ -27,6 +31,16 @@ const {
   serializeArtifactForUi,
   summarizeArtifact,
 } = require('./pipelineArtifactService');
+const {
+  DEFAULT_PLANNING_SCHEMA_ID,
+  buildPlanAuditDocument,
+  buildPlanPreviewDocument,
+  buildPlanningPacketDocument,
+  buildPlannerPrompt,
+  getPlanningSchemaDefinition,
+  validatePlanAgainstSchema,
+  validatePlanningPacketShape,
+} = require('../shared/planningSchema.cjs');
 const {
   generateImageWithWorkflowTool,
   interrogateImageWithWorkflowTool,
@@ -45,6 +59,10 @@ const {
   PORT_KIND_COMPOSITION,
   PORT_KIND_FILE,
   PORT_KIND_IMAGE,
+  PORT_KIND_PLANNING_PACKET,
+  PORT_KIND_PLAN,
+  PORT_KIND_PREVIEW,
+  PORT_KIND_AUDIT,
   PORT_KIND_TEXT,
   PORT_KIND_VIDEO,
   analyzePipeline,
@@ -69,6 +87,8 @@ class PipelineCancelledError extends Error {
 let pipelineEventSink = null;
 let activeRun = null;
 let pendingValidationControl = null;
+
+const PLANNER_PROVIDER_TIMEOUT_MS = 60000;
 
 function setPipelineEventSink(listener) {
   pipelineEventSink = typeof listener === 'function' ? listener : null;
@@ -103,6 +123,13 @@ function collectSelectedOllamaModels(definition = {}) {
     }
 
     if (node?.type === 'validation' && node?.config?.mode === 'llm' && node?.config?.llmExecutionMode === 'ollama') {
+      const model = String(node.config?.model || '').trim();
+      if (model) {
+        selectedModels.add(model);
+      }
+    }
+
+    if (node?.type === 'planner' && node?.config?.executionMode === 'ollama') {
       const model = String(node.config?.model || '').trim();
       if (model) {
         selectedModels.add(model);
@@ -1324,6 +1351,275 @@ async function buildLlmMessages(node, inputArtifact) {
   }
 
   throw new Error('This LLM step currently supports only the artifact types allowed by the selected provider or model mode.');
+}
+
+function collectStructuredReplyCandidates(replyText) {
+  const raw = String(replyText || '').trim();
+  if (!raw) {
+    return [];
+  }
+
+  const candidates = [];
+  const pushCandidate = (value) => {
+    const normalized = String(value || '').trim();
+    if (!normalized || candidates.includes(normalized)) {
+      return;
+    }
+    candidates.push(normalized);
+  };
+
+  pushCandidate(raw);
+
+  for (const match of raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) {
+    pushCandidate(match[1]);
+  }
+
+  const objectMatch = raw.match(/\{[\s\S]*\}/);
+  if (objectMatch) {
+    pushCandidate(objectMatch[0]);
+  }
+
+  return candidates;
+}
+
+function parsePlannerReply(schemaId, replyText) {
+  const raw = String(replyText || '').trim();
+  if (!raw) {
+    throw new Error('The planner returned an empty reply.');
+  }
+
+  let schemaError = '';
+  for (const candidate of collectStructuredReplyCandidates(raw)) {
+    try {
+      const parsed = JSON.parse(candidate);
+      const validation = validatePlanAgainstSchema(schemaId, parsed);
+      if (validation.ok) {
+        return validation.value;
+      }
+
+      schemaError = validation.errors[0] || 'The planner reply did not match the expected plan shape.';
+    } catch {
+      continue;
+    }
+  }
+
+  if (schemaError) {
+    throw new Error(schemaError);
+  }
+
+  throw new Error('The planner reply was not valid JSON. Ask the model to return JSON only for this planner step.');
+}
+
+async function executePlanningPacketNode(node, graph, run, contextMaps) {
+  const sourceArtifacts = getNodeInputArtifacts(node.id, 'source', graph, run.resultsByNodeId, run)
+    .map((entry) => entry?.artifact || null)
+    .filter(Boolean);
+  const packetDocument = buildPlanningPacketDocument({
+    ...node.config,
+    title: node.label,
+  }, sourceArtifacts, {
+    hardware: contextMaps?.hardware || null,
+    schemaId: node.config?.schemaId || DEFAULT_PLANNING_SCHEMA_ID,
+  });
+  const validation = validatePlanningPacketShape(packetDocument);
+  if (!validation.ok) {
+    throw new Error(validation.errors[0] || 'This planning packet is not ready yet.');
+  }
+
+  const packetArtifact = createPlanningPacketArtifact(validation.value, {
+    displayName: node.label,
+    role: 'generated',
+  });
+  const sourceCount = sourceArtifacts.length;
+  const schema = getPlanningSchemaDefinition(validation.value.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+  const message = sourceCount > 0
+    ? 'Planning Packet organized ' + sourceCount + ' source artifact' + (sourceCount === 1 ? '' : 's') + ' for the ' + (schema?.label || 'plan') + ' workflow.'
+    : 'Planning Packet prepared the ' + (schema?.label || 'plan') + ' workflow from the manual source summary.';
+
+  return {
+    message,
+    outputs: {
+      packet: packetArtifact,
+    },
+    preview: summarizeArtifact(packetArtifact),
+  };
+}
+
+async function executePlannerNode(node, graph, run, contextMaps, reportProgress) {
+  const packetArtifact = getNodeInputArtifact(node.id, 'packet', graph, run.resultsByNodeId, run);
+  if (!packetArtifact || String(packetArtifact.kind || '').trim() !== PORT_KIND_PLANNING_PACKET) {
+    throw new Error('This Planner step needs a Planning Packet input before it can run.');
+  }
+
+  const packetValidation = validatePlanningPacketShape(packetArtifact.packet || {});
+  if (!packetValidation.ok) {
+    throw new Error(packetValidation.errors[0] || 'This planning packet is not ready yet.');
+  }
+
+  const executionMode = node.config?.executionMode === 'ollama' ? 'ollama' : 'cloud';
+  const model = String(node.config?.model || '').trim();
+  if (!model) {
+    throw new Error('Choose or enter a model for the Planner node before running this pipeline.');
+  }
+
+  const schemaId = String(node.config?.schemaId || packetValidation.value.schemaId || packetValidation.value?.desiredOutput?.schemaId || DEFAULT_PLANNING_SCHEMA_ID).trim() || DEFAULT_PLANNING_SCHEMA_ID;
+  const schema = getPlanningSchemaDefinition(schemaId);
+  const plannerPrompt = buildPlannerPrompt(schemaId, packetValidation.value, {
+    guidance: node.config?.instruction,
+    systemPrompt: node.config?.systemPrompt,
+  });
+  const messages = [];
+  if (plannerPrompt.systemPrompt) {
+    messages.push({
+      role: 'system',
+      content: plannerPrompt.systemPrompt,
+    });
+  }
+  messages.push({
+    role: 'user',
+    content: plannerPrompt.userPrompt,
+  });
+
+  let providerId = '';
+  let providerLabel = 'Cloud provider';
+  let reply = '';
+
+  if (executionMode === 'ollama') {
+    const ollamaTool = await getInstalledToolOrThrow(
+      contextMaps,
+      'ollama',
+      'Install Ollama before using a local Planner step in a pipeline.',
+    );
+    reportProgress?.('Sending the planning packet to Ollama for structured scene planning.', 'Running ' + node.label + ' with Ollama...');
+    const result = await chatWithOllama(ollamaTool, {
+      messages,
+      model,
+    });
+    reply = String(result?.message?.content || '').trim();
+    providerLabel = 'Ollama';
+  } else {
+    providerId = String(node.config?.providerId || '').trim();
+    if (!providerId) {
+      throw new Error('Choose a connected cloud provider before running this Planner step.');
+    }
+
+    const provider = contextMaps?.providersById?.[providerId] || null;
+    if (!provider?.isConnected) {
+      throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
+    }
+
+    providerLabel = String(provider.name || providerId).trim() || providerId;
+    reportProgress?.('Sending the planning packet to ' + providerLabel + ' for structured planning.', 'Running ' + node.label + ' with ' + providerLabel + '...');
+    const result = await chatWithProvider(providerId, {
+      messages,
+      model,
+      timeoutMessage: providerLabel + ' took too long to answer this planner request. Try again or simplify the planning packet if the delay continues.',
+      timeoutMs: PLANNER_PROVIDER_TIMEOUT_MS,
+    });
+    reply = String(result?.message?.content || '').trim();
+  }
+
+  const normalizedPlan = parsePlannerReply(schemaId, reply);
+  if (!String(normalizedPlan.title || '').trim() || String(normalizedPlan.title || '').trim().toLowerCase() === 'scene plan') {
+    normalizedPlan.title = String(packetValidation.value.title || schema?.label || 'Plan').replace(/\s+packet$/i, '').trim() || (schema?.label || 'Plan');
+  }
+
+  const planArtifact = createPlanArtifact(normalizedPlan, {
+    displayName: node.label,
+    planner: {
+      executionMode,
+      model,
+      nodeId: node.id,
+      nodeLabel: node.label,
+      providerId,
+      providerLabel,
+      schemaId,
+      schemaLabel: String(schema?.label || 'Plan').trim() || 'Plan',
+    },
+    role: 'generated',
+    sourcePacket: packetValidation.value,
+  });
+  const sceneCount = Number(planArtifact.sceneCount || normalizedPlan.scenes?.length || 0) || 0;
+
+  return {
+    message: providerLabel + ' returned a structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + sceneCount + ' scene' + (sceneCount === 1 ? '' : 's') + '.',
+    outputs: {
+      plan: planArtifact,
+    },
+    preview: summarizeArtifact(planArtifact),
+  };
+}
+
+async function executePreviewNode(node, graph, run) {
+  const planArtifact = getNodeInputArtifact(node.id, 'plan', graph, run.resultsByNodeId, run);
+  if (!planArtifact || String(planArtifact.kind || '').trim() !== PORT_KIND_PLAN) {
+    throw new Error('This Preview step needs a structured Plan input before it can run.');
+  }
+
+  const previewDocument = buildPlanPreviewDocument(planArtifact.plan || {}, {
+    sourcePacket: planArtifact.sourcePacket || null,
+  });
+  const previewArtifact = createPreviewArtifact(previewDocument, {
+    displayName: node.label,
+    role: 'generated',
+    sourcePacket: planArtifact.sourcePacket || null,
+    sourcePlan: planArtifact.plan || null,
+  });
+  const savedArtifact = await copyArtifactToOutput(previewArtifact, run.directories, {
+    title: String(node.label || 'Preview').trim() || 'Preview',
+  });
+  const sceneCount = Number(savedArtifact.sceneCount || previewDocument.sceneCount || 0) || 0;
+  const destinationPath = savedArtifact.destinationPath || savedArtifact.filePath || '';
+
+  return {
+    destinationPath,
+    message: 'Preview prepared ' + sceneCount + ' scene' + (sceneCount === 1 ? '' : 's') + ' for review before later generation work.',
+    outputs: {
+      preview: savedArtifact,
+    },
+    preview: summarizeArtifact(savedArtifact),
+  };
+}
+
+async function executeAuditNode(node, graph, run) {
+  const planArtifact = getNodeInputArtifact(node.id, 'plan', graph, run.resultsByNodeId, run);
+  if (!planArtifact || String(planArtifact.kind || '').trim() !== PORT_KIND_PLAN) {
+    throw new Error('This Audit step needs a structured Plan input before it can run.');
+  }
+
+  const previewArtifact = getNodeInputArtifact(node.id, 'preview', graph, run.resultsByNodeId, run);
+  if (previewArtifact && String(previewArtifact.kind || '').trim() !== PORT_KIND_PREVIEW) {
+    throw new Error('This Audit step can only accept a typed Preview artifact on its Preview input.');
+  }
+
+  const auditDocument = buildPlanAuditDocument(planArtifact.plan || {}, {
+    preview: previewArtifact?.preview || null,
+    sourcePacket: planArtifact.sourcePacket || null,
+  });
+  const auditArtifact = createAuditArtifact(auditDocument, {
+    displayName: node.label,
+    role: 'generated',
+    sourcePacket: planArtifact.sourcePacket || null,
+    sourcePlan: planArtifact.plan || null,
+    sourcePreview: previewArtifact?.preview || null,
+  });
+  const savedArtifact = await copyArtifactToOutput(auditArtifact, run.directories, {
+    title: String(node.label || 'Audit').trim() || 'Audit',
+  });
+  const destinationPath = savedArtifact.destinationPath || savedArtifact.filePath || '';
+  const summary = auditDocument.summary || {};
+  const findingCount = Number(summary.errorCount || 0) + Number(summary.warningCount || 0) + Number(summary.infoCount || 0);
+
+  return {
+    destinationPath,
+    message: findingCount
+      ? 'Audit reviewed the plan and surfaced ' + findingCount + ' bounded finding' + (findingCount === 1 ? '' : 's') + '.'
+      : 'Audit reviewed the plan and found no structural or heuristic findings in this pass.',
+    outputs: {
+      audit: savedArtifact,
+    },
+    preview: summarizeArtifact(savedArtifact),
+  };
 }
 
 function buildImageGenerationPrompt(node, inputArtifact) {
@@ -2655,6 +2951,22 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     };
   }
 
+  if (node.type === 'planningPacket') {
+    return executePlanningPacketNode(node, graph, run, contextMaps);
+  }
+
+  if (node.type === 'planner') {
+    return executePlannerNode(node, graph, run, contextMaps, reportProgress);
+  }
+
+  if (node.type === 'preview') {
+    return executePreviewNode(node, graph, run);
+  }
+
+  if (node.type === 'audit') {
+    return executeAuditNode(node, graph, run);
+  }
+
   if (node.type === 'llmPrompt') {
     const promptArtifact = getNodeInputArtifact(node.id, 'prompt', graph, run.resultsByNodeId, run);
     const model = String(node.config?.model || '').trim();
@@ -3131,6 +3443,10 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
   if (node.type === 'collectionOutput') {
     return executeOutputNode(node, 'collection', graph, run);
+  }
+
+  if (node.type === 'planOutput') {
+    return executeOutputNode(node, 'plan', graph, run);
   }
 
   if (node.type === 'textOutput') {

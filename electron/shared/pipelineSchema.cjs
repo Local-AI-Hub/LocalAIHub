@@ -22,8 +22,13 @@ const {
   getGraphWorkflowOutputNodeOptions,
   parseGraphWorkflowDefinitionText,
 } = require('./graphWorkflowContracts.cjs');
+const {
+  DEFAULT_PLANNING_SCHEMA_ID,
+  getPlanningSchemaDefinition,
+  getPlanningSchemaOptions,
+} = require('./planningSchema.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 7;
+const PIPELINE_SCHEMA_VERSION = 8;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
@@ -32,6 +37,10 @@ const PORT_KIND_IMAGE = 'image';
 const PORT_KIND_AUDIO = 'audio';
 const PORT_KIND_VIDEO = 'video';
 const PORT_KIND_FILE = 'file';
+const PORT_KIND_PLANNING_PACKET = 'planningPacket';
+const PORT_KIND_PLAN = 'plan';
+const PORT_KIND_PREVIEW = 'preview';
+const PORT_KIND_AUDIT = 'audit';
 const PORT_KIND_COMPOSITION = 'composition';
 const PORT_KIND_COLLECTION = 'collection';
 const PORT_COLLECTION_KIND_PREFIX = PORT_KIND_COLLECTION + ':';
@@ -47,6 +56,10 @@ const COLLECTION_ITEM_PORT_KINDS = Object.freeze([
 ]);
 const SUPPORTED_PORT_KINDS = Object.freeze([
   ...COLLECTION_ITEM_PORT_KINDS,
+  PORT_KIND_PLANNING_PACKET,
+  PORT_KIND_PLAN,
+  PORT_KIND_PREVIEW,
+  PORT_KIND_AUDIT,
   PORT_KIND_COMPOSITION,
 ]);
 const PIPELINE_PORT_KIND_LABELS = Object.freeze({
@@ -55,6 +68,10 @@ const PIPELINE_PORT_KIND_LABELS = Object.freeze({
   [PORT_KIND_AUDIO]: 'Audio',
   [PORT_KIND_VIDEO]: 'Video',
   [PORT_KIND_FILE]: 'File',
+  [PORT_KIND_PLANNING_PACKET]: 'Planning Packet',
+  [PORT_KIND_PLAN]: 'Plan',
+  [PORT_KIND_PREVIEW]: 'Preview',
+  [PORT_KIND_AUDIT]: 'Audit',
   [PORT_KIND_COMPOSITION]: 'Composition',
   [PORT_KIND_COLLECTION]: 'Collection',
 });
@@ -197,6 +214,43 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       filePath: '',
     },
   }),
+  planningPacket: Object.freeze({
+    type: 'planningPacket',
+    label: 'Planning Packet',
+    category: 'Planning',
+    description: 'Builds an editable planning packet from upstream source artifacts plus structured planning context.',
+    inputPorts: [
+      {
+        id: 'source',
+        kind: PORT_KIND_ANY,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        label: 'Source',
+        allowMultipleConnections: true,
+        minimumConnections: 1,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'packet',
+        kind: PORT_KIND_PLANNING_PACKET,
+        label: 'Packet',
+      },
+    ],
+    configDefaults: {
+      schemaId: DEFAULT_PLANNING_SCHEMA_ID,
+      title: '',
+      goal: '',
+      sourceSummary: '',
+      constraintsText: '',
+      stylePolicyText: '',
+      availableToolsText: '',
+      readinessNotesText: '',
+      desiredOutputNotes: '',
+      riskNotesText: '',
+      uncertaintyFlagsText: '',
+      additionalContext: '',
+    },
+  }),
   llmPrompt: Object.freeze({
     type: 'llmPrompt',
     label: 'Model Step',
@@ -277,6 +331,98 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         label: 'Local media tool',
       },
     ],
+  }),
+  planner: Object.freeze({
+    type: 'planner',
+    label: 'Planner',
+    category: 'Planning',
+    description: 'Consumes a Planning Packet, reasons inside the selected planning schema, and returns a typed Plan artifact.',
+    inputPorts: [
+      {
+        id: 'packet',
+        kind: PORT_KIND_PLANNING_PACKET,
+        label: 'Planning Packet',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'plan',
+        kind: PORT_KIND_PLAN,
+        label: 'Plan',
+      },
+    ],
+    configDefaults: {
+      executionMode: 'cloud',
+      providerId: '',
+      model: '',
+      schemaId: '',
+      instruction: '',
+      systemPrompt: '',
+    },
+    supportedExecutionModes: [
+      {
+        id: 'cloud',
+        label: 'Cloud provider',
+      },
+      {
+        id: 'ollama',
+        label: 'Ollama (local)',
+        requiredToolId: 'ollama',
+      },
+    ],
+    schemaOptions: getPlanningSchemaOptions(),
+  }),
+  preview: Object.freeze({
+    type: 'preview',
+    label: 'Preview',
+    category: 'Planning',
+    description: 'Compiles a typed review preview from the connected Plan so you can inspect scene cards and prompt drafts before later generation work.',
+    inputPorts: [
+      {
+        id: 'plan',
+        kind: PORT_KIND_PLAN,
+        label: 'Plan',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'preview',
+        kind: PORT_KIND_PREVIEW,
+        label: 'Preview',
+      },
+    ],
+    persistsOutput: true,
+    configDefaults: {},
+  }),
+  audit: Object.freeze({
+    type: 'audit',
+    label: 'Audit',
+    category: 'Planning',
+    description: 'Builds a typed review audit from the connected Plan and optional Preview using schema grounding plus modest bounded heuristics.',
+    inputPorts: [
+      {
+        id: 'plan',
+        kind: PORT_KIND_PLAN,
+        label: 'Plan',
+        required: true,
+      },
+      {
+        id: 'preview',
+        kind: PORT_KIND_PREVIEW,
+        label: 'Preview',
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'audit',
+        kind: PORT_KIND_AUDIT,
+        label: 'Audit',
+      },
+    ],
+    persistsOutput: true,
+    configDefaults: {},
   }),
   whisperTranscribe: Object.freeze({
     type: 'whisperTranscribe',
@@ -675,6 +821,25 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       fps: 30,
       fitMode: 'contain',
       stopMode: 'shortest',
+    },
+  }),
+  planOutput: Object.freeze({
+    type: 'planOutput',
+    label: 'Plan Output',
+    category: 'Outputs',
+    description: 'Shows the final structured plan and saves its JSON output to the run folder.',
+    inputPorts: [
+      {
+        id: 'plan',
+        kind: PORT_KIND_PLAN,
+        label: 'Plan',
+        required: true,
+      },
+    ],
+    outputPorts: [],
+    terminal: true,
+    configDefaults: {
+      title: 'Plan result',
     },
   }),
   textOutput: Object.freeze({
@@ -2653,12 +2818,18 @@ function buildPipelineGraph(definition = {}) {
   );
 
   const terminalNodeIds = pipeline.nodes.filter((node) => getNodeTypeDefinition(node.type)?.terminal).map((node) => node.id);
-  if (!terminalNodeIds.length) {
-    errors.push('Add at least one output node so Local AI Hub knows which result to keep.');
+  const retainedResultNodeIds = pipeline.nodes
+    .filter((node) => {
+      const definition = getNodeTypeDefinition(node.type);
+      return Boolean(definition?.terminal || definition?.persistsOutput);
+    })
+    .map((node) => node.id);
+  if (!retainedResultNodeIds.length) {
+    errors.push('Add at least one output or review node so Local AI Hub knows which result to keep.');
   }
 
   const reachableNodeIds = new Set();
-  const reverseQueue = [...terminalNodeIds];
+  const reverseQueue = [...retainedResultNodeIds];
   while (reverseQueue.length > 0) {
     const nodeId = reverseQueue.shift();
     if (reachableNodeIds.has(nodeId)) {
@@ -2673,8 +2844,8 @@ function buildPipelineGraph(definition = {}) {
   }
 
   for (const node of pipeline.nodes) {
-    if (!reachableNodeIds.has(node.id) && terminalNodeIds.length > 0) {
-      warnings.push(`"${node.label}" is not connected to an output and will be skipped.`);
+    if (!reachableNodeIds.has(node.id) && retainedResultNodeIds.length > 0) {
+      warnings.push(`"${node.label}" does not lead to a kept result and will be skipped.`);
     }
   }
 
@@ -2726,6 +2897,7 @@ function buildPipelineGraph(definition = {}) {
     incomingEdgeByPortKey,
     reachableNodeIds,
     terminalNodeIds,
+    retainedResultNodeIds,
     executionOrder,
     executionIndexByNodeId: new Map(executionOrder.map((nodeId, index) => [nodeId, index])),
     retryLoopIssuesByNodeId: new Map(),
@@ -2793,6 +2965,10 @@ function getLocalToolRequirement(node, contextMaps = {}) {
   }
 
   if (node.type === 'llmPrompt' && getModelStepExecutionMode(node) === 'ollama') {
+    return 'ollama';
+  }
+
+  if (node.type === 'planner' && node.config?.executionMode === 'ollama') {
     return 'ollama';
   }
 
@@ -3649,6 +3825,125 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
+      if (node.type === 'planningPacket') {
+        const sourceKinds = getIncomingKindsForNodePort(node, 'source', graph);
+        const goal = String(node.config?.goal || '').trim();
+        const sourceSummary = String(node.config?.sourceSummary || '').trim();
+        if (!goal) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Describe the task goal before building this planning packet.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!sourceKinds.length && !sourceSummary) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect source content or add a manual source summary before building this planning packet.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          const schema = getPlanningSchemaDefinition(node.config?.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+          summary.readiness = {
+            tone: 'info',
+            message: 'This packet will carry structured planning context for the ' + (schema?.label || 'selected planning schema').toLowerCase() + '.',
+          };
+          issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
+        }
+      }
+
+      if (node.type === 'planner') {
+        const packetKinds = getIncomingKindsForNodePort(node, 'packet', graph);
+        const executionMode = node.config?.executionMode === 'ollama' ? 'ollama' : 'cloud';
+        const schema = getPlanningSchemaDefinition(node.config?.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+        const model = String(node.config?.model || '').trim();
+        if (!packetKinds.includes(normalizePortKind(PORT_KIND_PLANNING_PACKET))) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a Planning Packet before running this planner.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!model) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose or enter a model for this planner.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (executionMode === 'ollama') {
+          const ollamaTool = contextMaps.toolsById.ollama || null;
+          if (!ollamaTool) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Install Ollama before using a local planner.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (String(ollamaTool.status || '').toLowerCase() !== 'running') {
+            summary.readiness = {
+              tone: 'warn',
+              message: 'Ollama is not running yet. Local AI Hub can start it automatically when this planner runs.',
+            };
+            issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+          } else {
+            summary.readiness = {
+              tone: 'info',
+              message: 'Ollama will build a structured ' + (schema?.label || 'plan').toLowerCase() + ' inside the selected planning schema contract.',
+            };
+            issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
+          }
+        } else {
+          const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
+          if (providerStatus.tone === 'error') {
+            summary.readiness = {
+              tone: 'error',
+              message: providerStatus.message,
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else {
+            summary.readiness = {
+              tone: providerStatus.tone === 'warn' ? 'warn' : 'info',
+              message: providerStatus.tone === 'warn'
+                ? providerStatus.message
+                : (providerStatus.provider?.name || 'That provider') + ' will build a structured ' + (schema?.label || 'plan').toLowerCase() + ' inside the selected planning schema contract.',
+            };
+            issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
+          }
+        }
+      }
+
+      if (node.type === 'preview') {
+        const planKinds = getIncomingKindsForNodePort(node, 'plan', graph);
+        if (!planKinds.includes(normalizePortKind(PORT_KIND_PLAN))) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a structured Plan before running this preview step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step compiles reviewable scene preview cards from the connected Plan without pretending to be final generation output.',
+          };
+        }
+      }
+
+      if (node.type === 'audit') {
+        const planKinds = getIncomingKindsForNodePort(node, 'plan', graph);
+        const previewKinds = getIncomingKindsForNodePort(node, 'preview', graph);
+        if (!planKinds.includes(normalizePortKind(PORT_KIND_PLAN))) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a structured Plan before running this audit step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: previewKinds.includes(normalizePortKind(PORT_KIND_PREVIEW))
+              ? 'This audit will combine plan-shape validation, bounded heuristics, and preview coverage checks.'
+              : 'This audit will use plan-shape validation plus bounded heuristics. Connect a Preview when you want the audit to check review coverage too.',
+          };
+        }
+      }
+
       if (node.type === 'validation') {
         const outgoingEdges = graph.outgoingEdgesByNode.get(node.id) || [];
         const passCount = outgoingEdges.filter((edge) => edge.source.portId === 'pass').length;
@@ -3875,6 +4170,22 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
+      if (node.type === 'planOutput') {
+        const planKinds = getIncomingKindsForNodePort(node, 'plan', graph);
+        if (!planKinds.includes(PORT_KIND_PLAN)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a structured Plan before running this output step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This output saves the structured plan JSON and keeps it inspectable in the run folder.',
+          };
+        }
+      }
+
       if (node.type === 'mediaComposition') {
         const visualKinds = getIncomingKindsForNodePort(node, 'visuals', graph);
         if (!visualKinds.length) {
@@ -3973,6 +4284,7 @@ function analyzePipeline(definition = {}, context = {}) {
     executionOrder: graph.executionOrder,
     reachableNodeIds: [...graph.reachableNodeIds],
     terminalNodeIds: graph.terminalNodeIds,
+    retainedResultNodeIds: [...graph.retainedResultNodeIds],
     primaryIssue: highestIssue,
   };
 }
@@ -3996,12 +4308,17 @@ module.exports = {
   PORT_KIND_COMPOSITION,
   PORT_KIND_FILE,
   PORT_KIND_IMAGE,
+  PORT_KIND_PLANNING_PACKET,
+  PORT_KIND_PLAN,
+  PORT_KIND_PREVIEW,
+  PORT_KIND_AUDIT,
   PORT_KIND_PASSTHROUGH,
   PORT_KIND_TEXT,
   PORT_KIND_VIDEO,
   SUPPORTED_PORT_KINDS,
   createCollectionPortKind,
   formatPortKindLabel,
+  DEFAULT_PLANNING_SCHEMA_ID,
   getCollectionItemKind,
   isCollectionPortKind,
   VIDEO_WORKFLOW_TOOL_IDS,
@@ -4032,6 +4349,8 @@ module.exports = {
   getModelStepLocalToolId,
   getModelStepOperationId,
   getNodeTypeDefinition,
+  getPlanningSchemaDefinition,
+  getPlanningSchemaOptions,
   getPortAllowedKinds,
   getPortDefinition,
   getSupportedPortKinds,

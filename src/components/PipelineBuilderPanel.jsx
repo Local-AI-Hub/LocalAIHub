@@ -38,9 +38,19 @@ const {
   PIPELINE_OPERATION_IDS,
   PIPELINE_PORT_KIND_LABELS,
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
+  DEFAULT_PLANNING_SCHEMA_ID,
+  getPlanningSchemaOptions,
 } = pipelineShared;
 const CANVAS_MIN_WIDTH = 1280;
 const CANVAS_MIN_HEIGHT = 820;
+const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ? getPlanningSchemaOptions() : [];
+
+function getPlanningSchemaOptionById(schemaId) {
+  const normalizedSchemaId = String(schemaId || '').trim();
+  return PLANNING_SCHEMA_OPTIONS.find((entry) => entry.id === normalizedSchemaId)
+    || PLANNING_SCHEMA_OPTIONS.find((entry) => entry.id === DEFAULT_PLANNING_SCHEMA_ID)
+    || null;
+}
 
 function fileNameFromPath(value) {
   return String(value || '')
@@ -81,6 +91,16 @@ function getArtifactStoragePath(artifact) {
   return artifact?.destinationPath || artifact?.directoryPath || artifact?.filePath || '';
 }
 
+function getPrimaryNodeOutputArtifact(nodeState) {
+  const outputs = Object.values(nodeState?.outputs || {}).filter(Boolean);
+  return outputs[0] || null;
+}
+
+function shouldShowInlineNodeArtifactPreview(artifact) {
+  const previewKind = getArtifactPreviewKind(artifact);
+  return ['planning-packet', 'plan', 'preview', 'audit'].includes(previewKind);
+}
+
 function getArtifactPreviewKind(artifact) {
   if (!artifact) {
     return '';
@@ -96,6 +116,22 @@ function getArtifactPreviewKind(artifact) {
 
   if (artifact.kind === 'audio') {
     return 'audio';
+  }
+
+  if (artifact.kind === 'planningPacket') {
+    return 'planning-packet';
+  }
+
+  if (artifact.kind === 'plan') {
+    return 'plan';
+  }
+
+  if (artifact.kind === 'preview') {
+    return 'preview';
+  }
+
+  if (artifact.kind === 'audit') {
+    return 'audit';
   }
 
   if (artifact.kind === 'video') {
@@ -310,6 +346,96 @@ function buildVideoFactLabels(artifact) {
   ].filter(Boolean);
 }
 
+function buildPlanningPacketFactLabels(artifact) {
+  const packet = artifact?.packet && typeof artifact.packet === 'object' ? artifact.packet : {};
+  const sourceCount = Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts.length : 0;
+  const constraintCount = Array.isArray(packet.constraints) ? packet.constraints.length : 0;
+  const riskCount = Array.isArray(packet.riskNotes) ? packet.riskNotes.length : 0;
+  return [
+    packet.schemaLabel || 'Planning packet',
+    sourceCount ? sourceCount + ' source' + (sourceCount === 1 ? '' : 's') : '',
+    constraintCount ? constraintCount + ' constraint' + (constraintCount === 1 ? '' : 's') : '',
+    riskCount ? riskCount + ' risk note' + (riskCount === 1 ? '' : 's') : '',
+  ].filter(Boolean);
+}
+
+function buildPlanFactLabels(artifact) {
+  const plan = artifact?.plan && typeof artifact.plan === 'object' ? artifact.plan : {};
+  const sceneCount = Array.isArray(plan.scenes) ? plan.scenes.length : Number(artifact?.sceneCount || 0) || 0;
+  const openQuestionCount = Array.isArray(plan.openQuestions) ? plan.openQuestions.length : 0;
+  return [
+    artifact?.schemaLabel || getPlanningSchemaOptionById(plan.schemaId)?.label || 'Plan',
+    sceneCount ? sceneCount + ' scene' + (sceneCount === 1 ? '' : 's') : '',
+    openQuestionCount ? openQuestionCount + ' open question' + (openQuestionCount === 1 ? '' : 's') : '',
+  ].filter(Boolean);
+}
+
+function buildPreviewFactLabels(artifact) {
+  const preview = artifact?.preview && typeof artifact.preview === 'object' ? artifact.preview : {};
+  const sceneCount = Array.isArray(preview.scenes) ? preview.scenes.length : Number(artifact?.sceneCount || 0) || 0;
+  return [
+    preview.schemaLabel || artifact?.schemaLabel || 'Preview',
+    sceneCount ? sceneCount + ' scene' + (sceneCount === 1 ? '' : 's') : '',
+    preview.previewMode ? 'Review cards' : '',
+  ].filter(Boolean);
+}
+
+function buildAuditFactLabels(artifact) {
+  const audit = artifact?.audit && typeof artifact.audit === 'object' ? artifact.audit : {};
+  const summary = audit.summary && typeof audit.summary === 'object' ? audit.summary : {};
+  const findingCount = Number(summary.errorCount || 0) + Number(summary.warningCount || 0) + Number(summary.infoCount || 0);
+  return [
+    audit.schemaLabel || artifact?.schemaLabel || 'Audit',
+    audit.sceneCount ? audit.sceneCount + ' scene' + (audit.sceneCount === 1 ? '' : 's') : '',
+    findingCount ? findingCount + ' finding' + (findingCount === 1 ? '' : 's') : 'No findings',
+    audit.previewCoverage?.connected ? 'Preview checked' : 'Plan only',
+  ].filter(Boolean);
+}
+
+function PlanningTextBlock({ title, value }) {
+  if (!value) {
+    return null;
+  }
+
+  return (
+    <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{title}</p>
+      <p className="mt-3 text-sm leading-6 text-slate-200 whitespace-pre-wrap">{value}</p>
+    </div>
+  );
+}
+
+function PlanningListBlock({ title, items }) {
+  const normalizedItems = (Array.isArray(items) ? items : []).map((entry) => String(entry || '').trim()).filter(Boolean);
+  if (!normalizedItems.length) {
+    return null;
+  }
+
+  return (
+    <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{title}</p>
+      <div className="mt-3 space-y-2">
+        {normalizedItems.map((entry, index) => (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-sm leading-6 text-slate-200" key={title + '-' + index}>
+            {entry}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StructuredDataPreview({ value, className = '', minHeight = '220px' }) {
+  return (
+    <textarea
+      className={'store-input resize-none font-mono text-[11px] leading-5 ' + className}
+      readOnly
+      style={{ minHeight }}
+      value={JSON.stringify(value || {}, null, 2)}
+    />
+  );
+}
+
 function ArtifactFacts({ artifact, className = '' }) {
   if (!artifact) {
     return null;
@@ -319,7 +445,15 @@ function ArtifactFacts({ artifact, className = '' }) {
     ? buildCompositionFactLabels(artifact)
     : isCollectionArtifact(artifact)
       ? buildCollectionFactLabels(artifact)
-      : [
+      : artifact?.kind === 'planningPacket'
+        ? buildPlanningPacketFactLabels(artifact)
+        : artifact?.kind === 'plan'
+          ? buildPlanFactLabels(artifact)
+          : artifact?.kind === 'preview'
+            ? buildPreviewFactLabels(artifact)
+            : artifact?.kind === 'audit'
+              ? buildAuditFactLabels(artifact)
+              : [
           formatArtifactKindLabel(artifact.kind, artifact.itemKind),
           artifact.formatLabel || '',
           artifact.mimeType || '',
@@ -377,7 +511,26 @@ function buildNodePreview(node, runState) {
     return `${getModelStepOperationLabel(node)} | ${modeLabel}${node.config?.model ? ` | ${node.config.model}` : ''}`;
   }
   if (node.type === 'whisperTranscribe') {
-    return `Model: ${node.config?.model || 'base'}`;
+    return 'Model: ' + (node.config?.model || 'base');
+  }
+
+  if (node.type === 'planningPacket') {
+    const schema = getPlanningSchemaOptionById(node.config?.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+    return (schema?.label || 'Planning packet') + ' | ' + summarizePreview(node.config?.goal || 'Add a planning goal.');
+  }
+
+  if (node.type === 'planner') {
+    const schema = getPlanningSchemaOptionById(node.config?.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
+    const modeLabel = node.config?.executionMode === 'ollama' ? 'Ollama' : (node.config?.providerId || 'Cloud provider');
+    return (schema?.label || 'Plan') + ' | ' + modeLabel + (node.config?.model ? ' | ' + node.config.model : '');
+  }
+
+  if (node.type === 'preview') {
+    return 'Compiles scene-by-scene preview cards from the connected plan';
+  }
+
+  if (node.type === 'audit') {
+    return 'Runs schema grounding plus bounded review heuristics on the connected plan';
   }
 
   if (node.type === 'imageAnalyze') {
@@ -462,6 +615,13 @@ function getModelTargetConfig(node) {
   if (node?.type === 'validation' && node.config?.mode === 'llm') {
     return {
       executionModeKey: 'llmExecutionMode',
+      providerIdKey: 'providerId',
+    };
+  }
+
+  if (node?.type === 'planner') {
+    return {
+      executionModeKey: 'executionMode',
       providerIdKey: 'providerId',
     };
   }
@@ -654,6 +814,201 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
   }
 
   const previewKind = getArtifactPreviewKind(artifact);
+
+  if (previewKind === 'planning-packet') {
+    const packet = artifact?.packet && typeof artifact.packet === 'object' ? artifact.packet : {};
+    const sourceArtifacts = Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts : [];
+    const visibleSources = compact ? sourceArtifacts.slice(0, 2) : sourceArtifacts.slice(0, 4);
+    return (
+      <div className={`space-y-3 ${className}`}>
+        <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+          <p className="text-sm font-medium text-white">{artifact.displayName || packet.title || packet.schemaLabel || 'Planning packet'}</p>
+          {artifact.summary ? <p className="mt-2 text-xs leading-5 text-slate-400">{artifact.summary}</p> : null}
+        </div>
+        <ArtifactFacts artifact={artifact} />
+        <PlanningTextBlock title="Goal" value={packet.goal} />
+        <PlanningTextBlock title="Source Summary" value={packet.sourceSummary} />
+        <PlanningTextBlock title="Desired Output" value={packet.desiredOutput?.notes || packet.desiredOutput?.shapeSummary} />
+        <div className="grid gap-3 xl:grid-cols-2">
+          <PlanningListBlock title="Constraints" items={packet.constraints} />
+          <PlanningListBlock title="Style / Policy" items={packet.stylePolicy} />
+          <PlanningListBlock title="Available Tools" items={packet.availableTools} />
+          <PlanningListBlock title="Readiness Notes" items={packet.readiness?.notes} />
+          <PlanningListBlock title="Risk Notes" items={packet.riskNotes} />
+          <PlanningListBlock title="Uncertainty Flags" items={packet.uncertaintyFlags} />
+        </div>
+        {packet.readiness?.hardwareSummary ? <PlanningTextBlock title="Hardware Context" value={packet.readiness.hardwareSummary} /> : null}
+        {visibleSources.map((sourceArtifact, index) => (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4" key={(sourceArtifact?.filePath || sourceArtifact?.displayName || 'source') + '-' + index}>
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Source {index + 1}</p>
+            <p className="mt-2 text-sm font-medium text-white">{sourceArtifact.displayName || sourceArtifact.fileName || sourceArtifact.kind || 'Source artifact'}</p>
+            {sourceArtifact.summary ? <p className="mt-2 text-xs leading-5 text-slate-400">{sourceArtifact.summary}</p> : null}
+            {sourceArtifact.textExcerpt ? <textarea className="store-input mt-3 min-h-[120px] resize-none" readOnly value={sourceArtifact.textExcerpt} /> : null}
+          </div>
+        ))}
+        {sourceArtifacts.length > visibleSources.length ? <p className="text-xs leading-5 text-slate-500">Showing {visibleSources.length} of {sourceArtifacts.length} sources.</p> : null}
+        {packet.workingNotes ? <PlanningTextBlock title="Working Notes" value={packet.workingNotes} /> : null}
+        {!compact ? <StructuredDataPreview className="mt-1" minHeight="260px" value={packet} /> : null}
+      </div>
+    );
+  }
+
+  if (previewKind === 'plan') {
+    const plan = artifact?.plan && typeof artifact.plan === 'object' ? artifact.plan : {};
+    const overview = plan.overview && typeof plan.overview === 'object' ? plan.overview : {};
+    const scenes = Array.isArray(plan.scenes) ? plan.scenes : [];
+    const visibleScenes = compact ? scenes.slice(0, 2) : scenes.slice(0, 5);
+    return (
+      <div className={`space-y-3 ${className}`}>
+        <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+          <p className="text-sm font-medium text-white">{artifact.displayName || plan.title || artifact.schemaLabel || 'Plan'}</p>
+          {artifact.summary ? <p className="mt-2 text-xs leading-5 text-slate-400">{artifact.summary}</p> : null}
+        </div>
+        <ArtifactFacts artifact={artifact} />
+        <div className="grid gap-3 xl:grid-cols-2">
+          <PlanningTextBlock title="Overview Meaning / Intent" value={overview.meaningIntent} />
+          <PlanningTextBlock title="Viewer Takeaway" value={overview.viewerTakeaway} />
+          <PlanningTextBlock title="Narrative Arc" value={overview.narrativeArc} />
+          <PlanningTextBlock title="Tone Strategy" value={overview.toneStrategy} />
+          <PlanningListBlock title="Continuity Notes" items={overview.continuityNotes} />
+          <PlanningListBlock title="Risk Notes" items={overview.riskNotes} />
+        </div>
+        {visibleScenes.map((scene, index) => (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4" key={(scene?.sceneId || 'scene') + '-' + index}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm font-medium text-white">{scene.sourceSpanLabel || scene.sceneId || 'Scene ' + (index + 1)}</p>
+              {scene.sceneId ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">{scene.sceneId}</span> : null}
+            </div>
+            <div className="mt-3 grid gap-3 xl:grid-cols-2">
+              <PlanningTextBlock title="Meaning / Intent" value={scene.meaningIntent} />
+              <PlanningTextBlock title="Viewer Takeaway" value={scene.viewerTakeaway} />
+              <PlanningTextBlock title="Scene Concept" value={scene.sceneConcept} />
+              <PlanningTextBlock title="Treatment / Approach" value={scene.treatmentApproach} />
+            </div>
+            {scene.narrationDraft ? <PlanningTextBlock title="Narration Draft" value={scene.narrationDraft} /> : null}
+            {scene.visualPromptDraft ? <textarea className="store-input mt-3 min-h-[120px] resize-none" readOnly value={scene.visualPromptDraft} /> : null}
+            <PlanningListBlock title="Scene Risk Notes" items={scene.riskNotes} />
+          </div>
+        ))}
+        {scenes.length > visibleScenes.length ? <p className="text-xs leading-5 text-slate-500">Showing {visibleScenes.length} of {scenes.length} scenes.</p> : null}
+        <PlanningListBlock title="Open Questions" items={plan.openQuestions} />
+        {!compact ? <StructuredDataPreview className="mt-1" minHeight="280px" value={plan} /> : null}
+      </div>
+    );
+  }
+
+  if (previewKind === 'preview') {
+    const preview = artifact?.preview && typeof artifact.preview === 'object' ? artifact.preview : {};
+    const overview = preview.overview && typeof preview.overview === 'object' ? preview.overview : {};
+    const scenes = Array.isArray(preview.scenes) ? preview.scenes : [];
+    const visibleScenes = compact ? scenes.slice(0, 2) : scenes.slice(0, 4);
+    return (
+      <div className={`space-y-3 ${className}`}>
+        <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+          <p className="text-sm font-medium text-white">{artifact.displayName || preview.planTitle || 'Preview'}</p>
+          {artifact.summary ? <p className="mt-2 text-xs leading-5 text-slate-400">{artifact.summary}</p> : null}
+        </div>
+        <ArtifactFacts artifact={artifact} />
+        <PlanningTextBlock title="Review Boundary" value={preview.limitationNote} />
+        <div className="grid gap-3 xl:grid-cols-2">
+          <PlanningTextBlock title="Overview Meaning / Intent" value={overview.meaningIntent} />
+          <PlanningTextBlock title="Viewer Takeaway" value={overview.viewerTakeaway} />
+          <PlanningTextBlock title="Narrative Arc" value={overview.narrativeArc} />
+          <PlanningTextBlock title="Tone Strategy" value={overview.toneStrategy} />
+        </div>
+        {visibleScenes.map((scene, index) => (
+          <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4" key={(scene?.sceneId || 'preview-scene') + '-' + index}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm font-medium text-white">{scene.sourceSpanLabel || scene.sceneId || 'Scene ' + (index + 1)}</p>
+              <div className="flex flex-wrap items-center gap-2">
+                {scene.sceneId ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">{scene.sceneId}</span> : null}
+                {scene.promptReadiness ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">{scene.promptReadiness.replace(/-/g, ' ')}</span> : null}
+              </div>
+            </div>
+            {scene.summary ? <p className="mt-3 text-sm leading-6 text-slate-300">{scene.summary}</p> : null}
+            <div className="mt-3 grid gap-3 xl:grid-cols-2">
+              <PlanningTextBlock title="Meaning / Intent" value={scene.meaningIntent} />
+              <PlanningTextBlock title="Viewer Takeaway" value={scene.viewerTakeaway} />
+              <PlanningTextBlock title="Scene Concept" value={scene.sceneConcept} />
+              <PlanningTextBlock title="Treatment / Approach" value={scene.treatmentApproach} />
+            </div>
+            {scene.narrationDraft ? <PlanningTextBlock title="Narration Draft" value={scene.narrationDraft} /> : null}
+            {scene.promptPreview ? <textarea className="store-input mt-3 min-h-[120px] resize-none" readOnly value={scene.promptPreview} /> : null}
+            <PlanningListBlock title="Scene Risk Notes" items={scene.riskNotes} />
+          </div>
+        ))}
+        {scenes.length > visibleScenes.length ? <p className="text-xs leading-5 text-slate-500">Showing {visibleScenes.length} of {scenes.length} preview cards.</p> : null}
+        <PlanningListBlock title="Open Questions" items={preview.openQuestions} />
+        {!compact ? <StructuredDataPreview className="mt-1" minHeight="280px" value={preview} /> : null}
+      </div>
+    );
+  }
+
+  if (previewKind === 'audit') {
+    const audit = artifact?.audit && typeof artifact.audit === 'object' ? artifact.audit : {};
+    const findings = Array.isArray(audit.findings) ? audit.findings : [];
+    const visibleFindings = compact ? findings.slice(0, 3) : findings.slice(0, 8);
+    const summary = audit.summary && typeof audit.summary === 'object' ? audit.summary : {};
+    const totalFindingCount = Number(summary.errorCount || 0) + Number(summary.warningCount || 0) + Number(summary.infoCount || 0);
+    return (
+      <div className={`space-y-3 ${className}`}>
+        <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+          <p className="text-sm font-medium text-white">{artifact.displayName || audit.planTitle || 'Audit'}</p>
+          {artifact.summary ? <p className="mt-2 text-xs leading-5 text-slate-400">{artifact.summary}</p> : null}
+        </div>
+        <ArtifactFacts artifact={artifact} />
+        <PlanningTextBlock title="Audit Boundary" value={audit.limitationNote} />
+        <div className="grid gap-3 xl:grid-cols-2">
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Structural grounding</p>
+            <p className="mt-3 text-sm leading-6 text-slate-200">{audit.structuralValidation?.summary || 'No structural summary yet.'}</p>
+            {Array.isArray(audit.structuralValidation?.errors) && audit.structuralValidation.errors.length ? (
+              <div className="mt-3 space-y-2">
+                {audit.structuralValidation.errors.map((entry, index) => (
+                  <div className="rounded-2xl border border-rose-400/20 bg-rose-400/10 px-3 py-3 text-sm leading-6 text-rose-100" key={entry + '-' + index}>{entry}</div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+            <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Review summary</p>
+            <p className="mt-3 text-sm leading-6 text-slate-200">
+              {totalFindingCount
+                ? `This pass surfaced ${totalFindingCount} bounded finding${totalFindingCount === 1 ? '' : 's'}.`
+                : 'This pass did not surface any structural or heuristic findings.'}
+            </p>
+            <p className="mt-2 text-xs leading-5 text-slate-400">
+              {audit.previewCoverage?.connected
+                ? (audit.previewCoverage.matchesPlan ? 'The connected preview lines up with the current plan.' : 'The connected preview only partially lines up with the current plan.')
+                : 'This audit ran directly from the plan without a connected preview coverage check.'}
+            </p>
+          </div>
+        </div>
+        {visibleFindings.length ? visibleFindings.map((finding, index) => (
+          <div className={`rounded-2xl border px-4 py-4 ${toneToClassName(finding.severity)}`} key={(finding?.title || 'finding') + '-' + index}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm font-semibold text-white">{finding.title || 'Finding'}</p>
+              <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-white/85">{finding.severity || 'info'}</span>
+            </div>
+            {finding.sceneLabel ? <p className="mt-2 text-xs uppercase tracking-[0.16em] text-slate-200/80">{finding.sceneLabel}</p> : null}
+            {finding.detail ? <p className="mt-3 text-sm leading-6 text-slate-100">{finding.detail}</p> : null}
+            <p className="mt-2 text-xs leading-5 text-slate-200/80">
+              {(finding.category || 'review').replace(/-/g, ' ')}
+              {finding.approximate ? ' | approximate heuristic' : ''}
+              {finding.heuristic ? ' | ' + finding.heuristic.replace(/-/g, ' ') : ''}
+            </p>
+          </div>
+        )) : (
+          <div className="rounded-2xl border border-emerald-400/20 bg-emerald-400/10 px-4 py-4 text-sm leading-6 text-emerald-100">
+            No structural or heuristic findings were raised in this audit pass.
+          </div>
+        )}
+        {findings.length > visibleFindings.length ? <p className="text-xs leading-5 text-slate-500">Showing {visibleFindings.length} of {findings.length} findings.</p> : null}
+        <PlanningListBlock title="Heuristics Used" items={audit.heuristicsUsed} />
+        {!compact ? <StructuredDataPreview className="mt-1" minHeight="280px" value={audit} /> : null}
+      </div>
+    );
+  }
 
   if (previewKind === 'composition' && artifact?.composition) {
     const tracks = Array.isArray(artifact.composition.tracks) ? artifact.composition.tracks : [];
@@ -1287,6 +1642,7 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
               const node = draft.nodes.find((entry) => entry.id === nodeId);
               const nodeState = runState.nodeStates?.[nodeId];
               const attemptLabel = formatAttemptLabel(nodeState?.iteration, nodeState?.loopMaxAttempts);
+              const nodeArtifact = getPrimaryNodeOutputArtifact(nodeState);
               return (
                 <div key={nodeId} className={`rounded-2xl border px-3 py-3 ${runStatusClassName(nodeState?.status || 'queued')}`}>
                   <div className="flex items-center justify-between gap-3">
@@ -1305,6 +1661,12 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
                     </p>
                   ) : null}
                   {nodeState?.preview ? <p className="mt-2 text-xs leading-5 text-slate-300">{nodeState.preview}</p> : null}
+                  {shouldShowInlineNodeArtifactPreview(nodeArtifact) ? (
+                    <div className="mt-3">
+                      <ArtifactFacts artifact={nodeArtifact} />
+                      <ArtifactPreview artifact={nodeArtifact} className="mt-3" compact />
+                    </div>
+                  ) : null}
                   {nodeState?.selectedBranch ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-slate-400">Routed to {nodeState.selectedBranch}</p> : null}
                   <ValidationResultSummary validation={nodeState?.validation} />
                   <AttemptHistoryList entries={nodeState?.history} title="Previous attempts" />
@@ -1325,7 +1687,7 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
               ))
             ) : (
               <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">
-                Final outputs will appear here after the pipeline reaches an output node.
+                Final output cards appear here after the pipeline reaches an output node. Self-saved review artifacts like Preview and Audit still show up in the saved outputs panel below.
               </div>
             )}
           </div>
@@ -2460,7 +2822,12 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
         return;
       }
 
-      const result = await window.localAIHub.listProviderModels(node.type === 'llmPrompt' ? { operationId: getSelectedModelStepOperationId(node), providerId } : providerId);
+      const modelRequest = node.type === 'llmPrompt'
+        ? { operationId: getSelectedModelStepOperationId(node), providerId }
+        : node.type === 'planner'
+          ? { operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, providerId }
+          : providerId;
+      const result = await window.localAIHub.listProviderModels(modelRequest);
       if (!result?.ok) {
         setModelsBusyNodeId('');
         onToast(result?.message || 'Local AI Hub could not load models for that cloud provider.', 'error');
@@ -3252,6 +3619,101 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                     )}
                   </div>
                 ) : null}
+                {selectedNode.type === 'planningPacket' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      This node turns upstream script or transcript artifacts plus your planning context into a reusable Planning Packet. Connect source text when you have it, then fill in the goal, constraints, style, readiness notes, and desired output shape.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-schema">Planning schema</label>
+                      <select className="store-input mt-3" id="planning-schema" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, schemaId: event.target.value } }))} value={selectedNode.config?.schemaId || DEFAULT_PLANNING_SCHEMA_ID}>
+                        {PLANNING_SCHEMA_OPTIONS.map((schema) => <option key={schema.id} value={schema.id}>{schema.familyLabel ? schema.familyLabel + ' - ' + schema.label : schema.label}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-goal">Task goal</label>
+                      <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-goal" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, goal: event.target.value } }))} placeholder="Describe what the plan should accomplish." value={selectedNode.config?.goal || ''} />
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-source-summary">Manual source summary</label>
+                      <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-source-summary" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, sourceSummary: event.target.value } }))} placeholder="Optional fallback when your source is not connected as text." value={selectedNode.config?.sourceSummary || ''} />
+                    </div>
+                    <div className="grid gap-4 xl:grid-cols-2">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-constraints">Constraints</label>
+                        <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-constraints" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, constraintsText: event.target.value } }))} placeholder="One line per constraint." value={selectedNode.config?.constraintsText || ''} />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-style-policy">Style / policy context</label>
+                        <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-style-policy" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, stylePolicyText: event.target.value } }))} placeholder="One line per style or policy note." value={selectedNode.config?.stylePolicyText || ''} />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-tools">Available tools</label>
+                        <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-tools" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, availableToolsText: event.target.value } }))} placeholder="Optional list of downstream tools or surfaces." value={selectedNode.config?.availableToolsText || ''} />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-readiness">Readiness / hardware notes</label>
+                        <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-readiness" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, readinessNotesText: event.target.value } }))} placeholder="One line per readiness note." value={selectedNode.config?.readinessNotesText || ''} />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-output-notes">Desired output notes</label>
+                        <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-output-notes" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, desiredOutputNotes: event.target.value } }))} placeholder="What shape or emphasis should the plan have?" value={selectedNode.config?.desiredOutputNotes || ''} />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-risk-notes">Risk notes</label>
+                        <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-risk-notes" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, riskNotesText: event.target.value } }))} placeholder="One line per risk note." value={selectedNode.config?.riskNotesText || ''} />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-uncertainty">Uncertainty flags</label>
+                        <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planning-uncertainty" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, uncertaintyFlagsText: event.target.value } }))} placeholder="One line per open uncertainty." value={selectedNode.config?.uncertaintyFlagsText || ''} />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planning-context">Additional working notes</label>
+                      <textarea className="store-input mt-3 min-h-[140px] resize-none" id="planning-context" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, additionalContext: event.target.value } }))} placeholder="Optional extra context for the planner." value={selectedNode.config?.additionalContext || ''} />
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'planner' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      This node is the structured reasoning layer for planning. It consumes a Planning Packet, runs the selected model inside the chosen planning schema contract, and emits a typed Plan artifact.
+                    </div>
+                    <ModelTargetFields connectedProviders={connectedProviders} executionModeKey="executionMode" modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planner-schema">Planning schema</label>
+                      <select className="store-input mt-3" id="planner-schema" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, schemaId: event.target.value } }))} value={selectedNode.config?.schemaId || DEFAULT_PLANNING_SCHEMA_ID}>
+                        {PLANNING_SCHEMA_OPTIONS.map((schema) => <option key={schema.id} value={schema.id}>{schema.familyLabel ? schema.familyLabel + ' - ' + schema.label : schema.label}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planner-guidance">Planner guidance</label>
+                      <textarea className="store-input mt-3 min-h-[140px] resize-none" id="planner-guidance" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder="Optional extra guidance for how the planner should approach the packet." value={selectedNode.config?.instruction || ''} />
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="planner-system-prompt">System prompt</label>
+                      <textarea className="store-input mt-3 min-h-[120px] resize-none" id="planner-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional planner-specific system instruction." value={selectedNode.config?.systemPrompt || ''} />
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'preview' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      This node turns a typed Plan into a plainly reviewable Preview artifact. It compiles scene-by-scene preview cards and prompt drafts without pretending to be final generation output.
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'audit' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      This node turns a typed Plan into a bounded Audit artifact. It keeps schema validation explicit and adds a small set of honest heuristics such as repeated scene concepts, weak prompt specificity, and obvious constraint overlap. Connect a Preview when you want the audit to check preview coverage too.
+                    </div>
+                  </div>
+                ) : null}
+
                 {selectedNode.type === 'validation' ? (
                   <div className="space-y-4">
                     <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-mode">Validation mode</label><select className="store-input mt-3" id="validation-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, mode: event.target.value } }))} value={selectedNode.config?.mode || 'user'}><option value="user">User approval</option><option value="llm">LLM validator</option></select></div>
@@ -3485,6 +3947,12 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                 {selectedNode.type === 'collectionOutput' ? (
                   <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
                     This output writes an ordered collection folder with a manifest and keeps each item in order so you can inspect or reuse the result later.
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'planOutput' ? (
+                  <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                    This output writes the typed Plan artifact to a local JSON file so you can inspect the scene plan, reuse it downstream, or version it outside the builder.
                   </div>
                 ) : null}
 

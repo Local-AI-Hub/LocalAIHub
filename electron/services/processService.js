@@ -61,6 +61,38 @@ function clearRuntime(toolId, runtime = null) {
     runtimes.delete(toolId);
   }
 }
+function attachRuntimeLifecycle(runtimeState, runtimeOptions = {}) {
+  if (!runtimeState) {
+    return runtimeState;
+  }
+  runtimeState.onStopCleanup = typeof runtimeOptions.onStopCleanup === 'function'
+    ? runtimeOptions.onStopCleanup
+    : null;
+  runtimeState.onStopCleanupPromise = null;
+  return runtimeState;
+}
+async function runRuntimeStopCleanup(runtimeState) {
+  if (!runtimeState?.onStopCleanup) {
+    return;
+  }
+  if (!runtimeState.onStopCleanupPromise) {
+    runtimeState.onStopCleanupPromise = Promise.resolve()
+      .then(() => runtimeState.onStopCleanup())
+      .finally(() => {
+        runtimeState.onStopCleanup = null;
+      });
+  }
+  return runtimeState.onStopCleanupPromise;
+}
+async function logRuntimeStopCleanupFailure(runtimeState, context, error) {
+  if (!runtimeState?.logger || !error) {
+    return;
+  }
+  await runtimeState.logger.warn('Local AI Hub could not clean up a supporting runtime after the main tool stopped.', {
+    context,
+    error,
+  });
+}
 
 function emitRuntimeEvent(payload) {
   if (typeof runtimeEventSink !== 'function') {
@@ -1843,6 +1875,7 @@ async function stopRuntimeProcess(toolId, runtimeState, options = {}) {
   await killProcessTree(runtimeState.process.pid).catch(() => null);
   await waitForRuntimeExit(runtimeState).catch(() => false);
   clearRuntime(toolId, runtimeState);
+  await runRuntimeStopCleanup(runtimeState).catch((error) => logRuntimeStopCleanupFailure(runtimeState, 'internal-stop', error));
 }
 
 async function monitorPendingLaunch(toolState, runtimeState = null, options = {}) {
@@ -2115,6 +2148,7 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
         lastError: null,
         lastRepairMessage: null,
       });
+      await runRuntimeStopCleanup(runtimeState).catch((error) => logRuntimeStopCleanupFailure(runtimeState, 'clean-exit-before-ready', error));
       settleRuntimeStartupOutcome(runtimeState, {
         status: 'stopped',
       });
@@ -2167,6 +2201,7 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
         lastError: null,
         lastRepairMessage: null,
       });
+      await runRuntimeStopCleanup(runtimeState).catch((error) => logRuntimeStopCleanupFailure(runtimeState, 'clean-exit-before-ready', error));
       settleRuntimeStartupOutcome(runtimeState, {
         status: 'stopped',
       });
@@ -2254,6 +2289,7 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
       lastError: message,
       lastRepairMessage: null,
     });
+    await runRuntimeStopCleanup(runtimeState).catch((error) => logRuntimeStopCleanupFailure(runtimeState, 'unexpected-exit', error));
     settleRuntimeStartupOutcome(runtimeState, {
       status: 'error',
       recovered: false,
@@ -2344,6 +2380,7 @@ async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}
     exitHandled: false,
   });
 
+  attachRuntimeLifecycle(runtimeState, runtimeOptions);
   initializeRuntimeStartupOutcome(runtimeState);
   initializeRuntimeSessionTracking(toolState, runtimeState);
   return attachRuntimeHandlers(toolState, runtimeState, runtimeOptions);
@@ -2410,6 +2447,7 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
     exitHandled: false,
   });
 
+  attachRuntimeLifecycle(runtimeState, runtimeOptions);
   initializeRuntimeStartupOutcome(runtimeState);
   initializeRuntimeSessionTracking(toolState, runtimeState);
   return attachRuntimeHandlers(toolState, runtimeState, runtimeOptions);
@@ -2452,6 +2490,7 @@ async function launchBatchProfile(toolState, launchProfile, runtimeOptions = {})
     exitHandled: false,
   });
 
+  attachRuntimeLifecycle(runtimeState, runtimeOptions);
   initializeRuntimeStartupOutcome(runtimeState);
   initializeRuntimeSessionTracking(toolState, runtimeState);
   return attachRuntimeHandlers(toolState, runtimeState, runtimeOptions);
@@ -2695,6 +2734,11 @@ async function stopTool(toolState) {
       lastError: null,
       lastRepairMessage: null,
     });
+    try {
+      await runRuntimeStopCleanup(runtime);
+    } catch (error) {
+      throw new Error(humanizeError(error, toolState.name + ' stopped, but Local AI Hub could not shut down the supporting runtime it started for this session.'));
+    }
     return;
   }
 

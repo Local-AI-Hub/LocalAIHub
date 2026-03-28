@@ -5,6 +5,10 @@ const { pathToFileURL } = require('url');
 const { ensureStorage, getAppPaths } = require('./configService');
 const {
   buildFileArtifact,
+  createAuditArtifact,
+  createPlanArtifact,
+  createPlanningPacketArtifact,
+  createPreviewArtifact,
   createTextArtifact,
   serializeArtifactForUi,
   summarizeArtifact,
@@ -108,12 +112,69 @@ function attachTextFileDetails(artifact, filePath, stat, extension, transcriptio
   return artifact;
 }
 
+function attachJsonArtifactDetails(artifact, filePath, stat) {
+  artifact.destinationPath = filePath;
+  artifact.extension = '.json';
+  artifact.fileName = path.basename(filePath);
+  artifact.filePath = filePath;
+  artifact.fileUrl = pathToFileURL(filePath).toString();
+  artifact.formatLabel = artifact.formatLabel || 'JSON document';
+  artifact.mimeType = 'application/json';
+  artifact.sizeBytes = Number(stat?.size || 0) || 0;
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
+}
+
+async function buildDiscoveredTypedJsonArtifact(filePath, stat) {
+  const normalizedFilePath = normalizePath(filePath);
+  const normalizedLowerPath = normalizedFilePath.toLowerCase();
+  const payload = await readJsonIfExists(normalizedFilePath);
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  if (normalizedLowerPath.endsWith('.packet.json')) {
+    return attachJsonArtifactDetails(createPlanningPacketArtifact(payload, {
+      displayName: path.basename(normalizedFilePath),
+      role: 'output',
+    }), normalizedFilePath, stat);
+  }
+
+  if (normalizedLowerPath.endsWith('.plan.json')) {
+    return attachJsonArtifactDetails(createPlanArtifact(payload, {
+      displayName: path.basename(normalizedFilePath),
+      role: 'output',
+    }), normalizedFilePath, stat);
+  }
+
+  if (normalizedLowerPath.endsWith('.preview.json')) {
+    return attachJsonArtifactDetails(createPreviewArtifact(payload, {
+      displayName: path.basename(normalizedFilePath),
+      role: 'output',
+    }), normalizedFilePath, stat);
+  }
+
+  if (normalizedLowerPath.endsWith('.audit.json')) {
+    return attachJsonArtifactDetails(createAuditArtifact(payload, {
+      displayName: path.basename(normalizedFilePath),
+      role: 'output',
+    }), normalizedFilePath, stat);
+  }
+
+  return null;
+}
+
+
 async function buildDiscoveredFileArtifact(filePath) {
   const normalizedFilePath = normalizePath(filePath);
   const stat = await fs.stat(normalizedFilePath);
   const extension = path.extname(normalizedFilePath).toLowerCase();
   const basePath = path.join(path.dirname(normalizedFilePath), path.basename(normalizedFilePath, extension));
   const metadataPaths = [];
+  const typedJsonArtifact = await buildDiscoveredTypedJsonArtifact(normalizedFilePath, stat);
+  if (typedJsonArtifact) {
+    return typedJsonArtifact;
+  }
 
   if (TEXT_FILE_EXTENSIONS.has(extension)) {
     const text = await fs.readFile(normalizedFilePath, 'utf8').catch(() => '');
