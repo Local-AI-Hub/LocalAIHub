@@ -525,12 +525,8 @@ function buildNodePreview(node, runState) {
     return (schema?.label || 'Plan') + ' | ' + modeLabel + (node.config?.model ? ' | ' + node.config.model : '');
   }
 
-  if (node.type === 'preview') {
-    return 'Compiles scene-by-scene preview cards from the connected plan';
-  }
-
-  if (node.type === 'audit') {
-    return 'Runs schema grounding plus bounded review heuristics on the connected plan';
+  if (node.type === 'planScenes') {
+    return 'Builds an ordered text collection of scene prompt drafts from the connected Plan';
   }
 
   if (node.type === 'imageAnalyze') {
@@ -1276,6 +1272,10 @@ function formatValidationEvidenceMode(validation) {
     return 'Reviewed extracted image description';
   }
 
+  if (evidenceMode === 'structured-plan') {
+    return 'Reviewed structured Plan';
+  }
+
   if (evidenceMode === 'text-only') {
     return 'Reviewed plain text';
   }
@@ -1292,6 +1292,35 @@ function formatValidationConfidence(confidence) {
   return `${Math.round(Math.max(0, Math.min(1, numeric)) * 100)}% confidence`;
 }
 
+function PlanReviewEvidence({ planReview }) {
+  if (!planReview || typeof planReview !== 'object') {
+    return null;
+  }
+
+  const summary = planReview.summary && typeof planReview.summary === 'object' ? planReview.summary : {};
+  const findings = Array.isArray(planReview.findings) ? planReview.findings : [];
+  const visibleFindings = findings.slice(0, 5);
+  const totalFindingCount = Number(summary.errorCount || 0) + Number(summary.warningCount || 0) + Number(summary.infoCount || 0);
+
+  return (
+    <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-3 text-xs leading-5 text-slate-200">
+      <p className="uppercase tracking-[0.18em] text-slate-400">Plan review evidence</p>
+      <p className="mt-2 text-slate-300">{planReview.structuralValidation?.summary || (totalFindingCount ? `${totalFindingCount} bounded finding${totalFindingCount === 1 ? '' : 's'} recorded.` : 'No bounded findings recorded.')}</p>
+      {visibleFindings.length ? (
+        <div className="mt-2 space-y-2">
+          {visibleFindings.map((finding, index) => (
+            <div className={`rounded-xl border px-3 py-2 ${toneToClassName(finding.severity || 'info')}`} key={`${finding.title || 'finding'}-${index}`}>
+              <p className="font-medium text-white">{finding.title || 'Finding'}</p>
+              {finding.sceneLabel ? <p className="mt-1 uppercase tracking-[0.14em] text-slate-200/80">{finding.sceneLabel}</p> : null}
+              {finding.detail ? <p className="mt-1 text-slate-100">{finding.detail}</p> : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {findings.length > visibleFindings.length ? <p className="mt-2 text-slate-500">Showing {visibleFindings.length} of {findings.length} findings.</p> : null}
+    </div>
+  );
+}
 function ValidationResultSummary({ validation }) {
   if (!validation) {
     return null;
@@ -1319,6 +1348,7 @@ function ValidationResultSummary({ validation }) {
         </div>
       ) : null}
       {limitations ? <p className="mt-2 text-amber-200/90">{limitations}</p> : null}
+      <PlanReviewEvidence planReview={validation.planReview || validation.reviewContext?.planReview} />
     </div>
   );
 }
@@ -1535,6 +1565,7 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
       <div className="mt-4">
         <ArtifactPreview artifact={artifact} />
       </div>
+      <PlanReviewEvidence planReview={pendingValidation.planReview || pendingValidation.reviewContext?.planReview} />
       {artifactPath ? <input className="store-input mt-4" readOnly value={artifactPath} /> : null}
       <PathButtons onOpenPath={onOpenPath} onRevealPath={onRevealPath} path={artifactPath} />
       <label className="mt-4 block text-xs uppercase tracking-[0.18em] text-violet-100/80" htmlFor="validation-comment">
@@ -1687,7 +1718,7 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
               ))
             ) : (
               <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">
-                Final output cards appear here after the pipeline reaches an output node. Self-saved review artifacts like Preview and Audit still show up in the saved outputs panel below.
+                Final output cards appear here after the pipeline reaches an output node. Saved pipeline outputs still show up in the saved outputs panel below.
               </div>
             )}
           </div>
@@ -3698,19 +3729,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                   </div>
                 ) : null}
 
-                {selectedNode.type === 'preview' ? (
-                  <div className="space-y-4">
-                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      This node turns a typed Plan into a plainly reviewable Preview artifact. It compiles scene-by-scene preview cards and prompt drafts without pretending to be final generation output.
-                    </div>
-                  </div>
-                ) : null}
-
-                {selectedNode.type === 'audit' ? (
-                  <div className="space-y-4">
-                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      This node turns a typed Plan into a bounded Audit artifact. It keeps schema validation explicit and adds a small set of honest heuristics such as repeated scene concepts, weak prompt specificity, and obvious constraint overlap. Connect a Preview when you want the audit to check preview coverage too.
-                    </div>
+                {selectedNode.type === 'planScenes' ? (
+                  <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                    This node turns a structured Plan into an ordered text collection of scene prompt drafts. It is a small bridge from planning into existing collection and output flow.
                   </div>
                 ) : null}
 
@@ -4169,12 +4190,3 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     </section>
   );
 }
-
-
-
-
-
-
-
-
-

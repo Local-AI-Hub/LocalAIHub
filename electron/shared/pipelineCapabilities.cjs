@@ -3,6 +3,7 @@ const MODALITY_IMAGE = 'image';
 const MODALITY_AUDIO = 'audio';
 const MODALITY_VIDEO = 'video';
 const MODALITY_FILE = 'file';
+const MODALITY_PLAN = 'plan';
 
 const PIPELINE_OPERATION_IDS = Object.freeze({
   GRAPH_WORKFLOW: 'graphWorkflow',
@@ -86,8 +87,8 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
-        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE, MODALITY_PLAN]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_PLAN]),
         derivedInputKinds: Object.freeze([MODALITY_FILE]),
         notes: 'Image validation requires a vision-capable Ollama model. Document-style files are reviewed through extracted text and metadata.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
@@ -193,8 +194,8 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
-        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE, MODALITY_PLAN]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_PLAN]),
         derivedInputKinds: Object.freeze([MODALITY_FILE]),
         notes: 'Document-style files are reviewed through extracted text and metadata in the current OpenAI-compatible chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
@@ -225,8 +226,8 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
-        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE, MODALITY_PLAN]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE, MODALITY_PLAN]),
         notes: 'PDF documents can be attached directly. Other document-style files fall back to extracted text when needed.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
@@ -241,8 +242,8 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE]),
-        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE, MODALITY_PLAN]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE, MODALITY_PLAN]),
         notes: 'Gemini validation can review attached images, videos, and document-style files in the current provider path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
@@ -261,8 +262,8 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE]),
-        directInputKinds: Object.freeze([MODALITY_TEXT]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE, MODALITY_PLAN]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_PLAN]),
         derivedInputKinds: Object.freeze([MODALITY_FILE]),
         notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
@@ -277,8 +278,8 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE]),
-        directInputKinds: Object.freeze([MODALITY_TEXT]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE, MODALITY_PLAN]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_PLAN]),
         derivedInputKinds: Object.freeze([MODALITY_FILE]),
         notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
@@ -293,8 +294,8 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE]),
-        directInputKinds: Object.freeze([MODALITY_TEXT]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE, MODALITY_PLAN]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_PLAN]),
         derivedInputKinds: Object.freeze([MODALITY_FILE]),
         notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
@@ -309,8 +310,8 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE]),
-        directInputKinds: Object.freeze([MODALITY_TEXT]),
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_FILE, MODALITY_PLAN]),
+        directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_PLAN]),
         derivedInputKinds: Object.freeze([MODALITY_FILE]),
         notes: 'Document-style files are reviewed through extracted text and metadata in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
@@ -588,6 +589,7 @@ function getOperationDrivenToolIdsForPipelineOperation(operationId) {
 module.exports = {
   MODALITY_AUDIO,
   MODALITY_FILE,
+  MODALITY_PLAN,
   MODALITY_IMAGE,
   MODALITY_TEXT,
   MODALITY_VIDEO,
@@ -611,8 +613,3 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
-
-
-
-
-

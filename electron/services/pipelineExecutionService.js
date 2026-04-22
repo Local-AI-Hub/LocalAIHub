@@ -17,8 +17,6 @@ const {
   createCompositionArtifact,
   createPlanArtifact,
   createPlanningPacketArtifact,
-  createPreviewArtifact,
-  createAuditArtifact,
   createTextArtifact,
   describeArtifactForLlm,
   ensureRunDirectories,
@@ -33,8 +31,8 @@ const {
 } = require('./pipelineArtifactService');
 const {
   DEFAULT_PLANNING_SCHEMA_ID,
-  buildPlanAuditDocument,
-  buildPlanPreviewDocument,
+  buildPlanReviewDocument,
+  buildPlanTextCollectionItems,
   buildPlanningPacketDocument,
   buildPlannerPrompt,
   getPlanningSchemaDefinition,
@@ -61,8 +59,6 @@ const {
   PORT_KIND_IMAGE,
   PORT_KIND_PLANNING_PACKET,
   PORT_KIND_PLAN,
-  PORT_KIND_PREVIEW,
-  PORT_KIND_AUDIT,
   PORT_KIND_TEXT,
   PORT_KIND_VIDEO,
   analyzePipeline,
@@ -1230,6 +1226,8 @@ function getValidationEvidenceModeLabel(reviewContext = {}) {
       return 'The validator cannot open the raw file directly here, so Local AI Hub is sending extracted document text and metadata.';
     case 'derived-image-description':
       return 'The validator is relying on extracted image description and metadata instead of a direct image attachment.';
+    case 'structured-plan':
+      return 'The validator is reviewing a structured Plan artifact with Local AI Hub plan-review evidence.';
     case 'text-only':
       return 'The validator is reviewing plain text only.';
     default:
@@ -1410,7 +1408,165 @@ function parsePlannerReply(schemaId, replyText) {
   throw new Error('The planner reply was not valid JSON. Ask the model to return JSON only for this planner step.');
 }
 
-async function executePlanningPacketNode(node, graph, run, contextMaps) {
+function buildPlanValidationReview(artifact) {
+  if (!artifact || String(artifact.kind || '').trim() !== PORT_KIND_PLAN) {
+    return null;
+  }
+
+  try {
+    return buildPlanReviewDocument(artifact.plan || {}, {
+      sourcePacket: artifact.sourcePacket || null,
+    });
+  } catch (error) {
+    return {
+      findings: [{
+        approximate: false,
+        category: 'schema-validation',
+        detail: error?.message || 'Local AI Hub could not review this plan shape.',
+        heuristic: 'schema-validation',
+        sceneId: '',
+        sceneLabel: '',
+        severity: 'error',
+        title: 'Plan review could not run',
+      }],
+      heuristicsUsed: ['Planning schema validation'],
+      limitationNote: 'Local AI Hub could not complete the bounded plan review because the plan shape was not usable.',
+      planTitle: String(artifact.displayName || 'Plan').trim() || 'Plan',
+      reviewVersion: 1,
+      sceneCount: 0,
+      structuralValidation: {
+        errors: [error?.message || 'Local AI Hub could not review this plan shape.'],
+        ok: false,
+        summary: 'The plan does not match the current planning schema shape yet.',
+      },
+      summary: {
+        errorCount: 1,
+        infoCount: 0,
+        warningCount: 0,
+      },
+    };
+  }
+}
+
+function formatPlanReviewEvidence(planReview, maxFindings = 8) {
+  if (!planReview || typeof planReview !== 'object') {
+    return '';
+  }
+
+  const summary = planReview.summary && typeof planReview.summary === 'object' ? planReview.summary : {};
+  const findings = Array.isArray(planReview.findings) ? planReview.findings : [];
+  const lines = [
+    'Plan review summary: ' + [
+      Number(summary.errorCount || 0) ? Number(summary.errorCount || 0) + ' error(s)' : '',
+      Number(summary.warningCount || 0) ? Number(summary.warningCount || 0) + ' warning(s)' : '',
+      Number(summary.infoCount || 0) ? Number(summary.infoCount || 0) + ' note(s)' : '',
+    ].filter(Boolean).join(', ') || 'Plan review summary: no bounded findings.',
+    planReview.structuralValidation?.summary ? 'Structural check: ' + planReview.structuralValidation.summary : '',
+    planReview.limitationNote ? 'Review boundary: ' + planReview.limitationNote : '',
+    findings.length ? 'Findings:' : '',
+    ...findings.slice(0, maxFindings).map((finding, index) => {
+      const sceneLabel = finding?.sceneLabel ? ' [' + finding.sceneLabel + ']' : '';
+      const severity = String(finding?.severity || 'info').toUpperCase();
+      const detail = String(finding?.detail || '').trim();
+      return (index + 1) + '. ' + severity + sceneLabel + ': ' + (finding?.title || 'Finding') + (detail ? ' - ' + detail : '');
+    }),
+    findings.length > maxFindings ? '...and ' + (findings.length - maxFindings) + ' more finding(s).' : '',
+  ].filter(Boolean);
+
+  return lines.join('\n');
+}
+
+function attachPlanValidationResult(artifact, validationResult) {
+  if (!artifact || String(artifact.kind || '').trim() !== PORT_KIND_PLAN) {
+    return artifact;
+  }
+
+  const nextArtifact = serializeArtifactForUi(artifact);
+  nextArtifact.lastValidation = serializeArtifactForUi(validationResult);
+  nextArtifact.summary = summarizeArtifact(nextArtifact);
+  return nextArtifact;
+}
+
+function getRetryCorrectionArtifactsForNode(nodeId, graph, run) {
+  const loopNodeIds = graph?.retryLoopNodeIdsByTargetNodeId?.get?.(nodeId) || [];
+  const artifacts = [];
+  for (const loopNodeId of loopNodeIds) {
+    const loopState = run?.loopStates?.[loopNodeId] || null;
+    if (!loopState || Number(loopState.attempt || 1) <= 1 || !loopState.carriedArtifact) {
+      continue;
+    }
+
+    artifacts.push(loopState.carriedArtifact);
+  }
+
+  return artifacts;
+}
+
+function buildPlannerRevisionGuidance(correctionArtifacts = []) {
+  const failedPlans = (Array.isArray(correctionArtifacts) ? correctionArtifacts : [])
+    .filter((artifact) => artifact && String(artifact.kind || '').trim() === PORT_KIND_PLAN);
+  if (!failedPlans.length) {
+    return '';
+  }
+
+  const sections = failedPlans.slice(-2).map((artifact, index) => {
+    const validation = artifact.lastValidation && typeof artifact.lastValidation === 'object' ? artifact.lastValidation : null;
+    const planReview = validation?.planReview || buildPlanValidationReview(artifact);
+    return [
+      'Failed plan review ' + (index + 1) + ':',
+      validation?.summary || validation?.reason ? 'Validation reason: ' + (validation.summary || validation.reason) : '',
+      formatPlanReviewEvidence(planReview, 6),
+    ].filter(Boolean).join('\n');
+  });
+
+  return [
+    'Revise the plan because a downstream validation step routed the previous Plan to Retry.',
+    'Keep the same planning schema and source grounding, but address the review evidence below before returning JSON.',
+    ...sections,
+  ].join('\n\n');
+}
+
+function executePlanScenesNode(node, graph, run) {
+  const planArtifact = getNodeInputArtifact(node.id, 'plan', graph, run.resultsByNodeId, run);
+  if (!planArtifact || String(planArtifact.kind || '').trim() !== PORT_KIND_PLAN) {
+    throw new Error('This Plan Scenes step needs a structured Plan input before it can run.');
+  }
+
+  const textItems = buildPlanTextCollectionItems(planArtifact.plan || {}, {
+    sourcePlan: planArtifact,
+  });
+  if (!textItems.length) {
+    throw new Error('This Plan does not contain any text items to export.');
+  }
+
+  const sceneArtifacts = textItems.map((item, index) => createTextArtifact(item.text || '', {
+    displayName: item.displayName || 'Plan item ' + String(index + 1),
+    role: 'generated',
+  }));
+  const collection = createArtifactCollection(sceneArtifacts.map((artifact, index) => ({
+    artifact,
+    lineage: {
+      sourceNodeId: node.id,
+      sourceNodeLabel: node.label,
+      sourcePortId: 'collection',
+      sourceRunCount: run.nodeStates?.[node.id]?.runCount || 1,
+    },
+    itemId: textItems[index]?.itemId || '',
+  })), {
+    displayName: node.label,
+    itemKind: PORT_KIND_TEXT,
+    role: 'generated',
+  });
+
+  return {
+    message: 'Plan Scenes built an ordered text collection with ' + textItems.length + ' item' + (textItems.length === 1 ? '' : 's') + '.',
+    outputs: {
+      collection,
+    },
+    preview: summarizeArtifact(collection),
+  };
+}
+function executePlanningPacketNode(node, graph, run, contextMaps) {
   const sourceArtifacts = getNodeInputArtifacts(node.id, 'source', graph, run.resultsByNodeId, run)
     .map((entry) => entry?.artifact || null)
     .filter(Boolean);
@@ -1464,8 +1620,10 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
 
   const schemaId = String(node.config?.schemaId || packetValidation.value.schemaId || packetValidation.value?.desiredOutput?.schemaId || DEFAULT_PLANNING_SCHEMA_ID).trim() || DEFAULT_PLANNING_SCHEMA_ID;
   const schema = getPlanningSchemaDefinition(schemaId);
+  const plannerRevisionGuidance = buildPlannerRevisionGuidance(getRetryCorrectionArtifactsForNode(node.id, graph, run));
+  const plannerGuidance = [node.config?.instruction, plannerRevisionGuidance].map((entry) => String(entry || '').trim()).filter(Boolean).join('\n\n');
   const plannerPrompt = buildPlannerPrompt(schemaId, packetValidation.value, {
-    guidance: node.config?.instruction,
+    guidance: plannerGuidance,
     systemPrompt: node.config?.systemPrompt,
   });
   const messages = [];
@@ -1547,78 +1705,6 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       plan: planArtifact,
     },
     preview: summarizeArtifact(planArtifact),
-  };
-}
-
-async function executePreviewNode(node, graph, run) {
-  const planArtifact = getNodeInputArtifact(node.id, 'plan', graph, run.resultsByNodeId, run);
-  if (!planArtifact || String(planArtifact.kind || '').trim() !== PORT_KIND_PLAN) {
-    throw new Error('This Preview step needs a structured Plan input before it can run.');
-  }
-
-  const previewDocument = buildPlanPreviewDocument(planArtifact.plan || {}, {
-    sourcePacket: planArtifact.sourcePacket || null,
-  });
-  const previewArtifact = createPreviewArtifact(previewDocument, {
-    displayName: node.label,
-    role: 'generated',
-    sourcePacket: planArtifact.sourcePacket || null,
-    sourcePlan: planArtifact.plan || null,
-  });
-  const savedArtifact = await copyArtifactToOutput(previewArtifact, run.directories, {
-    title: String(node.label || 'Preview').trim() || 'Preview',
-  });
-  const sceneCount = Number(savedArtifact.sceneCount || previewDocument.sceneCount || 0) || 0;
-  const destinationPath = savedArtifact.destinationPath || savedArtifact.filePath || '';
-
-  return {
-    destinationPath,
-    message: 'Preview prepared ' + sceneCount + ' scene' + (sceneCount === 1 ? '' : 's') + ' for review before later generation work.',
-    outputs: {
-      preview: savedArtifact,
-    },
-    preview: summarizeArtifact(savedArtifact),
-  };
-}
-
-async function executeAuditNode(node, graph, run) {
-  const planArtifact = getNodeInputArtifact(node.id, 'plan', graph, run.resultsByNodeId, run);
-  if (!planArtifact || String(planArtifact.kind || '').trim() !== PORT_KIND_PLAN) {
-    throw new Error('This Audit step needs a structured Plan input before it can run.');
-  }
-
-  const previewArtifact = getNodeInputArtifact(node.id, 'preview', graph, run.resultsByNodeId, run);
-  if (previewArtifact && String(previewArtifact.kind || '').trim() !== PORT_KIND_PREVIEW) {
-    throw new Error('This Audit step can only accept a typed Preview artifact on its Preview input.');
-  }
-
-  const auditDocument = buildPlanAuditDocument(planArtifact.plan || {}, {
-    preview: previewArtifact?.preview || null,
-    sourcePacket: planArtifact.sourcePacket || null,
-  });
-  const auditArtifact = createAuditArtifact(auditDocument, {
-    displayName: node.label,
-    role: 'generated',
-    sourcePacket: planArtifact.sourcePacket || null,
-    sourcePlan: planArtifact.plan || null,
-    sourcePreview: previewArtifact?.preview || null,
-  });
-  const savedArtifact = await copyArtifactToOutput(auditArtifact, run.directories, {
-    title: String(node.label || 'Audit').trim() || 'Audit',
-  });
-  const destinationPath = savedArtifact.destinationPath || savedArtifact.filePath || '';
-  const summary = auditDocument.summary || {};
-  const findingCount = Number(summary.errorCount || 0) + Number(summary.warningCount || 0) + Number(summary.infoCount || 0);
-
-  return {
-    destinationPath,
-    message: findingCount
-      ? 'Audit reviewed the plan and surfaced ' + findingCount + ' bounded finding' + (findingCount === 1 ? '' : 's') + '.'
-      : 'Audit reviewed the plan and found no structural or heuristic findings in this pass.',
-    outputs: {
-      audit: savedArtifact,
-    },
-    preview: summarizeArtifact(savedArtifact),
   };
 }
 
@@ -1829,7 +1915,8 @@ async function buildValidationMessages(node, artifact, contextMaps) {
   const profile = getValidationCapabilityProfile(node);
   const attachments = [];
   const limitations = [];
-  let evidenceMode = artifact?.kind === PORT_KIND_TEXT ? 'text-only' : 'summary-only';
+  const planReview = buildPlanValidationReview(artifact);
+  let evidenceMode = artifact?.kind === PORT_KIND_TEXT ? 'text-only' : artifact?.kind === PORT_KIND_PLAN ? 'structured-plan' : 'summary-only';
 
   if (artifact?.kind === PORT_KIND_IMAGE) {
     if (profile.directKinds.includes(PORT_KIND_IMAGE) && artifact.filePath) {
@@ -1869,6 +1956,7 @@ async function buildValidationMessages(node, artifact, contextMaps) {
     directKinds: profile.directKinds,
     evidenceMode,
     limitations,
+    planReview: planReview ? serializeArtifactForUi(planReview) : null,
   };
 
   const messages = [];
@@ -2122,6 +2210,12 @@ async function getSelectedLocalImageToolOrThrow(contextMaps, node, actionLabel) 
 
 async function buildValidationArtifactDescription(artifact, contextMaps) {
   let description = await describeArtifactForLlm(artifact);
+  if (artifact?.kind === PORT_KIND_PLAN) {
+    const planReviewEvidence = formatPlanReviewEvidence(buildPlanValidationReview(artifact));
+    if (planReviewEvidence) {
+      description += '\n\nLocal AI Hub plan-review evidence:\n' + planReviewEvidence;
+    }
+  }
 
   if (artifact?.kind === PORT_KIND_IMAGE && artifact.isAnimated) {
     description = `${description}\n\nThis image is animated rather than a single still frame.`;
@@ -2165,6 +2259,7 @@ async function waitForUserValidation(run, node, artifact) {
   }
 
   const nodeState = run.nodeStates[node.id];
+  const planReview = buildPlanValidationReview(artifact);
   const iteration = Number(nodeState?.iteration || 1);
   const loopMaxAttempts = Number(nodeState?.loopMaxAttempts || 0) || null;
   const loopPathLabel = String(nodeState?.loopPathLabel || '').trim();
@@ -2177,6 +2272,13 @@ async function waitForUserValidation(run, node, artifact) {
     loopPathLabel,
     mode: 'user',
     nodeId: node.id,
+    planReview: planReview ? serializeArtifactForUi(planReview) : null,
+    reviewContext: {
+      artifactKind: String(artifact?.kind || '').trim(),
+      evidenceMode: planReview ? 'structured-plan' : 'user-review',
+      limitations: [],
+      planReview: planReview ? serializeArtifactForUi(planReview) : null,
+    },
     nodeLabel: node.label,
     requestId: createUniqueId('validation'),
     requestedAt: new Date().toISOString(),
@@ -2224,21 +2326,32 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
   }
 
   if (node.config?.mode !== 'llm') {
+    const planReview = buildPlanValidationReview(artifact);
     const decision = await waitForUserValidation(run, node, artifact);
     const selectedBranch = decision?.decision === 'pass' ? 'pass' : 'fail';
     const reason = decision?.comment ? `User note: ${decision.comment}` : `User selected ${selectedBranch}.`;
+    const validationResult = {
+      decision: selectedBranch,
+      evidenceMode: planReview ? 'structured-plan' : 'user-review',
+      mode: 'user',
+      planReview: planReview ? serializeArtifactForUi(planReview) : null,
+      reason,
+      reviewContext: {
+        artifactKind: String(artifact?.kind || '').trim(),
+        evidenceMode: planReview ? 'structured-plan' : 'user-review',
+        limitations: [],
+        planReview: planReview ? serializeArtifactForUi(planReview) : null,
+      },
+      summary: reason,
+    };
     return {
       message: `Validation routed this item to ${selectedBranch}.`,
       outputs: {
-        [selectedBranch]: artifact,
+        [selectedBranch]: attachPlanValidationResult(artifact, validationResult),
       },
       preview: trimPreviewText(reason),
       selectedBranch,
-      validation: {
-        decision: selectedBranch,
-        mode: 'user',
-        reason,
-      },
+      validation: validationResult,
     };
   }
 
@@ -2290,25 +2403,27 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
   const selectedBranch = parsed.decision === 'pass' ? 'pass' : 'fail';
   const reason = parsed.reason || `Validator selected ${selectedBranch}.`;
   const evidenceLimitations = parsed.evidenceLimitations || (reviewContext.limitations || []).join(' ');
+  const validationResult = {
+    confidence: parsed.confidence,
+    criteriaResults: parsed.criteriaResults,
+    decision: selectedBranch,
+    evidenceLimitations,
+    evidenceMode: parsed.evidenceMode || reviewContext.evidenceMode,
+    mode: 'llm',
+    planReview: reviewContext.planReview || null,
+    rawReply: reply,
+    reason,
+    reviewContext,
+    summary: parsed.summary || '',
+  };
   return {
     message: `Validator routed this item to ${selectedBranch}.`,
     outputs: {
-      [selectedBranch]: artifact,
+      [selectedBranch]: attachPlanValidationResult(artifact, validationResult),
     },
     preview: buildValidationPreview(parsed, reviewContext),
     selectedBranch,
-    validation: {
-      confidence: parsed.confidence,
-      criteriaResults: parsed.criteriaResults,
-      decision: selectedBranch,
-      evidenceLimitations,
-      evidenceMode: parsed.evidenceMode || reviewContext.evidenceMode,
-      mode: 'llm',
-      rawReply: reply,
-      reason,
-      reviewContext,
-      summary: parsed.summary || '',
-    },
+    validation: validationResult,
   };
 }
 
@@ -2959,12 +3074,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     return executePlannerNode(node, graph, run, contextMaps, reportProgress);
   }
 
-  if (node.type === 'preview') {
-    return executePreviewNode(node, graph, run);
-  }
-
-  if (node.type === 'audit') {
-    return executeAuditNode(node, graph, run);
+  if (node.type === 'planScenes') {
+    return executePlanScenesNode(node, graph, run);
   }
 
   if (node.type === 'llmPrompt') {

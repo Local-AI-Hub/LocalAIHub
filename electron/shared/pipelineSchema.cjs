@@ -54,12 +54,14 @@ const COLLECTION_ITEM_PORT_KINDS = Object.freeze([
   PORT_KIND_VIDEO,
   PORT_KIND_FILE,
 ]);
+const VALIDATION_INPUT_PORT_KINDS = Object.freeze([
+  ...COLLECTION_ITEM_PORT_KINDS,
+  PORT_KIND_PLAN,
+]);
 const SUPPORTED_PORT_KINDS = Object.freeze([
   ...COLLECTION_ITEM_PORT_KINDS,
   PORT_KIND_PLANNING_PACKET,
   PORT_KIND_PLAN,
-  PORT_KIND_PREVIEW,
-  PORT_KIND_AUDIT,
   PORT_KIND_COMPOSITION,
 ]);
 const PIPELINE_PORT_KIND_LABELS = Object.freeze({
@@ -373,11 +375,11 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     schemaOptions: getPlanningSchemaOptions(),
   }),
-  preview: Object.freeze({
-    type: 'preview',
-    label: 'Preview',
+  planScenes: Object.freeze({
+    type: 'planScenes',
+    label: 'Plan Scenes',
     category: 'Planning',
-    description: 'Compiles a typed review preview from the connected Plan so you can inspect scene cards and prompt drafts before later generation work.',
+    description: 'Turns a structured Plan into an ordered text collection of scene prompt drafts for downstream output or later generation work.',
     inputPorts: [
       {
         id: 'plan',
@@ -388,40 +390,12 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     outputPorts: [
       {
-        id: 'preview',
-        kind: PORT_KIND_PREVIEW,
-        label: 'Preview',
+        id: 'collection',
+        kind: PORT_KIND_TEXT,
+        collectionBehavior: 'only',
+        label: 'Scene Text Collection',
       },
     ],
-    persistsOutput: true,
-    configDefaults: {},
-  }),
-  audit: Object.freeze({
-    type: 'audit',
-    label: 'Audit',
-    category: 'Planning',
-    description: 'Builds a typed review audit from the connected Plan and optional Preview using schema grounding plus modest bounded heuristics.',
-    inputPorts: [
-      {
-        id: 'plan',
-        kind: PORT_KIND_PLAN,
-        label: 'Plan',
-        required: true,
-      },
-      {
-        id: 'preview',
-        kind: PORT_KIND_PREVIEW,
-        label: 'Preview',
-      },
-    ],
-    outputPorts: [
-      {
-        id: 'audit',
-        kind: PORT_KIND_AUDIT,
-        label: 'Audit',
-      },
-    ],
-    persistsOutput: true,
     configDefaults: {},
   }),
   whisperTranscribe: Object.freeze({
@@ -560,7 +534,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       {
         id: 'input',
         kind: PORT_KIND_ANY,
-        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        allowedKinds: VALIDATION_INPUT_PORT_KINDS,
         collectionBehavior: 'allow',
         label: 'Input',
         required: true,
@@ -2092,6 +2066,10 @@ function getValidationReadyMessage(targetLabel, capabilitySummary, connectedKind
   const kinds = uniqueKindList(connectedKinds);
   if (kinds.includes(PORT_KIND_VIDEO)) {
     return targetLabel + ' will review the connected video and return a pass or fail decision.';
+  }
+
+  if (kinds.includes(PORT_KIND_PLAN)) {
+    return targetLabel + ' will review the structured plan and return a pass or fail decision.';
   }
 
   if (kinds.includes(PORT_KIND_FILE)) {
@@ -3909,37 +3887,18 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
-      if (node.type === 'preview') {
+      if (node.type === 'planScenes') {
         const planKinds = getIncomingKindsForNodePort(node, 'plan', graph);
         if (!planKinds.includes(normalizePortKind(PORT_KIND_PLAN))) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect a structured Plan before running this preview step.',
+            message: 'Connect a structured Plan before building scene text.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else {
           summary.readiness = {
             tone: 'info',
-            message: 'This step compiles reviewable scene preview cards from the connected Plan without pretending to be final generation output.',
-          };
-        }
-      }
-
-      if (node.type === 'audit') {
-        const planKinds = getIncomingKindsForNodePort(node, 'plan', graph);
-        const previewKinds = getIncomingKindsForNodePort(node, 'preview', graph);
-        if (!planKinds.includes(normalizePortKind(PORT_KIND_PLAN))) {
-          summary.readiness = {
-            tone: 'error',
-            message: 'Connect a structured Plan before running this audit step.',
-          };
-          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else {
-          summary.readiness = {
-            tone: 'info',
-            message: previewKinds.includes(normalizePortKind(PORT_KIND_PREVIEW))
-              ? 'This audit will combine plan-shape validation, bounded heuristics, and preview coverage checks.'
-              : 'This audit will use plan-shape validation plus bounded heuristics. Connect a Preview when you want the audit to check review coverage too.',
+            message: 'This step will turn the connected Plan into an ordered text collection of scene prompt drafts.',
           };
         }
       }
@@ -3949,6 +3908,9 @@ function analyzePipeline(definition = {}, context = {}) {
         const passCount = outgoingEdges.filter((edge) => edge.source.portId === 'pass').length;
         const failCount = outgoingEdges.filter((edge) => edge.source.portId === 'fail').length;
         const connectedKinds = getIncomingKindsForNodePort(node, 'input', graph);
+        const validationRequiresExplicitModel = node.config?.llmExecutionMode === 'cloud'
+          ? doesProviderOperationRequireExplicitModel(String(node.config?.providerId || '').trim(), PIPELINE_OPERATION_IDS.VALIDATION_LLM)
+          : true;
         if (passCount === 0 || failCount === 0) {
           summary.readiness = {
             tone: 'error',
@@ -3976,7 +3938,7 @@ function analyzePipeline(definition = {}, context = {}) {
                 message: 'Describe the pass and fail rules for this validation step.',
               };
               issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-            } else if (requiresExplicitModel && !String(node.config?.model || '').trim()) {
+            } else if (validationRequiresExplicitModel && !String(node.config?.model || '').trim()) {
               summary.readiness = {
                 tone: 'error',
                 message: 'Choose or enter a model for this validator.',
