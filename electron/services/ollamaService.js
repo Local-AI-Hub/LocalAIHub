@@ -1,15 +1,82 @@
+const { spawn } = require('child_process');
+const fs = require('fs');
 const { createLogger } = require('./logService');
 const { buildOllamaAllocationFailureMessage, isOllamaAllocationFailureMessage } = require('./ollamaFailureService');
-const { launchToolFromUserAction, stopTool } = require('./processService');
+const { isToolActive, launchToolFromUserAction, stopTool } = require('./processService');
 const { getResolvedToolState } = require('./toolStateService');
 
 const LIST_REQUEST_TIMEOUT_MS = 15000;
 const MODEL_INSPECT_TIMEOUT_MS = 15000;
 const CHAT_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+const OLLAMA_READY_TIMEOUT_MS = 90 * 1000;
+const OLLAMA_READY_PROBE_TIMEOUT_MS = 3000;
+const OLLAMA_READY_POLL_INTERVAL_MS = 1000;
 
 function getBaseUrl(toolState) {
   const launchUrl = toolState?.launchUrl || `http://127.0.0.1:${toolState?.defaultPort || 11434}`;
   return String(launchUrl).replace(/\/$/, '');
+}
+
+function getOllamaServeToolState(toolState) {
+  if (String(toolState?.id || '').trim().toLowerCase() !== 'ollama') {
+    return toolState;
+  }
+  const launchProfile = toolState?.launchProfile && typeof toolState.launchProfile === 'object' ? toolState.launchProfile : null;
+  if (launchProfile?.kind !== 'binary') {
+    return toolState;
+  }
+  const args = Array.isArray(launchProfile.args) ? launchProfile.args.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+  if (args.some((entry) => entry.toLowerCase() === 'serve')) {
+    return toolState;
+  }
+  return {
+    ...toolState,
+    launchProfile: {
+      ...launchProfile,
+      args: ['serve', ...args],
+    },
+  };
+}
+
+function getOllamaExecutablePath(toolState = {}) {
+  const launchProfile = toolState.launchProfile && typeof toolState.launchProfile === 'object' ? toolState.launchProfile : null;
+  return String(
+    launchProfile?.executable
+      || toolState.executablePath
+      || toolState.externalExecutablePath
+      || toolState.detectedPath
+      || '',
+  ).trim();
+}
+
+function startOllamaServeProcess(toolState = {}) {
+  const executable = getOllamaExecutablePath(toolState);
+  if (!executable || !fs.existsSync(executable)) {
+    throw new Error('Local AI Hub could not find the Ollama executable needed to start the local model API.');
+  }
+  const launchProfile = toolState.launchProfile && typeof toolState.launchProfile === 'object' ? toolState.launchProfile : null;
+  const child = spawn(executable, ['serve'], {
+    cwd: launchProfile?.workingDir || toolState.appDir || toolState.installDir || undefined,
+    env: {
+      ...process.env,
+      ...(launchProfile?.env && typeof launchProfile.env === 'object' && !Array.isArray(launchProfile.env) ? launchProfile.env : {}),
+    },
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.on('error', () => {});
+  return child;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function getPositiveNumber(value, fallback) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) && numericValue > 0 ? numericValue : fallback;
 }
 
 function buildOllamaUnavailableMessage(toolState, options = {}) {
@@ -18,7 +85,9 @@ function buildOllamaUnavailableMessage(toolState, options = {}) {
   const actionLabel = String(options.actionLabel || '').trim();
   const followUp = options.autoStartAttempted
     ? ` Local AI Hub tried to start ${toolName} for you, but the API on ${baseUrl} is still not ready.`
-    : ` Start ${toolName} from Library and try again.`;
+    : options.alreadyActive
+      ? ` ${toolName} appears to be running, but the API on ${baseUrl} is not ready. Restart ${toolName} from Library and try again.`
+      : ` Start ${toolName} from Library and try again.`;
 
   if (actionLabel) {
     return `${toolName} is not answering on ${baseUrl} yet, so Local AI Hub cannot ${actionLabel}.${followUp}`;
@@ -30,33 +99,125 @@ function buildOllamaUnavailableMessage(toolState, options = {}) {
 async function prepareOllamaSession(toolState, options = {}) {
   const latestTool = toolState?.id ? await getResolvedToolState(toolState.id, { syncDiscovered: false }) : null;
   const resolvedTool = latestTool || toolState;
-  if (String(resolvedTool?.status || '').toLowerCase() === 'running' || !options.autoStart) {
+  if (!options.autoStart) {
     return {
+      alreadyActive: false,
       autoStarted: false,
+      launchAttempted: false,
       startedByLocalAIHub: false,
       tool: resolvedTool,
     };
   }
 
-  const startedTool = await launchToolFromUserAction(resolvedTool, {
+  const apiAlreadyReady = await probeOllamaReady(resolvedTool, { timeoutMs: 1000 });
+  if (apiAlreadyReady) {
+    return {
+      alreadyActive: true,
+      autoStarted: false,
+      launchAttempted: false,
+      startedByLocalAIHub: false,
+      tool: resolvedTool,
+    };
+  }
+
+  const wasAlreadyActive = await isToolActive(resolvedTool).catch(() => false);
+  if (String(resolvedTool?.id || '').trim().toLowerCase() === 'ollama') {
+    const serveProcess = startOllamaServeProcess(resolvedTool);
+    return {
+      alreadyActive: wasAlreadyActive,
+      autoStarted: true,
+      launchAttempted: true,
+      serveProcess,
+      startedByLocalAIHub: true,
+      tool: resolvedTool,
+    };
+  }
+
+  const launchTool = getOllamaServeToolState(resolvedTool);
+  const startedTool = await launchToolFromUserAction(launchTool, {
     launchContext: options.launchContext || 'background-task',
     skipOpenInterface: true,
   });
   return {
+    alreadyActive: wasAlreadyActive,
     autoStarted: true,
+    launchAttempted: true,
     startedByLocalAIHub: true,
     tool: startedTool,
   };
 }
 
 async function finishOllamaSession(session) {
-  if (!session?.startedByLocalAIHub || !session.tool) {
+  if (!session?.startedByLocalAIHub) {
     return;
   }
 
+  if (session.serveProcess && !session.serveProcess.killed) {
+    session.serveProcess.kill();
+    return;
+  }
+
+  if (!session.tool) {
+    return;
+  }
   await stopTool(session.tool).catch(() => null);
 }
 
+async function probeOllamaReady(toolState, options = {}) {
+  const baseUrl = getBaseUrl(toolState);
+  const endpoint = options.endpoint || '/api/tags';
+  const timeoutMs = getPositiveNumber(options.timeoutMs, OLLAMA_READY_PROBE_TIMEOUT_MS);
+  const fetchImpl = typeof options.fetch === 'function' ? options.fetch : fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetchImpl(new URL(endpoint, `${baseUrl}/`).toString(), {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    return Boolean(response?.ok);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function waitForOllamaReady(toolState, options = {}) {
+  const baseUrl = getBaseUrl(toolState);
+  const timeoutMs = getPositiveNumber(options.timeoutMs, OLLAMA_READY_TIMEOUT_MS);
+  const intervalMs = getPositiveNumber(options.intervalMs, OLLAMA_READY_POLL_INTERVAL_MS);
+  const probeTimeoutMs = getPositiveNumber(options.probeTimeoutMs, OLLAMA_READY_PROBE_TIMEOUT_MS);
+  const sleepImpl = typeof options.sleep === 'function' ? options.sleep : sleep;
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    const ready = await probeOllamaReady(toolState, {
+      endpoint: options.endpoint || '/api/tags',
+      fetch: options.fetch,
+      timeoutMs: probeTimeoutMs,
+    });
+    if (ready) {
+      return {
+        baseUrl,
+        ready: true,
+      };
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error(buildOllamaUnavailableMessage(toolState, {
+        actionLabel: options.actionLabel,
+        alreadyActive: Boolean(options.alreadyActive),
+        autoStartAttempted: Boolean(options.autoStartAttempted),
+        baseUrl,
+      }));
+    }
+
+    await sleepImpl(Math.min(intervalMs, remainingMs));
+  }
+}
 async function requestOllama(toolState, endpoint, options = {}) {
   const baseUrl = getBaseUrl(toolState);
   const logger = createLogger('ollama', {
@@ -68,7 +229,8 @@ async function requestOllama(toolState, endpoint, options = {}) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(new URL(endpoint, `${baseUrl}/`).toString(), {
+    const fetchImpl = typeof options.fetch === 'function' ? options.fetch : fetch;
+    const response = await fetchImpl(new URL(endpoint, `${baseUrl}/`).toString(), {
       method: options.method || 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -133,7 +295,7 @@ async function requestOllama(toolState, endpoint, options = {}) {
       baseUrl,
     });
 
-    throw new Error(buildOllamaUnavailableMessage(toolState, { baseUrl }));
+    throw new Error(options.unavailableMessage || buildOllamaUnavailableMessage(toolState, { baseUrl }));
   } finally {
     clearTimeout(timer);
   }
@@ -335,16 +497,27 @@ async function chatWithOllama(toolState, payload = {}) {
     throw new Error('Type a message before sending it to Ollama.');
   }
 
+  const requestBody = {
+    model,
+    messages,
+    stream: false,
+  };
+  if (payload.format) {
+    requestBody.format = payload.format;
+  }
+  if (payload.options && typeof payload.options === 'object' && !Array.isArray(payload.options)) {
+    requestBody.options = payload.options;
+  }
+
+  const baseUrl = getBaseUrl(toolState);
   const response = await requestOllama(toolState, '/api/chat', {
     method: 'POST',
-    body: JSON.stringify({
-      model,
-      messages,
-      stream: false,
-    }),
+    body: JSON.stringify(requestBody),
+    fetch: payload.fetch,
     modelName: model,
-    timeoutMessage: (toolState?.name || 'Ollama') + ' is taking too long to answer. If this PC is struggling with ' + model + ', try a smaller model or give it more time to finish loading.',
-    timeoutMs: CHAT_REQUEST_TIMEOUT_MS,
+    timeoutMessage: payload.timeoutMessage || (toolState?.name || 'Ollama') + ' is taking too long to answer. If this PC is struggling with ' + model + ', try a smaller model or give it more time to finish loading.',
+    timeoutMs: Number(payload.timeoutMs || 0) > 0 ? Number(payload.timeoutMs) : CHAT_REQUEST_TIMEOUT_MS,
+    unavailableMessage: (toolState?.name || 'Ollama') + ' could not complete the chat request on ' + baseUrl + '. If Ollama is still open, the selected model may have crashed or stopped responding while loading. Try a smaller model or restart Ollama and try again.',
   });
 
   const content = response.payload?.message?.content || response.payload?.response || '';
@@ -371,4 +544,5 @@ module.exports = {
   inspectOllamaModelCapabilities,
   listOllamaModels,
   prepareOllamaSession,
+  waitForOllamaReady,
 };

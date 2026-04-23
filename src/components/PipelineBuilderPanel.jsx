@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
+import pipelineWizardShared from '../../electron/shared/pipelineWizard.cjs';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
   GRAPH_WORKFLOW_TOOL_IDS,
@@ -18,6 +19,13 @@ import {
   summarizePreview,
   toneToClassName,
 } from '../lib/pipeline-ui';
+
+const {
+  buildPipelineWizardContext,
+  buildPipelineWizardDraft,
+  buildPipelineWizardMessages,
+  parsePipelineWizardPlan,
+} = pipelineWizardShared;
 
 const {
   arePortsCompatible,
@@ -741,6 +749,108 @@ function buildOllamaModelDetail(model) {
   return detailParts.join(' | ');
 }
 
+function estimateModelSizeMb(model) {
+  const size = Number(model?.size || model?.sizeBytes || 0);
+  return Number.isFinite(size) && size > 0 ? Math.round(size / 1024 / 1024) : 0;
+}
+
+function getLocalWizardModelSuitability(model, hardware = {}) {
+  const modelId = String(model?.id || model?.name || '').toLowerCase();
+  const sizeMb = estimateModelSizeMb(model);
+  const vramMb = Number(hardware?.vramMb || 0) || 0;
+  const systemRamMb = Number(hardware?.systemRamMb || 0) || 0;
+  if (/cloud/.test(modelId)) {
+    return {
+      label: 'Cloud via Ollama',
+      message: 'This Ollama entry appears to require remote/cloud access. Prefer a downloaded local model for the local wizard.',
+      score: -50,
+      tone: 'warn',
+    };
+  }
+  if (sizeMb > 0 && sizeMb < 900) {
+    return {
+      label: 'Fast but weak',
+      message: 'This very small model may refresh quickly, but it may under-plan complex pipeline drafts. Best for simple drafts only.',
+      score: 25,
+      tone: 'warn',
+    };
+  }
+  if (vramMb > 0 && sizeMb > Math.max(2800, vramMb * 0.5)) {
+    return {
+      label: 'May be slow here',
+      message: 'This model is large for the detected VRAM once context memory is included, so local wizard drafting may be slow or fail on this PC.',
+      score: 45,
+      tone: 'warn',
+    };
+  }
+  if (systemRamMb > 0 && sizeMb > systemRamMb * 0.55) {
+    return {
+      label: 'Memory-heavy',
+      message: 'This model is large relative to detected system RAM. It may work, but drafts can be slow.',
+      score: 40,
+      tone: 'warn',
+    };
+  }
+  if (sizeMb >= 1200) {
+    return {
+      label: 'Good for simple local drafts',
+      message: 'This downloaded model is a reasonable local choice for simple or moderate drafts on this PC. Complex multi-stage workflows may still need a stronger or cloud wizard model and can fall back to a simple placeholder.',
+      score: 100 - Math.max(0, Math.round((sizeMb - 4500) / 300)),
+      tone: 'info',
+    };
+  }
+  return {
+    label: 'Usable for simple drafts',
+    message: 'This model can be used for local wizard drafts, but a 1.5B-8B downloaded model is usually more reliable.',
+    score: 60,
+    tone: 'info',
+  };
+}
+
+function rankLocalWizardModelOptions(models = [], hardware = {}) {
+  return [...models]
+    .map((model) => {
+      const suitability = getLocalWizardModelSuitability(model, hardware);
+      const detailParts = [model.detail, suitability.label].filter(Boolean);
+      return {
+        ...model,
+        detail: detailParts.join(' | '),
+        wizardSuitability: suitability,
+      };
+    })
+    .sort((left, right) => Number(right.wizardSuitability?.score || 0) - Number(left.wizardSuitability?.score || 0));
+}
+
+function inferWizardRequestComplexity(intent = '') {
+  const text = String(intent || '').toLowerCase();
+  const signals = [
+    /\b(plan|planning|planner|storyboard|scene|scenes|shot list)\b/,
+    /\b(validat\w*|review|approve|approval|quality|qa)\b/,
+    /\b(retry|regenerat\w*|revise|loop|on fail|until valid|until approved)\b/,
+    /\b(prompt|prompts|per[-\s]?scene|scene prompt)\b/,
+    /\b(image|images|visual|frame|thumbnail|illustration)\b/,
+    /\b(video|sequence|sequencing|compose|composition|export|render|clip|movie)\b/,
+    /\b(collection|batch|accumulat\w*)\b/,
+  ].filter((pattern) => pattern.test(text)).length;
+  const complex = signals >= 4 || /multi[-\s]?stage|pipeline.*validat|validat.*retry|retry.*validat/.test(text);
+  return { complex, signals };
+}
+
+function getLocalWizardModelGuidance(modelOption, intent = '') {
+  const suitability = modelOption?.wizardSuitability;
+  if (!suitability) {
+    return '';
+  }
+  const complexity = inferWizardRequestComplexity(intent);
+  if (!complexity.complex) {
+    return suitability.message;
+  }
+  if (suitability.tone === 'warn') {
+    return suitability.message + ' For this complex multi-stage request, a cloud wizard model or a stronger downloaded local model is more likely to produce a meaningful draft; local mode may insert a simple placeholder if the model cannot complete.';
+  }
+  return suitability.message + ' For this complex multi-stage request, treat local drafting as best effort on this hardware; a cloud wizard model is more likely to compose the full workflow without falling back to a placeholder.';
+}
+
 function collectOllamaModelCapabilities(modelOptionsByNodeId) {
   const modelCapabilitiesByName = {};
 
@@ -795,6 +905,36 @@ function collectLocalToolModelsByToolId(modelOptionsByNodeId) {
   return localModelsByToolId;
 }
 
+function getAssistantReplyText(result) {
+  const message = result?.data?.message || null;
+  if (typeof message?.content === 'string') {
+    return message.content;
+  }
+
+  if (Array.isArray(message?.content)) {
+    return message.content.map((part) => part?.text || '').join('\n').trim();
+  }
+
+  return String(result?.data?.content || result?.data?.text || '').trim();
+}
+
+function getWizardTargetLabel(target, providers = []) {
+  if (target.mode === 'ollama') {
+    return target.model ? `Ollama | ${target.model}` : 'Ollama';
+  }
+
+  const provider = providers.find((entry) => entry.id === target.providerId);
+  return [provider?.name || target.providerId || 'Cloud provider', target.model].filter(Boolean).join(' | ');
+}
+
+function buildWizardModelOption(model) {
+  return {
+    ...model,
+    id: String(model?.id || model?.name || '').trim(),
+    label: String(model?.label || model?.name || model?.id || '').trim(),
+    detail: buildModelOptionDetail(model) || model?.detail || '',
+  };
+}
 function formatGraphWorkflowNodeLabel(entry) {
   const nodeId = String(entry?.id || '').trim();
   const classType = String(entry?.classType || '').trim();
@@ -2056,6 +2196,14 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const [outputsLoading, setOutputsLoading] = useState(false);
   const [outputsBusyPath, setOutputsBusyPath] = useState('');
   const [pipelineOutputsExpanded, setPipelineOutputsExpanded] = useState(false);
+  const [wizardExecutionMode, setWizardExecutionMode] = useState('cloud');
+  const [wizardProviderId, setWizardProviderId] = useState('');
+  const [wizardModel, setWizardModel] = useState('');
+  const [wizardModelOptions, setWizardModelOptions] = useState([]);
+  const [wizardModelsBusy, setWizardModelsBusy] = useState(false);
+  const [wizardIntent, setWizardIntent] = useState('');
+  const [wizardBusy, setWizardBusy] = useState(false);
+  const [wizardSummary, setWizardSummary] = useState(null);
   const canvasRef = useRef(null);
   const dragRef = useRef(null);
   const notifiedRunStateRef = useRef('');
@@ -2097,6 +2245,19 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     [draft.nodes, graph, selectedNode],
   );
   const connectedProviders = useMemo(() => (providers || []).filter((provider) => provider.isConnected), [providers]);
+  const wizardContext = useMemo(
+    () => buildPipelineWizardContext({ hardware, manifests, providers, tools: pipelineTools }),
+    [hardware, manifests, pipelineTools, providers],
+  );
+  const wizardTarget = useMemo(() => ({
+    mode: wizardExecutionMode === 'ollama' ? 'ollama' : 'cloud',
+    providerId: wizardExecutionMode === 'cloud' ? wizardProviderId : '',
+    model: wizardModel,
+  }), [wizardExecutionMode, wizardModel, wizardProviderId]);
+  const selectedWizardModelOption = useMemo(
+    () => wizardModelOptions.find((model) => model.id === wizardModel) || null,
+    [wizardModel, wizardModelOptions],
+  );
   const audioTools = useMemo(() => (tools || []).filter((tool) => AUDIO_WORKFLOW_TOOL_IDS.includes(tool.id) && !AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const audioTransformTools = useMemo(() => (tools || []).filter((tool) => AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const imageTools = useMemo(() => (tools || []).filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
@@ -2445,6 +2606,25 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     outputRefreshKeyRef.current = refreshKey;
     loadPipelineOutputs({ silent: true });
   }, [runState?.runId, runState?.status]);
+
+  useEffect(() => {
+    if (wizardExecutionMode !== 'cloud') {
+      return;
+    }
+
+    if (!connectedProviders.length) {
+      if (wizardProviderId) {
+        setWizardProviderId('');
+      }
+      return;
+    }
+
+    if (!wizardProviderId || !connectedProviders.some((provider) => provider.id === wizardProviderId)) {
+      setWizardProviderId(connectedProviders[0].id);
+      setWizardModel('');
+      setWizardModelOptions([]);
+    }
+  }, [connectedProviders, wizardExecutionMode, wizardProviderId]);
 
   useEffect(() => {
     setValidationComment('');
@@ -2895,6 +3075,193 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
     setModelsBusyNodeId('');
   }
+  async function refreshWizardModels() {
+    setWizardModelsBusy(true);
+    setWizardSummary(null);
+    let result = null;
+    if (wizardExecutionMode === 'ollama') {
+      result = await window.localAIHub.listOllamaModels({ includeCapabilities: true, autoStart: true, launchContext: 'pipeline-wizard-model-refresh' });
+      if (!result?.ok) {
+        setWizardModelsBusy(false);
+        onToast(result?.message || 'Local AI Hub could not load Ollama models for the wizard.', 'error');
+        return;
+      }
+
+      const models = rankLocalWizardModelOptions((result.data?.models || []).map((model) => buildWizardModelOption({
+        id: model.name,
+        label: model.name,
+        detail: buildOllamaModelDetail(model),
+        size: model.size,
+        capabilityLabels: Array.isArray(model.capabilityLabels) ? model.capabilityLabels : [],
+        capabilitySource: model.capabilitySource || '',
+        supportsImageInput: typeof model.supportsImageInput === 'boolean' ? model.supportsImageInput : undefined,
+      })).filter((model) => model.id), hardware);
+      setWizardModelOptions(models);
+      if ((!wizardModel || !models.some((model) => model.id === wizardModel)) && models[0]?.id) {
+        setWizardModel(models[0].id);
+      }
+      if (result.data?.stoppedAfterUse) {
+        onToast('Local AI Hub started Ollama to inspect local models, then stopped it again.', 'info');
+      }
+      setWizardModelsBusy(false);
+      return;
+    }
+
+    if (!wizardProviderId) {
+      setWizardModelsBusy(false);
+      onToast('Choose a connected cloud provider for the pipeline wizard first.', 'error');
+      return;
+    }
+
+    result = await window.localAIHub.listProviderModels({ providerId: wizardProviderId, operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT });
+    if (!result?.ok) {
+      setWizardModelsBusy(false);
+      onToast(result?.message || 'Local AI Hub could not load wizard models for that provider.', 'error');
+      return;
+    }
+
+    const models = (result.data?.models || []).map((model) => buildWizardModelOption(model)).filter((model) => model.id);
+    setWizardModelOptions(models);
+    if (!wizardModel && (result.data?.selectedModel || models[0]?.id)) {
+      setWizardModel(result.data?.selectedModel || models[0].id);
+    }
+    setWizardModelsBusy(false);
+  }
+
+  async function handleGenerateWizardDraft() {
+    const normalizedIntent = String(wizardIntent || '').trim();
+    if (!normalizedIntent) {
+      onToast('Describe the workflow you want the wizard to draft first.', 'error');
+      return;
+    }
+
+    if (wizardExecutionMode === 'cloud' && !wizardProviderId) {
+      onToast('Choose a connected cloud provider for the wizard first.', 'error');
+      return;
+    }
+
+    if (!String(wizardModel || '').trim()) {
+      onToast('Choose a model for the wizard first.', 'error');
+      return;
+    }
+
+    if (dirty) {
+      const confirmed = window.confirm('Replace the current unsaved draft with a wizard-generated pipeline?');
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    setWizardBusy(true);
+    setWizardSummary(null);
+    const messages = buildPipelineWizardMessages({
+      context: wizardContext,
+      intent: normalizedIntent,
+      wizardTarget,
+    });
+    const targetLabel = getWizardTargetLabel(wizardTarget, connectedProviders);
+    const result = wizardExecutionMode === 'ollama'
+      ? await window.localAIHub.chatWithOllama({
+          messages,
+          model: wizardModel,
+          timeoutMessage: 'Ollama took too long to draft the pipeline. Local AI Hub will keep this failure bounded; for complex workflows on this hardware, try a simpler request, a stronger downloaded model, or a cloud wizard model.',
+          timeoutMs: 300000,
+          format: 'json',
+          options: { temperature: 0.1, num_predict: 700, num_ctx: 2048 },
+          autoStart: true,
+          launchContext: 'pipeline-wizard-draft',
+        })
+      : await window.localAIHub.chatWithProvider({
+          messages,
+          model: wizardModel,
+          providerId: wizardProviderId,
+          timeoutMessage: targetLabel + ' took too long to draft the pipeline. Try again with a shorter workflow request.',
+          timeoutMs: 90000,
+        });
+
+    if (!result?.ok) {
+      const message = result?.message || 'Local AI Hub could not ask that model to draft a pipeline.';
+      const localTimedOut = wizardExecutionMode === 'ollama' && /took too long|timed out|timeout|empty reply|memory|allocat/i.test(message);
+      if (localTimedOut) {
+        const fallbackPlan = parsePipelineWizardPlan('', { intent: normalizedIntent });
+        const fallbackDraft = buildPipelineWizardDraft({
+          context: wizardContext,
+          intent: normalizedIntent,
+          modelPlan: fallbackPlan,
+          wizardTarget,
+        });
+        replaceDraft(fallbackDraft.pipeline, {
+          dirty: true,
+          selectedNodeId: fallbackDraft.pipeline.nodes[0]?.id || '',
+        });
+        setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
+        setWizardBusy(false);
+        const recoveredSummary = fallbackDraft.summary?.resultState === 'placeholder'
+          ? {
+              ...fallbackDraft.summary,
+              message: 'The selected local wizard model did not return a usable plan. ' + fallbackDraft.summary.message,
+              gaps: [...new Set([...(fallbackDraft.summary?.gaps || []), 'The selected local wizard model did not return a usable plan.', 'This placeholder may be much shallower than the workflow you requested.'])],
+              manualRefinementNotes: [...new Set([...(fallbackDraft.summary?.manualRefinementNotes || []), 'Treat this as a starting placeholder, not a completed wizard plan. Use a stronger downloaded local model or cloud wizard model for complex multi-stage drafting.'])],
+            }
+          : {
+              ...fallbackDraft.summary,
+              headline: fallbackDraft.summary?.resultState === 'repaired'
+                ? 'Recovered draft created after model failure'
+                : fallbackDraft.summary.headline,
+              message: 'The selected local wizard model did not return a usable plan. ' + fallbackDraft.summary.message,
+              gaps: [...new Set([...(fallbackDraft.summary?.gaps || []), 'The selected local wizard model did not return a usable plan.'])],
+              manualRefinementNotes: [...new Set([...(fallbackDraft.summary?.manualRefinementNotes || []), 'Review this recovered draft carefully before running. Local AI Hub rebuilt it from the request after the local model failed.'])],
+            };
+        setWizardSummary(recoveredSummary);
+        onToast(
+          recoveredSummary.resultState === 'placeholder'
+            ? 'Local model did not produce a usable plan; inserted a simple fallback placeholder.'
+            : 'Local model did not produce a usable plan; Local AI Hub recovered an editable draft from built-in rules.',
+          'info',
+        );
+        return;
+      }
+      setWizardBusy(false);
+      setWizardSummary({
+        recipeId: '',
+        recipeLabel: 'Wizard model error',
+        targetLabel,
+        headline: 'Wizard draft was not created',
+        message,
+        gaps: ['No draft pipeline was inserted. Fix the local model issue and try again.'],
+        manualRefinementNotes: [],
+        graphErrorCount: 1,
+        graphWarningCount: 0,
+      });
+      onToast(message, 'error');
+      return;
+    }
+
+    const replyText = getAssistantReplyText(result);
+    const modelPlan = parsePipelineWizardPlan(replyText, { intent: normalizedIntent });
+    const draftResult = buildPipelineWizardDraft({
+      context: wizardContext,
+      intent: normalizedIntent,
+      modelPlan,
+      wizardTarget,
+    });
+
+    replaceDraft(draftResult.pipeline, {
+      dirty: true,
+      selectedNodeId: draftResult.pipeline.nodes[0]?.id || '',
+    });
+    setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
+    setWizardSummary(draftResult.summary);
+    setWizardBusy(false);
+
+    const needsAttention = draftResult.summary?.graphErrorCount > 0 || draftResult.analysis?.primaryIssue?.tone === 'error';
+    onToast(
+      needsAttention
+        ? 'The wizard created an editable draft, but it still needs attention before running.'
+        : 'The wizard created an editable draft pipeline.',
+      needsAttention ? 'info' : 'success',
+    );
+  }
   async function chooseNodeFile(nodeId, kind) {
     const result = await window.localAIHub.pickPipelineFile({ kind });
     if (!result?.ok) {
@@ -3074,6 +3441,146 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                 {analysis.issues.slice(0, 5).map((issue, index) => (
                   <div key={`${issue.message}-${index}`} className={`rounded-2xl border px-3 py-2 text-sm ${toneToClassName(issue.tone)}`}>{issue.message}</div>
                 ))}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+      <div className="panel p-5">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline wizard</p>
+            <p className="mt-2 text-lg font-semibold text-white">Draft from plain English</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">Grounded recipes</span>
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">Editable graph</span>
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-4 xl:grid-cols-[0.9fr,1.2fr]">
+          <div className="space-y-4 rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+            <div>
+              <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-mode">Wizard target</label>
+              <select
+                className="store-input mt-3"
+                id="pipeline-wizard-mode"
+                onChange={(event) => {
+                  setWizardExecutionMode(event.target.value === 'ollama' ? 'ollama' : 'cloud');
+                  setWizardModel('');
+                  setWizardModelOptions([]);
+                  setWizardSummary(null);
+                }}
+                value={wizardExecutionMode}
+              >
+                <option value="cloud">Cloud provider</option>
+                <option value="ollama">Ollama (local)</option>
+              </select>
+            </div>
+
+            {wizardExecutionMode === 'cloud' ? (
+              <div>
+                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-provider">Provider</label>
+                <select
+                  className="store-input mt-3"
+                  id="pipeline-wizard-provider"
+                  onChange={(event) => {
+                    setWizardProviderId(event.target.value);
+                    setWizardModel('');
+                    setWizardModelOptions([]);
+                    setWizardSummary(null);
+                  }}
+                  value={wizardProviderId}
+                >
+                  <option value="">Choose a connected provider</option>
+                  {connectedProviders.map((provider) => (
+                    <option key={provider.id} value={provider.id}>{provider.name}</option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
+
+            <div>
+              <div className="flex items-center justify-between gap-3">
+                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-model">Model</label>
+                <button className="ghost-button px-3 py-1.5 text-xs" disabled={wizardModelsBusy} onClick={refreshWizardModels} type="button">
+                  {wizardModelsBusy ? 'Loading...' : 'Refresh'}
+                </button>
+              </div>
+              <input
+                className="store-input mt-3"
+                id="pipeline-wizard-model"
+                list="pipeline-wizard-model-options"
+                onChange={(event) => setWizardModel(event.target.value)}
+                placeholder={wizardExecutionMode === 'ollama' ? 'Choose an Ollama model' : 'Choose a provider model'}
+                value={wizardModel}
+              />
+              <datalist id="pipeline-wizard-model-options">
+                {wizardModelOptions.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+              </datalist>
+              {wizardModelOptions.length ? (
+                <div className="mt-3 max-h-36 space-y-2 overflow-auto pr-1">
+                  {wizardModelOptions.slice(0, 8).map((model) => (
+                    <button
+                      className="w-full rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-left text-xs transition hover:border-cyan-300/25 hover:bg-white/10"
+                      key={model.id}
+                      onClick={() => setWizardModel(model.id)}
+                      type="button"
+                    >
+                      <span className="font-medium text-white">{model.label || model.id}</span>
+                      {model.detail ? <span className="ml-2 text-slate-400">{model.detail}</span> : null}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              {wizardExecutionMode === 'ollama' && selectedWizardModelOption?.wizardSuitability ? (
+                <p className={`mt-3 text-xs leading-5 ${selectedWizardModelOption.wizardSuitability.tone === 'warn' ? 'text-amber-200' : 'text-slate-300'}`}>
+                  {getLocalWizardModelGuidance(selectedWizardModelOption, wizardIntent)}
+                </p>
+              ) : wizardExecutionMode === 'ollama' ? (
+                <p className="mt-3 text-xs leading-5 text-slate-400">Refresh to rank downloaded Ollama models for local wizard drafting on this PC.</p>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="space-y-4 rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+            <div>
+              <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-intent">Workflow request</label>
+              <textarea
+                className="store-input mt-3 min-h-[152px] resize-none"
+                id="pipeline-wizard-intent"
+                onChange={(event) => {
+                  setWizardIntent(event.target.value);
+                  setWizardSummary(null);
+                }}
+                placeholder="Example: turn a product description into a short image generation pipeline with a final image output."
+                value={wizardIntent}
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <button className="primary-button" disabled={wizardBusy} onClick={handleGenerateWizardDraft} type="button">
+                {wizardBusy ? 'Drafting...' : 'Generate draft'}
+              </button>
+              <span className="text-xs leading-5 text-slate-400">{getWizardTargetLabel(wizardTarget, connectedProviders)}</span>
+            </div>
+            {wizardSummary ? (
+              <div className={`rounded-[24px] border p-4 ${toneToClassName(wizardSummary.resultState === 'placeholder' || wizardSummary.graphErrorCount ? 'warn' : 'info')}`}>
+                <p className="text-sm font-semibold text-white">{wizardSummary.headline}</p>
+                <p className="mt-2 text-sm leading-6 text-slate-100">{wizardSummary.message}</p>
+                <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.16em] text-slate-200">
+                  <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{wizardSummary.recipeLabel}</span>
+                  {wizardSummary.targetLabel ? <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{wizardSummary.targetLabel}</span> : null}
+                </div>
+                {wizardSummary.gaps?.length ? (
+                  <div className="mt-3 space-y-1 text-xs leading-5 text-slate-200">
+                    {wizardSummary.gaps.slice(0, 3).map((gap) => <p key={gap}>{gap}</p>)}
+                  </div>
+                ) : null}
+                {wizardSummary.manualRefinementNotes?.length ? (
+                  <div className="mt-3 space-y-1 text-xs leading-5 text-slate-300">
+                    {wizardSummary.manualRefinementNotes.slice(0, 3).map((note) => <p key={note}>{note}</p>)}
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>

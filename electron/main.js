@@ -48,7 +48,7 @@ const {
   uninstallTool,
   updateToolInstallation,
 } = require('./services/installerService');
-const { listOllamaModels, chatWithOllama, finishOllamaSession, prepareOllamaSession } = require('./services/ollamaService');
+const { buildOllamaUnavailableMessage, listOllamaModels, chatWithOllama, finishOllamaSession, prepareOllamaSession, waitForOllamaReady } = require('./services/ollamaService');
 const { buildAiderLaunchConfiguration, inspectAiderProject, listAiderLaunchModels } = require('./services/aiderService');
 const {
   disposeAllRuntimes,
@@ -109,6 +109,7 @@ let liveResourceCache = {
   value: null,
 };
 let fatalAppErrorHandled = false;
+let appStartupComplete = false;
 
 function toError(value) {
   if (value instanceof Error) {
@@ -164,6 +165,16 @@ function reportFatalAppError(error, context = {}) {
 
   isQuitting = true;
   app.exit(1);
+}
+
+function reportPostStartupUnhandledRejection(reason, context = {}) {
+  const normalizedError = toError(reason);
+  const diagnosticPath = writeDiagnosticLog('main-process-unhandled-rejection', normalizedError, context);
+  try {
+    console.error('[Local AI Hub] Main-process promise rejection after startup:', normalizedError, diagnosticPath || '');
+  } catch {
+    return;
+  }
 }
 
 function normalizeCloseBehavior(value) {
@@ -1513,7 +1524,7 @@ function registerIpcHandlers() {
       const requestOptions = options || {};
       const state = await buildAppState();
       const tool = toolLookup('ollama', state.tools);
-      if (requestOptions.preferLocalLibrary && String(tool?.status || '').trim().toLowerCase() !== 'running') {
+      if (requestOptions.preferLocalLibrary && !requestOptions.autoStart && String(tool?.status || '').trim().toLowerCase() !== 'running') {
         const localModels = await listDownloadedModels(tool);
         return {
           baseUrl: '',
@@ -1526,7 +1537,34 @@ function registerIpcHandlers() {
         };
       }
 
-      return listOllamaModels(tool, requestOptions);
+      let session = null;
+      try {
+        if (requestOptions.autoStart) {
+          session = await prepareOllamaSession(tool, {
+            autoStart: true,
+            launchContext: requestOptions.launchContext || 'model-list-refresh',
+          });
+        }
+        const activeTool = session?.tool || tool;
+        if (requestOptions.autoStart) {
+          await waitForOllamaReady(activeTool, {
+            actionLabel: 'refresh local models',
+            alreadyActive: Boolean(session?.alreadyActive),
+            autoStartAttempted: Boolean(session?.autoStarted || session?.launchAttempted),
+            timeoutMs: requestOptions.readinessTimeoutMs,
+          });
+        }
+        const result = await listOllamaModels(activeTool, requestOptions);
+        return {
+          ...result,
+          autoStarted: Boolean(session?.autoStarted),
+          stoppedAfterUse: Boolean(session?.startedByLocalAIHub),
+        };
+      } catch (error) {
+        throw error;
+      } finally {
+        await finishOllamaSession(session);
+      }
     }, 'Local AI Hub could not load your local Ollama models.'),
   );
 
@@ -1534,7 +1572,35 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = toolLookup('ollama', state.tools);
-      return chatWithOllama(tool, payload);
+      let session = null;
+      try {
+        if (payload?.autoStart) {
+          session = await prepareOllamaSession(tool, {
+            autoStart: true,
+            launchContext: payload.launchContext || 'ollama-chat',
+          });
+        }
+        const activeTool = session?.tool || tool;
+        if (payload?.autoStart) {
+          await waitForOllamaReady(activeTool, {
+            actionLabel: 'run the wizard model',
+            alreadyActive: Boolean(session?.alreadyActive),
+            autoStartAttempted: Boolean(session?.autoStarted || session?.launchAttempted),
+            timeoutMs: payload.readinessTimeoutMs,
+          });
+        }
+        return await chatWithOllama(activeTool, payload);
+      } catch (error) {
+        if (payload?.autoStart && !session) {
+          throw new Error(buildOllamaUnavailableMessage(tool, {
+            actionLabel: 'run the wizard model',
+            autoStartAttempted: true,
+          }));
+        }
+        throw error;
+      } finally {
+        await finishOllamaSession(session);
+      }
     }, 'Local AI Hub could not send that message to Ollama.'),
   );
 
@@ -1703,6 +1769,7 @@ async function startApplication() {
       .catch(() => null);
   }, TOOL_UPDATE_CHECK_INTERVAL_MS);
   broadcastWindowActivity(true);
+  appStartupComplete = true;
 }
 
 process.on('uncaughtException', (error) => {
@@ -1712,7 +1779,14 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason) => {
-  reportFatalAppError(toError(reason), {
+  if (!appStartupComplete) {
+    reportFatalAppError(toError(reason), {
+      phase: 'unhandledRejection',
+    });
+    return;
+  }
+
+  reportPostStartupUnhandledRejection(reason, {
     phase: 'unhandledRejection',
   });
 });
