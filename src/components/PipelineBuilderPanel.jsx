@@ -51,7 +51,40 @@ const {
 } = pipelineShared;
 const CANVAS_MIN_WIDTH = 1280;
 const CANVAS_MIN_HEIGHT = 820;
+const CANVAS_MIN_SCALE = 0.55;
+const CANVAS_MAX_SCALE = 1.85;
+const CANVAS_ZOOM_STEP = 0.14;
+const CANVAS_PADDING_X = 360;
+const CANVAS_PADDING_Y = 280;
+const PIPELINE_SECTION_VISIBILITY_STORAGE_KEY = 'local-ai-hub.pipeline-builder.section-visibility.v1';
+const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
+  canvas: true,
+  inspector: true,
+  nodePalette: true,
+  pipelineWizard: true,
+  runStatus: true,
+  savedPipelines: true,
+});
 const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ? getPlanningSchemaOptions() : [];
+
+function clampValue(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
+function normalizePipelineSectionVisibility(value) {
+  const normalized = { ...DEFAULT_PIPELINE_SECTION_VISIBILITY };
+  if (!value || typeof value !== 'object') {
+    return normalized;
+  }
+
+  for (const key of Object.keys(normalized)) {
+    if (typeof value[key] === 'boolean') {
+      normalized[key] = value[key];
+    }
+  }
+
+  return normalized;
+}
 
 function getPlanningSchemaOptionById(schemaId) {
   const normalizedSchemaId = String(schemaId || '').trim();
@@ -1412,8 +1445,16 @@ function formatValidationEvidenceMode(validation) {
     return 'Reviewed extracted image description';
   }
 
+  if (evidenceMode === 'structured-collection') {
+    return 'Reviewed whole collection';
+  }
+
   if (evidenceMode === 'structured-plan') {
     return 'Reviewed structured Plan';
+  }
+
+  if (evidenceMode === 'whole-collection-review') {
+    return 'User reviewed whole collection';
   }
 
   if (evidenceMode === 'text-only') {
@@ -1631,7 +1672,7 @@ function PipelineOutputsPanel({ busyPath, expanded, loading, onDelete, onOpenPat
     </div>
   );
 }
-function SavedPipelineRow({ active, pipeline, onClick }) {
+function SavedPipelineRow({ active, hasPendingMetadataChanges = false, pipeline, onClick }) {
   return (
     <button
       className={`w-full rounded-[24px] border px-4 py-4 text-left transition ${
@@ -1642,9 +1683,12 @@ function SavedPipelineRow({ active, pipeline, onClick }) {
     >
       <div className="flex items-center justify-between gap-3">
         <p className="text-sm font-semibold text-white">{pipeline.name}</p>
-        <span className="rounded-full border border-white/10 bg-slate-950/40 px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-400">
-          {pipeline.nodeCount} node{pipeline.nodeCount === 1 ? '' : 's'}
-        </span>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {active && hasPendingMetadataChanges ? <span className="rounded-full border border-amber-300/30 bg-amber-300/12 px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] text-amber-100">Unsaved metadata</span> : null}
+          <span className="rounded-full border border-white/10 bg-slate-950/40 px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-400">
+            {pipeline.nodeCount} node{pipeline.nodeCount === 1 ? '' : 's'}
+          </span>
+        </div>
       </div>
       <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-400">{pipeline.description || 'No description yet.'}</p>
       <p className="mt-3 text-[11px] uppercase tracking-[0.2em] text-slate-500">Updated {formatDateLabel(pipeline.updatedAt)}</p>
@@ -1700,7 +1744,7 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
           </span>
         </div>
       </div>
-      <p className="mt-3 text-sm leading-6 text-violet-50/90">Review the received artifact below. If a preview is available, Local AI Hub shows it here before you choose pass or fail.</p>
+      <p className="mt-3 text-sm leading-6 text-violet-50/90">{artifact?.kind === 'collection' ? 'Review the received collection as a whole below. Local AI Hub shows the ordered collection preview before you choose pass or fail.' : 'Review the received artifact below. If a preview is available, Local AI Hub shows it here before you choose pass or fail.'}</p>
       <ArtifactFacts artifact={artifact} className="mt-4" />
       <div className="mt-4">
         <ArtifactPreview artifact={artifact} />
@@ -2196,6 +2240,20 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const [outputsLoading, setOutputsLoading] = useState(false);
   const [outputsBusyPath, setOutputsBusyPath] = useState('');
   const [pipelineOutputsExpanded, setPipelineOutputsExpanded] = useState(false);
+  const [sectionVisibility, setSectionVisibility] = useState(() => {
+    if (typeof window === 'undefined') {
+      return DEFAULT_PIPELINE_SECTION_VISIBILITY;
+    }
+
+    try {
+      const storedValue = window.localStorage.getItem(PIPELINE_SECTION_VISIBILITY_STORAGE_KEY);
+      return normalizePipelineSectionVisibility(storedValue ? JSON.parse(storedValue) : null);
+    } catch {
+      return DEFAULT_PIPELINE_SECTION_VISIBILITY;
+    }
+  });
+  const [canvasZoom, setCanvasZoom] = useState(1);
+  const [canvasPanning, setCanvasPanning] = useState(false);
   const [wizardExecutionMode, setWizardExecutionMode] = useState('cloud');
   const [wizardProviderId, setWizardProviderId] = useState('');
   const [wizardModel, setWizardModel] = useState('');
@@ -2328,12 +2386,65 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     [selectedGraphWorkflowDefinition],
   );
   const currentPipelineSaved = useMemo(() => pipelines.some((pipeline) => pipeline.id === draft.id), [pipelines, draft.id]);
+  const activeSavedPipeline = useMemo(() => pipelines.find((pipeline) => pipeline.id === draft.id) || null, [pipelines, draft.id]);
+  const pipelineMetadataDirty = useMemo(() => {
+    if (!activeSavedPipeline) {
+      return false;
+    }
+
+    return String(activeSavedPipeline.name || '').trim() !== String(draft.name || '').trim()
+      || String(activeSavedPipeline.description || '').trim() !== String(draft.description || '').trim();
+  }, [activeSavedPipeline, draft.description, draft.name]);
+  const visibleSavedPipelines = useMemo(
+    () => pipelines.map((pipeline) => (
+      pipeline.id === draft.id
+        ? {
+            ...pipeline,
+            description: pipelineMetadataDirty ? draft.description : pipeline.description,
+            name: pipelineMetadataDirty ? draft.name : pipeline.name,
+          }
+        : pipeline
+    )),
+    [draft.description, draft.id, draft.name, pipelineMetadataDirty, pipelines],
+  );
   const currentNodeSummary = selectedNode ? analysis.nodeSummaries?.[selectedNode.id] || null : null;
   const canvasSize = useMemo(() => {
-    const width = Math.max(CANVAS_MIN_WIDTH, ...draft.nodes.map((node) => Math.round(node.position.x + PIPELINE_NODE_WIDTH + 180)));
-    const height = Math.max(CANVAS_MIN_HEIGHT, ...draft.nodes.map((node) => Math.round(node.position.y + getNodeCardHeight(node) + 200)));
-    return { height, width };
+    if (!draft.nodes.length) {
+      return { height: CANVAS_MIN_HEIGHT, width: CANVAS_MIN_WIDTH };
+    }
+
+    const bounds = draft.nodes.reduce((accumulator, node) => {
+      const nodeBottom = node.position.y + getNodeCardHeight(node);
+      const nodeRight = node.position.x + PIPELINE_NODE_WIDTH;
+      return {
+        maxX: Math.max(accumulator.maxX, nodeRight),
+        maxY: Math.max(accumulator.maxY, nodeBottom),
+        minX: Math.min(accumulator.minX, node.position.x),
+        minY: Math.min(accumulator.minY, node.position.y),
+      };
+    }, {
+      maxX: 0,
+      maxY: 0,
+      minX: Number.POSITIVE_INFINITY,
+      minY: Number.POSITIVE_INFINITY,
+    });
+    const spanWidth = Math.max(0, bounds.maxX - bounds.minX);
+    const spanHeight = Math.max(0, bounds.maxY - bounds.minY);
+    const densityPaddingX = Math.min(3200, CANVAS_PADDING_X + draft.nodes.length * 88);
+    const densityPaddingY = Math.min(2800, CANVAS_PADDING_Y + draft.nodes.length * 72);
+    return {
+      height: Math.max(CANVAS_MIN_HEIGHT, Math.round(bounds.maxY + densityPaddingY), Math.round(spanHeight + CANVAS_PADDING_Y * 2)),
+      width: Math.max(CANVAS_MIN_WIDTH, Math.round(bounds.maxX + densityPaddingX), Math.round(spanWidth + CANVAS_PADDING_X * 2)),
+    };
   }, [draft.nodes]);
+  const scaledCanvasSize = useMemo(
+    () => ({
+      height: Math.round(canvasSize.height * canvasZoom),
+      width: Math.round(canvasSize.width * canvasZoom),
+    }),
+    [canvasSize.height, canvasSize.width, canvasZoom],
+  );
+  const savePipelineLabel = saveBusy ? (currentPipelineSaved ? 'Updating...' : 'Saving...') : (currentPipelineSaved ? 'Update pipeline' : 'Save pipeline');
 
   function replaceDraft(nextPipeline, options = {}) {
     setDraft(nextPipeline);
@@ -2631,15 +2742,41 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   }, [runState?.pendingValidation?.requestId]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(PIPELINE_SECTION_VISIBILITY_STORAGE_KEY, JSON.stringify(sectionVisibility));
+    } catch {
+      return;
+    }
+  }, [sectionVisibility]);
+
+  useEffect(() => {
     function handleMouseMove(event) {
       if (!dragRef.current || !canvasRef.current) {
         return;
       }
 
+      if (dragRef.current.type === 'pan') {
+        canvasRef.current.scrollLeft = Math.max(0, dragRef.current.scrollLeft - (event.clientX - dragRef.current.startClientX));
+        canvasRef.current.scrollTop = Math.max(0, dragRef.current.scrollTop - (event.clientY - dragRef.current.startClientY));
+        return;
+      }
+
+      if (dragRef.current.type !== 'node') {
+        return;
+      }
+
+      const nextPoint = getCanvasGraphPoint(event);
+      if (!nextPoint) {
+        return;
+      }
+
       const { nodeId, offsetX, offsetY } = dragRef.current;
-      const canvasBounds = canvasRef.current.getBoundingClientRect();
-      const nextX = Math.max(24, event.clientX - canvasBounds.left + canvasRef.current.scrollLeft - offsetX);
-      const nextY = Math.max(24, event.clientY - canvasBounds.top + canvasRef.current.scrollTop - offsetY);
+      const nextX = Math.max(24, nextPoint.x - offsetX);
+      const nextY = Math.max(24, nextPoint.y - offsetY);
 
       setDraft((current) => ({
         ...current,
@@ -2659,6 +2796,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     function handleMouseUp() {
+      if (dragRef.current?.type === 'pan') {
+        setCanvasPanning(false);
+      }
       dragRef.current = null;
     }
 
@@ -2668,7 +2808,101 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, []);
+  }, [canvasZoom]);
+
+  function toggleSection(sectionKey) {
+    setSectionVisibility((current) => ({
+      ...current,
+      [sectionKey]: !current[sectionKey],
+    }));
+  }
+
+  function updatePipelineMetadata(field, value) {
+    setDraft((current) => ({
+      ...current,
+      [field]: value,
+    }));
+    markDirty();
+  }
+
+  function getCanvasGraphPoint(event) {
+    if (!canvasRef.current) {
+      return null;
+    }
+
+    const canvasBounds = canvasRef.current.getBoundingClientRect();
+    return {
+      x: (event.clientX - canvasBounds.left + canvasRef.current.scrollLeft) / canvasZoom,
+      y: (event.clientY - canvasBounds.top + canvasRef.current.scrollTop) / canvasZoom,
+    };
+  }
+
+  function handleCanvasMouseDown(event) {
+    if (event.button !== 0 || !canvasRef.current) {
+      return;
+    }
+
+    const interactiveTarget = event.target instanceof Element ? event.target.closest('[data-canvas-interactive="true"]') : null;
+    if (interactiveTarget) {
+      return;
+    }
+
+    dragRef.current = {
+      type: 'pan',
+      scrollLeft: canvasRef.current.scrollLeft,
+      scrollTop: canvasRef.current.scrollTop,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+    };
+    setCanvasPanning(true);
+    event.preventDefault();
+  }
+
+  function handleCanvasWheel(event) {
+    if (!canvasRef.current) {
+      return;
+    }
+
+    const direction = Math.sign(event.deltaY);
+    if (!direction) {
+      return;
+    }
+
+    event.preventDefault();
+    const nextZoom = clampValue(
+      Number((canvasZoom * (direction > 0 ? (1 - CANVAS_ZOOM_STEP) : (1 + CANVAS_ZOOM_STEP))).toFixed(3)),
+      CANVAS_MIN_SCALE,
+      CANVAS_MAX_SCALE,
+    );
+    if (nextZoom === canvasZoom) {
+      return;
+    }
+
+    const canvasElement = canvasRef.current;
+    const canvasBounds = canvasElement.getBoundingClientRect();
+    const pointerX = event.clientX - canvasBounds.left;
+    const pointerY = event.clientY - canvasBounds.top;
+    const graphX = (canvasElement.scrollLeft + pointerX) / canvasZoom;
+    const graphY = (canvasElement.scrollTop + pointerY) / canvasZoom;
+
+    setCanvasZoom(nextZoom);
+    window.requestAnimationFrame(() => {
+      if (!canvasRef.current) {
+        return;
+      }
+
+      canvasRef.current.scrollLeft = Math.max(0, graphX * nextZoom - pointerX);
+      canvasRef.current.scrollTop = Math.max(0, graphY * nextZoom - pointerY);
+    });
+  }
+
+  function resetCanvasView() {
+    setCanvasZoom(1);
+    canvasRef.current?.scrollTo({
+      left: 0,
+      top: 0,
+    });
+  }
 
   function createNewPipeline() {
     if (dirty) {
@@ -2716,21 +2950,22 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   }
 
   function startDrag(nodeId, event) {
-    if (!canvasRef.current) {
-      return;
-    }
-
-    const canvasBounds = canvasRef.current.getBoundingClientRect();
     const node = draft.nodes.find((entry) => entry.id === nodeId);
-    if (!node) {
+    const pointer = getCanvasGraphPoint(event);
+    if (!node || !pointer) {
       return;
     }
 
     dragRef.current = {
+      type: 'node',
       nodeId,
-      offsetX: event.clientX - canvasBounds.left + canvasRef.current.scrollLeft - node.position.x,
-      offsetY: event.clientY - canvasBounds.top + canvasRef.current.scrollTop - node.position.y,
+      offsetX: pointer.x - node.position.x,
+      offsetY: pointer.y - node.position.y,
     };
+    setSelectedEdgeId('');
+    setSelectedNodeId(nodeId);
+    event.preventDefault();
+    event.stopPropagation();
   }
   function connectPorts(sourceNodeId, sourcePortId, targetNodeId, targetPortId) {
     const sourceNode = draft.nodes.find((node) => node.id === sourceNodeId);
@@ -3385,7 +3620,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
               {deleteBusy ? 'Deleting...' : 'Delete'}
             </button>
             <button className="primary-button" disabled={saveBusy} onClick={handleSavePipeline} type="button">
-              {saveBusy ? 'Saving...' : 'Save pipeline'}
+              {savePipelineLabel}
             </button>
             {runState?.status === 'running' || runState?.status === 'paused' ? (
               <button className="ghost-button" disabled={cancelBusy} onClick={handleCancelRun} type="button">
@@ -3401,15 +3636,15 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
         <div className="mt-6 grid gap-4 xl:grid-cols-[1.1fr,1fr]">
           <div className="rounded-[28px] border border-white/10 bg-slate-950/35 p-4">
-            <label className="text-xs uppercase tracking-[0.2em] text-slate-500" htmlFor="pipeline-name">Pipeline name</label>
+            <div className="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">
+              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">{currentPipelineSaved ? 'Saved pipeline' : 'New pipeline'}</span>
+              {pipelineMetadataDirty ? <span className="rounded-full border border-amber-300/30 bg-amber-300/12 px-3 py-1 text-amber-100">Metadata changed</span> : null}
+            </div>
+            <label className="mt-4 block text-xs uppercase tracking-[0.2em] text-slate-500" htmlFor="pipeline-name">Pipeline name</label>
             <input
               className="store-input mt-3"
               id="pipeline-name"
-              onChange={(event) => {
-                const value = event.target.value;
-                setDraft((current) => ({ ...current, name: value }));
-                markDirty();
-              }}
+              onChange={(event) => updatePipelineMetadata('name', event.target.value)}
               placeholder="Untitled pipeline"
               value={draft.name}
             />
@@ -3417,14 +3652,15 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             <textarea
               className="store-input mt-3 min-h-[120px] resize-none"
               id="pipeline-description"
-              onChange={(event) => {
-                const value = event.target.value;
-                setDraft((current) => ({ ...current, description: value }));
-                markDirty();
-              }}
+              onChange={(event) => updatePipelineMetadata('description', event.target.value)}
               placeholder="What should this workflow do?"
               value={draft.description}
             />
+            <p className="mt-3 text-xs leading-5 text-slate-400">
+              {currentPipelineSaved
+                ? 'Editing the name or description updates this same saved pipeline when you click Update pipeline. You do not need to rebuild the graph first.'
+                : 'Set the name and description before the first save so this pipeline is easy to find later.'}
+            </p>
           </div>
 
           <div className={`rounded-[28px] border p-4 ${toneToClassName(analysis.compatibilitySummary?.tone || analysis.primaryIssue?.tone || 'neutral')}`}>
@@ -3455,189 +3691,219 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
           <div className="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">
             <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">Grounded recipes</span>
             <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">Editable graph</span>
+            <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('pipelineWizard')} type="button">
+              {sectionVisibility.pipelineWizard ? 'Collapse' : 'Expand'}
+            </button>
           </div>
         </div>
 
-        <div className="mt-4 grid gap-4 xl:grid-cols-[0.9fr,1.2fr]">
-          <div className="space-y-4 rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
-            <div>
-              <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-mode">Wizard target</label>
-              <select
-                className="store-input mt-3"
-                id="pipeline-wizard-mode"
-                onChange={(event) => {
-                  setWizardExecutionMode(event.target.value === 'ollama' ? 'ollama' : 'cloud');
-                  setWizardModel('');
-                  setWizardModelOptions([]);
-                  setWizardSummary(null);
-                }}
-                value={wizardExecutionMode}
-              >
-                <option value="cloud">Cloud provider</option>
-                <option value="ollama">Ollama (local)</option>
-              </select>
-            </div>
-
-            {wizardExecutionMode === 'cloud' ? (
+        {sectionVisibility.pipelineWizard ? (
+          <div className="mt-4 grid gap-4 xl:grid-cols-[0.9fr,1.2fr]">
+            <div className="space-y-4 rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
               <div>
-                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-provider">Provider</label>
+                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-mode">Wizard target</label>
                 <select
                   className="store-input mt-3"
-                  id="pipeline-wizard-provider"
+                  id="pipeline-wizard-mode"
                   onChange={(event) => {
-                    setWizardProviderId(event.target.value);
+                    setWizardExecutionMode(event.target.value === 'ollama' ? 'ollama' : 'cloud');
                     setWizardModel('');
                     setWizardModelOptions([]);
                     setWizardSummary(null);
                   }}
-                  value={wizardProviderId}
+                  value={wizardExecutionMode}
                 >
-                  <option value="">Choose a connected provider</option>
-                  {connectedProviders.map((provider) => (
-                    <option key={provider.id} value={provider.id}>{provider.name}</option>
-                  ))}
+                  <option value="cloud">Cloud provider</option>
+                  <option value="ollama">Ollama (local)</option>
                 </select>
               </div>
-            ) : null}
 
-            <div>
-              <div className="flex items-center justify-between gap-3">
-                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-model">Model</label>
-                <button className="ghost-button px-3 py-1.5 text-xs" disabled={wizardModelsBusy} onClick={refreshWizardModels} type="button">
-                  {wizardModelsBusy ? 'Loading...' : 'Refresh'}
+              {wizardExecutionMode === 'cloud' ? (
+                <div>
+                  <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-provider">Provider</label>
+                  <select
+                    className="store-input mt-3"
+                    id="pipeline-wizard-provider"
+                    onChange={(event) => {
+                      setWizardProviderId(event.target.value);
+                      setWizardModel('');
+                      setWizardModelOptions([]);
+                      setWizardSummary(null);
+                    }}
+                    value={wizardProviderId}
+                  >
+                    <option value="">Choose a connected provider</option>
+                    {connectedProviders.map((provider) => (
+                      <option key={provider.id} value={provider.id}>{provider.name}</option>
+                    ))}
+                  </select>
+                </div>
+              ) : null}
+
+              <div>
+                <div className="flex items-center justify-between gap-3">
+                  <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-model">Model</label>
+                  <button className="ghost-button px-3 py-1.5 text-xs" disabled={wizardModelsBusy} onClick={refreshWizardModels} type="button">
+                    {wizardModelsBusy ? 'Loading...' : 'Refresh'}
+                  </button>
+                </div>
+                <input
+                  className="store-input mt-3"
+                  id="pipeline-wizard-model"
+                  list="pipeline-wizard-model-options"
+                  onChange={(event) => setWizardModel(event.target.value)}
+                  placeholder={wizardExecutionMode === 'ollama' ? 'Choose an Ollama model' : 'Choose a provider model'}
+                  value={wizardModel}
+                />
+                <datalist id="pipeline-wizard-model-options">
+                  {wizardModelOptions.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                </datalist>
+                {wizardModelOptions.length ? (
+                  <div className="mt-3 max-h-36 space-y-2 overflow-auto pr-1">
+                    {wizardModelOptions.slice(0, 8).map((model) => (
+                      <button
+                        className="w-full rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-left text-xs transition hover:border-cyan-300/25 hover:bg-white/10"
+                        key={model.id}
+                        onClick={() => setWizardModel(model.id)}
+                        type="button"
+                      >
+                        <span className="font-medium text-white">{model.label || model.id}</span>
+                        {model.detail ? <span className="ml-2 text-slate-400">{model.detail}</span> : null}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {wizardExecutionMode === 'ollama' && selectedWizardModelOption?.wizardSuitability ? (
+                  <p className={`mt-3 text-xs leading-5 ${selectedWizardModelOption.wizardSuitability.tone === 'warn' ? 'text-amber-200' : 'text-slate-300'}`}>
+                    {getLocalWizardModelGuidance(selectedWizardModelOption, wizardIntent)}
+                  </p>
+                ) : wizardExecutionMode === 'ollama' ? (
+                  <p className="mt-3 text-xs leading-5 text-slate-400">Refresh to rank downloaded Ollama models for local wizard drafting on this PC.</p>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="space-y-4 rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+              <div>
+                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-intent">Workflow request</label>
+                <textarea
+                  className="store-input mt-3 min-h-[152px] resize-none"
+                  id="pipeline-wizard-intent"
+                  onChange={(event) => {
+                    setWizardIntent(event.target.value);
+                    setWizardSummary(null);
+                  }}
+                  placeholder="Example: turn a product description into a short image generation pipeline with a final image output."
+                  value={wizardIntent}
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-3">
+                <button className="primary-button" disabled={wizardBusy} onClick={handleGenerateWizardDraft} type="button">
+                  {wizardBusy ? 'Drafting...' : 'Generate draft'}
                 </button>
+                <span className="text-xs leading-5 text-slate-400">{getWizardTargetLabel(wizardTarget, connectedProviders)}</span>
               </div>
-              <input
-                className="store-input mt-3"
-                id="pipeline-wizard-model"
-                list="pipeline-wizard-model-options"
-                onChange={(event) => setWizardModel(event.target.value)}
-                placeholder={wizardExecutionMode === 'ollama' ? 'Choose an Ollama model' : 'Choose a provider model'}
-                value={wizardModel}
-              />
-              <datalist id="pipeline-wizard-model-options">
-                {wizardModelOptions.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
-              </datalist>
-              {wizardModelOptions.length ? (
-                <div className="mt-3 max-h-36 space-y-2 overflow-auto pr-1">
-                  {wizardModelOptions.slice(0, 8).map((model) => (
-                    <button
-                      className="w-full rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-left text-xs transition hover:border-cyan-300/25 hover:bg-white/10"
-                      key={model.id}
-                      onClick={() => setWizardModel(model.id)}
-                      type="button"
-                    >
-                      <span className="font-medium text-white">{model.label || model.id}</span>
-                      {model.detail ? <span className="ml-2 text-slate-400">{model.detail}</span> : null}
-                    </button>
-                  ))}
+              {wizardSummary ? (
+                <div className={`rounded-[24px] border p-4 ${toneToClassName(wizardSummary.resultState === 'placeholder' || wizardSummary.graphErrorCount ? 'warn' : 'info')}`}>
+                  <p className="text-sm font-semibold text-white">{wizardSummary.headline}</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-100">{wizardSummary.message}</p>
+                  <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.16em] text-slate-200">
+                    <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{wizardSummary.recipeLabel}</span>
+                    {wizardSummary.targetLabel ? <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{wizardSummary.targetLabel}</span> : null}
+                  </div>
+                  {wizardSummary.gaps?.length ? (
+                    <div className="mt-3 space-y-1 text-xs leading-5 text-slate-200">
+                      {wizardSummary.gaps.slice(0, 3).map((gap) => <p key={gap}>{gap}</p>)}
+                    </div>
+                  ) : null}
+                  {wizardSummary.manualRefinementNotes?.length ? (
+                    <div className="mt-3 space-y-1 text-xs leading-5 text-slate-300">
+                      {wizardSummary.manualRefinementNotes.slice(0, 3).map((note) => <p key={note}>{note}</p>)}
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
-              {wizardExecutionMode === 'ollama' && selectedWizardModelOption?.wizardSuitability ? (
-                <p className={`mt-3 text-xs leading-5 ${selectedWizardModelOption.wizardSuitability.tone === 'warn' ? 'text-amber-200' : 'text-slate-300'}`}>
-                  {getLocalWizardModelGuidance(selectedWizardModelOption, wizardIntent)}
-                </p>
-              ) : wizardExecutionMode === 'ollama' ? (
-                <p className="mt-3 text-xs leading-5 text-slate-400">Refresh to rank downloaded Ollama models for local wizard drafting on this PC.</p>
               ) : null}
             </div>
           </div>
-
-          <div className="space-y-4 rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
-            <div>
-              <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-wizard-intent">Workflow request</label>
-              <textarea
-                className="store-input mt-3 min-h-[152px] resize-none"
-                id="pipeline-wizard-intent"
-                onChange={(event) => {
-                  setWizardIntent(event.target.value);
-                  setWizardSummary(null);
-                }}
-                placeholder="Example: turn a product description into a short image generation pipeline with a final image output."
-                value={wizardIntent}
-              />
-            </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <button className="primary-button" disabled={wizardBusy} onClick={handleGenerateWizardDraft} type="button">
-                {wizardBusy ? 'Drafting...' : 'Generate draft'}
-              </button>
-              <span className="text-xs leading-5 text-slate-400">{getWizardTargetLabel(wizardTarget, connectedProviders)}</span>
-            </div>
-            {wizardSummary ? (
-              <div className={`rounded-[24px] border p-4 ${toneToClassName(wizardSummary.resultState === 'placeholder' || wizardSummary.graphErrorCount ? 'warn' : 'info')}`}>
-                <p className="text-sm font-semibold text-white">{wizardSummary.headline}</p>
-                <p className="mt-2 text-sm leading-6 text-slate-100">{wizardSummary.message}</p>
-                <div className="mt-3 flex flex-wrap gap-2 text-[11px] uppercase tracking-[0.16em] text-slate-200">
-                  <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{wizardSummary.recipeLabel}</span>
-                  {wizardSummary.targetLabel ? <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{wizardSummary.targetLabel}</span> : null}
-                </div>
-                {wizardSummary.gaps?.length ? (
-                  <div className="mt-3 space-y-1 text-xs leading-5 text-slate-200">
-                    {wizardSummary.gaps.slice(0, 3).map((gap) => <p key={gap}>{gap}</p>)}
-                  </div>
-                ) : null}
-                {wizardSummary.manualRefinementNotes?.length ? (
-                  <div className="mt-3 space-y-1 text-xs leading-5 text-slate-300">
-                    {wizardSummary.manualRefinementNotes.slice(0, 3).map((note) => <p key={note}>{note}</p>)}
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-        </div>
+        ) : null}
       </div>
       <div className="space-y-5">
           <div className="panel p-5">
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Saved pipelines</p>
                 <p className="mt-2 text-lg font-semibold text-white">Load and reuse</p>
               </div>
-              <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => refreshPipelineList()} type="button">Refresh list</button>
+              <div className="flex flex-wrap items-center gap-3">
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => refreshPipelineList()} type="button">Refresh list</button>
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('savedPipelines')} type="button">
+                  {sectionVisibility.savedPipelines ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
             </div>
+            {sectionVisibility.savedPipelines ? (
             <div className="mt-4 grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
-              {pipelines.length ? pipelines.map((pipeline) => (
-                <SavedPipelineRow active={pipeline.id === draft.id} key={pipeline.id} onClick={() => loadSavedPipeline(pipeline.id)} pipeline={pipeline} />
+              {visibleSavedPipelines.length ? visibleSavedPipelines.map((pipeline) => (
+                <SavedPipelineRow active={pipeline.id === draft.id} hasPendingMetadataChanges={pipeline.id === draft.id && pipelineMetadataDirty} key={pipeline.id} onClick={() => loadSavedPipeline(pipeline.id)} pipeline={pipeline} />
               )) : (
                 <div className="rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">
                   Save the current pipeline to build a reusable library here.
                 </div>
               )}
             </div>
+            ) : null}
           </div>
 
           <div className="panel p-5">
-            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node palette</p>
-            <p className="mt-2 text-lg font-semibold text-white">Inputs, AI, flow, validation, outputs</p>
-            <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs leading-6 text-slate-400">
-              Add nodes across text, image, audio, video, and file workflows. Connections stay typed, validation can branch to pass or fail, and Branch Merge recombines compatible paths explicitly.
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node palette</p>
+                <p className="mt-2 text-lg font-semibold text-white">Inputs, AI, flow, validation, outputs</p>
+              </div>
+              <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('nodePalette')} type="button">
+                {sectionVisibility.nodePalette ? 'Collapse' : 'Expand'}
+              </button>
             </div>
-            <div className="mt-4 grid gap-4 xl:grid-cols-2 2xl:grid-cols-4">
-              {paletteGroups.map((group) => (
-                <div key={group.label} className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{group.label}</p>
-                  <div className="mt-3 space-y-2">
-                    {group.entries.map((entry) => (
-                      <button
-                        className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition hover:border-cyan-300/25 hover:bg-white/10"
-                        key={entry.type}
-                        onClick={() => addNode(entry.type)}
-                        type="button"
-                      >
-                        <p className="text-sm font-semibold text-white">{entry.label}</p>
-                        <p className="mt-1 text-xs leading-5 text-slate-400">{entry.description}</p>
-                      </button>
-                    ))}
-                  </div>
+            {sectionVisibility.nodePalette ? (
+              <>
+                <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs leading-6 text-slate-400">
+                  Add nodes across text, image, audio, video, and file workflows. Connections stay typed, validation can branch to pass or fail, and Branch Merge recombines compatible paths explicitly.
                 </div>
-              ))}
-            </div>
+                <div className="mt-4 grid gap-4 xl:grid-cols-2 2xl:grid-cols-4">
+                  {paletteGroups.map((group) => (
+                    <div key={group.label} className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4">
+                      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{group.label}</p>
+                      <div className="mt-3 space-y-2">
+                        {group.entries.map((entry) => (
+                          <button
+                            className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition hover:border-cyan-300/25 hover:bg-white/10"
+                            key={entry.type}
+                            onClick={() => addNode(entry.type)}
+                            type="button"
+                          >
+                            <p className="text-sm font-semibold text-white">{entry.label}</p>
+                            <p className="mt-1 text-xs leading-5 text-slate-400">{entry.description}</p>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : null}
           </div>
 
           <div className="panel p-5">
-            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Inspector</p>
-            <p className="mt-2 text-lg font-semibold text-white">{selectedNode ? selectedNode.label : 'Select a node'}</p>
-            {selectedNode ? (
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node inspector</p>
+                <p className="mt-2 text-lg font-semibold text-white">{selectedNode ? selectedNode.label : 'Select a node'}</p>
+              </div>
+              <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('inspector')} type="button">
+                {sectionVisibility.inspector ? 'Collapse' : 'Expand'}
+              </button>
+            </div>
+            {sectionVisibility.inspector ? (selectedNode ? (
               <PipelineInspectorErrorBoundary onClearSelection={() => setSelectedNodeId('')} resetKey={selectedNode.id}>
                 <div className="mt-4 space-y-4">
                 <div>
@@ -4252,7 +4518,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="validation-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="validation-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional validator instruction." value={selectedNode.config?.systemPrompt || ''} /></div>
                       </>
                     ) : (
-                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This run will pause at the validation node, show the connected artifact preview when possible, and wait for your pass or fail decision.</div>
+                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This run will pause at the validation node, show the connected artifact preview when possible, and wait for your pass or fail decision. Ordered collections are reviewed as whole collections in this pass.</div>
                     )}
                   </div>
                 ) : null}
@@ -4510,176 +4776,203 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                 <button className="ghost-button w-full justify-center" onClick={() => removeNode(selectedNode.id)} type="button">Delete node</button>
                 </div>
               </PipelineInspectorErrorBoundary>
-            ) : <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">Select a node on the canvas to edit its settings and inspect its connections.</div>}
+            ) : <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">Select a node on the canvas to edit its settings and inspect its connections.</div>) : null}
           </div>
 
           <div className="panel p-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Canvas</p>
-                <p className="mt-2 text-lg font-semibold text-white">Drag nodes and connect typed ports</p>
+                <p className="mt-2 text-lg font-semibold text-white">Navigate large pipeline graphs without losing node interaction</p>
               </div>
               <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Click an output port, then an input port. Click a connection line to disconnect it.</span>
+                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Blank space drags the viewport. The mouse wheel zooms while the cursor is over the canvas.</span>
+                <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1.5 text-slate-200">{Math.round(canvasZoom * 100)}%</span>
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={resetCanvasView} type="button">Reset view</button>
                 {selectedEdge ? <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => removeEdge(selectedEdge.id)} type="button">Disconnect selected link</button> : null}
                 {pendingConnection ? <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => setPendingConnection(null)} type="button">Cancel connection</button> : null}
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('canvas')} type="button">
+                  {sectionVisibility.canvas ? 'Collapse' : 'Expand'}
+                </button>
               </div>
             </div>
 
-            <div className="mt-4 rounded-[28px] border border-white/10 bg-slate-950/30 p-2">
-              <div className="relative h-[860px] overflow-auto rounded-[24px] border border-dashed border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(67,171,255,0.08),transparent_24%),linear-gradient(180deg,rgba(7,15,26,0.96),rgba(5,10,18,0.96))]" ref={canvasRef}>
-                <div className="relative" style={{ height: `${canvasSize.height}px`, width: `${canvasSize.width}px` }}>
-                  <svg className="absolute inset-0 h-full w-full">
-                    {graphEdges.map((edge) => {
-                      const sourceNode = graph.nodeMap.get(edge.source.nodeId);
-                      const targetNode = graph.nodeMap.get(edge.target.nodeId);
-                      const sourceDefinition = getPipelineNodeDefinition(sourceNode?.type);
-                      const targetDefinition = getPipelineNodeDefinition(targetNode?.type);
-                      const sourceIndex = (sourceDefinition?.outputPorts || []).findIndex((port) => port.id === edge.source.portId);
-                      const targetIndex = (targetDefinition?.inputPorts || []).findIndex((port) => port.id === edge.target.portId);
-                      const sourcePoint = getNodePortCenter(sourceNode, 'output', sourceIndex);
-                      const targetPoint = getNodePortCenter(targetNode, 'input', targetIndex);
-                      const curveOffset = Math.max(80, (targetPoint.x - sourcePoint.x) / 2);
-                      const pathValue = `M ${sourcePoint.x} ${sourcePoint.y} C ${sourcePoint.x + curveOffset} ${sourcePoint.y}, ${targetPoint.x - curveOffset} ${targetPoint.y}, ${targetPoint.x} ${targetPoint.y}`;
-                      const selected = selectedEdge?.id === edge.id;
-                      return (
-                        <g key={edge.id}>
-                          <path
-                            d={pathValue}
-                            fill="none"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              setPendingConnection(null);
-                              setSelectedEdgeId(edge.id);
-                              setSelectedNodeId('');
-                            }}
-                            pointerEvents="stroke"
-                            stroke="transparent"
-                            strokeWidth="16"
-                            style={{ cursor: 'pointer' }}
-                          />
-                          <path
-                            d={pathValue}
-                            fill="none"
-                            pointerEvents="none"
-                            stroke={selected ? 'rgba(147, 226, 255, 0.98)' : 'rgba(103, 214, 255, 0.58)'}
-                            strokeWidth={selected ? '5' : '3'}
-                          />
-                        </g>
-                      );
-                    })}
-                  </svg>
+            {sectionVisibility.canvas ? (
+              <div className="mt-4 rounded-[28px] border border-white/10 bg-slate-950/30 p-2">
+                <div
+                  className="relative h-[860px] overflow-auto rounded-[24px] border border-dashed border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(67,171,255,0.08),transparent_24%),linear-gradient(180deg,rgba(7,15,26,0.96),rgba(5,10,18,0.96))]"
+                  onMouseDown={handleCanvasMouseDown}
+                  onWheel={handleCanvasWheel}
+                  ref={canvasRef}
+                  style={{ cursor: canvasPanning ? 'grabbing' : 'grab' }}
+                >
+                  <div className="relative" style={{ height: `${scaledCanvasSize.height}px`, width: `${scaledCanvasSize.width}px` }}>
+                    <div className="relative origin-top-left" style={{ height: `${canvasSize.height}px`, transform: `scale(${canvasZoom})`, transformOrigin: 'top left', width: `${canvasSize.width}px` }}>
+                      <svg className="absolute inset-0 h-full w-full">
+                        {graphEdges.map((edge) => {
+                          const sourceNode = graph.nodeMap.get(edge.source.nodeId);
+                          const targetNode = graph.nodeMap.get(edge.target.nodeId);
+                          const sourceDefinition = getPipelineNodeDefinition(sourceNode?.type);
+                          const targetDefinition = getPipelineNodeDefinition(targetNode?.type);
+                          const sourceIndex = (sourceDefinition?.outputPorts || []).findIndex((port) => port.id === edge.source.portId);
+                          const targetIndex = (targetDefinition?.inputPorts || []).findIndex((port) => port.id === edge.target.portId);
+                          const sourcePoint = getNodePortCenter(sourceNode, 'output', sourceIndex);
+                          const targetPoint = getNodePortCenter(targetNode, 'input', targetIndex);
+                          const curveOffset = Math.max(80, (targetPoint.x - sourcePoint.x) / 2);
+                          const pathValue = `M ${sourcePoint.x} ${sourcePoint.y} C ${sourcePoint.x + curveOffset} ${sourcePoint.y}, ${targetPoint.x - curveOffset} ${targetPoint.y}, ${targetPoint.x} ${targetPoint.y}`;
+                          const selected = selectedEdge?.id === edge.id;
+                          return (
+                            <g key={edge.id}>
+                              <path
+                                d={pathValue}
+                                data-canvas-interactive="true"
+                                fill="none"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setPendingConnection(null);
+                                  setSelectedEdgeId(edge.id);
+                                  setSelectedNodeId('');
+                                }}
+                                onMouseDown={(event) => event.stopPropagation()}
+                                pointerEvents="stroke"
+                                stroke="transparent"
+                                strokeWidth="16"
+                                style={{ cursor: 'pointer' }}
+                              />
+                              <path
+                                d={pathValue}
+                                fill="none"
+                                pointerEvents="none"
+                                stroke={selected ? 'rgba(147, 226, 255, 0.98)' : 'rgba(103, 214, 255, 0.58)'}
+                                strokeWidth={selected ? '5' : '3'}
+                              />
+                            </g>
+                          );
+                        })}
+                      </svg>
 
-                  {draft.nodes.length ? draft.nodes.map((node) => {
-                    const definition = getPipelineNodeDefinition(node.type);
-                    const inputPorts = definition?.inputPorts || [];
-                    const outputPorts = definition?.outputPorts || [];
-                    const rowCount = Math.max(inputPorts.length, outputPorts.length, 1);
-                    const nodeRunState = runState?.nodeStates?.[node.id];
-                    const nodeSummary = analysis.nodeSummaries?.[node.id];
-                    const preview = buildNodePreview(node, runState);
-                    return (
-                      <div
-                        className={`absolute rounded-[28px] border bg-[#0f1825]/96 shadow-soft ${selectedNodeId === node.id ? 'border-cyan-300/45' : 'border-white/10'}`}
-                        key={node.id}
-                        onClick={() => { setSelectedEdgeId(''); setSelectedNodeId(node.id); }}
-                        style={{ left: `${node.position.x}px`, minHeight: `${getNodeCardHeight(node)}px`, top: `${node.position.y}px`, width: `${PIPELINE_NODE_WIDTH}px` }}
-                      >
-                        <div className="flex cursor-grab items-start justify-between gap-3 rounded-t-[28px] border-b border-white/10 px-4 py-4" onMouseDown={(event) => startDrag(node.id, event)} role="presentation">
-                          <div>
-                            <p className="text-[11px] uppercase tracking-[0.2em] text-slate-500">{definition?.category || 'Node'}</p>
-                            <p className="mt-1 text-sm font-semibold text-white">{node.label}</p>
-                          </div>
-                          <span className={`rounded-full border px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] ${runStatusClassName(nodeRunState?.status || 'queued')}`}>
-                            {nodeRunState?.status || 'idle'}
-                          </span>
-                        </div>
-                        <div className="px-4 pt-4">
-                          {Array.from({ length: rowCount }).map((_, index) => {
-                            const inputPort = inputPorts[index] || null;
-                            const outputPort = outputPorts[index] || null;
-                            const inputConnectionCount = inputPort ? getIncomingConnectionCount(graph, node.id, inputPort.id) : 0;
-                            const allowsMultipleInputConnections = Boolean(inputPort?.allowMultipleConnections);
-                            return (
-                              <div className="grid h-9 grid-cols-2 items-center gap-4" key={`${node.id}-row-${index}`}>
-                                <div className="flex items-center gap-2">
-                                  {inputPort ? (
-                                    <button
-                                      className={`flex items-center gap-2 rounded-full border px-2 py-1 text-left text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection && isPendingConnectionCompatible(node, inputPort) ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        if (!pendingConnection) {
-                                          setSelectedEdgeId('');
-                                          setSelectedNodeId(node.id);
-                                          return;
-                                        }
-                                        connectPorts(pendingConnection.sourceNodeId, pendingConnection.sourcePortId, node.id, inputPort.id);
-                                      }}
-                                      type="button"
-                                    >
-                                      <span className="h-2.5 w-2.5 rounded-full bg-white/70" />
-                                      <span className="truncate">{inputPort.label}</span>
-                                      {allowsMultipleInputConnections ? <span className="rounded-full border border-white/10 bg-slate-950/50 px-2 py-0.5 text-[10px] text-slate-200">{inputConnectionCount}</span> : null}
-                                    </button>
-                                  ) : null}
-                                </div>
-                                <div className="flex items-center justify-end gap-2">
-                                  {outputPort ? (
-                                    <button
-                                      className={`flex items-center gap-2 rounded-full border px-2 py-1 text-right text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection?.sourceNodeId === node.id && pendingConnection?.sourcePortId === outputPort.id ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        setSelectedEdgeId('');
-                                        setPendingConnection({
-                                          isDynamic: outputPort.kind === 'passthrough' || outputPort.kind === 'any',
-                                          kind: outputPort.kind,
-                                          sourceNodeId: node.id,
-                                          sourcePortId: outputPort.id,
-                                        });
-                                      }}
-                                      type="button"
-                                    >
-                                      <span className="truncate">{outputPort.label}</span>
-                                      <span className="h-2.5 w-2.5 rounded-full bg-cyan-300" />
-                                    </button>
-                                  ) : null}
-                                </div>
+                      {draft.nodes.length ? draft.nodes.map((node) => {
+                        const definition = getPipelineNodeDefinition(node.type);
+                        const inputPorts = definition?.inputPorts || [];
+                        const outputPorts = definition?.outputPorts || [];
+                        const rowCount = Math.max(inputPorts.length, outputPorts.length, 1);
+                        const nodeRunState = runState?.nodeStates?.[node.id];
+                        const nodeSummary = analysis.nodeSummaries?.[node.id];
+                        const preview = buildNodePreview(node, runState);
+                        return (
+                          <div
+                            className={`absolute rounded-[28px] border bg-[#0f1825]/96 shadow-soft ${selectedNodeId === node.id ? 'border-cyan-300/45' : 'border-white/10'}`}
+                            data-canvas-interactive="true"
+                            key={node.id}
+                            onClick={() => { setSelectedEdgeId(''); setSelectedNodeId(node.id); }}
+                            style={{ left: `${node.position.x}px`, minHeight: `${getNodeCardHeight(node)}px`, top: `${node.position.y}px`, width: `${PIPELINE_NODE_WIDTH}px` }}
+                          >
+                            <div className="flex cursor-grab items-start justify-between gap-3 rounded-t-[28px] border-b border-white/10 px-4 py-4" onMouseDown={(event) => startDrag(node.id, event)} role="presentation">
+                              <div>
+                                <p className="text-[11px] uppercase tracking-[0.2em] text-slate-500">{definition?.category || 'Node'}</p>
+                                <p className="mt-1 text-sm font-semibold text-white">{node.label}</p>
                               </div>
-                            );
-                          })}
-                        </div>
-                        <div className="mt-3 border-t border-white/10 px-4 py-3">
-                          <div className={`rounded-2xl border px-3 py-2 text-xs ${toneToClassName(nodeSummary?.readiness?.tone || nodeSummary?.compatibility?.tone || 'neutral')}`}>
-                            <p className="font-semibold text-white">{nodeSummary?.readiness?.message || nodeSummary?.compatibility?.message || 'Ready.'}</p>
-                            {nodeSummary?.capabilitySummary ? <p className="mt-1 leading-5 text-slate-300">{nodeSummary.capabilitySummary.message}</p> : null}
-                            {preview ? <p className="mt-1 leading-5 text-slate-200">{preview}</p> : null}
+                              <span className={`rounded-full border px-2.5 py-1 text-[10px] uppercase tracking-[0.18em] ${runStatusClassName(nodeRunState?.status || 'queued')}`}>
+                                {nodeRunState?.status || 'idle'}
+                              </span>
+                            </div>
+                            <div className="px-4 pt-4">
+                              {Array.from({ length: rowCount }).map((_, index) => {
+                                const inputPort = inputPorts[index] || null;
+                                const outputPort = outputPorts[index] || null;
+                                const inputConnectionCount = inputPort ? getIncomingConnectionCount(graph, node.id, inputPort.id) : 0;
+                                const allowsMultipleInputConnections = Boolean(inputPort?.allowMultipleConnections);
+                                return (
+                                  <div className="grid h-9 grid-cols-2 items-center gap-4" key={`${node.id}-row-${index}`}>
+                                    <div className="flex items-center gap-2">
+                                      {inputPort ? (
+                                        <button
+                                          className={`flex items-center gap-2 rounded-full border px-2 py-1 text-left text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection && isPendingConnectionCompatible(node, inputPort) ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            if (!pendingConnection) {
+                                              setSelectedEdgeId('');
+                                              setSelectedNodeId(node.id);
+                                              return;
+                                            }
+                                            connectPorts(pendingConnection.sourceNodeId, pendingConnection.sourcePortId, node.id, inputPort.id);
+                                          }}
+                                          type="button"
+                                        >
+                                          <span className="h-2.5 w-2.5 rounded-full bg-white/70" />
+                                          <span className="truncate">{inputPort.label}</span>
+                                          {allowsMultipleInputConnections ? <span className="rounded-full border border-white/10 bg-slate-950/50 px-2 py-0.5 text-[10px] text-slate-200">{inputConnectionCount}</span> : null}
+                                        </button>
+                                      ) : null}
+                                    </div>
+                                    <div className="flex items-center justify-end gap-2">
+                                      {outputPort ? (
+                                        <button
+                                          className={`flex items-center gap-2 rounded-full border px-2 py-1 text-right text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection?.sourceNodeId === node.id && pendingConnection?.sourcePortId === outputPort.id ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            setSelectedEdgeId('');
+                                            setPendingConnection({
+                                              isDynamic: outputPort.kind === 'passthrough' || outputPort.kind === 'any',
+                                              kind: outputPort.kind,
+                                              sourceNodeId: node.id,
+                                              sourcePortId: outputPort.id,
+                                            });
+                                          }}
+                                          type="button"
+                                        >
+                                          <span className="truncate">{outputPort.label}</span>
+                                          <span className="h-2.5 w-2.5 rounded-full bg-cyan-300" />
+                                        </button>
+                                      ) : null}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            <div className="mt-3 border-t border-white/10 px-4 py-3">
+                              <div className={`rounded-2xl border px-3 py-2 text-xs ${toneToClassName(nodeSummary?.readiness?.tone || nodeSummary?.compatibility?.tone || 'neutral')}`}>
+                                <p className="font-semibold text-white">{nodeSummary?.readiness?.message || nodeSummary?.compatibility?.message || 'Ready.'}</p>
+                                {nodeSummary?.capabilitySummary ? <p className="mt-1 leading-5 text-slate-300">{nodeSummary.capabilitySummary.message}</p> : null}
+                                {preview ? <p className="mt-1 leading-5 text-slate-200">{preview}</p> : null}
+                              </div>
+                            </div>
                           </div>
-                        </div>
-                      </div>
-                    );
-                  }) : (
-                    <div className="flex h-full items-center justify-center px-6 text-center text-sm leading-7 text-slate-400">Add a few nodes from the palette to start building a pipeline.</div>
-                  )}
+                        );
+                      }) : (
+                        <div className="flex h-full items-center justify-center px-6 text-center text-sm leading-7 text-slate-400">Add a few nodes from the palette to start building a pipeline.</div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
-            </div>
+            ) : null}
           </div>
 
           <div className="panel p-5">
-            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Run status</p>
-            <p className="mt-2 text-lg font-semibold text-white">Sequential execution timeline</p>
-            <div className="mt-4">
-              <PipelineTimeline
-                draft={draft}
-                onChangeValidationComment={setValidationComment}
-                onDecideValidation={handleValidationDecision}
-                onOpenPath={openPath}
-                onRevealPath={(pathValue) => openPath(pathValue, true)}
-                runState={runState}
-                validationBusy={validationBusy}
-                validationComment={validationComment}
-              />
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Runtime status</p>
+                <p className="mt-2 text-lg font-semibold text-white">Sequential execution timeline</p>
+              </div>
+              <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('runStatus')} type="button">
+                {sectionVisibility.runStatus ? 'Collapse' : 'Expand'}
+              </button>
             </div>
+            {sectionVisibility.runStatus ? (
+              <div className="mt-4">
+                <PipelineTimeline
+                  draft={draft}
+                  onChangeValidationComment={setValidationComment}
+                  onDecideValidation={handleValidationDecision}
+                  onOpenPath={openPath}
+                  onRevealPath={(pathValue) => openPath(pathValue, true)}
+                  runState={runState}
+                  validationBusy={validationBusy}
+                  validationComment={validationComment}
+                />
+              </div>
+            ) : null}
           </div>
 
           <PipelineOutputsPanel

@@ -53,7 +53,7 @@ select {
   }
 
   .sidebar-shell {
-    @apply panel flex min-h-[calc(100vh-2.5rem)] flex-col justify-between p-5;
+    @apply panel flex flex-col gap-6 p-5;
   }
 
   .sidebar-tab {
@@ -92,3 +92,4 @@ select {
     @apply w-full rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-300/40 focus:bg-slate-950/55;
   }
 }
+

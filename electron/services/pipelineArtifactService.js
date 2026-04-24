@@ -2015,23 +2015,37 @@ async function describeArtifactForLlm(artifact) {
   }
 
   if (isArtifactCollection(artifact)) {
+    const items = Array.isArray(artifact.items) ? artifact.items : [];
+    const accumulation = artifact.accumulation && typeof artifact.accumulation === 'object' ? artifact.accumulation : null;
+    const itemDescriptions = [];
+    for (let index = 0; index < Math.min(items.length, 6); index += 1) {
+      const entry = items[index];
+      const itemArtifact = entry?.artifact || null;
+      const lineage = entry?.lineage || null;
+      const sourceLabel = lineage?.sourceNodeLabel || lineage?.sourceNodeId || '';
+      const nestedDescription = trimPreviewText(await describeArtifactForLlm(itemArtifact), 220)
+        || summarizeArtifact(itemArtifact, 140)
+        || itemArtifact?.displayName
+        || itemArtifact?.fileName
+        || 'Item ' + (index + 1);
+      itemDescriptions.push((index + 1) + '. ' + nestedDescription + (sourceLabel ? ' (from ' + sourceLabel + ')' : ''));
+    }
+
     const lines = [
       'Type: ordered collection',
+      'Review scope: validate the collection as a whole, not as separate per-item passes.',
       artifact.itemKind ? 'Item type: ' + artifact.itemKind : '',
       Number(artifact.itemCount || 0) ? 'Item count: ' + artifact.itemCount : '',
       artifact.displayName ? 'Name: ' + artifact.displayName : '',
       artifact.summary ? 'Summary: ' + artifact.summary : '',
       artifact.manifestPath ? 'Manifest: ' + artifact.manifestPath : '',
+      accumulation?.status ? 'Collection state: ' + accumulation.status : '',
+      Number(accumulation?.acceptedCount || 0) ? 'Accepted count: ' + Number(accumulation.acceptedCount || 0) : '',
+      Number(accumulation?.targetCount || 0) ? 'Target count: ' + Number(accumulation.targetCount || 0) : '',
       '',
       'Items:',
-      ...(artifact.items || []).slice(0, 8).map((entry, index) => {
-        const itemArtifact = entry?.artifact || null;
-        const lineage = entry?.lineage || null;
-        const sourceLabel = lineage?.sourceNodeLabel || lineage?.sourceNodeId || '';
-        const itemSummary = summarizeArtifact(itemArtifact, 120) || itemArtifact?.displayName || itemArtifact?.fileName || 'Item ' + (index + 1);
-        return (index + 1) + '. ' + itemSummary + (sourceLabel ? ' (from ' + sourceLabel + ')' : '');
-      }),
-      (artifact.items || []).length > 8 ? '...and ' + ((artifact.items || []).length - 8) + ' more items.' : '',
+      ...itemDescriptions,
+      items.length > itemDescriptions.length ? '...and ' + (items.length - itemDescriptions.length) + ' more items.' : '',
     ].filter(Boolean);
     return lines.join('\n').trim();
   }

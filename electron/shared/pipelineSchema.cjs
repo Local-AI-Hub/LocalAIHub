@@ -2043,6 +2043,33 @@ function formatValidationReviewKinds(directKinds = [], derivedKinds = []) {
   return segments.length === 2 ? segments[0] + ' and ' + segments[1] : segments[0];
 }
 
+function getValidationConnectedKinds(connectedKinds = []) {
+  const normalizedKinds = uniqueKindList(connectedKinds);
+  const collectionKinds = normalizedKinds.filter((kind) => isCollectionPortKind(kind));
+  const itemKinds = uniqueKindList(collectionKinds.map((kind) => getCollectionItemKind(kind)).filter(Boolean));
+  return {
+    collectionKinds,
+    itemKinds,
+    normalizedKinds,
+    resolvedKinds: uniqueKindList([...normalizedKinds, ...itemKinds]),
+  };
+}
+
+function doesValidationCapabilityAcceptKind(capabilitySummary, kind) {
+  const normalizedKind = normalizePortKind(kind);
+  if (!normalizedKind || !capabilitySummary) {
+    return false;
+  }
+
+  const supportedKinds = uniqueKindList(capabilitySummary.inputKinds || []);
+  if (supportedKinds.includes(normalizedKind)) {
+    return true;
+  }
+
+  const itemKind = getCollectionItemKind(normalizedKind);
+  return Boolean(itemKind) && supportedKinds.includes(itemKind);
+}
+
 function getValidationKindMode(capabilitySummary, kind) {
   const normalizedKind = normalizePortKind(kind);
   if (!normalizedKind || !capabilitySummary) {
@@ -2063,16 +2090,23 @@ function getValidationKindMode(capabilitySummary, kind) {
 }
 
 function getValidationReadyMessage(targetLabel, capabilitySummary, connectedKinds = []) {
-  const kinds = uniqueKindList(connectedKinds);
-  if (kinds.includes(PORT_KIND_VIDEO)) {
+  const { collectionKinds, resolvedKinds } = getValidationConnectedKinds(connectedKinds);
+  if (collectionKinds.length) {
+    const collectionLabel = collectionKinds.length === 1
+      ? formatPortKindLabel(collectionKinds[0]).toLowerCase()
+      : 'collection input';
+    return targetLabel + ' will review the connected ' + collectionLabel + ' as a whole and return a pass or fail decision.';
+  }
+
+  if (resolvedKinds.includes(PORT_KIND_VIDEO)) {
     return targetLabel + ' will review the connected video and return a pass or fail decision.';
   }
 
-  if (kinds.includes(PORT_KIND_PLAN)) {
+  if (resolvedKinds.includes(PORT_KIND_PLAN)) {
     return targetLabel + ' will review the structured plan and return a pass or fail decision.';
   }
 
-  if (kinds.includes(PORT_KIND_FILE)) {
+  if (resolvedKinds.includes(PORT_KIND_FILE)) {
     const mode = getValidationKindMode(capabilitySummary, PORT_KIND_FILE);
     if (mode === 'direct') {
       return targetLabel + ' will review the connected file and return a pass or fail decision.';
@@ -2083,7 +2117,7 @@ function getValidationReadyMessage(targetLabel, capabilitySummary, connectedKind
     }
   }
 
-  if (kinds.includes(PORT_KIND_IMAGE)) {
+  if (resolvedKinds.includes(PORT_KIND_IMAGE)) {
     return targetLabel + ' can review the connected image and return a pass or fail decision.';
   }
 
@@ -2362,8 +2396,12 @@ function buildNodeCapabilitySummary(node, contextMaps = {}) {
   const derivedInputKinds = uniqueKindList(capability.derivedInputKinds || []);
   const outputKinds = uniqueKindList(capability.outputKinds);
   const notes = String(capability.notes || '').trim();
+  const collectionSupportNote = resolved.operationId === PIPELINE_OPERATION_IDS.VALIDATION_LLM
+    && inputKinds.some((kind) => COLLECTION_ITEM_PORT_KINDS.includes(kind))
+      ? ' Same-type collections are also reviewed as whole collections in this step.'
+      : '';
   const message = resolved.operationId === PIPELINE_OPERATION_IDS.VALIDATION_LLM
-    ? resolved.targetLabel + ' can review ' + formatValidationReviewKinds(directInputKinds, derivedInputKinds) + ' in this validation step.' + (notes ? ' ' + notes : '')
+    ? resolved.targetLabel + ' can review ' + formatValidationReviewKinds(directInputKinds, derivedInputKinds) + ' in this validation step.' + collectionSupportNote + (notes ? ' ' + notes : '')
     : resolved.targetLabel + ' supports ' + formatPortKindList(inputKinds) + ' to ' + formatPortKindList(outputKinds) + ' for this step.' + (notes ? ' ' + notes : '');
   return {
     derivedInputKinds,
@@ -2456,8 +2494,8 @@ function getValidationModalitySupportState(node, capabilitySummary, contextMaps 
     };
   }
 
-  const normalizedKinds = uniqueKindList(connectedKinds);
-  if (!normalizedKinds.length) {
+  const { collectionKinds, itemKinds, resolvedKinds } = getValidationConnectedKinds(connectedKinds);
+  if (!resolvedKinds.length) {
     return {
       status: 'supported',
       message: '',
@@ -2472,14 +2510,33 @@ function getValidationModalitySupportState(node, capabilitySummary, contextMaps 
   );
   const derivedKinds = uniqueKindList(capabilitySummary.derivedInputKinds || []);
 
-  if (normalizedKinds.includes(PORT_KIND_IMAGE) && directKinds.includes(PORT_KIND_IMAGE)) {
+  if (collectionKinds.length) {
+    const collectionLabel = collectionKinds.length === 1
+      ? formatPortKindLabel(collectionKinds[0]).toLowerCase()
+      : 'ordered collection';
+    if (itemKinds.some((kind) => kind === PORT_KIND_IMAGE || kind === PORT_KIND_VIDEO || kind === PORT_KIND_AUDIO)) {
+      return {
+        status: 'limited',
+        message: targetLabel + ' will review the connected ' + collectionLabel + ' as a whole through collection metadata and per-item summaries. It will not inspect every media item as a separate attachment in this step.',
+      };
+    }
+
+    if (itemKinds.includes(PORT_KIND_FILE)) {
+      return {
+        status: 'limited',
+        message: targetLabel + ' will review the connected ' + collectionLabel + ' as a whole through collection metadata and extracted per-file evidence when available. It will not open every file as a separate attachment in this step.',
+      };
+    }
+  }
+
+  if (resolvedKinds.includes(PORT_KIND_IMAGE) && directKinds.includes(PORT_KIND_IMAGE)) {
     const imageSupport = getImageModelSupportState(node, capabilitySummary, contextMaps);
     if (imageSupport.status !== 'not-applicable') {
       return imageSupport;
     }
   }
 
-  if (normalizedKinds.includes(PORT_KIND_VIDEO)) {
+  if (resolvedKinds.includes(PORT_KIND_VIDEO)) {
     if (directKinds.includes(PORT_KIND_VIDEO)) {
       return capabilitySummary.targetKind === 'provider' && capabilitySummary.targetId === 'google'
         ? {
@@ -2498,7 +2555,7 @@ function getValidationModalitySupportState(node, capabilitySummary, contextMaps 
     };
   }
 
-  if (normalizedKinds.includes(PORT_KIND_FILE)) {
+  if (resolvedKinds.includes(PORT_KIND_FILE)) {
     if (directKinds.includes(PORT_KIND_FILE)) {
       if (capabilitySummary.targetKind === 'provider' && capabilitySummary.targetId === 'anthropic') {
         return {
@@ -3925,7 +3982,7 @@ function analyzePipeline(definition = {}, context = {}) {
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
           } else {
-            const unsupportedKinds = connectedKinds.filter((kind) => !(summary.capabilitySummary?.inputKinds || []).includes(kind));
+            const unsupportedKinds = connectedKinds.filter((kind) => !doesValidationCapabilityAcceptKind(summary.capabilitySummary, kind));
             if (unsupportedKinds.length) {
               summary.readiness = {
                 tone: 'error',

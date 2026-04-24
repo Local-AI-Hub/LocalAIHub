@@ -4,6 +4,53 @@ const path = require('path');
 const Module = require('module');
 
 const TEST_STORAGE_ROOT = path.join(process.cwd(), 'temp', 'verify-pipeline-collections');
+const providerCalls = [];
+
+function flattenProviderText(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => flattenProviderText(entry)).filter(Boolean).join(' ');
+  }
+
+  if (value && typeof value === 'object') {
+    if (typeof value.text === 'string') {
+      return value.text;
+    }
+
+    if (typeof value.content === 'string' || Array.isArray(value.content)) {
+      return flattenProviderText(value.content);
+    }
+
+    if (typeof value.input_text === 'string') {
+      return value.input_text;
+    }
+
+    return '';
+  }
+
+  return typeof value === 'string' ? value : '';
+}
+
+function buildMockProviderResponse(payload = {}) {
+  const messageText = flattenProviderText(payload.messages || []).trim();
+  if (/Validation rules:/i.test(messageText)) {
+    return JSON.stringify({
+      decision: 'pass',
+      reason: 'Mock provider approved the collection.',
+      summary: 'Mock provider approved the collection.',
+      confidence: 0.82,
+      evidenceMode: /ordered collection/i.test(messageText) ? 'structured-collection' : 'text-only',
+      criteriaResults: [
+        {
+          criterion: 'default',
+          decision: 'pass',
+          reason: 'Mock provider found the supplied evidence sufficient.',
+        },
+      ],
+    });
+  }
+
+  return 'Mock rewritten collection item.';
+}
 
 const originalLoad = Module._load;
 Module._load = function patchedModuleLoad(request, parent, isMain) {
@@ -48,9 +95,19 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
 
     if (request === './providerService') {
       return {
-        chatWithProvider: async () => ({ message: { content: 'pass' } }),
-        listProviderConnections: async () => ([]),
-        runProviderOperation: async () => ({ message: { content: '' } }),
+        chatWithProvider: async (_providerId, payload = {}) => {
+          providerCalls.push({ payload, type: 'chat' });
+          return { message: { content: buildMockProviderResponse(payload) } };
+        },
+        listProviderConnections: async () => ([{
+          id: 'openai',
+          isConnected: true,
+          name: 'Mock OpenAI',
+        }]),
+        runProviderOperation: async (_providerId, payload = {}) => {
+          providerCalls.push({ payload, type: 'operation' });
+          return { message: { content: buildMockProviderResponse(payload) } };
+        },
       };
     }
 
@@ -118,6 +175,19 @@ async function cleanupActiveRun() {
     const currentRun = getActiveRunSnapshot();
     return !currentRun || ['cancelled', 'completed', 'failed'].includes(currentRun.status) ? currentRun || true : null;
   });
+}
+
+function buildProviderContext() {
+  return {
+    hardware: null,
+    providers: [{
+      id: 'openai',
+      isConnected: true,
+      name: 'Mock OpenAI',
+    }],
+    toolCatalog: [],
+    tools: [],
+  };
 }
 
 function buildOrderedCollectionPipeline() {
@@ -260,6 +330,110 @@ function buildValidatedCollectionPipeline() {
       createEdge(validation.id, 'pass', merge.id, 'branch'),
       createEdge(validation.id, 'fail', merge.id, 'branch'),
       createEdge(merge.id, 'result', output.id, 'collection'),
+    ],
+  });
+}
+
+function buildLlmValidatedCollectionPipeline() {
+  const first = createNode('textInput', {
+    id: 'llm-validated-first',
+    label: 'First clip',
+    config: { text: 'Shot one' },
+  });
+  const second = createNode('textInput', {
+    id: 'llm-validated-second',
+    label: 'Second clip',
+    config: { text: 'Shot two' },
+  });
+  const collectionBuilder = createNode('collectionBuilder', {
+    id: 'llm-validated-builder',
+    label: 'Validated collection',
+  });
+  const validation = createNode('validation', {
+    id: 'llm-validate-collection',
+    label: 'Review collection with model',
+    config: {
+      llmExecutionMode: 'cloud',
+      mode: 'llm',
+      model: 'gpt-4o-mini',
+      providerId: 'openai',
+      ruleset: 'Pass the ordered collection when the items remain grounded, coherent, and in order.',
+    },
+  });
+  const merge = createNode('branchMerge', {
+    id: 'llm-validated-merge',
+    label: 'Validated merge',
+  });
+  const output = createNode('collectionOutput', {
+    id: 'llm-validated-output',
+    label: 'Validated output',
+    config: {
+      title: 'LLM validated scenes',
+    },
+  });
+
+  return createEmptyPipeline({
+    id: 'verify-llm-validated-collection-pipeline',
+    name: 'Verify LLM Validated Collection Pipeline',
+    nodes: [first, second, collectionBuilder, validation, merge, output],
+    edges: [
+      createEdge(first.id, 'text', collectionBuilder.id, 'items'),
+      createEdge(second.id, 'text', collectionBuilder.id, 'items'),
+      createEdge(collectionBuilder.id, 'collection', validation.id, 'input'),
+      createEdge(validation.id, 'pass', merge.id, 'branch'),
+      createEdge(validation.id, 'fail', merge.id, 'branch'),
+      createEdge(merge.id, 'result', output.id, 'collection'),
+    ],
+  });
+}
+
+function buildCollectionValidationRetryPipeline() {
+  const first = createNode('textInput', {
+    id: 'retry-collection-first',
+    label: 'First clip',
+    config: { text: 'Shot one' },
+  });
+  const second = createNode('textInput', {
+    id: 'retry-collection-second',
+    label: 'Second clip',
+    config: { text: 'Shot two' },
+  });
+  const collectionBuilder = createNode('collectionBuilder', {
+    id: 'retry-collection-builder',
+    label: 'Validated collection',
+  });
+  const validation = createNode('validation', {
+    id: 'retry-collection-validation',
+    label: 'Retry collection review',
+    config: { mode: 'user' },
+  });
+  const retryLoop = createNode('retryLoop', {
+    id: 'retry-collection-loop',
+    label: 'Retry collection loop',
+    config: {
+      maxAttempts: 3,
+      retryTargetNodeId: validation.id,
+    },
+  });
+  const output = createNode('collectionOutput', {
+    id: 'retry-collection-output',
+    label: 'Retried collection output',
+    config: {
+      title: 'Retried validated scenes',
+    },
+  });
+
+  return createEmptyPipeline({
+    id: 'verify-collection-validation-retry-pipeline',
+    name: 'Verify Collection Validation Retry Pipeline',
+    nodes: [first, second, collectionBuilder, validation, retryLoop, output],
+    edges: [
+      createEdge(first.id, 'text', collectionBuilder.id, 'items'),
+      createEdge(second.id, 'text', collectionBuilder.id, 'items'),
+      createEdge(collectionBuilder.id, 'collection', validation.id, 'input'),
+      createEdge(validation.id, 'pass', retryLoop.id, 'complete'),
+      createEdge(validation.id, 'fail', retryLoop.id, 'retry'),
+      createEdge(retryLoop.id, 'result', output.id, 'collection'),
     ],
   });
 }
@@ -499,6 +673,7 @@ async function verifyCollectionValidationPause() {
   assert.strictEqual(pausedRun.pendingValidation?.artifact?.kind, 'collection', 'Expected the validation step to receive a collection value.');
   assert.strictEqual(pausedRun.pendingValidation?.artifact?.itemKind, 'text', 'Expected the validation step to receive a typed text collection.');
   assert.strictEqual(pausedRun.pendingValidation?.artifact?.itemCount, 2, 'Expected the validation collection to contain two items.');
+  assert.strictEqual(pausedRun.pendingValidation?.reviewContext?.evidenceMode, 'whole-collection-review', 'Expected user collection validation to advertise whole-collection review.');
   assert.deepStrictEqual(
     (pausedRun.pendingValidation?.artifact?.items || []).map((entry) => entry?.artifact?.text),
     ['Shot one', 'Shot two'],
@@ -522,6 +697,87 @@ async function verifyCollectionValidationPause() {
   assert(result, 'Expected the validated collection pipeline to produce a terminal result.');
   assert.strictEqual(result.kind, 'collection', 'Expected the validated output to stay a collection.');
   assert.strictEqual(result.itemCount, 2, 'Expected the validated output to keep both ordered items.');
+}
+async function verifyLlmCollectionValidation() {
+  providerCalls.length = 0;
+  const pipeline = buildLlmValidatedCollectionPipeline();
+  const analysis = analyzePipeline(pipeline, buildProviderContext());
+  assert.strictEqual(analysis.executable, true, analysis.primaryIssue?.message || 'Expected LLM validated collection pipeline to be executable.');
+  assert.notStrictEqual(
+    analysis.nodeSummaries?.['llm-validate-collection']?.readiness?.tone,
+    'error',
+    'Expected the LLM collection validator to accept the collection input.',
+  );
+  assert(/collection/i.test(String(analysis.nodeSummaries?.['llm-validate-collection']?.readiness?.message || '')), 'Expected the LLM collection validator readiness message to mention collection review.');
+
+  const initialRun = await runPipeline(pipeline);
+  assert(initialRun?.runId, 'Expected a pipeline run id for the LLM validated collection pipeline.');
+
+  const completedRun = await waitFor('the LLM validated collection pipeline to complete', () => {
+    const run = getActiveRunSnapshot();
+    return run?.status === 'completed' && run?.runId === initialRun.runId ? run : null;
+  });
+
+  const validationState = completedRun.nodeStates?.['llm-validate-collection'] || null;
+  assert.strictEqual(validationState?.selectedBranch, 'pass', 'Expected the mock provider to pass the collection.');
+  assert.strictEqual(validationState?.validation?.evidenceMode, 'structured-collection', 'Expected LLM collection validation to record whole-collection evidence mode.');
+
+  const validationCall = providerCalls.find((entry) => flattenProviderText(entry?.payload?.messages || []).includes('Collection scope:')) || null;
+  assert(validationCall, 'Expected the mock provider to receive a collection validation request.');
+  const validationPrompt = flattenProviderText(validationCall.payload.messages || []);
+  assert(/Review the ordered collection as a whole/i.test(validationPrompt), 'Expected the collection validation prompt to describe whole-collection review.');
+  assert(/Type:\s*ordered collection/i.test(validationPrompt), 'Expected the provider prompt to include the ordered collection evidence.');
+}
+
+async function verifyCollectionValidationRetryLoop() {
+  const pipeline = buildCollectionValidationRetryPipeline();
+  const analysis = analyzePipeline(pipeline, {
+    hardware: null,
+    providers: [],
+    toolCatalog: [],
+    tools: [],
+  });
+  assert.strictEqual(analysis.executable, true, analysis.primaryIssue?.message || 'Expected collection validation retry pipeline to be executable.');
+
+  const initialRun = await runPipeline(pipeline);
+  assert(initialRun?.runId, 'Expected a pipeline run id for the collection validation retry pipeline.');
+
+  const firstPause = await waitFor('the first collection retry validation pause', () => {
+    const run = getActiveRunSnapshot();
+    return run?.status === 'paused' && run?.pendingValidation?.nodeId === 'retry-collection-validation' && run?.pendingValidation?.iteration === 1 ? run : null;
+  });
+  assert.strictEqual(firstPause.pendingValidation?.artifact?.kind, 'collection', 'Expected the retry validation step to receive a collection artifact.');
+  resumePipelineValidation(firstPause.runId, {
+    comment: 'Fail the first whole-collection review so the retry loop runs again.',
+    decision: 'fail',
+    nodeId: firstPause.pendingValidation.nodeId,
+    requestId: firstPause.pendingValidation.requestId,
+    runId: firstPause.runId,
+  });
+
+  const secondPause = await waitFor('the second collection retry validation pause', () => {
+    const run = getActiveRunSnapshot();
+    return run?.status === 'paused' && run?.pendingValidation?.nodeId === 'retry-collection-validation' && run?.pendingValidation?.iteration === 2 ? run : null;
+  });
+  assert.strictEqual(secondPause.loopStates?.['retry-collection-loop']?.attempt, 2, 'Expected the collection retry loop to advance to attempt 2 after a failed whole-collection review.');
+  assert.strictEqual(secondPause.pendingValidation?.artifact?.kind, 'collection', 'Expected the retried validation step to keep receiving a collection artifact.');
+  resumePipelineValidation(secondPause.runId, {
+    comment: 'Pass the retried whole-collection review.',
+    decision: 'pass',
+    nodeId: secondPause.pendingValidation.nodeId,
+    requestId: secondPause.pendingValidation.requestId,
+    runId: secondPause.runId,
+  });
+
+  const completedRun = await waitFor('the collection validation retry pipeline to complete', () => {
+    const run = getActiveRunSnapshot();
+    return run?.status === 'completed' && run?.runId === initialRun.runId ? run : null;
+  });
+
+  const result = completedRun.terminalResults?.[0] || null;
+  assert(result, 'Expected the collection validation retry pipeline to produce a terminal result.');
+  assert.strictEqual(result.kind, 'collection', 'Expected collection validation retry to preserve the collection output kind.');
+  assert.strictEqual(result.itemCount, 2, 'Expected collection validation retry to preserve both collection items.');
 }
 
 async function verifyAccumulateUntilTargetLoop() {
@@ -746,6 +1002,10 @@ async function main() {
   await verifyOrderedCollectionOutput();
   await cleanupActiveRun();
   await verifyCollectionValidationPause();
+  await cleanupActiveRun();
+  await verifyLlmCollectionValidation();
+  await cleanupActiveRun();
+  await verifyCollectionValidationRetryLoop();
   await cleanupActiveRun();
   await verifyAccumulateUntilTargetLoop();
   await cleanupActiveRun();

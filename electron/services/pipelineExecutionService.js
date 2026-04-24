@@ -54,6 +54,7 @@ const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities,
 const {
   PIPELINE_OPERATION_IDS,
   PORT_KIND_AUDIO,
+  PORT_KIND_COLLECTION,
   PORT_KIND_COMPOSITION,
   PORT_KIND_FILE,
   PORT_KIND_IMAGE,
@@ -751,6 +752,9 @@ function resetLoopSegmentForRetry(run, graph, loopNodeId, nextAttempt) {
   loopState.attempt = nextAttempt;
   loopState.status = 'retrying';
   resetNestedLoopStatesForRetry(run, graph, loopNodeId);
+  if (isArtifactCollection(loopState.carriedArtifact)) {
+    resetCollectionControlStatesForLoop(run, graph, loopNodeId);
+  }
 
   for (const segmentNodeId of loopMeta.segmentExecutionOrder) {
     delete run.resultsByNodeId[segmentNodeId];
@@ -1226,8 +1230,12 @@ function getValidationEvidenceModeLabel(reviewContext = {}) {
       return 'The validator cannot open the raw file directly here, so Local AI Hub is sending extracted document text and metadata.';
     case 'derived-image-description':
       return 'The validator is relying on extracted image description and metadata instead of a direct image attachment.';
+    case 'structured-collection':
+      return 'The validator is reviewing an ordered collection as a whole using Local AI Hub collection evidence.';
     case 'structured-plan':
       return 'The validator is reviewing a structured Plan artifact with Local AI Hub plan-review evidence.';
+    case 'whole-collection-review':
+      return 'The validator is paused so you can review the ordered collection as a whole.';
     case 'text-only':
       return 'The validator is reviewing plain text only.';
     default:
@@ -1235,6 +1243,13 @@ function getValidationEvidenceModeLabel(reviewContext = {}) {
   }
 }
 
+function getUserValidationEvidenceMode(artifact, planReview) {
+  if (isArtifactCollection(artifact)) {
+    return 'whole-collection-review';
+  }
+
+  return planReview ? 'structured-plan' : 'user-review';
+}
 function canAttachValidationFileDirectly(node, artifact, profile) {
   if (!profile?.directKinds?.includes(PORT_KIND_FILE) || !artifact?.filePath || node?.config?.llmExecutionMode === 'ollama') {
     return false;
@@ -1261,6 +1276,9 @@ function buildValidationPrompt(node, artifactDescription, reviewContext) {
   const ruleset = String(node.config?.ruleset || '').trim() || 'Decide whether this artifact should pass or fail based on the available evidence.';
   const sections = [
     'Validation rules:\n' + ruleset,
+    reviewContext?.artifactKind === PORT_KIND_COLLECTION
+      ? 'Collection scope:\nReview the ordered collection as a whole. Do not fan out into separate per-item pass or fail decisions unless the ruleset explicitly asks for commentary about individual items.'
+      : '',
     'Evidence mode:\n' + getValidationEvidenceModeLabel(reviewContext),
     reviewContext?.limitations?.length ? 'Evidence limitations:\n- ' + reviewContext.limitations.join('\n- ') : '',
     'Artifact to review:\n' + artifactDescription,
@@ -1271,7 +1289,6 @@ function buildValidationPrompt(node, artifactDescription, reviewContext) {
   ].filter(Boolean);
   return sections.join('\n\n');
 }
-
 async function buildLlmMessages(node, inputArtifact) {
   const instruction = String(node.config?.instruction || '').trim();
   const systemPrompt = String(node.config?.systemPrompt || '').trim();
@@ -1918,7 +1935,14 @@ async function buildValidationMessages(node, artifact, contextMaps) {
   const planReview = buildPlanValidationReview(artifact);
   let evidenceMode = artifact?.kind === PORT_KIND_TEXT ? 'text-only' : artifact?.kind === PORT_KIND_PLAN ? 'structured-plan' : 'summary-only';
 
-  if (artifact?.kind === PORT_KIND_IMAGE) {
+  if (isArtifactCollection(artifact)) {
+    evidenceMode = 'structured-collection';
+    if (artifact?.itemKind === PORT_KIND_FILE) {
+      limitations.push('This validator is reviewing the ordered collection as a whole through collection metadata and extracted per-file evidence when available. It is not opening every file as a separate attachment in this step.');
+    } else if (artifact?.itemKind === PORT_KIND_IMAGE || artifact?.itemKind === PORT_KIND_VIDEO || artifact?.itemKind === PORT_KIND_AUDIO) {
+      limitations.push('This validator is reviewing the ordered collection as a whole through collection metadata and per-item summaries. It is not inspecting every media item as a separate attachment in this step.');
+    }
+  } else if (artifact?.kind === PORT_KIND_IMAGE) {
     if (profile.directKinds.includes(PORT_KIND_IMAGE) && artifact.filePath) {
       attachments.push(await buildImageMessageContentPart(artifact));
       evidenceMode = 'direct-image';
@@ -1986,7 +2010,6 @@ async function buildValidationMessages(node, artifact, contextMaps) {
     reviewContext,
   };
 }
-
 function clampValidationConfidence(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
@@ -2217,6 +2240,16 @@ async function buildValidationArtifactDescription(artifact, contextMaps) {
     }
   }
 
+  if (artifact?.kind === PORT_KIND_COLLECTION) {
+    if (artifact?.itemKind === PORT_KIND_FILE) {
+      description += '\n\nLocal AI Hub is validating this ordered collection as a whole. Per-file extracted text is included when available, but the raw files are not attached one by one in this pass.';
+    } else if (artifact?.itemKind === PORT_KIND_IMAGE || artifact?.itemKind === PORT_KIND_VIDEO || artifact?.itemKind === PORT_KIND_AUDIO) {
+      description += '\n\nLocal AI Hub is validating this ordered collection as a whole using collection metadata and per-item summaries. It is not attaching every media item separately in this pass.';
+    } else {
+      description += '\n\nLocal AI Hub is validating this ordered collection as a whole rather than fanning out into separate per-item validation passes.';
+    }
+  }
+
   if (artifact?.kind === PORT_KIND_IMAGE && artifact.isAnimated) {
     description = `${description}\n\nThis image is animated rather than a single still frame.`;
   }
@@ -2252,7 +2285,6 @@ async function buildValidationArtifactDescription(artifact, contextMaps) {
 
   return description;
 }
-
 async function waitForUserValidation(run, node, artifact) {
   if (pendingValidationControl) {
     throw new Error('Local AI Hub is already waiting on another validation decision.');
@@ -2260,6 +2292,7 @@ async function waitForUserValidation(run, node, artifact) {
 
   const nodeState = run.nodeStates[node.id];
   const planReview = buildPlanValidationReview(artifact);
+  const evidenceMode = getUserValidationEvidenceMode(artifact, planReview);
   const iteration = Number(nodeState?.iteration || 1);
   const loopMaxAttempts = Number(nodeState?.loopMaxAttempts || 0) || null;
   const loopPathLabel = String(nodeState?.loopPathLabel || '').trim();
@@ -2275,7 +2308,7 @@ async function waitForUserValidation(run, node, artifact) {
     planReview: planReview ? serializeArtifactForUi(planReview) : null,
     reviewContext: {
       artifactKind: String(artifact?.kind || '').trim(),
-      evidenceMode: planReview ? 'structured-plan' : 'user-review',
+      evidenceMode,
       limitations: [],
       planReview: planReview ? serializeArtifactForUi(planReview) : null,
     },
@@ -2327,25 +2360,26 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
 
   if (node.config?.mode !== 'llm') {
     const planReview = buildPlanValidationReview(artifact);
+    const evidenceMode = getUserValidationEvidenceMode(artifact, planReview);
     const decision = await waitForUserValidation(run, node, artifact);
     const selectedBranch = decision?.decision === 'pass' ? 'pass' : 'fail';
     const reason = decision?.comment ? `User note: ${decision.comment}` : `User selected ${selectedBranch}.`;
     const validationResult = {
       decision: selectedBranch,
-      evidenceMode: planReview ? 'structured-plan' : 'user-review',
+      evidenceMode,
       mode: 'user',
       planReview: planReview ? serializeArtifactForUi(planReview) : null,
       reason,
       reviewContext: {
         artifactKind: String(artifact?.kind || '').trim(),
-        evidenceMode: planReview ? 'structured-plan' : 'user-review',
+        evidenceMode,
         limitations: [],
         planReview: planReview ? serializeArtifactForUi(planReview) : null,
       },
       summary: reason,
     };
     return {
-      message: `Validation routed this item to ${selectedBranch}.`,
+      message: `Validation routed this artifact to ${selectedBranch}.`,
       outputs: {
         [selectedBranch]: attachPlanValidationResult(artifact, validationResult),
       },
