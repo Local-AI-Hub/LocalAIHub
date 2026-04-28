@@ -2,7 +2,7 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const { runCommand } = require('./commandService');
-const { getProviderSecret } = require('./credentialService');
+const { resolveProviderCredential } = require('./credentialService');
 const { listDownloadedModels } = require('./modelService');
 const { listOllamaModels } = require('./ollamaService');
 const { detectHardwareSnapshot } = require('./hardwareService');
@@ -459,9 +459,10 @@ async function resolveAiderLaunchSelection({ providerId, modelId, ollamaTool, pr
     throw new Error(`Local AI Hub could not map ${provider.name}'s selected model into an Aider launch profile.`);
   }
 
-  const providerSecret = await getProviderSecret(provider.id).catch(() => '');
-  if (!String(providerSecret || '').trim()) {
-    throw new Error(`Reconnect ${provider.name} before launching Aider. Local AI Hub could not read its saved API key.`);
+  const providerCredential = await resolveProviderCredential(provider.id).catch(() => null);
+  const providerSecret = String(providerCredential?.apiKey || '').trim();
+  if (!providerSecret) {
+    throw new Error(`Connect ${provider.name} before launching Aider. Local AI Hub could not find a saved API key or supported environment variable.`);
   }
 
   if (protocol === 'openai-compatible') {

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 import pipelineWizardShared from '../../electron/shared/pipelineWizard.cjs';
+import pipelineWizardLifecycleShared from '../../electron/shared/pipelineWizardLifecycle.cjs';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
   GRAPH_WORKFLOW_TOOL_IDS,
@@ -24,8 +25,17 @@ const {
   buildPipelineWizardContext,
   buildPipelineWizardDraft,
   buildPipelineWizardMessages,
+  buildPipelineWizardStructuredOutputRequest,
   parsePipelineWizardPlan,
 } = pipelineWizardShared;
+
+const {
+  WIZARD_CLOUD_DRAFT_TIMEOUT_MS,
+  WIZARD_CLIENT_TIMEOUT_GRACE_MS,
+  WIZARD_LOCAL_DRAFT_TIMEOUT_MS,
+  buildWizardFailureSummary,
+  runPipelineWizardLifecycle,
+} = pipelineWizardLifecycleShared;
 
 const {
   arePortsCompatible,
@@ -38,6 +48,8 @@ const {
   getGraphWorkflowInputBinding,
   getGraphWorkflowOutputBinding,
   getGraphWorkflowOutputNodeOptions,
+  getGraphWorkflowOperationBackendSupport,
+  getPipelineNodePorts,
   getPortDefinition,
   parseGraphWorkflowDefinitionText,
   AUDIO_TRANSFORM_TOOL_IDS,
@@ -607,6 +619,11 @@ function buildNodePreview(node, runState) {
   if (node.type === 'collectionAccumulator') {
     return 'Target ' + Math.max(1, Number(node.config?.targetCount || 3) || 3) + ' | keeps accepted items from one or more branches until the collection is ready';
   }
+  if (node.type === 'collectionMap') {
+    const modeLabel = node.config?.executionMode === 'localTool' ? (node.config?.toolId || 'Local image tool') : (node.config?.providerId || 'Cloud provider');
+    return 'Text collection to image collection | ' + modeLabel;
+  }
+
 
   if (node.type === 'mediaComposition') {
     return `${Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4)}s per image | optional narration + music`;
@@ -951,20 +968,29 @@ function getAssistantReplyText(result) {
   return String(result?.data?.content || result?.data?.text || '').trim();
 }
 
+function getWizardModelId(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return String(value.id || value.model || value.modelId || value.name || value.label || '').trim();
+  }
+  return String(value || '').trim();
+}
+
 function getWizardTargetLabel(target, providers = []) {
+  const model = getWizardModelId(target.model);
   if (target.mode === 'ollama') {
-    return target.model ? `Ollama | ${target.model}` : 'Ollama';
+    return model ? `Ollama | ${model}` : 'Ollama';
   }
 
   const provider = providers.find((entry) => entry.id === target.providerId);
-  return [provider?.name || target.providerId || 'Cloud provider', target.model].filter(Boolean).join(' | ');
+  return [provider?.name || target.providerId || 'Cloud provider', model].filter(Boolean).join(' | ');
 }
 
 function buildWizardModelOption(model) {
+  const id = getWizardModelId(model);
   return {
     ...model,
-    id: String(model?.id || model?.name || '').trim(),
-    label: String(model?.label || model?.name || model?.id || '').trim(),
+    id,
+    label: String(model?.label || model?.name || id || '').trim(),
     detail: buildModelOptionDetail(model) || model?.detail || '',
   };
 }
@@ -1981,8 +2007,9 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
         ? 'Choose Upscayl or FaceFusion'
         : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
           ? 'Choose Wan2.1 WebUI'
-          : 'Choose Automatic1111 or Forge';
-  const selectedLocalToolId = String(node.config?.toolId || localToolOptions[0]?.id || '').trim();
+          : 'Auto (best ready local backend)';
+  const isLocalImageGenerationMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  const selectedLocalToolId = String(node.config?.toolId || (isLocalImageGenerationMode ? '' : localToolOptions[0]?.id || '')).trim();
   const selectedLocalTool = localToolOptions.find((tool) => tool.id === selectedLocalToolId) || null;
   const isLocalAudioMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE;
   const isLocalAudioTransformMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM;
@@ -2028,7 +2055,9 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                       : localImageTools;
               const currentToolId = String(currentNode.config?.toolId || '').trim();
               const nextToolId = nextExecutionMode === 'localTool'
-                ? (nextLocalToolOptions.some((tool) => tool.id === currentToolId) ? currentToolId : nextLocalToolOptions[0]?.id || '')
+                ? (nextOperationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+                  ? (nextLocalToolOptions.some((tool) => tool.id === currentToolId) ? currentToolId : '')
+                  : (nextLocalToolOptions.some((tool) => tool.id === currentToolId) ? currentToolId : nextLocalToolOptions[0]?.id || ''))
                 : currentToolId;
 
               return {
@@ -2117,7 +2146,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                   ? 'This mode runs a single local image-to-image transformation and returns a transformed image artifact with source lineage. Use Upscayl for enhancement and upscaling, or FaceFusion when you also connect a Reference Image.'
                   : isLocalVideoMode
                     ? 'This mode runs a single local Wan video request inside the sequential pipeline. Use the Graph Workflow step when you want graph-native video generation through ComfyUI.'
-                    : 'This mode runs a single Automatic1111 or Forge image request inside the current sequential pipeline. Use the Graph Workflow step when you need a graph-native tool such as ComfyUI.'}
+                    : 'This mode runs a single local image request through the best ready WebUI-compatible backend when Auto is selected. Use the Graph Workflow step when you need a graph-native tool such as ComfyUI.'}
           </div>
         </div>
       ) : (
@@ -2263,6 +2292,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const [wizardBusy, setWizardBusy] = useState(false);
   const [wizardSummary, setWizardSummary] = useState(null);
   const canvasRef = useRef(null);
+  const wizardRequestIdRef = useRef(0);
   const dragRef = useRef(null);
   const notifiedRunStateRef = useRef('');
   const outputRefreshKeyRef = useRef('');
@@ -2310,10 +2340,10 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const wizardTarget = useMemo(() => ({
     mode: wizardExecutionMode === 'ollama' ? 'ollama' : 'cloud',
     providerId: wizardExecutionMode === 'cloud' ? wizardProviderId : '',
-    model: wizardModel,
+    model: getWizardModelId(wizardModel),
   }), [wizardExecutionMode, wizardModel, wizardProviderId]);
   const selectedWizardModelOption = useMemo(
-    () => wizardModelOptions.find((model) => model.id === wizardModel) || null,
+    () => wizardModelOptions.find((model) => model.id === getWizardModelId(wizardModel)) || null,
     [wizardModel, wizardModelOptions],
   );
   const audioTools = useMemo(() => (tools || []).filter((tool) => AUDIO_WORKFLOW_TOOL_IDS.includes(tool.id) && !AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
@@ -2384,6 +2414,45 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const graphWorkflowVideoOutputNodeOptions = useMemo(
     () => getGraphWorkflowOutputNodeOptions(selectedGraphWorkflowDefinition, 'video'),
     [selectedGraphWorkflowDefinition],
+  );
+  const collectionMapGraphWorkflowTool = useMemo(
+    () => (selectedNode?.type === 'collectionMap'
+      ? graphWorkflowTools.find((tool) => tool.id === (selectedNode.config?.graphWorkflowToolId || graphWorkflowTools[0]?.id || '')) || null
+      : null),
+    [graphWorkflowTools, selectedNode],
+  );
+  const collectionMapGraphWorkflowContract = useMemo(
+    () => (selectedNode?.type === 'collectionMap'
+      ? getGraphWorkflowContract(selectedNode.config?.graphWorkflowToolId || collectionMapGraphWorkflowTool?.id || graphWorkflowTools[0]?.id || '')
+      : null),
+    [collectionMapGraphWorkflowTool, graphWorkflowTools, selectedNode],
+  );
+  const collectionMapGraphWorkflowDefinition = useMemo(
+    () => (selectedNode?.type === 'collectionMap'
+      ? parseGraphWorkflowDefinitionText(selectedNode.config?.graphWorkflowToolId || collectionMapGraphWorkflowTool?.id || '', selectedNode.config?.workflowText)
+      : null),
+    [collectionMapGraphWorkflowTool, selectedNode],
+  );
+  const collectionMapGraphWorkflowSupport = useMemo(
+    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowOperationBackendSupport(selectedNode) : null),
+    [selectedNode],
+  );
+  const collectionMapGraphWorkflowNodeOptions = collectionMapGraphWorkflowDefinition?.nodeEntries || [];
+  const collectionMapGraphWorkflowTextBinding = useMemo(
+    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowInputBinding(selectedNode, 'text') : null),
+    [selectedNode],
+  );
+  const collectionMapGraphWorkflowImageOutputBinding = useMemo(
+    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowOutputBinding(selectedNode, 'image') : null),
+    [selectedNode],
+  );
+  const collectionMapGraphWorkflowTextFieldOptions = useMemo(
+    () => getGraphWorkflowFieldOptions(collectionMapGraphWorkflowDefinition, collectionMapGraphWorkflowTextBinding?.nodeId, 'text'),
+    [collectionMapGraphWorkflowDefinition, collectionMapGraphWorkflowTextBinding?.nodeId],
+  );
+  const collectionMapGraphWorkflowImageOutputNodeOptions = useMemo(
+    () => getGraphWorkflowOutputNodeOptions(collectionMapGraphWorkflowDefinition, 'image'),
+    [collectionMapGraphWorkflowDefinition],
   );
   const currentPipelineSaved = useMemo(() => pipelines.some((pipeline) => pipeline.id === draft.id), [pipelines, draft.id]);
   const activeSavedPipeline = useMemo(() => pipelines.find((pipeline) => pipeline.id === draft.id) || null, [pipelines, draft.id]);
@@ -2496,6 +2565,28 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       nodes: current.nodes.map((node) => (node.id === nodeId ? updater(node) : node)),
     }));
     markDirty();
+  }
+
+  function updateCollectionMapExecutionMode(nodeId, nextMode) {
+    updateNode(nodeId, (currentNode) => {
+      const executionMode = nextMode === 'localTool' ? 'localTool' : nextMode === 'graphWorkflow' ? 'graphWorkflow' : 'cloud';
+      const graphToolId = String(currentNode.config?.graphWorkflowToolId || graphWorkflowTools[0]?.id || 'comfyui').trim();
+      const graphDefaults = getDefaultGraphWorkflowBindings(graphToolId);
+      return {
+        ...currentNode,
+        config: {
+          ...currentNode.config,
+          executionMode,
+          graphWorkflowToolId: executionMode === 'graphWorkflow' ? graphToolId : currentNode.config?.graphWorkflowToolId || '',
+          inputBindings: executionMode === 'graphWorkflow' ? (currentNode.config?.inputBindings || graphDefaults.inputBindings) : currentNode.config?.inputBindings,
+          outputBindings: executionMode === 'graphWorkflow' ? (currentNode.config?.outputBindings || graphDefaults.outputBindings) : currentNode.config?.outputBindings,
+          providerId: executionMode === 'cloud' ? currentNode.config?.providerId || '' : '',
+          toolId: executionMode === 'localTool' ? currentNode.config?.toolId || '' : '',
+          workflowFormat: executionMode === 'graphWorkflow' ? currentNode.config?.workflowFormat || graphDefaults.workflowFormat : currentNode.config?.workflowFormat,
+          workflowText: executionMode === 'graphWorkflow' ? currentNode.config?.workflowText || '' : currentNode.config?.workflowText,
+        },
+      };
+    });
   }
 
   function updateGraphWorkflowInputBinding(nodeId, portId, nextBinding) {
@@ -2970,8 +3061,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   function connectPorts(sourceNodeId, sourcePortId, targetNodeId, targetPortId) {
     const sourceNode = draft.nodes.find((node) => node.id === sourceNodeId);
     const targetNode = draft.nodes.find((node) => node.id === targetNodeId);
-    const sourcePort = getPortDefinition(sourceNode?.type, 'output', sourcePortId);
-    const targetPort = getPortDefinition(targetNode?.type, 'input', targetPortId);
+    const sourcePort = getPortDefinition(sourceNode, 'output', sourcePortId);
+    const targetPort = getPortDefinition(targetNode, 'input', targetPortId);
 
     if (!sourceNode || !targetNode || !sourcePort || !targetPort) {
       onToast('Local AI Hub could not create that connection.', 'error');
@@ -3031,7 +3122,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     const sourceNode = draft.nodes.find((node) => node.id === pendingConnection.sourceNodeId);
-    const sourcePort = getPortDefinition(sourceNode?.type, 'output', pendingConnection.sourcePortId);
+    const sourcePort = getPortDefinition(sourceNode, 'output', pendingConnection.sourcePortId);
     if (!sourceNode || !sourcePort) {
       return false;
     }
@@ -3358,7 +3449,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     const models = (result.data?.models || []).map((model) => buildWizardModelOption(model)).filter((model) => model.id);
     setWizardModelOptions(models);
     if (!wizardModel && (result.data?.selectedModel || models[0]?.id)) {
-      setWizardModel(result.data?.selectedModel || models[0].id);
+      setWizardModel(getWizardModelId(result.data?.selectedModel) || models[0].id);
     }
     setWizardModelsBusy(false);
   }
@@ -3375,7 +3466,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       return;
     }
 
-    if (!String(wizardModel || '').trim()) {
+    const wizardModelId = getWizardModelId(wizardModel);
+    if (!wizardModelId) {
       onToast('Choose a model for the wizard first.', 'error');
       return;
     }
@@ -3387,115 +3479,108 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       }
     }
 
+    const requestId = wizardRequestIdRef.current + 1;
+    wizardRequestIdRef.current = requestId;
+    const isCurrentWizardRequest = () => wizardRequestIdRef.current === requestId;
     setWizardBusy(true);
     setWizardSummary(null);
-    const messages = buildPipelineWizardMessages({
-      context: wizardContext,
-      intent: normalizedIntent,
-      wizardTarget,
-    });
-    const targetLabel = getWizardTargetLabel(wizardTarget, connectedProviders);
-    const result = wizardExecutionMode === 'ollama'
-      ? await window.localAIHub.chatWithOllama({
-          messages,
-          model: wizardModel,
-          timeoutMessage: 'Ollama took too long to draft the pipeline. Local AI Hub will keep this failure bounded; for complex workflows on this hardware, try a simpler request, a stronger downloaded model, or a cloud wizard model.',
-          timeoutMs: 300000,
-          format: 'json',
-          options: { temperature: 0.1, num_predict: 700, num_ctx: 2048 },
-          autoStart: true,
-          launchContext: 'pipeline-wizard-draft',
-        })
-      : await window.localAIHub.chatWithProvider({
-          messages,
-          model: wizardModel,
-          providerId: wizardProviderId,
-          timeoutMessage: targetLabel + ' took too long to draft the pipeline. Try again with a shorter workflow request.',
-          timeoutMs: 90000,
-        });
 
-    if (!result?.ok) {
-      const message = result?.message || 'Local AI Hub could not ask that model to draft a pipeline.';
-      const localTimedOut = wizardExecutionMode === 'ollama' && /took too long|timed out|timeout|empty reply|memory|allocat/i.test(message);
-      if (localTimedOut) {
-        const fallbackPlan = parsePipelineWizardPlan('', { intent: normalizedIntent });
-        const fallbackDraft = buildPipelineWizardDraft({
-          context: wizardContext,
-          intent: normalizedIntent,
-          modelPlan: fallbackPlan,
-          wizardTarget,
-        });
-        replaceDraft(fallbackDraft.pipeline, {
-          dirty: true,
-          selectedNodeId: fallbackDraft.pipeline.nodes[0]?.id || '',
-        });
-        setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
-        setWizardBusy(false);
-        const recoveredSummary = fallbackDraft.summary?.resultState === 'placeholder'
-          ? {
-              ...fallbackDraft.summary,
-              message: 'The selected local wizard model did not return a usable plan. ' + fallbackDraft.summary.message,
-              gaps: [...new Set([...(fallbackDraft.summary?.gaps || []), 'The selected local wizard model did not return a usable plan.', 'This placeholder may be much shallower than the workflow you requested.'])],
-              manualRefinementNotes: [...new Set([...(fallbackDraft.summary?.manualRefinementNotes || []), 'Treat this as a starting placeholder, not a completed wizard plan. Use a stronger downloaded local model or cloud wizard model for complex multi-stage drafting.'])],
-            }
-          : {
-              ...fallbackDraft.summary,
-              headline: fallbackDraft.summary?.resultState === 'repaired'
-                ? 'Recovered draft created after model failure'
-                : fallbackDraft.summary.headline,
-              message: 'The selected local wizard model did not return a usable plan. ' + fallbackDraft.summary.message,
-              gaps: [...new Set([...(fallbackDraft.summary?.gaps || []), 'The selected local wizard model did not return a usable plan.'])],
-              manualRefinementNotes: [...new Set([...(fallbackDraft.summary?.manualRefinementNotes || []), 'Review this recovered draft carefully before running. Local AI Hub rebuilt it from the request after the local model failed.'])],
-            };
-        setWizardSummary(recoveredSummary);
-        onToast(
-          recoveredSummary.resultState === 'placeholder'
-            ? 'Local model did not produce a usable plan; inserted a simple fallback placeholder.'
-            : 'Local model did not produce a usable plan; Local AI Hub recovered an editable draft from built-in rules.',
-          'info',
-        );
+    const targetLabel = getWizardTargetLabel({ ...wizardTarget, model: wizardModelId }, connectedProviders);
+    const requestTimeoutMs = wizardExecutionMode === 'ollama'
+      ? WIZARD_LOCAL_DRAFT_TIMEOUT_MS
+      : WIZARD_CLOUD_DRAFT_TIMEOUT_MS;
+    const timeoutMessage = wizardExecutionMode === 'ollama'
+      ? 'Ollama took too long to draft the pipeline. Local AI Hub kept the request bounded; for complex workflows on this hardware, try a simpler request, a stronger downloaded model, or a cloud wizard model.'
+      : 'The wizard model did not return a draft within the allowed time. Try a simpler request, a stronger model, or split the workflow into stages.';
+
+    try {
+      const messages = buildPipelineWizardMessages({
+        context: wizardContext,
+        intent: normalizedIntent,
+        wizardTarget: { ...wizardTarget, model: wizardModelId },
+      });
+      const lifecycleResult = await runPipelineWizardLifecycle({
+        context: wizardContext,
+        intent: normalizedIntent,
+        targetLabel,
+        wizardTarget: { ...wizardTarget, model: wizardModelId },
+        timeoutMessage,
+        timeoutMs: requestTimeoutMs + WIZARD_CLIENT_TIMEOUT_GRACE_MS,
+        getReplyText: getAssistantReplyText,
+        parsePlan: parsePipelineWizardPlan,
+        buildDraft: buildPipelineWizardDraft,
+        requestModelDraft: () => wizardExecutionMode === 'ollama'
+          ? window.localAIHub.chatWithOllama({
+              messages,
+              model: wizardModelId,
+              timeoutMessage,
+              timeoutMs: requestTimeoutMs,
+              format: 'json',
+              options: { temperature: 0.1, num_predict: 700, num_ctx: 2048 },
+              autoStart: true,
+              launchContext: 'pipeline-wizard-draft',
+            })
+          : window.localAIHub.chatWithProvider({
+              messages,
+              model: wizardModelId,
+              providerId: wizardProviderId,
+              timeoutMessage,
+              timeoutMs: requestTimeoutMs,
+              maxOutputTokens: 4096,
+              responseFormat: buildPipelineWizardStructuredOutputRequest(),
+            }),
+      });
+
+      if (!isCurrentWizardRequest()) {
         return;
       }
-      setWizardBusy(false);
-      setWizardSummary({
-        recipeId: '',
-        recipeLabel: 'Wizard model error',
-        targetLabel,
-        headline: 'Wizard draft was not created',
-        message,
-        gaps: ['No draft pipeline was inserted. Fix the local model issue and try again.'],
-        manualRefinementNotes: [],
-        graphErrorCount: 1,
-        graphWarningCount: 0,
+
+      if (!lifecycleResult?.ok || !lifecycleResult.draftResult?.pipeline) {
+        const summary = lifecycleResult?.summary || buildWizardFailureSummary({
+          category: lifecycleResult?.diagnosticCategory || 'ui-ipc-failure',
+          message: 'Local AI Hub could not finish this wizard request.',
+          targetLabel,
+        });
+        setWizardSummary(summary);
+        onToast(summary.message || 'Local AI Hub could not finish this wizard request.', 'error');
+        return;
+      }
+
+      const draftResult = lifecycleResult.draftResult;
+      replaceDraft(draftResult.pipeline, {
+        dirty: true,
+        selectedNodeId: draftResult.pipeline.nodes[0]?.id || '',
       });
+      setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
+      setWizardSummary(draftResult.summary);
+
+      const needsAttention = draftResult.summary?.graphErrorCount > 0 || draftResult.analysis?.primaryIssue?.tone === 'error';
+      const recovered = Boolean(lifecycleResult.recovered || draftResult.summary?.diagnosticCategory);
+      onToast(
+        recovered
+          ? 'The wizard model path failed, but Local AI Hub recovered an editable draft from built-in rules.'
+          : needsAttention
+            ? 'The wizard created an editable draft, but it still needs attention before running.'
+            : 'The wizard created an editable draft pipeline.',
+        needsAttention || recovered ? 'info' : 'success',
+      );
+    } catch (error) {
+      if (!isCurrentWizardRequest()) {
+        return;
+      }
+      const message = error?.message || 'Local AI Hub could not finish this wizard request.';
+      const summary = buildWizardFailureSummary({
+        category: 'ui-ipc-failure',
+        message,
+        targetLabel,
+      });
+      setWizardSummary(summary);
       onToast(message, 'error');
-      return;
+    } finally {
+      if (isCurrentWizardRequest()) {
+        setWizardBusy(false);
+      }
     }
-
-    const replyText = getAssistantReplyText(result);
-    const modelPlan = parsePipelineWizardPlan(replyText, { intent: normalizedIntent });
-    const draftResult = buildPipelineWizardDraft({
-      context: wizardContext,
-      intent: normalizedIntent,
-      modelPlan,
-      wizardTarget,
-    });
-
-    replaceDraft(draftResult.pipeline, {
-      dirty: true,
-      selectedNodeId: draftResult.pipeline.nodes[0]?.id || '',
-    });
-    setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
-    setWizardSummary(draftResult.summary);
-    setWizardBusy(false);
-
-    const needsAttention = draftResult.summary?.graphErrorCount > 0 || draftResult.analysis?.primaryIssue?.tone === 'error';
-    onToast(
-      needsAttention
-        ? 'The wizard created an editable draft, but it still needs attention before running.'
-        : 'The wizard created an editable draft pipeline.',
-      needsAttention ? 'info' : 'success',
-    );
   }
   async function chooseNodeFile(nodeId, kind) {
     const result = await window.localAIHub.pickPipelineFile({ kind });
@@ -4156,14 +4241,15 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
                 {selectedNode.type === 'imageAnalyze' ? (
                   <div className="space-y-4">
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-tool">Execution tool</label><select className="store-input mt-3" id="image-analyze-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-tool">Execution tool</label><select className="store-input mt-3" id="image-analyze-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto (best ready local backend)</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
                     <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-analyze-mode">Analysis mode</label><select className="store-input mt-3" id="image-analyze-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: event.target.value } }))} value={selectedNode.config?.analysisMode || 'clip'}><option value="clip">CLIP caption</option><option value="deepdanbooru">DeepDanbooru tags</option></select></div>
                   </div>
                 ) : null}
 
                 {selectedNode.type === 'imageGenerate' ? (
                   <div className="space-y-4">
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-generate-tool">Execution tool</label><select className="store-input mt-3" id="image-generate-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto-detect running tool</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-generate-tool">Local backend</label><select className="store-input mt-3" id="image-generate-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: '', toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto (best ready local backend)</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-generate-model">Checkpoint override</label><input className="store-input mt-3" id="image-generate-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder="Use backend's currently loaded checkpoint" value={selectedNode.config?.model || ''} /><p className="mt-2 text-xs leading-5 text-slate-500">Leave blank to use the selected backend's current checkpoint. Pick Forge or Automatic1111 when you want to force a checkpoint file name.</p></div>
                     <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-width">Width</label><input className="store-input mt-3" id="image-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-height">Height</label><input className="store-input mt-3" id="image-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
                     <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-steps">Steps</label><input className="store-input mt-3" id="image-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-cfg">CFG scale</label><input className="store-input mt-3" id="image-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="image-seed">Seed</label><input className="store-input mt-3" id="image-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
                     <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for the image step." value={selectedNode.config?.negativePrompt || ''} /></div>
@@ -4664,6 +4750,55 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                   </div>
                 ) : null}
 
+                {selectedNode.type === 'collectionMap' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-mode">Execution mode</label>
+                      <select
+                        className="store-input mt-3"
+                        id="collection-map-mode"
+                        onChange={(event) => updateCollectionMapExecutionMode(selectedNode.id, event.target.value)}
+                        value={selectedNode.config?.executionMode === 'graphWorkflow' ? 'graphWorkflow' : selectedNode.config?.executionMode === 'localTool' ? 'localTool' : 'cloud'}
+                      >
+                        <option value="cloud">Cloud image provider</option>
+                        <option value="localTool">Local image tool</option>
+                        <option value="graphWorkflow">Configured graph workflow</option>
+                      </select>
+                    </div>
+                    {selectedNode.config?.executionMode === 'graphWorkflow' ? (
+                      <div className="space-y-4">
+                        <div className="rounded-[24px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3 text-sm leading-6 text-cyan-100">
+                          Use a real graph workflow boundary here. Paste the workflow JSON, map the Text input, and choose a final Image output node; Local AI Hub will run that workflow once per collection item.
+                        </div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-tool">Graph workflow tool</label><select className="store-input mt-3" id="collection-map-graph-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => { const nextToolId = event.target.value; const nextBindings = getDefaultGraphWorkflowBindings(nextToolId); return { ...currentNode, config: { ...currentNode.config, graphWorkflowToolId: nextToolId, inputBindings: nextBindings.inputBindings, outputBindings: nextBindings.outputBindings, toolId: '', workflowFormat: nextBindings.workflowFormat, workflowText: '' } }; })} value={selectedNode.config?.graphWorkflowToolId || graphWorkflowTools[0]?.id || ''}><option value="">Choose a graph workflow tool</option>{graphWorkflowTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select><p className="mt-2 text-xs leading-5 text-slate-500">ComfyUI and InvokeAI stay graph-native. They are only usable here after this workflow boundary is configured.</p></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-json">Workflow definition</label><textarea className="store-input mt-3 min-h-[180px] resize-none font-mono text-xs leading-6" id="collection-map-graph-json" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, workflowText: event.target.value } }))} placeholder={collectionMapGraphWorkflowContract?.workflowFormat?.placeholder || 'Paste the workflow definition here.'} value={selectedNode.config?.workflowText || ''} />{collectionMapGraphWorkflowDefinition ? <p className={'mt-2 text-xs leading-5 ' + (collectionMapGraphWorkflowDefinition.ok ? 'text-emerald-200' : 'text-amber-200')}>{collectionMapGraphWorkflowDefinition.message}</p> : null}</div>
+                        <div className="grid gap-4 xl:grid-cols-2">
+                          <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4"><p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Text Input Boundary</p><div className="mt-3 space-y-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-text-node">Workflow node</label>{collectionMapGraphWorkflowDefinition?.ok ? <select className="store-input mt-3" id="collection-map-graph-text-node" onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: '', nodeId: event.target.value })} value={collectionMapGraphWorkflowTextBinding?.nodeId || ''}><option value="">Choose the text input node</option>{collectionMapGraphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}</select> : <input className="store-input mt-3" id="collection-map-graph-text-node" onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { nodeId: event.target.value })} placeholder="For example: 6" value={collectionMapGraphWorkflowTextBinding?.nodeId || ''} />}</div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-text-field">Workflow field</label>{collectionMapGraphWorkflowTextFieldOptions.length ? <select className="store-input mt-3" id="collection-map-graph-text-field" onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })} value={collectionMapGraphWorkflowTextBinding?.field || ''}><option value="">Choose a prompt field</option>{collectionMapGraphWorkflowTextFieldOptions.map((field) => <option key={field} value={field}>{field}</option>)}</select> : <input className="store-input mt-3" id="collection-map-graph-text-field" onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })} placeholder="For example: text" value={collectionMapGraphWorkflowTextBinding?.field || ''} />}</div></div></div>
+                          <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4"><p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Image Output Boundary</p><div className="mt-3"><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-image-output">Workflow node</label>{collectionMapGraphWorkflowDefinition?.ok ? <select className="store-input mt-3" id="collection-map-graph-image-output" onChange={(event) => updateGraphWorkflowOutputBinding(selectedNode.id, 'image', { nodeId: event.target.value })} value={collectionMapGraphWorkflowImageOutputBinding?.nodeId || ''}><option value="">Choose the image output node</option>{(collectionMapGraphWorkflowImageOutputNodeOptions.length ? collectionMapGraphWorkflowImageOutputNodeOptions : collectionMapGraphWorkflowNodeOptions).map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}{entry.imageOutputCandidate ? ' (likely image output)' : ''}</option>)}</select> : <input className="store-input mt-3" id="collection-map-graph-image-output" onChange={(event) => updateGraphWorkflowOutputBinding(selectedNode.id, 'image', { nodeId: event.target.value })} placeholder="For example: 19" value={collectionMapGraphWorkflowImageOutputBinding?.nodeId || ''} />}</div><p className="mt-3 text-xs leading-5 text-slate-400">Choose a final node that saves or returns one image artifact.</p></div>
+                        </div>
+                        {collectionMapGraphWorkflowSupport ? <p className={'text-xs leading-5 ' + (collectionMapGraphWorkflowSupport.usable ? 'text-emerald-200' : 'text-amber-200')}>{collectionMapGraphWorkflowSupport.message}</p> : null}
+                      </div>
+                    ) : selectedNode.config?.executionMode === 'localTool' ? (
+                      <div className="space-y-4">
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-tool">Local backend</label><select className="store-input mt-3" id="collection-map-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: '', toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto (best ready local backend)</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-checkpoint">Checkpoint override</label><input className="store-input mt-3" id="collection-map-checkpoint" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder="Use backend's currently loaded checkpoint" value={selectedNode.config?.model || ''} /><p className="mt-2 text-xs leading-5 text-slate-500">Leave blank to use the backend's current checkpoint for every mapped prompt.</p></div>
+                        <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-width">Width</label><input className="store-input mt-3" id="collection-map-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-height">Height</label><input className="store-input mt-3" id="collection-map-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
+                        <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-steps">Steps</label><input className="store-input mt-3" id="collection-map-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cfg">CFG scale</label><input className="store-input mt-3" id="collection-map-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-seed">Seed</label><input className="store-input mt-3" id="collection-map-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
+                      </div>
+                    ) : (
+                      <div className="space-y-4">
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-provider">Provider</label><select className="store-input mt-3" id="collection-map-provider" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, providerId: event.target.value } }))} value={selectedNode.config?.providerId || ''}><option value="">Choose provider</option>{connectedProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model">Image model</label><input className="store-input mt-3" id="collection-map-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder="Provider image model" value={selectedNode.config?.model || ''} /></div>
+                        <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-size">Image size</label><select className="store-input mt-3" id="collection-map-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-quality">Quality</label><select className="store-input mt-3" id="collection-map-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-background">Background</label><select className="store-input mt-3" id="collection-map-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div></div>
+                      </div>
+                    )}
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-instruction">Prompt prefix / style guidance</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="collection-map-instruction" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder="Optional style or scene guidance to prepend to every text item." value={selectedNode.config?.instruction || ''} /></div>
+                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[100px] resize-none" id="collection-map-negative" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for every mapped image." value={selectedNode.config?.negativePrompt || ''} /></div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      This node maps an ordered text collection into an ordered image collection. It fails the mapped step if any item fails, and the run message identifies the item so the collection is never marked complete with hidden partial results.
+                    </div>
+                  </div>
+                ) : null}
                 {selectedNode.type === 'mediaComposition' ? (
                   <div className="space-y-4">
                     <div>
@@ -4760,8 +4895,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                     {draft.edges.filter((edge) => edge.source.nodeId === selectedNode.id || edge.target.nodeId === selectedNode.id).length ? draft.edges.filter((edge) => edge.source.nodeId === selectedNode.id || edge.target.nodeId === selectedNode.id).map((edge) => {
                       const sourceNode = draft.nodes.find((node) => node.id === edge.source.nodeId);
                       const targetNode = draft.nodes.find((node) => node.id === edge.target.nodeId);
-                      const sourcePort = getPortDefinition(sourceNode?.type, 'output', edge.source.portId);
-                      const targetPort = getPortDefinition(targetNode?.type, 'input', edge.target.portId);
+                      const sourcePort = getPortDefinition(sourceNode, 'output', edge.source.portId);
+                      const targetPort = getPortDefinition(targetNode, 'input', edge.target.portId);
                       return (
                         <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3" key={edge.id}>
                           <p className="text-sm font-medium text-white">{sourceNode?.label || 'Unknown'}: <span className="text-slate-400">{sourcePort?.label || edge.source.portId}</span></p>
@@ -4812,10 +4947,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         {graphEdges.map((edge) => {
                           const sourceNode = graph.nodeMap.get(edge.source.nodeId);
                           const targetNode = graph.nodeMap.get(edge.target.nodeId);
-                          const sourceDefinition = getPipelineNodeDefinition(sourceNode?.type);
-                          const targetDefinition = getPipelineNodeDefinition(targetNode?.type);
-                          const sourceIndex = (sourceDefinition?.outputPorts || []).findIndex((port) => port.id === edge.source.portId);
-                          const targetIndex = (targetDefinition?.inputPorts || []).findIndex((port) => port.id === edge.target.portId);
+                          const sourceIndex = getPipelineNodePorts(sourceNode, 'output').findIndex((port) => port.id === edge.source.portId);
+                          const targetIndex = getPipelineNodePorts(targetNode, 'input').findIndex((port) => port.id === edge.target.portId);
                           const sourcePoint = getNodePortCenter(sourceNode, 'output', sourceIndex);
                           const targetPoint = getNodePortCenter(targetNode, 'input', targetIndex);
                           const curveOffset = Math.max(80, (targetPoint.x - sourcePoint.x) / 2);
@@ -4853,8 +4986,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
                       {draft.nodes.length ? draft.nodes.map((node) => {
                         const definition = getPipelineNodeDefinition(node.type);
-                        const inputPorts = definition?.inputPorts || [];
-                        const outputPorts = definition?.outputPorts || [];
+                        const inputPorts = getPipelineNodePorts(node, 'input');
+                        const outputPorts = getPipelineNodePorts(node, 'output');
                         const rowCount = Math.max(inputPorts.length, outputPorts.length, 1);
                         const nodeRunState = runState?.nodeStates?.[node.id];
                         const nodeSummary = analysis.nodeSummaries?.[node.id];

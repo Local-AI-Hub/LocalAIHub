@@ -8,6 +8,32 @@ const SECRET_ACCOUNTS = {
   civitaiApiKey: 'model-manager:civitai-api-key',
 };
 
+const DEFAULT_PROVIDER_ENV_VARS = {
+  anthropic: ['ANTHROPIC_API_KEY'],
+  civitai: ['CIVITAI_API_KEY'],
+  deepseek: ['DEEPSEEK_API_KEY'],
+  google: ['GOOGLE_API_KEY', 'GEMINI_API_KEY'],
+  groq: ['GROQ_API_KEY'],
+  mistral: ['MISTRAL_API_KEY'],
+  openai: ['OPENAI_API_KEY'],
+  xai: ['XAI_API_KEY'],
+};
+
+function getProviderEnvVarNames(providerId) {
+  const normalizedProviderId = sanitizeManifestId(providerId);
+  return [...(DEFAULT_PROVIDER_ENV_VARS[normalizedProviderId] || [])];
+}
+
+function readEnvironmentSecret(envVarName) {
+  const normalizedName = String(envVarName || '').trim();
+  if (!normalizedName) {
+    return '';
+  }
+
+  const matchedName = Object.keys(process.env).find((key) => key.toLowerCase() === normalizedName.toLowerCase());
+  return matchedName ? String(process.env[matchedName] || '').trim() : '';
+}
+
 function getAccountName(secretKey) {
   if (SECRET_ACCOUNTS[secretKey]) {
     return SECRET_ACCOUNTS[secretKey];
@@ -87,29 +113,71 @@ async function setProviderSecret(providerId, secretValue) {
   return setSecret(`provider:${sanitizeManifestId(providerId)}`, secretValue);
 }
 
+async function resolveProviderCredential(providerId) {
+  const normalizedProviderId = sanitizeManifestId(providerId);
+  const envVarNames = getProviderEnvVarNames(normalizedProviderId);
+  const savedSecret = await getProviderSecret(normalizedProviderId).catch(() => '');
+  const hasSavedCredential = Boolean(String(savedSecret || '').trim());
+
+  for (const envVarName of envVarNames) {
+    const envValue = readEnvironmentSecret(envVarName);
+    if (envValue) {
+      return {
+        apiKey: envValue,
+        credentialSource: 'environment',
+        envVarName,
+        envVarNames,
+        hasEnvCredential: true,
+        hasSavedCredential,
+      };
+    }
+  }
+
+  if (hasSavedCredential) {
+    return {
+      apiKey: String(savedSecret || '').trim(),
+      credentialSource: 'saved',
+      envVarName: envVarNames[0] || '',
+      envVarNames,
+      hasEnvCredential: false,
+      hasSavedCredential: true,
+    };
+  }
+
+  return {
+    apiKey: '',
+    credentialSource: 'missing',
+    envVarName: envVarNames[0] || '',
+    envVarNames,
+    hasEnvCredential: false,
+    hasSavedCredential: false,
+  };
+}
+
 async function hasProviderSecret(providerId) {
-  const secret = await getProviderSecret(providerId).catch(() => '');
-  return Boolean(String(secret || '').trim());
+  const credential = await resolveProviderCredential(providerId).catch(() => null);
+  return Boolean(String(credential?.apiKey || '').trim());
 }
 
 async function readModelManagerSecrets() {
-  const civitaiApiKey = await getSecret('civitaiApiKey').catch(() => '');
+  const savedCivitaiApiKey = await getSecret('civitaiApiKey').catch(() => '');
+  const envCivitaiApiKey = readEnvironmentSecret('CIVITAI_API_KEY');
+  const civitaiApiKey = envCivitaiApiKey || savedCivitaiApiKey;
   return {
     civitaiApiKey,
+    civitaiCredentialSource: envCivitaiApiKey ? 'environment' : savedCivitaiApiKey ? 'saved' : 'missing',
+    civitaiEnvVarName: 'CIVITAI_API_KEY',
     hasCivitaiApiKey: Boolean(civitaiApiKey),
+    hasSavedCivitaiApiKey: Boolean(savedCivitaiApiKey),
   };
 }
 
 async function writeModelManagerSecrets(patch = {}) {
-  const result = await readModelManagerSecrets();
-
   if (Object.prototype.hasOwnProperty.call(patch, 'civitaiApiKey')) {
-    const civitaiApiKey = await setSecret('civitaiApiKey', patch.civitaiApiKey);
-    result.civitaiApiKey = civitaiApiKey;
-    result.hasCivitaiApiKey = Boolean(civitaiApiKey);
+    await setSecret('civitaiApiKey', patch.civitaiApiKey);
   }
 
-  return result;
+  return readModelManagerSecrets();
 }
 
 async function migrateLegacyModelManagerSecrets(legacySettings = {}) {
@@ -130,12 +198,14 @@ function stripModelManagerSecrets(settings = {}) {
 }
 
 module.exports = {
+  getProviderEnvVarNames,
   getProviderSecret,
   getSecret,
   hasProviderSecret,
   maskSecret,
   migrateLegacyModelManagerSecrets,
   readModelManagerSecrets,
+  resolveProviderCredential,
   setProviderSecret,
   setSecret,
   stripModelManagerSecrets,

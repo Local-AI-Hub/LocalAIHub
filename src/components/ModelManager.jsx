@@ -91,20 +91,27 @@ function normalizeMatchKey(value) {
   return String(value || '').trim().replace(/[\\/]+/g, '/').toLowerCase();
 }
 function getRemoteMatchKeys(remoteItem) {
-  const keys = [remoteItem?.installRelativePath, remoteItem?.fileName, remoteItem?.name];
-  if (remoteItem?.catalogRepositoryId && remoteItem?.installRelativePath) {
-    keys.push(`${remoteItem.catalogRepositoryId}/${remoteItem.installRelativePath}`);
-  }
-  return [...new Set(keys.map((value) => normalizeMatchKey(value)).filter(Boolean))];
-}
-function matchingLocalModel(remoteItem, localModels) {
-  const remoteKeys = getRemoteMatchKeys(remoteItem);
-  return (localModels || []).find((model) => {
-    const localKeys = [model?.relativePath, model?.fileName, model?.name]
+  if (remoteItem?.source === 'ollama') {
+    return [remoteItem?.downloadPlan?.recommendedArtifactPath, remoteItem?.fileName, remoteItem?.name]
       .map((value) => normalizeMatchKey(value))
       .filter(Boolean);
-    return remoteKeys.some((key) => localKeys.includes(key));
-  });
+  }
+  return [remoteItem?.downloadIdentity].map((value) => normalizeMatchKey(value)).filter(Boolean);
+}
+function matchingLocalModel(remoteItem, localModels) {
+  if (remoteItem?.downloadPlan?.runnable === false) {
+    return null;
+  }
+  const remoteKeys = getRemoteMatchKeys(remoteItem);
+  if (!remoteKeys.length) {
+    return null;
+  }
+  return (localModels || []).find((model) => {
+    const localKeys = remoteItem?.source === 'ollama'
+      ? [model?.relativePath, model?.fileName, model?.name]
+      : [model?.downloadIdentity, model?.metadata?.downloadIdentity];
+    return localKeys.map((value) => normalizeMatchKey(value)).filter(Boolean).some((key) => remoteKeys.includes(key));
+  }) || null;
 }
 function mergeRemoteItems(currentItems, nextItems) {
   const merged = [...currentItems];
@@ -170,6 +177,12 @@ function ModelPreview({ item }) {
   );
 }
 function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, onDownload }) {
+  const selectedArtifact = item.downloadPlan?.recommendedArtifactPath || item.installRelativePath || item.fileName || '';
+  const artifactStatus = item.downloadPlan?.runnable === false ? 'Blocked' : item.downloadPlan?.warning ? 'Possible' : 'Selected';
+  const targetDirectory = item.downloadPlan?.targetDirectory || item.downloadTarget || '';
+  const artifactStatusClass = item.downloadPlan?.runnable === false
+    ? 'border-rose-400/25 bg-rose-400/10 text-rose-100'
+    : 'border-emerald-400/20 bg-emerald-400/10 text-emerald-100';
   return (
     <article className="rounded-[28px] border border-white/10 bg-slate-950/35 p-4">
       <div className="aspect-[16/9] overflow-hidden rounded-[22px] border border-white/10 bg-white/5">
@@ -181,6 +194,12 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
           <span className="status-pill border-cyan-400/20 bg-cyan-400/10 text-cyan-100">{item.catalogEntityLabel}</span>
         ) : null}
         <span className="status-pill border-white/10 bg-white/5 text-slate-300">{item.modelType}</span>
+        {item.artifactLabel && item.artifactLabel !== item.modelType ? (
+          <span className="status-pill border-cyan-400/20 bg-cyan-400/10 text-cyan-100">{item.artifactLabel}</span>
+        ) : null}
+        {item.downloadPlan?.runnable === false ? (
+          <span className="status-pill border-rose-400/25 bg-rose-400/10 text-rose-100">Not compatible</span>
+        ) : null}
         {item.hardwareFit ? <span className={`status-pill ${badgeClass(item.hardwareFit.tone)}`}>{item.hardwareFit.label}</span> : null}
         {item.highVramWarning ? (
           <span className="status-pill border-rose-400/25 bg-rose-400/10 text-rose-100">{item.highVramWarning.warningLabel}</span>
@@ -194,9 +213,24 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
           {item.catalogParentLabel && item.catalogContext ? <p className="mt-2 text-xs leading-5 text-slate-400">{item.catalogContext}</p> : null}
         </div>
       ) : null}
+      <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Selected artifact</p>
+          <span className={`status-pill ${artifactStatusClass}`}>{artifactStatus}</span>
+        </div>
+        <p className="mt-2 break-all text-sm font-medium text-white">{selectedArtifact || 'No compatible artifact selected'}</p>
+        <p className="mt-2 text-xs leading-5 text-slate-400">{item.artifactLabel || item.modelType || 'Model artifact'}</p>
+        <p className="mt-3 text-xs uppercase tracking-[0.2em] text-slate-500">Install target</p>
+        <p className="mt-2 break-all text-xs leading-5 text-slate-400">{targetDirectory || 'No compatible install folder for this target.'}</p>
+      </div>
       {item.highVramWarning ? (
         <div className="mt-4 rounded-2xl border border-rose-400/20 bg-rose-400/10 px-3 py-3 text-sm text-rose-100">
           {item.highVramWarning.warningMessage}
+        </div>
+      ) : null}
+      {item.downloadPlan?.blockingReason || item.downloadPlan?.warning ? (
+        <div className={`mt-4 rounded-2xl border px-3 py-3 text-sm ${item.downloadPlan?.blockingReason ? 'border-rose-400/20 bg-rose-400/10 text-rose-100' : 'border-amber-400/25 bg-amber-400/10 text-amber-100'}`}>
+          {item.downloadPlan.blockingReason || item.downloadPlan.warning}
         </div>
       ) : null}
       <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -243,15 +277,14 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
             {deleteBusy ? 'Deleting...' : 'Delete'}
           </button>
         ) : (
-          <button className="primary-button" onClick={() => onDownload(item)} type="button">
-            Download
+          <button className="primary-button" disabled={item.downloadPlan?.runnable === false} onClick={() => onDownload(item)} type="button">
+            {item.downloadPlan?.runnable === false ? 'Not compatible' : 'Download'}
           </button>
         )}
       </div>
     </article>
   );
-}
-export default function ModelManager({ tools, onToast }) {
+}export default function ModelManager({ tools, onToast }) {
   const modelTools = useMemo(() => (tools || []).filter((tool) => getModelManagerConfig(tool)), [tools]);
   const [selectedToolId, setSelectedToolId] = useState(modelTools[0]?.id || '');
   const [selectedSource, setSelectedSource] = useState(getToolDefaults(modelTools[0]).source);
@@ -260,8 +293,9 @@ export default function ModelManager({ tools, onToast }) {
   const [loadingMore, setLoadingMore] = useState(false);
   const [localLoading, setLocalLoading] = useState(false);
   const [remoteItems, setRemoteItems] = useState([]);
+  const [catalogState, setCatalogState] = useState({ error: null, query: '', source: '' });
   const [localModels, setLocalModels] = useState([]);
-  const [settings, setSettings] = useState({ civitaiApiKey: '', hasCivitaiApiKey: false });
+  const [settings, setSettings] = useState({ civitaiApiKey: '', civitaiCredentialSource: 'missing', civitaiEnvVarName: 'CIVITAI_API_KEY', hasCivitaiApiKey: false, hasSavedCivitaiApiKey: false });
   const [civitaiApiKeyDraft, setCivitaiApiKeyDraft] = useState('');
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
   const [pagination, setPagination] = useState(EMPTY_PAGINATION);
@@ -288,12 +322,13 @@ export default function ModelManager({ tools, onToast }) {
     setSearch('');
     browseRequestIdRef.current += 1;
     setRemoteItems([]);
+    setCatalogState({ error: null, query: '', source: defaults.source });
     setPagination(EMPTY_PAGINATION);
   }
   async function loadSettings() {
     const result = await window.localAIHub.getModelSettings();
     if (result?.ok) {
-      setSettings(result.data || { civitaiApiKey: '', hasCivitaiApiKey: false });
+      setSettings(result.data || { civitaiApiKey: '', civitaiCredentialSource: 'missing', civitaiEnvVarName: 'CIVITAI_API_KEY', hasCivitaiApiKey: false, hasSavedCivitaiApiKey: false });
       setCivitaiApiKeyDraft('');
     }
   }
@@ -322,12 +357,16 @@ export default function ModelManager({ tools, onToast }) {
       setRemoteItems([]);
       setLocalModels([]);
       setPagination(EMPTY_PAGINATION);
+      setCatalogState({ error: null, query: '', source });
       return;
     }
     if (append) {
       setLoadingMore(true);
     } else {
       setBrowseLoading(true);
+      setRemoteItems([]);
+      setPagination(EMPTY_PAGINATION);
+      setCatalogState({ error: null, query, source });
     }
     const requestId = browseRequestIdRef.current + 1;
     browseRequestIdRef.current = requestId;
@@ -345,7 +384,13 @@ export default function ModelManager({ tools, onToast }) {
       if (requestId !== browseRequestIdRef.current) {
         return;
       }
-      onToast(result?.message || 'Local AI Hub could not load remote models right now.', 'error');
+      const message = result?.message || 'Local AI Hub could not load remote models right now.';
+      onToast(message, 'error');
+      if (!append) {
+        setRemoteItems([]);
+        setPagination(EMPTY_PAGINATION);
+        setCatalogState({ error: message, query, source });
+      }
       setBrowseLoading(false);
       setLoadingMore(false);
       return;
@@ -355,6 +400,9 @@ export default function ModelManager({ tools, onToast }) {
     }
     const nextItems = result.data?.items || [];
     setRemoteItems((current) => (append ? mergeRemoteItems(current, nextItems) : nextItems));
+    if (!append) {
+      setCatalogState({ error: null, query, source });
+    }
     setLocalModels(result.data?.localModels || []);
     setPagination(result.data?.pagination || EMPTY_PAGINATION);
     if (result.data?.settings) {
@@ -406,6 +454,7 @@ export default function ModelManager({ tools, onToast }) {
       setRemoteItems([]);
       setLocalModels([]);
       setPagination(EMPTY_PAGINATION);
+      setCatalogState({ error: null, query: '', source });
       return;
     }
     const defaults = getToolDefaults(selectedTool);
@@ -501,7 +550,7 @@ export default function ModelManager({ tools, onToast }) {
       onToast(result?.message || 'Local AI Hub could not save the CivitAI API key.', 'error');
       return;
     }
-    setSettings(result.data?.settings || { civitaiApiKey: '', hasCivitaiApiKey: !clearExisting && Boolean(trimmedKey) });
+    setSettings(result.data?.settings || { civitaiApiKey: '', civitaiCredentialSource: !clearExisting && Boolean(trimmedKey) ? 'saved' : 'missing', civitaiEnvVarName: 'CIVITAI_API_KEY', hasCivitaiApiKey: !clearExisting && Boolean(trimmedKey), hasSavedCivitaiApiKey: !clearExisting && Boolean(trimmedKey) });
     setCivitaiApiKeyDraft('');
     onToast(result.data?.message || (clearExisting ? 'CivitAI API key removed.' : 'CivitAI API key saved.'), 'success');
   }
@@ -516,6 +565,14 @@ export default function ModelManager({ tools, onToast }) {
       </section>
     );
   }
+  const emptyQuery = String(catalogState.query || '').trim();
+  const emptySource = catalogState.source || selectedSource;
+  const selectedSourceLabel = sourceOptions.find((entry) => entry.id === emptySource)?.label || emptySource;
+  const emptyCatalogMessage = catalogState.error
+    ? `${catalogState.error} Previous catalog results were cleared for this search.`
+    : emptyQuery
+      ? `No ${selectedSourceLabel} results matched "${emptyQuery}". Local AI Hub searched with the selected source and filters; try another source or a shorter model-family query.`
+      : 'No catalog results matched this search. Try another query or filter.';
   return (
     <section className="space-y-5">
       <div className="panel p-6">
@@ -592,7 +649,7 @@ export default function ModelManager({ tools, onToast }) {
                 <input
                   className="store-input mt-3"
                   onChange={(event) => setCivitaiApiKeyDraft(event.target.value)}
-                  placeholder={settings.hasCivitaiApiKey ? 'Saved in Windows Credential Manager. Paste a new key to replace it.' : 'Paste your CivitAI API key'}
+                  placeholder={settings.hasSavedCivitaiApiKey ? 'Saved in Windows Credential Manager. Paste a new key to replace it.' : 'Paste your CivitAI API key'}
                   type="password"
                   value={civitaiApiKeyDraft}
                 />
@@ -600,15 +657,16 @@ export default function ModelManager({ tools, onToast }) {
               <button className="ghost-button" onClick={() => handleSaveCivitaiKey()} type="button">
                 Save key
               </button>
-              {settings.hasCivitaiApiKey ? (
+              {settings.hasSavedCivitaiApiKey ? (
                 <button className="ghost-button" onClick={() => handleSaveCivitaiKey(true)} type="button">
-                  Clear key
+                  Clear saved key
                 </button>
               ) : null}
             </div>
             <div className="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-400">
-              <p className="leading-6">Stored in Windows Credential Manager on this PC and reused for future CivitAI downloads. Public browsing still works without a key.</p>
-              {settings.hasCivitaiApiKey ? <span className="status-pill border-emerald-400/20 bg-emerald-400/10 text-emerald-100">Saved</span> : null}
+              <p className="leading-6">Uses CIVITAI_API_KEY when it is present for this app session, otherwise uses Windows Credential Manager. Public browsing still works without a key.</p>
+              {settings.civitaiCredentialSource === 'environment' ? <span className="status-pill border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Using environment variable</span> : null}
+              {settings.civitaiCredentialSource === 'saved' ? <span className="status-pill border-emerald-400/20 bg-emerald-400/10 text-emerald-100">Saved</span> : null}
             </div>
           </div>
         ) : null}
@@ -677,7 +735,7 @@ export default function ModelManager({ tools, onToast }) {
               })
             ) : (
               <div className="rounded-[28px] border border-dashed border-white/15 bg-white/5 p-10 text-center text-slate-400 2xl:col-span-2">
-                {browseLoading ? 'Loading remote catalog results...' : 'No catalog results matched this search. Try another query or filter.'}
+                {browseLoading ? 'Loading remote catalog results...' : emptyCatalogMessage}
               </div>
             )}
           </div>

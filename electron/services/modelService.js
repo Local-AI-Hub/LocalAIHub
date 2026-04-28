@@ -15,6 +15,7 @@ const { createLogger } = require('./logService');
 const { buildOllamaUnavailableMessage, finishOllamaSession, listOllamaModels, prepareOllamaSession } = require('./ollamaService');
 const { assertLoopbackUrl, assertSecureRemoteUrl } = require('./pathSafetyService');
 const { getToolManifest } = require('./toolRegistry');
+const { annotateArtifactsForDownloadPlan, artifactPath, createModelDownloadPlan, ollamaTagPlan } = require('./modelDownloadPlanService');
 const APP_USER_AGENT = `LocalAIHub/${APP_VERSION}`;
 const MODEL_SETTINGS_FILE = 'model-manager.settings.json';
 const MODEL_DOWNLOAD_BUFFER_LIMIT = 10 * 1024 * 1024;
@@ -30,6 +31,7 @@ const IMAGE_FILE_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
 const README_FILE_PATTERN = /(?:^|\/)README\.md$/i;
 const HUGGING_FACE_FILE_SIZE_CACHE = new Map();
 const HUGGING_FACE_PREVIEW_CACHE = new Map();
+const HUGGING_FACE_TREE_CACHE = new Map();
 const OLLAMA_FAMILY_CACHE = new Map();
 const HF_SORT_MAP = {
   'most-downloaded': 'downloads',
@@ -272,7 +274,10 @@ function getCatalogRequirements(browseOptions) {
 function buildModelSettingsDefaults() {
   return {
     civitaiApiKey: '',
+    civitaiCredentialSource: 'missing',
+    civitaiEnvVarName: 'CIVITAI_API_KEY',
     hasCivitaiApiKey: false,
+    hasSavedCivitaiApiKey: false,
   };
 }
 async function getModelSettingsPath() {
@@ -310,7 +315,10 @@ async function readModelSettingsInternal() {
     ...buildModelSettingsDefaults(),
     ...stripModelManagerSecrets(fileSettings),
     civitaiApiKey: secrets.civitaiApiKey || '',
+    civitaiCredentialSource: secrets.civitaiCredentialSource || 'missing',
+    civitaiEnvVarName: secrets.civitaiEnvVarName || 'CIVITAI_API_KEY',
     hasCivitaiApiKey: Boolean(secrets.hasCivitaiApiKey),
+    hasSavedCivitaiApiKey: Boolean(secrets.hasSavedCivitaiApiKey),
   };
 }
 async function readModelSettings() {
@@ -318,7 +326,10 @@ async function readModelSettings() {
   return {
     ...stripModelManagerSecrets(settings),
     civitaiApiKey: '',
+    civitaiCredentialSource: settings.civitaiCredentialSource || 'missing',
+    civitaiEnvVarName: settings.civitaiEnvVarName || 'CIVITAI_API_KEY',
     hasCivitaiApiKey: Boolean(settings.hasCivitaiApiKey),
+    hasSavedCivitaiApiKey: Boolean(settings.hasSavedCivitaiApiKey),
   };
 }
 async function saveModelManagerSettings(patch) {
@@ -338,7 +349,10 @@ async function saveModelManagerSettings(patch) {
     ...buildModelSettingsDefaults(),
     ...nextSettings,
     civitaiApiKey: '',
+    civitaiCredentialSource: secrets.civitaiCredentialSource || 'missing',
+    civitaiEnvVarName: secrets.civitaiEnvVarName || 'CIVITAI_API_KEY',
     hasCivitaiApiKey: Boolean(secrets.hasCivitaiApiKey),
+    hasSavedCivitaiApiKey: Boolean(secrets.hasSavedCivitaiApiKey),
   };
 }
 function getManagedModelRoot(tool, directoryName) {
@@ -465,14 +479,172 @@ function buildDiskWarning(sizeBytes, disk) {
     message: `${preflight.mount} has enough free space for this download.`,
   };
 }
-function buildHardwareFit(sizeBytes, hardware, requirements = null) {
+function getHardwareRamMb(hardware) {
+  for (const candidate of [hardware?.ramMb, hardware?.systemRamMb, hardware?.memoryMb, hardware?.totalRamMb]) {
+    const ramMb = Number(candidate || 0);
+    if (Number.isFinite(ramMb) && ramMb > 0) {
+      return ramMb;
+    }
+  }
+  return 0;
+}
+function bytesToMb(bytes) {
+  return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / 1024 / 1024) : 0;
+}
+function inferRuntimeModelFamily(item = {}) {
+  const text = [
+    item.name,
+    item.fileName,
+    item.installRelativePath,
+    item.catalogContext,
+    item.catalogRepositoryId,
+    item.description,
+    item.modelType,
+    item.source,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  if (normalizeModelType(item.modelType).toLowerCase() === 'gguf' || /\.gguf\b/i.test(text)) {
+    return 'gguf';
+  }
+  if (/wan\d|cogvideo|mochi|ltx[-_\s]?video|video generation|image to video|text to video/.test(text)) {
+    return 'video';
+  }
+  if (/flux|stable[-_\s]?diffusion[-_\s]?3|\bsd3\b/.test(text)) {
+    return 'flux-sd3';
+  }
+  if (/pony|sdxl|stable[-_\s]?diffusion[-_\s]?xl|\bxl[-_\s]?(base|refiner)?\b/.test(text)) {
+    return 'sdxl';
+  }
+  if (/sd[-_\s]?1\.?5|stable[-_\s]?diffusion[-_\s]?v?1[-_\s]?5|\bv1[-_\s]?5\b|1[-_\s]?5[-_\s]?pruned/.test(text)) {
+    return 'sd15';
+  }
+  if (/lora|vae|controlnet|upscaler|embedding|hypernetwork/.test(text)) {
+    return 'accessory';
+  }
+  if (/audio|speech|musicgen|bark|whisper/.test(text)) {
+    return 'audio';
+  }
+  const sizeMb = bytesToMb(Number(item.sizeBytes || 0));
+  if (normalizeModelType(item.modelType) === 'Checkpoint') {
+    return sizeMb >= 6144 ? 'sdxl' : 'sd15';
+  }
+  return 'unknown';
+}
+function imageRuntimeProfile(item, tool) {
+  const family = inferRuntimeModelFamily(item);
+  const toolId = String(tool?.id || '').toLowerCase();
+  if (family === 'video') {
+    return { minimumMb: 16 * 1024, recommendedMb: 24 * 1024, label: 'video model' };
+  }
+  if (family === 'flux-sd3') {
+    return { minimumMb: toolId === 'forge' ? 10 * 1024 : 12 * 1024, recommendedMb: 16 * 1024, label: 'Flux / SD3-class model' };
+  }
+  if (family === 'sdxl') {
+    return {
+      minimumMb: toolId === 'forge' || toolId === 'comfyui' ? 6 * 1024 : 8 * 1024,
+      recommendedMb: toolId === 'forge' ? 10 * 1024 : 12 * 1024,
+      label: 'SDXL / Pony XL-class model',
+    };
+  }
+  if (family === 'sd15') {
+    return {
+      minimumMb: toolId === 'automatic1111' ? 5 * 1024 : 4 * 1024,
+      recommendedMb: toolId === 'automatic1111' ? 6 * 1024 : 5 * 1024,
+      label: 'SD 1.5-class model',
+    };
+  }
+  if (family === 'accessory') {
+    return { minimumMb: 0, recommendedMb: 0, label: 'support model' };
+  }
+  if (family === 'audio') {
+    return { minimumMb: 6 * 1024, recommendedMb: 8 * 1024, label: 'audio model' };
+  }
+  return null;
+}
+function buildHardwareFit(itemOrSizeBytes, toolOrHardware, hardwareOrRequirements = null, maybeRequirements = null) {
+  const item = typeof itemOrSizeBytes === 'object' && itemOrSizeBytes !== null ? itemOrSizeBytes : { sizeBytes: Number(itemOrSizeBytes || 0) };
+  const tool = typeof itemOrSizeBytes === 'object' && itemOrSizeBytes !== null ? toolOrHardware : null;
+  const hardware = typeof itemOrSizeBytes === 'object' && itemOrSizeBytes !== null ? hardwareOrRequirements : toolOrHardware;
+  const requirements = typeof itemOrSizeBytes === 'object' && itemOrSizeBytes !== null ? maybeRequirements : hardwareOrRequirements;
+  if (item?.downloadPlan?.runnable === false) {
+    return {
+      label: 'Incompatible',
+      tone: 'danger',
+      message: item.downloadPlan.blockingReason || 'This catalog item is not compatible with the selected target.',
+    };
+  }
+  const sizeBytes = Number(item?.sizeBytes || 0);
   const vramMb = Number(hardware?.vramMb || 0);
+  const ramMb = getHardwareRamMb(hardware);
   const minimumVramMb = Number(requirements?.minimumVramMb || 0);
   if (minimumVramMb > 0 && vramMb > 0 && vramMb < minimumVramMb) {
     return {
-      label: 'Too Large',
+      label: 'Not recommended',
       tone: 'danger',
       message: requirements?.warningMessage || 'This model needs more GPU memory than Local AI Hub detected on this PC.',
+    };
+  }
+  const family = inferRuntimeModelFamily(item);
+  if (family === 'gguf') {
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+      return {
+        label: 'Unknown',
+        tone: 'neutral',
+        message: 'Local AI Hub could not estimate this GGUF file size yet.',
+      };
+    }
+    const fileMb = bytesToMb(sizeBytes);
+    const comfortableGpuMb = fileMb + 1536;
+    const minimumRamMb = fileMb + 2048;
+    if (vramMb > 0 && vramMb >= comfortableGpuMb) {
+      return {
+        label: 'Recommended',
+        tone: 'good',
+        message: `This GGUF is about ${formatBytes(sizeBytes)} and should fit with GPU offload overhead on this PC.`,
+      };
+    }
+    if (ramMb > 0 && ramMb >= minimumRamMb) {
+      return {
+        label: 'Possible / may be slow',
+        tone: 'warn',
+        message: `This GGUF is about ${formatBytes(sizeBytes)}. It may need CPU/RAM offload because detected VRAM is below the file size plus runtime overhead.`,
+      };
+    }
+    return {
+      label: 'Not recommended',
+      tone: 'danger',
+      message: `This GGUF is about ${formatBytes(sizeBytes)} and likely needs more RAM or VRAM headroom than Local AI Hub detected.`,
+    };
+  }
+  const runtimeProfile = imageRuntimeProfile(item, tool);
+  if (runtimeProfile?.label === 'support model') {
+    return {
+      label: 'Unknown',
+      tone: 'neutral',
+      message: 'This support model depends on the base checkpoint and workflow loaded with it.',
+    };
+  }
+  if (runtimeProfile && vramMb > 0) {
+    if (vramMb >= runtimeProfile.recommendedMb) {
+      return {
+        label: 'Recommended',
+        tone: 'good',
+        message: `This looks like a ${runtimeProfile.label}; detected VRAM meets the recommended range for this target.`,
+      };
+    }
+    if (vramMb >= runtimeProfile.minimumMb) {
+      return {
+        label: 'Possible / may be slow',
+        tone: 'warn',
+        message: `This looks like a ${runtimeProfile.label}. It may run with low-VRAM settings, but it is below the recommended VRAM range for this target.`,
+      };
+    }
+    return {
+      label: 'Not recommended',
+      tone: 'danger',
+      message: `This looks like a ${runtimeProfile.label} and likely needs more VRAM than Local AI Hub detected for this target.`,
     };
   }
   if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || vramMb <= 0) {
@@ -483,24 +655,24 @@ function buildHardwareFit(sizeBytes, hardware, requirements = null) {
     };
   }
   const availableVramBytes = vramMb * 1024 * 1024;
-  if (sizeBytes <= availableVramBytes * 0.75) {
+  if (sizeBytes <= availableVramBytes * 0.55) {
     return {
       label: 'Recommended',
       tone: 'good',
-      message: 'This model should fit comfortably in your GPU memory.',
+      message: 'This model leaves reasonable room for runtime overhead in your detected GPU memory.',
     };
   }
-  if (sizeBytes <= availableVramBytes) {
+  if (sizeBytes <= availableVramBytes * 0.85) {
     return {
-      label: 'Possible',
+      label: 'Possible / may be slow',
       tone: 'warn',
-      message: 'This model is close to your VRAM limit and may run slowly.',
+      message: 'This model is close to your practical VRAM limit after runtime overhead.',
     };
   }
   return {
-    label: 'Too Large',
+    label: 'Not recommended',
     tone: 'danger',
-    message: 'This model is larger than your detected VRAM capacity.',
+    message: 'This model is likely too large once runtime overhead is included.',
   };
 }
 function attachHardwareHints(item, tool, hardwareContext) {
@@ -511,7 +683,7 @@ function attachHardwareHints(item, tool, hardwareContext) {
     ...item,
     diskWarning: buildDiskWarning(item.sizeBytes, disk),
     downloadTarget: targetDirectory,
-    hardwareFit: buildHardwareFit(item.sizeBytes, hardwareContext.hardware, requirements),
+    hardwareFit: buildHardwareFit(item, tool, hardwareContext.hardware, requirements),
     targetDisk: disk
       ? {
           freeBytes: disk.freeBytes,
@@ -519,6 +691,32 @@ function attachHardwareHints(item, tool, hardwareContext) {
           sizeBytes: disk.sizeBytes,
         }
       : null,
+  };
+}
+function serializeDownloadPlan(plan, targetDirectory = null) {
+  if (!plan) {
+    return null;
+  }
+  return {
+    artifactLabel: plan.artifactLabel || null,
+    blockingReason: plan.blockingReason || null,
+    compatibleArtifacts: plan.compatibleArtifacts || [],
+    optionalArtifacts: plan.optionalArtifacts || [],
+    recommendedArtifactPath: plan.recommendedArtifactPath || null,
+    rejectedArtifacts: plan.rejectedArtifacts || [],
+    requiredArtifacts: plan.requiredArtifacts || [],
+    runnable: Boolean(plan.runnable),
+    targetDirectory,
+    warning: plan.warning || null,
+  };
+}
+function attachDownloadPlanFields(item, plan, targetDirectory = null) {
+  return {
+    ...item,
+    artifactKind: item.artifactKind || plan?.recommendedArtifact?.artifactKind || null,
+    artifactLabel: item.artifactLabel || plan?.artifactLabel || item.modelType,
+    compatibilityMessage: plan?.blockingReason || plan?.warning || null,
+    downloadPlan: serializeDownloadPlan(plan, targetDirectory),
   };
 }
 function getToolModelDirectories(tool) {
@@ -596,6 +794,87 @@ function isSafeChildPath(parentPath, candidatePath) {
 function normalizePathForId(value) {
   return String(value || '').replace(/[\\/]+/g, ':');
 }
+function getModelMetadataPath(modelPath) {
+  return modelPath ? `${modelPath}.localaihub.json` : '';
+}
+function normalizeIdentityPart(value) {
+  return normalizeLookupKey(value).replace(/\|/g, '%7c');
+}
+function buildSourceDownloadIdentity(item = {}) {
+  const source = normalizeIdentityPart(item.source);
+  const toolId = normalizeIdentityPart(item.toolId);
+  if (!source || !toolId) {
+    return null;
+  }
+  if (source === 'ollama') {
+    const tag = normalizeIdentityPart(item.name || item.fileName || item.downloadPlan?.recommendedArtifactPath);
+    return tag ? `${source}|${toolId}|tag:${tag}` : null;
+  }
+  const artifactPath = normalizeIdentityPart(
+    item.sourceArtifactPath ||
+      item.downloadPlan?.recommendedArtifactPath ||
+      item.installRelativePath ||
+      item.fileName,
+  );
+  if (!artifactPath) {
+    return null;
+  }
+  if (source === 'huggingface' || source === 'tabby') {
+    const repositoryId = normalizeIdentityPart(item.catalogRepositoryId || item.name);
+    return repositoryId ? `${source}|${toolId}|repo:${repositoryId}|artifact:${artifactPath}` : null;
+  }
+  if (source === 'civitai') {
+    const modelId = normalizeIdentityPart(item.catalogModelId || item.catalogRepositoryId || item.name);
+    const versionId = normalizeIdentityPart(item.catalogVersionId || item.catalogVersionLabel || 'unknown-version');
+    const fileId = normalizeIdentityPart(item.sourceFileId || artifactPath);
+    return modelId ? `${source}|${toolId}|model:${modelId}|version:${versionId}|artifact:${fileId}` : null;
+  }
+  const repositoryId = normalizeIdentityPart(item.catalogRepositoryId || item.name || 'unknown-source');
+  return `${source}|${toolId}|source:${repositoryId}|artifact:${artifactPath}`;
+}
+function buildDownloadMetadata(tool, payload, destination = {}) {
+  const identityPayload = {
+    ...payload,
+    fileName: destination.fileName || payload.fileName,
+    installRelativePath: destination.installRelativePath || payload.installRelativePath,
+    toolId: tool?.id || payload.toolId,
+  };
+  return {
+    schemaVersion: 1,
+    downloadedAt: new Date().toISOString(),
+    downloadIdentity: buildSourceDownloadIdentity(identityPayload),
+    source: payload.source || null,
+    toolId: tool?.id || payload.toolId || null,
+    catalogEntityType: payload.catalogEntityType || null,
+    catalogRepositoryId: payload.catalogRepositoryId || null,
+    catalogModelId: payload.catalogModelId || null,
+    catalogVersionId: payload.catalogVersionId || null,
+    catalogVersionLabel: payload.catalogVersionLabel || null,
+    sourceArtifactPath: payload.sourceArtifactPath || payload.downloadPlan?.recommendedArtifactPath || payload.installRelativePath || payload.fileName || null,
+    sourceFileId: payload.sourceFileId || null,
+    installRelativePath: destination.installRelativePath || payload.installRelativePath || null,
+    fileName: destination.fileName || payload.fileName || null,
+    modelType: payload.modelType || null,
+    sizeBytes: Number(payload.sizeBytes || 0) || null,
+    downloadUrl: payload.downloadUrl || null,
+  };
+}
+async function readModelMetadata(modelPath) {
+  const metadataPath = getModelMetadataPath(modelPath);
+  if (!metadataPath || !(await fs.pathExists(metadataPath))) {
+    return null;
+  }
+  const metadata = await fs.readJson(metadataPath).catch(() => null);
+  return metadata && typeof metadata === 'object' ? metadata : null;
+}
+async function writeModelMetadata(modelPath, metadata) {
+  const metadataPath = getModelMetadataPath(modelPath);
+  if (!metadataPath || !metadata?.downloadIdentity) {
+    return null;
+  }
+  await fs.writeJson(metadataPath, metadata, { spaces: 2 });
+  return metadata;
+}
 async function listLocalFileModels(tool) {
   const directories = getToolModelDirectories(tool);
   const localModels = [];
@@ -609,16 +888,23 @@ async function listLocalFileModels(tool) {
         continue;
       }
       const stats = await fs.stat(fullPath);
+      const metadata = await readModelMetadata(fullPath);
       localModels.push({
         id: tool.id + ':' + modelType + ':' + normalizePathForId(path.relative(directory, fullPath)),
         downloaded: true,
+        downloadIdentity: metadata?.downloadIdentity || null,
         fileName: path.basename(fullPath),
+        metadata: metadata || null,
         modelType,
         name: path.parse(path.basename(fullPath)).name,
         path: fullPath,
         relativePath: path.relative(directory, fullPath),
         sizeBytes: stats.size,
         source: 'local',
+        sourceArtifactPath: metadata?.sourceArtifactPath || null,
+        sourceCatalogRepositoryId: metadata?.catalogRepositoryId || null,
+        sourceCatalogModelId: metadata?.catalogModelId || null,
+        sourceName: metadata?.source || 'local',
         toolId: tool.id,
       });
     }
@@ -754,10 +1040,16 @@ function normalizeLookupKey(value) {
 function buildDownloadedLookup(localModels) {
   const lookup = new Set();
   for (const model of localModels || []) {
-    for (const value of [model.fileName, model.name, model.relativePath]) {
-      const key = normalizeLookupKey(value);
-      if (key) {
-        lookup.add(key);
+    const identity = normalizeLookupKey(model.downloadIdentity || model.metadata?.downloadIdentity);
+    if (identity) {
+      lookup.add(identity);
+    }
+    if (model.source === 'ollama') {
+      for (const value of [model.fileName, model.name, model.relativePath]) {
+        const key = normalizeLookupKey(value);
+        if (key) {
+          lookup.add(key);
+        }
       }
     }
   }
@@ -771,7 +1063,7 @@ function isDownloadedMatch(downloadedLookup, values = []) {
 }
 function buildCatalogLookupValues(repositoryId, installRelativePath, extras = []) {
   const values = [...(extras || [])];
-  if (repositoryId) {
+  if (repositoryId && !installRelativePath) {
     values.push(repositoryId);
   }
   if (installRelativePath) {
@@ -806,7 +1098,7 @@ function inferHuggingFaceType(detail, fileEntry) {
   return normalizeModelType(combined);
 }
 function getKnownHuggingFaceFileSize(entry) {
-  const candidates = [entry?.lfs?.size, entry?.size, entry?.blob?.size, entry?.metadata?.size];
+  const candidates = [entry?.lfs?.size, entry?.xet?.size, entry?.size, entry?.blob?.size, entry?.metadata?.size];
   for (const candidate of candidates) {
     const sizeBytes = Number(candidate || 0);
     if (Number.isFinite(sizeBytes) && sizeBytes > 0) {
@@ -815,15 +1107,151 @@ function getKnownHuggingFaceFileSize(entry) {
   }
   return 0;
 }
+function normalizeHuggingFaceTreeEntry(entry) {
+  const filePath = String(entry?.rfilename || entry?.path || '').trim();
+  if (!filePath || String(entry?.type || 'file').toLowerCase() === 'directory') {
+    return null;
+  }
+  return {
+    ...entry,
+    rfilename: filePath,
+    size: Number(entry?.size || 0) || undefined,
+  };
+}
+function mergeHuggingFaceSiblingEntries(siblings = [], expandedEntries = []) {
+  const merged = new Map();
+  for (const entry of [...(siblings || []), ...(expandedEntries || [])]) {
+    const normalized = normalizeHuggingFaceTreeEntry(entry);
+    if (!normalized) {
+      continue;
+    }
+    const key = String(normalized.rfilename || '').replace(/\\+/g, '/');
+    const existing = merged.get(key) || {};
+    merged.set(key, {
+      ...existing,
+      ...normalized,
+      rfilename: key,
+    });
+  }
+  return [...merged.values()];
+}
+async function fetchHuggingFaceRepositoryTree(detail, logger) {
+  const modelId = String(detail?.id || '').trim();
+  if (!modelId) {
+    return [];
+  }
+  if (HUGGING_FACE_TREE_CACHE.has(modelId)) {
+    return HUGGING_FACE_TREE_CACHE.get(modelId);
+  }
+  const treeUrl = HUGGING_FACE_MODEL_URL + '/' + modelId + '/tree/main?recursive=true&expand=true';
+  try {
+    await logger.info('Expanding Hugging Face repository file tree for artifact planning.', { modelId }).catch(() => null);
+    const { payload } = await fetchJsonResponse(treeUrl, {
+      headers: {
+        'User-Agent': APP_USER_AGENT,
+      },
+    });
+    const entries = Array.isArray(payload) ? payload.map(normalizeHuggingFaceTreeEntry).filter(Boolean) : [];
+    HUGGING_FACE_TREE_CACHE.set(modelId, entries);
+    return entries;
+  } catch (error) {
+    await logger.warn('A Hugging Face repository tree expansion failed.', { error, modelId }).catch(() => null);
+    return [];
+  }
+}
+async function expandHuggingFaceDetailForPlanning(detail, selectedType, tool, logger) {
+  if (!tool) {
+    return detail;
+  }
+  const existingCandidate = collectHuggingFaceDownloadFiles(detail, selectedType, tool)[0] || null;
+  if (existingCandidate) {
+    return detail;
+  }
+  const expandedEntries = await fetchHuggingFaceRepositoryTree(detail, logger);
+  if (!expandedEntries.length) {
+    return detail;
+  }
+  return {
+    ...detail,
+    siblings: mergeHuggingFaceSiblingEntries(detail.siblings || [], expandedEntries),
+  };
+}
 function normalizeSearchQuery(value) {
   return String(value || '').trim().toLowerCase();
+}
+function normalizeSearchSeparators(value) {
+  return normalizeSearchQuery(value)
+    .replace(/\.(safetensors|ckpt|pt|pth|bin|gguf)$/i, ' $1')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+function compactSearchText(value) {
+  return normalizeSearchSeparators(value).replace(/\s+/g, '');
+}
+function searchTokens(value) {
+  return normalizeSearchSeparators(value).split(/\s+/).filter(Boolean);
+}
+function stripSearchFileExtension(value) {
+  return String(value || '').replace(/\.(safetensors|ckpt|pt|pth|bin|gguf)$/i, '');
+}
+function stripQuantizationSuffix(value) {
+  return String(value || '')
+    .replace(/(?:[-_. ](?:q\d(?:_[a-z0-9]+)*|iq\d(?:_[a-z0-9]+)*|f\d{2}|k_[msl]|ks|km))+$/i, '')
+    .replace(/[-_. ]+$/g, '');
+}
+function getSearchQueryVariants(query) {
+  const raw = String(query || '').trim();
+  const baseName = path.basename(raw.replace(/\\+/g, '/'));
+  const withoutExtension = stripSearchFileExtension(baseName || raw);
+  const withoutQuant = stripQuantizationSuffix(withoutExtension);
+  const variants = [
+    raw,
+    baseName,
+    withoutExtension,
+    withoutQuant,
+    normalizeSearchSeparators(raw),
+    normalizeSearchSeparators(withoutExtension),
+    normalizeSearchSeparators(withoutQuant),
+  ];
+  if (/\.gguf$/i.test(raw) && withoutQuant) {
+    variants.push(`${normalizeSearchSeparators(withoutQuant)} gguf`);
+  }
+  return mergeUniqueStrings(variants.map((value) => String(value || '').trim()).filter(Boolean));
 }
 function matchesSearchQuery(query, values = []) {
   const normalizedQuery = normalizeSearchQuery(query);
   if (!normalizedQuery) {
     return true;
   }
-  return values.some((value) => normalizeSearchQuery(value).includes(normalizedQuery));
+  const queryVariants = getSearchQueryVariants(query);
+  const queryCanonical = normalizeSearchSeparators(query);
+  const queryCompact = compactSearchText(query);
+  const queryTokens = searchTokens(query);
+  return values.some((value) => {
+    const normalizedValue = normalizeSearchQuery(value);
+    const valueCanonical = normalizeSearchSeparators(value);
+    const valueCompact = compactSearchText(value);
+    const valueTokens = searchTokens(value);
+    if (!normalizedValue && !valueCanonical) {
+      return false;
+    }
+    if (
+      queryVariants.some((variant) => {
+        const normalizedVariant = normalizeSearchQuery(variant);
+        const canonicalVariant = normalizeSearchSeparators(variant);
+        return (
+          normalizedVariant &&
+          (normalizedValue.includes(normalizedVariant) ||
+            valueCanonical.includes(canonicalVariant) ||
+            valueCompact.includes(compactSearchText(variant)))
+        );
+      })
+    ) {
+      return true;
+    }
+    return queryTokens.length > 0 && queryTokens.every((queryToken) => valueTokens.some((valueToken) => valueToken.includes(queryToken)));
+  });
 }
 function isFileLikeSearchQuery(query) {
   const normalizedQuery = normalizeSearchQuery(query);
@@ -832,19 +1260,33 @@ function isFileLikeSearchQuery(query) {
   }
   return MODEL_FILE_PATTERN.test(normalizedQuery) || /[\\/]/.test(normalizedQuery) || /\.[a-z0-9]{2,16}$/i.test(normalizedQuery);
 }
-function collectHuggingFaceDownloadFiles(detail, selectedType) {
-  return (detail.siblings || [])
+function isArtifactLevelSearchQuery(query) {
+  const normalizedQuery = normalizeSearchQuery(path.basename(String(query || '').replace(/\\+/g, '/')));
+  return MODEL_FILE_PATTERN.test(normalizedQuery);
+}
+function isRepositoryIdSearchQuery(query) {
+  const normalizedQuery = String(query || '').trim().replace(/\\+/g, '/');
+  return /^[^/\s]+\/[^/\s]+$/.test(normalizedQuery) && !MODEL_FILE_PATTERN.test(normalizedQuery);
+}
+function collectHuggingFaceDownloadFiles(detail, selectedType, tool = null) {
+  const artifacts = (detail.siblings || [])
     .filter((entry) => MODEL_FILE_PATTERN.test(entry.rfilename || ''))
     .map((entry) => ({
       ...entry,
       modelType: inferHuggingFaceType(detail, entry),
       sizeBytes: getKnownHuggingFaceFileSize(entry),
-    }))
-    .filter((entry) => matchesSelectedModelType(entry.modelType, selectedType))
-    .sort((left, right) => right.sizeBytes - left.sizeBytes || String(left.rfilename || '').localeCompare(String(right.rfilename || '')));
+    }));
+  if (!tool) {
+    return artifacts
+      .filter((entry) => matchesSelectedModelType(entry.modelType, selectedType))
+      .sort((left, right) => right.sizeBytes - left.sizeBytes || String(left.rfilename || '').localeCompare(String(right.rfilename || '')));
+  }
+  return annotateArtifactsForDownloadPlan({ artifacts, selectedType, source: 'huggingface', tool })
+    .filter((entry) => entry.runnable)
+    .sort((left, right) => Number(right.score || 0) - Number(left.score || 0) || String(left.rfilename || '').localeCompare(String(right.rfilename || '')));
 }
-function pickHuggingFaceDownloadFile(detail, selectedType) {
-  return collectHuggingFaceDownloadFiles(detail, selectedType)[0] || null;
+function pickHuggingFaceDownloadFile(detail, selectedType, tool = null) {
+  return collectHuggingFaceDownloadFiles(detail, selectedType, tool)[0] || null;
 }
 function normalizeHuggingFacePreviewCandidate(modelId, value) {
   const rawValue = String(value || '').trim();
@@ -1025,8 +1467,9 @@ async function fetchHuggingFaceFileSize(modelId, filePath, logger) {
   HUGGING_FACE_FILE_SIZE_CACHE.set(cacheKey, sizeBytes || 0);
   return sizeBytes || 0;
 }
-async function resolveHuggingFaceDownloadFile(detail, selectedType, logger) {
-  const downloadFile = pickHuggingFaceDownloadFile(detail, selectedType);
+async function resolveHuggingFaceDownloadFile(detail, selectedType, logger, tool = null) {
+  const planningDetail = await expandHuggingFaceDetailForPlanning(detail, selectedType, tool, logger);
+  const downloadFile = pickHuggingFaceDownloadFile(planningDetail, selectedType, tool);
   if (!downloadFile) {
     return null;
   }
@@ -1035,8 +1478,19 @@ async function resolveHuggingFaceDownloadFile(detail, selectedType, logger) {
   }
   return {
     ...downloadFile,
-    sizeBytes: await fetchHuggingFaceFileSize(detail.id, downloadFile.rfilename, logger),
+    sizeBytes: await fetchHuggingFaceFileSize(planningDetail.id, downloadFile.rfilename, logger),
   };
+}
+async function resolveHuggingFaceDownloadPlan(detail, selectedType, logger, tool = null) {
+  const planningDetail = await expandHuggingFaceDetailForPlanning(detail, selectedType, tool, logger);
+  const artifacts = (planningDetail.siblings || [])
+    .filter((entry) => MODEL_FILE_PATTERN.test(entry.rfilename || ''))
+    .map((entry) => ({
+      ...entry,
+      modelType: inferHuggingFaceType(planningDetail, entry),
+      sizeBytes: getKnownHuggingFaceFileSize(entry),
+    }));
+  return createModelDownloadPlan({ artifacts, selectedType, source: 'huggingface', tool });
 }
 async function fetchHuggingFaceReadmePreview(detail, logger) {
   const readmeEntry = (detail.siblings || []).find((entry) => README_FILE_PATTERN.test(entry.rfilename || ''));
@@ -1105,10 +1559,10 @@ async function fetchHuggingFaceSeedDetails(browseOptions, logger) {
     logger,
   );
 }
-async function requestHuggingFacePage(tool, browseOptions, logger, pipelineTag = '') {
+async function requestHuggingFacePage(tool, browseOptions, logger, pipelineTag = '', queryOverride = null) {
   const searchUrl = new URL(HUGGING_FACE_SEARCH_URL);
   const derivedSearchTerms = getDerivedSearchTerms(browseOptions);
-  const derivedSearchQuery = derivedSearchTerms.find(Boolean) || '';
+  const derivedSearchQuery = queryOverride === null ? derivedSearchTerms.find(Boolean) || '' : String(queryOverride || '').trim();
   searchUrl.searchParams.set('limit', String(browseOptions.limit));
   searchUrl.searchParams.set('sort', HF_SORT_MAP[browseOptions.sort] || HF_SORT_MAP['most-downloaded']);
   searchUrl.searchParams.set('direction', '-1');
@@ -1155,21 +1609,26 @@ async function fetchHuggingFacePage(tool, browseOptions, logger) {
   const derivedSearchQuery = derivedSearchTerms.find(Boolean) || '';
   const preferredPipelineTag = pipelineTags[0] || '';
   const primaryPage = await requestHuggingFacePage(tool, browseOptions, logger, preferredPipelineTag);
-  if (!derivedSearchQuery || !preferredPipelineTag || !isFileLikeSearchQuery(derivedSearchQuery)) {
+  if (!derivedSearchQuery || !isFileLikeSearchQuery(derivedSearchQuery)) {
     return primaryPage;
   }
-  const fallbackPage = await requestHuggingFacePage(tool, browseOptions, logger, '');
+  const fallbackPages = [];
+  const variants = getSearchQueryVariants(derivedSearchQuery).slice(0, 6);
+  for (const variant of variants) {
+    fallbackPages.push(await requestHuggingFacePage(tool, browseOptions, logger, '', variant));
+  }
   return {
-    nextCursor: primaryPage.nextCursor || fallbackPage.nextCursor,
-    results: mergeUniqueRemoteEntriesById([...primaryPage.results, ...fallbackPage.results]),
+    nextCursor: primaryPage.nextCursor || fallbackPages.find((page) => page.nextCursor)?.nextCursor || null,
+    results: mergeUniqueRemoteEntriesById([primaryPage, ...fallbackPages].flatMap((page) => page.results || [])),
   };
 }
-async function resolveHuggingFaceArtifactFiles(detail, browseOptions, logger) {
+async function resolveHuggingFaceArtifactFiles(detail, browseOptions, logger, tool = null) {
   const query = String(browseOptions.query || '').trim();
   if (!query) {
     return [];
   }
-  const matchingFiles = collectHuggingFaceDownloadFiles(detail, browseOptions.modelType).filter((file) =>
+  const planningDetail = await expandHuggingFaceDetailForPlanning(detail, browseOptions.modelType, tool, logger);
+  const matchingFiles = collectHuggingFaceDownloadFiles(planningDetail, browseOptions.modelType, tool).filter((file) =>
     matchesSearchQuery(query, [file.rfilename, path.basename(file.rfilename)]),
   );
   if (!matchingFiles.length) {
@@ -1204,16 +1663,19 @@ function mergeCatalogSearchItems(itemGroups, limit) {
   return merged;
 }
 function getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch) {
+  if (modelItems.length) {
+    return [modelItems];
+  }
   if (fileLevelSearch) {
     return [artifactItems];
   }
-  return artifactItems.length ? [modelItems, artifactItems] : [modelItems];
+  return artifactItems.length ? [artifactItems] : [modelItems];
 }
 function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl) {
   const fileName = path.basename(file.rfilename || '');
   const installRelativePath = normalizeRelativeInstallPath(file.rfilename || fileName) || fileName;
   return attachHardwareHints(
-    {
+    attachDownloadPlanFields({
       id: 'huggingface:repository:' + detail.id,
       author: detail.author || null,
       catalogEntityLabel: 'Repository',
@@ -1222,18 +1684,47 @@ function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, 
       catalogRepositoryId: detail.id,
       catalogRequirements,
       description: buildHuggingFaceDescription(detail),
-      downloaded: isDownloadedMatch(downloadedLookup, buildCatalogLookupValues(detail.id, installRelativePath, [fileName, detail.id])),
+      downloaded: isDownloadedMatch(downloadedLookup, [buildSourceDownloadIdentity({ source: 'huggingface', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName })]),
+      downloadIdentity: buildSourceDownloadIdentity({ source: 'huggingface', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName }),
       downloadUrl: buildHuggingFaceResolveUrl(detail.id, file.rfilename),
       fileName,
       highVramWarning: catalogRequirements,
       installRelativePath,
       modelType: file.modelType,
       name: detail.id,
+      sourceArtifactPath: file.rfilename,
       previewUrl,
       sizeBytes: Number(file.sizeBytes || 0),
       source: 'huggingface',
       toolId: tool.id,
-    },
+    }, file.downloadPlan, getTargetDirectory(tool, file.modelType, { ...file, catalogRepositoryId: detail.id })),
+    tool,
+    hardwareContext,
+  );
+}
+function buildHuggingFaceBlockedRepositoryResult(detail, plan, tool, hardwareContext, catalogRequirements, previewUrl) {
+  return attachHardwareHints(
+    attachDownloadPlanFields({
+      id: 'huggingface:repository:' + detail.id + ':blocked',
+      author: detail.author || null,
+      catalogEntityLabel: 'Repository',
+      catalogEntityType: 'repository',
+      catalogContext: 'No compatible primary artifact found for this target.',
+      catalogRepositoryId: detail.id,
+      catalogRequirements,
+      description: buildHuggingFaceDescription(detail),
+      downloaded: false,
+      downloadUrl: null,
+      fileName: '',
+      highVramWarning: catalogRequirements,
+      installRelativePath: '',
+      modelType: 'Incompatible',
+      name: detail.id,
+      previewUrl,
+      sizeBytes: 0,
+      source: 'huggingface',
+      toolId: tool.id,
+    }, plan, null),
     tool,
     hardwareContext,
   );
@@ -1243,7 +1734,7 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
   const nestedPath = String(file.rfilename || '').trim();
   const installRelativePath = normalizeRelativeInstallPath(nestedPath || fileName) || fileName;
   return attachHardwareHints(
-    {
+    attachDownloadPlanFields({
       id: 'huggingface:artifact:' + detail.id + ':' + normalizePathForId(nestedPath || fileName),
       author: detail.author || null,
       catalogEntityLabel: 'Artifact',
@@ -1253,7 +1744,8 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
       catalogRepositoryId: detail.id,
       catalogRequirements,
       description: `File from ${detail.id} | ${buildHuggingFaceDescription(detail)}`,
-      downloaded: isDownloadedMatch(downloadedLookup, buildCatalogLookupValues(detail.id, installRelativePath, [fileName, detail.id, nestedPath])),
+      downloaded: isDownloadedMatch(downloadedLookup, [buildSourceDownloadIdentity({ source: 'huggingface', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName })]),
+      downloadIdentity: buildSourceDownloadIdentity({ source: 'huggingface', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName }),
       downloadUrl: buildHuggingFaceResolveUrl(detail.id, file.rfilename),
       fileName,
       highVramWarning: catalogRequirements,
@@ -1263,8 +1755,9 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
       previewUrl,
       sizeBytes: Number(file.sizeBytes || 0),
       source: 'huggingface',
+      sourceArtifactPath: file.rfilename,
       toolId: tool.id,
-    },
+    }, file.downloadPlan, getTargetDirectory(tool, file.modelType, { ...file, catalogRepositoryId: detail.id })),
     tool,
     hardwareContext,
   );
@@ -1275,6 +1768,8 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
   const catalogRequirements = getCatalogRequirements(browseOptions);
   const query = String(browseOptions.query || '').trim();
   const fileLevelSearch = Boolean(query) && isFileLikeSearchQuery(query);
+  const artifactLevelSearch = Boolean(query) && isArtifactLevelSearchQuery(query);
+  const repositoryIdSearch = Boolean(query) && isRepositoryIdSearchQuery(query);
   let rawCursor = browseOptions.cursor;
   let nextCursor = null;
   for (let scanCount = 0; scanCount < 3; scanCount += 1) {
@@ -1285,20 +1780,26 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
     const page = await fetchHuggingFacePage(tool, { ...browseOptions, cursor: rawCursor }, logger);
     const pageDetails = await fetchHuggingFaceDetails(page.results, logger);
     const seedDetails = scanCount === 0 && !rawCursor ? await fetchHuggingFaceSeedDetails(browseOptions, logger) : [];
-    const details = mergeUniqueDetailsById([...seedDetails, ...pageDetails]);
+    let details = mergeUniqueDetailsById([...seedDetails, ...pageDetails]);
+    if (repositoryIdSearch) {
+      const exactDetails = details.filter((detail) => String(detail.id || '').toLowerCase() === query.toLowerCase());
+      if (exactDetails.length) {
+        details = exactDetails;
+      }
+    }
     for (const detail of details) {
       const previewUrl = await resolveHuggingFacePreview(detail, logger);
-      const primaryFile = await resolveHuggingFaceDownloadFile(detail, browseOptions.modelType, logger);
+      const matchingArtifacts = artifactLevelSearch ? await resolveHuggingFaceArtifactFiles(detail, browseOptions, logger, tool) : [];
+      const primaryFile = matchingArtifacts[0] || (await resolveHuggingFaceDownloadFile(detail, browseOptions.modelType, logger, tool));
       if (primaryFile) {
         modelItems.push(
           buildHuggingFaceRepositoryResult(detail, primaryFile, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl),
         );
-      }
-      const matchingArtifacts = await resolveHuggingFaceArtifactFiles(detail, browseOptions, logger);
-      for (const file of matchingArtifacts) {
-        artifactItems.push(
-          buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl),
-        );
+      } else if (query) {
+        const plan = await resolveHuggingFaceDownloadPlan(detail, browseOptions.modelType, logger, tool);
+        if (plan && plan.runnable === false && plan.rejectedArtifacts?.length) {
+          modelItems.push(buildHuggingFaceBlockedRepositoryResult(detail, plan, tool, hardwareContext, catalogRequirements, previewUrl));
+        }
       }
       const mergedItems = mergeCatalogSearchItems(getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), browseOptions.limit);
       if (mergedItems.length >= browseOptions.limit) {
@@ -1333,20 +1834,39 @@ function buildCivitaiHeaders(settings) {
     Authorization: `Bearer ${apiKey}`,
   };
 }
-function collectCivitaiVersionFiles(model, selectedType) {
-  return (model.modelVersions || [])
-    .flatMap((version) =>
-      (version.files || [])
-        .map((file) => ({
-          file: {
-            ...file,
-            normalizedType: normalizeModelType(file.type || file.name || model.type),
-            sizeBytes: Number(file.sizeBytes || 0) || toFileSizeBytes(Number(file.sizeKB || 0)),
-          },
-          version,
-        }))
-        .filter((entry) => matchesSelectedModelType(entry.file.normalizedType, selectedType)),
-    )
+function collectCivitaiVersionFiles(model, selectedType, tool = null) {
+  const entries = (model.modelVersions || []).flatMap((version) =>
+    (version.files || []).map((file) => ({
+      file: {
+        ...file,
+        name: String(file.name || '').trim(),
+        normalizedType: normalizeModelType(file.type || file.name || model.type),
+        rfilename: String(file.name || '').trim(),
+        sizeBytes: Number(file.sizeBytes || 0) || toFileSizeBytes(Number(file.sizeKB || 0)),
+      },
+      version,
+    })),
+  );
+  const plannedPaths = tool
+    ? new Set(
+        annotateArtifactsForDownloadPlan({
+          artifacts: entries.map((entry) => ({ ...entry.file, primary: entry.file.primary })),
+          selectedType,
+          source: 'civitai',
+          tool,
+        })
+          .filter((entry) => entry.runnable)
+          .map((entry) => artifactPath(entry)),
+      )
+    : null;
+  return entries
+    .filter((entry) => (plannedPaths ? plannedPaths.has(artifactPath(entry.file)) : matchesSelectedModelType(entry.file.normalizedType, selectedType)))
+    .map((entry) => ({
+      ...entry,
+      file: tool
+        ? annotateArtifactsForDownloadPlan({ artifacts: [entry.file], selectedType, source: 'civitai', tool })[0]
+        : entry.file,
+    }))
     .sort((left, right) => {
       const primaryOrder = Number(Boolean(right.file.primary)) - Number(Boolean(left.file.primary));
       if (primaryOrder !== 0) {
@@ -1384,16 +1904,31 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
   const versionLabel = formatCivitaiVersionLabel(entry?.version);
   const previewImage = entry?.version?.images?.find((image) => image.type === 'image');
   const installRelativePath = normalizeRelativeInstallPath(fileName) || fileName;
+  const identity = buildSourceDownloadIdentity({
+    source: 'civitai',
+    toolId: tool.id,
+    catalogModelId: model.id,
+    catalogVersionId: entry.version?.id,
+    catalogVersionLabel: versionLabel,
+    sourceFileId: entry.file.id,
+    sourceArtifactPath: fileName,
+    installRelativePath,
+    fileName,
+  });
   return attachHardwareHints(
-    {
+    attachDownloadPlanFields({
       id: 'civitai:model:' + model.id,
       author: model.creator?.username || null,
       catalogEntityLabel: 'Model',
       catalogEntityType: 'model',
       catalogContext: `Primary version: ${versionLabel} | Primary artifact: ${fileName}`,
+      catalogModelId: String(model.id || ''),
       catalogRequirements,
+      catalogVersionId: entry.version?.id ? String(entry.version.id) : null,
+      catalogVersionLabel: versionLabel,
       description: buildCivitaiDescription(model),
-      downloaded: isDownloadedMatch(downloadedLookup, buildCatalogLookupValues(null, installRelativePath, [fileName, model.name])),
+      downloaded: isDownloadedMatch(downloadedLookup, [identity]),
+      downloadIdentity: identity,
       downloadUrl: entry.file.downloadUrl || entry.version.downloadUrl,
       fileName,
       highVramWarning: catalogRequirements,
@@ -1403,8 +1938,10 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
       previewUrl: previewImage?.url || null,
       sizeBytes: entry.file.sizeBytes,
       source: 'civitai',
+      sourceArtifactPath: fileName,
+      sourceFileId: entry.file.id ? String(entry.file.id) : null,
       toolId: tool.id,
-    },
+    }, entry.file.downloadPlan, getTargetDirectory(tool, entry.file.normalizedType, entry.file)),
     tool,
     hardwareContext,
   );
@@ -1414,17 +1951,32 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
   const versionLabel = formatCivitaiVersionLabel(entry?.version);
   const previewImage = entry?.version?.images?.find((image) => image.type === 'image');
   const installRelativePath = normalizeRelativeInstallPath(fileName) || fileName;
+  const identity = buildSourceDownloadIdentity({
+    source: 'civitai',
+    toolId: tool.id,
+    catalogModelId: model.id,
+    catalogVersionId: entry.version?.id,
+    catalogVersionLabel: versionLabel,
+    sourceFileId: entry.file.id,
+    sourceArtifactPath: fileName,
+    installRelativePath,
+    fileName,
+  });
   return attachHardwareHints(
-    {
+    attachDownloadPlanFields({
       id: 'civitai:artifact:' + model.id + ':' + String(entry?.version?.id || versionLabel) + ':' + fileName,
       author: model.creator?.username || null,
       catalogEntityLabel: 'Artifact',
       catalogEntityType: 'artifact',
       catalogParentLabel: model.name,
       catalogContext: `Version: ${versionLabel}`,
+      catalogModelId: String(model.id || ''),
       catalogRequirements,
+      catalogVersionId: entry.version?.id ? String(entry.version.id) : null,
+      catalogVersionLabel: versionLabel,
       description: `File from ${model.name} | Version ${versionLabel} | ${buildCivitaiDescription(model)}`,
-      downloaded: isDownloadedMatch(downloadedLookup, buildCatalogLookupValues(null, installRelativePath, [fileName, model.name])),
+      downloaded: isDownloadedMatch(downloadedLookup, [identity]),
+      downloadIdentity: identity,
       downloadUrl: entry.file.downloadUrl || entry.version.downloadUrl,
       fileName,
       highVramWarning: catalogRequirements,
@@ -1434,13 +1986,14 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
       previewUrl: previewImage?.url || null,
       sizeBytes: entry.file.sizeBytes,
       source: 'civitai',
+      sourceArtifactPath: fileName,
+      sourceFileId: entry.file.id ? String(entry.file.id) : null,
       toolId: tool.id,
-    },
+    }, entry.file.downloadPlan, getTargetDirectory(tool, entry.file.normalizedType, entry.file)),
     tool,
     hardwareContext,
   );
-}
-async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settings, hardwareContext, logger) {
+}async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settings, hardwareContext, logger) {
   const selectedModelType = normalizeModelTypeFilter(browseOptions.modelType);
   const selectedTaskType = normalizeTaskTypeFilter(browseOptions.taskType);
   const modelTypeProfile = getModelTypeProfile(selectedModelType);
@@ -1448,6 +2001,9 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
   const derivedSearchQuery = derivedSearchTerms.find(Boolean) || '';
   const catalogRequirements = getCatalogRequirements(browseOptions);
   const fileLevelSearch = Boolean(derivedSearchQuery) && isFileLikeSearchQuery(derivedSearchQuery);
+  const apiSearchQuery = fileLevelSearch
+    ? getSearchQueryVariants(derivedSearchQuery).find((variant) => !MODEL_FILE_PATTERN.test(variant) && variant.length < derivedSearchQuery.length) || derivedSearchQuery
+    : derivedSearchQuery;
   if (selectedModelType === 'gguf' || selectedModelType === 'audio-speech' || selectedTaskType === 'audio-speech') {
     return {
       items: [],
@@ -1465,8 +2021,8 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
   if (browseOptions.cursor) {
     searchUrl.searchParams.set('cursor', browseOptions.cursor);
   }
-  if (derivedSearchQuery) {
-    searchUrl.searchParams.set('query', derivedSearchQuery);
+  if (apiSearchQuery) {
+    searchUrl.searchParams.set('query', apiSearchQuery);
   }
   const mappedTypes = [...(modelTypeProfile.civitaiTypes || [])];
   if (selectedTaskType === 'video-generation' || selectedTaskType === 'image-to-video') {
@@ -1479,7 +2035,7 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
     cursor: browseOptions.cursor,
     modelType: browseOptions.modelType,
     page: browseOptions.page,
-    query: derivedSearchQuery,
+    query: apiSearchQuery,
     sort: browseOptions.sort,
     taskType: browseOptions.taskType,
     toolId: tool.id,
@@ -1491,20 +2047,22 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
   const modelItems = [];
   const artifactItems = [];
   for (const model of payload.items || []) {
-    const candidateFiles = collectCivitaiVersionFiles(model, browseOptions.modelType);
-    const primaryEntry = candidateFiles[0] || null;
+    const candidateFiles = collectCivitaiVersionFiles(model, browseOptions.modelType, tool);
+    const matchingFiles = derivedSearchQuery
+      ? candidateFiles.filter((entry) =>
+          matchesSearchQuery(derivedSearchQuery, [
+            entry.file.name,
+            entry.version?.name,
+            entry.version?.baseModel,
+            entry.version?.baseModelType,
+          ]),
+        )
+      : [];
+    const primaryEntry = (fileLevelSearch && matchingFiles[0]) || candidateFiles[0] || null;
     if (primaryEntry) {
       modelItems.push(buildCivitaiModelResult(model, primaryEntry, tool, downloadedLookup, hardwareContext, catalogRequirements));
     }
-    if (derivedSearchQuery) {
-      const matchingFiles = candidateFiles.filter((entry) =>
-        matchesSearchQuery(derivedSearchQuery, [
-          entry.file.name,
-          entry.version?.name,
-          entry.version?.baseModel,
-          entry.version?.baseModelType,
-        ]),
-      );
+    if (!primaryEntry && matchingFiles.length) {
       for (const entry of matchingFiles) {
         artifactItems.push(buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwareContext, catalogRequirements));
       }
@@ -1538,7 +2096,10 @@ async function browseRemoteModels(tool, options = {}) {
   const publicSettings = {
     ...stripModelManagerSecrets(settings),
     civitaiApiKey: '',
+    civitaiCredentialSource: settings.civitaiCredentialSource || 'missing',
+    civitaiEnvVarName: settings.civitaiEnvVarName || 'CIVITAI_API_KEY',
     hasCivitaiApiKey: Boolean(settings.hasCivitaiApiKey),
+    hasSavedCivitaiApiKey: Boolean(settings.hasSavedCivitaiApiKey),
   };
   const localModels = await listDownloadedModels(tool).catch(() => []);
   const downloadedLookup = buildDownloadedLookup(localModels);
@@ -1761,14 +2322,18 @@ function getOllamaDefaultVariant(familyDetails) {
 }
 function buildOllamaFamilyCard(entry, familyDetails) {
   const defaultVariant = getOllamaDefaultVariant(familyDetails);
+  const pullName = defaultVariant?.name || entry.fileName || entry.name;
   return {
     ...entry,
+    artifactKind: 'ollama-tag',
+    artifactLabel: 'Ollama tag',
     catalogContext: defaultVariant?.name && defaultVariant.name !== entry.name ? `Default variant: ${defaultVariant.name}` : null,
     catalogEntityLabel: 'Model',
     catalogEntityType: 'model',
     description: familyDetails?.description || entry.description,
     familySearchText: familyDetails?.searchText || '',
-    fileName: defaultVariant?.name || entry.fileName,
+    downloadPlan: ollamaTagPlan(pullName),
+    fileName: pullName,
     previewUrl: familyDetails?.previewUrl || entry.previewUrl || null,
     sizeBytes: defaultVariant?.sizeBytes || entry.sizeBytes || 0,
     sizeLabel: defaultVariant?.sizeLabel || entry.sizeLabel,
@@ -1776,6 +2341,8 @@ function buildOllamaFamilyCard(entry, familyDetails) {
 }
 function buildOllamaVariantCard(entry, familyDetails, variant) {
   return {
+    artifactKind: 'ollama-tag',
+    artifactLabel: 'Ollama tag',
     capabilities: entry.capabilities,
     catalogContext: [variant.sizeLabel, variant.contextLabel, variant.inputLabel].filter(Boolean).join(' | ') || null,
     catalogEntityLabel: 'Variant',
@@ -1783,6 +2350,7 @@ function buildOllamaVariantCard(entry, familyDetails, variant) {
     catalogParentLabel: entry.name,
     contextLabel: variant.contextLabel,
     description: familyDetails?.description || entry.description,
+    downloadPlan: ollamaTagPlan(variant.name),
     downloadUrl: null,
     familyDescription: familyDetails?.description || entry.description,
     familyName: entry.name,
@@ -2126,11 +2694,7 @@ function matchesTabbyRegistryQuery(entry, query) {
   if (!normalizedQuery) {
     return true;
   }
-  const haystack = [entry.name, entry.repoId, entry.license, ...(entry.categories || []).map((category) => TABBY_SECTION_LABELS[category])]
-    .filter(Boolean)
-    .join(' ')
-    .toLowerCase();
-  return haystack.includes(normalizedQuery);
+  return matchesSearchQuery(normalizedQuery, [entry.name, entry.repoId, entry.license, ...(entry.categories || []).map((category) => TABBY_SECTION_LABELS[category])]);
 }
 function parseSortableTimestamp(value) {
   const timestamp = Date.parse(String(value || ''));
@@ -2151,6 +2715,7 @@ function compareTabbyRegistryDetails(left, right, sort) {
 async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, hardwareContext, logger) {
   const registryHtml = await fetchTabbyRegistryHtml(logger);
   const allowedCategories = getTabbyRegistryCategories(browseOptions, tool);
+  const fileLevelSearch = Boolean(browseOptions.query) && isFileLikeSearchQuery(browseOptions.query);
   if (!allowedCategories.size) {
     return {
       items: [],
@@ -2163,7 +2728,7 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
   }
   const entries = parseTabbyRegistryEntries(registryHtml)
     .filter((entry) => (entry.categories || []).some((category) => allowedCategories.has(category)))
-    .filter((entry) => matchesTabbyRegistryQuery(entry, browseOptions.query));
+    .filter((entry) => fileLevelSearch || matchesTabbyRegistryQuery(entry, browseOptions.query));
   if (!entries.length) {
     return {
       items: [],
@@ -2190,7 +2755,10 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
     if (!detail) {
       continue;
     }
-    const file = await resolveHuggingFaceDownloadFile(detail, effectiveModelType, logger);
+    const artifactMatches = fileLevelSearch
+      ? await resolveHuggingFaceArtifactFiles(detail, { ...browseOptions, modelType: effectiveModelType }, logger, tool)
+      : [];
+    const file = artifactMatches[0] || (!fileLevelSearch ? await resolveHuggingFaceDownloadFile(detail, effectiveModelType, logger, tool) : null);
     if (!file) {
       continue;
     }
@@ -2212,8 +2780,9 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
       const fileName = path.basename(file.rfilename);
       const categoryLabels = mergeUniqueStrings((entry.categories || []).map((category) => TABBY_SECTION_LABELS[category])).join(' / ');
       const installRelativePath = normalizeRelativeInstallPath(file.rfilename || fileName) || fileName;
+      const identity = buildSourceDownloadIdentity({ source: 'tabby', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName });
       return attachHardwareHints(
-        {
+        attachDownloadPlanFields({
           id: `tabby:repository:${detail.id}`,
           author: detail.author || null,
           catalogContext: [categoryLabels ? `Tabby ${categoryLabels}` : 'Tabby registry', `Repository: ${detail.id}`, file.rfilename ? `Primary artifact: ${file.rfilename}` : null]
@@ -2223,7 +2792,8 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
           catalogEntityType: 'repository',
           catalogRepositoryId: detail.id,
           description: `Tabby ${categoryLabels || 'registry'} pick | ${buildHuggingFaceDescription(detail)} | ${entry.license}`,
-          downloaded: isDownloadedMatch(downloadedLookup, buildCatalogLookupValues(detail.id, installRelativePath, [fileName, detail.id, entry.name])),
+          downloaded: isDownloadedMatch(downloadedLookup, [identity]),
+          downloadIdentity: identity,
           downloadUrl: buildHuggingFaceResolveUrl(detail.id, file.rfilename),
           fileName,
           installRelativePath,
@@ -2232,8 +2802,9 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
           previewUrl: await resolveHuggingFacePreview(detail, logger),
           sizeBytes: Number(file.sizeBytes || 0),
           source: 'tabby',
+          sourceArtifactPath: file.rfilename,
           toolId: tool.id,
-        },
+        }, file.downloadPlan, getTargetDirectory(tool, file.modelType, { ...file, catalogRepositoryId: detail.id })),
         tool,
         hardwareContext,
       );
@@ -2298,7 +2869,13 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
     destinationPath,
   };
 }
+function assertRunnableDownloadPlan(payload = {}) {
+  if (payload?.downloadPlan && payload.downloadPlan.runnable === false) {
+    throw new Error(payload.downloadPlan.blockingReason || 'That catalog item is not compatible with the selected tool.');
+  }
+}
 async function getModelDownloadPreflight(tool, payload = {}) {
+  assertRunnableDownloadPlan(payload);
   const { targetDirectory } = resolveModelDestination(tool, payload);
   const sizeBytes = Number(payload.sizeBytes || 0);
   const { disk } = await getDiskSnapshotForPath(targetDirectory);
@@ -2334,6 +2911,7 @@ async function ensureDiskHasCapacity(tool, payload) {
   return preflight;
 }
 async function downloadRemoteModel(tool, payload, options = {}) {
+  assertRunnableDownloadPlan(payload);
   const logger = createLogger('models', {
     toolId: tool.id,
     mode: 'download',
@@ -2345,6 +2923,10 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   const settings = await readModelSettingsInternal();
   const headers = payload.source === 'civitai' ? buildCivitaiHeaders(settings) : { 'User-Agent': APP_USER_AGENT };
   if (await fs.pathExists(destinationPath)) {
+    const existingMetadata = await readModelMetadata(destinationPath);
+    if (!existingMetadata?.downloadIdentity) {
+      await writeModelMetadata(destinationPath, buildDownloadMetadata(tool, payload, { destinationPath, fileName, installRelativePath, targetDirectory })).catch(() => null);
+    }
     return {
       destinationPath,
       fileName,
@@ -2385,6 +2967,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
         receivedBytes: result.downloadedBytes,
         totalBytes: result.totalBytes || payload.sizeBytes || 0,
       });
+      await writeModelMetadata(destinationPath, buildDownloadMetadata(tool, payload, { destinationPath, fileName, installRelativePath, targetDirectory })).catch(() => null);
       return {
         destinationPath,
         fileName,
@@ -2404,6 +2987,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   throw new Error(humanizeError(lastError, `${payload.name} could not be downloaded.`));
 }
 async function pullOllamaModel(tool, payload, options = {}) {
+  assertRunnableDownloadPlan(payload);
   await ensureDiskHasCapacity(tool, payload);
   const logger = createLogger('models', {
     toolId: tool.id,
@@ -2588,6 +3172,7 @@ async function deleteModel(tool, payload) {
     throw new Error('Local AI Hub refused to delete a file outside the model folder.');
   }
   await fs.remove(resolvedPath);
+  await fs.remove(getModelMetadataPath(resolvedPath)).catch(() => null);
   return {
     message: `${payload.fileName || payload.name} was deleted from ${tool.name}.`,
   };
@@ -2601,5 +3186,20 @@ module.exports = {
   listDownloadedModels,
   readModelSettings,
   saveModelManagerSettings,
-  supportsModelManager
+  supportsModelManager,
+  _test: {
+    buildDownloadedLookup,
+    buildDownloadMetadata,
+    buildHuggingFaceRepositoryResult,
+    buildHardwareFit,
+    buildSourceDownloadIdentity,
+    collectCivitaiVersionFiles,
+    collectHuggingFaceDownloadFiles,
+    createModelDownloadPlan,
+    matchesSearchQuery,
+    resolveHuggingFaceDownloadFile,
+    searchHuggingFaceModels,
+    resolveModelDestination,
+    writeModelMetadata,
+  }
 };

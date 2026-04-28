@@ -13,8 +13,10 @@ const {
 } = require('./pipelineCapabilities.cjs');
 const {
   GRAPH_WORKFLOW_BINDING_MODE_IDS,
+  GRAPH_WORKFLOW_OPERATION_BACKEND_IDS,
   getDefaultGraphWorkflowBindings,
   getGraphWorkflowContract,
+  getGraphWorkflowOperationBackendSupport,
   getGraphWorkflowFieldOptions,
   getGraphWorkflowInputBinding,
   getGraphWorkflowNodeEntry,
@@ -262,7 +264,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       {
         id: 'prompt',
         kind: PORT_KIND_ANY,
-        allowedKinds: [PORT_KIND_TEXT, PORT_KIND_IMAGE],
+        allowedKinds: [PORT_KIND_TEXT, PORT_KIND_IMAGE, PORT_KIND_VIDEO, PORT_KIND_FILE],
         label: 'Input',
         required: true,
       },
@@ -472,6 +474,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       toolId: '',
+      model: '',
       negativePrompt: '',
       width: 832,
       height: 832,
@@ -485,7 +488,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'graphWorkflow',
     label: 'Graph Workflow',
     category: 'Graph Workflows',
-    description: 'Runs a graph-native local workflow with explicit typed boundaries. Use this for ComfyUI and future graph-style tools instead of the model-step abstraction.',
+    description: 'Runs a graph-native local workflow with explicit typed boundaries. Use this for ComfyUI, InvokeAI, and other graph-style tools instead of the model-step abstraction.',
     inputPorts: [
       {
         id: 'text',
@@ -503,11 +506,6 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         id: 'image',
         kind: PORT_KIND_IMAGE,
         label: 'Image',
-      },
-      {
-        id: 'audio',
-        kind: PORT_KIND_AUDIO,
-        label: 'Audio',
       },
       {
         id: 'video',
@@ -681,6 +679,51 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       insertionMode: 'append',
+    },
+  }),
+  collectionMap: Object.freeze({
+    type: 'collectionMap',
+    label: 'Map Collection',
+    category: 'Flow',
+    description: 'Applies one supported operation to every item in an ordered collection and emits a same-order collection with item lineage preserved. This first slice supports text prompts to generated images.',
+    inputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_TEXT,
+        collectionBehavior: 'only',
+        label: 'Text Collection',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_IMAGE,
+        collectionBehavior: 'only',
+        label: 'Image Collection',
+      },
+    ],
+    configDefaults: {
+      operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+      executionMode: 'cloud',
+      providerId: '',
+      toolId: '',
+      graphWorkflowToolId: DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
+      workflowText: '',
+      inputBindings: DEFAULT_GRAPH_WORKFLOW_BINDINGS.inputBindings,
+      outputBindings: DEFAULT_GRAPH_WORKFLOW_BINDINGS.outputBindings,
+      workflowFormat: DEFAULT_GRAPH_WORKFLOW_BINDINGS.workflowFormat,
+      model: '',
+      instruction: 'Generate one image for each text item while preserving the source order.',
+      imageSize: '1024x1024',
+      imageQuality: 'auto',
+      imageBackground: 'auto',
+      negativePrompt: '',
+      width: 832,
+      height: 832,
+      steps: 24,
+      cfgScale: 7,
+      seed: -1,
     },
   }),
   collectionAccumulator: Object.freeze({
@@ -1069,6 +1112,9 @@ function resolveDynamicInputKinds(node, port) {
     return [];
   }
 
+  if (node.type === 'collectionMap' && port.id === 'collection') {
+    return isSupportedCollectionMapOperation(node) ? [PORT_KIND_TEXT] : [];
+  }
   if (node.type === 'validation' && port.id === 'input' && node.config?.mode === 'llm') {
     const executionMode = node?.config?.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud';
     if (executionMode === 'ollama') {
@@ -1097,12 +1143,15 @@ function getPortAllowedKinds(port, options = {}) {
   const dynamicKinds = options?.direction === 'input'
     ? resolveDynamicInputKinds(options?.node || null, port)
     : [];
+  const staticKinds = Array.isArray(port.allowedKinds) && port.allowedKinds.length
+    ? [...new Set(port.allowedKinds.map((entry) => normalizePortKind(entry)).filter(Boolean))]
+    : [];
   const baseKinds = port.dynamicOnly
     ? dynamicKinds
     : dynamicKinds.length
-      ? dynamicKinds
-      : Array.isArray(port.allowedKinds) && port.allowedKinds.length
-        ? [...new Set(port.allowedKinds.map((entry) => normalizePortKind(entry)).filter(Boolean))]
+      ? uniqueKindList([...dynamicKinds, ...staticKinds])
+      : staticKinds.length
+        ? staticKinds
         : (() => {
             const kind = normalizePortKind(port.kind);
             if (kind === PORT_KIND_ANY) {
@@ -1166,7 +1215,7 @@ function getIncomingKindsForPort(node, port, graph, visited = new Set()) {
   const incomingKindLists = incomingEdges
     .map((edge) => {
       const sourceNode = graph.nodeMap.get(edge.source.nodeId);
-      const sourcePort = getPortDefinition(sourceNode?.type, 'output', edge.source.portId);
+      const sourcePort = getPortDefinition(sourceNode, 'output', edge.source.portId);
       return resolveOutputKinds(sourceNode, sourcePort, graph, new Set(visited));
     })
     .filter((kindList) => kindList.length);
@@ -1231,6 +1280,26 @@ function getModelStepOperationId(node) {
     : PIPELINE_OPERATION_IDS.LLM_PROMPT;
 }
 
+function getCollectionMapExecutionMode(node) {
+  if (node?.config?.executionMode === 'localTool') {
+    return 'localTool';
+  }
+
+  if (node?.config?.executionMode === 'graphWorkflow') {
+    return 'graphWorkflow';
+  }
+
+  return 'cloud';
+}
+
+function getCollectionMapOperationId(node) {
+  const requestedOperationId = String(node?.config?.operationId || '').trim();
+  return requestedOperationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+}
+
+function isSupportedCollectionMapOperation(node) {
+  return getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+}
 function getOperationDrivenToolIdsForModelStepOperation(operationId) {
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
     return VIDEO_WORKFLOW_TOOL_IDS;
@@ -1257,7 +1326,12 @@ function getModelStepLocalToolId(node, contextMaps = {}) {
     return selectedToolId;
   }
 
-  return pickAvailableToolId(getOperationDrivenToolIdsForModelStepOperation(getModelStepOperationId(node)), contextMaps);
+  const operationId = getModelStepOperationId(node);
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+    return selectLocalImageBackend(contextMaps, node, { operationId }).toolId || '';
+  }
+
+  return pickAvailableToolId(getOperationDrivenToolIdsForModelStepOperation(operationId), contextMaps);
 }
 
 function getGraphWorkflowToolId(node) {
@@ -1388,10 +1462,39 @@ function normalizePipelineDefinition(definition = {}, options = {}) {
   };
 }
 
-function getPortDefinition(nodeType, direction, portId) {
+function isPipelineNodeLike(value) {
+  return Boolean(value && typeof value === 'object' && typeof value.type === 'string');
+}
+
+function buildGraphWorkflowPortDefinition(spec) {
+  const id = String(spec?.portId || '').trim();
+  if (!id) {
+    return null;
+  }
+
+  return {
+    id,
+    kind: spec.kind,
+    label: spec.label || PIPELINE_PORT_KIND_LABELS[normalizePortKind(spec.kind)] || id,
+  };
+}
+
+function getPipelineNodePorts(nodeOrType, direction) {
+  const node = isPipelineNodeLike(nodeOrType) ? nodeOrType : null;
+  const nodeType = node ? node.type : nodeOrType;
   const definition = getNodeTypeDefinition(nodeType);
+  if (node?.type === 'graphWorkflow') {
+    const contract = getGraphWorkflowContract(getGraphWorkflowToolId(node));
+    const specs = direction === 'input' ? contract.inputPorts : contract.outputPorts;
+    return (specs || []).map(buildGraphWorkflowPortDefinition).filter(Boolean);
+  }
+
   const portList = direction === 'input' ? definition?.inputPorts : definition?.outputPorts;
-  return (portList || []).find((port) => port.id === portId) || null;
+  return portList || [];
+}
+
+function getPortDefinition(nodeOrType, direction, portId) {
+  return getPipelineNodePorts(nodeOrType, direction).find((port) => port.id === portId) || null;
 }
 function resolveOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) {
   if (!sourcePort) {
@@ -1419,7 +1522,7 @@ function resolveOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) 
 
   visited.add(visitKey);
   const passthroughPortId = sourcePort.passthroughFrom || 'input';
-  const passthroughInputPort = getPortDefinition(sourceNode.type, 'input', passthroughPortId) || {
+  const passthroughInputPort = getPortDefinition(sourceNode, 'input', passthroughPortId) || {
     id: passthroughPortId,
     kind: PORT_KIND_ANY,
   };
@@ -2168,7 +2271,7 @@ function getIncomingKindsForNodePort(node, portId, graph) {
     return [];
   }
 
-  const port = getPortDefinition(node.type, 'input', portId);
+  const port = getPortDefinition(node, 'input', portId);
   return getIncomingKindsForPort(node, port, graph);
 }
 
@@ -2231,6 +2334,71 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
     };
   }
 
+  if (node.type === 'collectionMap') {
+    const operationId = getCollectionMapOperationId(node);
+    if (!isSupportedCollectionMapOperation(node)) {
+      return {
+        capability: null,
+        operationId,
+        targetId: '',
+        targetKind: 'collection-map',
+        targetLabel: 'Map Collection',
+      };
+    }
+
+    if (getCollectionMapExecutionMode(node) === 'graphWorkflow') {
+      const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+      const tool = support.toolId ? getContextToolEntry(support.toolId, contextMaps) : null;
+      return {
+        capability: support.usable
+          ? {
+              inputKinds: [PORT_KIND_TEXT],
+              notes: support.message,
+              outputKinds: [PORT_KIND_IMAGE],
+            }
+          : null,
+        operationId,
+        targetId: support.toolId || '',
+        targetKind: 'tool',
+        targetLabel: tool?.name || support.contract?.toolId || 'Graph workflow',
+      };
+    }
+
+    if (getCollectionMapExecutionMode(node) === 'localTool') {
+      const effectiveToolId = getImageToolIdForNode(node, contextMaps);
+      const toolIds = effectiveToolId ? [effectiveToolId] : IMAGE_WORKFLOW_TOOL_IDS;
+      const tool = effectiveToolId ? getContextToolEntry(effectiveToolId, contextMaps) : null;
+      return {
+        capability: mergeCapabilityOperations(toolIds.map((toolId) => getContextToolOperation(toolId, operationId, contextMaps))),
+        operationId,
+        targetId: effectiveToolId || '',
+        targetKind: 'tool',
+        targetLabel: tool?.name || 'Automatic1111 or Forge',
+      };
+    }
+
+    const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+    if (providerId) {
+      const provider = getContextProviderEntry(providerId, contextMaps);
+      return {
+        capability: getContextProviderOperation(providerId, operationId, contextMaps),
+        operationId,
+        targetId: providerId,
+        targetKind: 'provider',
+        targetLabel: provider?.name || 'Cloud provider',
+      };
+    }
+
+    return {
+      capability: mergeCapabilityOperations(
+        getProviderIdsForPipelineOperation(operationId).map((entry) => getContextProviderOperation(entry, operationId, contextMaps)),
+      ),
+      operationId,
+      targetId: '',
+      targetKind: 'provider',
+      targetLabel: 'Cloud provider',
+    };
+  }
   if (node.type === 'graphWorkflow') {
     const toolId = getGraphWorkflowToolId(node);
     const tool = getContextToolEntry(toolId, contextMaps);
@@ -2272,7 +2440,7 @@ function resolveLlmNodeCapability(node, contextMaps = {}) {
     const supportedToolIds = getOperationDrivenToolIdsForModelStepOperation(operationId);
     const effectiveToolId = selectedToolId && supportedToolIds.includes(selectedToolId)
       ? selectedToolId
-      : pickAvailableToolId(supportedToolIds, contextMaps);
+      : getModelStepLocalToolId(node, contextMaps);
     const toolIds = effectiveToolId ? [effectiveToolId] : supportedToolIds;
     const tool = effectiveToolId ? getContextToolEntry(effectiveToolId, contextMaps) : null;
     const fallbackLabel = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
@@ -2592,7 +2760,7 @@ function getConnectedOutputPortEntries(node, graph) {
   return (graph.outgoingEdgesByNode.get(node.id) || [])
     .map((edge) => ({
       edge,
-      port: getPortDefinition(node.type, 'output', edge.source.portId),
+      port: getPortDefinition(node, 'output', edge.source.portId),
     }))
     .filter((entry) => entry.port);
 }
@@ -2630,6 +2798,7 @@ function getModelStepSupportState(node, capabilitySummary, contextMaps = {}, con
         || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
         || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
         || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+        || capabilitySummary.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
       )
     ) {
       return {
@@ -2757,8 +2926,8 @@ function buildPipelineGraph(definition = {}) {
       continue;
     }
 
-    const sourcePort = getPortDefinition(sourceNode.type, 'output', edge.source.portId);
-    const targetPort = getPortDefinition(targetNode.type, 'input', edge.target.portId);
+    const sourcePort = getPortDefinition(sourceNode, 'output', edge.source.portId);
+    const targetPort = getPortDefinition(targetNode, 'input', edge.target.portId);
     if (!sourcePort || !targetPort) {
       errors.push(`Local AI Hub found an invalid connection between "${sourceNode.label}" and "${targetNode.label}".`);
       continue;
@@ -2985,13 +3154,247 @@ function pickAvailableToolId(candidateToolIds = [], contextMaps = {}) {
   return candidateToolIds[0] || null;
 }
 
+function isLikelySupportOnlyImageModel(entry) {
+  const haystack = [entry?.title, entry?.model_name, entry?.filename, entry?.name, entry?.fileName, entry?.relativePath]
+    .map((value) => String(value || '').toLowerCase())
+    .join('\n');
+  return Boolean(haystack) && /(^|[\/\s_-])safety[_ -]?checker([\/\s_.-]|$)/i.test(haystack);
+}
+
+function getLocalImageCheckpointModels(tool) {
+  return (Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : []).filter((entry) => {
+    const modelType = String(entry?.modelType || '').trim().toLowerCase();
+    return (modelType === 'checkpoint' || modelType === 'inpainting') && !isLikelySupportOnlyImageModel(entry);
+  });
+}
+
+function toolHasDownloadedModelInfo(tool) {
+  return Array.isArray(tool?.downloadedModels);
+}
+
+function doesLocalImageToolExposeModel(tool, model) {
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  if (!normalizedModel) {
+    return false;
+  }
+
+  return getLocalImageCheckpointModels(tool).some((entry) => {
+    const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.relativePath, entry?.path]
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean);
+    return candidates.includes(normalizedModel);
+  });
+}
+
+function getLocalImageBackendOperationId(node, fallback = PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+  if (node?.type === 'imageAnalyze') {
+    return PIPELINE_OPERATION_IDS.IMAGE_ANALYZE;
+  }
+
+  if (node?.type === 'collectionMap') {
+    return getCollectionMapOperationId(node);
+  }
+
+  if (node?.type === 'llmPrompt') {
+    return getModelStepOperationId(node);
+  }
+
+  return fallback;
+}
+
+function getLocalImageBackendModelState(tool, model) {
+  const requestedModel = String(model || '').trim();
+  const hasModelInfo = toolHasDownloadedModelInfo(tool);
+  const checkpoints = getLocalImageCheckpointModels(tool);
+
+  if (requestedModel) {
+    if (!hasModelInfo) {
+      return {
+        status: 'unknown',
+        message: (tool?.name || 'This image backend') + ' has not shared its local checkpoint list yet. Refresh checkpoints before relying on this override, or leave it blank to use the backend current checkpoint.',
+      };
+    }
+
+    if (!doesLocalImageToolExposeModel(tool, requestedModel)) {
+      return {
+        status: 'missing',
+        message: 'Selected checkpoint is not available in ' + (tool?.name || 'this image backend') + '. Refresh checkpoints or download that checkpoint before running this step.',
+      };
+    }
+
+    return { status: 'ready', message: '' };
+  }
+
+  if (!hasModelInfo) {
+    return {
+      status: 'unknown',
+      message: (tool?.name || 'This image backend') + ' will use its currently loaded checkpoint. Local AI Hub will verify the live WebUI model list before sending the request.',
+    };
+  }
+
+  if (!checkpoints.length) {
+    return {
+      status: 'missing',
+      message: (tool?.name || 'This image backend') + ' does not have a usable Stable Diffusion checkpoint in its local model list. Download or add a real checkpoint before running this step.',
+    };
+  }
+
+  return { status: 'ready', message: '' };
+}
+
+function getLocalImageBackendCandidateState(toolId, contextMaps = {}, options = {}) {
+  const normalizedToolId = String(toolId || '').trim().toLowerCase();
+  const operationId = options.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  const installedTool = contextMaps.toolsById?.[normalizedToolId] || null;
+  const catalogTool = contextMaps.toolCatalogById?.[normalizedToolId] || null;
+  const tool = installedTool || catalogTool || null;
+  const label = tool?.name || normalizedToolId || 'This backend';
+  const capability = getContextToolOperation(normalizedToolId, operationId, contextMaps);
+  const model = String(options.model || '').trim();
+  const messages = [];
+  let score = 0;
+  let usable = true;
+
+  if (!normalizedToolId || !capability) {
+    return { toolId: normalizedToolId, tool, installedTool, usable: false, score: -1000, message: label + ' is not a Local AI Hub pipeline image-generation backend.' };
+  }
+
+  if (!installedTool) {
+    return { toolId: normalizedToolId, tool, installedTool, usable: false, score: -900, message: 'Install ' + label + ' before using it for local image generation.' };
+  }
+
+  score += 100;
+  if (!canToolLikelyLaunch(installedTool)) {
+    usable = false;
+    score -= 300;
+    messages.push(label + ' is installed, but Local AI Hub cannot find a launchable local runtime. Run Repair or reinstall it before using this image backend.');
+  }
+
+  const status = String(installedTool.status || '').trim().toLowerCase();
+  const lastError = String(installedTool.lastError || '').trim();
+  if (status === 'running') {
+    score += 80;
+  } else if (status === 'starting') {
+    score += 45;
+  } else if (status === 'error') {
+    usable = false;
+    score -= 250;
+    messages.push(lastError || (label + ' is currently marked unhealthy. Open Library or run Repair before using it for image generation.'));
+  } else {
+    score += 30;
+    if (lastError) {
+      score -= 60;
+      messages.push(label + ' has a recent launch issue: ' + lastError);
+    }
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+    const modelState = getLocalImageBackendModelState(installedTool, model);
+    if (modelState.status === 'ready') {
+      score += 35;
+    } else if (modelState.status === 'missing') {
+      usable = false;
+      score -= 220;
+      messages.push(modelState.message);
+    } else if (modelState.status === 'unknown') {
+      score -= 5;
+      messages.push(modelState.message);
+    }
+  }
+
+  const compatibilityProfile = installedTool.compatibility || catalogTool?.compatibility || catalogTool?.installInstructions?.compatibility || null;
+  const compatibility = evaluateCompatibilityProfile(compatibilityProfile, contextMaps.hardware);
+  if (compatibility?.tone === 'good') {
+    score += 12;
+  } else if (compatibility?.tone === 'warn') {
+    score -= 8;
+  } else if (compatibility?.tone === 'danger' || compatibility?.tone === 'error') {
+    score -= 35;
+    messages.push(compatibility.message);
+  }
+
+  return {
+    compatibility,
+    installedTool,
+    message: messages.find(Boolean) || '',
+    score,
+    status,
+    tool: installedTool,
+    toolId: normalizedToolId,
+    usable,
+  };
+}
+
+function getUnsupportedLocalImageBackendMessage(toolId, contextMaps = {}) {
+  const normalizedToolId = String(toolId || '').trim().toLowerCase();
+  const label = getContextToolEntry(normalizedToolId, contextMaps)?.name || normalizedToolId || 'This tool';
+  if (normalizedToolId === 'fooocus') {
+    return 'Fooocus is launchable from Library, but this Local AI Hub build does not have a stable Fooocus pipeline adapter yet. Use Forge or Automatic1111 for sequential Image Generation nodes, or keep Fooocus on its full UI surface.';
+  }
+  if (normalizedToolId === 'comfyui' || normalizedToolId === 'invokeai') {
+    return label + ' stays graph-native in Local AI Hub. Use a Graph Workflow node with an imported workflow instead of the sequential Image Generation backend selector.';
+  }
+  return 'Choose Auto, Forge, or Automatic1111 for this local image generation step.';
+}
+
+function selectLocalImageBackend(contextMaps = {}, node = {}, options = {}) {
+  const operationId = options.operationId || getLocalImageBackendOperationId(node);
+  const candidateToolIds = (Array.isArray(options.candidateToolIds) && options.candidateToolIds.length ? options.candidateToolIds : IMAGE_WORKFLOW_TOOL_IDS)
+    .map((toolId) => String(toolId || '').trim().toLowerCase())
+    .filter(Boolean);
+  const selectedToolId = String(options.toolId || node?.config?.toolId || '').trim().toLowerCase();
+  const model = String(options.model !== undefined ? options.model : node?.config?.model || '').trim();
+
+  if (selectedToolId) {
+    if (!candidateToolIds.includes(selectedToolId)) {
+      return {
+        explicit: true,
+        message: getUnsupportedLocalImageBackendMessage(selectedToolId, contextMaps),
+        score: -1000,
+        tool: getContextToolEntry(selectedToolId, contextMaps),
+        toolId: selectedToolId,
+        usable: false,
+      };
+    }
+
+    return {
+      explicit: true,
+      ...getLocalImageBackendCandidateState(selectedToolId, contextMaps, { model, operationId }),
+    };
+  }
+
+  const candidates = candidateToolIds.map((toolId) => getLocalImageBackendCandidateState(toolId, contextMaps, { model, operationId }));
+  const usableCandidates = candidates
+    .filter((entry) => entry.usable)
+    .sort((left, right) => right.score - left.score);
+  const selected = usableCandidates[0] || null;
+  if (selected) {
+    return {
+      auto: true,
+      candidates,
+      ...selected,
+    };
+  }
+
+  const bestBlocked = candidates.sort((left, right) => right.score - left.score)[0] || null;
+  return {
+    auto: true,
+    candidates,
+    message: bestBlocked?.message || 'No usable local image generation backend is ready. Install or repair Forge or Automatic1111, then make sure a real Stable Diffusion checkpoint is available.',
+    score: bestBlocked?.score || -1000,
+    tool: bestBlocked?.tool || null,
+    toolId: bestBlocked?.toolId || '',
+    usable: false,
+  };
+}
+
 function getImageToolIdForNode(node, contextMaps = {}) {
   const selectedToolId = String(node?.config?.toolId || '').trim();
   if (selectedToolId) {
     return selectedToolId;
   }
 
-  return pickAvailableToolId(IMAGE_WORKFLOW_TOOL_IDS, contextMaps);
+  return selectLocalImageBackend(contextMaps, node).toolId || '';
 }
 
 function getLocalToolRequirement(node, contextMaps = {}) {
@@ -3019,6 +3422,14 @@ function getLocalToolRequirement(node, contextMaps = {}) {
     return getImageToolIdForNode(node, contextMaps);
   }
 
+  if (node.type === 'collectionMap' && getCollectionMapExecutionMode(node) === 'localTool') {
+    return getImageToolIdForNode(node, contextMaps);
+  }
+
+  if (node.type === 'collectionMap' && getCollectionMapExecutionMode(node) === 'graphWorkflow') {
+    const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+    return support.toolId || String(node.config?.graphWorkflowToolId || '').trim().toLowerCase() || null;
+  }
   if (node.type === 'graphWorkflow') {
     return getGraphWorkflowToolId(node);
   }
@@ -3214,44 +3625,27 @@ function analyzeWhisperNode(summary, contextMaps) {
 }
 
 function analyzeImageToolNode(node, summary, contextMaps) {
-  const selectedToolId = String(node.config?.toolId || '').trim();
-  const effectiveToolId = getImageToolIdForNode(node, contextMaps);
-  if (selectedToolId && !IMAGE_WORKFLOW_TOOL_IDS.includes(selectedToolId)) {
+  const selection = selectLocalImageBackend(contextMaps, node);
+  if (!selection.usable) {
     summary.readiness = {
       tone: 'error',
-      message: 'Choose Automatic1111 or Forge for this image step.',
+      message: selection.message || 'No usable local image generation backend is ready. Install or repair Forge or Automatic1111, then refresh checkpoints.',
     };
     return false;
   }
 
-  if (!effectiveToolId) {
-    summary.readiness = {
-      tone: 'error',
-      message: 'Install Automatic1111 or Forge before using this image step.',
-    };
-    return false;
-  }
-
-  const tool = contextMaps.toolsById[effectiveToolId] || null;
-  if (!tool) {
-    summary.readiness = {
-      tone: 'error',
-      message: 'Install Automatic1111 or Forge before using this image step.',
-    };
-    return false;
-  }
-
+  const tool = selection.tool || null;
   if (String(tool.status || '').toLowerCase() !== 'running') {
     summary.readiness = {
       tone: 'warn',
-      message: tool.name + ' is not running yet. Local AI Hub can start it automatically when this image step begins.',
+      message: tool.name + ' is not running yet. Local AI Hub can start it automatically when this image step begins. ' + (selection.message || 'Leave Checkpoint blank to use the backend current checkpoint.'),
     };
     return true;
   }
 
   summary.readiness = {
     tone: 'info',
-    message: tool.name + ' will handle this image step locally.',
+    message: tool.name + ' will handle this image step locally. ' + (selection.message || 'Leave Checkpoint blank to use the backend current checkpoint.'),
   };
   return true;
 }
@@ -3311,6 +3705,34 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
       message: tool.name + ' is installed, but Local AI Hub cannot find its local runtime yet. Run Repair or reinstall the tool before using this model step.',
     };
     return false;
+  }
+
+
+
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+    const selection = selectLocalImageBackend(contextMaps, node, { operationId });
+    if (!selection.usable) {
+      summary.readiness = {
+        tone: 'error',
+        message: selection.message || 'No usable local image generation backend is ready. Install or repair Forge or Automatic1111, then refresh checkpoints.',
+      };
+      return false;
+    }
+
+    const imageTool = selection.tool || tool;
+    if (String(imageTool.status || '').toLowerCase() !== 'running') {
+      summary.readiness = {
+        tone: 'warn',
+        message: imageTool.name + ' is not running yet. Local AI Hub can start it automatically when this model step begins. ' + (selection.message || 'Leave Checkpoint blank to use the backend current checkpoint.'),
+      };
+      return true;
+    }
+
+    summary.readiness = {
+      tone: 'info',
+      message: imageTool.name + ' will turn the connected text prompt into an image locally. ' + (selection.message || 'Leave Checkpoint blank to use the backend current checkpoint.'),
+    };
+    return true;
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
@@ -3410,6 +3832,58 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
   summary.readiness = {
     tone: 'info',
     message: tool.name + ' will turn the connected text prompt into an image locally.',
+  };
+  return true;
+}
+
+function analyzeCollectionMapGraphWorkflowNode(node, summary, contextMaps) {
+  const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+  if (!support.usable) {
+    summary.readiness = {
+      tone: 'error',
+      message: support.message || 'Configure a compatible text-to-image graph workflow before using it for Map Collection.',
+    };
+    return false;
+  }
+
+  const toolLabel = getContextToolEntry(support.toolId, contextMaps)?.name || support.contract?.toolId || 'This graph workflow tool';
+  const installedTool = contextMaps.toolsById[support.toolId] || null;
+  if (!installedTool) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Install ' + toolLabel + ' before using this graph workflow for Map Collection.',
+    };
+    return false;
+  }
+
+  if (!canToolLikelyLaunch(installedTool)) {
+    summary.readiness = {
+      tone: 'error',
+      message: toolLabel + ' is installed, but Local AI Hub cannot find its local runtime yet. Run Repair or reinstall the tool before using this graph workflow backend.',
+    };
+    return false;
+  }
+
+  const status = String(installedTool.status || '').trim().toLowerCase();
+  if (status === 'error') {
+    summary.readiness = {
+      tone: 'error',
+      message: String(installedTool.lastError || '').trim() || (toolLabel + ' is currently marked unhealthy. Open Library or run Repair before using this graph workflow backend.'),
+    };
+    return false;
+  }
+
+  if (status !== 'running') {
+    summary.readiness = {
+      tone: 'warn',
+      message: toolLabel + ' is not running yet. Local AI Hub can start it automatically, then run the configured graph workflow once for each text item and keep the original order.',
+    };
+    return true;
+  }
+
+  summary.readiness = {
+    tone: 'info',
+    message: toolLabel + ' will run the configured text-to-image graph workflow once for each text item and keep the original order.',
   };
   return true;
 }
@@ -3638,7 +4112,7 @@ function analyzePipeline(definition = {}, context = {}) {
           const providerRequiresExplicitModel = executionMode === 'cloud'
             ? doesProviderOperationRequireExplicitModel(String(node.config?.providerId || '').trim(), operationId)
             : true;
-          const requiresExplicitModel = !(executionMode === 'localTool' && (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM || operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM))
+          const requiresExplicitModel = !(executionMode === 'localTool' && (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE || operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM || operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM || operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE))
             && (executionMode !== 'cloud' || providerRequiresExplicitModel);
           if (unsupportedKinds.length) {
             summary.readiness = {
@@ -4124,6 +4598,78 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
+      if (node.type === 'collectionMap') {
+        const connectedKinds = getIncomingKindsForNodePort(node, 'collection', graph);
+        const executionMode = getCollectionMapExecutionMode(node);
+        const operationId = getCollectionMapOperationId(node);
+        if (!isSupportedCollectionMapOperation(node)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Map Collection currently supports text collection to image collection only. Choose Image generation or use another explicit pipeline step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!connectedKinds.includes(createCollectionPortKind(PORT_KIND_TEXT))) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect an ordered text collection before mapping it through image generation.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (executionMode === 'graphWorkflow') {
+          const ready = analyzeCollectionMapGraphWorkflowNode(node, summary, contextMaps);
+          if (!ready || summary.readiness.tone === 'error') {
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (summary.readiness.tone === 'warn') {
+            issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+          } else {
+            issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
+          }
+        } else if (executionMode === 'localTool') {
+          if (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Use at least 256 by 256 for mapped local image generation.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else {
+            const ready = analyzeImageToolNode(node, summary, contextMaps);
+            if (!ready || summary.readiness.tone === 'error') {
+              issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+            } else if (summary.readiness.tone === 'warn') {
+              issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
+            } else {
+              summary.readiness = {
+                tone: 'info',
+                message: summary.readiness.message + ' Map Collection will generate one image for each text item and keep the original order.',
+              };
+              issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
+            }
+          }
+        } else if (summary.capabilitySummary?.supported === false) {
+          summary.readiness = {
+            tone: 'error',
+            message: summary.capabilitySummary.message,
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (doesProviderOperationRequireExplicitModel(String(node.config?.providerId || '').trim(), operationId) && !String(node.config?.model || '').trim()) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose or enter an image model before mapping this text collection.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
+          summary.readiness = providerStatus.tone === 'good'
+            ? {
+                tone: 'info',
+                message: (providerStatus.provider?.name || 'That provider') + ' will generate one image for each text item and keep the original collection order.',
+              }
+            : {
+                tone: providerStatus.tone,
+                message: providerStatus.message,
+              };
+          issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
+        }
+      }
       if (node.type === 'collectionBuilder') {
         const itemEdges = graph.incomingEdgesByPortKey.get(node.id + ':items') || [];
         const itemKinds = getIncomingKindsForNodePort(node, 'items', graph).filter((kind) => !isCollectionPortKind(kind));
@@ -4313,6 +4859,7 @@ module.exports = {
   PIPELINE_NODE_TYPES,
   NODE_TYPE_LIST,
   GRAPH_WORKFLOW_TOOL_IDS,
+  GRAPH_WORKFLOW_OPERATION_BACKEND_IDS,
   IMAGE_WORKFLOW_TOOL_IDS,
   PIPELINE_OPERATION_IDS,
   PIPELINE_PORT_KIND_LABELS,
@@ -4361,10 +4908,14 @@ module.exports = {
   getGraphWorkflowNodeEntry,
   getGraphWorkflowOutputBinding,
   getGraphWorkflowOutputNodeOptions,
+  getGraphWorkflowOperationBackendSupport,
   getGraphWorkflowToolId,
   getImageToolIdForNode,
+  selectLocalImageBackend,
+  getLocalImageCheckpointModels,
   getLocalToolRequirement,
   getModelStepExecutionMode,
+  getPipelineNodePorts,
   getModelStepLocalToolId,
   getModelStepOperationId,
   getNodeTypeDefinition,

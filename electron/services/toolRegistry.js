@@ -152,6 +152,15 @@ function buildLaunchUrl(tool) {
   return `http://127.0.0.1:${tool.defaultPort}`;
 }
 
+function getEffectiveHealthCheckPath(tool) {
+  const requestedPath = String(tool?.healthCheckPath || '').trim();
+  if (tool?.id === 'automatic1111' || tool?.id === 'forge') {
+    return '/sdapi/v1/sd-models';
+  }
+
+  return requestedPath;
+}
+
 function buildHealthUrl(tool, launchUrl) {
   if (tool.healthUrl) {
     return tool.healthUrl;
@@ -161,12 +170,13 @@ function buildHealthUrl(tool, launchUrl) {
     return null;
   }
 
-  if (!tool.healthCheckPath) {
+  const healthCheckPath = getEffectiveHealthCheckPath(tool);
+  if (!healthCheckPath) {
     return launchUrl;
   }
 
   try {
-    return new URL(tool.healthCheckPath, `${launchUrl.replace(/\/$/, '')}/`).toString();
+    return new URL(healthCheckPath, `${launchUrl.replace(/\/$/, '')}/`).toString();
   } catch {
     return launchUrl;
   }
@@ -667,4 +677,3 @@ module.exports = {
   initializeToolRegistry,
   tokenizeCommand,
 };
-

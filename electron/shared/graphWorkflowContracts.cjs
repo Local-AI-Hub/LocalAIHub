@@ -13,6 +13,10 @@ const GRAPH_WORKFLOW_BOUNDARY_DIRECTION_IDS = Object.freeze({
   OUTPUT: 'output',
 });
 
+const GRAPH_WORKFLOW_OPERATION_BACKEND_IDS = Object.freeze({
+  TEXT_TO_IMAGE: 'textToImage',
+});
+
 const PORT_KIND_TEXT = 'text';
 const PORT_KIND_IMAGE = 'image';
 const PORT_KIND_VIDEO = 'video';
@@ -22,7 +26,7 @@ const INVOKEAI_RESERVED_GRAPH_FIELDS = new Set(['id', 'is_intermediate', 'type',
 const GRAPH_WORKFLOW_TOOL_CONTRACTS = Object.freeze({
   comfyui: Object.freeze({
     adapterStatus: GRAPH_WORKFLOW_ADAPTER_STATUS_IDS.RUNNABLE,
-    executionBlockedMessage: 'only ComfyUI graph workflows run inside Local AI Hub in v0.9.8.',
+    executionBlockedMessage: 'ComfyUI graph workflows run through the ComfyUI API adapter.',
     inputPorts: Object.freeze([
       Object.freeze({
         bindingMode: GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_FIELD,
@@ -689,12 +693,203 @@ function getGraphWorkflowOutputBinding(node, portId) {
   return getGraphWorkflowBinding(node, GRAPH_WORKFLOW_BOUNDARY_DIRECTION_IDS.OUTPUT, portId);
 }
 
+function getGraphWorkflowOperationBackendConfig(nodeOrConfig = {}) {
+  const config = nodeOrConfig && typeof nodeOrConfig === 'object' && nodeOrConfig.config && typeof nodeOrConfig.config === 'object'
+    ? nodeOrConfig.config
+    : nodeOrConfig || {};
+  const toolId = normalizeToolId(config.graphWorkflowToolId || config.toolId) || DEFAULT_GRAPH_WORKFLOW_TOOL_ID;
+  const defaults = getDefaultGraphWorkflowBindings(toolId);
+  return {
+    inputBindings: isRecord(config.graphWorkflowInputBindings)
+      ? cloneValue(config.graphWorkflowInputBindings)
+      : isRecord(config.inputBindings)
+        ? cloneValue(config.inputBindings)
+        : defaults.inputBindings,
+    outputBindings: isRecord(config.graphWorkflowOutputBindings)
+      ? cloneValue(config.graphWorkflowOutputBindings)
+      : isRecord(config.outputBindings)
+        ? cloneValue(config.outputBindings)
+        : defaults.outputBindings,
+    toolId,
+    workflowFormat: String(config.graphWorkflowFormat || config.workflowFormat || defaults.workflowFormat || '').trim(),
+    workflowText: String(config.graphWorkflowWorkflowText !== undefined ? config.graphWorkflowWorkflowText : config.workflowText || ''),
+  };
+}
+
+function buildGraphWorkflowOperationBackendNode(nodeOrConfig = {}, options = {}) {
+  const backendConfig = getGraphWorkflowOperationBackendConfig(nodeOrConfig);
+  return {
+    id: String(options.id || nodeOrConfig?.id || 'graph-workflow-operation-backend').trim() || 'graph-workflow-operation-backend',
+    label: String(options.label || nodeOrConfig?.label || 'Graph Workflow Backend').trim() || 'Graph Workflow Backend',
+    type: 'graphWorkflow',
+    config: {
+      inputBindings: backendConfig.inputBindings,
+      outputBindings: backendConfig.outputBindings,
+      toolId: backendConfig.toolId,
+      workflowFormat: backendConfig.workflowFormat,
+      workflowText: backendConfig.workflowText,
+    },
+  };
+}
+
+function getGraphWorkflowNodeEntrySummary(definition, nodeId) {
+  const normalizedNodeId = String(nodeId || '').trim();
+  return (definition?.nodeEntries || []).find((entry) => String(entry?.id || '').trim() === normalizedNodeId) || null;
+}
+
+function getGraphWorkflowOperationBackendSupport(nodeOrConfig = {}, operationId = GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE) {
+  const normalizedOperationId = String(operationId || '').trim() || GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE;
+  const backendNode = buildGraphWorkflowOperationBackendNode(nodeOrConfig);
+  const toolId = normalizeToolId(backendNode.config.toolId) || DEFAULT_GRAPH_WORKFLOW_TOOL_ID;
+  const contract = getGraphWorkflowContract(toolId);
+
+  if (normalizedOperationId !== GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE) {
+    return {
+      contract,
+      message: 'This graph workflow operation backend is not supported yet.',
+      operationId: normalizedOperationId,
+      toolId,
+      usable: false,
+    };
+  }
+
+  if (!contract?.supportsExecution) {
+    return {
+      contract,
+      message: (contract?.executionBlockedMessage || 'This graph workflow tool does not have a runnable adapter in Local AI Hub yet.'),
+      operationId: normalizedOperationId,
+      toolId,
+      usable: false,
+    };
+  }
+
+  const textInputSpec = (contract.inputPorts || []).find((entry) => entry.kind === PORT_KIND_TEXT && entry.portId === 'text')
+    || (contract.inputPorts || []).find((entry) => entry.kind === PORT_KIND_TEXT)
+    || null;
+  const imageOutputSpec = (contract.outputPorts || []).find((entry) => entry.kind === PORT_KIND_IMAGE && entry.portId === 'image')
+    || (contract.outputPorts || []).find((entry) => entry.kind === PORT_KIND_IMAGE)
+    || null;
+
+  if (!textInputSpec || !imageOutputSpec) {
+    return {
+      contract,
+      message: 'This graph workflow contract does not expose the text input and image output boundaries needed for text-to-image mapping.',
+      operationId: normalizedOperationId,
+      toolId,
+      usable: false,
+    };
+  }
+
+  const parsedWorkflow = parseGraphWorkflowDefinitionText(toolId, backendNode.config.workflowText);
+  if (!parsedWorkflow.ok) {
+    return {
+      contract,
+      message: parsedWorkflow.message || 'Paste a workflow definition before using this graph workflow as an operation backend.',
+      operationId: normalizedOperationId,
+      parsedWorkflow,
+      toolId,
+      usable: false,
+    };
+  }
+
+  const textBinding = getGraphWorkflowInputBinding(backendNode, textInputSpec.portId);
+  const textNodeId = String(textBinding?.nodeId || '').trim();
+  const textField = String(textBinding?.field || '').trim();
+  if (!textNodeId || !textField || textBinding?.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_FIELD) {
+    return {
+      contract,
+      message: 'Map the graph workflow Text input boundary to a workflow node and field before using it for collection mapping.',
+      operationId: normalizedOperationId,
+      parsedWorkflow,
+      toolId,
+      usable: false,
+    };
+  }
+
+  const textWorkflowNode = getGraphWorkflowNodeEntry(parsedWorkflow.workflow, textNodeId);
+  if (!textWorkflowNode) {
+    return {
+      contract,
+      message: 'The mapped graph workflow Text input node could not be found in the imported workflow definition.',
+      operationId: normalizedOperationId,
+      parsedWorkflow,
+      toolId,
+      usable: false,
+    };
+  }
+
+  if (!textWorkflowNode.inputs || typeof textWorkflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(textWorkflowNode.inputs, textField)) {
+    return {
+      contract,
+      message: 'The mapped graph workflow Text input field could not be found in the imported workflow definition.',
+      operationId: normalizedOperationId,
+      parsedWorkflow,
+      toolId,
+      usable: false,
+    };
+  }
+
+  const imageOutputBinding = getGraphWorkflowOutputBinding(backendNode, imageOutputSpec.portId);
+  const imageOutputNodeId = String(imageOutputBinding?.nodeId || '').trim();
+  if (!imageOutputNodeId || imageOutputBinding?.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_OUTPUT) {
+    return {
+      contract,
+      message: 'Choose the graph workflow node that should feed the Image output boundary before using it for collection mapping.',
+      operationId: normalizedOperationId,
+      parsedWorkflow,
+      toolId,
+      usable: false,
+    };
+  }
+
+  if (!getGraphWorkflowNodeEntry(parsedWorkflow.workflow, imageOutputNodeId)) {
+    return {
+      contract,
+      message: 'The selected graph workflow Image output boundary node could not be found in the imported workflow definition.',
+      operationId: normalizedOperationId,
+      parsedWorkflow,
+      toolId,
+      usable: false,
+    };
+  }
+
+  const imageOutputEntry = getGraphWorkflowNodeEntrySummary(parsedWorkflow, imageOutputNodeId);
+  if (!imageOutputEntry?.imageOutputCandidate) {
+    return {
+      contract,
+      message: 'The selected graph workflow Image output boundary is not recognized as an image-producing node. Choose a final image output node such as SaveImage, PreviewImage, or a final InvokeAI image node.',
+      operationId: normalizedOperationId,
+      parsedWorkflow,
+      toolId,
+      usable: false,
+    };
+  }
+
+  return {
+    contract,
+    inputBinding: textBinding,
+    inputPortId: textInputSpec.portId,
+    message: (contract.toolId === 'comfyui' ? 'ComfyUI' : contract.toolId === 'invokeai' ? 'InvokeAI' : 'The graph workflow') + ' can map text input to an image output through the configured workflow boundary.',
+    node: backendNode,
+    operationId: normalizedOperationId,
+    outputBinding: imageOutputBinding,
+    outputPortId: imageOutputSpec.portId,
+    parsedWorkflow,
+    toolId,
+    usable: true,
+  };
+}
+
 module.exports = {
   DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
   GRAPH_WORKFLOW_ADAPTER_STATUS_IDS,
   GRAPH_WORKFLOW_BINDING_MODE_IDS,
   GRAPH_WORKFLOW_BOUNDARY_DIRECTION_IDS,
+  GRAPH_WORKFLOW_OPERATION_BACKEND_IDS,
+  buildGraphWorkflowOperationBackendNode,
   getDefaultGraphWorkflowBindings,
+  getGraphWorkflowOperationBackendConfig,
+  getGraphWorkflowOperationBackendSupport,
   getGraphWorkflowBinding,
   getGraphWorkflowBoundarySpec,
   getGraphWorkflowBoundarySpecs,

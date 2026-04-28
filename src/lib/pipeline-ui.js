@@ -14,6 +14,7 @@ const {
   buildContextMaps,
   createNode,
   getNodeTypeDefinition,
+  getPipelineNodePorts,
   trimPreviewText,
 } = pipelineShared;
 
@@ -69,8 +70,7 @@ export function createPositionedNode(type, existingNodes = []) {
 }
 
 export function getNodePortCenter(node, direction, portIndex) {
-  const definition = getNodeTypeDefinition(node.type);
-  const rowCount = Math.max(definition?.inputPorts?.length || 0, definition?.outputPorts?.length || 0, 1);
+  const rowCount = Math.max(getPipelineNodePorts(node, 'input').length, getPipelineNodePorts(node, 'output').length, 1);
   const baseY = node.position.y + PIPELINE_PORT_SECTION_OFFSET;
   const safeIndex = Number.isFinite(portIndex) ? portIndex : 0;
   return {
@@ -81,8 +81,7 @@ export function getNodePortCenter(node, direction, portIndex) {
 }
 
 export function getNodeCardHeight(node) {
-  const definition = getNodeTypeDefinition(node.type);
-  const portCount = Math.max(definition?.inputPorts?.length || 0, definition?.outputPorts?.length || 0, 1);
+  const portCount = Math.max(getPipelineNodePorts(node, 'input').length, getPipelineNodePorts(node, 'output').length, 1);
   return Math.max(PIPELINE_NODE_MIN_HEIGHT, PIPELINE_PORT_SECTION_OFFSET + portCount * PIPELINE_PORT_ROW_HEIGHT + 56);
 }
 

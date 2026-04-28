@@ -29,6 +29,13 @@ const providers = [
     lastTestedAt: new Date().toISOString(),
     name: 'OpenAI',
   },
+  {
+    id: 'google',
+    isConnected: true,
+    lastTestSucceeded: true,
+    lastTestedAt: new Date().toISOString(),
+    name: 'Google Gemini',
+  },
 ];
 
 const tools = [
@@ -97,6 +104,71 @@ function analyzeWithRealContext(pipeline) {
     toolCatalog: tools,
     tools,
   }));
+}
+
+function buildMediaCapabilityContext(overrides = {}) {
+  const mediaTools = [
+    ...tools,
+    {
+      compatibility: { minimumRamMb: 8192, minimumVramMb: 4096, recommendedRamMb: 16384, recommendedVramMb: 8192 },
+      id: 'audiocraft-webui',
+      installDir: 'C:/mock/audiocraft',
+      launchProfile: { kind: 'python-script', pythonPath: 'C:/mock/python.exe' },
+      name: 'AudioCraft WebUI',
+      status: 'stopped',
+    },
+    {
+      id: 'rvc',
+      installDir: 'C:/mock/rvc',
+      launchProfile: { kind: 'python-script', pythonPath: 'C:/mock/python.exe' },
+      name: 'RVC',
+      status: 'stopped',
+    },
+    {
+      compatibility: { minimumRamMb: 16384, minimumVramMb: 8192, recommendedRamMb: 32768, recommendedVramMb: 12288 },
+      id: 'wan21-webui',
+      installDir: 'C:/mock/wan21',
+      launchProfile: { kind: 'python-script', pythonPath: 'C:/mock/python.exe' },
+      name: 'Wan2.1 WebUI',
+      status: 'stopped',
+    },
+    {
+      id: 'upscayl',
+      installDir: 'C:/mock/upscayl',
+      launchProfile: { kind: 'binary', executable: 'C:/mock/upscayl.exe' },
+      name: 'Upscayl',
+      status: 'stopped',
+    },
+    {
+      id: 'facefusion',
+      installDir: 'C:/mock/facefusion',
+      launchProfile: { kind: 'python-script', pythonPath: 'C:/mock/python.exe' },
+      name: 'FaceFusion',
+      status: 'stopped',
+    },
+  ];
+  const selectedTools = overrides.tools || mediaTools;
+  return buildPipelineWizardContext({
+    hardware: overrides.hardware || hardware,
+    manifests: overrides.manifests || selectedTools,
+    providers: overrides.providers || providers,
+    tools: selectedTools,
+  });
+}
+
+function getModelStepByOperation(pipeline, operationId) {
+  return pipeline.nodes.find((node) => node.type === 'llmPrompt' && node.config?.operationId === operationId) || null;
+}
+
+function assertNoInventedRuntimeFileOrModelPaths(pipeline) {
+  for (const node of pipeline.nodes) {
+    if (['imageInput', 'audioInput', 'videoInput', 'fileInput'].includes(node.type)) {
+      assert.strictEqual(node.config.filePath, '', node.label + ' should remain an empty runtime placeholder.');
+    }
+    if (node.type === 'llmPrompt' && node.config?.operationId === 'audioTransform') {
+      assert.strictEqual(node.config.model, '', 'RVC voice model selection should remain a visible manual configuration requirement.');
+    }
+  }
 }
 
 function testWizardPromptBoundary(context) {
@@ -354,9 +426,10 @@ function testComplexStoryboardVideoScaffold(context) {
   }
   assert(result.pipeline.nodes.filter((node) => node.type === 'validation').length >= 2, 'Expected the repaired draft to preserve plan and prompt validation stages.');
   assert(result.pipeline.nodes.filter((node) => node.type === 'retryLoop').length >= 2, 'Expected the repaired draft to preserve retry stages.');
-  assert.strictEqual(result.pipeline.nodes.some((node) => node.type === 'mediaExport'), false, 'Unsupported downstream export should stay an explicit gap instead of a fake compiled graph.');
-  assert(result.pipeline.nodes.length > 6, 'Expected the repaired draft to avoid collapsing to a shallow three-node graph.');
-  assert(result.summary.gaps.some((gap) => /does not yet map each collection item through image generation automatically/i.test(gap)), 'Expected explicit unsupported collection-to-image bridge gap.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'collectionMap'), 'Expected repaired storyboard draft to map scene prompts through collection image generation.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'mediaExport'), 'Expected supported image collection to video export to compile now that collectionMap exists.');
+  assert(result.pipeline.nodes.length > 10, 'Expected the repaired draft to avoid collapsing to a shallow three-node graph.');
+  assert.strictEqual(result.summary.gaps.some((gap) => /does not yet map each collection item through image generation automatically/i.test(gap)), false, 'Collection-to-image should no longer be reported as an unsupported bridge.');
   assert(!/Make a pipeline for the user request/.test(result.summary.message), 'Summary should describe the graph Local AI Hub actually created.');
   assert.strictEqual(result.summary.resultState, 'repaired', 'Expected repaired storyboard draft to be classified as repaired, not placeholder.');
   assert(/repaired and compiled the requested workflow/i.test(result.summary.message), 'Expected graph-grounded repaired intent summary after repair.');
@@ -501,6 +574,287 @@ function testFallbackPlanningRecoveryIsNotPlaceholder(context) {
     assert(result.pipeline.nodes.some((node) => node.type === expectedType), 'Expected recovered planning graph to include ' + expectedType + '.');
   }
 }
+function testCollectionTextPromptsToImagesDraft(context) {
+  const intent = 'turn a collection of text prompts into a collection of images';
+  const fallbackPlan = parsePipelineWizardPlan('', { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: fallbackPlan,
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  for (const expectedType of ['textInput', 'collectionBuilder', 'collectionMap', 'collectionOutput']) {
+    assert(result.pipeline.nodes.some((node) => node.type === expectedType), 'Expected collection-aware prompt-to-image graph to include ' + expectedType + '.');
+  }
+  assert.strictEqual(result.pipeline.nodes.some((node) => node.type === 'imageOutput'), false, 'Collection request should not collapse to a single image output.');
+  assert.strictEqual(result.pipeline.nodes.some((node) => node.type === 'imageGenerate'), false, 'Collection request should use collectionMap rather than a single imageGenerate node.');
+  assert(/Collection Builder -> Map Collection -> Collection Output/i.test(result.summary.message), 'Summary should describe collection-aware lowering.');
+}
+
+function testPlanScenesCanMapToImages(context) {
+  const intent = 'plan scenes, then generate one image per scene';
+  const fallbackPlan = parsePipelineWizardPlan('', { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: fallbackPlan,
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  for (const expectedType of ['planningPacket', 'planner', 'planScenes', 'collectionMap', 'collectionOutput']) {
+    assert(result.pipeline.nodes.some((node) => node.type === expectedType), 'Expected scene-to-image draft to include ' + expectedType + '.');
+  }
+  assert.strictEqual(result.summary.gaps.some((gap) => /collection item through image generation automatically/i.test(gap)), false, 'Scene image mapping should not be reported as unsupported.');
+}
+
+function testUnsupportedCollectionMappingStaysHonest(context) {
+  const intent = 'collection mapping verification';
+  const plan = parsePipelineWizardPlan(JSON.stringify({
+    title: 'Unsupported image collection mapping',
+    intentIr: {
+      sources: [{ name: 'sourceImage', modality: 'image', role: 'Source image' }],
+      artifacts: [
+        { name: 'imageCollection', kind: 'collection:image' },
+        { name: 'generatedImages', kind: 'collection:image' },
+      ],
+      stages: [
+        { id: 'collectImages', kind: 'build_collection', input: 'sourceImage', output: 'imageCollection' },
+        { id: 'mapImages', kind: 'generate_image', input: 'imageCollection', output: 'generatedImages' },
+      ],
+      outputs: [{ artifact: 'generatedImages', kind: 'collection:image', title: 'Generated images' }],
+    },
+  }), { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: plan,
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'collectionBuilder'), 'Expected source collection to be preserved.');
+  assert.strictEqual(result.pipeline.nodes.some((node) => node.type === 'collectionMap'), false, 'Unsupported image collection mapping must not become a fake collectionMap.');
+  assert(result.summary.gaps.some((gap) => /only ordered text collections|only map text collections/i.test(gap)), 'Expected honest unsupported collection mapping gap.');
+}
+
+function testGeminiVideoInputTextGeneration(context) {
+  const intent = 'summarize a video file';
+  const fallbackPlan = parsePipelineWizardPlan('', { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: fallbackPlan,
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'videoInput'), 'Expected requested video source to be preserved.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'llmPrompt'), 'Expected video to feed a text-generation model step.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'textOutput'), 'Expected text output for video summary.');
+  assert.strictEqual(result.summary.gaps.some((gap) => /does not accept video/i.test(gap)), false, 'Gemini video input should be treated as supported by capability declarations.');
+}
+
+function testUnsupportedVideoInputProviderIsSurfaced(context) {
+  const intent = 'summarize a video file';
+  const fallbackPlan = parsePipelineWizardPlan('', { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: fallbackPlan,
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'videoInput'), 'Expected unsupported provider case to preserve requested video source.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'llmPrompt'), 'Expected editable model step to remain visible for provider correction.');
+  assert(result.summary.gaps.some((gap) => /does not accept video inputs/i.test(gap)), 'Expected honest unsupported provider/model gap.');
+}
+
+function testFileInputTextGenerationForSupportedProvider(context) {
+  const intent = 'review a document file and summarize it';
+  const fallbackPlan = parsePipelineWizardPlan('', { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: fallbackPlan,
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'fileInput'), 'Expected requested file source to be preserved.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'llmPrompt'), 'Expected file to feed a text-generation model step.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'textOutput'), 'Expected text output for file review.');
+}
+
+
+function testAudioGenerationIntentIrDraft() {
+  const context = buildMediaCapabilityContext();
+  const intent = 'generate background music from a text prompt';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'textInput'), 'Expected text prompt placeholder for audio generation.');
+  const step = getModelStepByOperation(result.pipeline, 'audioGenerate');
+  assert(step, 'Expected audio generation to compile through a Model Step operation.');
+  assert.strictEqual(step.config.executionMode, 'localTool', 'Expected installed AudioCraft to be preferred for local audio generation.');
+  assert.strictEqual(step.config.toolId, 'audiocraft-webui', 'Expected AudioCraft for generated music/audio.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'audioOutput'), 'Expected audio output node.');
+  assertNoInventedRuntimeFileOrModelPaths(result.pipeline);
+  assertRuntimeConfigsDoNotContainIntent(result.pipeline, intent);
+}
+
+function testAudioTransformRvcIntentIrDraft() {
+  const context = buildMediaCapabilityContext();
+  const intent = 'convert a voiceover using RVC';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'audioInput'), 'Expected audio file placeholder for RVC conversion.');
+  const step = getModelStepByOperation(result.pipeline, 'audioTransform');
+  assert(step, 'Expected RVC voice conversion to compile through audioTransform.');
+  assert.strictEqual(step.config.toolId, 'rvc', 'Expected installed RVC to be selected.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'audioOutput'), 'Expected transformed audio output.');
+  assert(result.summary.gaps.some((gap) => /voice model/i.test(gap)), 'Expected visible voice-model configuration requirement.');
+  assertNoInventedRuntimeFileOrModelPaths(result.pipeline);
+  assertRuntimeConfigsDoNotContainIntent(result.pipeline, intent);
+}
+
+function testVideoGenerationFromTextIntentIrDraft() {
+  const context = buildMediaCapabilityContext();
+  const intent = 'generate a video from a text prompt';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'textInput'), 'Expected text prompt placeholder for text-to-video.');
+  assert(getModelStepByOperation(result.pipeline, 'videoGenerate'), 'Expected videoGenerate model step.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Expected video output node.');
+  assert(result.summary.gaps.some((gap) => /Wan2.1|hardware|reduced settings|practical fit/i.test(gap)), 'Expected honest Wan hardware/readiness warning on GTX 1060-class hardware.');
+  assertNoInventedRuntimeFileOrModelPaths(result.pipeline);
+}
+
+function testVideoGenerationFromImageIntentIrDraft() {
+  const context = buildMediaCapabilityContext();
+  const intent = 'turn an image input into a video';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'imageInput'), 'Expected image file placeholder for image-to-video.');
+  assert(getModelStepByOperation(result.pipeline, 'videoGenerate'), 'Expected image-to-video to compile through videoGenerate.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Expected video output node.');
+  assert.strictEqual(result.summary.gaps.some((gap) => /only generate images from text/i.test(gap)), false, 'Image-to-video should not fall into image-generation gaps.');
+  assertNoInventedRuntimeFileOrModelPaths(result.pipeline);
+}
+
+function testImageUpscaleIntentIrDraft() {
+  const context = buildMediaCapabilityContext();
+  const intent = 'upscale an image';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.pipeline.nodes.some((node) => node.type === 'imageInput'), 'Expected image placeholder for upscaling.');
+  const step = getModelStepByOperation(result.pipeline, 'imageTransform');
+  assert(step, 'Expected imageTransform model step for upscaling.');
+  assert.strictEqual(step.config.toolId, 'upscayl', 'Expected Upscayl to be preferred for generic upscale/enhance requests.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'imageOutput'), 'Expected image output node.');
+  assertNoInventedRuntimeFileOrModelPaths(result.pipeline);
+}
+
+function testFaceFusionIntentIrDraft() {
+  const context = buildMediaCapabilityContext();
+  const intent = 'swap a face using a reference image';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert.strictEqual(result.pipeline.nodes.filter((node) => node.type === 'imageInput').length, 2, 'Expected target and reference image placeholders.');
+  const step = getModelStepByOperation(result.pipeline, 'imageTransform');
+  assert(step, 'Expected FaceFusion to compile through imageTransform.');
+  assert.strictEqual(step.config.toolId, 'facefusion', 'Expected FaceFusion for face-swap requests.');
+  assert(result.pipeline.edges.some((edge) => edge.target?.nodeId === step.id && edge.target?.portId === 'referenceImage'), 'Expected reference image to connect to the Model Step reference input.');
+  assertNoInventedRuntimeFileOrModelPaths(result.pipeline);
+}
+
+function testUnavailableLocalTransformStaysHonest() {
+  const context = buildMediaCapabilityContext({ tools, manifests: tools, providers: [] });
+  const intent = 'convert a voiceover using RVC';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  const step = getModelStepByOperation(result.pipeline, 'audioTransform');
+  assert(step, 'Expected unsupported RVC request to remain an editable audioTransform graph.');
+  assert.strictEqual(step.config.executionMode, 'localTool', 'Unavailable RVC should stay on the local operation path instead of pretending cloud support.');
+  assert.strictEqual(step.config.toolId, '', 'Unavailable RVC should not invent a selected tool installation.');
+  assert(result.summary.gaps.some((gap) => /Install RVC/i.test(gap)), 'Expected honest missing-RVC readiness gap.');
+  assertNoInventedRuntimeFileOrModelPaths(result.pipeline);
+}
+
+function testWizardProviderModelLabelAvoidsObjectString(context) {
+  const intent = 'Summarize a plain text input.';
+  const fallbackPlan = parsePipelineWizardPlan('', { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: fallbackPlan,
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash' } },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  assert(result.summary.targetLabel.includes('Google Gemini'), 'Expected provider name in target label.');
+  assert(result.summary.targetLabel.includes('gemini-2.5-flash'), 'Expected normalized model id in target label.');
+  assert(!result.summary.targetLabel.includes('[object Object]'), 'Provider/model label should not expose object stringification.');
+}
+
 function testHallucinatedPlanFallsBack(context) {
   const intent = 'Transcribe an interview audio file into text.';
   const plan = parsePipelineWizardPlan('{"recipeId":"invented-graph","steps":[{"operationId":"magic","targetKind":"dragon"}]}', { intent });
@@ -532,6 +886,20 @@ testImageDescriptionValidationHarness(context);
 testExplicitTextOutputStaysText(context);
 testFallbackPlanningRecoveryIsNotPlaceholder(context);
 testPartialStoryboardDraftStaysFlexible(context);
+testCollectionTextPromptsToImagesDraft(context);
+testPlanScenesCanMapToImages(context);
+testAudioGenerationIntentIrDraft();
+testAudioTransformRvcIntentIrDraft();
+testVideoGenerationFromTextIntentIrDraft();
+testVideoGenerationFromImageIntentIrDraft();
+testImageUpscaleIntentIrDraft();
+testFaceFusionIntentIrDraft();
+testUnavailableLocalTransformStaysHonest();
+testUnsupportedCollectionMappingStaysHonest(context);
+testGeminiVideoInputTextGeneration(context);
+testUnsupportedVideoInputProviderIsSurfaced(context);
+testFileInputTextGenerationForSupportedProvider(context);
+testWizardProviderModelLabelAvoidsObjectString(context);
 testHallucinatedPlanFallsBack(context);
 
 console.log('Pipeline wizard verifier passed.');

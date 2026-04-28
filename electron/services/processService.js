@@ -772,6 +772,30 @@ async function buildLaunchRuntimeEnv(toolState, extraEnv = {}) {
   };
 }
 
+function isStableDiffusionApiTool(toolState) {
+  return Boolean(toolState?.id && MANAGED_STABLE_DIFFUSION_TOOL_IDS.has(toolState.id));
+}
+
+function launchProfileHasArg(launchProfile, argName) {
+  return (Array.isArray(launchProfile?.args) ? launchProfile.args : [])
+    .some((entry) => String(entry || '').trim().toLowerCase() === argName);
+}
+
+function ensureStableDiffusionApiLaunchProfile(toolState, launchProfile) {
+  if (
+    !isStableDiffusionApiTool(toolState)
+    || !launchProfile
+    || !['python-script', 'python-module', 'batch'].includes(launchProfile.kind)
+    || launchProfileHasArg(launchProfile, '--api')
+  ) {
+    return launchProfile;
+  }
+
+  return {
+    ...launchProfile,
+    args: ['--api', ...(launchProfile.args || [])],
+  };
+}
 function isManagedStableDiffusionLaunch(toolState, launchProfile) {
   return Boolean(
     toolState
@@ -1351,7 +1375,7 @@ async function probeUrl(url) {
     const response = await fetch(safeUrl, {
       method: 'GET',
     });
-    return Boolean(response);
+    return response.ok;
   } catch {
     return false;
   }
@@ -1466,8 +1490,14 @@ async function isToolActive(toolState) {
     return toolState.status === 'running';
   }
 
-  if (await probeUrl(toolState.healthUrl || toolState.launchUrl)) {
-    return true;
+  if (toolUsesLocalUrl(toolState)) {
+    if (await probeUrl(toolState.healthUrl)) {
+      return true;
+    }
+
+    if (toolState.launchUrl && String(toolState.launchUrl).trim() !== String(toolState.healthUrl || '').trim() && await probeUrl(toolState.launchUrl)) {
+      return true;
+    }
   }
 
   const runningProcessNames = await getRunningProcessNames(toolState.processNames);
@@ -1506,12 +1536,12 @@ async function openToolInterface(toolState) {
   }
 
   const launchUrl = assertLoopbackUrl(toolState.launchUrl, 'tool URL');
-  const shouldBypassInterfaceProbe = toolState.id === 'automatic1111'
+  const shouldBypassInterfaceProbe = isStableDiffusionApiTool(toolState)
     && Boolean(toolState.healthUrl)
     && String(toolState.healthUrl).trim() !== String(toolState.launchUrl).trim();
 
   if (shouldBypassInterfaceProbe) {
-    // Automatic1111 can answer its API before its heavy Gradio root page is safe to probe.
+    // Stable Diffusion WebUI tools can answer the API before the heavier Gradio root page is safe to probe.
     await sleep(1500);
     await shell.openExternal(launchUrl).catch(() => null);
     return;
@@ -2602,6 +2632,7 @@ async function launchToolInternal(toolState, options = {}) {
   }
 
   launchProfile = await prepareManagedStableDiffusionLaunchProfile(toolState, launchProfile);
+  launchProfile = ensureStableDiffusionApiLaunchProfile(toolState, launchProfile);
 
   if (launchProfile.kind === 'embedded') {
     await persistToolRuntimeState(toolState, 'running', {

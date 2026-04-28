@@ -18,6 +18,7 @@ const {
   evaluateCompatibilityProfile,
   getNodeTypeDefinition,
   normalizePipelineDefinition,
+  selectLocalImageBackend,
   trimPreviewText,
 } = require('./pipelineSchema.cjs');
 const {
@@ -38,6 +39,7 @@ const WIZARD_RECIPE_IDS = Object.freeze({
   IMAGE_TO_TEXT: 'image-to-text',
   IMAGE_TRANSFORM: 'image-transform',
   AUDIO_TRANSCRIBE: 'audio-transcribe',
+  AUDIO_TRANSFORM: 'audio-transform',
   SCENE_PLAN: 'scene-plan',
 });
 
@@ -51,8 +53,13 @@ const OUTPUT_NODE_BY_KIND = Object.freeze({
 const WIZARD_INTENT_STAGE_KINDS = Object.freeze([
   'plan',
   'plan_scenes',
+  'build_collection',
   'llm_generate_text',
   'generate_image',
+  'generate_audio',
+  'transform_audio',
+  'generate_video',
+  'transform_image',
   'transcribe_audio',
   'validate',
   'retry',
@@ -72,7 +79,7 @@ const WIZARD_RECIPE_OPTIONS = Object.freeze([
   Object.freeze({
     id: WIZARD_RECIPE_IDS.TEXT_TO_IMAGE,
     label: 'Text to image',
-    summary: 'Text input to image generation, then Image Output. Prefers installed Automatic1111 or Forge, otherwise a compatible connected provider draft.',
+    summary: 'Text input to image generation, then Image Output. Prefers the healthiest compatible local image backend, otherwise a compatible connected provider draft.',
     mature: true,
   }),
   Object.freeze({
@@ -106,6 +113,12 @@ const WIZARD_RECIPE_OPTIONS = Object.freeze([
     mature: true,
   }),
   Object.freeze({
+    id: WIZARD_RECIPE_IDS.AUDIO_TRANSFORM,
+    label: 'Audio transform',
+    summary: 'Audio File input to local audio transformation, then Audio Output. Prefers installed RVC and leaves voice model selection editable.',
+    mature: true,
+  }),
+  Object.freeze({
     id: WIZARD_RECIPE_IDS.SCENE_PLAN,
     label: 'Longform scene plan',
     summary: 'Text input to Planning Packet, Planner, Plan Output, Plan Scenes, and Collection Output. Uses the mature longform scene-planning family only.',
@@ -120,6 +133,13 @@ function cloneValue(value) {
 function normalizeString(value, fallback = '') {
   const normalized = String(value || '').replace(/\s+/g, ' ').trim();
   return normalized || fallback;
+}
+
+function normalizeModelId(value, fallback = '') {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return normalizeString(value.id || value.model || value.modelId || value.name || value.label, fallback);
+  }
+  return normalizeString(value, fallback);
 }
 
 function normalizeId(value) {
@@ -199,9 +219,18 @@ function inferIntentFeatures(intent) {
     wantsPlanning: /\b(plan|planning|scene plan|storyboard|shot list|scene[s]?|beats?)\b/.test(text),
     wantsValidation: /\b(validat\w*|approval|approve|review|check|qa|quality)\b/.test(text),
     wantsRetry: /\b(retry|regenerat\w*|revise|repair|loop|on fail|fail|until approved|until valid)\b/.test(text),
-    wantsPromptGeneration: /\b(prompt|per[-\s]?scene|scene prompt|prompt generation)\b/.test(text),
+    wantsPromptGeneration: /\b(prompts?|per[-\s]?scene|scene prompts?|prompt generation)\b/.test(text),
     wantsImageGeneration: /\b(images?|illustrations?|visuals?|frames?|thumbnails?|pictures?)\b/.test(text),
-    wantsVideo: /\b(video|sequence|sequencing|compose|composition|export|render|movie|clip)\b/.test(text),
+    wantsAudioGeneration: /\b(generat\w*|creat\w*|mak\w*|produc\w*|draft\w*)\b[^.]{0,80}\b(audio|music|song|sound effects?|sfx|speech|tts|narration|voiceover|voice over)\b/.test(text)
+      || /\b(text[-\s]?to[-\s]?(audio|speech|music)|background music|sound effects?|generated audio)\b/.test(text),
+    wantsAudioTransform: /\b(rvc|voice conversion|convert (?:a |the )?voice|change (?:an? )?audio[^.]{0,60}voice|different voice|audio transform|transform audio|voice model)\b/.test(text)
+      || /\b(audio file|audio input|voiceover|voice over|recording)\b[^.]{0,80}\b(convert|change|transform)\b[^.]{0,80}\b(voice|rvc)\b/.test(text),
+    wantsVideoGeneration: /\b(text[-\s]?to[-\s]?video|image[-\s]?to[-\s]?video|wan2?\.?1|wan webui|generate video|video generation)\b/.test(text)
+      || /\b(generat\w*|creat\w*|mak\w*|turn|convert|animate)\b[^.]{0,90}\b(video|clip|animation|movie)\b/.test(text),
+    wantsImageToVideo: /\b(image|photo|picture)\b[^.]{0,80}\b(video|clip|animation|animate|motion)\b/.test(text),
+    wantsImageTransform: /\b(upscale|enhance|restore|face.?swap|swap[^.]{0,30}face|facefusion|transform image|image transform|clean up an image|improve an image|image enhancement|upscayl)\b/.test(text),
+    wantsFaceFusionTransform: /\b(face.?swap|swap[^.]{0,30}face|facefusion|source face|reference face)\b/.test(text),
+    wantsVideo: /\b(video|sequence|sequencing|compose|composition|export|render|movie|clip|animation|animate)\b/.test(text),
   };
 }
 
@@ -292,6 +321,9 @@ function getDefaultInstructionForOperation(operationId) {
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
     return 'Generate audio from the connected text. Leave voice, style, and duration settings editable for manual refinement.';
   }
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+    return 'Transform the connected source audio. Leave voice model and conversion settings editable for manual refinement.';
+  }
   return 'Process the connected runtime input and produce the requested text result.';
 }
 
@@ -347,6 +379,7 @@ function buildAvailableToolEntries(tools = [], manifests = [], hardware = {}) {
       const merged = { ...(catalog || {}), ...(tool || {}) };
       const hardwareSuitability = getToolCompatibility(merged, hardware);
       return {
+        ...merged,
         id: toolId,
         name: getToolDisplayName(merged),
         status: normalizeString(tool?.status || merged?.status, 'installed'),
@@ -494,12 +527,103 @@ function compactWizardContextForLocalPrompt(context = {}) {
   };
 }
 
+function buildPipelineWizardIntentIrJsonSchema() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    required: ['title', 'summary', 'intentIr', 'gaps', 'userRefinementNotes'],
+    properties: {
+      title: { type: 'string', description: 'Short user-facing draft title. Do not copy the full request.' },
+      summary: { type: 'string', description: 'One concise sentence describing the abstract workflow intent.' },
+      recipeId: { type: 'string', enum: Object.values(WIZARD_RECIPE_IDS), description: 'Optional broad recipe hint only.' },
+      gaps: { type: 'array', items: { type: 'string' }, description: 'Honest unsupported or manual follow-up items.' },
+      userRefinementNotes: { type: 'array', items: { type: 'string' }, description: 'Short notes for settings the user should review.' },
+      intentIr: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sources', 'artifacts', 'stages', 'outputs', 'assumptions', 'gaps'],
+        properties: {
+          sources: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['name', 'modality', 'role'],
+              properties: {
+                name: { type: 'string' },
+                modality: { type: 'string', enum: WIZARD_INTENT_SOURCE_MODALITIES },
+                role: { type: 'string' },
+              },
+            },
+          },
+          artifacts: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['name', 'kind', 'role'],
+              properties: {
+                name: { type: 'string' },
+                kind: { type: 'string', enum: ['text', 'image', 'audio', 'video', 'file', 'plan', 'planningPacket', 'composition', 'collection', 'collection:text', 'collection:image', 'collection:audio', 'collection:video', 'collection:file'] },
+                role: { type: 'string' },
+              },
+            },
+          },
+          stages: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['id', 'kind', 'inputs', 'outputs', 'purpose'],
+              properties: {
+                id: { type: 'string' },
+                kind: { type: 'string', enum: WIZARD_INTENT_STAGE_KINDS },
+                input: { type: 'string' },
+                inputs: { type: 'array', items: { type: 'string' } },
+                output: { type: 'string' },
+                outputs: { type: 'array', items: { type: 'string' } },
+                purpose: { type: 'string' },
+                validationMode: { type: 'string', enum: ['', 'llm', 'user', 'manual', 'approval'] },
+                retryTarget: { type: 'string' },
+                maxAttempts: { type: 'integer', minimum: 2, maximum: PIPELINE_RETRY_LOOP_MAX_ATTEMPTS },
+              },
+            },
+          },
+          outputs: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['artifact', 'kind', 'title'],
+              properties: {
+                artifact: { type: 'string' },
+                kind: { type: 'string', enum: ['text', 'image', 'audio', 'video', 'file', 'plan', 'composition', 'collection', 'collection:text', 'collection:image', 'collection:audio', 'collection:video', 'collection:file'] },
+                title: { type: 'string' },
+              },
+            },
+          },
+          assumptions: { type: 'array', items: { type: 'string' } },
+          gaps: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+  };
+}
+
+function buildPipelineWizardStructuredOutputRequest() {
+  return {
+    type: 'json_schema',
+    name: 'local_ai_hub_pipeline_wizard_intent_ir',
+    schema: buildPipelineWizardIntentIrJsonSchema(),
+  };
+}
+
 function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget = {} } = {}) {
   const normalizedIntent = normalizeString(intent);
   const selectedTarget = {
     mode: wizardTarget.mode === 'ollama' ? 'ollama' : 'cloud',
     providerId: normalizeId(wizardTarget.providerId),
-    model: normalizeString(wizardTarget.model),
+    model: normalizeModelId(wizardTarget.model),
   };
   const localWizard = selectedTarget.mode === 'ollama';
   const systemLines = localWizard
@@ -511,7 +635,7 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         'Use stage kinds only from supportedIntentStageKinds. Do not emit node ids or port ids in intentIr.',
         'Never copy the authoring request into runtime node defaults, labels, titles, rules, workflow text, or instructions.',
         'Leave runtime source content empty unless actual source content was supplied.',
-        'For complex workflows, preserve requested modality, validation, retry, planning, collection, composition, and export intent in intentIr stages and gaps.',
+        'For complex workflows, preserve requested modality, validation, retry, planning, collection, generation, transformation, composition, and export intent in intentIr stages and gaps.',
         'Recipe ids are hints, not required templates. Local AI Hub will compile, validate, and instantiate the graph.',
         'Local AI Hub will restore explicit source/output modality plus planning, validation, retry, composition, and export obligations before graph compilation when the request clearly requires them.',
         'Only the longform scene-planning schema is mature today.',
@@ -519,14 +643,15 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
     : [
         'You are the Local AI Hub Pipeline Wizard planner.',
         'Convert the request into a grounded Wizard Intent IR first. Local AI Hub will compile it into real nodes and wiring.',
-        'Recipe ids are optional broad hints only. Prefer intentIr over recipeId and over literal draftGraph generation.',
+        'Recipe ids are optional broad hints only. Prefer intentIr over recipeId. Do not emit draftGraph unless explicitly asked for legacy debugging.',
         'Do not invent node types, ports, tools, providers, or full pipeline schema JSON.',
         'Keep authoring-time requests separate from runtime pipeline content: do not copy the user request into runtime node defaults, input content, Planning Packet fields, validation rules, labels, output titles, workflow text, or runtime instructions.',
         'For runtime source nodes, leave content empty unless the user supplied actual source content rather than a request to build a pipeline.',
-        'For complex requests, decompose into intentIr stages for planning, validation, retry loops, generation, collections, composition, export, and outputs when requested.',
+        'For complex requests, decompose into intentIr stages for transcription, planning, plan_scenes, validation, retry, generate_image, generate_audio, transform_audio, generate_video, transform_image, compose_media, export, and outputs when requested.',
         'Return JSON only. The JSON must be an object with: title, summary, intentIr, recipeId, gaps, userRefinementNotes. draftGraph is legacy fallback only.',
         'intentIr shape: {sources:[{name,modality,role}], artifacts:[{name,kind}], stages:[{id,kind,input,output,inputs,outputs,validationMode,retryTarget,maxAttempts,purpose}], outputs:[{artifact,kind,title}], gaps, assumptions}.',
         'Use stage kinds only from supportedIntentStageKinds. Local AI Hub will choose exact nodes, ports, tools, providers, validation, and wiring.',
+        'Current limitation: validation/retry for collections is whole-collection validation. Do not claim per-item validation/retry inside collectionMap or internal llmPrompt workflows.',
         'Local AI Hub will repair missing explicit source/output modality and requested planning/validation/retry/composition/export structure before graph compilation, so keep intentIr compact and honest.',
         'If the request is only partly possible, draft the closest honest graph and put the missing pieces in gaps.',
         'Only the longform scene-planning schema is mature today. Do not claim other planning schema families are mature.',
@@ -556,6 +681,18 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         supportedSourceModalities: WIZARD_INTENT_SOURCE_MODALITIES,
         allowedNodeTypes: (context.nodeTypes || []).map((node) => node.type),
         allowedOperationIds: Object.values(PIPELINE_OPERATION_IDS),
+        intentIrContract: {
+          stageGuidance: {
+            audioVoiceoverToVideo: ['audio source', 'transcribe_audio', 'plan', 'plan_scenes', 'validate', 'retry', 'generate_image', 'compose_media', 'export', 'video output'],
+            collectionImageGeneration: 'Use generate_image with collection:text input; Local AI Hub compiles that to collectionMap.',
+            localAudioGeneration: 'Use generate_audio for text-to-audio/music/sound requests; Local AI Hub prefers AudioCraft when installed or compatible provider speech where available.',
+            localAudioTransform: 'Use transform_audio for RVC/voice-conversion requests with an audio source placeholder and manual voice-model selection.',
+            localVideoGeneration: 'Use generate_video for text-to-video or image-to-video requests; image-to-video uses an image source placeholder and editable motion guidance.',
+            localImageTransform: 'Use transform_image for Upscayl/FaceFusion image transformation; FaceFusion needs target and reference image source placeholders.',
+            collectionValidation: 'Only whole-collection validation/retry is supported today. Put true per-item validation as a gap if requested.',
+          },
+          outputKinds: ['text', 'image', 'audio', 'video', 'plan', 'composition', 'collection:text', 'collection:image'],
+        },
       }, null, localWizard ? 0 : 2),
     },
   ];
@@ -586,13 +723,16 @@ function extractJsonObject(text) {
 
 function inferRecipeIdFromIntent(intent) {
   const text = String(intent || '').toLowerCase();
+  if (/\b(rvc|voice conversion|convert (?:a |the )?voice|change (?:an? )?audio[^.]{0,60}voice|different voice|audio transform|transform audio|voice model)\b/.test(text)) {
+    return WIZARD_RECIPE_IDS.AUDIO_TRANSFORM;
+  }
   if (/\b(transcribe|transcription|captions?|subtitle|speech to text|audio to text)\b/.test(text)) {
     return WIZARD_RECIPE_IDS.AUDIO_TRANSCRIBE;
   }
   if (/\b(scene plan|storyboard|shot list|visual beats?|episode plan|longform|narrative plan|plan scenes?)\b/.test(text)) {
     return WIZARD_RECIPE_IDS.SCENE_PLAN;
   }
-  if (/\b(upscale|enhance|restore|face.?swap|transform image|image transform|clean up an image|improve an image)\b/.test(text)) {
+  if (/\b(upscale|enhance|restore|face.?swap|swap[^.]{0,30}face|facefusion|transform image|image transform|clean up an image|improve an image)\b/.test(text)) {
     return WIZARD_RECIPE_IDS.IMAGE_TRANSFORM;
   }
   if (/\b(describe image|caption image|analy[sz]e image|image to text|vision|image input|input image|source image|image file)\b/.test(text) && /\b(describ\w*|description|caption|analy[sz]\w*|text|vision|model)\b/.test(text)) {
@@ -689,8 +829,13 @@ function normalizeIntentStageKind(value) {
   const normalized = normalizeId(value).replace(/-/g, '_');
   if (['plan', 'planning', 'planner', 'scene_plan', 'storyboard'].includes(normalized)) return 'plan';
   if (['plan_scenes', 'scene_prompts', 'scenes_from_plan', 'plan_to_scenes', 'derive_scene_prompts'].includes(normalized)) return 'plan_scenes';
+  if (['build_collection', 'collection_builder', 'collect_items', 'collect_prompts', 'prompt_collection', 'make_collection'].includes(normalized)) return 'build_collection';
   if (['llm_generate_text', 'generate_text', 'text_generate', 'text_generation', 'model_text', 'summarize', 'rewrite', 'prompt_generation'].includes(normalized)) return 'llm_generate_text';
   if (['generate_image', 'image_generate', 'text_to_image', 'image_generation'].includes(normalized)) return 'generate_image';
+  if (['generate_audio', 'audio_generate', 'text_to_audio', 'text_to_music', 'audio_generation', 'music_generation', 'sound_generation'].includes(normalized)) return 'generate_audio';
+  if (['transform_audio', 'audio_transform', 'voice_conversion', 'convert_voice', 'rvc'].includes(normalized)) return 'transform_audio';
+  if (['generate_video', 'video_generate', 'text_to_video', 'image_to_video', 'video_generation'].includes(normalized)) return 'generate_video';
+  if (['transform_image', 'image_transform', 'upscale_image', 'image_upscale', 'enhance_image', 'face_swap', 'facefusion', 'upscayl'].includes(normalized)) return 'transform_image';
   if (['transcribe_audio', 'audio_transcribe', 'transcription', 'speech_to_text'].includes(normalized)) return 'transcribe_audio';
   if (['validate', 'validation', 'review', 'approval', 'quality_check', 'qa'].includes(normalized)) return 'validate';
   if (['retry', 'retry_loop', 'regenerate', 'revise_on_fail'].includes(normalized)) return 'retry';
@@ -768,8 +913,21 @@ function normalizeWizardIntentIr(value, options = {}) {
     stages,
     outputs,
     gaps: (Array.isArray(input.gaps) ? input.gaps : []).map((gap) => trimPreviewText(normalizeString(gap), 220)).filter(Boolean),
-    assumptions: (Array.isArray(input.assumptions) ? input.assumptions : []).map((assumption) => trimPreviewText(normalizeString(assumption), 220)).filter(Boolean),
+    assumptions: normalizeWizardIntentAssumptions(input.assumptions),
   };
+}
+
+function isMisleadingCollectionMapAssumption(value) {
+  const text = String(value || '').toLowerCase();
+  return /collectionmap/.test(text)
+    && (/internal workflow|per[-\s]?item|for each individual|each individual/.test(text))
+    && (/validation|retry|llmprompt|llm prompt|model step/.test(text));
+}
+
+function normalizeWizardIntentAssumptions(value) {
+  return (Array.isArray(value) ? value : [])
+    .map((assumption) => trimPreviewText(normalizeString(assumption), 220))
+    .filter((assumption) => assumption && !isMisleadingCollectionMapAssumption(assumption));
 }
 
 function buildIntentMatcher(pattern) {
@@ -798,10 +956,10 @@ function intentHasPattern(text, patterns = []) {
 
 function buildWizardSourceObligation(intent, features) {
   const text = String(intent || '');
-  if (intentHasPattern(text, [/\b(image input|input image|source image|image file|uploaded image|photo input|photo file)\b/])) {
-    return { name: 'sourceImage', modality: 'image', role: 'Source image', explicit: true };
+  if (features.wantsImageTransform || (features.wantsImageToVideo && !features.wantsPlanning) || intentHasPattern(text, [/\b(image input|input image|source image|image file|uploaded image|photo input|photo file)\b/])) {
+    return { name: 'sourceImage', modality: 'image', role: features.wantsFaceFusionTransform ? 'Target image' : 'Source image', explicit: true };
   }
-  if (intentHasPattern(text, [/\b(audio input|input audio|audio file|source audio|uploaded audio|interview audio|recording|voice memo|voice note|podcast audio)\b/])) {
+  if (features.wantsAudioTransform || intentHasPattern(text, [/\b(audio input|input audio|audio file|source audio|uploaded audio|interview audio|recording|voice memo|voice note|podcast audio)\b/])) {
     return { name: 'sourceAudio', modality: 'audio', role: 'Source audio', explicit: true };
   }
   if (intentHasPattern(text, [/\b(video input|input video|source video|video file|uploaded video|clip input)\b/])) {
@@ -832,8 +990,27 @@ function hasExplicitImageGenerationRequest(intent) {
     /\b(generat\w*|creat\w*|mak\w*|render\w*|produc\w*)\b[^.]{0,60}\b(images?|thumbnail|illustration|poster|visuals?|frames?)\b/,
     /\b(thumbnail|illustration|poster|visuals?|frames?)\b[^.]{0,60}\b(generat\w*|creat\w*|mak\w*|render\w*|produc\w*)\b/,
     /\b(text to image|image generation)\b/,
+    /\b(turn|convert|transform|map)\b[^.]{0,80}\b(prompts?|text)\b[^.]{0,80}\b(images?|pictures?|visuals?)\b/,
+    /\b(make|create|generate|produce)\b[^.]{0,60}\bone image\b[^.]{0,40}\b(each|per[-\s]?prompt|per[-\s]?scene)\b/,
   ]);
 }
+function isTextCollectionSourceRequest(intent) {
+  const text = String(intent || '');
+  return intentHasPattern(text, [
+    /\b(collection|list|set|batch|multiple|many|several)\b[^.]{0,50}\b(text\s+)?prompts?\b/,
+    /\b(text\s+)?prompts?\b[^.]{0,50}\b(collection|list|set|batch)\b/,
+    /\b(each|per[-\s]?prompt|for each prompt|one image for each)\b/,
+  ]);
+}
+
+function isVideoSourceAnalysisRequest(intent) {
+  const text = String(intent || '');
+  return intentHasPattern(text, [
+    /\b(summariz\w*|analy[sz]\w*|review|caption|describe|validate)\b[^.]{0,80}\b(video file|video input|source video|uploaded video|clip input|clip)\b/,
+    /\b(video file|video input|source video|uploaded video|clip input|clip)\b[^.]{0,80}\b(summariz\w*|analy[sz]\w*|review|caption|describe|validate)\b/,
+  ]);
+}
+
 function buildWizardOutputObligations(intent, features) {
   const text = String(intent || '');
   const outputs = [];
@@ -869,14 +1046,23 @@ function buildWizardOutputObligations(intent, features) {
       true,
     );
   }
-  if (intentHasPattern(text, [/\b(video output|output video|final video|storyboard video|export(?:ed)? video|render(?:ed)? video|final clip)\b/]) || features.wantsVideo) {
-    add('exportedVideo', 'video', 'Video output', features.wantsVideo);
+  const wantsExplicitVideoOutput = intentHasPattern(text, [/\b(video output|output video|final video|storyboard video|export(?:ed)? video|render(?:ed)? video|final clip)\b/]);
+  if (wantsExplicitVideoOutput || features.wantsVideoGeneration || (features.wantsVideo && !isVideoSourceAnalysisRequest(text))) {
+    add(features.wantsVideoGeneration ? 'generatedVideo' : 'exportedVideo', 'video', 'Video output', features.wantsVideo);
   }
-  if (intentHasPattern(text, [/\b(image output|output image|thumbnail|illustration|poster|generated image)\b/]) || (hasExplicitImageGenerationRequest(text) && !features.wantsVideo)) {
+  const wantsImageCollection = hasExplicitImageGenerationRequest(text)
+    && !features.wantsVideo
+    && (wantsScenePrompts || features.wantsPlanning || intentHasPattern(text, [/\b(each|per[-\s]?(scene|item|prompt)|collection of images?|image collection|images? for each)\b/]));
+  if (wantsImageCollection) {
+    add('generatedImages', 'collection:image', 'Generated image collection', true);
+  } else if (intentHasPattern(text, [/\b(image output|output image|thumbnail|illustration|poster|generated image)\b/]) || (hasExplicitImageGenerationRequest(text) && !features.wantsVideo)) {
     add('generatedImage', 'image', 'Generated image', true);
   }
-  if (intentHasPattern(text, [/\b(audio output|output audio|narration audio|music|speech audio|generated audio)\b/])) {
-    add('generatedAudio', 'audio', 'Audio output', true);
+  if (features.wantsAudioGeneration || features.wantsAudioTransform || intentHasPattern(text, [/\b(audio output|output audio|narration audio|music|speech audio|generated audio|converted audio|voice conversion)\b/])) {
+    add(features.wantsAudioTransform ? 'transformedAudio' : 'generatedAudio', 'audio', 'Audio output', true);
+  }
+  if (features.wantsImageTransform) {
+    add('transformedImage', 'image', 'Image output', true);
   }
   if (!outputs.length) {
     add(
@@ -900,6 +1086,7 @@ function buildWizardValidationTargets(intent, features) {
 
   if (intentHasPattern(text, [/\bvalidat\w*[^.]{0,60}\bplan\b/, /\bplan\b[^.]{0,60}\bvalidat\w*/])) add('plan');
   if (intentHasPattern(text, [/\bvalidat\w*[^.]{0,60}\b(prompt|scene prompts?|prompt collection)\b/, /\b(prompt|scene prompts?|prompt collection)\b[^.]{0,60}\bvalidat\w*/])) add('plan_scenes');
+  if (features.wantsPromptGeneration && intentHasPattern(text, [/\b(validat\w*|review|check)\b[^.]{0,80}\b(each|each one|them|prompts?)\b/, /\bprompts?\b[^.]{0,80}\b(validat\w*|review|check)\b/])) add('plan_scenes');
   if (intentHasPattern(text, [/\bvalidat\w*[^.]{0,60}\bimages?\b/, /\bimages?\b[^.]{0,60}\bvalidat\w*/])) add('generate_image');
   if (intentHasPattern(text, [/\bvalidat\w*[^.]{0,60}\b(description|caption|summary|text|transcript)\b/, /\b(description|caption|summary|text|transcript)\b[^.]{0,60}\bvalidat\w*/])) add('llm_generate_text');
   if (!targets.length && features.wantsValidation) add('latest');
@@ -912,11 +1099,20 @@ function extractWizardRequestObligations(intent = '') {
   const features = inferIntentFeatures(normalizedIntent);
   const source = buildWizardSourceObligation(normalizedIntent, features);
   const outputs = buildWizardOutputObligations(normalizedIntent, features);
-  const wantsPromptCollection = outputs.some((output) => output.kind === 'collection:text');
-  const wantsImageGeneration = hasExplicitImageGenerationRequest(normalizedIntent);
-  const wantsComposition = (features.wantsVideo && wantsImageGeneration)
-    || intentHasPattern(normalizedIntent, [/\b(sequence|sequenc\w+|compose|composition|slideshow|timeline)\b/]);
-  const wantsExport = features.wantsVideo;
+  const rawWantsImageGeneration = hasExplicitImageGenerationRequest(normalizedIntent);
+  const wantsVideoGeneration = Boolean(features.wantsVideoGeneration && !isVideoSourceAnalysisRequest(normalizedIntent) && !(features.wantsPlanning && rawWantsImageGeneration));
+  const wantsImageGeneration = rawWantsImageGeneration && !wantsVideoGeneration && !features.wantsImageTransform;
+  const wantsTextCollectionSource = isTextCollectionSourceRequest(normalizedIntent);
+  const wantsPromptCollection = outputs.some((output) => output.kind === 'collection:text')
+    || wantsTextCollectionSource
+    || (features.wantsPlanning && wantsImageGeneration)
+    || intentHasPattern(normalizedIntent, [/\b(scene prompts?|per[-\s]?scene prompts?|prompt collection|prompt set|scene prompt set)\b/]);
+  const wantsAudioGeneration = Boolean(features.wantsAudioGeneration && !features.wantsAudioTransform);
+  const wantsAudioTransform = Boolean(features.wantsAudioTransform);
+  const wantsImageTransform = Boolean(features.wantsImageTransform);
+  const wantsComposition = !wantsVideoGeneration && ((features.wantsVideo && wantsImageGeneration)
+    || intentHasPattern(normalizedIntent, [/\b(sequence|sequenc\w+|compose|composition|slideshow|timeline)\b/]));
+  const wantsExport = !wantsVideoGeneration && features.wantsVideo && source.modality !== 'video' && !isVideoSourceAnalysisRequest(normalizedIntent);
   const wantsTextLikeOutput = outputs.some((output) => ['text', 'plan', 'collection:text'].includes(output.kind));
   const transformKind = source.modality === 'audio' && (wantsTextLikeOutput || features.wantsPlanning || intentHasPattern(normalizedIntent, [/\btranscrib\w*|speech to text|audio to text\b/]))
     ? 'transcribe_audio'
@@ -930,11 +1126,20 @@ function extractWizardRequestObligations(intent = '') {
     transformKind,
     wantsPlanning: Boolean(features.wantsPlanning),
     wantsPromptCollection,
+    wantsTextCollectionSource,
     wantsValidation: Boolean(features.wantsValidation),
     wantsRetry: Boolean(features.wantsRetry),
     wantsImageGeneration,
+    wantsAudioGeneration,
+    wantsAudioTransform,
+    wantsVideoGeneration,
+    wantsImageTransform,
     wantsComposition,
     wantsExport,
+    wantsFaceFusionTransform: Boolean(features.wantsFaceFusionTransform),
+    imageTransformReferenceRequired: Boolean(features.wantsFaceFusionTransform),
+    extraSources: features.wantsFaceFusionTransform ? [{ name: 'referenceFaceImage', modality: 'image', role: 'Reference face image', explicit: true }] : [],
+    forceLocalVideo: /\b(wan2?\.?1|wan webui|local video|locally)\b/i.test(normalizedIntent),
     prefersDescription: Boolean(features.wantsDescription),
     validationTargets: buildWizardValidationTargets(normalizedIntent, features),
   };
@@ -949,6 +1154,10 @@ function hasStructuralRequestObligations(obligations = {}) {
     || obligations.wantsValidation
     || obligations.wantsRetry
     || obligations.wantsImageGeneration
+    || obligations.wantsAudioGeneration
+    || obligations.wantsAudioTransform
+    || obligations.wantsVideoGeneration
+    || obligations.wantsImageTransform
     || obligations.wantsComposition
     || obligations.wantsExport
     || (obligations.outputs || []).some((output) => output.kind && output.kind !== 'text'),
@@ -971,13 +1180,29 @@ function buildRequiredObligationStageKinds(obligations = {}) {
     kinds.push(obligations.transformKind);
     addValidationPair(obligations.transformKind);
   }
+  if (obligations.wantsAudioGeneration) {
+    kinds.push('generate_audio');
+    addValidationPair('generate_audio');
+  }
+  if (obligations.wantsAudioTransform) {
+    kinds.push('transform_audio');
+    addValidationPair('transform_audio');
+  }
+  if (obligations.wantsVideoGeneration) {
+    kinds.push('generate_video');
+    addValidationPair('generate_video');
+  }
+  if (obligations.wantsImageTransform) {
+    kinds.push('transform_image');
+    addValidationPair('transform_image');
+  }
   if (obligations.wantsPlanning) {
     kinds.push('plan');
     addValidationPair('plan');
   }
   if (obligations.wantsPromptCollection) {
-    kinds.push('plan_scenes');
-    addValidationPair('plan_scenes');
+    kinds.push(obligations.wantsPlanning ? 'plan_scenes' : 'build_collection');
+    addValidationPair(obligations.wantsPlanning ? 'plan_scenes' : 'build_collection');
   }
   if (obligations.wantsImageGeneration) {
     kinds.push('generate_image');
@@ -1010,6 +1235,12 @@ function doesIntentIrCoverObligations(intentIr, obligations) {
   const normalizedIr = normalizeWizardIntentIr(intentIr);
   if (obligations.source?.explicit && !normalizedIr.sources.some((source) => source.modality === obligations.source.modality)) {
     reasons.push('source:' + obligations.source.modality);
+  }
+  for (const extraSource of obligations.extraSources || []) {
+    if (extraSource?.modality && !normalizedIr.sources.some((source) => source.name === extraSource.name || (source.modality === extraSource.modality && source.role === extraSource.role))) {
+      reasons.push('source:' + extraSource.modality + ':' + extraSource.name);
+      break;
+    }
   }
 
   const outputKinds = getIntentIrOutputKinds(normalizedIr);
@@ -1060,6 +1291,15 @@ function applySimpleObligationRepairs(intentIr, obligations, options = {}) {
       role: trimPreviewText(normalizeString(obligations.source.role || obligations.source.name), 80),
     });
   }
+  for (const extraSource of obligations.extraSources || []) {
+    if (!sources.some((source) => source.name === extraSource.name)) {
+      sources.push({
+        name: normalizeArtifactRef(extraSource.name, 'runtimeSource'),
+        modality: normalizeIntentKind(extraSource.modality, 'text'),
+        role: trimPreviewText(normalizeString(extraSource.role || extraSource.name), 80),
+      });
+    }
+  }
 
   const outputs = [...normalizedIr.outputs];
   const outputKinds = new Set(getIntentIrOutputKinds(normalizedIr));
@@ -1101,7 +1341,7 @@ function getWizardIntentStageSupport(kind, artifactKind, options = {}) {
       : { ok: false, message: 'Local AI Hub can only transcribe from an audio source artifact in this wizard pass.' };
   }
   if (kind === 'llm_generate_text') {
-    return ['text', 'image'].includes(normalizedKind)
+    return ['text', 'image', 'video', 'file'].includes(normalizedKind)
       ? { ok: true, outputKind: 'text' }
       : { ok: false, message: 'Local AI Hub does not yet route ' + normalizedKind + ' artifacts directly into a text-generation step in this wizard pass.' };
   }
@@ -1115,6 +1355,11 @@ function getWizardIntentStageSupport(kind, artifactKind, options = {}) {
       ? { ok: true, outputKind: 'collection:text' }
       : { ok: false, message: 'Local AI Hub can only derive ordered scene prompts from a structured Plan artifact in this wizard pass.' };
   }
+  if (kind === 'build_collection') {
+    return ['text', 'image', 'audio', 'video', 'file'].includes(normalizedKind)
+      ? { ok: true, outputKind: 'collection:' + normalizedKind }
+      : { ok: false, message: 'Local AI Hub can only build collections from concrete runtime artifacts in this wizard pass.' };
+  }
   if (kind === 'validate') {
     return normalizedKind
       ? { ok: true, outputKind: normalizedKind }
@@ -1125,12 +1370,35 @@ function getWizardIntentStageSupport(kind, artifactKind, options = {}) {
       ? { ok: true, outputKind: normalizedKind || 'text' }
       : { ok: false, message: 'Local AI Hub can only add retry after a validation stage with pass/fail branches.' };
   }
+  if (kind === 'generate_audio') {
+    return ['text', 'audio'].includes(normalizedKind)
+      ? { ok: true, outputKind: 'audio' }
+      : { ok: false, message: 'Local AI Hub can only generate audio from a text prompt or supported audio guidance artifact in this wizard pass.' };
+  }
+  if (kind === 'transform_audio') {
+    return normalizedKind === 'audio'
+      ? { ok: true, outputKind: 'audio' }
+      : { ok: false, message: 'Local AI Hub can only transform audio from an audio source artifact in this wizard pass.' };
+  }
+  if (kind === 'generate_video') {
+    return ['text', 'image'].includes(normalizedKind)
+      ? { ok: true, outputKind: 'video' }
+      : { ok: false, message: 'Local AI Hub can only generate video from a text prompt or image source artifact in this wizard pass.' };
+  }
+  if (kind === 'transform_image') {
+    return normalizedKind === 'image'
+      ? { ok: true, outputKind: 'image' }
+      : { ok: false, message: 'Local AI Hub can only transform images from an image source artifact in this wizard pass.' };
+  }
   if (kind === 'generate_image') {
     if (normalizedKind === 'text') {
       return { ok: true, outputKind: 'image' };
     }
+    if (normalizedKind === 'collection:text') {
+      return { ok: true, outputKind: 'collection:image' };
+    }
     if (String(normalizedKind).startsWith('collection:')) {
-      return { ok: false, message: 'Local AI Hub does not yet map each collection item through image generation automatically. It preserved the prompt collection and left downstream image/video work as an explicit gap.' };
+      return { ok: false, message: 'Local AI Hub can only map text collections through image generation in this wizard pass. It preserved the collection and left the unsupported mapped operation as an explicit gap.' };
     }
     return { ok: false, message: 'Local AI Hub can only generate images from text prompt artifacts in this wizard pass.' };
   }
@@ -1154,6 +1422,9 @@ function getWizardStagePurpose(kind, obligations) {
   if (kind === 'plan_scenes') {
     return 'Derive ordered scene prompts from the approved plan.';
   }
+  if (kind === 'build_collection') {
+    return 'Build an ordered collection from the connected runtime prompt inputs.';
+  }
   if (kind === 'llm_generate_text') {
     return obligations.prefersDescription
       ? 'Describe the connected runtime input in clear, specific text.'
@@ -1161,6 +1432,18 @@ function getWizardStagePurpose(kind, obligations) {
   }
   if (kind === 'generate_image') {
     return 'Generate an image from the connected prompt artifact.';
+  }
+  if (kind === 'generate_audio') {
+    return 'Generate an audio artifact from the connected prompt or guidance.';
+  }
+  if (kind === 'transform_audio') {
+    return 'Transform the connected source audio with editable voice-conversion settings.';
+  }
+  if (kind === 'generate_video') {
+    return 'Generate a video artifact from the connected prompt or image source.';
+  }
+  if (kind === 'transform_image') {
+    return 'Transform the connected source image with editable local image settings.';
   }
   if (kind === 'compose_media') {
     return 'Sequence the connected approved images into a reusable composition.';
@@ -1206,10 +1489,13 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
   let planArtifactName = '';
   let promptArtifactName = '';
   let imageArtifactName = '';
+  let audioArtifactName = '';
   let compositionArtifactName = '';
   let videoArtifactName = '';
   let textArtifactName = '';
   let transcriptArtifactName = '';
+  let sourceArtifactName = '';
+  let referenceImageArtifactName = '';
 
   const takeBorrowedStage = (kind) => {
     const list = borrowedStages.get(kind) || [];
@@ -1262,7 +1548,26 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
 
   const source = addSource(obligations.source || normalizedIr.sources[0] || { name: 'runtimeSource', modality: 'text', role: 'Runtime source' });
   addArtifact(source.name, source.modality, source.role);
+  sourceArtifactName = source.name;
   currentArtifact = { name: source.name, kind: source.modality };
+  for (const extraSource of obligations.extraSources || []) {
+    const addedExtraSource = addSource(extraSource);
+    addArtifact(addedExtraSource.name, addedExtraSource.modality, addedExtraSource.role);
+    if (addedExtraSource.modality === 'image' && !referenceImageArtifactName) {
+      referenceImageArtifactName = addedExtraSource.name;
+    }
+  }
+  const collectionSourceInputNames = [];
+  if (obligations.wantsTextCollectionSource && !obligations.wantsPlanning && source.modality === 'text') {
+    for (const entry of [
+      { name: 'promptItem2', modality: 'text', role: 'Additional prompt placeholder' },
+      { name: 'promptItem3', modality: 'text', role: 'Additional prompt placeholder' },
+    ]) {
+      const extraSource = addSource(entry);
+      addArtifact(extraSource.name, extraSource.modality, extraSource.role);
+      collectionSourceInputNames.push(extraSource.name);
+    }
+  }
 
   const addStage = (kind, preferredId, outputName, extra = {}) => {
     const inputName = normalizeArtifactRef(extra.inputName || currentArtifact?.name, currentArtifact?.name || 'runtimeSource');
@@ -1282,7 +1587,7 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
       id: normalizeArtifactKey(borrowed?.id || preferredId, preferredId),
       kind,
       input: inputName,
-      inputs: inputName ? [inputName] : [],
+      inputs: [...new Set([inputName, ...(Array.isArray(extra.inputNames) ? extra.inputNames : [])].filter(Boolean))],
       output: outputArtifact.name,
       outputs: outputArtifact.name ? [outputArtifact.name] : [],
       purpose: trimPreviewText(normalizeString(extra.purpose || borrowed?.purpose), 220),
@@ -1352,6 +1657,54 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
     }
   }
 
+  if (obligations.wantsAudioGeneration && !bridgeBroken) {
+    const audioStage = addStage('generate_audio', 'generate-audio', 'generatedAudio', {
+      purpose: getWizardStagePurpose('generate_audio', obligations),
+    });
+    if (audioStage) {
+      audioArtifactName = currentArtifact.name;
+      addValidationPair('generate_audio', audioStage, 'reviewedAudio', 'approvedAudio');
+    }
+  }
+
+  if (obligations.wantsAudioTransform && !bridgeBroken) {
+    const audioStage = addStage('transform_audio', 'transform-audio', 'transformedAudio', {
+      inputName: sourceArtifactName,
+      inputKind: source.modality,
+      purpose: getWizardStagePurpose('transform_audio', obligations),
+    });
+    if (audioStage) {
+      audioArtifactName = currentArtifact.name;
+      addValidationPair('transform_audio', audioStage, 'reviewedAudio', 'approvedAudio');
+    }
+  }
+
+  if (obligations.wantsVideoGeneration && !bridgeBroken) {
+    const videoStage = addStage('generate_video', 'generate-video', 'generatedVideo', {
+      inputName: sourceArtifactName,
+      inputKind: source.modality,
+      purpose: getWizardStagePurpose('generate_video', obligations),
+    });
+    if (videoStage) {
+      videoArtifactName = currentArtifact.name;
+      addValidationPair('generate_video', videoStage, 'reviewedVideo', 'approvedVideo');
+    }
+  }
+
+  if (obligations.wantsImageTransform && !bridgeBroken) {
+    const inputNames = referenceImageArtifactName ? [referenceImageArtifactName] : [];
+    const imageStage = addStage('transform_image', 'transform-image', 'transformedImage', {
+      inputName: sourceArtifactName,
+      inputKind: source.modality,
+      inputNames,
+      purpose: obligations.wantsFaceFusionTransform ? 'Transform the target image using a reference face image placeholder.' : getWizardStagePurpose('transform_image', obligations),
+    });
+    if (imageStage) {
+      imageArtifactName = currentArtifact.name;
+      addValidationPair('transform_image', imageStage, 'reviewedImage', 'approvedImage');
+    }
+  }
+
   if (obligations.wantsPlanning && !bridgeBroken) {
     const planStage = addStage('plan', 'plan-stage', 'scenePlan', {
       purpose: getWizardStagePurpose('plan', obligations),
@@ -1366,11 +1719,16 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
   }
 
   if (obligations.wantsPromptCollection && !bridgeBroken) {
-    const promptStage = addStage('plan_scenes', 'plan-scenes', 'scenePrompts', {
-      purpose: getWizardStagePurpose('plan_scenes', obligations),
+    const promptStageKind = obligations.wantsPlanning ? 'plan_scenes' : 'build_collection';
+    const promptStage = addStage(promptStageKind, obligations.wantsPlanning ? 'plan-scenes' : 'build-collection', 'scenePrompts', {
+      inputNames: obligations.wantsPlanning ? [] : collectionSourceInputNames,
+      purpose: getWizardStagePurpose(promptStageKind, obligations),
     });
     if (promptStage) {
       promptArtifactName = currentArtifact.name;
+      if (remainingValidationTargets.has('plan_scenes') && obligations.wantsRetry) {
+        gaps.add('Prompt collection validation and retry are whole-collection controls today. Local AI Hub does not yet retry individual prompt items inside collectionMap.');
+      }
       addValidationPair('plan_scenes', promptStage, 'reviewedScenePrompts', 'approvedScenePrompts');
       if (String(currentArtifact?.kind || '').startsWith('collection:')) {
         promptArtifactName = currentArtifact.name;
@@ -1379,7 +1737,8 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
   }
 
   if (obligations.wantsImageGeneration && !bridgeBroken) {
-    const imageStage = addStage('generate_image', 'generate-image', 'generatedImage', {
+    const imageOutputName = (obligations.outputs || []).some((output) => output.kind === 'collection:image') ? 'generatedImages' : 'generatedImage';
+    const imageStage = addStage('generate_image', 'generate-image', imageOutputName, {
       purpose: getWizardStagePurpose('generate_image', obligations),
     });
     if (imageStage) {
@@ -1422,6 +1781,8 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
       artifactName = promptArtifactName || output.artifact;
     } else if (output.kind === 'image') {
       artifactName = imageArtifactName || output.artifact;
+    } else if (output.kind === 'audio') {
+      artifactName = audioArtifactName || output.artifact;
     } else if (output.kind === 'video') {
       artifactName = videoArtifactName || output.artifact;
     } else if (output.kind === 'text') {
@@ -1441,7 +1802,7 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
     stages,
     outputs,
     gaps: [...gaps],
-    assumptions: [...assumptions],
+    assumptions: normalizeWizardIntentAssumptions([...assumptions]),
   };
 }
 
@@ -1534,25 +1895,38 @@ function buildPipelineTitle(intent, recipeId) {
 }
 
 function getTargetLabel(target = {}, context = {}) {
+  const model = normalizeModelId(target.model);
   if (target.executionMode === 'ollama') {
-    return target.model ? 'Ollama ' + target.model : 'Ollama';
+    return ['Ollama', model].filter(Boolean).join(' / ');
   }
-  if (target.executionMode === 'localTool') {
+  if (target.executionMode === 'localTool' || target.executionMode === 'localImageNode') {
     return getToolEntry(context, target.toolId)?.name || target.toolId || 'local tool';
   }
-  return getProviderEntry(context, target.providerId)?.name || target.providerId || 'provider';
+  const providerLabel = getProviderEntry(context, target.providerId)?.name || target.providerId || 'provider';
+  return [providerLabel, model].filter(Boolean).join(' / ');
 }
 
 function normalizeWizardTarget(wizardTarget = {}) {
   return {
     mode: wizardTarget.mode === 'ollama' ? 'ollama' : 'cloud',
     providerId: normalizeId(wizardTarget.providerId),
-    model: normalizeString(wizardTarget.model),
+    model: normalizeModelId(wizardTarget.model),
   };
 }
 
 function getPreferredToolId(operationId, context, candidateToolIds = []) {
   const candidates = candidateToolIds.length ? candidateToolIds : (context.availableTools || []).map((tool) => tool.id);
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+    const selection = selectLocalImageBackend(buildContextMaps({
+      hardware: context.hardware,
+      toolCatalog: context.availableTools || [],
+      tools: context.availableTools || [],
+    }), { config: {} }, { candidateToolIds: candidates, operationId });
+    if (selection.usable && selection.toolId) {
+      return selection.toolId;
+    }
+  }
+
   for (const toolId of candidates.map(normalizeId)) {
     const tool = getToolEntry(context, toolId);
     if (tool && getToolPipelineOperation(tool.id, operationId) && isCompatibilityPractical(tool)) {
@@ -1619,7 +1993,10 @@ function chooseTargetForOperation(operationId, context, wizardTarget = {}, optio
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
-    const localToolId = getPreferredToolId(operationId, context, IMAGE_TRANSFORM_TOOL_IDS.filter((toolId) => toolId !== 'facefusion'))
+    const preferredToolIds = Array.isArray(options.preferredToolIds) && options.preferredToolIds.length
+      ? options.preferredToolIds.map(normalizeId).filter(Boolean)
+      : IMAGE_TRANSFORM_TOOL_IDS.filter((toolId) => toolId !== 'facefusion');
+    const localToolId = getPreferredToolId(operationId, context, preferredToolIds)
       || getPreferredToolId(operationId, context, IMAGE_TRANSFORM_TOOL_IDS);
     if (localToolId) {
       return {
@@ -1726,8 +2103,12 @@ function buildLlmStepConfig(operationId, target, intent, extraConfig = {}) {
 function buildSimpleModelPipeline({ intent, operationId, outputKind, context, wizardTarget, plan }) {
   const nodes = [];
   const edges = [];
-  const sourceKind = operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM || plan.recipeId === WIZARD_RECIPE_IDS.IMAGE_TO_TEXT ? 'image' : 'text';
-  const inputNode = makeNode(sourceKind === 'image' ? 'imageInput' : 'textInput', 0, sourceKind === 'text' ? { text: '' } : {}, sourceKind === 'image' ? 'Source image' : getRuntimeSourceLabel(intent));
+  const sourceKind = operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+    ? 'audio'
+    : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM || plan.recipeId === WIZARD_RECIPE_IDS.IMAGE_TO_TEXT
+      ? 'image'
+      : 'text';
+  const inputNode = makeNode(sourceNodeTypeForKind(sourceKind), 0, sourceKind === 'text' ? { text: '' } : {}, sourceKind === 'image' ? 'Source image' : sourceKind === 'audio' ? 'Source audio' : getRuntimeSourceLabel(intent));
   nodes.push(inputNode);
 
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
@@ -1754,7 +2135,7 @@ function buildSimpleModelPipeline({ intent, operationId, outputKind, context, wi
   }), operationId === PIPELINE_OPERATION_IDS.LLM_PROMPT ? 'Model response' : getRecipeOption(plan.recipeId)?.label || 'Model step');
   const outputNode = makeOutputNode(outputKind, 2, outputKind === 'text' ? 'Text result' : outputKind === 'audio' ? 'Audio result' : outputKind === 'video' ? 'Video result' : 'Image result');
   nodes.push(stepNode, outputNode);
-  connect(edges, inputNode, sourceKind === 'image' ? 'image' : 'text', stepNode, 'prompt');
+  connect(edges, inputNode, sourcePortForKind(sourceKind), stepNode, 'prompt');
   connect(edges, stepNode, outputKind, outputNode, outputKind);
 
   return { nodes, edges, target, warnings: [] };
@@ -1837,6 +2218,68 @@ function buildValidationConfig(kind, wizardTarget, ruleset, options = {}) {
   };
 }
 
+function getPreferredImageTransformToolIds(intent, options = {}) {
+  if (Array.isArray(options.preferredToolIds) && options.preferredToolIds.length) {
+    return options.preferredToolIds;
+  }
+  return inferIntentFeatures(intent).wantsFaceFusionTransform
+    ? ['facefusion', ...IMAGE_TRANSFORM_TOOL_IDS.filter((toolId) => toolId !== 'facefusion')]
+    : [...IMAGE_TRANSFORM_TOOL_IDS.filter((toolId) => toolId !== 'facefusion'), 'facefusion'];
+}
+
+function getLocalOnlyOperationFallbackTarget(operationId) {
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM || operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+    return { executionMode: 'localTool', model: '', providerId: '', toolId: '' };
+  }
+  return null;
+}
+
+function makeOperationModelStepNode(index, operationId, outputKind, context, wizardTarget, intent, options = {}) {
+  const target = chooseTargetForOperation(operationId, context, wizardTarget, options);
+  const localOnlyFallback = getLocalOnlyOperationFallbackTarget(operationId);
+  const effectiveTarget = (target.executionMode === 'cloud' && !target.providerId && localOnlyFallback)
+    || (options.forceLocal && target.executionMode === 'cloud' ? { executionMode: 'localTool', model: '', providerId: '', toolId: '' } : null)
+    || target;
+  const warnings = [];
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM && !effectiveTarget.toolId) {
+    warnings.push('Install RVC and choose a voice model before this audio transformation draft can run.');
+  } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM && !effectiveTarget.toolId) {
+    warnings.push('Install Upscayl or FaceFusion before this image transformation draft can run.');
+  } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && !effectiveTarget.toolId && !effectiveTarget.providerId) {
+    warnings.push('Install Wan2.1 WebUI or choose a video-capable provider before this video generation draft can run.');
+  } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && !effectiveTarget.toolId && !effectiveTarget.providerId) {
+    warnings.push('Install AudioCraft WebUI or choose a speech-capable provider before this audio generation draft can run.');
+  }
+  if (effectiveTarget.toolId) {
+    const tool = getToolEntry(context, effectiveTarget.toolId);
+    const suitabilityTone = normalizeTone(tool?.hardwareSuitability?.tone);
+    const suitabilityMessage = normalizeString(tool?.hardwareSuitability?.message || tool?.hardwareSuitability?.label);
+    if (['danger', 'error'].includes(suitabilityTone) && suitabilityMessage) {
+      warnings.push((tool?.name || effectiveTarget.toolId) + ' is not a practical fit for this hardware: ' + suitabilityMessage);
+    } else if (suitabilityTone === 'warn' && suitabilityMessage) {
+      warnings.push((tool?.name || effectiveTarget.toolId) + ' may need reduced settings on this hardware: ' + suitabilityMessage);
+    }
+  }
+  const label = operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    ? 'Generate audio'
+    : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+      ? 'Transform audio'
+      : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+        ? 'Generate video'
+        : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+          ? 'Transform image'
+          : 'Model step';
+  return {
+    node: makeNode('llmPrompt', index, buildLlmStepConfig(operationId, effectiveTarget, intent, {
+      instruction: options.instruction || getDefaultInstructionForOperation(operationId),
+      ...(options.config || {}),
+    }), label),
+    outputPortId: outputKind,
+    target: effectiveTarget,
+    warnings,
+  };
+}
+
 function makeImageGenerationNode(index, context, wizardTarget, intent) {
   const target = chooseTargetForOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE, context, wizardTarget);
   if (target.executionMode === 'localImageNode') {
@@ -1860,6 +2303,31 @@ function makeImageGenerationNode(index, context, wizardTarget, intent) {
   };
 }
 
+function makeCollectionMapImageNode(index, context, wizardTarget, intent) {
+  const target = chooseTargetForOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE, context, wizardTarget);
+  const config = target.executionMode === 'localImageNode'
+    ? {
+        executionMode: 'localTool',
+        operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+        toolId: target.toolId,
+        instruction: 'Generate one image for each text item while preserving the source order. Leave detailed image settings editable for manual refinement.',
+      }
+    : buildLlmStepConfig(PIPELINE_OPERATION_IDS.IMAGE_GENERATE, target, intent, {
+        instruction: 'Generate one image for each text item while preserving the source order. Leave detailed image settings editable for manual refinement.',
+      });
+  if (target.executionMode === 'localImageNode') {
+    config.providerId = '';
+    config.model = '';
+  }
+  return {
+    node: makeNode('collectionMap', index, config, 'Generate images for collection'),
+    outputPortId: 'collection',
+    target,
+    warnings: target.providerId || target.toolId
+      ? []
+      : ['Choose an image-capable provider or install a local image generator before this collection map can run.'],
+  };
+}
 function buildStoryboardVideoScaffoldPipeline({ intent, context, wizardTarget }) {
   const nodes = [];
   const edges = [];
@@ -1906,28 +2374,24 @@ function buildStoryboardVideoScaffoldPipeline({ intent, context, wizardTarget })
   const promptOutputNode = add(makeNode('collectionOutput', 8, { title: 'Approved scene prompts' }, 'Approved prompts'));
   promptOutputNode.position.y += 20;
 
-  const approvedPromptNode = add(makeNode('textInput', 0, { text: '' }, 'Approved scene prompt'));
-  approvedPromptNode.position.y += 430;
-  const imageStep = makeImageGenerationNode(1, context, wizardTarget, intent);
-  const imageNode = add(imageStep.node);
-  imageNode.position.y += 430;
-  const imageValidationNode = add(makeNode('validation', 2, buildValidationConfig('image', wizardTarget, 'Pass only if the image matches the approved scene prompt and is suitable for the final video. Fail for mismatched content, obvious artifacts, or unusable framing.', { mode: 'user' }), 'Validate image'));
-  imageValidationNode.position.y += 430;
-  const imageAccumulatorNode = add(makeNode('collectionAccumulator', 3, { targetCount: 3 }, 'Collect approved images'));
-  imageAccumulatorNode.position.y += 350;
-  const imageLoopNode = add(makeNode('retryLoop', 4, {
-    retryTargetNodeId: imageNode.id,
-    maxAttempts: 5,
+  const imageMapStep = makeCollectionMapImageNode(8, context, wizardTarget, intent);
+  const imageMapNode = add(imageMapStep.node);
+  imageMapNode.position.y += 320;
+  const imageValidationNode = add(makeNode('validation', 9, buildValidationConfig('image collection', wizardTarget, 'Pass only if the generated image collection is ordered, complete, visually usable, and suitable for the final video. Fail if the collection is incomplete, mismatched, or unusable.', { mode: 'user' }), 'Validate image collection'));
+  imageValidationNode.position.y += 320;
+  const imageLoopNode = add(makeNode('retryLoop', 10, {
+    retryTargetNodeId: imageMapNode.id,
+    maxAttempts: 3,
     retryTerminationAction: 'fail',
     stopWhenRetryArtifactRepeats: true,
-  }, 'Regenerate images until approved'));
-  imageLoopNode.position.y += 430;
-  const compositionNode = add(makeNode('mediaComposition', 5, { secondsPerItem: 4 }, 'Sequence approved images'));
-  compositionNode.position.y += 430;
-  const exportNode = add(makeNode('mediaExport', 6, { title: 'Storyboard video' }, 'Export video'));
-  exportNode.position.y += 430;
-  const videoOutputNode = add(makeNode('videoOutput', 7, { title: 'Storyboard video' }, 'Video output'));
-  videoOutputNode.position.y += 430;
+  }, 'Regenerate image collection until approved'));
+  imageLoopNode.position.y += 320;
+  const compositionNode = add(makeNode('mediaComposition', 11, { secondsPerItem: 4 }, 'Sequence approved images'));
+  compositionNode.position.y += 320;
+  const exportNode = add(makeNode('mediaExport', 12, { title: 'Storyboard video' }, 'Export video'));
+  exportNode.position.y += 320;
+  const videoOutputNode = add(makeNode('videoOutput', 13, { title: 'Storyboard video' }, 'Video output'));
+  videoOutputNode.position.y += 320;
 
   connect(edges, sourceNode, 'text', packetNode, 'source');
   connect(edges, packetNode, 'packet', plannerNode, 'packet');
@@ -1940,10 +2404,9 @@ function buildStoryboardVideoScaffoldPipeline({ intent, context, wizardTarget })
   connect(edges, promptValidationNode, 'pass', promptLoopNode, 'complete');
   connect(edges, promptValidationNode, 'fail', promptLoopNode, 'retry');
   connect(edges, promptLoopNode, 'result', promptOutputNode, 'collection');
-  connect(edges, approvedPromptNode, 'text', imageNode, 'prompt');
-  connect(edges, imageNode, imageStep.outputPortId, imageValidationNode, 'input');
-  connect(edges, imageValidationNode, 'pass', imageAccumulatorNode, 'item');
-  connect(edges, imageAccumulatorNode, 'collection', imageLoopNode, 'complete');
+  connect(edges, promptLoopNode, 'result', imageMapNode, 'collection');
+  connect(edges, imageMapNode, imageMapStep.outputPortId, imageValidationNode, 'input');
+  connect(edges, imageValidationNode, 'pass', imageLoopNode, 'complete');
   connect(edges, imageValidationNode, 'fail', imageLoopNode, 'retry');
   connect(edges, imageLoopNode, 'result', compositionNode, 'visuals');
   connect(edges, compositionNode, 'composition', exportNode, 'composition');
@@ -1955,13 +2418,12 @@ function buildStoryboardVideoScaffoldPipeline({ intent, context, wizardTarget })
     target: plannerTarget,
     operationTargets: [
       { nodeLabel: plannerNode.label, operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, target: plannerTarget },
-      { nodeLabel: imageNode.label, operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE, target: imageStep.target },
+      { nodeLabel: imageMapNode.label, operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE, target: imageMapStep.target },
     ],
     scaffold: 'validated-storyboard-video',
     warnings: [
-      ...imageStep.warnings,
-      'The current pipeline schema does not yet map every Plan Scenes text item directly through image generation. This draft includes an approved scene prompt input plus an image approval/accumulation loop as editable downstream scaffolding.',
-      'Image validation is set to user approval by default so local wizard models without vision support do not block the draft. Switch it to LLM validation if you choose a vision-capable validator.',
+      ...imageMapStep.warnings,
+      'Image validation reviews the generated collection as a whole in this pass. Per-item approval can be added later when item-wise validation has a real execution bridge.',
     ],
   };
 }
@@ -1972,7 +2434,7 @@ function resultCoversStoryboardVideoDepth(result) {
     accumulator[node.type] = Number(accumulator[node.type] || 0) + 1;
     return accumulator;
   }, {});
-  const hasImageGeneration = nodes.some((node) => node.type === 'imageGenerate' || (node.type === 'llmPrompt' && node.config?.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
+  const hasImageGeneration = nodes.some((node) => node.type === 'imageGenerate' || node.type === 'collectionMap' || (node.type === 'llmPrompt' && node.config?.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
   return Number(typeCounts.validation || 0) >= 2
     && Number(typeCounts.retryLoop || 0) >= 2
     && hasImageGeneration
@@ -2287,8 +2749,36 @@ function sourceNodeTypeForKind(kind) {
   return 'textInput';
 }
 
-function canModelPromptReadKind(kind) {
-  return kind === 'text' || kind === 'image';
+function getTargetOperationInputKinds(target = {}, operationId, context = {}) {
+  if (target.executionMode === 'ollama') {
+    return getToolPipelineOperation('ollama', operationId)?.inputKinds || [];
+  }
+  if (target.executionMode === 'localTool' || target.executionMode === 'localImageNode') {
+    return getToolPipelineOperation(target.toolId, operationId)?.inputKinds || [];
+  }
+  if (target.executionMode === 'cloud') {
+    const providerId = normalizeId(target.providerId);
+    const model = normalizeModelId(target.model);
+    if (!providerId) {
+      return [];
+    }
+    return (model ? getProviderModelCapabilities(providerId, model)?.operations?.[operationId] : null)?.inputKinds
+      || getProviderPipelineOperation(providerId, operationId)?.inputKinds
+      || [];
+  }
+  return (context.connectedProviders || [])
+    .flatMap((provider) => getProviderPipelineOperation(provider.id, operationId)?.inputKinds || []);
+}
+
+function canModelPromptReadKind(kind, target = null, context = {}) {
+  const normalizedKind = normalizeIntentKind(kind, '');
+  if (!['text', 'image', 'video', 'file'].includes(normalizedKind)) {
+    return false;
+  }
+  if (!target) {
+    return true;
+  }
+  return getTargetOperationInputKinds(target, PIPELINE_OPERATION_IDS.LLM_PROMPT, context).includes(normalizedKind);
 }
 
 function addIntentOutputNode(nodes, edges, artifact, outputRequest = {}) {
@@ -2386,11 +2876,14 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
     }
 
     if (stage.kind === 'llm_generate_text') {
+      const target = chooseTargetForOperation(PIPELINE_OPERATION_IDS.LLM_PROMPT, context, wizardTarget);
       if (!canModelPromptReadKind(inputArtifact.kind)) {
         warnings.push('Skipped text generation because ' + inputArtifact.kind + ' is not a supported Model Step input in this pass.');
         continue;
       }
-      const target = chooseTargetForOperation(PIPELINE_OPERATION_IDS.LLM_PROMPT, context, wizardTarget);
+      if (!canModelPromptReadKind(inputArtifact.kind, target, context)) {
+        warnings.push('The selected text-generation runtime does not accept ' + inputArtifact.kind + ' inputs. Switch this step to a provider/model whose declared capabilities include ' + inputArtifact.kind + ' before running.');
+      }
       if (inputArtifact.kind === 'image') {
         const normalizedTarget = normalizeWizardTarget(wizardTarget);
         const targetCapabilities = normalizedTarget.mode === 'cloud' && normalizedTarget.providerId && normalizedTarget.model
@@ -2412,11 +2905,44 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
       continue;
     }
 
+    if (stage.kind === 'build_collection') {
+      const inputArtifacts = (Array.isArray(stage.inputs) && stage.inputs.length ? stage.inputs : [stage.input])
+        .map((inputName) => artifactMap.get(inputName))
+        .filter((artifact) => artifact?.node && artifact?.portId);
+      const itemKinds = [...new Set(inputArtifacts.map((artifact) => artifact.kind).filter((kind) => kind && !String(kind).startsWith('collection:')))]
+      if (!inputArtifacts.length || itemKinds.length !== 1) {
+        warnings.push('Skipped collection building because it needs one or more single artifacts of the same kind.');
+        continue;
+      }
+      const collectionNode = makeNode('collectionBuilder', nodes.length, { insertionMode: 'append' }, 'Build prompt collection');
+      nodes.push(collectionNode);
+      for (const artifact of inputArtifacts) {
+        connect(edges, artifact.node, artifact.portId, collectionNode, 'items');
+      }
+      stagePrimaryNodes.set(stage.id, collectionNode);
+      lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'collection:' + itemKinds[0], node: collectionNode, portId: 'collection', label: stage.purpose || outputName });
+      stageOutputArtifacts.set(stage.id, lastArtifact);
+      continue;
+    }
+
     if (stage.kind === 'generate_image') {
+      if (inputArtifact.kind === 'collection:text') {
+        const mapStep = makeCollectionMapImageNode(nodes.length, context, wizardTarget, intent);
+        nodes.push(mapStep.node);
+        connect(edges, inputArtifact.node, inputArtifact.portId, mapStep.node, 'collection');
+        stagePrimaryNodes.set(stage.id, mapStep.node);
+        operationTargets.push({ nodeLabel: mapStep.node.label, operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE, target: mapStep.target });
+        warnings.push(...mapStep.warnings);
+        lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'collection:image', node: mapStep.node, portId: mapStep.outputPortId, label: stage.purpose || outputName });
+        stageOutputArtifacts.set(stage.id, lastArtifact);
+        continue;
+      }
+      if (String(inputArtifact.kind).startsWith('collection:')) {
+        warnings.push('Skipped image generation because only ordered text collections can be mapped through image generation in this pass.');
+        continue;
+      }
       if (inputArtifact.kind !== 'text') {
-        warnings.push(String(inputArtifact.kind).startsWith('collection')
-          ? 'Local AI Hub does not yet map each collection item through image generation automatically. Add an image generation loop after reviewing the scene prompt collection.'
-          : 'Skipped image generation because it needs a text prompt artifact in this pass.');
+        warnings.push('Skipped image generation because it needs a text prompt artifact in this pass.');
         continue;
       }
       const imageStep = makeImageGenerationNode(nodes.length, context, wizardTarget, intent);
@@ -2426,6 +2952,99 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
       operationTargets.push({ nodeLabel: imageStep.node.label, operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE, target: imageStep.target });
       warnings.push(...imageStep.warnings);
       lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'image', node: imageStep.node, portId: imageStep.outputPortId, label: stage.purpose || outputName });
+      stageOutputArtifacts.set(stage.id, lastArtifact);
+      continue;
+    }
+
+    if (stage.kind === 'generate_audio') {
+      if (!['text', 'audio'].includes(inputArtifact.kind)) {
+        warnings.push('Skipped audio generation because it needs a text prompt or supported audio guidance artifact.');
+        continue;
+      }
+      const audioStep = makeOperationModelStepNode(nodes.length, PIPELINE_OPERATION_IDS.AUDIO_GENERATE, 'audio', context, wizardTarget, intent, {
+        instruction: normalizeString(sanitizeRuntimeTextDefault(stage.purpose, intent), getDefaultInstructionForOperation(PIPELINE_OPERATION_IDS.AUDIO_GENERATE)),
+      });
+      if (!getTargetOperationInputKinds(audioStep.target, PIPELINE_OPERATION_IDS.AUDIO_GENERATE, context).includes(inputArtifact.kind)) {
+        warnings.push('The selected audio-generation runtime does not accept ' + inputArtifact.kind + ' inputs. Switch this step to AudioCraft or a compatible provider before running.');
+      }
+      nodes.push(audioStep.node);
+      connect(edges, inputArtifact.node, inputArtifact.portId, audioStep.node, 'prompt');
+      stagePrimaryNodes.set(stage.id, audioStep.node);
+      operationTargets.push({ nodeLabel: audioStep.node.label, operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE, target: audioStep.target });
+      warnings.push(...audioStep.warnings);
+      lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'audio', node: audioStep.node, portId: 'audio', label: stage.purpose || outputName });
+      stageOutputArtifacts.set(stage.id, lastArtifact);
+      continue;
+    }
+
+    if (stage.kind === 'transform_audio') {
+      if (inputArtifact.kind !== 'audio') {
+        warnings.push('Skipped audio transformation because it needs an audio source artifact.');
+        continue;
+      }
+      const audioStep = makeOperationModelStepNode(nodes.length, PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM, 'audio', context, wizardTarget, intent, {
+        instruction: normalizeString(sanitizeRuntimeTextDefault(stage.purpose, intent), getDefaultInstructionForOperation(PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM)),
+      });
+      nodes.push(audioStep.node);
+      connect(edges, inputArtifact.node, inputArtifact.portId, audioStep.node, 'prompt');
+      stagePrimaryNodes.set(stage.id, audioStep.node);
+      operationTargets.push({ nodeLabel: audioStep.node.label, operationId: PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM, target: audioStep.target });
+      warnings.push(...audioStep.warnings, 'Choose an RVC voice model before running this audio transformation step.');
+      lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'audio', node: audioStep.node, portId: 'audio', label: stage.purpose || outputName });
+      stageOutputArtifacts.set(stage.id, lastArtifact);
+      continue;
+    }
+
+    if (stage.kind === 'generate_video') {
+      if (!['text', 'image'].includes(inputArtifact.kind)) {
+        warnings.push('Skipped video generation because it needs a text prompt or image source artifact.');
+        continue;
+      }
+      const videoStep = makeOperationModelStepNode(nodes.length, PIPELINE_OPERATION_IDS.VIDEO_GENERATE, 'video', context, wizardTarget, intent, {
+        forceLocal: Boolean(plan?.requestObligations?.forceLocalVideo),
+        instruction: inputArtifact.kind === 'image'
+          ? 'Create a short video from the connected image. Leave motion guidance and generation settings editable for manual refinement.'
+          : normalizeString(sanitizeRuntimeTextDefault(stage.purpose, intent), getDefaultInstructionForOperation(PIPELINE_OPERATION_IDS.VIDEO_GENERATE)),
+      });
+      if (!getTargetOperationInputKinds(videoStep.target, PIPELINE_OPERATION_IDS.VIDEO_GENERATE, context).includes(inputArtifact.kind)) {
+        warnings.push('The selected video-generation runtime does not accept ' + inputArtifact.kind + ' inputs. Switch this step to Wan2.1 WebUI or a compatible video provider before running.');
+      }
+      nodes.push(videoStep.node);
+      connect(edges, inputArtifact.node, inputArtifact.portId, videoStep.node, 'prompt');
+      stagePrimaryNodes.set(stage.id, videoStep.node);
+      operationTargets.push({ nodeLabel: videoStep.node.label, operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE, target: videoStep.target });
+      warnings.push(...videoStep.warnings);
+      lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'video', node: videoStep.node, portId: 'video', label: stage.purpose || outputName });
+      stageOutputArtifacts.set(stage.id, lastArtifact);
+      continue;
+    }
+
+    if (stage.kind === 'transform_image') {
+      if (inputArtifact.kind !== 'image') {
+        warnings.push('Skipped image transformation because it needs an image source artifact.');
+        continue;
+      }
+      const inputArtifacts = (Array.isArray(stage.inputs) && stage.inputs.length ? stage.inputs : [stage.input])
+        .map((inputName) => artifactMap.get(inputName))
+        .filter((artifact) => artifact?.node && artifact?.portId);
+      const referenceArtifact = inputArtifacts.find((artifact) => artifact !== inputArtifact && artifact.kind === 'image') || null;
+      const wantsFaceFusion = inferIntentFeatures(intent).wantsFaceFusionTransform || Boolean(referenceArtifact);
+      const imageStep = makeOperationModelStepNode(nodes.length, PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM, 'image', context, wizardTarget, intent, {
+        preferredToolIds: wantsFaceFusion ? ['facefusion', ...IMAGE_TRANSFORM_TOOL_IDS.filter((toolId) => toolId !== 'facefusion')] : getPreferredImageTransformToolIds(intent),
+        instruction: normalizeString(sanitizeRuntimeTextDefault(stage.purpose, intent), getDefaultInstructionForOperation(PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM)),
+      });
+      nodes.push(imageStep.node);
+      connect(edges, inputArtifact.node, inputArtifact.portId, imageStep.node, 'prompt');
+      if (wantsFaceFusion && referenceArtifact) {
+        connect(edges, referenceArtifact.node, referenceArtifact.portId, imageStep.node, 'referenceImage');
+      }
+      stagePrimaryNodes.set(stage.id, imageStep.node);
+      operationTargets.push({ nodeLabel: imageStep.node.label, operationId: PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM, target: imageStep.target });
+      warnings.push(...imageStep.warnings);
+      if (wantsFaceFusion && !referenceArtifact) {
+        warnings.push('FaceFusion image mode needs a reference face image placeholder before running.');
+      }
+      lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'image', node: imageStep.node, portId: 'image', label: stage.purpose || outputName });
       stageOutputArtifacts.set(stage.id, lastArtifact);
       continue;
     }
@@ -2496,6 +3115,10 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
       const compositionNode = makeNode('mediaComposition', nodes.length, { secondsPerItem: 4 }, 'Sequence media');
       nodes.push(compositionNode);
       connect(edges, visualArtifact.node, visualArtifact.portId, compositionNode, 'visuals');
+      const primaryAudioArtifact = [...artifactMap.values()].find((artifact) => artifact?.kind === 'audio' && artifact?.node && artifact?.portId);
+      if (primaryAudioArtifact) {
+        connect(edges, primaryAudioArtifact.node, primaryAudioArtifact.portId, compositionNode, 'audio');
+      }
       stagePrimaryNodes.set(stage.id, compositionNode);
       lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'composition', node: compositionNode, portId: 'composition', label: stage.purpose || outputName });
       stageOutputArtifacts.set(stage.id, lastArtifact);
@@ -2600,6 +3223,8 @@ function buildDraftNodesForPlan({ intent, plan, context, wizardTarget }) {
       return buildSimpleModelPipeline({ intent, operationId: PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM, outputKind: 'image', context, wizardTarget, plan });
     case WIZARD_RECIPE_IDS.AUDIO_TRANSCRIBE:
       return buildTranscriptionPipeline({ context });
+    case WIZARD_RECIPE_IDS.AUDIO_TRANSFORM:
+      return buildSimpleModelPipeline({ intent, operationId: PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM, outputKind: 'audio', context, wizardTarget, plan });
     case WIZARD_RECIPE_IDS.SCENE_PLAN:
       return buildScenePlanPipeline({ intent, context, wizardTarget });
     case WIZARD_RECIPE_IDS.TEXT_RESPONSE:
@@ -2660,7 +3285,7 @@ function buildResultMessage(plan, result, classification = classifyWizardDraftRe
     return 'Local AI Hub inserted a simple editable placeholder from built-in node and wiring rules: ' + summarizeResultShape(result) + '. Treat it as a starting graph, not a completed wizard draft for the full request.';
   }
   if (result?.scaffold === 'validated-storyboard-video') {
-    return 'Local AI Hub expanded the request into an editable multi-stage storyboard/video scaffold with planning, validation, retry loops, image approval/accumulation, media composition, and video export where the current node system supports them.';
+    return 'Local AI Hub expanded the request into an editable multi-stage storyboard/video scaffold with planning, validation, retry loops, collection image mapping, whole-collection image validation, media composition, and video export where the current node system supports them.';
   }
   if (result?.harness === 'image-description-validation') {
     return 'Local AI Hub created an editable image-description draft with image input, model description, validation, retry, and approved text output. The runtime image is still supplied by the user, and the selected runtime model must support image input before this can run successfully.';
@@ -2807,6 +3432,8 @@ module.exports = {
   WIZARD_INTENT_STAGE_KINDS,
   WIZARD_RECIPE_IDS,
   WIZARD_RECIPE_OPTIONS,
+  buildPipelineWizardIntentIrJsonSchema,
+  buildPipelineWizardStructuredOutputRequest,
   buildPipelineWizardContext,
   buildPipelineWizardDraft,
   buildPipelineWizardMessages,

@@ -775,10 +775,21 @@ function normalizeCollectionLineage(lineage) {
     sourcePortId: String(lineage.sourcePortId || '').trim(),
     sourcePortLabel: String(lineage.sourcePortLabel || '').trim(),
   };
+  const sourceItemId = String(lineage.sourceItemId || '').trim();
+  if (sourceItemId) {
+    normalized.sourceItemId = sourceItemId;
+  }
+  const sourceItemIndex = Number(lineage.sourceItemIndex);
+  if (Number.isInteger(sourceItemIndex) && sourceItemIndex >= 0) {
+    normalized.sourceItemIndex = sourceItemIndex;
+  }
+  const parentLineage = normalizeCollectionLineage(lineage.parentLineage);
+  if (parentLineage) {
+    normalized.parentLineage = parentLineage;
+  }
 
-  return Object.values(normalized).some(Boolean) ? normalized : null;
+  return Object.values(normalized).some((value) => Boolean(value) || value === 0) ? normalized : null;
 }
-
 function normalizeCollectionAccumulation(accumulation) {
   if (!accumulation || typeof accumulation !== 'object') {
     return null;

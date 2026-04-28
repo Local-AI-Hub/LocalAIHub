@@ -14,7 +14,7 @@ export default function ConnectionsPanel({
           <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Connections</p>
           <h3 className="mt-3 text-3xl font-semibold text-white">Manage cloud provider API keys</h3>
           <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
-            Keys are stored in Windows Credential Manager. Local AI Hub only shows masked versions after you save them.
+            Keys can come from Windows Credential Manager or supported environment variables. Local AI Hub never shows raw key values after you save them.
           </p>
         </div>
       </div>
@@ -29,7 +29,8 @@ export default function ConnectionsPanel({
                   <span className="status-pill border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Cloud</span>
                 </div>
                 <p className="mt-2 text-sm text-slate-300">{provider.statusLabel}</p>
-                <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-500">{provider.maskedKey || 'No key saved yet'}</p>
+                <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-500">{provider.credentialStatusLabel || 'No credential configured'}</p>
+                {provider.maskedKey ? <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-500">{provider.maskedKey}</p> : null}
               </div>
               <a className="ghost-button" href={provider.docsUrl} rel="noreferrer" target="_blank">
                 Docs
@@ -46,19 +47,19 @@ export default function ConnectionsPanel({
 
             <div className="mt-4 flex flex-wrap gap-3">
               <button className="primary-button" disabled={busyMap[`provider-save:${provider.id}`] || !(drafts[provider.id] || '').trim()} onClick={() => onSave(provider.id)} type="button">
-                {busyMap[`provider-save:${provider.id}`] ? 'Saving...' : provider.isConnected ? 'Replace key' : 'Save key'}
+                {busyMap[`provider-save:${provider.id}`] ? 'Saving...' : provider.hasSavedCredential ? 'Replace saved key' : 'Save key'}
               </button>
               <button className="ghost-button" disabled={busyMap[`provider-test:${provider.id}`] || !provider.isConnected} onClick={() => onTest(provider.id)} type="button">
                 {busyMap[`provider-test:${provider.id}`] ? 'Testing...' : 'Test connection'}
               </button>
-              <button className="ghost-button" disabled={busyMap[`provider-disconnect:${provider.id}`] || !provider.isConnected} onClick={() => onDisconnect(provider.id)} type="button">
-                {busyMap[`provider-disconnect:${provider.id}`] ? 'Disconnecting...' : 'Disconnect'}
+              <button className="ghost-button" disabled={busyMap[`provider-disconnect:${provider.id}`] || !provider.hasSavedCredential} onClick={() => onDisconnect(provider.id)} type="button">
+                {busyMap[`provider-disconnect:${provider.id}`] ? 'Clearing...' : 'Clear saved key'}
               </button>
             </div>
 
-            {provider.statusMessage || provider.lastTestMessage ? (
+            {provider.credentialStatusMessage || provider.statusMessage || provider.lastTestMessage ? (
               <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 px-3 py-3 text-sm leading-6 text-slate-300">
-                {provider.statusMessage || provider.lastTestMessage}
+                {provider.credentialStatusMessage || provider.statusMessage || provider.lastTestMessage}
               </div>
             ) : null}
           </div>

@@ -20,7 +20,9 @@
     "preview": "vite preview",
     "remediate:lifecycle": "node scripts/remediate-local-ai-hub.js",
     "verify:audio-pipeline": "node scripts/verify-audio-pipeline.js",
-    "verify:media-composition": "node scripts/verify-pipeline-media-composition.js"
+    "verify:media-composition": "node scripts/verify-pipeline-media-composition.js",
+    "verify:model-download-plans": "node scripts/verify-model-download-plans.js",
+    "verify:provider-credential-security": "node scripts/verify-provider-credential-security.js"
   },
   "dependencies": {
     "7zip-bin": "^5.2.0",

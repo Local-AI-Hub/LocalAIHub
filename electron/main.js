@@ -85,6 +85,7 @@ const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
 const { cancelPipelineRun, getActiveRunSnapshot, resumePipelineValidation, runPipeline, setPipelineEventSink } = require('./services/pipelineExecutionService');
 const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./services/pipelineStoreService');
 const { deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
+const { redactSensitiveText } = require('./services/redactionService');
 
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
@@ -127,14 +128,36 @@ function getDiagnosticLogPath() {
   }
 }
 
+function normalizeDiagnosticValue(value) {
+  if (value instanceof Error) {
+    return {
+      message: redactSensitiveText(value.message || ''),
+      stack: redactSensitiveText(value.stack || ''),
+      code: value.code,
+      stdout: redactSensitiveText(value.stdout || ''),
+      stderr: redactSensitiveText(value.stderr || ''),
+    };
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeDiagnosticValue(entry));
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, normalizeDiagnosticValue(entry)]));
+  }
+
+  return typeof value === 'string' ? redactSensitiveText(value) : value;
+}
+
 function writeDiagnosticLog(label, error, context = {}) {
   const diagnosticPath = getDiagnosticLogPath();
   const payload = {
     appVersion: app.getVersion(),
-    context,
+    context: normalizeDiagnosticValue(context),
     isPackaged: app.isPackaged,
-    message: error?.message || String(error),
-    stack: error?.stack || null,
+    message: redactSensitiveText(error?.message || String(error)),
+    stack: redactSensitiveText(error?.stack || ''),
     timestamp: new Date().toISOString(),
   };
 

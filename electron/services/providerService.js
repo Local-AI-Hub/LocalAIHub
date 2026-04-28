@@ -2,8 +2,9 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const { ensureStorage, humanizeError } = require('./configService');
-const { getProviderSecret, maskSecret, setProviderSecret } = require('./credentialService');
+const { maskSecret, resolveProviderCredential, setProviderSecret } = require('./credentialService');
 const { createLogger } = require('./logService');
+const { redactSensitiveText } = require('./redactionService');
 const { getProviderCatalog, getProviderManifest, initializeProviderRegistry, resolveProviderUrl } = require('./providerRegistry');
 const { PIPELINE_OPERATION_IDS, doesProviderOperationRequireExplicitModel, getProviderModelCapabilities } = require('../shared/pipelineCapabilities.cjs');
 
@@ -145,7 +146,7 @@ async function requestProviderJson(provider, apiKey, endpoint, options = {}) {
         payload?.detail ||
         payload?.rawText ||
         `${provider.name} returned ${response.status}.`;
-      throw new Error(String(responseMessage).trim());
+      throw new Error(redactSensitiveText(String(responseMessage).trim(), { additionalSecrets: [apiKey] }));
     }
 
     return payload;
@@ -195,7 +196,7 @@ async function requestProviderBuffer(provider, apiKey, endpoint, options = {}) {
         payload?.detail ||
         payload?.rawText ||
         `${provider.name} returned ${response.status}.`;
-      throw new Error(String(responseMessage).trim());
+      throw new Error(redactSensitiveText(String(responseMessage).trim(), { additionalSecrets: [apiKey] }));
     }
 
     return {
@@ -365,6 +366,8 @@ function describeProviderUsageOperation(operationId) {
 
 function buildProviderStatusMessage(provider, settingsEntry = {}, options = {}) {
   const hasKey = options.hasKey === true;
+  const credentialSource = String(options.credentialSource || '').trim();
+  const envVarName = String(options.envVarName || '').trim();
   const lastTestSucceeded = settingsEntry.lastTestSucceeded === true;
   const lastTestFailed = settingsEntry.lastTestSucceeded === false;
   const lastSuccessfulUseAt = String(settingsEntry.lastSuccessfulUseAt || '').trim();
@@ -378,7 +381,17 @@ function buildProviderStatusMessage(provider, settingsEntry = {}, options = {}) 
     return {
       libraryStatus: 'disconnected',
       statusLabel: 'Not connected',
-      statusMessage: '',
+      statusMessage: envVarName
+        ? 'No saved credential was found, and Local AI Hub could not find the default environment variable ' + envVarName + ' in this app session.'
+        : '',
+    };
+  }
+
+  if (credentialSource === 'environment') {
+    return {
+      libraryStatus: 'connected',
+      statusLabel: 'Using environment variable',
+      statusMessage: 'Local AI Hub will use ' + envVarName + ' for ' + provider.name + ' on this PC. Saved credentials remain in Windows Credential Manager, but environment variables take precedence.',
     };
   }
 
@@ -421,14 +434,44 @@ function buildProviderStatusMessage(provider, settingsEntry = {}, options = {}) 
   };
 }
 
-function normalizeProviderSummary(provider, settingsEntry = {}, apiKey = '') {
-  const hasKey = Boolean(String(apiKey || '').trim());
+function formatEnvVarList(envVarNames = []) {
+  const names = (Array.isArray(envVarNames) ? envVarNames : []).map((entry) => String(entry || '').trim()).filter(Boolean);
+  if (names.length <= 1) {
+    return names[0] || '';
+  }
+
+  return names.slice(0, -1).join(', ') + ' or ' + names[names.length - 1];
+}
+
+function normalizeProviderSummary(provider, settingsEntry = {}, credential = {}) {
+  const apiKey = String(credential?.apiKey || '').trim();
+  const hasKey = Boolean(apiKey);
+  const credentialSource = String(credential?.credentialSource || (hasKey ? 'saved' : 'missing')).trim();
+  const envVarNames = Array.isArray(credential?.envVarNames) ? credential.envVarNames : [];
+  const envVarName = String(credential?.envVarName || envVarNames[0] || '').trim();
+  const hasSavedCredential = credential?.hasSavedCredential === true;
   const lastTestSucceeded = settingsEntry.lastTestSucceeded === true
     ? true
     : settingsEntry.lastTestSucceeded === false
       ? false
       : undefined;
-  const status = buildProviderStatusMessage(provider, settingsEntry, { hasKey });
+  const safeSettingsEntry = {
+    ...settingsEntry,
+    lastTestMessage: redactSensitiveText(settingsEntry.lastTestMessage || '', { additionalSecrets: [apiKey] }),
+  };
+  const status = buildProviderStatusMessage(provider, safeSettingsEntry, { credentialSource, envVarName, hasKey });
+  const credentialStatusLabel = credentialSource === 'environment'
+    ? 'Using environment variable: ' + envVarName
+    : credentialSource === 'saved'
+      ? 'Using saved credential'
+      : 'No credential configured';
+  const credentialStatusMessage = credentialSource === 'environment'
+    ? 'Environment variable values are not shown or copied into saved credentials.'
+    : credentialSource === 'saved'
+      ? ''
+      : credentialSource === 'missing' && envVarNames.length
+        ? 'Default environment variable not found: ' + formatEnvVarList(envVarNames) + '.'
+        : '';
 
   return {
     ...provider,
@@ -437,12 +480,18 @@ function normalizeProviderSummary(provider, settingsEntry = {}, apiKey = '') {
     cloudBadge: 'Cloud',
     isConnected: hasKey,
     libraryStatus: status.libraryStatus,
-    maskedKey: hasKey ? maskSecret(apiKey) : '',
+    credentialSource,
+    credentialStatusLabel,
+    credentialStatusMessage,
+    envVarName,
+    envVarNames,
+    hasSavedCredential,
+    maskedKey: hasSavedCredential && credentialSource !== 'environment' ? maskSecret(apiKey) : '',
     lastAvailableModelId: settingsEntry.lastAvailableModelId || '',
     lastConnectedAt: settingsEntry.lastConnectedAt || null,
     lastSuccessfulOperation: settingsEntry.lastSuccessfulOperation || '',
     lastSuccessfulUseAt: settingsEntry.lastSuccessfulUseAt || null,
-    lastTestMessage: settingsEntry.lastTestMessage || '',
+    lastTestMessage: safeSettingsEntry.lastTestMessage || '',
     lastTestSucceeded,
     lastTestedAt: settingsEntry.lastTestedAt || null,
     modelCount: Number(settingsEntry.modelCount || 0),
@@ -453,9 +502,13 @@ function normalizeProviderSummary(provider, settingsEntry = {}, apiKey = '') {
 }
 
 async function loadProviderSecretOrThrow(providerId) {
-  const apiKey = await getProviderSecret(providerId).catch(() => '');
-  if (!String(apiKey || '').trim()) {
-    throw new Error('Enter an API key for this provider first.');
+  const credential = await resolveProviderCredential(providerId).catch(() => null);
+  const apiKey = String(credential?.apiKey || '').trim();
+  if (!apiKey) {
+    const envVarName = String(credential?.envVarName || '').trim();
+    throw new Error(envVarName
+      ? 'Enter an API key for this provider first, or set ' + envVarName + ' before starting Local AI Hub.'
+      : 'Enter an API key for this provider first.');
   }
 
   return apiKey;
@@ -558,6 +611,58 @@ function getProviderChatTimeoutMessage(provider, payload = {}) {
   return String(payload.timeoutMessage || '').trim() || (provider.name + ' did not answer before Local AI Hub timed out waiting for this response.');
 }
 
+function normalizeProviderMaxOutputTokens(value, fallback = 0) {
+  const tokens = Math.floor(Number(value || 0));
+  if (tokens > 0) {
+    return Math.max(128, Math.min(tokens, 8192));
+  }
+  const fallbackTokens = Math.floor(Number(fallback || 0));
+  return fallbackTokens > 0 ? Math.max(128, Math.min(fallbackTokens, 8192)) : 0;
+}
+
+function normalizeStructuredResponseFormat(value = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  if (value.type !== 'json_schema' || !value.schema || typeof value.schema !== 'object' || Array.isArray(value.schema)) {
+    return null;
+  }
+  return {
+    type: 'json_schema',
+    name: String(value.name || 'local_ai_hub_response').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 80) || 'local_ai_hub_response',
+    schema: value.schema,
+  };
+}
+
+function buildGoogleGenerationConfig(provider, payload = {}) {
+  const config = {};
+  const maxOutputTokens = normalizeProviderMaxOutputTokens(payload.maxOutputTokens, provider.configuration?.maxOutputTokens);
+  if (maxOutputTokens) {
+    config.maxOutputTokens = maxOutputTokens;
+  }
+  const responseFormat = normalizeStructuredResponseFormat(payload.responseFormat);
+  if (responseFormat) {
+    config.responseMimeType = 'application/json';
+    config.responseJsonSchema = responseFormat.schema;
+  }
+  return config;
+}
+
+function buildOpenAiResponseFormat(payload = {}) {
+  const responseFormat = normalizeStructuredResponseFormat(payload.responseFormat);
+  if (!responseFormat) {
+    return null;
+  }
+  return {
+    type: 'json_schema',
+    json_schema: {
+      name: responseFormat.name,
+      schema: responseFormat.schema,
+      strict: true,
+    },
+  };
+}
+
 function extractTextParts(value) {
   if (typeof value === 'string') {
     return value.trim();
@@ -653,6 +758,7 @@ function toGoogleContentParts(parts = []) {
 }
 
 async function sendOpenAICompatibleChat(provider, apiKey, payload) {
+  const structuredResponseFormat = provider.id === 'openai' ? buildOpenAiResponseFormat(payload) : null;
   const response = await requestProviderJson(provider, apiKey, provider.configuration?.chatEndpoint || '/chat/completions', {
     method: 'POST',
     body: JSON.stringify({
@@ -662,6 +768,8 @@ async function sendOpenAICompatibleChat(provider, apiKey, payload) {
         content: toOpenAiCompatibleContent(message.content),
       })),
       stream: false,
+      ...(normalizeProviderMaxOutputTokens(payload.maxOutputTokens) ? { max_tokens: normalizeProviderMaxOutputTokens(payload.maxOutputTokens) } : {}),
+      ...(structuredResponseFormat ? { response_format: structuredResponseFormat } : {}),
     }),
     timeoutMessage: getProviderChatTimeoutMessage(provider, payload),
     timeoutMs: getProviderChatTimeoutMs(payload),
@@ -703,7 +811,7 @@ async function sendAnthropicChat(provider, apiKey, payload) {
     method: 'POST',
     body: JSON.stringify({
       model: payload.model,
-      max_tokens: provider.configuration?.maxOutputTokens || 512,
+      max_tokens: normalizeProviderMaxOutputTokens(payload.maxOutputTokens, provider.configuration?.maxOutputTokens || 512),
       messages: conversation,
       ...(systemMessages.length ? { system: systemMessages.join('\n\n') } : {}),
     }),
@@ -744,6 +852,7 @@ async function sendGoogleChat(provider, apiKey, payload) {
   }
 
   const modelPath = String(payload.model || '').startsWith('models/') ? payload.model : 'models/' + payload.model;
+  const generationConfig = buildGoogleGenerationConfig(provider, payload);
   const response = await requestProviderJson(provider, apiKey, modelPath + ':generateContent', {
     method: 'POST',
     body: JSON.stringify({
@@ -755,6 +864,7 @@ async function sendGoogleChat(provider, apiKey, payload) {
             },
           }
         : {}),
+      ...(Object.keys(generationConfig).length ? { generationConfig } : {}),
     }),
     timeoutMessage: getProviderChatTimeoutMessage(provider, payload),
     timeoutMs: getProviderChatTimeoutMs(payload),
@@ -1092,7 +1202,7 @@ async function sendOpenAiVideoGeneration(provider, apiKey, payload) {
         latestPayload?.failure?.message ||
         latestPayload?.message ||
         provider.name + ' could not finish that video request.';
-      throw new Error(String(failureMessage).trim());
+      throw new Error(redactSensitiveText(String(failureMessage).trim(), { additionalSecrets: [apiKey] }));
     }
 
     if (Date.now() - startedAt > OPENAI_VIDEO_STATUS_TIMEOUT_MS) {
@@ -1147,8 +1257,8 @@ async function listProviderConnections() {
 
   return Promise.all(
     getProviderCatalog().map(async (provider) => {
-      const apiKey = await getProviderSecret(provider.id).catch(() => '');
-      return normalizeProviderSummary(provider, settings.providers[provider.id] || {}, apiKey);
+      const credential = await resolveProviderCredential(provider.id).catch(() => ({ apiKey: '', credentialSource: 'missing' }));
+      return normalizeProviderSummary(provider, settings.providers[provider.id] || {}, credential);
     }),
   );
 }
@@ -1367,6 +1477,8 @@ async function chatWithProvider(providerId, payload = {}) {
       model,
       timeoutMessage: payload.timeoutMessage,
       timeoutMs: payload.timeoutMs,
+      maxOutputTokens: payload.maxOutputTokens,
+      responseFormat: payload.responseFormat,
     };
     let result = null;
     if (provider.configuration?.protocol === 'anthropic') {
@@ -1437,6 +1549,8 @@ async function runProviderOperation(providerId, payload = {}) {
 }
 
 module.exports = {
+  buildGoogleGenerationConfig,
+  buildOpenAiResponseFormat,
   chatWithProvider,
   disconnectProvider,
   listProviderConnections,

@@ -1,6 +1,13 @@
 const assert = require('assert');
 const path = require('path');
 const Module = require('module');
+const {
+  buildPipelineGraph,
+  createEdge,
+  getNodeTypeDefinition,
+  getPipelineNodePorts,
+  getPortDefinition,
+} = require('../electron/shared/pipelineSchema.cjs');
 
 function loadOrchestratorWithStubs(stubs) {
   const originalLoad = Module._load;
@@ -149,7 +156,54 @@ async function verifySharedLaunchFailure() {
   );
 }
 
+function createGraphWorkflowNode(toolId) {
+  return {
+    config: {
+      toolId,
+    },
+    id: 'graph-1',
+    label: 'Graph Workflow',
+    position: { x: 0, y: 0 },
+    type: 'graphWorkflow',
+  };
+}
+
+function verifyGraphWorkflowPortContracts() {
+  const staticOutputPortIds = (getNodeTypeDefinition('graphWorkflow')?.outputPorts || []).map((port) => port.id);
+  assert.deepStrictEqual(staticOutputPortIds, ['image', 'video'], 'Expected the static Graph Workflow schema fallback to avoid unsupported audio output.');
+
+  const comfyNode = createGraphWorkflowNode('comfyui');
+  const comfyOutputPortIds = getPipelineNodePorts(comfyNode, 'output').map((port) => port.id);
+  assert.deepStrictEqual(comfyOutputPortIds, ['image', 'video'], 'Expected ComfyUI graph workflows to expose image and video outputs.');
+  assert.strictEqual(getPortDefinition(comfyNode, 'output', 'audio'), null, 'Expected ComfyUI graph workflows not to expose audio output.');
+
+  const invokeNode = createGraphWorkflowNode('invokeai');
+  const invokeOutputPortIds = getPipelineNodePorts(invokeNode, 'output').map((port) => port.id);
+  assert.deepStrictEqual(invokeOutputPortIds, ['image'], 'Expected InvokeAI graph workflows to expose image output only.');
+  assert.strictEqual(getPortDefinition(invokeNode, 'output', 'video'), null, 'Expected InvokeAI graph workflows not to expose video output.');
+  assert.strictEqual(getPortDefinition(invokeNode, 'output', 'audio'), null, 'Expected InvokeAI graph workflows not to expose audio output.');
+
+  const validComfyGraph = buildPipelineGraph({
+    nodes: [
+      comfyNode,
+      { config: {}, id: 'video-out', label: 'Video Output', position: { x: 320, y: 0 }, type: 'videoOutput' },
+    ],
+    edges: [createEdge('graph-1', 'video', 'video-out', 'video')],
+  });
+  assert.deepStrictEqual(validComfyGraph.errors, [], 'Expected ComfyUI video graph workflow wiring to remain valid.');
+
+  const invalidInvokeAudioGraph = buildPipelineGraph({
+    nodes: [
+      invokeNode,
+      { config: {}, id: 'audio-out', label: 'Audio Output', position: { x: 320, y: 0 }, type: 'audioOutput' },
+    ],
+    edges: [createEdge('graph-1', 'audio', 'audio-out', 'audio')],
+  });
+  assert(invalidInvokeAudioGraph.errors.some((message) => message.includes('invalid connection')), 'Expected audio wiring from InvokeAI graph workflow to be rejected.');
+}
+
 async function main() {
+  verifyGraphWorkflowPortContracts();
   await verifyLateStartupWait();
   await verifySharedLaunchFailure();
   console.log('Graph workflow orchestration verification passed.');

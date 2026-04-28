@@ -45,6 +45,11 @@ const {
   resolveSelectedImageTool,
 } = require('./workflowToolService');
 const { executeGraphWorkflowNode } = require('./graphWorkflowService');
+const {
+  GRAPH_WORKFLOW_OPERATION_BACKEND_IDS,
+  buildGraphWorkflowOperationBackendNode,
+  getGraphWorkflowOperationBackendSupport,
+} = require('../shared/graphWorkflowContracts.cjs');
 const { generateAudioWithLocalAudioTool } = require('./localAudioService');
 const { generateImageWithLocalImageTool } = require('./localImageService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
@@ -72,6 +77,7 @@ const {
   getNodeTypeDefinition,
   getPortDefinition,
   trimPreviewText,
+  selectLocalImageBackend,
 } = require('../shared/pipelineSchema.cjs');
 
 class PipelineCancelledError extends Error {
@@ -157,21 +163,29 @@ function attachOllamaModelCapabilities(tools = [], modelCapabilitiesByName = {})
 
 function collectSelectedLocalImageToolIds(definition = {}) {
   const selectedToolIds = new Set();
-  let hasLocalImageModelStep = false;
+  let hasLocalImageGenerationStep = false;
 
   for (const node of Array.isArray(definition?.nodes) ? definition.nodes : []) {
-    if (node?.type !== 'llmPrompt' || node?.config?.executionMode !== 'localTool' || getModelStepOperationId(node) !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+    const isModelStepImageGeneration = node?.type === 'llmPrompt'
+      && node?.config?.executionMode === 'localTool'
+      && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+    const isDirectImageGeneration = node?.type === 'imageGenerate';
+    const isLocalCollectionImageMap = node?.type === 'collectionMap'
+      && node?.config?.executionMode === 'localTool'
+      && String(node?.config?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE).trim() === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+
+    if (!isModelStepImageGeneration && !isDirectImageGeneration && !isLocalCollectionImageMap) {
       continue;
     }
 
-    hasLocalImageModelStep = true;
+    hasLocalImageGenerationStep = true;
     const toolId = String(node?.config?.toolId || '').trim().toLowerCase();
     if (toolId) {
       selectedToolIds.add(toolId);
     }
   }
 
-  if (!hasLocalImageModelStep) {
+  if (!hasLocalImageGenerationStep) {
     return [];
   }
 
@@ -1744,6 +1758,196 @@ function buildImageGenerationPrompt(node, inputArtifact) {
 
 }
 
+async function generateMappedImageArtifact(node, textArtifact, options = {}) {
+  const contextMaps = options.contextMaps || {};
+  const run = options.run || null;
+  const reportProgress = options.reportProgress;
+  const itemIndex = Number(options.itemIndex || 0) || 0;
+  const itemCount = Number(options.itemCount || 0) || 0;
+  const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '');
+  const prompt = buildImageGenerationPrompt(node, textArtifact);
+  const executionMode = node.config?.executionMode === 'localTool'
+    ? 'localTool'
+    : node.config?.executionMode === 'graphWorkflow'
+      ? 'graphWorkflow'
+      : 'cloud';
+
+  if (executionMode === 'graphWorkflow') {
+    const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+    if (!support.usable) {
+      throw new Error(support.message || 'Configure a compatible text-to-image graph workflow before using it for collection mapping.');
+    }
+
+    const tool = options.graphWorkflowTool || await getGraphWorkflowBackendToolOrThrow(contextMaps, node, 'collection image mapping');
+    const graphNode = buildGraphWorkflowOperationBackendNode(node, {
+      label: node.label + ' ' + itemLabel,
+    });
+    reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' through the configured graph workflow.', 'Running ' + node.label + '...');
+    const result = await executeGraphWorkflowNode({
+      inputArtifacts: {
+        text: createTextArtifact(prompt, {
+          displayName: node.label + ' ' + itemLabel,
+          role: 'generated',
+        }),
+      },
+      node: graphNode,
+      reportProgress,
+      runDirectories: run.directories,
+      tool,
+    });
+    const imageArtifact = result?.outputs?.image || null;
+    if (!imageArtifact || imageArtifact.kind !== PORT_KIND_IMAGE) {
+      throw new Error((tool.name || 'The graph workflow tool') + ' finished the graph workflow, but it did not return an image artifact.');
+    }
+
+    return imageArtifact;
+  }
+
+  if (executionMode === 'localTool') {
+    const tool = options.localTool || await getSelectedImageToolOrThrow(contextMaps, node, 'collection image mapping');
+    reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for image generation.', 'Running ' + node.label + '...');
+    const generated = await generateImageWithWorkflowTool(tool, {
+      cfgScale: node.config?.cfgScale,
+      height: node.config?.height,
+      model: String(node.config?.model || '').trim(),
+      negativePrompt: node.config?.negativePrompt,
+      prompt,
+      seed: node.config?.seed,
+      steps: node.config?.steps,
+      width: node.config?.width,
+    });
+    return saveBase64Artifact(run.directories, generated.base64Image, {
+      baseName: node.label + '-item-' + String(itemIndex + 1).padStart(3, '0') + '-' + Date.now(),
+      displayName: node.label + ' item ' + String(itemIndex + 1),
+      extension: '.png',
+      kind: PORT_KIND_IMAGE,
+      role: 'generated',
+    });
+  }
+
+  const providerId = String(node.config?.providerId || '').trim();
+  if (!providerId) {
+    throw new Error('Choose a connected cloud provider before running this collection map.');
+  }
+  const model = String(node.config?.model || '').trim();
+  if (doesProviderOperationRequireExplicitModel(providerId, PIPELINE_OPERATION_IDS.IMAGE_GENERATE) && !model) {
+    throw new Error('Choose or enter an image model before running this collection map.');
+  }
+  const provider = contextMaps.providersById[providerId] || null;
+  if (!provider?.isConnected) {
+    throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
+  }
+
+  reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + ' for image generation.', 'Running ' + node.label + '...');
+  const result = await runProviderOperation(providerId, {
+    background: node.config?.imageBackground,
+    model,
+    operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+    prompt,
+    providerId,
+    quality: node.config?.imageQuality,
+    size: node.config?.imageSize,
+  });
+  const base64Image = String(result?.images?.[0]?.base64Data || '').trim();
+  if (!base64Image) {
+    throw new Error((provider.name || 'The selected provider') + ' finished the request, but it did not return an image.');
+  }
+
+  return saveBase64Artifact(run.directories, base64Image, {
+    baseName: node.label + '-item-' + String(itemIndex + 1).padStart(3, '0') + '-' + Date.now(),
+    displayName: node.label + ' item ' + String(itemIndex + 1),
+    extension: '.png',
+    kind: PORT_KIND_IMAGE,
+    role: 'generated',
+  });
+}
+
+async function executeCollectionMapNode(node, graph, run, contextMaps, reportProgress) {
+  const operationId = String(node.config?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE).trim() || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+    throw new Error('Map Collection currently supports text collection to image collection only. Choose Image generation or use another explicit pipeline step.');
+  }
+
+  const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
+  if (!isArtifactCollection(sourceCollection)) {
+    throw new Error('This Map Collection step needs an ordered text collection before it can run.');
+  }
+  if (String(sourceCollection.itemKind || '').trim() !== PORT_KIND_TEXT) {
+    throw new Error('This Map Collection step currently maps text collections to image collections. Connect an ordered text collection.');
+  }
+
+  const sourceItems = Array.isArray(sourceCollection.items) ? sourceCollection.items.filter((entry) => entry?.artifact) : [];
+  if (!sourceItems.length) {
+    throw new Error('This Map Collection step received an empty collection. Add at least one text item before mapping.');
+  }
+
+  const executionMode = node.config?.executionMode === 'localTool'
+    ? 'localTool'
+    : node.config?.executionMode === 'graphWorkflow'
+      ? 'graphWorkflow'
+      : 'cloud';
+  const localTool = executionMode === 'localTool'
+    ? await getSelectedImageToolOrThrow(contextMaps, node, 'collection image mapping')
+    : null;
+  const graphWorkflowTool = executionMode === 'graphWorkflow'
+    ? await getGraphWorkflowBackendToolOrThrow(contextMaps, node, 'collection image mapping')
+    : null;
+  const mappedItems = [];
+  for (let index = 0; index < sourceItems.length; index += 1) {
+    const entry = sourceItems[index];
+    const sourceArtifact = entry?.artifact || null;
+    try {
+      if (!sourceArtifact || sourceArtifact.kind !== PORT_KIND_TEXT) {
+        throw new Error('That collection item is not a text prompt.');
+      }
+      const imageArtifact = await generateMappedImageArtifact(node, sourceArtifact, {
+        contextMaps,
+        itemCount: sourceItems.length,
+        itemIndex: index,
+        graphWorkflowTool,
+        localTool,
+        reportProgress,
+        run,
+      });
+      mappedItems.push({
+        artifact: imageArtifact,
+        itemId: String(entry?.itemId || '').trim(),
+        lineage: {
+          sourceNodeId: node.id,
+          sourceNodeLabel: node.label,
+          sourcePortId: 'collection',
+          sourcePortLabel: 'Image Collection',
+          sourceItemId: String(entry?.itemId || '').trim(),
+          sourceItemIndex: index,
+          parentLineage: entry?.lineage || null,
+        },
+      });
+    } catch (error) {
+      const itemId = String(entry?.itemId || '').trim();
+      const itemLabel = 'item ' + String(index + 1) + ' of ' + sourceItems.length + (itemId ? ' (' + itemId + ')' : '');
+      throw new Error(node.label + ' failed on ' + itemLabel + ': ' + (error?.message || 'The mapped image generation step failed.'));
+    }
+  }
+
+  const collection = createArtifactCollection(mappedItems, {
+    displayName: node.label,
+    itemKind: PORT_KIND_IMAGE,
+    role: 'generated',
+  });
+  const persistedCollection = await persistArtifactCollection(run.directories, collection, {
+    baseName: node.label,
+    displayName: node.label,
+    role: 'generated',
+    target: 'artifacts',
+  });
+  return {
+    message: node.label + ' generated ' + persistedCollection.itemCount + ' image' + (persistedCollection.itemCount === 1 ? '' : 's') + ' from the ordered text collection.',
+    outputs: {
+      collection: persistedCollection,
+    },
+    preview: summarizeArtifact(persistedCollection),
+  };
+}
 async function buildVideoGenerationRequest(node, inputArtifact) {
   if (!inputArtifact) {
     throw new Error('This video generation step did not receive any input.');
@@ -2182,16 +2386,36 @@ async function getInstalledToolOrThrow(contextMaps, toolId, message) {
   return tool;
 }
 
+async function getGraphWorkflowBackendToolOrThrow(contextMaps, node, actionLabel) {
+  const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+  if (!support.usable) {
+    throw new Error(support.message || 'Configure a compatible text-to-image graph workflow before using it for ' + actionLabel + '.');
+  }
+
+  const label = support.contract?.toolId === 'comfyui'
+    ? 'ComfyUI'
+    : support.contract?.toolId === 'invokeai'
+      ? 'InvokeAI'
+      : 'the selected graph workflow tool';
+  return getInstalledToolOrThrow(
+    contextMaps,
+    support.toolId,
+    'Install ' + label + ' before using this graph workflow for ' + actionLabel + '.',
+  );
+}
+
 async function getSelectedImageToolOrThrow(contextMaps, node, actionLabel) {
-  const selectedTool = resolveSelectedImageTool(contextMaps, node);
-  if (!selectedTool?.id) {
-    throw new Error(`Install Automatic1111 or Forge before using the ${actionLabel} step.`);
+  const operationId = node?.type === 'imageAnalyze' ? PIPELINE_OPERATION_IDS.IMAGE_ANALYZE : PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  const selection = selectLocalImageBackend(contextMaps, node, { operationId });
+  const selectedTool = selection.tool || resolveSelectedImageTool(contextMaps, node);
+  if (!selectedTool?.id || !selection.usable) {
+    throw new Error(selection.message || 'No usable local image generation backend is ready. Install or repair Forge or Automatic1111, then refresh checkpoints.');
   }
 
   return getInstalledToolOrThrow(
     contextMaps,
     selectedTool.id,
-    `Install Automatic1111 or Forge before using the ${actionLabel} step.`,
+    selection.message || 'Install or repair Forge or Automatic1111 before using the ' + actionLabel + ' step.',
   );
 }
 
@@ -3258,16 +3482,20 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
       const prompt = buildImageGenerationPrompt(node, promptArtifact);
       const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'local image generation');
-      const selectedCheckpoint = getDownloadedToolModelEntry(tool, model);
-      if (!selectedCheckpoint) {
-        throw new Error(tool.name + ' does not have the selected checkpoint available locally. Refresh the local model list or download that checkpoint before running this step.');
+      let checkpointOverride = '';
+      if (model) {
+        const selectedCheckpoint = getDownloadedToolModelEntry(tool, model);
+        if (Array.isArray(tool.downloadedModels) && tool.downloadedModels.length && !selectedCheckpoint) {
+          throw new Error(tool.name + ' does not have the selected checkpoint available locally. Refresh the local model list or download that checkpoint before running this step.');
+        }
+        checkpointOverride = selectedCheckpoint?.fileName || selectedCheckpoint?.name || model;
       }
 
       reportProgress?.('Sending the prompt to ' + tool.name + ' for local image generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
       const generated = await generateImageWithWorkflowTool(tool, {
         cfgScale: node.config?.cfgScale,
         height: node.config?.height,
-        model: selectedCheckpoint.fileName || selectedCheckpoint.name || model,
+        model: checkpointOverride,
         negativePrompt: node.config?.negativePrompt,
         prompt,
         seed: node.config?.seed,
@@ -3517,6 +3745,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     const generated = await generateImageWithWorkflowTool(tool, {
       cfgScale: node.config?.cfgScale,
       height: node.config?.height,
+      model: String(node.config?.model || '').trim(),
       negativePrompt: node.config?.negativePrompt,
       prompt,
       seed: node.config?.seed,
@@ -3560,6 +3789,10 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
   if (node.type === 'validation') {
     return executeValidationNode(node, graph, run, contextMaps, reportProgress);
+  }
+
+  if (node.type === 'collectionMap') {
+    return executeCollectionMapNode(node, graph, run, contextMaps, reportProgress);
   }
 
   if (node.type === 'collectionBuilder') {

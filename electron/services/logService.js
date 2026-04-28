@@ -11,11 +11,11 @@ function currentDateStamp() {
 function normalizeContextValue(value) {
   if (value instanceof Error) {
     return {
-      message: value.message,
-      stack: value.stack,
+      message: redactSensitiveText(value.message || ''),
+      stack: redactSensitiveText(value.stack || ''),
       code: value.code,
-      stdout: value.stdout,
-      stderr: value.stderr,
+      stdout: redactSensitiveText(value.stdout || ''),
+      stderr: redactSensitiveText(value.stderr || ''),
     };
   }
 
