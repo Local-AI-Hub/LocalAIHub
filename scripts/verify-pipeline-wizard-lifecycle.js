@@ -104,7 +104,7 @@ async function testValidStructuredLongformIntentIrCompilesDirectly() {
   assert.strictEqual(result.ok, true, 'Valid structured longform IR should compile directly.');
   assert.strictEqual(result.diagnosticCategory, '', 'Valid structured IR should not be classified as malformed recovery.');
   const types = nodeTypes(result);
-  for (const expectedType of ['audioInput', 'whisperTranscribe', 'planner', 'planScenes', 'validation', 'retryLoop', 'collectionMap', 'mediaComposition', 'mediaExport', 'videoOutput']) {
+  for (const expectedType of ['audioInput', 'llmPrompt', 'planner', 'planScenes', 'validation', 'retryLoop', 'collectionMap', 'mediaComposition', 'mediaExport', 'videoOutput']) {
     assert(types.includes(expectedType), 'Expected structured longform draft to include ' + expectedType + '.');
   }
 }
@@ -191,7 +191,7 @@ async function testLongformMediaTimeoutRecoversToGroundedDraft() {
   });
   assert.strictEqual(result.ok, true, 'Longform timeout should recover to a bounded draft when deterministic repair can ground it.');
   const types = nodeTypes(result);
-  for (const expectedType of ['audioInput', 'whisperTranscribe', 'planningPacket', 'planner', 'planScenes', 'validation', 'retryLoop', 'collectionMap', 'mediaComposition', 'mediaExport', 'videoOutput']) {
+  for (const expectedType of ['audioInput', 'llmPrompt', 'planningPacket', 'planner', 'planScenes', 'validation', 'retryLoop', 'collectionMap', 'mediaComposition', 'mediaExport', 'videoOutput']) {
     assert(types.includes(expectedType), 'Expected recovered longform draft to include ' + expectedType + '.');
   }
   const audioToComposition = result.draftResult.pipeline.edges.some((edge) => edge.source.portId === 'audio' && edge.target.portId === 'audio');

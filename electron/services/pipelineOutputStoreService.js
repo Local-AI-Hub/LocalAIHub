@@ -15,7 +15,7 @@ const {
 } = require('./pipelineArtifactService');
 
 const TEXT_FILE_EXTENSIONS = new Set(['.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log', '.html', '.xml', '.ini', '.rtf']);
-const METADATA_SUFFIXES = ['.audio.json', '.image.json', '.transcription.json', '.composition-export.json'];
+const METADATA_SUFFIXES = ['.audio.json', '.image.json', '.transcription.json', '.composition-export.json', '.video.json'];
 const TEXT_MIME_TYPES = {
   '.csv': 'text/csv',
   '.html': 'text/html',
@@ -71,6 +71,28 @@ function toIsoString(value) {
   }
 }
 
+function isDiscoverableFinalOutputArtifact(artifact) {
+  if (!artifact || typeof artifact !== 'object') {
+    return false;
+  }
+
+  const artifactRole = String(artifact.artifactRole || '').trim().toLowerCase();
+  if (['debug', 'intermediate', 'internal'].includes(artifactRole)) {
+    return false;
+  }
+
+  if (artifact.isFinalOutput === false) {
+    return false;
+  }
+
+  const role = String(artifact.role || '').trim().toLowerCase();
+  if (role && role !== 'output' && artifactRole !== 'final' && artifact.isFinalOutput !== true) {
+    return false;
+  }
+
+  return true;
+}
+
 function buildOutputRecord(recordPath, artifact, stat, context = {}) {
   const outputPath = artifact?.destinationPath || artifact?.directoryPath || artifact?.filePath || recordPath;
   const savedAt = toIsoString(stat?.mtime || stat?.birthtime || Date.now());
@@ -81,8 +103,10 @@ function buildOutputRecord(recordPath, artifact, stat, context = {}) {
     id: `${context.runId || 'run'}:${relativePath || path.basename(outputPath)}`,
     isDirectory: Boolean(stat?.isDirectory?.()),
     kind: String(artifact?.kind || '').trim(),
+    isFinalOutput: artifact?.isFinalOutput !== false,
     itemKind: String(artifact?.itemKind || '').trim(),
-    outputLabel: String(artifact?.displayName || artifact?.fileName || path.basename(outputPath)).trim() || path.basename(outputPath),
+    outputKind: String(artifact?.outputKind || artifact?.kind || '').trim(),
+    outputLabel: String(artifact?.outputLabel || artifact?.displayName || artifact?.fileName || path.basename(outputPath)).trim() || path.basename(outputPath),
     outputPath,
     outputsDirectory: context.outputsDirectory || '',
     runDirectory: context.runDirectory || '',
@@ -196,10 +220,12 @@ async function buildDiscoveredFileArtifact(filePath) {
   const audioMetadataPath = `${basePath}.audio.json`;
   const imageMetadataPath = `${basePath}.image.json`;
   const compositionExportMetadataPath = `${basePath}.composition-export.json`;
+  const videoMetadataPath = `${basePath}.video.json`;
 
   const audioMetadata = await readJsonIfExists(audioMetadataPath);
   const imageMetadata = await readJsonIfExists(imageMetadataPath);
   const compositionExportMetadata = await readJsonIfExists(compositionExportMetadataPath);
+  const videoMetadata = await readJsonIfExists(videoMetadataPath);
 
   if (audioMetadata) {
     metadataPaths.push(audioMetadataPath);
@@ -210,6 +236,9 @@ async function buildDiscoveredFileArtifact(filePath) {
   if (compositionExportMetadata) {
     metadataPaths.push(compositionExportMetadataPath);
   }
+  if (videoMetadata) {
+    metadataPaths.push(videoMetadataPath);
+  }
 
   const artifact = await buildFileArtifact(normalizedFilePath, {
     audio: audioMetadata?.audio,
@@ -218,6 +247,7 @@ async function buildDiscoveredFileArtifact(filePath) {
     compositionExport: compositionExportMetadata?.compositionExport,
     displayName: path.basename(normalizedFilePath),
     imageTransformation: imageMetadata?.imageTransformation,
+    videoGeneration: videoMetadata?.videoGeneration,
     role: 'output',
   });
 
@@ -240,12 +270,14 @@ function buildCollectionArtifactFromManifest(directoryPath, manifestPath, manife
 
   const artifact = {
     accumulation: serializeArtifactForUi(manifest?.accumulation || null),
+    artifactRole: String(manifest?.artifactRole || '').trim(),
     destinationPath: directoryPath,
     directoryPath,
     displayName: String(manifest?.displayName || path.basename(directoryPath)).trim() || path.basename(directoryPath),
     fileName: path.basename(manifestPath),
     filePath: manifestPath,
     fileUrl: pathToFileURL(manifestPath).toString(),
+    isFinalOutput: manifest?.isFinalOutput === true || String(manifest?.artifactRole || '').trim() === 'final' || String(manifest?.role || 'output').trim() === 'output',
     itemCount: Number(manifest?.itemCount || items.length) || items.length,
     itemKind: String(manifest?.itemKind || '').trim(),
     items,
@@ -253,8 +285,13 @@ function buildCollectionArtifactFromManifest(directoryPath, manifestPath, manife
     manifestPath,
     metadataPaths: [manifestPath],
     order: String(manifest?.order || 'explicit').trim() || 'explicit',
+    outputKind: String(manifest?.outputKind || '').trim(),
+    outputLabel: String(manifest?.outputLabel || '').trim(),
+    outputNodeId: String(manifest?.outputNodeId || '').trim(),
+    outputPortId: String(manifest?.outputPortId || '').trim(),
     previewKind: 'collection',
     role: String(manifest?.role || 'output').trim() || 'output',
+    runId: String(manifest?.runId || '').trim(),
     summary: String(manifest?.summary || '').trim(),
   };
   artifact.summary = artifact.summary || summarizeArtifact(artifact);
@@ -270,6 +307,7 @@ function buildCompositionArtifactFromManifest(directoryPath, manifestPath, manif
   };
 
   const artifact = {
+    artifactRole: String(manifest?.artifactRole || '').trim(),
     composition,
     destinationPath: directoryPath,
     directoryPath,
@@ -277,11 +315,17 @@ function buildCompositionArtifactFromManifest(directoryPath, manifestPath, manif
     fileName: path.basename(manifestPath),
     filePath: manifestPath,
     fileUrl: pathToFileURL(manifestPath).toString(),
+    isFinalOutput: manifest?.isFinalOutput === true || String(manifest?.artifactRole || '').trim() === 'final' || String(manifest?.role || 'output').trim() === 'output',
     kind: 'composition',
     manifestPath,
     metadataPaths: [manifestPath],
+    outputKind: String(manifest?.outputKind || '').trim(),
+    outputLabel: String(manifest?.outputLabel || '').trim(),
+    outputNodeId: String(manifest?.outputNodeId || '').trim(),
+    outputPortId: String(manifest?.outputPortId || '').trim(),
     previewKind: 'composition',
     role: String(manifest?.role || 'output').trim() || 'output',
+    runId: String(manifest?.runId || '').trim(),
     summary: String(manifest?.summary || '').trim(),
     trackCount: Number(manifest?.trackCount || composition?.tracks?.length || 0) || 0,
   };
@@ -360,7 +404,7 @@ async function listPipelineOutputs() {
         artifact = await buildDiscoveredFileArtifact(recordPath);
       }
 
-      if (!artifact) {
+      if (!artifact || !isDiscoverableFinalOutputArtifact(artifact)) {
         continue;
       }
 

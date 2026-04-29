@@ -342,7 +342,8 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
     throw new Error('Local AI Hub could not prepare a pipeline run folder for the transformed image output.');
   }
 
-  const sourceImagePath = path.resolve(String(options.sourceImagePath || '').trim());
+  const rawSourceImagePath = String(options.sourceImagePath || '').trim();
+  const sourceImagePath = rawSourceImagePath ? path.resolve(rawSourceImagePath) : '';
   if (!sourceImagePath || !(await fs.pathExists(sourceImagePath))) {
     throw new Error('The source image for this Upscayl step could not be found anymore. Choose it again and rerun the pipeline.');
   }
@@ -355,6 +356,9 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
 
   const modelsDirectory = await resolveUpscaylModelDirectory(toolRoot);
   const modelName = await resolveUpscaylModelName(modelsDirectory);
+  const transformSubtype = ['upscale', 'enhance'].includes(String(options.transformSubtype || '').trim().toLowerCase())
+    ? String(options.transformSubtype || '').trim().toLowerCase()
+    : 'upscale';
   const scale = Math.max(2, Number(options.scale || 4) || 4);
   const nodeLabel = String(options.nodeLabel || options.displayName || 'Image transform').trim() || 'Image transform';
   const outputDirectory = path.join(runDirectories.artifactsDir, `${sanitizeLabelSegment(nodeLabel, 'image-transform')}-${Date.now()}-upscayl`);
@@ -400,11 +404,13 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
           backend: 'upscayl',
           backendLabel: 'Upscayl',
           model: modelName,
+          operationId: String(options.operationId || '').trim(),
           scale,
           sourceImage: buildImageSourceReference(options.sourceImageArtifact),
           toolId: String(tool?.id || '').trim() || 'upscayl',
           toolLabel,
-          transformationType: 'upscale',
+          transformationType: transformSubtype,
+          transformSubtype,
         },
         kind: PORT_KIND_IMAGE,
         role: 'generated',
@@ -416,6 +422,8 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
           model: modelName,
           outputPath: artifact.filePath,
           scale,
+          transformationType: transformSubtype,
+          transformSubtype,
         },
         outputs: {
           image: artifact,
@@ -438,12 +446,14 @@ async function generateImageWithFaceFusionTool(tool, options = {}) {
     throw new Error('Local AI Hub could not prepare a pipeline run folder for the transformed image output.');
   }
 
-  const targetImagePath = path.resolve(String(options.sourceImagePath || '').trim());
+  const rawTargetImagePath = String(options.sourceImagePath || '').trim();
+  const targetImagePath = rawTargetImagePath ? path.resolve(rawTargetImagePath) : '';
   if (!targetImagePath || !(await fs.pathExists(targetImagePath))) {
     throw new Error('The target image for this FaceFusion step could not be found anymore. Choose it again and rerun the pipeline.');
   }
 
-  const referenceImagePath = path.resolve(String(options.referenceImagePath || '').trim());
+  const rawReferenceImagePath = String(options.referenceImagePath || '').trim();
+  const referenceImagePath = rawReferenceImagePath ? path.resolve(rawReferenceImagePath) : '';
   if (!referenceImagePath || !(await fs.pathExists(referenceImagePath))) {
     throw new Error('FaceFusion needs a source face image on the Reference Image input. Choose it again and rerun the pipeline.');
   }
@@ -469,17 +479,20 @@ async function generateImageWithFaceFusionTool(tool, options = {}) {
     throw new Error(toolLabel + ' reported success, but the transformed image file could not be found.');
   }
 
+  const transformSubtype = 'face-swap';
   const artifact = await buildFileArtifact(finalOutputPath, {
     displayName: String(options.displayName || nodeLabel || 'Image').trim() || 'Image',
     imageTransformation: {
       backend: 'facefusion',
       backendLabel: 'FaceFusion',
+      operationId: String(options.operationId || '').trim(),
       instruction: String(options.instruction || '').trim(),
       referenceImage: buildImageSourceReference(options.referenceImageArtifact),
       sourceImage: buildImageSourceReference(options.sourceImageArtifact),
       toolId: String(tool?.id || '').trim() || 'facefusion',
       toolLabel,
-      transformationType: String(response?.transformationType || 'face-swap').trim() || 'face-swap',
+      transformationType: transformSubtype,
+      transformSubtype,
     },
     kind: PORT_KIND_IMAGE,
     role: 'generated',
@@ -488,7 +501,11 @@ async function generateImageWithFaceFusionTool(tool, options = {}) {
   return {
     destinationPath: artifact.filePath,
     message: String(response?.message || toolLabel + ' transformed the connected image locally and saved it to ' + artifact.filePath + '.').trim(),
-    metadata: response,
+    metadata: {
+      ...response,
+      transformSubtype,
+      transformationType: transformSubtype,
+    },
     outputs: {
       image: artifact,
     },

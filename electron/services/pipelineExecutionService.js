@@ -51,6 +51,12 @@ const {
   getGraphWorkflowOperationBackendSupport,
 } = require('../shared/graphWorkflowContracts.cjs');
 const { generateAudioWithLocalAudioTool } = require('./localAudioService');
+const {
+  findRvcVoiceModelMatch,
+  findStableDiffusionCheckpointMatch,
+  getRvcVoiceModels,
+  getStableDiffusionCheckpointModels,
+} = require('../shared/toolAssetSelection.cjs');
 const { generateImageWithLocalImageTool } = require('./localImageService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
 const { exportCompositionArtifactToVideo } = require('./mediaCompositionService');
@@ -72,8 +78,10 @@ const {
   buildContextMaps,
   createUniqueId,
   getGraphWorkflowToolId,
+  getLocalImageBackendOperationId,
   getModelStepLocalToolId,
   getModelStepOperationId,
+  normalizeImageTransformSubtype,
   getNodeTypeDefinition,
   getPortDefinition,
   trimPreviewText,
@@ -169,7 +177,7 @@ function collectSelectedLocalImageToolIds(definition = {}) {
     const isModelStepImageGeneration = node?.type === 'llmPrompt'
       && node?.config?.executionMode === 'localTool'
       && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
-    const isDirectImageGeneration = node?.type === 'imageGenerate';
+    const isDirectImageGeneration = false;
     const isLocalCollectionImageMap = node?.type === 'collectionMap'
       && node?.config?.executionMode === 'localTool'
       && String(node?.config?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE).trim() === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
@@ -245,7 +253,16 @@ function getDownloadedToolModelEntry(tool, model) {
     return null;
   }
 
-  return (Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : []).find((entry) => {
+  const downloadedModels = Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : [];
+  if (tool?.id === 'automatic1111' || tool?.id === 'forge') {
+    return findStableDiffusionCheckpointMatch(getStableDiffusionCheckpointModels(downloadedModels), model);
+  }
+
+  if (tool?.id === 'rvc') {
+    return findRvcVoiceModelMatch(getRvcVoiceModels(downloadedModels), model);
+  }
+
+  return downloadedModels.find((entry) => {
     const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.relativePath, entry?.path]
       .map((value) => String(value || '').trim().toLowerCase())
       .filter(Boolean);
@@ -1967,6 +1984,7 @@ async function buildVideoGenerationRequest(node, inputArtifact) {
       prompt: motionPrompt ? motionPrompt + '\n\nPrompt:\n' + promptText : promptText,
       referenceImage: null,
       referenceImagePath: '',
+      sourceImageArtifact: null,
       size,
     };
   }
@@ -1997,6 +2015,7 @@ async function buildVideoGenerationRequest(node, inputArtifact) {
         mimeType: String(inputArtifact.mimeType || 'image/png').trim() || 'image/png',
       },
       referenceImagePath: filePath,
+      sourceImageArtifact: inputArtifact,
       size,
     };
   }
@@ -2071,7 +2090,13 @@ async function buildAudioTransformRequest(node, inputArtifact) {
   };
 }
 
-async function buildImageTransformRequest(node, inputArtifact, referenceArtifact) {
+async function buildImageTransformRequest(node, inputArtifact, referenceArtifact, tool) {
+  const toolId = String(tool?.id || node?.config?.toolId || '').trim().toLowerCase();
+  const transformSubtype = normalizeImageTransformSubtype(toolId, node.config?.transformSubtype);
+  if (!transformSubtype) {
+    throw new Error((tool?.name || 'This local image tool') + ' does not support the selected image transform subtype. Choose a supported transform subtype before running this step.');
+  }
+
   if (!inputArtifact) {
     throw new Error('This image transformation step did not receive any source image.');
   }
@@ -2097,12 +2122,17 @@ async function buildImageTransformRequest(node, inputArtifact, referenceArtifact
     }
   }
 
+  if (toolId === 'facefusion' && !referenceImagePath) {
+    throw new Error('FaceFusion needs a source face image on the Reference Image input before it can transform the target image.');
+  }
+
   return {
     instruction: String(node.config?.instruction || '').trim(),
     referenceImageArtifact: referenceArtifact || null,
     referenceImagePath,
     sourceImageArtifact: inputArtifact,
     sourceImagePath,
+    transformSubtype,
   };
 }
 
@@ -2405,7 +2435,7 @@ async function getGraphWorkflowBackendToolOrThrow(contextMaps, node, actionLabel
 }
 
 async function getSelectedImageToolOrThrow(contextMaps, node, actionLabel) {
-  const operationId = node?.type === 'imageAnalyze' ? PIPELINE_OPERATION_IDS.IMAGE_ANALYZE : PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  const operationId = getLocalImageBackendOperationId(node, PIPELINE_OPERATION_IDS.IMAGE_GENERATE);
   const selection = selectLocalImageBackend(contextMaps, node, { operationId });
   const selectedTool = selection.tool || resolveSelectedImageTool(contextMaps, node);
   if (!selectedTool?.id || !selection.usable) {
@@ -2430,7 +2460,11 @@ async function getSelectedLocalVideoToolOrThrow(contextMaps, node, actionLabel) 
 
 async function getSelectedLocalAudioToolOrThrow(contextMaps, node, actionLabel) {
   const operationId = getModelStepOperationId(node);
-  const fallbackToolId = operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM ? 'rvc' : 'audiocraft-webui';
+  const fallbackToolId = operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
+    ? 'whisper'
+    : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+      ? 'rvc'
+      : 'audiocraft-webui';
   const selectedToolId = String(getModelStepLocalToolId(node, contextMaps) || fallbackToolId).trim().toLowerCase() || fallbackToolId;
   const installMessage = operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
     ? 'Install RVC before using the ' + actionLabel + ' step.'
@@ -3264,6 +3298,10 @@ async function executeOutputNode(node, inputPortId, graph, run) {
   }
 
   const savedArtifact = await copyArtifactToOutput(artifact, run.directories, {
+    outputKind: artifact.kind,
+    outputNodeId: node.id,
+    outputPortId: inputPortId,
+    runId: run.runId,
     title: String(node.config?.title || node.label || 'output').trim() || 'output',
   });
   const destinationPath = savedArtifact.destinationPath || savedArtifact.directoryPath || savedArtifact.filePath || '';
@@ -3412,6 +3450,31 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         });
       }
 
+      if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
+        const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'local audio transcription');
+        if (!promptArtifact?.filePath || promptArtifact.kind !== PORT_KIND_AUDIO) {
+          throw new Error('This model-step transcription did not receive an audio file.');
+        }
+        reportProgress?.('Sending the audio to ' + tool.name + ' for transcription.', 'Running ' + node.label + ' with ' + tool.name + '...');
+        const result = await transcribeWithWhisper(tool, {
+          audioPath: promptArtifact.filePath,
+          model: model || DEFAULT_WHISPER_MODEL,
+        });
+        const transcript = String(result?.text || '').trim();
+        if (!transcript) {
+          throw new Error(tool.name + ' finished, but it did not return any transcript text for this pipeline step.');
+        }
+
+        const artifact = buildWhisperTranscriptArtifact(node, promptArtifact, result);
+        return {
+          message: buildWhisperCompletionMessage(result),
+          outputs: {
+            text: artifact,
+          },
+          preview: summarizeArtifact(artifact),
+        };
+      }
+
       if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
         const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'local audio transformation');
         const audioRequest = await buildAudioTransformRequest(node, promptArtifact);
@@ -3450,6 +3513,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           prompt: videoRequest.prompt,
           referenceImagePath: videoRequest.referenceImagePath,
           reportProgress,
+          sourceImageArtifact: videoRequest.sourceImageArtifact,
           runDirectories: run.directories,
           seed: node.config?.seed,
           size: videoRequest.size,
@@ -3457,10 +3521,38 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         });
       }
 
+      if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
+        if (!promptArtifact?.filePath || promptArtifact.kind !== PORT_KIND_IMAGE) {
+          throw new Error('This model-step image analysis did not receive an image file.');
+        }
+        const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'local image analysis');
+        reportProgress?.('Sending the image to ' + tool.name + ' for analysis.', 'Running ' + node.label + ' with ' + tool.name + '...');
+        const result = await interrogateImageWithWorkflowTool(tool, {
+          analysisMode: node.config?.analysisMode || model || 'clip',
+          imagePath: promptArtifact.filePath,
+        });
+        const description = String(result?.text || '').trim();
+        if (!description) {
+          throw new Error((tool?.name || 'The selected image tool') + ' did not return an image description.');
+        }
+
+        const artifact = createTextArtifact(description, {
+          displayName: node.label,
+          role: 'generated',
+        });
+        return {
+          message: tool.name + ' described the image.',
+          outputs: {
+            text: artifact,
+          },
+          preview: summarizeArtifact(artifact),
+        };
+      }
+
       if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
         const tool = await getSelectedLocalImageToolOrThrow(contextMaps, node, 'local image transformation');
         const referenceArtifact = getNodeInputArtifact(node.id, 'referenceImage', graph, run.resultsByNodeId, run);
-        const imageRequest = await buildImageTransformRequest(node, promptArtifact, referenceArtifact);
+        const imageRequest = await buildImageTransformRequest(node, promptArtifact, referenceArtifact, tool);
         reportProgress?.('Sending the source image to ' + tool.name + ' for local image transformation.', 'Running ' + node.label + ' with ' + tool.name + '...');
         return generateImageWithLocalImageTool(tool, {
           displayName: node.label,
@@ -3473,23 +3565,17 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           runDirectories: run.directories,
           sourceImageArtifact: imageRequest.sourceImageArtifact,
           sourceImagePath: imageRequest.sourceImagePath,
+          transformSubtype: imageRequest.transformSubtype,
         });
       }
 
       if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-        throw new Error('Local AI Hub currently supports audio generation, audio transformation, image generation, image transformation, and video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
+        throw new Error('Local AI Hub currently supports audio transcription, audio generation, audio transformation, image analysis, image generation, image transformation, and video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
       }
 
       const prompt = buildImageGenerationPrompt(node, promptArtifact);
       const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'local image generation');
-      let checkpointOverride = '';
-      if (model) {
-        const selectedCheckpoint = getDownloadedToolModelEntry(tool, model);
-        if (Array.isArray(tool.downloadedModels) && tool.downloadedModels.length && !selectedCheckpoint) {
-          throw new Error(tool.name + ' does not have the selected checkpoint available locally. Refresh the local model list or download that checkpoint before running this step.');
-        }
-        checkpointOverride = selectedCheckpoint?.fileName || selectedCheckpoint?.name || model;
-      }
+      const checkpointOverride = String(model || '').trim();
 
       reportProgress?.('Sending the prompt to ' + tool.name + ' for local image generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
       const generated = await generateImageWithWorkflowTool(tool, {
@@ -3557,6 +3643,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           backendLabel: provider.name,
           mode: 'speech',
           model,
+          operationId,
+          operationSubtype: 'speech',
           prompt: audioRequest.spokenText,
           voice: generatedAudio.voice || audioRequest.voice,
         },
@@ -3671,104 +3759,6 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       preview: summarizeArtifact(artifact),
     };
   }
-  if (node.type === 'whisperTranscribe') {
-
-    const audioArtifact = getNodeInputArtifact(node.id, 'audio', graph, run.resultsByNodeId, run);
-    if (!audioArtifact?.filePath) {
-      throw new Error('This Whisper step did not receive an audio file.');
-    }
-
-    reportProgress?.('Sending the audio to Whisper for transcription.', `Running ${node.label} with Whisper...`);
-    const whisperTool = await getInstalledToolOrThrow(
-      contextMaps,
-      'whisper',
-      'Install Whisper before using a transcription step in a pipeline.',
-    );
-    const result = await transcribeWithWhisper(whisperTool, {
-      audioPath: audioArtifact.filePath,
-      model: node.config?.model || DEFAULT_WHISPER_MODEL,
-    });
-    const transcript = String(result?.text || '').trim();
-    if (!transcript) {
-      throw new Error('Whisper finished, but it did not return any transcript text for this pipeline step.');
-    }
-
-    const artifact = buildWhisperTranscriptArtifact(node, audioArtifact, result);
-    return {
-      message: buildWhisperCompletionMessage(result),
-      outputs: {
-        text: artifact,
-      },
-      preview: summarizeArtifact(artifact),
-    };
-  }
-
-  if (node.type === 'imageAnalyze') {
-    const imageArtifact = getNodeInputArtifact(node.id, 'image', graph, run.resultsByNodeId, run);
-    if (!imageArtifact?.filePath) {
-      throw new Error('This image analysis step did not receive an image file.');
-    }
-
-    const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'image analysis');
-    reportProgress?.(`Sending the image to ${tool.name} for analysis.`, `Running ${node.label} with ${tool.name}...`);
-    const result = await interrogateImageWithWorkflowTool(tool, {
-      analysisMode: node.config?.analysisMode || 'clip',
-      imagePath: imageArtifact.filePath,
-    });
-    const description = String(result?.text || '').trim();
-    if (!description) {
-      throw new Error(`${tool?.name || 'The selected image tool'} did not return an image description.`);
-    }
-
-    const artifact = createTextArtifact(description, {
-      displayName: node.label,
-      role: 'generated',
-    });
-    return {
-      message: `${tool.name} described the image.`,
-      outputs: {
-        text: artifact,
-      },
-      preview: summarizeArtifact(artifact),
-    };
-  }
-
-  if (node.type === 'imageGenerate') {
-    const promptArtifact = getNodeInputArtifact(node.id, 'prompt', graph, run.resultsByNodeId, run);
-    const prompt = String(promptArtifact?.text || '').trim();
-    if (!prompt) {
-      throw new Error('This image generation step did not receive any text prompt.');
-    }
-
-    const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'image generation');
-    reportProgress?.(`Sending the prompt to ${tool.name} for image generation.`, `Running ${node.label} with ${tool.name}...`);
-    const generated = await generateImageWithWorkflowTool(tool, {
-      cfgScale: node.config?.cfgScale,
-      height: node.config?.height,
-      model: String(node.config?.model || '').trim(),
-      negativePrompt: node.config?.negativePrompt,
-      prompt,
-      seed: node.config?.seed,
-      steps: node.config?.steps,
-      width: node.config?.width,
-    });
-    const artifact = await saveBase64Artifact(run.directories, generated.base64Image, {
-      baseName: `${node.label}-${Date.now()}`,
-      displayName: node.label,
-      extension: '.png',
-      kind: 'image',
-      role: 'generated',
-    });
-    return {
-      destinationPath: artifact.filePath,
-      message: `${tool.name} generated an image and saved the intermediate file to ${artifact.filePath}.`,
-      outputs: {
-        image: artifact,
-      },
-      preview: summarizeArtifact(artifact),
-    };
-  }
-
   if (node.type === 'graphWorkflow') {
     const toolId = getGraphWorkflowToolId(node);
     const installMessage = toolId === 'comfyui'

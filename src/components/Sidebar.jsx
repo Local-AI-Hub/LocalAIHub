@@ -1,11 +1,11 @@
 import { memo } from 'react';
 import { formatMemory } from '../lib/formatters';
 
-function NavButton({ active, label, count, onClick }) {
+function NavButton({ active, label, count, detail, onClick }) {
   return (
     <button className={`sidebar-tab ${active ? 'sidebar-tab-active' : ''}`} onClick={onClick} type="button">
       <span>{label}</span>
-      {count === null || count === undefined ? null : <span className="sidebar-count">{count}</span>}
+      {detail ? <span className="sidebar-count">{detail}</span> : count === null || count === undefined ? null : <span className="sidebar-count">{count}</span>}
     </button>
   );
 }
@@ -18,6 +18,7 @@ function Sidebar({
   onChangeTab,
   onOpenLogs,
   logsBusy,
+  pipelineRunStatus,
   storeCount,
 }) {
   return (
@@ -36,7 +37,7 @@ function Sidebar({
           <NavButton active={activeTab === 'library'} count={installedCount} label="Library" onClick={() => onChangeTab('library')} />
           <NavButton active={activeTab === 'store'} count={storeCount} label="Store" onClick={() => onChangeTab('store')} />
           <NavButton active={activeTab === 'models'} count={modelManagerCount} label="Model Manager" onClick={() => onChangeTab('models')} />
-          <NavButton active={activeTab === 'pipelines'} count={null} label="Pipelines" onClick={() => onChangeTab('pipelines')} />
+          <NavButton active={activeTab === 'pipelines'} count={null} detail={pipelineRunStatus} label="Pipelines" onClick={() => onChangeTab('pipelines')} />
           <NavButton active={activeTab === 'statistics'} count={null} label="Statistics" onClick={() => onChangeTab('statistics')} />
           <NavButton active={activeTab === 'settings'} count={null} label="Settings" onClick={() => onChangeTab('settings')} />
         </div>
@@ -71,11 +72,10 @@ function areSidebarPropsEqual(prevProps, nextProps) {
     prevProps.hardware === nextProps.hardware &&
     prevProps.installedCount === nextProps.installedCount &&
     prevProps.modelManagerCount === nextProps.modelManagerCount &&
+    prevProps.pipelineRunStatus === nextProps.pipelineRunStatus &&
     prevProps.storeCount === nextProps.storeCount &&
     prevProps.logsBusy === nextProps.logsBusy
   );
 }
 
 export default memo(Sidebar, areSidebarPropsEqual);
-
-

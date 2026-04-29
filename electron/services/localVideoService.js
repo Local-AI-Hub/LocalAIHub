@@ -10,7 +10,7 @@ try {
 const { runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
-const { PORT_KIND_VIDEO } = require('../shared/pipelineSchema.cjs');
+const { PIPELINE_OPERATION_IDS, PORT_KIND_VIDEO } = require('../shared/pipelineSchema.cjs');
 
 const LOCAL_VIDEO_RUNTIME_MODE_IDS = Object.freeze({
   DIRECT_COMMAND: 'direct-command',
@@ -87,6 +87,24 @@ function buildVideoOutputPath(runDirectories, nodeLabel) {
   return path.join(runDirectories.artifactsDir, `${safeLabel}-${Date.now()}.mp4`);
 }
 
+function buildSourceImageReference(artifact) {
+  if (!artifact || typeof artifact !== 'object') {
+    return null;
+  }
+
+  return {
+    displayName: String(artifact.displayName || '').trim(),
+    fileName: String(artifact.fileName || '').trim(),
+    filePath: String(artifact.filePath || '').trim(),
+    fileUrl: String(artifact.fileUrl || '').trim(),
+    formatLabel: String(artifact.formatLabel || '').trim(),
+    kind: String(artifact.kind || '').trim(),
+    mimeType: String(artifact.mimeType || '').trim(),
+    sizeBytes: Number(artifact.sizeBytes || 0) || 0,
+    summary: String(artifact.summary || '').trim(),
+  };
+}
+
 function parseCommandJson(stdout, toolLabel) {
   const lastLine = String(stdout || '')
     .trim()
@@ -160,19 +178,28 @@ async function generateVideoWithWanTool(tool, options = {}) {
 
   const outputPath = buildVideoOutputPath(runDirectories, options.nodeLabel || options.displayName || 'video-step');
   const requestPath = buildJsonRequestPath(runDirectories, options.nodeLabel || options.displayName || 'video-step');
+  const referenceImagePath = String(options.referenceImagePath || '').trim();
+  const operationSubtype = referenceImagePath ? 'image-to-video' : 'text-to-video';
+  const prompt = String(options.prompt || '').trim();
+  const requestedModel = String(options.model || '').trim();
+  const requestedSize = String(options.size || '1280x720').trim() || '1280x720';
+  const requestedFps = Number(options.fps || 15);
+  const requestedSeed = Number.isFinite(Number(options.seed)) ? Number(options.seed) : 0;
+  const requestedSteps = Math.max(1, Number(options.steps || 24) || 24);
   const response = await runWanLocalVideoTask(tool, {
-    fps: Number(options.fps || 15),
-    model: String(options.model || '').trim(),
+    fps: requestedFps,
+    generationMode: operationSubtype,
+    model: requestedModel,
     negativePrompt: String(options.negativePrompt || '').trim(),
     nodeLabel: String(options.nodeLabel || options.displayName || 'Video step').trim() || 'Video step',
     outputPath,
-    prompt: String(options.prompt || '').trim(),
+    prompt,
     quality: Number(options.quality || 5),
-    referenceImagePath: String(options.referenceImagePath || '').trim(),
+    referenceImagePath,
     requestPath,
-    seed: Number.isFinite(Number(options.seed)) ? Number(options.seed) : 0,
-    size: String(options.size || '1280x720').trim() || '1280x720',
-    steps: Math.max(1, Number(options.steps || 24) || 24),
+    seed: requestedSeed,
+    size: requestedSize,
+    steps: requestedSteps,
     toolRoot: resolveLocalVideoToolRoot(tool),
   }, options.reportProgress);
 
@@ -181,10 +208,29 @@ async function generateVideoWithWanTool(tool, options = {}) {
     throw new Error(toolLabel + ' reported success, but the rendered video file could not be found.');
   }
 
+  const resolvedModel = String(response?.modelDir || requestedModel || '').trim();
   const artifact = await buildFileArtifact(finalOutputPath, {
     displayName: String(options.displayName || options.nodeLabel || 'Video').trim() || 'Video',
     kind: PORT_KIND_VIDEO,
     role: 'generated',
+    videoGeneration: {
+      backend: 'local-video',
+      backendLabel: toolLabel,
+      fps: requestedFps,
+      mode: operationSubtype,
+      model: resolvedModel ? path.basename(resolvedModel) : '',
+      negativePrompt: String(options.negativePrompt || '').trim(),
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      operationSubtype,
+      prompt,
+      seed: requestedSeed,
+      size: String(response?.size || requestedSize).trim() || requestedSize,
+      sourceImage: buildSourceImageReference(options.sourceImageArtifact),
+      steps: requestedSteps,
+      toolId: String(tool?.id || '').trim().toLowerCase(),
+      toolLabel,
+      usedReferenceImage: Boolean(referenceImagePath),
+    },
   });
 
   return {

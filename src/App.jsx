@@ -128,6 +128,7 @@ export default function App() {
   const [updateProgressMap, setUpdateProgressMap] = useState({});
   const [toasts, setToasts] = useState([]);
   const [activeTab, setActiveTab] = useState('library');
+  const [activePipelineRun, setActivePipelineRun] = useState(null);
   const [storeSearch, setStoreSearch] = useState('');
   const [storeCategory, setStoreCategory] = useState('All categories');
   const [settingsToolId, setSettingsToolId] = useState(null);
@@ -292,6 +293,7 @@ export default function App() {
   );
   const activeCloudProvider = cloudChatProviderId ? providerMap[cloudChatProviderId] || null : null;
   const currentResources = liveResources || appState.resources;
+  const pipelineRunStatus = ['running', 'paused'].includes(activePipelineRun?.status) ? (activePipelineRun.status === 'paused' ? 'Paused' : 'Running') : '';
   const modelManagerCount = Number(appState.downloadedModelCount || 0);
   const libraryCount = tools.length + connectedProviders.length;
 
@@ -1394,6 +1396,11 @@ export default function App() {
         setWindowActivity(result.data);
       }
     });
+    window.localAIHub.getActivePipelineRun().then((result) => {
+      if (result?.ok) {
+        setActivePipelineRun(result.data?.run || null);
+      }
+    });
 
     const unsubscribeInstallProgress = window.localAIHub.onInstallProgress((progress) => {
       if (!progress?.toolId) {
@@ -1452,6 +1459,12 @@ export default function App() {
         ...current,
         [progress.toolId]: progress,
       }));
+    });
+
+    const unsubscribePipelineRunUpdate = window.localAIHub.onPipelineRunUpdate((payload) => {
+      if (payload?.run) {
+        setActivePipelineRun(payload.run);
+      }
     });
 
     const unsubscribeRuntimeOutput = window.localAIHub.onRuntimeOutput((payload) => {
@@ -1532,6 +1545,7 @@ export default function App() {
       unsubscribeWindowActivity();
       unsubscribeAppStateUpdated();
       unsubscribeLaunchProgress();
+      unsubscribePipelineRunUpdate();
       unsubscribeRuntimeOutput();
       unsubscribeToolState();
       unsubscribeUnexpectedStop();
@@ -1797,6 +1811,7 @@ export default function App() {
           modelManagerCount={modelManagerCount}
           onChangeTab={setActiveTab}
           onOpenLogs={() => runAction('open-logs', () => window.localAIHub.openLogsFolder())}
+          pipelineRunStatus={pipelineRunStatus}
           storeCount={availableStoreTools.length}
         />
 

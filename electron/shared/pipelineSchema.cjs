@@ -29,6 +29,13 @@ const {
   getPlanningSchemaDefinition,
   getPlanningSchemaOptions,
 } = require('./planningSchema.cjs');
+const {
+  findRvcVoiceModelMatch,
+  findStableDiffusionCheckpointMatch,
+  getRvcVoiceModels,
+  getStableDiffusionCheckpointModels,
+  isLikelySupportOnlyStableDiffusionModel,
+} = require('./toolAssetSelection.cjs');
 
 const PIPELINE_SCHEMA_VERSION = 8;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
@@ -111,6 +118,15 @@ const MODEL_STEP_CLOUD_OPERATION_OPTIONS = Object.freeze([
 ]);
 const IMAGE_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
 const IMAGE_TRANSFORM_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM));
+const IMAGE_TRANSFORM_SUBTYPE_OPTIONS = Object.freeze({
+  upscayl: Object.freeze([
+    Object.freeze({ id: 'upscale', label: 'Upscale' }),
+    Object.freeze({ id: 'enhance', label: 'Enhance' }),
+  ]),
+  facefusion: Object.freeze([
+    Object.freeze({ id: 'face-swap', label: 'Face swap' }),
+  ]),
+});
 const VIDEO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.VIDEO_GENERATE));
 const AUDIO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.AUDIO_GENERATE));
 const AUDIO_TRANSFORM_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM));
@@ -318,6 +334,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       steps: 24,
       cfgScale: 7,
       seed: -1,
+      transformSubtype: '',
+      analysisMode: 'clip',
     },
     cloudOperationOptions: MODEL_STEP_CLOUD_OPERATION_OPTIONS,
     supportedExecutionModes: [
@@ -400,94 +418,10 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {},
   }),
-  whisperTranscribe: Object.freeze({
-    type: 'whisperTranscribe',
-    label: 'Audio Transcription',
-    category: 'AI Steps',
-    description: 'Turns incoming audio into text. Choose the transcription model in the inspector.',
-    inputPorts: [
-      {
-        id: 'audio',
-        kind: PORT_KIND_AUDIO,
-        label: 'Audio',
-        required: true,
-      },
-    ],
-    outputPorts: [
-      {
-        id: 'text',
-        kind: PORT_KIND_TEXT,
-        label: 'Transcript',
-      },
-    ],
-    configDefaults: {
-      model: 'base',
-    },
-    requiredToolId: 'whisper',
-  }),
-  imageAnalyze: Object.freeze({
-    type: 'imageAnalyze',
-    label: 'Image Analysis',
-    category: 'AI Steps',
-    description: 'Describes an incoming image. Choose the execution tool in the inspector.',
-    inputPorts: [
-      {
-        id: 'image',
-        kind: PORT_KIND_IMAGE,
-        label: 'Image',
-        required: true,
-      },
-    ],
-    outputPorts: [
-      {
-        id: 'text',
-        kind: PORT_KIND_TEXT,
-        label: 'Description',
-      },
-    ],
-    configDefaults: {
-      toolId: '',
-      analysisMode: 'clip',
-      instruction: '',
-    },
-    supportedToolIds: IMAGE_WORKFLOW_TOOL_IDS,
-  }),
-  imageGenerate: Object.freeze({
-    type: 'imageGenerate',
-    label: 'Image Generation',
-    category: 'AI Steps',
-    description: 'Turns text into an image. Choose the execution tool in the inspector.',
-    inputPorts: [
-      {
-        id: 'prompt',
-        kind: PORT_KIND_TEXT,
-        label: 'Prompt',
-        required: true,
-      },
-    ],
-    outputPorts: [
-      {
-        id: 'image',
-        kind: PORT_KIND_IMAGE,
-        label: 'Image',
-      },
-    ],
-    configDefaults: {
-      toolId: '',
-      model: '',
-      negativePrompt: '',
-      width: 832,
-      height: 832,
-      steps: 24,
-      cfgScale: 7,
-      seed: -1,
-    },
-    supportedToolIds: IMAGE_WORKFLOW_TOOL_IDS,
-  }),
   graphWorkflow: Object.freeze({
     type: 'graphWorkflow',
     label: 'Graph Workflow',
-    category: 'Graph Workflows',
+    category: 'AI Steps',
     description: 'Runs a graph-native local workflow with explicit typed boundaries. Use this for ComfyUI, InvokeAI, and other graph-style tools instead of the model-step abstraction.',
     inputPorts: [
       {
@@ -1255,6 +1189,14 @@ function getModelStepOperationId(node) {
 
   if (executionMode === 'localTool') {
     const requestedOperationId = String(node?.config?.operationId || '').trim();
+    if (requestedOperationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
+      return PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE;
+    }
+
+    if (requestedOperationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
+      return PIPELINE_OPERATION_IDS.IMAGE_ANALYZE;
+    }
+
     if (requestedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
       return PIPELINE_OPERATION_IDS.VIDEO_GENERATE;
     }
@@ -1300,6 +1242,44 @@ function getCollectionMapOperationId(node) {
 function isSupportedCollectionMapOperation(node) {
   return getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
 }
+function getImageTransformSubtypeOptions(toolId = '') {
+  const normalizedToolId = String(toolId || '').trim().toLowerCase();
+  const options = IMAGE_TRANSFORM_SUBTYPE_OPTIONS[normalizedToolId] || Object.values(IMAGE_TRANSFORM_SUBTYPE_OPTIONS).flat();
+  const seen = new Set();
+  return options
+    .map((entry) => ({
+      id: String(entry?.id || '').trim(),
+      label: String(entry?.label || entry?.id || '').trim(),
+    }))
+    .filter((entry) => {
+      if (!entry.id || seen.has(entry.id)) {
+        return false;
+      }
+
+      seen.add(entry.id);
+      return true;
+    });
+}
+
+function getDefaultImageTransformSubtype(toolId = '') {
+  return getImageTransformSubtypeOptions(toolId)[0]?.id || '';
+}
+
+function getImageTransformSubtypeLabel(subtype = '') {
+  const normalizedSubtype = String(subtype || '').trim().toLowerCase();
+  return getImageTransformSubtypeOptions()
+    .find((entry) => entry.id === normalizedSubtype)?.label || normalizedSubtype.replace(/-/g, ' ');
+}
+
+function normalizeImageTransformSubtype(toolId = '', subtype = '') {
+  const normalizedSubtype = String(subtype || '').trim().toLowerCase();
+  const options = getImageTransformSubtypeOptions(toolId);
+  if (normalizedSubtype && options.some((entry) => entry.id === normalizedSubtype)) {
+    return normalizedSubtype;
+  }
+
+  return normalizedSubtype ? '' : getDefaultImageTransformSubtype(toolId);
+}
 function getOperationDrivenToolIdsForModelStepOperation(operationId) {
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
     return VIDEO_WORKFLOW_TOOL_IDS;
@@ -1311,6 +1291,10 @@ function getOperationDrivenToolIdsForModelStepOperation(operationId) {
 
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
     return AUDIO_TRANSFORM_TOOL_IDS;
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
+    return ['whisper'];
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
@@ -1327,7 +1311,7 @@ function getModelStepLocalToolId(node, contextMaps = {}) {
   }
 
   const operationId = getModelStepOperationId(node);
-  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE || operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
     return selectLocalImageBackend(contextMaps, node, { operationId }).toolId || '';
   }
 
@@ -1346,8 +1330,16 @@ function doesToolExposeDownloadedModel(tool, model) {
     return false;
   }
 
+  if (tool?.id === 'automatic1111' || tool?.id === 'forge') {
+    return Boolean(findStableDiffusionCheckpointMatch(getStableDiffusionCheckpointModels(tool?.downloadedModels || []), model));
+  }
+
+  if (tool?.id === 'rvc') {
+    return Boolean(findRvcVoiceModelMatch(getRvcVoiceModels(tool?.downloadedModels || []), model));
+  }
+
   return (Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : []).some((entry) => {
-    const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.path]
+    const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.relativePath, entry?.path]
       .map((value) => String(value || '').trim().toLowerCase())
       .filter(Boolean);
     return candidates.includes(normalizedModel);
@@ -2262,7 +2254,9 @@ function mergeCapabilityOperations(operations = []) {
   return {
     inputKinds: uniqueKindList(usableOperations.flatMap((operation) => operation.inputKinds || [])),
     notes: usableOperations.map((operation) => String(operation.notes || '').trim()).find(Boolean) || '',
+    operationSubtypes: uniqueKindList(usableOperations.flatMap((operation) => operation.operationSubtypes || [])),
     outputKinds: uniqueKindList(usableOperations.flatMap((operation) => operation.outputKinds || [])),
+    transformSubtypes: uniqueKindList(usableOperations.flatMap((operation) => operation.transformSubtypes || [])),
   };
 }
 
@@ -2307,31 +2301,6 @@ function doesModelLikelySupportImages(targetKind, targetId, model) {
 function resolveToolBackedNodeCapability(node, contextMaps = {}) {
   if (!node) {
     return null;
-  }
-
-  if (node.type === 'whisperTranscribe') {
-    const tool = getContextToolEntry('whisper', contextMaps);
-    return {
-      capability: getContextToolOperation('whisper', PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, contextMaps),
-      operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE,
-      targetId: 'whisper',
-      targetKind: 'tool',
-      targetLabel: tool?.name || 'Whisper',
-    };
-  }
-
-  if (node.type === 'imageAnalyze' || node.type === 'imageGenerate') {
-    const operationId = node.type === 'imageAnalyze' ? PIPELINE_OPERATION_IDS.IMAGE_ANALYZE : PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
-    const effectiveToolId = getImageToolIdForNode(node, contextMaps);
-    const toolIds = effectiveToolId ? [effectiveToolId] : IMAGE_WORKFLOW_TOOL_IDS;
-    const tool = effectiveToolId ? getContextToolEntry(effectiveToolId, contextMaps) : null;
-    return {
-      capability: mergeCapabilityOperations(toolIds.map((toolId) => getContextToolOperation(toolId, operationId, contextMaps))),
-      operationId,
-      targetId: effectiveToolId || '',
-      targetKind: 'tool',
-      targetLabel: tool?.name || 'Automatic1111 or Forge',
-    };
   }
 
   if (node.type === 'collectionMap') {
@@ -2447,7 +2416,11 @@ function resolveLlmNodeCapability(node, contextMaps = {}) {
       ? 'Wan2.1 WebUI'
       : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
         ? 'AudioCraft WebUI'
-        : 'Automatic1111 or Forge';
+        : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+          ? 'RVC'
+          : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+            ? 'Upscayl or FaceFusion'
+            : 'Automatic1111 or Forge';
     return {
       capability: mergeCapabilityOperations(toolIds.map((toolId) => getContextToolOperation(toolId, operationId, contextMaps))),
       operationId,
@@ -2563,6 +2536,8 @@ function buildNodeCapabilitySummary(node, contextMaps = {}) {
   const directInputKinds = uniqueKindList(capability.directInputKinds && capability.directInputKinds.length ? capability.directInputKinds : inputKinds);
   const derivedInputKinds = uniqueKindList(capability.derivedInputKinds || []);
   const outputKinds = uniqueKindList(capability.outputKinds);
+  const operationSubtypes = uniqueKindList(capability.operationSubtypes || []);
+  const transformSubtypes = uniqueKindList(capability.transformSubtypes || []);
   const notes = String(capability.notes || '').trim();
   const collectionSupportNote = resolved.operationId === PIPELINE_OPERATION_IDS.VALIDATION_LLM
     && inputKinds.some((kind) => COLLECTION_ITEM_PORT_KINDS.includes(kind))
@@ -2579,7 +2554,9 @@ function buildNodeCapabilitySummary(node, contextMaps = {}) {
     notes,
     operationId: resolved.operationId,
     operationLabel: getPipelineOperationLabel(resolved.operationId),
+    operationSubtypes,
     outputKinds,
+    transformSubtypes,
     supported: true,
     targetId: resolved.targetId,
     targetKind: resolved.targetKind,
@@ -3155,17 +3132,11 @@ function pickAvailableToolId(candidateToolIds = [], contextMaps = {}) {
 }
 
 function isLikelySupportOnlyImageModel(entry) {
-  const haystack = [entry?.title, entry?.model_name, entry?.filename, entry?.name, entry?.fileName, entry?.relativePath]
-    .map((value) => String(value || '').toLowerCase())
-    .join('\n');
-  return Boolean(haystack) && /(^|[\/\s_-])safety[_ -]?checker([\/\s_.-]|$)/i.test(haystack);
+  return isLikelySupportOnlyStableDiffusionModel(entry);
 }
 
 function getLocalImageCheckpointModels(tool) {
-  return (Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : []).filter((entry) => {
-    const modelType = String(entry?.modelType || '').trim().toLowerCase();
-    return (modelType === 'checkpoint' || modelType === 'inpainting') && !isLikelySupportOnlyImageModel(entry);
-  });
+  return getStableDiffusionCheckpointModels(Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : []);
 }
 
 function toolHasDownloadedModelInfo(tool) {
@@ -3173,17 +3144,7 @@ function toolHasDownloadedModelInfo(tool) {
 }
 
 function doesLocalImageToolExposeModel(tool, model) {
-  const normalizedModel = String(model || '').trim().toLowerCase();
-  if (!normalizedModel) {
-    return false;
-  }
-
-  return getLocalImageCheckpointModels(tool).some((entry) => {
-    const candidates = [entry?.id, entry?.name, entry?.fileName, entry?.relativePath, entry?.path]
-      .map((value) => String(value || '').trim().toLowerCase())
-      .filter(Boolean);
-    return candidates.includes(normalizedModel);
-  });
+  return Boolean(findStableDiffusionCheckpointMatch(getLocalImageCheckpointModels(tool), model));
 }
 
 function getLocalImageBackendOperationId(node, fallback = PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
@@ -3217,8 +3178,8 @@ function getLocalImageBackendModelState(tool, model) {
 
     if (!doesLocalImageToolExposeModel(tool, requestedModel)) {
       return {
-        status: 'missing',
-        message: 'Selected checkpoint is not available in ' + (tool?.name || 'this image backend') + '. Refresh checkpoints or download that checkpoint before running this step.',
+        status: 'unknown',
+        message: 'Selected checkpoint is not in the last cached checkpoint list for ' + (tool?.name || 'this image backend') + '. Local AI Hub will verify the live WebUI model list before sending the request.',
       };
     }
 
@@ -3233,6 +3194,14 @@ function getLocalImageBackendModelState(tool, model) {
   }
 
   if (!checkpoints.length) {
+    const status = String(tool?.status || '').trim().toLowerCase();
+    if (status === 'running' || status === 'starting') {
+      return {
+        status: 'unknown',
+        message: (tool?.name || 'This image backend') + ' will use its currently loaded checkpoint if the live WebUI API reports a usable generation checkpoint. Refresh checkpoints to see the backend list before running.',
+      };
+    }
+
     return {
       status: 'missing',
       message: (tool?.name || 'This image backend') + ' does not have a usable Stable Diffusion checkpoint in its local model list. Download or add a real checkpoint before running this step.',
@@ -3398,10 +3367,6 @@ function getImageToolIdForNode(node, contextMaps = {}) {
 }
 
 function getLocalToolRequirement(node, contextMaps = {}) {
-  if (node.type === 'whisperTranscribe') {
-    return 'whisper';
-  }
-
   if (node.type === 'llmPrompt' && getModelStepExecutionMode(node) === 'ollama') {
     return 'ollama';
   }
@@ -3416,10 +3381,6 @@ function getLocalToolRequirement(node, contextMaps = {}) {
 
   if (node.type === 'validation' && node.config?.mode === 'llm' && node.config?.llmExecutionMode === 'ollama') {
     return 'ollama';
-  }
-
-  if (node.type === 'imageAnalyze' || node.type === 'imageGenerate') {
-    return getImageToolIdForNode(node, contextMaps);
   }
 
   if (node.type === 'collectionMap' && getCollectionMapExecutionMode(node) === 'localTool') {
@@ -3655,24 +3616,32 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
   const selectedToolId = String(node.config?.toolId || '').trim();
   const supportedToolIds = getOperationDrivenToolIdsForModelStepOperation(operationId);
   const effectiveToolId = getModelStepLocalToolId(node, contextMaps);
-  const installMessage = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-    ? 'Install Wan2.1 WebUI before using local video generation in a model step.'
-    : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
-      ? 'Install AudioCraft WebUI before using local audio generation in a model step.'
-      : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
-        ? 'Install RVC before using local audio transformation in a model step.'
-        : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
-          ? 'Install Upscayl or FaceFusion before using local image transformation in a model step.'
-          : 'Install Automatic1111 or Forge before using the local image tool mode in a model step.';
-  const selectionMessage = operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-    ? 'Choose Wan2.1 WebUI for this local video model step. ComfyUI video workflows use the dedicated Graph Workflow step instead of this model-step mode.'
-    : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
-      ? 'Choose AudioCraft WebUI for this local audio model step. RVC-style audio transformation is not wired into this model-step path yet, so keep this slice focused on generated-audio output.'
-      : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
-        ? 'Choose RVC for this local audio transformation step. Generated-audio tools stay on the dedicated audio-generation path.'
-        : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
-          ? 'Choose Upscayl or FaceFusion for this local image transformation step. Automatic1111, Forge, and graph-native tools stay on the generation or Graph Workflow paths.'
-          : 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.';
+  const installMessage = operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
+    ? 'Install Whisper before using local audio transcription in a model step.'
+    : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? 'Install Wan2.1 WebUI before using local video generation in a model step.'
+      : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+        ? 'Install AudioCraft WebUI before using local audio generation in a model step.'
+        : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+          ? 'Install RVC before using local audio transformation in a model step.'
+          : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+            ? 'Install Upscayl or FaceFusion before using local image transformation in a model step.'
+            : operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE
+              ? 'Install Automatic1111 or Forge before using local image analysis in a model step.'
+              : 'Install Automatic1111 or Forge before using the local image tool mode in a model step.';
+  const selectionMessage = operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
+    ? 'Choose Whisper for this local audio transcription model step.'
+    : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+      ? 'Choose Wan2.1 WebUI for this local video model step. ComfyUI video workflows use the dedicated Graph Workflow step instead of this model-step mode.'
+      : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+        ? 'Choose AudioCraft WebUI for this local audio generation step. Use Audio transform when you want RVC voice conversion, so this operation stays focused on generated-audio output.'
+        : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+          ? 'Choose RVC for this local audio transformation step. Generated-audio tools stay on the dedicated audio-generation path.'
+          : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+            ? 'Choose Upscayl or FaceFusion for this local image transformation step. Automatic1111, Forge, and graph-native tools stay on the generation or Graph Workflow paths.'
+            : operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE
+              ? 'Choose Automatic1111 or Forge for this local image analysis model step.'
+              : 'Choose Automatic1111 or Forge for this local image model step. ComfyUI and other graph-native local tools use the dedicated Graph Workflow step instead of this model-step mode.';
 
   if (selectedToolId && !supportedToolIds.includes(selectedToolId)) {
     summary.readiness = {
@@ -3695,6 +3664,16 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
     summary.readiness = {
       tone: 'error',
       message: installMessage,
+    };
+    return false;
+  }
+
+  const toolStatus = String(tool.status || '').trim().toLowerCase();
+  const toolLastError = String(tool.lastError || '').trim();
+  if (toolStatus === 'error') {
+    summary.readiness = {
+      tone: 'error',
+      message: toolLastError || (tool.name + ' is currently marked unhealthy. Run Repair or reinstall the tool before using this model step.'),
     };
     return false;
   }
@@ -3762,18 +3741,19 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
       return false;
     }
 
-    const downloadedModels = Array.isArray(tool.downloadedModels) ? tool.downloadedModels : [];
-    const normalizedSelectedModel = selectedModel.toLowerCase();
-    const matchedModel = downloadedModels.find((entry) =>
-      [entry?.id, entry?.name, entry?.fileName, entry?.relativePath, entry?.path]
-        .map((value) => String(value || '').trim().toLowerCase())
-        .filter(Boolean)
-        .includes(normalizedSelectedModel)
-    ) || null;
+    const downloadedModels = getRvcVoiceModels(Array.isArray(tool.downloadedModels) ? tool.downloadedModels : []);
+    const matchedModel = findRvcVoiceModelMatch(downloadedModels, selectedModel);
+    if (Array.isArray(tool.downloadedModels) && !downloadedModels.length) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'No RVC voice models were found in the local weights folder. Add a .pth voice model under the RVC weights folder, then refresh voice models.',
+      };
+      return false;
+    }
     if (downloadedModels.length && !matchedModel) {
       summary.readiness = {
         tone: 'error',
-        message: 'The selected RVC voice model is not available locally. Refresh the local model list or pick a model file from the RVC weights folder.',
+        message: 'The selected RVC voice model is not available locally. Refresh voice models or pick a .pth file from the RVC weights folder.',
       };
       return false;
     }
@@ -3786,6 +3766,16 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+    const transformSubtype = normalizeImageTransformSubtype(tool.id, node.config?.transformSubtype);
+    if (!transformSubtype) {
+      const subtypeOptions = getImageTransformSubtypeOptions(tool.id).map((entry) => entry.label).join(' or ');
+      summary.readiness = {
+        tone: 'error',
+        message: tool.name + ' does not support the selected image transform subtype. Choose ' + subtypeOptions + ' for this tool.',
+      };
+      return false;
+    }
+
     const referenceImageConnected = referenceKinds.includes(PORT_KIND_IMAGE);
     if (tool.id === 'facefusion' && !referenceImageConnected) {
       summary.readiness = {
@@ -3795,11 +3785,12 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
       return false;
     }
 
+    const subtypeLabel = getImageTransformSubtypeLabel(transformSubtype);
     summary.readiness = {
       tone: 'info',
       message: tool.id === 'facefusion'
-        ? tool.name + ' will transform the connected target image using the Reference Image input as the source face. This first pass stays image-only and keeps both source images attached to the saved result lineage.'
-        : tool.name + ' will enhance the connected image through its dedicated local backend adapter. This first pass keeps the main source image attached to the transformed result lineage and leaves advanced Upscayl tuning on the full tool surface.',
+        ? tool.name + ' will run a ' + subtypeLabel + ' transform on the connected target image using the Reference Image input as the source face. This first pass stays image-only and keeps both source images attached to the saved result lineage.'
+        : tool.name + ' will run a ' + subtypeLabel + ' transform through its dedicated local backend adapter. This first pass keeps the main source image attached to the transformed result lineage and leaves advanced Upscayl tuning on the full tool surface.',
     };
     return true;
   }
@@ -3814,9 +3805,38 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
       return false;
     }
 
+    const hasTextInput = connectedKinds.includes(PORT_KIND_TEXT);
+    const hasImageInput = connectedKinds.includes(PORT_KIND_IMAGE);
+    if (hasImageInput && !String(node.config?.instruction || '').trim()) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Wan image-to-video needs motion guidance in the Instruction box before this step can run.',
+      };
+      return false;
+    }
+
+    if (Array.isArray(tool.downloadedModels) && !tool.downloadedModels.length) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Wan2.1 is installed, but Local AI Hub did not find Wan model assets under models\\Wan-AI. Download the matching text-to-video or image-to-video model folders before running this step.',
+      };
+      return false;
+    }
+
+    const modeLabel = hasImageInput ? 'image-to-video' : hasTextInput ? 'text-to-video' : 'local video generation';
+    const compatibilityProfile = tool.compatibility || null;
+    const compatibility = evaluateCompatibilityProfile(compatibilityProfile, contextMaps.hardware);
+    if (compatibilityProfile && (compatibility?.tone === 'danger' || compatibility?.tone === 'warn')) {
+      summary.readiness = {
+        tone: 'warn',
+        message: tool.name + ' is configured for ' + modeLabel + ', but this machine is below or near the low end of Wan2.1 hardware targets. ' + compatibility.message + ' Wan also needs CUDA toolkit support and local model folders before runtime can succeed.',
+      };
+      return true;
+    }
+
     summary.readiness = {
       tone: 'info',
-      message: tool.name + ' will run this video generation step through its dedicated local backend adapter. Local AI Hub keeps the pipeline sequential and saves the rendered video back into the run folder.',
+      message: tool.name + ' will run this ' + modeLabel + ' step through its dedicated local backend adapter. Local AI Hub keeps the pipeline sequential, requires CUDA-ready Wan dependencies and model folders, and saves the rendered video back into the run folder.',
     };
     return true;
   }
@@ -4276,49 +4296,6 @@ function analyzePipeline(definition = {}, context = {}) {
                 issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
               }
             }
-          }
-        }
-      }
-
-      if (node.type === 'whisperTranscribe') {
-        const ready = analyzeWhisperNode(summary, contextMaps);
-        if (!ready || summary.readiness.tone === 'error') {
-          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (summary.readiness.tone === 'warn') {
-          issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
-        }
-      }
-
-      if (node.type === 'imageAnalyze') {
-        if (!String(node.config?.analysisMode || '').trim()) {
-          summary.readiness = {
-            tone: 'error',
-            message: 'Choose an analysis mode for this image step.',
-          };
-          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else {
-          const ready = analyzeImageToolNode(node, summary, contextMaps);
-          if (!ready || summary.readiness.tone === 'error') {
-            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-          } else if (summary.readiness.tone === 'warn') {
-            issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
-          }
-        }
-      }
-
-      if (node.type === 'imageGenerate') {
-        if (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256) {
-          summary.readiness = {
-            tone: 'error',
-            message: 'Use at least 256 by 256 for generated images.',
-          };
-          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else {
-          const ready = analyzeImageToolNode(node, summary, contextMaps);
-          if (!ready || summary.readiness.tone === 'error') {
-            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-          } else if (summary.readiness.tone === 'warn') {
-            issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
           }
         }
       }
@@ -4911,8 +4888,12 @@ module.exports = {
   getGraphWorkflowOperationBackendSupport,
   getGraphWorkflowToolId,
   getImageToolIdForNode,
+  getDefaultImageTransformSubtype,
+  getImageTransformSubtypeLabel,
+  getImageTransformSubtypeOptions,
   selectLocalImageBackend,
   getLocalImageCheckpointModels,
+  getLocalImageBackendOperationId,
   getLocalToolRequirement,
   getModelStepExecutionMode,
   getPipelineNodePorts,
@@ -4924,6 +4905,7 @@ module.exports = {
   getPortAllowedKinds,
   getPortDefinition,
   getSupportedPortKinds,
+  normalizeImageTransformSubtype,
   normalizePipelineDefinition,
   normalizePortKind,
   parseGraphWorkflowDefinitionText,

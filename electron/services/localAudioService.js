@@ -10,7 +10,7 @@ try {
 const { runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
-const { PORT_KIND_AUDIO } = require('../shared/pipelineSchema.cjs');
+const { PIPELINE_OPERATION_IDS, PORT_KIND_AUDIO } = require('../shared/pipelineSchema.cjs');
 
 const LOCAL_AUDIO_RUNTIME_MODE_IDS = Object.freeze({
   DIRECT_COMMAND: 'direct-command',
@@ -247,6 +247,8 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
     durationSeconds: Number(response?.durationSeconds || options.durationSeconds || 0) || 0,
     mode: String(response?.audioMode || options.audioMode || 'music').trim() || 'music',
     model: String(response?.model || options.model || '').trim(),
+    operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+    operationSubtype: String(response?.audioMode || options.audioMode || 'music').trim() || 'music',
     prompt: String(response?.prompt || options.prompt || '').trim(),
     sourceAudio: buildSourceAudioReference(options.sourceAudioArtifact),
     toolId: String(tool?.id || '').trim() || 'audiocraft-webui',
@@ -318,6 +320,8 @@ async function generateAudioWithRvcTool(tool, options = {}) {
     durationSeconds: Number(response?.durationSeconds || 0) || 0,
     instruction: String(options.instruction || '').trim(),
     model: String(response?.model || voiceModel.model || '').trim(),
+    operationId: PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM,
+    operationSubtype: String(response?.transformationType || 'voice-conversion').trim() || 'voice-conversion',
     sourceAudio: buildSourceAudioReference(options.sourceAudioArtifact),
     targetVoice: String(response?.targetVoice || voiceModel.name || voiceModel.fileName || '').trim(),
     toolId: String(tool?.id || '').trim() || 'rvc',

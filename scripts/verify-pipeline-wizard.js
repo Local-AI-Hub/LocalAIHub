@@ -196,7 +196,7 @@ function testLocalWizardPromptIsCompactAndGrounded(context) {
   const localPrompt = JSON.stringify(localMessages);
   assert(localPrompt.length < 9000, 'Local wizard prompt should stay compact enough for modest Ollama models.');
   assert(localPrompt.includes('textInput|'), 'Local prompt should still include grounded node signatures.');
-  assert(localPrompt.includes('imageGenerate|'), 'Local prompt should still include image generation node signatures.');
+  assert(localPrompt.includes('llmPrompt|'), 'Local prompt should include the unified Model Step node signature.');
   assert(localPrompt.includes('automatic1111'), 'Local prompt should still include real available tools.');
   assert(localPrompt.includes('intentIr'), 'Local prompt should ask weaker models for abstract intent instead of exact wiring.');
   assert(localPrompt.includes('supportedIntentStageKinds'), 'Local prompt should constrain local models to supported abstract stage kinds.');
@@ -228,7 +228,7 @@ function testIntentIrTextToImageDraft(context) {
   assertKnownNodeTypes(result.pipeline);
   assert.strictEqual(result.summary.recipeLabel, 'Intent IR graph', 'Expected the generic intent IR compiler to own this draft.');
   assert(result.pipeline.nodes.some((node) => node.type === 'textInput'), 'Expected text source node from IR source.');
-  assert(result.pipeline.nodes.some((node) => node.type === 'imageGenerate' && node.config.toolId === 'automatic1111'), 'Expected Local AI Hub to infer grounded local image generation.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'llmPrompt' && node.config.operationId === 'imageGenerate' && node.config.toolId === 'automatic1111'), 'Expected Local AI Hub to infer grounded local image generation through Model Step.');
   assert(result.pipeline.nodes.some((node) => node.type === 'imageOutput'), 'Expected image output node from IR output.');
   assertRuntimeConfigsDoNotContainIntent(result.pipeline, intent);
 }
@@ -330,7 +330,7 @@ function testTextToImageDraft(context) {
   const inputNode = result.pipeline.nodes.find((node) => node.type === 'textInput');
   assert(inputNode, 'Expected a text input node.');
   assert.strictEqual(inputNode.config.text, '', 'Text input should not copy the authoring request as runtime content.');
-  assert(result.pipeline.nodes.some((node) => node.type === 'imageGenerate' && node.config.toolId === 'automatic1111'), 'Expected grounded Automatic1111 image generation.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'llmPrompt' && node.config.operationId === 'imageGenerate' && node.config.toolId === 'automatic1111'), 'Expected grounded Automatic1111 image generation through Model Step.');
   assert(result.pipeline.nodes.some((node) => node.type === 'imageOutput'), 'Expected an image output node.');
   assert(result.summary.manualRefinementNotes.some((note) => /settings/i.test(note)), 'Expected honest manual refinement note.');
   assertRuntimeConfigsDoNotContainIntent(result.pipeline, intent);
@@ -869,7 +869,7 @@ function testHallucinatedPlanFallsBack(context) {
   });
   assertNoStructuralErrors(result.pipeline);
   assertKnownNodeTypes(result.pipeline);
-  assert(result.pipeline.nodes.some((node) => node.type === 'whisperTranscribe'), 'Expected hallucinated plan to instantiate only the bounded Whisper transcription recipe.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'llmPrompt' && node.config?.operationId === 'whisperTranscribe'), 'Expected hallucinated plan to instantiate bounded Whisper transcription through Model Step.');
 }
 
 const context = buildPipelineWizardContext({ hardware, manifests: tools, providers, tools });

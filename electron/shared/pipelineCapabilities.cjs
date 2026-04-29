@@ -140,6 +140,7 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
         inputKinds: Object.freeze([MODALITY_IMAGE]),
         notes: 'Runs Upscayl through a dedicated local adapter so enhancement and upscaling return a transformed image artifact with clear lineage back to the connected source image.',
         outputKinds: Object.freeze([MODALITY_IMAGE]),
+        transformSubtypes: Object.freeze(['upscale', 'enhance']),
       }),
     }),
     targetType: 'tool',
@@ -150,6 +151,8 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
         inputKinds: Object.freeze([MODALITY_IMAGE]),
         notes: 'Runs FaceFusion through a dedicated local adapter for image-only face transformation in this pass. Connect the target image on the main input and a source face image on the Reference Image input.',
         outputKinds: Object.freeze([MODALITY_IMAGE]),
+        requiresReferenceImage: true,
+        transformSubtypes: Object.freeze(['face-swap']),
       }),
     }),
     targetType: 'tool',
@@ -159,6 +162,7 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
       [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
         notes: 'Runs a local Wan video request through a dedicated direct Python adapter. Text input produces text-to-video. Image input produces image-to-video when motion guidance is supplied in the step instruction box.',
+        operationSubtypes: Object.freeze(['text-to-video', 'image-to-video']),
         outputKinds: Object.freeze([MODALITY_VIDEO]),
       }),
     }),
@@ -169,6 +173,7 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
       [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_AUDIO]),
         notes: 'Runs AudioCraft through a dedicated direct Python adapter. Text input produces generated audio. Audio input reuses the connected clip as music guidance in Music mode for this first audio-output pipeline slice.',
+        operationSubtypes: Object.freeze(['music', 'sound']),
         outputKinds: Object.freeze([MODALITY_AUDIO]),
       }),
     }),
@@ -179,7 +184,9 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
       [PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_AUDIO]),
         notes: 'Runs RVC through a dedicated direct Python adapter. The connected source clip stays first-class and the converted result keeps explicit lineage back to that source audio.',
+        operationSubtypes: Object.freeze(['voice-conversion']),
         outputKinds: Object.freeze([MODALITY_AUDIO]),
+        transformSubtypes: Object.freeze(['voice-conversion']),
       }),
     }),
     targetType: 'tool',
@@ -191,6 +198,11 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
     operations: Object.freeze({
       [PIPELINE_OPERATION_IDS.LLM_PROMPT]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        outputKinds: Object.freeze([MODALITY_TEXT]),
+      }),
+      [PIPELINE_OPERATION_IDS.IMAGE_ANALYZE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_IMAGE]),
+        notes: 'Runs through the provider chat path as a vision image-to-text request.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
@@ -225,6 +237,11 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         notes: 'Claude can review images and many document-style files in the current chat path.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
+      [PIPELINE_OPERATION_IDS.IMAGE_ANALYZE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_IMAGE]),
+        notes: 'Runs through the provider chat path as a vision image-to-text request.',
+        outputKinds: Object.freeze([MODALITY_TEXT]),
+      }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE, MODALITY_PLAN]),
         directInputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_FILE, MODALITY_PLAN]),
@@ -239,6 +256,11 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
       [PIPELINE_OPERATION_IDS.LLM_PROMPT]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO, MODALITY_FILE]),
         notes: 'Gemini can review attached images, videos, and document-style files in the current provider path.',
+        outputKinds: Object.freeze([MODALITY_TEXT]),
+      }),
+      [PIPELINE_OPERATION_IDS.IMAGE_ANALYZE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_IMAGE]),
+        notes: 'Runs through the provider chat path as a vision image-to-text request.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.VALIDATION_LLM]: Object.freeze({
@@ -387,8 +409,8 @@ const PROVIDER_MODEL_CAPABILITY_RULES = Object.freeze({
 });
 
 const PROVIDER_MODEL_FALLBACK_OPERATION_IDS = Object.freeze({
-  openai: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.VALIDATION_LLM]),
-  google: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.VALIDATION_LLM]),
+  openai: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.IMAGE_ANALYZE, PIPELINE_OPERATION_IDS.VALIDATION_LLM]),
+  google: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.IMAGE_ANALYZE, PIPELINE_OPERATION_IDS.VALIDATION_LLM]),
 });
 
 function normalizeId(value) {
@@ -397,6 +419,10 @@ function normalizeId(value) {
 
 function cloneKinds(kinds = []) {
   return [...new Set((kinds || []).map((kind) => String(kind || '').trim().toLowerCase()).filter(Boolean))];
+}
+
+function cloneSubtypes(subtypes = []) {
+  return [...new Set((subtypes || []).map((entry) => String(entry || '').trim()).filter(Boolean))];
 }
 
 function cloneOperation(operation) {
@@ -410,6 +436,8 @@ function cloneOperation(operation) {
     directInputKinds: cloneKinds(operation.directInputKinds),
     inputKinds: cloneKinds(operation.inputKinds),
     outputKinds: cloneKinds(operation.outputKinds),
+    operationSubtypes: cloneSubtypes(operation.operationSubtypes),
+    transformSubtypes: cloneSubtypes(operation.transformSubtypes),
   };
 }
 

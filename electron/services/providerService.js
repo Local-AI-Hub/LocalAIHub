@@ -262,11 +262,37 @@ function shouldIncludeProviderModel(provider, modelId, operationId = '') {
     return false;
   }
 
+  const capabilities = getProviderModelCapabilities(provider.id, modelId);
+  const blocked = matchesBlockedModel(provider, modelId);
   if (operationId) {
-    return Boolean(getProviderModelCapabilities(provider.id, modelId)?.operations?.[operationId]);
+    const supportsOperation = Boolean(capabilities?.operations?.[operationId]);
+    if (!supportsOperation) {
+      return false;
+    }
+
+    return !blocked || capabilities?.capabilitySource === 'explicit';
   }
 
-  return !matchesBlockedModel(provider, modelId);
+  return !blocked;
+}
+
+function getProviderModelPreferenceRank(provider, modelId) {
+  const normalizedModelId = String(modelId || '').trim().toLowerCase();
+  const prefixes = Array.isArray(provider?.configuration?.preferredModelPrefixes)
+    ? provider.configuration.preferredModelPrefixes
+    : [];
+  const index = prefixes.findIndex((prefix) => normalizedModelId.startsWith(String(prefix || '').trim().toLowerCase()));
+  return index >= 0 ? index : Number.MAX_SAFE_INTEGER;
+}
+
+function compareProviderModels(provider, left, right) {
+  const leftRank = getProviderModelPreferenceRank(provider, left?.id);
+  const rightRank = getProviderModelPreferenceRank(provider, right?.id);
+  if (leftRank !== rightRank) {
+    return leftRank - rightRank;
+  }
+
+  return String(left?.label || left?.id || '').localeCompare(String(right?.label || right?.id || ''));
 }
 
 function finalizeProviderModels(provider, models = [], options = {}) {
@@ -277,7 +303,7 @@ function finalizeProviderModels(provider, models = [], options = {}) {
       ...entry,
       ...buildProviderModelMetadata(provider, entry.id),
     }))
-    .sort((left, right) => left.label.localeCompare(right.label));
+    .sort((left, right) => compareProviderModels(provider, left, right));
 }
 
 function normalizeAllowedValue(value, allowedValues, fallback) {

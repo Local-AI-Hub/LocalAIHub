@@ -3,6 +3,12 @@ const path = require('path');
 
 const { createLogger } = require('./logService');
 const { IMAGE_WORKFLOW_TOOL_IDS, selectLocalImageBackend } = require('../shared/pipelineSchema.cjs');
+const {
+  findStableDiffusionCheckpointMatch,
+  getCanonicalStableDiffusionCheckpointName,
+  getStableDiffusionCheckpointModels,
+  normalizeStableDiffusionCheckpointEntry,
+} = require('../shared/toolAssetSelection.cjs');
 
 const IMAGE_MIME_TYPES = {
   '.gif': 'image/gif',
@@ -59,38 +65,91 @@ class ToolApiHttpError extends Error {
   }
 }
 
-function isLikelySafetyCheckerModel(entry) {
-  const haystack = [entry?.title, entry?.model_name, entry?.filename, entry?.name]
-    .map((value) => String(value || '').toLowerCase())
-    .join('\n');
-  return Boolean(haystack) && /(^|[\\/\s_-])safety[_ -]?checker([\\/\s_.-]|$)/i.test(haystack);
-}
-
 function summarizeModelEntries(models = []) {
   return models
     .slice(0, 5)
-    .map((entry) => String(entry?.title || entry?.model_name || entry?.filename || entry?.name || '').trim())
+    .map((entry) => getCanonicalStableDiffusionCheckpointName(entry))
     .filter(Boolean)
     .join(', ');
 }
 
-async function assertUsableGenerationModel(tool, options = {}) {
-  if (String(options.model || '').trim()) {
-    return;
+function summarizeModelEntriesForDiagnostics(models = []) {
+  const entries = (Array.isArray(models) ? models : [])
+    .slice(0, 8)
+    .map((entry) => {
+      const label = getCanonicalStableDiffusionCheckpointName(entry);
+      const baseName = String(entry?.fileName || entry?.basename || path.basename(String(entry?.filename || '')) || '').trim();
+      return [label, baseName && baseName !== label ? baseName : ''].filter(Boolean).join(' / ');
+    })
+    .filter(Boolean);
+  return entries.join(', ');
+}
+
+function formatSelectedCheckpointDiagnostic(selectedValue) {
+  const value = String(selectedValue || '').trim();
+  return value ? ' Selected value: "' + value + '".' : '';
+}
+
+function getLocalCheckpointEntries(tool) {
+  return getStableDiffusionCheckpointModels(Array.isArray(tool?.downloadedModels) ? tool.downloadedModels : [])
+    .filter((entry) => entry?.backendVisible !== true);
+}
+
+function summarizeLocalCheckpointMismatch(tool) {
+  const localCheckpoints = getLocalCheckpointEntries(tool);
+  if (!localCheckpoints.length) {
+    return '';
   }
 
+  const firstPath = String(localCheckpoints[0]?.path || '').trim();
+  const folder = firstPath ? path.dirname(firstPath) : 'the tool model folder';
+  return ' Local AI Hub can see downloaded checkpoint files locally' + (folder ? ' under ' + folder : '') + ', but the live WebUI API is not listing them. Restart ' + (tool?.name || 'the backend') + ' or use its model refresh control so it scans the checkpoint folder.';
+}
+
+async function listStableDiffusionApiCheckpoints(tool) {
   const models = await requestToolJson(tool, '/sdapi/v1/sd-models', null, 'list-models', {
     method: 'GET',
   });
-  if (!Array.isArray(models) || models.length === 0) {
-    throw new Error(`${tool?.name || 'This image tool'} API is reachable, but it did not report any Stable Diffusion checkpoints. Add or select a generation checkpoint before running this pipeline step.`);
+  if (!Array.isArray(models)) {
+    throw new Error((tool?.name || 'This image tool') + ' API answered, but its Stable Diffusion checkpoint list was not readable.');
   }
 
-  const usableModels = models.filter((entry) => !isLikelySafetyCheckerModel(entry));
+  return models.map((entry) => normalizeStableDiffusionCheckpointEntry(entry, tool, { backendVisible: true }));
+}
+
+async function resolveUsableGenerationModel(tool, options = {}) {
+  const requestedModel = String(options.model || '').trim();
+  const models = await listStableDiffusionApiCheckpoints(tool);
+  const usableModels = getStableDiffusionCheckpointModels(models, { requireBackendVisible: true });
+
+  if (!models.length) {
+    throw new Error(`${tool?.name || 'This image tool'} API is reachable, but it did not report any Stable Diffusion checkpoints. Add a real checkpoint to the WebUI checkpoint folder before running this pipeline step.${summarizeLocalCheckpointMismatch(tool)}`);
+  }
+
   if (!usableModels.length) {
     const summary = summarizeModelEntries(models);
-    throw new Error(`${tool?.name || 'This image tool'} API is reachable, but its model list only shows non-generation support files${summary ? ': ' + summary : ''}. Add a real Stable Diffusion checkpoint before running this pipeline step.`);
+    throw new Error(`${tool?.name || 'This image tool'} API is reachable, but its model list only shows non-generation support files${summary ? ': ' + summary : ''}. Add a real Stable Diffusion checkpoint before running this pipeline step.${summarizeLocalCheckpointMismatch(tool)}`);
   }
+
+  if (!requestedModel) {
+    return { checkpoint: '', models: usableModels };
+  }
+
+  const matchedModel = findStableDiffusionCheckpointMatch(usableModels, requestedModel);
+  if (!matchedModel) {
+    const localMatch = findStableDiffusionCheckpointMatch(getLocalCheckpointEntries(tool), requestedModel);
+    if (localMatch) {
+      throw new Error('Selected checkpoint is downloaded locally, but ' + (tool?.name || 'the selected image backend') + ' does not list it through the live /sdapi/v1/sd-models response yet.' + formatSelectedCheckpointDiagnostic(requestedModel) + ' Restart the backend or use its model refresh control, then refresh checkpoints in Local AI Hub.');
+    }
+
+    const summary = summarizeModelEntriesForDiagnostics(usableModels);
+    throw new Error('Selected checkpoint is not available in the live ' + (tool?.name || 'selected image backend') + ' model list.' + formatSelectedCheckpointDiagnostic(requestedModel) + ' Runtime source: live /sdapi/v1/sd-models.' + (summary ? ' Available checkpoints: ' + summary + '.' : '') + ' Refresh checkpoints or download that checkpoint before running this step.');
+  }
+
+  return {
+    checkpoint: getCanonicalStableDiffusionCheckpointName(matchedModel) || requestedModel,
+    models: usableModels,
+  };
 }
 
 async function requestToolJson(tool, endpoint, payload, actionLabel, options = {}) {
@@ -203,7 +262,8 @@ async function readImageAsDataUrl(filePath) {
 
 async function generateImageWithWorkflowTool(tool, options = {}) {
   const runningTool = assertRunningImageTool(tool, 'image generation');
-  await assertUsableGenerationModel(runningTool, options);
+  const checkpointSelection = await resolveUsableGenerationModel(runningTool, options);
+  const checkpointOverride = String(checkpointSelection.checkpoint || '').trim();
   const data = await requestToolJson(
     runningTool,
     '/sdapi/v1/txt2img',
@@ -215,10 +275,10 @@ async function generateImageWithWorkflowTool(tool, options = {}) {
       seed: Number.isFinite(Number(options.seed)) ? Number(options.seed) : -1,
       steps: Number(options.steps || 24),
       width: Number(options.width || 832),
-      ...(String(options.model || '').trim()
+      ...(checkpointOverride
         ? {
             override_settings: {
-              sd_model_checkpoint: String(options.model || '').trim(),
+              sd_model_checkpoint: checkpointOverride,
             },
             override_settings_restore_afterwards: true,
           }
@@ -265,7 +325,9 @@ module.exports = {
   generateImageWithWorkflowTool,
   interrogateImageWithWorkflowTool,
   isImageWorkflowTool,
+  listStableDiffusionApiCheckpoints,
   resolveSelectedImageTool,
 };
+
 
 

@@ -16,11 +16,21 @@ const { buildOllamaUnavailableMessage, finishOllamaSession, listOllamaModels, pr
 const { assertLoopbackUrl, assertSecureRemoteUrl } = require('./pathSafetyService');
 const { getToolManifest } = require('./toolRegistry');
 const { annotateArtifactsForDownloadPlan, artifactPath, createModelDownloadPlan, ollamaTagPlan } = require('./modelDownloadPlanService');
+const { listStableDiffusionApiCheckpoints } = require('./workflowToolService');
+const { isToolActive, isToolReady, launchToolFromUserAction, stopTool } = require('./processService');
+const { getResolvedToolState } = require('./toolStateService');
+const {
+  findStableDiffusionCheckpointMatch,
+  getRvcVoiceModels,
+  getStableDiffusionCheckpointModels,
+} = require('../shared/toolAssetSelection.cjs');
 const APP_USER_AGENT = `LocalAIHub/${APP_VERSION}`;
 const MODEL_SETTINGS_FILE = 'model-manager.settings.json';
 const MODEL_DOWNLOAD_BUFFER_LIMIT = 10 * 1024 * 1024;
 const REMOTE_PAGE_SIZE = 24;
 const OLLAMA_PAGE_SIZE = 40;
+const TOOL_ASSET_REFRESH_POLL_INTERVAL_MS = 1500;
+const TOOL_ASSET_REFRESH_STARTUP_GRACE_MS = 15000;
 const OLLAMA_LIBRARY_URL = 'https://ollama.com/library';
 const TABBY_MODEL_REGISTRY_URLS = ['https://models.tabbyml.com', 'https://tabby.tabbyml.com/docs/models/'];
 const HUGGING_FACE_SEARCH_URL = 'https://huggingface.co/api/models';
@@ -1021,6 +1031,162 @@ async function listDownloadedModels(tool) {
     return listLocalOllamaModels(tool);
   }
   return listLocalFileModels(tool);
+}
+
+function isStableDiffusionWebUiTool(tool) {
+  const toolId = String(tool?.id || '').trim().toLowerCase();
+  return toolId === 'automatic1111' || toolId === 'forge';
+}
+
+function mergeBackendAndLocalStableDiffusionModels(backendModels = [], localModels = []) {
+  const merged = getStableDiffusionCheckpointModels(backendModels).map((entry) => ({
+    ...entry,
+    backendVisible: true,
+    discoverySource: 'backend',
+  }));
+
+  for (const localModel of getStableDiffusionCheckpointModels(localModels)) {
+    if (findStableDiffusionCheckpointMatch(merged, localModel.fileName || localModel.relativePath || localModel.name || localModel.id)) {
+      continue;
+    }
+
+    merged.push({
+      ...localModel,
+      backendVisible: false,
+      discoverySource: 'local-only',
+    });
+  }
+
+  return merged;
+}
+
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function resolveFreshToolForAssetRefresh(tool) {
+  const resolved = await getResolvedToolState(tool?.id, { includeSnapshots: false, resolveStatuses: true }).catch(() => null);
+  return resolved || tool;
+}
+
+async function waitForToolReadyForAssetRefresh(tool, timeoutMs) {
+  const startedAt = Date.now();
+  let lastTool = tool;
+  while (Date.now() - startedAt <= timeoutMs) {
+    lastTool = await resolveFreshToolForAssetRefresh(lastTool);
+    if (await isToolReady(lastTool).catch(() => false)) {
+      return lastTool;
+    }
+    await sleep(TOOL_ASSET_REFRESH_POLL_INTERVAL_MS);
+  }
+
+  throw new Error((tool?.name || 'This tool') + ' did not become API-ready in time for model refresh. Start it from Library and try Refresh again if the first launch is still loading.');
+}
+
+async function prepareStableDiffusionBackendForAssetRefresh(tool) {
+  const freshTool = await resolveFreshToolForAssetRefresh(tool);
+  const wasActive = await isToolActive(freshTool).catch(() => false);
+  const wasReady = wasActive ? await isToolReady(freshTool).catch(() => false) : false;
+  if (!wasReady) {
+    await launchToolFromUserAction(freshTool, {
+      allowPendingStartup: true,
+      launchContext: 'pipeline-checkpoint-refresh',
+      skipOpenInterface: true,
+    });
+  }
+
+  const timeoutMs = Math.max(
+    Number(freshTool?.startupTimeoutMs || 0) || 0,
+    Number(freshTool?.launchProfile?.startupTimeoutMs || 0) || 0,
+    120000,
+  ) + TOOL_ASSET_REFRESH_STARTUP_GRACE_MS;
+  const readyTool = await waitForToolReadyForAssetRefresh(freshTool, timeoutMs);
+  return {
+    readyTool,
+    startedForRefresh: !wasActive,
+  };
+}
+
+async function stopStableDiffusionBackendAfterAssetRefresh(tool) {
+  try {
+    await stopTool(tool);
+  } catch (error) {
+    throw new Error((tool?.name || 'This image backend') + ' refreshed checkpoints, but Local AI Hub could not stop the backend it started for refresh: ' + humanizeError(error, 'Stop failed.'));
+  }
+}
+function getDirectorySummary(models = [], fallback = '') {
+  const firstPath = String(models[0]?.path || '').trim();
+  if (firstPath) {
+    return path.dirname(firstPath);
+  }
+  return fallback;
+}
+
+async function listToolAssets(tool, options = {}) {
+  if (isStableDiffusionWebUiTool(tool)) {
+    const localModels = supportsModelManager(tool) ? await listLocalFileModels(tool).catch(() => []) : [];
+    let prepared = null;
+    try {
+      prepared = await prepareStableDiffusionBackendForAssetRefresh(tool);
+      const backendModels = await listStableDiffusionApiCheckpoints(prepared.readyTool);
+      const models = mergeBackendAndLocalStableDiffusionModels(backendModels, localModels);
+      const backendCheckpoints = getStableDiffusionCheckpointModels(backendModels);
+      const localOnlyCount = models.filter((entry) => entry.backendVisible === false).length;
+      const localFolder = getDirectorySummary(localModels, 'the WebUI checkpoint folder');
+      let message = '';
+      if (!backendModels.length) {
+        message = (prepared.readyTool?.name || 'This image backend') + ' is API-ready, but /sdapi/v1/sd-models returned no checkpoints.';
+      } else if (!backendCheckpoints.length) {
+        message = (prepared.readyTool?.name || 'This image backend') + ' is API-ready, but its live model list only contains support files. Add a real .safetensors or .ckpt checkpoint.';
+      } else if (localOnlyCount) {
+        message = (prepared.readyTool?.name || 'This image backend') + ' listed ' + backendCheckpoints.length + ' usable checkpoint' + (backendCheckpoints.length === 1 ? '' : 's') + ', but ' + localOnlyCount + ' local checkpoint file' + (localOnlyCount === 1 ? ' is' : 's are') + ' not visible to the backend yet. Restart or refresh the WebUI if you expected files under ' + localFolder + ' to appear.';
+      } else {
+        message = (prepared.readyTool?.name || 'This image backend') + ' listed ' + backendCheckpoints.length + ' usable checkpoint' + (backendCheckpoints.length === 1 ? '' : 's') + ' from its live WebUI API.';
+      }
+      if (prepared.startedForRefresh) {
+        message += ' Local AI Hub started the backend for this refresh and stopped it afterward.';
+      }
+
+      return {
+        assetKind: 'stable-diffusion-checkpoint',
+        live: true,
+        message,
+        models,
+        startedForRefresh: prepared.startedForRefresh,
+        toolId: prepared.readyTool?.id || tool?.id || '',
+      };
+    } catch (error) {
+      throw new Error(humanizeError(error, (tool?.name || 'This image backend') + ' could not refresh checkpoints from the live WebUI API.'));
+    } finally {
+      if (prepared?.startedForRefresh && prepared.readyTool) {
+        await stopStableDiffusionBackendAfterAssetRefresh(prepared.readyTool);
+      }
+    }
+  }
+
+  if (tool?.id === 'rvc') {
+    const localModels = await listLocalFileModels(tool).catch(() => []);
+    const models = getRvcVoiceModels(localModels);
+    const weightsFolder = getDirectorySummary(models, tool?.appDir || tool?.installDir ? path.join(tool.appDir || tool.installDir, 'weights') : 'the RVC weights folder');
+    return {
+      assetKind: 'rvc-voice-model',
+      live: false,
+      message: models.length
+        ? 'Found ' + models.length + ' RVC voice model' + (models.length === 1 ? '' : 's') + ' under ' + weightsFolder + '.'
+        : 'No RVC voice models were found. Add .pth voice model files under ' + weightsFolder + ', then refresh voice models.',
+      models,
+      toolId: tool?.id || '',
+    };
+  }
+
+  return {
+    assetKind: String(options.assetKind || 'model').trim() || 'model',
+    live: false,
+    message: (tool?.name || 'This tool') + ' uses the regular Model Manager local model list.',
+    models: await listDownloadedModels(tool),
+    toolId: tool?.id || '',
+  };
 }
 async function countDownloadedModels(tool) {
   if (tool?.id === 'rvc') {
@@ -3184,6 +3350,7 @@ module.exports = {
   downloadModel,
   getModelDownloadPreflight,
   listDownloadedModels,
+  listToolAssets,
   readModelSettings,
   saveModelManagerSettings,
   supportsModelManager,
@@ -3203,3 +3370,5 @@ module.exports = {
     writeModelMetadata,
   }
 };
+
+

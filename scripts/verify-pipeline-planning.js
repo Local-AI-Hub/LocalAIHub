@@ -402,6 +402,7 @@ async function main() {
   assert(planResult.destinationPath && fs.existsSync(planResult.destinationPath), 'Expected the saved .plan.json output to exist.');
   assert(planResult.destinationPath.endsWith('.plan.json'), 'Expected the saved plan output to use the .plan.json extension.');
   assert.strictEqual(planResult.artifact?.kind, 'plan', 'Expected the saved artifact kind to stay plan.');
+  assert.strictEqual(planResult.artifact?.isFinalOutput, true, 'Expected explicit Plan Output artifacts to be marked as final outputs.');
   assert.strictEqual(planResult.artifact?.schemaId, 'longformMedia.scenePlan.v1', 'Expected the saved plan artifact to preserve the planning schema id.');
   assert.strictEqual(Array.isArray(planResult.artifact?.plan?.scenes), true, 'Expected the saved plan artifact to include scenes.');
   assert.strictEqual(planResult.artifact.plan.scenes.length, 2, 'Expected the saved plan artifact to include two scenes.');
@@ -416,6 +417,7 @@ async function main() {
   const collectionResult = completedRun.terminalResults?.find((entry) => entry.kind === 'collection') || null;
   assert(collectionResult, 'Expected a terminal collection result from Plan Scenes.');
   assert(collectionResult.directoryPath && fs.existsSync(collectionResult.directoryPath), 'Expected the saved collection output directory to exist.');
+  assert.strictEqual(collectionResult.artifact?.isFinalOutput, true, 'Expected explicit Collection Output artifacts to be marked as final outputs.');
 
   const outputsDirectory = path.dirname(planResult.destinationPath);
   const savedOutputFiles = fs.readdirSync(outputsDirectory);

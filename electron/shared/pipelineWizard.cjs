@@ -1899,7 +1899,7 @@ function getTargetLabel(target = {}, context = {}) {
   if (target.executionMode === 'ollama') {
     return ['Ollama', model].filter(Boolean).join(' / ');
   }
-  if (target.executionMode === 'localTool' || target.executionMode === 'localImageNode') {
+  if (target.executionMode === 'localTool' || target.executionMode === 'localTool') {
     return getToolEntry(context, target.toolId)?.name || target.toolId || 'local tool';
   }
   const providerLabel = getProviderEntry(context, target.providerId)?.name || target.providerId || 'provider';
@@ -1984,7 +1984,7 @@ function chooseTargetForOperation(operationId, context, wizardTarget = {}, optio
     const localToolId = getPreferredToolId(operationId, context, IMAGE_WORKFLOW_TOOL_IDS);
     if (localToolId) {
       return {
-        executionMode: 'localImageNode',
+        executionMode: 'localTool',
         model: '',
         providerId: '',
         toolId: localToolId,
@@ -2090,10 +2090,10 @@ function connect(edges, sourceNode, sourcePortId, targetNode, targetPortId) {
 
 function buildLlmStepConfig(operationId, target, intent, extraConfig = {}) {
   return {
-    executionMode: target.executionMode === 'ollama' ? 'ollama' : target.executionMode === 'localTool' ? 'localTool' : 'cloud',
+    executionMode: target.executionMode === 'ollama' ? 'ollama' : (target.executionMode === 'localTool' || target.executionMode === 'localTool') ? 'localTool' : 'cloud',
     operationId,
     providerId: target.executionMode === 'cloud' ? target.providerId : '',
-    toolId: target.executionMode === 'localTool' ? target.toolId : '',
+    toolId: target.executionMode === 'localTool' || target.executionMode === 'localTool' ? target.toolId : '',
     model: target.model || '',
     ...extraConfig,
     instruction: sanitizeRuntimeInstruction(extraConfig.instruction, intent, operationId),
@@ -2110,20 +2110,6 @@ function buildSimpleModelPipeline({ intent, operationId, outputKind, context, wi
       : 'text';
   const inputNode = makeNode(sourceNodeTypeForKind(sourceKind), 0, sourceKind === 'text' ? { text: '' } : {}, sourceKind === 'image' ? 'Source image' : sourceKind === 'audio' ? 'Source audio' : getRuntimeSourceLabel(intent));
   nodes.push(inputNode);
-
-  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-    const target = chooseTargetForOperation(operationId, context, wizardTarget);
-    if (target.executionMode === 'localImageNode') {
-      const imageNode = makeNode('imageGenerate', 1, {
-        toolId: target.toolId,
-      }, 'Generate image');
-      const outputNode = makeOutputNode('image', 2, 'Generated image');
-      nodes.push(imageNode, outputNode);
-      connect(edges, inputNode, 'text', imageNode, 'prompt');
-      connect(edges, imageNode, 'image', outputNode, 'image');
-      return { nodes, edges, target, warnings: [] };
-    }
-  }
 
   const target = chooseTargetForOperation(operationId, context, wizardTarget);
   const stepNode = makeNode('llmPrompt', 1, buildLlmStepConfig(operationId, target, intent, {
@@ -2145,10 +2131,12 @@ function buildTranscriptionPipeline({ context }) {
   const nodes = [];
   const edges = [];
   const inputNode = makeNode('audioInput', 0, {}, 'Source audio');
-  const whisperNode = makeNode('whisperTranscribe', 1, { model: 'base' }, 'Transcribe audio');
+  const whisperNode = makeNode('llmPrompt', 1, buildLlmStepConfig(PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, { executionMode: 'localTool', toolId: 'whisper', model: 'base', providerId: '' }, '', {
+    instruction: 'Transcribe the connected source audio into text.',
+  }), 'Transcribe audio');
   const outputNode = makeOutputNode('text', 2, 'Transcript');
   nodes.push(inputNode, whisperNode, outputNode);
-  connect(edges, inputNode, 'audio', whisperNode, 'audio');
+  connect(edges, inputNode, 'audio', whisperNode, 'prompt');
   connect(edges, whisperNode, 'text', outputNode, 'text');
   return {
     nodes,
@@ -2282,15 +2270,6 @@ function makeOperationModelStepNode(index, operationId, outputKind, context, wiz
 
 function makeImageGenerationNode(index, context, wizardTarget, intent) {
   const target = chooseTargetForOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE, context, wizardTarget);
-  if (target.executionMode === 'localImageNode') {
-    return {
-      node: makeNode('imageGenerate', index, { toolId: target.toolId }, 'Generate image'),
-      outputPortId: 'image',
-      target,
-      warnings: [],
-    };
-  }
-
   return {
     node: makeNode('llmPrompt', index, buildLlmStepConfig(PIPELINE_OPERATION_IDS.IMAGE_GENERATE, target, intent, {
       instruction: 'Generate an image from the connected approved scene prompt. Leave detailed image settings editable for manual refinement.',
@@ -2305,7 +2284,7 @@ function makeImageGenerationNode(index, context, wizardTarget, intent) {
 
 function makeCollectionMapImageNode(index, context, wizardTarget, intent) {
   const target = chooseTargetForOperation(PIPELINE_OPERATION_IDS.IMAGE_GENERATE, context, wizardTarget);
-  const config = target.executionMode === 'localImageNode'
+  const config = target.executionMode === 'localTool'
     ? {
         executionMode: 'localTool',
         operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
@@ -2315,7 +2294,7 @@ function makeCollectionMapImageNode(index, context, wizardTarget, intent) {
     : buildLlmStepConfig(PIPELINE_OPERATION_IDS.IMAGE_GENERATE, target, intent, {
         instruction: 'Generate one image for each text item while preserving the source order. Leave detailed image settings editable for manual refinement.',
       });
-  if (target.executionMode === 'localImageNode') {
+  if (target.executionMode === 'localTool') {
     config.providerId = '';
     config.model = '';
   }
@@ -2434,7 +2413,7 @@ function resultCoversStoryboardVideoDepth(result) {
     accumulator[node.type] = Number(accumulator[node.type] || 0) + 1;
     return accumulator;
   }, {});
-  const hasImageGeneration = nodes.some((node) => node.type === 'imageGenerate' || node.type === 'collectionMap' || (node.type === 'llmPrompt' && node.config?.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
+  const hasImageGeneration = nodes.some((node) => node.type === 'collectionMap' || (node.type === 'llmPrompt' && node.config?.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE));
   return Number(typeCounts.validation || 0) >= 2
     && Number(typeCounts.retryLoop || 0) >= 2
     && hasImageGeneration
@@ -2753,7 +2732,7 @@ function getTargetOperationInputKinds(target = {}, operationId, context = {}) {
   if (target.executionMode === 'ollama') {
     return getToolPipelineOperation('ollama', operationId)?.inputKinds || [];
   }
-  if (target.executionMode === 'localTool' || target.executionMode === 'localImageNode') {
+  if (target.executionMode === 'localTool' || target.executionMode === 'localTool') {
     return getToolPipelineOperation(target.toolId, operationId)?.inputKinds || [];
   }
   if (target.executionMode === 'cloud') {
@@ -3054,9 +3033,9 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
         warnings.push('Skipped audio transcription because it needs an audio source artifact.');
         continue;
       }
-      const whisperNode = makeNode('whisperTranscribe', nodes.length, { model: 'base' }, 'Transcribe audio');
+      const whisperNode = makeNode('llmPrompt', nodes.length, buildLlmStepConfig(PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, { executionMode: 'localTool', toolId: 'whisper', model: 'base', providerId: '' }, '', { instruction: 'Transcribe the connected source audio into text.' }), 'Transcribe audio');
       nodes.push(whisperNode);
-      connect(edges, inputArtifact.node, inputArtifact.portId, whisperNode, 'audio');
+      connect(edges, inputArtifact.node, inputArtifact.portId, whisperNode, 'prompt');
       stagePrimaryNodes.set(stage.id, whisperNode);
       operationTargets.push({ nodeLabel: whisperNode.label, operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, target: { executionMode: 'localTool', toolId: 'whisper', model: 'base', providerId: '' } });
       if (!getToolEntry(context, 'whisper')) warnings.push('Install Whisper before this transcription draft can run.');
@@ -3192,7 +3171,7 @@ function buildFlexibleGraphPipeline({ intent, plan, context, wizardTarget }) {
                 providerId: node.config?.providerId,
                 toolId: '',
               }
-            : node.type === 'imageGenerate' || node.type === 'graphWorkflow'
+            : node.type === 'graphWorkflow'
               ? { executionMode: 'localTool', model: '', providerId: '', toolId: node.config?.toolId || '' }
               : null,
       } : null;

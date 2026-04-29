@@ -29,6 +29,7 @@ const {
   downloadModel,
   getModelDownloadPreflight,
   listDownloadedModels,
+  listToolAssets,
   readModelSettings,
   saveModelManagerSettings,
   supportsModelManager,
@@ -86,6 +87,7 @@ const { cancelPipelineRun, getActiveRunSnapshot, resumePipelineValidation, runPi
 const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./services/pipelineStoreService');
 const { deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
 const { redactSensitiveText } = require('./services/redactionService');
+const { appendLog } = require('./services/logService');
 
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
@@ -829,6 +831,19 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(buildAppState, 'Local AI Hub could not refresh the dashboard.'),
   );
 
+  ipcMain.handle('app:log-renderer-event', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const level = String(payload?.level || 'error').trim().toLowerCase();
+      const message = String(payload?.message || 'Renderer event').trim() || 'Renderer event';
+      const normalizedLevel = ['info', 'warn', 'error'].includes(level) ? level : 'error';
+      const logPath = await appendLog('renderer', normalizedLevel, message, {
+        context: payload?.context || {},
+        source: String(payload?.source || 'renderer').trim() || 'renderer',
+      });
+      return { ok: true, logPath };
+    }, 'Local AI Hub could not record the renderer diagnostic.'),
+  );
+
   ipcMain.handle('app:get-live-resources', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const { managedRoot } = getAppPaths();
@@ -1360,6 +1375,14 @@ function registerIpcHandlers() {
       const tool = modelToolLookup(payload.toolId, state.tools);
       return listDownloadedModels(tool);
     }, 'Local AI Hub could not load the downloaded models for that tool.'),
+  );
+
+  ipcMain.handle('models:list-tool-assets', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = modelToolLookup(payload.toolId, state.tools);
+      return listToolAssets(tool, payload || {});
+    }, 'Local AI Hub could not refresh the local tool assets for that pipeline step.'),
   );
 
   ipcMain.handle('models:get-download-preflight', (_event, payload) =>

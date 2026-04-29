@@ -45,11 +45,104 @@ function createAnimatedGifBuffer() {
   ]);
 }
 
+function createWanTool(overrides = {}) {
+  return {
+    appDir: 'C:/mock/wan21',
+    compatibility: {
+      minimumRamMb: 32768,
+      minimumVramMb: 12288,
+      recommendedRamMb: 65536,
+      recommendedVramMb: 16384,
+    },
+    downloadedModels: [
+      {
+        id: 'wan21-webui:Model:Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors',
+        fileName: 'diffusion_pytorch_model.safetensors',
+        modelType: 'Model',
+        name: 'diffusion_pytorch_model',
+        relativePath: 'Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors',
+      },
+    ],
+    id: 'wan21-webui',
+    installDir: 'C:/mock/wan21',
+    launchProfile: { kind: 'python-script', pythonPath: 'C:/mock/python.exe' },
+    name: 'Wan2.1 WebUI',
+    status: 'stopped',
+    ...overrides,
+  };
+}
+
+function createTextToVideoPipeline(config = {}) {
+  return {
+    id: 'wan-text-video-pipeline',
+    name: 'Wan Text Video Pipeline',
+    nodes: [
+      { id: 'text-input', type: 'textInput', label: 'Prompt', config: { text: 'A sunrise over a quiet city.' } },
+      {
+        id: 'video-step',
+        type: 'llmPrompt',
+        label: 'Wan Video Step',
+        config: {
+          executionMode: 'localTool',
+          operationId: pipelineSchema.PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+          toolId: 'wan21-webui',
+          videoSize: '832x480',
+          ...config,
+        },
+      },
+      { id: 'video-output', type: 'videoOutput', label: 'Video Output', config: { title: 'Wan video' } },
+    ],
+    edges: [
+      { id: 'edge-prompt', source: { nodeId: 'text-input', portId: 'text' }, target: { nodeId: 'video-step', portId: 'prompt' } },
+      { id: 'edge-video', source: { nodeId: 'video-step', portId: 'video' }, target: { nodeId: 'video-output', portId: 'video' } },
+    ],
+  };
+}
+
+function createImageToVideoPipeline(config = {}) {
+  return {
+    id: 'wan-image-video-pipeline',
+    name: 'Wan Image Video Pipeline',
+    nodes: [
+      { id: 'image-input', type: 'imageInput', label: 'Source Image', config: { filePath: 'C:/mock/source.png' } },
+      {
+        id: 'video-step',
+        type: 'llmPrompt',
+        label: 'Wan Image Video Step',
+        config: {
+          executionMode: 'localTool',
+          instruction: 'Slow cinematic push-in with soft light.',
+          operationId: pipelineSchema.PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+          toolId: 'wan21-webui',
+          videoSize: '832x480',
+          ...config,
+        },
+      },
+      { id: 'video-output', type: 'videoOutput', label: 'Video Output', config: { title: 'Wan image video' } },
+    ],
+    edges: [
+      { id: 'edge-image', source: { nodeId: 'image-input', portId: 'image' }, target: { nodeId: 'video-step', portId: 'prompt' } },
+      { id: 'edge-video', source: { nodeId: 'video-step', portId: 'video' }, target: { nodeId: 'video-output', portId: 'video' } },
+    ],
+  };
+}
+
+function analyzeWanPipeline(pipeline, options = {}) {
+  const tool = createWanTool(options.tool || {});
+  return pipelineSchema.analyzePipeline(pipeline, {
+    hardware: options.hardware || { gpuModel: 'NVIDIA GTX 1060', systemRamMb: 16384, vramMb: 6144 },
+    toolCatalog: [tool],
+    tools: options.tools || [tool],
+  });
+}
+
+
 async function verifyCapabilityRegistration() {
   const wanOperation = pipelineCapabilities.getToolPipelineOperation('wan21-webui', pipelineCapabilities.PIPELINE_OPERATION_IDS.VIDEO_GENERATE);
   assert(wanOperation, 'Expected Wan to advertise a video generation capability.');
   assert.deepStrictEqual(wanOperation.inputKinds, ['text', 'image'], 'Expected Wan to accept text or image input for video generation.');
   assert.deepStrictEqual(wanOperation.outputKinds, ['video'], 'Expected Wan to produce video output.');
+  assert.deepStrictEqual(wanOperation.operationSubtypes, ['text-to-video', 'image-to-video'], 'Expected Wan to expose text-to-video and image-to-video generation modes.');
   assert(pipelineSchema.VIDEO_WORKFLOW_TOOL_IDS.includes('wan21-webui'), 'Expected the pipeline schema to expose Wan as an operation-driven video tool.');
 }
 
@@ -132,6 +225,7 @@ async function verifyLocalVideoService() {
           fileName: path.basename(filePath),
           kind: options.kind || 'video',
           role: options.role || 'generated',
+          videoGeneration: options.videoGeneration || null,
           summary: path.basename(filePath),
         }),
         summarizeArtifact: (artifact) => artifact?.summary || '',
@@ -166,6 +260,40 @@ async function verifyLocalVideoService() {
   assert.strictEqual(requestPayloads[0].size, '832x480', 'Expected the local video request to preserve the selected video size.');
   assert.strictEqual(result.outputs.video.kind, 'video', 'Expected the local video service to return a video artifact.');
   assert(fs.existsSync(result.outputs.video.filePath), 'Expected the stubbed local video output file to exist.');
+  assert.strictEqual(requestPayloads[0].generationMode, 'text-to-video', 'Expected the Wan request to mark text-to-video mode.');
+  assert.strictEqual(result.outputs.video.videoGeneration.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.VIDEO_GENERATE, 'Expected the local video artifact to preserve the operation id.');
+  assert.strictEqual(result.outputs.video.videoGeneration.operationSubtype, 'text-to-video', 'Expected the local video artifact to preserve text-to-video subtype.');
+  assert.strictEqual(result.outputs.video.videoGeneration.toolId, 'wan21-webui', 'Expected the local video artifact to preserve the producing tool id.');
+
+  const imageResult = await generateVideoWithLocalVideoTool(
+    {
+      appDir: tempDir,
+      id: 'wan21-webui',
+      launchProfile: { pythonPath: 'python' },
+      name: 'Wan2.1 WebUI',
+    },
+    {
+      displayName: 'Image Video Step',
+      nodeLabel: 'Image Video Step',
+      prompt: 'Slow cinematic push-in.',
+      referenceImagePath: path.join(tempDir, 'source.png'),
+      reportProgress: () => {},
+      runDirectories: {
+        artifactsDir: tempDir,
+      },
+      size: '832x480',
+      sourceImageArtifact: {
+        displayName: 'Source Image',
+        fileName: 'source.png',
+        filePath: path.join(tempDir, 'source.png'),
+        kind: 'image',
+      },
+    },
+  );
+
+  assert.strictEqual(requestPayloads[1].generationMode, 'image-to-video', 'Expected the Wan request to mark image-to-video mode.');
+  assert.strictEqual(imageResult.outputs.video.videoGeneration.operationSubtype, 'image-to-video', 'Expected the local video artifact to preserve image-to-video subtype.');
+  assert.strictEqual(imageResult.outputs.video.videoGeneration.sourceImage.fileName, 'source.png', 'Expected the local video artifact to preserve source image lineage.');
 }
 
 async function verifyComfyUiVideoExecution() {
@@ -401,6 +529,99 @@ async function verifyComfyUiAnimatedVideoExecution() {
   }
 }
 
+
+async function verifyVideoGenerationArtifactMetadata() {
+  const tempDir = path.resolve(__dirname, '..', 'temp', 'video-generation-metadata-test');
+  await fsp.mkdir(tempDir, { recursive: true });
+  const videoPath = path.join(tempDir, 'wan-output.mp4');
+  await fsp.writeFile(videoPath, Buffer.from('video-output'));
+
+  const { buildFileArtifact, copyArtifactToOutput } = loadModuleWithStubs('electron/services/pipelineArtifactService.js', {
+    '/electron/services/pipelineArtifactService.js': {
+      './configService': {
+        ensureStorage: async () => {},
+        getAppPaths: () => ({ runtimesRoot: tempDir }),
+      },
+    },
+  });
+
+  const artifact = await buildFileArtifact(videoPath, {
+    displayName: 'Wan Video',
+    kind: 'video',
+    role: 'generated',
+    videoGeneration: {
+      backend: 'local-video',
+      fps: 15,
+      model: 'Wan2.1-T2V-1.3B',
+      operationId: pipelineSchema.PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      operationSubtype: 'text-to-video',
+      prompt: 'A sunrise over a quiet city.',
+      seed: 7,
+      size: '832x480',
+      steps: 12,
+      toolId: 'wan21-webui',
+      toolLabel: 'Wan2.1 WebUI',
+    },
+  });
+
+  assert.strictEqual(artifact.kind, 'video', 'Expected Wan artifacts to stay video-typed.');
+  assert.strictEqual(artifact.videoGeneration.operationSubtype, 'text-to-video', 'Expected generated video metadata to preserve the operation subtype.');
+  assert(artifact.summary.includes('text to video'), 'Expected generated video summary to include the operation mode.');
+
+  const outputDir = path.join(tempDir, 'pipeline-runs', 'run-video-output', 'outputs');
+  await fsp.mkdir(outputDir, { recursive: true });
+  const saved = await copyArtifactToOutput(artifact, { outputsDir: outputDir }, { title: 'Final Wan Video' });
+  const sidecarPath = saved.metadataPaths.find((entry) => entry.endsWith('.video.json'));
+  assert(sidecarPath, 'Expected generated video outputs to save a video metadata sidecar.');
+  const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
+  assert.strictEqual(sidecar.videoGeneration.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.VIDEO_GENERATE, 'Expected the saved video sidecar to preserve the operation id.');
+  assert.strictEqual(sidecar.videoGeneration.operationSubtype, 'text-to-video', 'Expected the saved video sidecar to preserve the operation subtype.');
+
+  const { listPipelineOutputs } = loadModuleWithStubs('electron/services/pipelineOutputStoreService.js', {
+    '/electron/services/pipelineArtifactService.js': {
+      './configService': {
+        ensureStorage: async () => {},
+        getAppPaths: () => ({ runtimesRoot: tempDir }),
+      },
+    },
+    '/electron/services/pipelineOutputStoreService.js': {
+      './configService': {
+        ensureStorage: async () => {},
+        getAppPaths: () => ({ runtimesRoot: tempDir }),
+      },
+    },
+  });
+  const discoveredOutputs = await listPipelineOutputs();
+  const runOutputs = discoveredOutputs.filter((entry) => entry.runId === 'run-video-output');
+  assert(runOutputs.some((entry) => entry.kind === 'video' && entry.outputPath === saved.destinationPath), 'Expected the Outputs manager to list the final video output.');
+  assert(!runOutputs.some((entry) => entry.outputPath.endsWith('.video.json')), 'Expected the Outputs manager to hide video metadata sidecars.');
+}
+
+function verifyWanReadinessStates() {
+  const textAnalysis = analyzeWanPipeline(createTextToVideoPipeline());
+  const textSummary = textAnalysis.nodeSummaries['video-step'];
+  assert.deepStrictEqual(textSummary.capabilitySummary.operationSubtypes, ['text-to-video', 'image-to-video'], 'Expected Wan capability summary to expose video generation modes.');
+  assert.strictEqual(textSummary.readiness.tone, 'warn', 'Expected GTX 1060-class Wan readiness to warn instead of looking comfortable.');
+  assert(/text-to-video|CUDA toolkit|model folders/i.test(textSummary.readiness.message), 'Expected Wan text readiness to name mode and runtime requirements.');
+  assert.strictEqual(textAnalysis.compatibilitySummary.tone, 'danger', 'Expected Wan workflow compatibility to remain below spec on GTX 1060-class hardware.');
+
+  const imageMissingMotion = analyzeWanPipeline(createImageToVideoPipeline({ instruction: '' }), { hardware: { gpuModel: 'NVIDIA RTX 4090', systemRamMb: 65536, vramMb: 24576 } });
+  assert.strictEqual(imageMissingMotion.nodeSummaries['video-step'].readiness.tone, 'error', 'Expected Wan image-to-video to require motion guidance.');
+  assert(/motion guidance/i.test(imageMissingMotion.nodeSummaries['video-step'].readiness.message), 'Expected missing image-to-video guidance to be actionable.');
+
+  const imageReady = analyzeWanPipeline(createImageToVideoPipeline(), { hardware: { gpuModel: 'NVIDIA RTX 4090', systemRamMb: 65536, vramMb: 24576 } });
+  assert.strictEqual(imageReady.nodeSummaries['video-step'].readiness.tone, 'info', 'Expected configured Wan image-to-video to be structurally ready on high-end mock hardware.');
+  assert(/image-to-video/i.test(imageReady.nodeSummaries['video-step'].readiness.message), 'Expected Wan image readiness to name image-to-video mode.');
+
+  const missingModels = analyzeWanPipeline(createTextToVideoPipeline(), { tool: { downloadedModels: [] }, hardware: { gpuModel: 'NVIDIA RTX 4090', systemRamMb: 65536, vramMb: 24576 } });
+  assert.strictEqual(missingModels.nodeSummaries['video-step'].readiness.tone, 'error', 'Expected Wan readiness to block when model assets are known missing.');
+  assert(/models\\Wan-AI|model assets/i.test(missingModels.nodeSummaries['video-step'].readiness.message), 'Expected missing Wan models to point at the model folder.');
+
+  const unsupportedTool = analyzeWanPipeline(createTextToVideoPipeline({ toolId: 'comfyui' }), { tools: [createWanTool(), { id: 'comfyui', name: 'ComfyUI', status: 'stopped' }] });
+  assert.strictEqual(unsupportedTool.nodeSummaries['video-step'].readiness.tone, 'error', 'Expected unsupported video tool selection to fail honestly.');
+  assert(/does not support video generation/i.test(unsupportedTool.nodeSummaries['video-step'].readiness.message), 'Expected unsupported video tool selection to explain the unsupported local video path.');
+}
+
 async function verifyDirectVideoOrchestrationBypass() {
   let launchCalls = 0;
   const { createPipelineToolOrchestrator } = loadModuleWithStubs('electron/services/pipelineToolOrchestrationService.js', {
@@ -456,6 +677,8 @@ async function main() {
   verifyComfyUiVideoContracts();
   await verifyAnimatedArtifactSemantics();
   await verifyLocalVideoService();
+  await verifyVideoGenerationArtifactMetadata();
+  verifyWanReadinessStates();
   await verifyComfyUiVideoExecution();
   await verifyComfyUiAnimatedVideoExecution();
   await verifyDirectVideoOrchestrationBypass();

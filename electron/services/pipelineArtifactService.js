@@ -431,6 +431,8 @@ function serializeAudioGenerationForUi(generation = null) {
     durationSeconds,
     mode: String(generation.mode || '').trim(),
     model: String(generation.model || '').trim(),
+    operationId: String(generation.operationId || '').trim(),
+    operationSubtype: String(generation.operationSubtype || generation.mode || '').trim(),
     prompt: String(generation.prompt || '').trim(),
     sourceAudio: serializeAudioSourceReference(generation.sourceAudio),
     voice: String(generation.voice || '').trim(),
@@ -458,6 +460,8 @@ function serializeAudioTransformationForUi(transformation = null) {
     durationSeconds,
     instruction: String(transformation.instruction || '').trim(),
     model: String(transformation.model || '').trim(),
+    operationId: String(transformation.operationId || '').trim(),
+    operationSubtype: String(transformation.operationSubtype || transformation.transformationType || '').trim(),
     sourceAudio: serializeAudioSourceReference(transformation.sourceAudio),
     targetVoice: String(transformation.targetVoice || '').trim(),
     toolId: String(transformation.toolId || '').trim(),
@@ -504,12 +508,49 @@ function serializeImageTransformationForUi(transformation = null) {
     backendLabel: String(transformation.backendLabel || '').trim(),
     instruction: String(transformation.instruction || '').trim(),
     model: String(transformation.model || '').trim(),
+    operationId: String(transformation.operationId || '').trim(),
     referenceImage: serializeImageSourceReference(transformation.referenceImage),
     scale: scale > 0 ? scale : null,
     sourceImage: serializeImageSourceReference(transformation.sourceImage),
     toolId: String(transformation.toolId || '').trim(),
     toolLabel: String(transformation.toolLabel || '').trim(),
     transformationType: String(transformation.transformationType || '').trim(),
+    transformSubtype: String(transformation.transformSubtype || transformation.transformationType || '').trim(),
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
+function serializeVideoGenerationForUi(generation = null) {
+  if (!generation || typeof generation !== 'object') {
+    return null;
+  }
+
+  const fps = Number(generation.fps || 0) || 0;
+  const seed = Number(generation.seed || 0);
+  const steps = Number(generation.steps || 0) || 0;
+  const normalized = {
+    backend: String(generation.backend || '').trim(),
+    backendLabel: String(generation.backendLabel || '').trim(),
+    fps: fps > 0 ? fps : null,
+    mode: String(generation.mode || generation.operationSubtype || '').trim(),
+    model: String(generation.model || '').trim(),
+    negativePrompt: String(generation.negativePrompt || '').trim(),
+    operationId: String(generation.operationId || '').trim(),
+    operationSubtype: String(generation.operationSubtype || generation.mode || '').trim(),
+    prompt: String(generation.prompt || '').trim(),
+    seed: Number.isFinite(seed) ? seed : null,
+    size: String(generation.size || '').trim(),
+    sourceImage: serializeImageSourceReference(generation.sourceImage),
+    steps: steps > 0 ? steps : null,
+    toolId: String(generation.toolId || '').trim(),
+    toolLabel: String(generation.toolLabel || '').trim(),
+    usedReferenceImage: Boolean(generation.usedReferenceImage),
   };
 
   return Object.entries(normalized).some(([, value]) => {
@@ -899,7 +940,7 @@ function summarizeArtifact(artifact, limit = 180) {
       formatDurationSummary(audio?.durationSeconds || generation?.durationSeconds || transformation?.durationSeconds),
       audio?.sampleRate ? `${audio.sampleRate} Hz` : '',
       buildAudioChannelLabel(audio?.channelCount),
-      transformation?.transformationType ? transformation.transformationType.replace(/-/g, ' ') : '',
+      (transformation?.transformSubtype || transformation?.transformationType) ? String(transformation.transformSubtype || transformation.transformationType).replace(/-/g, ' ') : '',
       transformation?.toolLabel || transformation?.backendLabel || '',
       transformation?.targetVoice ? `Voice ${transformation.targetVoice}` : '',
       transformation?.sourceAudio?.fileName ? `Source ${transformation.sourceAudio.fileName}` : '',
@@ -917,7 +958,7 @@ function summarizeArtifact(artifact, limit = 180) {
       artifact.fileName || artifact.displayName || '',
       artifact.formatLabel || '',
       artifact.width && artifact.height ? `${artifact.width}x${artifact.height}` : '',
-      transformation?.transformationType ? transformation.transformationType.replace(/-/g, ' ') : '',
+      (transformation?.transformSubtype || transformation?.transformationType) ? String(transformation.transformSubtype || transformation.transformationType).replace(/-/g, ' ') : '',
       transformation?.toolLabel || transformation?.backendLabel || '',
       transformation?.scale ? `${transformation.scale}x scale` : '',
       transformation?.sourceImage?.fileName ? `Target ${transformation.sourceImage.fileName}` : '',
@@ -944,6 +985,21 @@ function summarizeArtifact(artifact, limit = 180) {
     return trimPreviewText(details.join(' | '), limit);
   }
 
+  if (artifact.kind === PORT_KIND_VIDEO && artifact.videoGeneration && typeof artifact.videoGeneration === 'object') {
+    const generation = artifact.videoGeneration;
+    const details = [
+      artifact.fileName || artifact.displayName || '',
+      artifact.formatLabel || '',
+      generation.size || (artifact.width && artifact.height ? artifact.width + 'x' + artifact.height : ''),
+      generation.fps ? generation.fps + ' fps' : '',
+      generation.operationSubtype ? String(generation.operationSubtype).replace(/-/g, ' ') : 'local video generation',
+      generation.toolLabel || generation.backendLabel || '',
+      generation.model ? 'Model ' + generation.model : '',
+      generation.sourceImage?.fileName ? 'Source ' + generation.sourceImage.fileName : '',
+    ].filter(Boolean);
+    return trimPreviewText(details.join(' | '), limit);
+  }
+
   const details = [];
   if (artifact.fileName) {
     details.push(artifact.fileName);
@@ -965,6 +1021,34 @@ function summarizeArtifact(artifact, limit = 180) {
 
 function serializeArtifactForUi(artifact) {
   return artifact ? JSON.parse(JSON.stringify(artifact)) : null;
+}
+
+function applyFinalOutputMetadata(artifact, options = {}) {
+  if (!artifact || typeof artifact !== 'object') {
+    return artifact;
+  }
+
+  const outputLabel = String(options.outputLabel || options.title || artifact.displayName || artifact.fileName || 'Output').trim() || 'Output';
+  artifact.artifactRole = 'final';
+  artifact.isFinalOutput = true;
+  artifact.outputKind = String(options.outputKind || artifact.kind || '').trim();
+  artifact.outputLabel = outputLabel;
+
+  const outputNodeId = String(options.outputNodeId || '').trim();
+  const outputPortId = String(options.outputPortId || '').trim();
+  const runId = String(options.runId || '').trim();
+  if (outputNodeId) {
+    artifact.outputNodeId = outputNodeId;
+  }
+  if (outputPortId) {
+    artifact.outputPortId = outputPortId;
+  }
+  if (runId) {
+    artifact.runId = runId;
+  }
+
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
 }
 
 function createArtifactCollection(items, options = {}) {
@@ -1221,6 +1305,13 @@ async function buildFileArtifact(filePath, options = {}) {
     const imageTransformation = serializeImageTransformationForUi(options.imageTransformation);
     if (imageTransformation) {
       artifact.imageTransformation = imageTransformation;
+    }
+  }
+
+  if (kind === PORT_KIND_VIDEO || String(mimeType || '').toLowerCase().startsWith('video/')) {
+    const videoGeneration = serializeVideoGenerationForUi(options.videoGeneration);
+    if (videoGeneration) {
+      artifact.videoGeneration = videoGeneration;
     }
   }
 
@@ -1515,11 +1606,13 @@ async function saveVideoArtifactMetadata(filePath, artifact) {
   const compositionExport = artifact?.compositionExport && typeof artifact.compositionExport === 'object'
     ? serializeArtifactForUi(artifact.compositionExport)
     : null;
-  if (!compositionExport) {
+  const videoGeneration = serializeVideoGenerationForUi(artifact?.videoGeneration);
+  if (!compositionExport && !videoGeneration) {
     return [];
   }
 
-  const metadataPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.composition-export.json`);
+  const suffix = videoGeneration ? '.video.json' : '.composition-export.json';
+  const metadataPath = path.join(path.dirname(filePath), path.basename(filePath, path.extname(filePath)) + suffix);
   await fs.writeJson(metadataPath, {
     compositionExport,
     displayName: String(artifact?.displayName || '').trim(),
@@ -1527,6 +1620,7 @@ async function saveVideoArtifactMetadata(filePath, artifact) {
     formatLabel: String(artifact?.formatLabel || '').trim(),
     kind: String(artifact?.kind || PORT_KIND_VIDEO).trim() || PORT_KIND_VIDEO,
     summary: String(artifact?.summary || '').trim(),
+    videoGeneration,
   }, { spaces: 2 });
 
   return [metadataPath];
@@ -1577,6 +1671,7 @@ async function saveArtifactIntoDirectory(directoryPath, artifact, options = {}) 
     compositionExport: artifact.compositionExport,
     displayName: artifact.displayName || options.baseName || path.basename(filePath),
     imageTransformation: artifact.imageTransformation,
+    videoGeneration: artifact.videoGeneration,
     kind: artifact.kind,
     role: options.role || artifact.role || 'artifact',
   });
@@ -1669,12 +1764,22 @@ async function persistCompositionArtifact(runDirectories, artifact, options = {}
     metadataPaths: [manifestPath],
     role: options.role || artifact?.role || (options.target === 'outputs' ? 'output' : 'artifact'),
   });
+  if (options.isFinalOutput) {
+    applyFinalOutputMetadata(savedComposition, options);
+  }
 
   await fs.writeJson(manifestPath, {
+    artifactRole: savedComposition.artifactRole || '',
     composition: serializeArtifactForUi(savedComposition.composition),
     displayName: savedComposition.displayName,
+    isFinalOutput: Boolean(savedComposition.isFinalOutput),
     kind: PORT_KIND_COMPOSITION,
+    outputKind: savedComposition.outputKind || '',
+    outputLabel: savedComposition.outputLabel || '',
+    outputNodeId: savedComposition.outputNodeId || '',
+    outputPortId: savedComposition.outputPortId || '',
     role: savedComposition.role,
+    runId: savedComposition.runId || '',
     schemaVersion: 1,
     summary: savedComposition.summary,
     trackCount: savedComposition.trackCount,
@@ -1730,15 +1835,25 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
     metadataPaths: [manifestPath],
     role: options.role || artifact?.role || (options.target === 'outputs' ? 'output' : 'artifact'),
   });
+  if (options.isFinalOutput) {
+    applyFinalOutputMetadata(savedCollection, options);
+  }
 
   await fs.writeJson(manifestPath, {
     schemaVersion: 1,
+    artifactRole: savedCollection.artifactRole || '',
     kind: PORT_KIND_COLLECTION,
+    isFinalOutput: Boolean(savedCollection.isFinalOutput),
     itemCount: savedCollection.itemCount,
     itemKind: savedCollection.itemKind,
     displayName: savedCollection.displayName,
     order: savedCollection.order,
+    outputKind: savedCollection.outputKind || '',
+    outputLabel: savedCollection.outputLabel || '',
+    outputNodeId: savedCollection.outputNodeId || '',
+    outputPortId: savedCollection.outputPortId || '',
     role: savedCollection.role,
+    runId: savedCollection.runId || '',
     summary: savedCollection.summary,
     accumulation: savedCollection.accumulation ? serializeArtifactForUi(savedCollection.accumulation) : null,
     items: savedCollection.items.map((entry) => buildCollectionManifestItem(entry, directoryPath)),
@@ -1749,10 +1864,20 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
 
 async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
   const title = String(options.title || artifact?.displayName || 'result').trim() || 'result';
+  const finalOutputOptions = {
+    isFinalOutput: true,
+    outputKind: String(options.outputKind || artifact?.kind || '').trim(),
+    outputLabel: title,
+    outputNodeId: String(options.outputNodeId || '').trim(),
+    outputPortId: String(options.outputPortId || '').trim(),
+    runId: String(options.runId || '').trim(),
+    title,
+  };
   if (isCompositionArtifact(artifact)) {
     return persistCompositionArtifact(runDirectories, artifact, {
       baseName: title,
       displayName: title,
+      ...finalOutputOptions,
       role: 'output',
       target: 'outputs',
       title,
@@ -1765,6 +1890,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
       copyItems: true,
       displayName: title,
       itemRole: 'output',
+      ...finalOutputOptions,
       role: 'output',
       target: 'outputs',
       title,
@@ -1822,7 +1948,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     savedArtifact.mimeType = 'application/json';
     savedArtifact.destinationPath = filePath;
     savedArtifact.sourcePath = artifact.filePath || '';
-    savedArtifact.summary = summarizeArtifact(savedArtifact);
+    applyFinalOutputMetadata(savedArtifact, finalOutputOptions);
     return savedArtifact;
   }
 
@@ -1842,7 +1968,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     savedArtifact.mimeType = 'text/plain';
     savedArtifact.destinationPath = filePath;
     savedArtifact.sourcePath = artifact.filePath || '';
-    savedArtifact.summary = summarizeArtifact(savedArtifact);
+    applyFinalOutputMetadata(savedArtifact, finalOutputOptions);
     return savedArtifact;
   }
 
@@ -1866,6 +1992,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     compositionExport: artifact.compositionExport,
     displayName: title,
     imageTransformation: artifact.imageTransformation,
+    videoGeneration: artifact.videoGeneration,
     kind: artifact.kind,
     role: 'output',
   });
@@ -1874,7 +2001,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
   }
   savedArtifact.destinationPath = filePath;
   savedArtifact.sourcePath = sourcePath;
-  savedArtifact.summary = summarizeArtifact(savedArtifact);
+  applyFinalOutputMetadata(savedArtifact, finalOutputOptions);
   return savedArtifact;
 }
 
@@ -1893,6 +2020,7 @@ function buildTerminalResult(node, artifact) {
     destinationPath: artifact?.destinationPath || artifact?.directoryPath || artifact?.filePath || '',
     directoryPath: artifact?.directoryPath || '',
     imageTransformation: artifact?.imageTransformation ? serializeArtifactForUi(artifact.imageTransformation) : null,
+    videoGeneration: artifact?.videoGeneration ? serializeArtifactForUi(artifact.videoGeneration) : null,
     filePath: artifact?.filePath || '',
     fileUrl: artifact?.fileUrl || '',
     itemCount: Number(artifact?.itemCount || 0) || 0,
@@ -2110,7 +2238,7 @@ async function describeArtifactForLlm(artifact) {
     artifact.imageTransformation?.backendLabel ? 'Image transformed by: ' + artifact.imageTransformation.backendLabel : '',
     artifact.imageTransformation?.toolLabel ? 'Image transform tool: ' + artifact.imageTransformation.toolLabel : '',
     artifact.imageTransformation?.model ? 'Image transform model: ' + artifact.imageTransformation.model : '',
-    artifact.imageTransformation?.transformationType ? 'Image transform type: ' + artifact.imageTransformation.transformationType : '',
+    artifact.imageTransformation?.transformSubtype ? 'Image transform subtype: ' + artifact.imageTransformation.transformSubtype : artifact.imageTransformation?.transformationType ? 'Image transform type: ' + artifact.imageTransformation.transformationType : '',
     artifact.imageTransformation?.scale ? 'Image transform scale: ' + artifact.imageTransformation.scale + 'x' : '',
     artifact.imageTransformation?.instruction ? 'Image transform note: ' + artifact.imageTransformation.instruction : '',
     artifact.imageTransformation?.sourceImage?.fileName ? 'Target image: ' + artifact.imageTransformation.sourceImage.fileName : '',
@@ -2157,4 +2285,3 @@ module.exports = {
   serializeArtifactForUi,
   summarizeArtifact,
 };
-
