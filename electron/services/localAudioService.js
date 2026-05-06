@@ -8,6 +8,7 @@ try {
 }
 
 const { runCommand } = require('./commandService');
+const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
 const { PIPELINE_OPERATION_IDS, PORT_KIND_AUDIO } = require('../shared/pipelineSchema.cjs');
@@ -123,6 +124,165 @@ function parseCommandJson(stdout, toolLabel) {
   }
 }
 
+function parseCommandMessage(value) {
+  const lines = String(value || '')
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse();
+
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line);
+      const message = String(parsed && parsed.message || '').trim();
+      if (message) {
+        return message;
+      }
+    } catch {
+      // Keep looking for the helper's structured result line.
+    }
+  }
+
+  return '';
+}
+
+function resolveCommandFailureMessage(commandResult, fallbackMessage) {
+  return parseCommandMessage(commandResult?.stdout)
+    || parseCommandMessage(commandResult?.stderr)
+    || firstNonEmptyLine(commandResult?.stdout)
+    || firstNonEmptyLine(commandResult?.stderr)
+    || fallbackMessage;
+}
+
+const AUDIOCRAFT_PIPELINE_IMPORT_CHECKS = Object.freeze([
+  Object.freeze({ label: 'numpy', moduleName: 'numpy' }),
+  Object.freeze({ label: 'torchaudio', moduleName: 'torchaudio' }),
+  Object.freeze({ label: 'audiocraft', moduleName: 'audiocraft' }),
+  Object.freeze({ label: 'audiocraft.data.audio', moduleName: 'audiocraft.data.audio' }),
+  Object.freeze({ label: 'audiocraft.models', moduleName: 'audiocraft.models' }),
+]);
+
+function uniqueNonEmptyStrings(values) {
+  return [...new Set((values || [])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean))];
+}
+
+function buildAudiocraftMissingPipelinePackagesMessage(missingPackages = []) {
+  const uniqueMissing = uniqueNonEmptyStrings(missingPackages);
+  const detail = uniqueMissing.length ? ': ' + uniqueMissing.join(', ') : '';
+  return 'AudioCraft is installed, but its Python environment is missing the packages needed for pipeline audio generation' + detail + '. Run Repair or reinstall AudioCraft WebUI, then try again.';
+}
+
+function buildAudiocraftPipelineLoadFailureMessage() {
+  return 'AudioCraft is installed, but Local AI Hub could not load the Python packages needed for pipeline audio generation. Run Repair or reinstall AudioCraft WebUI, then try again.';
+}
+
+function buildAudiocraftPipelineProbeScript() {
+  const checksJson = JSON.stringify(AUDIOCRAFT_PIPELINE_IMPORT_CHECKS.map((entry) => [entry.moduleName, entry.label]));
+  return [
+    'import importlib, json, sys',
+    'checks = ' + checksJson,
+    'missing = []',
+    'failures = []',
+    'for module_name, label in checks:',
+    '    try:',
+    '        importlib.import_module(module_name)',
+    '    except ModuleNotFoundError as exc:',
+    '        missing.append(str(getattr(exc, "name", "") or label))',
+    '    except Exception as exc:',
+    '        failures.append({"module": module_name, "label": label, "errorType": exc.__class__.__name__})',
+    'payload = {"ready": not missing and not failures, "missing": sorted(set(missing)), "failures": failures}',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
+
+function parseProbeJson(stdout) {
+  const lastLine = String(stdout || '')
+    .trim()
+    .split(/\r?\n/)
+    .reverse()
+    .find(Boolean);
+  if (!lastLine) {
+    return null;
+  }
+  try {
+    return JSON.parse(lastLine);
+  } catch {
+    return null;
+  }
+}
+
+async function checkAudiocraftPipelineReadiness(tool) {
+  const toolLabel = getLocalAudioToolLabel(tool);
+  let toolRoot = '';
+  try {
+    toolRoot = resolveLocalAudioToolRoot(tool);
+  } catch (error) {
+    return {
+      message: error?.message || toolLabel + ' is not installed yet.',
+      ready: false,
+      reason: 'not-installed',
+    };
+  }
+
+  let pythonPath = '';
+  try {
+    pythonPath = await resolveLocalAudioPythonPath(tool);
+  } catch (error) {
+    return {
+      message: error?.message || 'Local AI Hub could not find the Python runtime for ' + toolLabel + '.',
+      ready: false,
+      reason: 'python-missing',
+    };
+  }
+
+  const runtimeEnv = await buildLaunchRuntimeEnv(tool, {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+  }, { launchProfile: tool?.launchProfile || null });
+  const commandResult = await runCommand(pythonPath, ['-c', buildAudiocraftPipelineProbeScript()], {
+    allowFailure: true,
+    cwd: toolRoot,
+    env: runtimeEnv,
+    replaceEnv: true,
+  });
+  const probe = parseProbeJson(commandResult.stdout);
+  if (Number(commandResult.code || 0) === 0 && probe?.ready !== false) {
+    return {
+      message: 'AudioCraft pipeline packages are ready.',
+      ready: true,
+      reason: 'ready',
+    };
+  }
+
+  const missing = uniqueNonEmptyStrings(probe?.missing || []);
+  if (missing.length) {
+    return {
+      message: buildAudiocraftMissingPipelinePackagesMessage(missing),
+      missingPackages: missing,
+      ready: false,
+      reason: 'missing-packages',
+    };
+  }
+
+  return {
+    message: buildAudiocraftPipelineLoadFailureMessage(),
+    ready: false,
+    reason: 'package-load-failed',
+  };
+}
+
+async function assertAudiocraftPipelineReady(tool) {
+  const readiness = await checkAudiocraftPipelineReadiness(tool);
+  if (!readiness.ready) {
+    throw new Error(readiness.message);
+  }
+  return readiness;
+}
+
 async function runLocalAudioTask(tool, payload, reportProgress, progressMessages = {}) {
   const toolId = String(tool?.id || '').trim().toLowerCase();
   const toolLabel = getLocalAudioToolLabel(tool);
@@ -148,17 +308,22 @@ async function runLocalAudioTask(tool, payload, reportProgress, progressMessages
     progressMessages.run || ('Running ' + (payload.nodeLabel || 'this step') + ' with ' + toolLabel + '...'),
   );
 
+  const runtimeEnv = await buildLaunchRuntimeEnv(tool, {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+  }, { launchProfile: tool?.launchProfile || null });
+  await logger.info?.('Local audio helper launch environment prepared.', {
+    launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
+  });
   const commandResult = await runCommand(pythonPath, [helperScript, requestPath], {
     allowFailure: true,
     cwd: toolRoot,
-    env: {
-      PYTHONIOENCODING: 'utf-8',
-      PYTHONUTF8: '1',
-    },
+    env: runtimeEnv,
+    replaceEnv: true,
   });
 
   if (Number(commandResult.code || 0) !== 0) {
-    const message = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout) || toolLabel + ' could not finish the local audio request.';
+    const message = resolveCommandFailureMessage(commandResult, toolLabel + ' could not finish the local audio request.');
     await logger.warn('Local audio helper failed.', {
       message,
       stderr: String(commandResult.stderr || '').trim(),
@@ -217,6 +382,8 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
   if (!runDirectories?.artifactsDir) {
     throw new Error('Local AI Hub could not prepare a pipeline run folder for the local audio output.');
   }
+
+  await assertAudiocraftPipelineReady(tool);
 
   const nodeLabel = String(options.nodeLabel || options.displayName || 'Audio step').trim() || 'Audio step';
   const outputPath = buildAudioOutputPath(runDirectories, nodeLabel, 'wav');
@@ -362,6 +529,16 @@ async function generateAudioWithLocalAudioTool(tool, options = {}) {
 
 module.exports = {
   LOCAL_AUDIO_RUNTIME_MODE_IDS,
+  checkAudiocraftPipelineReadiness,
   generateAudioWithLocalAudioTool,
   getLocalAudioToolRuntimeMode,
+  _test: {
+    AUDIOCRAFT_PIPELINE_IMPORT_CHECKS,
+    buildAudiocraftMissingPipelinePackagesMessage,
+    buildAudiocraftPipelineLoadFailureMessage,
+    buildAudiocraftPipelineProbeScript,
+    parseCommandMessage,
+    parseProbeJson,
+    resolveCommandFailureMessage,
+  },
 };

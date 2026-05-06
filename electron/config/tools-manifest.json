@@ -658,65 +658,6 @@
     }
   },
   {
-    "id": "fooocus",
-    "name": "Fooocus",
-    "description": "A simplified image generation tool optimized for low-VRAM cards and a great starting point for beginners who want something easier than Automatic1111.",
-    "icon": "FO",
-    "category": "Image generation",
-    "downloadUrl": "https://github.com/lllyasviel/Fooocus/releases/download/v2.5.0/Fooocus_win64_2-5-0.7z",
-    "installInstructions": {
-      "kind": "zip",
-      "runtime": "binary",
-      "archiveName": "Fooocus_win64_2-5-0.7z",
-      "installSummary": "Downloads the official Windows Fooocus package, keeps it inside Local AI Hub, and launches its beginner-friendly low-VRAM workflow locally.",
-      "configTargets": [
-        "Fooocus\\presets",
-        "Fooocus\\config.txt"
-      ],
-      "externalBatchCandidates": [
-        "run.bat",
-        "run_anime.bat"
-      ],
-      "externalPythonCandidates": [
-        "python_embeded\\python.exe",
-        "python_embedded\\python.exe"
-      ],
-      "compatibility": {
-        "minimumVramMb": 4096,
-        "recommendedVramMb": 6144,
-        "minimumRamMb": 16384,
-        "recommendedRamMb": 24576
-      }
-    },
-    "launchCommand": "python_embeded\\python.exe -s Fooocus\\entry_with_update.py --listen 127.0.0.1 --port {port} --disable-in-browser",
-    "externalLaunchCommand": "python_embeded\\python.exe -s Fooocus\\entry_with_update.py --listen 127.0.0.1 --port {port} --disable-in-browser",
-    "defaultPort": 7865,
-    "healthCheckPath": "/",
-    "detectionPaths": [
-      "%USERPROFILE%\\Fooocus\\run.bat",
-      "%USERPROFILE%\\Documents\\Fooocus\\run.bat",
-      "%USERPROFILE%\\Downloads\\Fooocus\\run.bat",
-      "%LOCALAPPDATA%\\Fooocus\\run.bat",
-      "%APPDATA%\\Fooocus\\run.bat"
-    ],
-    "discovery": {
-      "folderNames": [
-        "Fooocus",
-        "fooocus",
-        "Fooocus_win64",
-        "Fooocus_win64_2-5-0"
-      ],
-      "markerPaths": [
-        "run.bat",
-        "Fooocus\\launch.py",
-        "Fooocus\\entry_with_update.py"
-      ],
-      "pathExecutables": [],
-      "pythonModules": []
-    },
-    "startupTimeoutMs": 180000
-  },
-  {
     "id": "facefusion",
     "name": "FaceFusion",
     "description": "A local face swap and face enhancement tool with a large community. It lets you handle face swapping and enhancement on your own machine with no data leaving your PC, and a mid to high end GPU is recommended for the best experience.",
@@ -1022,6 +963,32 @@
       "%LOCALAPPDATA%\\Retrieval-based-Voice-Conversion-WebUI\\infer-web.py",
       "%APPDATA%\\Retrieval-based-Voice-Conversion-WebUI\\infer-web.py"
     ],
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "rvc-voice",
+        "taskType": "voice-conversion"
+      },
+      "allowedModelTypes": [
+        "rvc-voice"
+      ],
+      "allowedTaskTypes": [
+        "voice-conversion"
+      ],
+      "targetLayout": {
+        "basePath": "app-dir",
+        "directories": {
+          "RVC Voice Model": "weights"
+        }
+      }
+    },
     "discovery": {
       "folderNames": [
         "Retrieval-based-Voice-Conversion-WebUI",
@@ -1114,11 +1081,19 @@
         },
         {
           "kind": "package",
+          "value": "diffsynth",
+          "message": "Installing the DiffSynth runtime used by Local AI Hub's Wan pipeline adapter."
+        },
+        {
+          "kind": "package",
           "value": "flash_attn",
+          "optional": true,
+          "requiresCudaToolkit": true,
           "pipArgs": [
             "--no-build-isolation"
           ],
-          "message": "Installing flash_attn the way the upstream Wan2.1 install guide recommends."
+          "message": "Trying optional flash_attn acceleration for Wan2.1 WebUI.",
+          "optionalFailureMessage": "Wan2.1 installed without optional flash_attn acceleration. Generation may be slower or more limited, but the install can continue with PyTorch attention fallback."
         },
         {
           "kind": "requirements",
@@ -1140,23 +1115,17 @@
         "recommendedVramMb": 16384,
         "minimumRamMb": 32768,
         "recommendedRamMb": 65536
-      },
-      "preflightChecks": [
-        {
-          "kind": "cuda-toolkit",
-          "message": "Wan2.1 WebUI needs the NVIDIA CUDA toolkit to build flash_attn on Windows. This PC does not currently expose nvcc or CUDA_HOME, so Local AI Hub stopped before attempting a broken install."
-        }
-      ]
+      }
     },
-    "launchCommand": "python gradio/app.py --server-name 127.0.0.1 --server-port {port}",
+    "launchCommand": "python gradio/t2v_1.3B_singleGPU.py",
     "defaultPort": 7860,
     "healthCheckPath": "/",
     "detectionPaths": [
-      "%USERPROFILE%\\Wan2.1\\gradio\\app.py",
-      "%USERPROFILE%\\Documents\\Wan2.1\\gradio\\app.py",
-      "%USERPROFILE%\\Downloads\\Wan2.1\\gradio\\app.py",
-      "%LOCALAPPDATA%\\Wan2.1\\gradio\\app.py",
-      "%APPDATA%\\Wan2.1\\gradio\\app.py"
+      "%USERPROFILE%\\Wan2.1\\gradio\\t2v_1.3B_singleGPU.py",
+      "%USERPROFILE%\\Documents\\Wan2.1\\gradio\\t2v_1.3B_singleGPU.py",
+      "%USERPROFILE%\\Downloads\\Wan2.1\\gradio\\t2v_1.3B_singleGPU.py",
+      "%LOCALAPPDATA%\\Wan2.1\\gradio\\t2v_1.3B_singleGPU.py",
+      "%APPDATA%\\Wan2.1\\gradio\\t2v_1.3B_singleGPU.py"
     ],
     "discovery": {
       "folderNames": [
@@ -1165,11 +1134,38 @@
         "Wan-Video"
       ],
       "markerPaths": [
-        "gradio\\app.py",
+        "gradio\\t2v_1.3B_singleGPU.py",
         "gradio\\vace.py"
       ],
       "pathExecutables": [],
       "pythonModules": []
+    },
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "video",
+        "taskType": "video-generation"
+      },
+      "allowedModelTypes": [
+        "video"
+      ],
+      "allowedTaskTypes": [
+        "video-generation",
+        "image-to-video"
+      ],
+      "targetLayout": {
+        "basePath": "app-dir",
+        "directories": {
+          "Video": "models/Wan-AI"
+        }
+      }
     }
   },
   {
@@ -1194,6 +1190,14 @@
         {
           "kind": "requirements",
           "value": "requirements.txt"
+        },
+        {
+          "kind": "path",
+          "value": ".",
+          "pipArgs": [
+            "--no-deps"
+          ],
+          "message": "Installing the AudioCraft Python package for pipeline generation."
         }
       ],
       "externalPythonCandidates": [
@@ -1231,6 +1235,32 @@
       ],
       "pathExecutables": [],
       "pythonModules": []
+    },
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "audio-speech",
+        "taskType": "audio-speech"
+      },
+      "allowedModelTypes": [
+        "audio-speech"
+      ],
+      "allowedTaskTypes": [
+        "audio-speech"
+      ],
+      "targetLayout": {
+        "basePath": "app-dir",
+        "directories": {
+          "Audio / Speech": "models"
+        }
+      }
     }
   },
   {
@@ -1484,6 +1514,32 @@
     },
     "processNames": [
       "Upscayl.exe"
-    ]
+    ],
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        }
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "upscaler",
+        "taskType": "image-to-image"
+      },
+      "allowedModelTypes": [
+        "upscaler"
+      ],
+      "allowedTaskTypes": [
+        "image-to-image"
+      ],
+      "targetLayout": {
+        "basePath": "app-dir",
+        "directories": {
+          "Upscaler": "resources/models"
+        }
+      }
+    }
   }
 ]

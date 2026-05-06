@@ -342,26 +342,6 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
     };
   }
 
-  if (toolState?.id === 'fooocus' && /memoryerror/i.test(stderr) && /(window\.gradio_config|gradio_config|toorjson|gradio\\templates\\frontend\\index\.html)/i.test(stderr)) {
-    const systemRamGb = formatMemoryGb(hardware?.systemRamMb);
-    const minimumRamGb = formatMemoryGb(toolState?.compatibility?.minimumRamMb);
-    const belowMinimumRam = Number(hardware?.systemRamMb || 0) > 0
-      && Number(toolState?.compatibility?.minimumRamMb || 0) > 0
-      && Number(hardware.systemRamMb) < Number(toolState.compatibility.minimumRamMb);
-    const memoryContext = systemRamGb ? ` This PC currently reports about ${systemRamGb} of system RAM.` : '';
-    const minimumContext = minimumRamGb ? ` Local AI Hub lists Fooocus with a ${minimumRamGb} minimum RAM floor.` : '';
-
-    return {
-      recognized: true,
-      id: 'fooocus-gradio-memoryerror',
-      action: 'none',
-      summary: belowMinimumRam
-        ? `${toolState.name} reached its local URL, but Gradio ran out of memory while rendering the first page. Fooocus hit MemoryError while serializing window.gradio_config.${memoryContext}${minimumContext} This is a real runtime memory limit on this machine, not an install or library-state problem.`
-        : `${toolState.name} reached its local URL, but Gradio ran out of memory while rendering the first page. Fooocus hit MemoryError while serializing window.gradio_config.${memoryContext} This points to a real runtime memory failure inside Fooocus, not an install or library-state problem.`,
-      repairingMessage: null,
-    };
-  }
-
   const missingModule = stderr.match(/ModuleNotFoundError:\s+No module named ['"]([^'"]+)['"]/i);
   if (missingModule && missingModule[1] && missingModule[1].toLowerCase() !== 'torch') {
     return {

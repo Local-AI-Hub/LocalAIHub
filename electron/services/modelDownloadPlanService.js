@@ -1,6 +1,8 @@
 const path = require('path');
 
 const IMAGE_FILE_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
+const AUDIO_PREVIEW_FILE_PATTERN = /\.(wav|mp3|flac|ogg|m4a|aac)$/i;
+const ARCHIVE_FILE_PATTERN = /\.(zip|7z|rar|tar|tgz|tar\.gz)$/i;
 const DOCUMENTATION_FILE_PATTERN = /(?:^|[\\/])(?:README|LICENSE|NOTICE|CHANGELOG)(?:\.[a-z0-9]+)?$/i;
 const CONFIG_ONLY_FILE_PATTERN = /\.(json|ya?ml|txt|md)$/i;
 const DIFFUSERS_COMPONENT_SEGMENTS = new Set([
@@ -17,13 +19,216 @@ const DIFFUSERS_GENERIC_COMPONENT_FILE_PATTERN = /^(?:diffusion_pytorch_model|mo
 const SUPPORT_SEGMENTS = new Set(['assets', 'asset', 'examples', 'example', 'images', 'image', 'media', 'previews', 'preview', 'samples', 'sample']);
 const WEBUI_TOOL_IDS = new Set(['automatic1111', 'forge']);
 const GGUF_TOOL_IDS = new Set(['lmstudio', 'koboldcpp']);
+const RVC_MODEL_FILE_PATTERN = /\.(?:pth|pt)$/i;
+const RVC_INDEX_FILE_PATTERN = /\.index$/i;
+const RVC_CONTEXT_PATTERN = /(?:^|[^a-z0-9])(?:rvc|retrieval[-_\s]*based[-_\s]*voice[-_\s]*conversion|retrieval[-_\s]*voice[-_\s]*conversion|voice[-_\s]*conversion|voice[-_\s]*model|voice[-_\s]*clone|speaker[-_\s]*model)(?:[^a-z0-9]|$)/i;
+const PACKAGE_TOOL_IDS = new Set(['audiocraft-webui', 'wan21-webui', 'upscayl']);
+const AUDIOCRAFT_CORE_REQUIRED_FILES = Object.freeze(['state_dict.bin', 'compression_state_dict.bin']);
+const AUDIOCRAFT_MUSICGEN_OPTIONAL_FILES = Object.freeze(['config.json']);
+const AUDIOCRAFT_AUDIOGEN_OPTIONAL_FILES = Object.freeze([]);
+const AUDIOCRAFT_REPOSITORIES = new Map([
+  ['facebook/audiogen-medium', { audioMode: 'sound', label: 'AudioCraft AudioGen snapshot', modelType: 'Audio / Speech', required: AUDIOCRAFT_CORE_REQUIRED_FILES, optional: AUDIOCRAFT_AUDIOGEN_OPTIONAL_FILES }],
+  ['facebook/musicgen-small', { audioMode: 'music', label: 'AudioCraft MusicGen snapshot', modelType: 'Audio / Speech', required: AUDIOCRAFT_CORE_REQUIRED_FILES, optional: AUDIOCRAFT_MUSICGEN_OPTIONAL_FILES }],
+  ['facebook/musicgen-medium', { audioMode: 'music', label: 'AudioCraft MusicGen snapshot', modelType: 'Audio / Speech', required: AUDIOCRAFT_CORE_REQUIRED_FILES, optional: AUDIOCRAFT_MUSICGEN_OPTIONAL_FILES }],
+  ['facebook/musicgen-large', { audioMode: 'music', label: 'AudioCraft MusicGen large snapshot', modelType: 'Audio / Speech', required: AUDIOCRAFT_CORE_REQUIRED_FILES, optional: AUDIOCRAFT_MUSICGEN_OPTIONAL_FILES }],
+  ['facebook/musicgen-melody', { audioMode: 'music', label: 'AudioCraft MusicGen melody snapshot', modelType: 'Audio / Speech', required: AUDIOCRAFT_CORE_REQUIRED_FILES, optional: AUDIOCRAFT_MUSICGEN_OPTIONAL_FILES }],
+]);
+const WAN_REPOSITORIES = new Map([
+  ['wan-ai/wan2.1-t2v-1.3b', { generationMode: 'text-to-video', label: 'Wan2.1 text-to-video model folder', modelType: 'Video', requiredPatterns: [/^diffusion_pytorch_model(?:-[0-9]{5}-of-[0-9]{5})?\.safetensors$/i, /^models_t5_.*\.pth$/i, /^Wan2\.1_VAE\.pth$/i] }],
+  ['wan-ai/wan2.1-t2v-14b', { generationMode: 'text-to-video', label: 'Wan2.1 text-to-video model folder', modelType: 'Video', requiredPatterns: [/^diffusion_pytorch_model(?:-[0-9]{5}-of-[0-9]{5})?\.safetensors$/i, /^models_t5_.*\.pth$/i, /^Wan2\.1_VAE\.pth$/i] }],
+  ['wan-ai/wan2.1-i2v-14b-480p', { generationMode: 'image-to-video', label: 'Wan2.1 image-to-video model folder', modelType: 'Video', requiredPatterns: [/^diffusion_pytorch_model(?:-[0-9]{5}-of-[0-9]{5})?\.safetensors$/i, /^models_t5_.*\.pth$/i, /^Wan2\.1_VAE\.pth$/i, /^models_clip_.*\.pth$/i] }],
+  ['wan-ai/wan2.1-i2v-14b-720p', { generationMode: 'image-to-video', label: 'Wan2.1 image-to-video model folder', modelType: 'Video', requiredPatterns: [/^diffusion_pytorch_model(?:-[0-9]{5}-of-[0-9]{5})?\.safetensors$/i, /^models_t5_.*\.pth$/i, /^Wan2\.1_VAE\.pth$/i, /^models_clip_.*\.pth$/i] }],
+]);
+
+function normalizeRepositoryId(value) {
+  return String(value || '').trim().replace(/\\+/g, '/').replace(/^\/+|\/+$/g, '').toLowerCase();
+}
+
+function repositoryFolderName(repositoryId) {
+  const parts = String(repositoryId || '').trim().replace(/\\+/g, '/').split('/').filter(Boolean);
+  return parts.pop() || 'model-package';
+}
+
+function packageArtifactEntry(artifact, required = true, installRelativePath = null) {
+  const sourcePath = artifactPath(artifact);
+  const fileName = artifactName(artifact);
+  return {
+    fileName,
+    installRelativePath: String(installRelativePath || sourcePath || fileName).replace(/\\+/g, '/'),
+    path: sourcePath,
+    required: Boolean(required),
+    sizeBytes: Number((artifact && artifact.sizeBytes) || 0),
+  };
+}
+
+function sumPackageSize(files = []) {
+  return files.reduce((total, entry) => total + (Number(entry.sizeBytes || 0) || 0), 0);
+}
+
+function buildBlockedPackagePlan(tool, repositoryId, reason, rejectedArtifacts = []) {
+  return {
+    artifactLabel: 'Package',
+    blockingReason: reason,
+    compatibleArtifacts: [],
+    modelType: tool && tool.id === 'wan21-webui' ? 'Video' : tool && tool.id === 'upscayl' ? 'Upscaler' : 'Audio / Speech',
+    optionalArtifacts: [],
+    packageIdentity: repositoryId ? 'hf:' + repositoryId : null,
+    planType: 'package',
+    recommendedArtifactPath: repositoryId || null,
+    rejectedArtifacts: rejectedArtifacts.slice(0, 8).map((artifact) => ({ fileName: artifactName(artifact), modelType: artifact.modelType || 'Support file', path: artifactPath(artifact), reason: 'This file is not enough to install the required package layout.' })),
+    requiredArtifacts: [],
+    runnable: false,
+    warning: null,
+  };
+}
+
+function createAudioCraftPackagePlan(options, artifacts) {
+  const rawRepositoryId = String(options && (options.catalogRepositoryId || options.repositoryId) || '').trim().replace(/\\+/g, '/');
+  const repositoryId = normalizeRepositoryId(rawRepositoryId);
+  const profile = AUDIOCRAFT_REPOSITORIES.get(repositoryId);
+  if (!profile) {
+    return buildBlockedPackagePlan(options.tool, repositoryId, 'AudioCraft Model Manager installs are limited to known MusicGen and AudioGen snapshots whose complete local layout Local AI Hub can verify. Use a supported facebook/musicgen-* or facebook/audiogen-* snapshot, or leave the pipeline model field blank to use AudioCraft upstream defaults.', artifacts);
+  }
+  const byPath = new Map((artifacts || []).map((artifact) => [artifactPath(artifact).toLowerCase(), artifact]));
+  const requiredFiles = profile.required.map((filePath) => byPath.get(filePath.toLowerCase())).filter(Boolean).map((artifact) => packageArtifactEntry(artifact, true));
+  const missing = profile.required.filter((filePath) => !byPath.has(filePath.toLowerCase()));
+  if (missing.length) {
+    return buildBlockedPackagePlan(options.tool, repositoryId, 'This AudioCraft snapshot is missing required files: ' + missing.join(', ') + '. Local AI Hub will not install a partial AudioCraft package.', artifacts);
+  }
+  const optionalFiles = profile.optional.map((filePath) => byPath.get(filePath.toLowerCase())).filter(Boolean).map((artifact) => packageArtifactEntry(artifact, false));
+  const downloadFiles = [...requiredFiles, ...optionalFiles];
+  const packageRoot = path.join('audiocraft', repositoryFolderName(rawRepositoryId || repositoryId)).replace(/\\+/g, '/');
+  return {
+    artifactLabel: profile.label,
+    blockingReason: null,
+    compatibleArtifacts: [{ artifactKind: 'audiocraft-snapshot', fileName: repositoryFolderName(rawRepositoryId || repositoryId), modelType: profile.modelType, path: packageRoot, requiredArtifacts: requiredFiles.map((entry) => entry.path) }],
+    downloadFiles,
+    modelType: profile.modelType,
+    optionalArtifacts: optionalFiles,
+    packageIdentity: 'hf:' + repositoryId + ':audiocraft-snapshot',
+    packageName: repositoryFolderName(rawRepositoryId || repositoryId),
+    packageRoot,
+    packageTargetMode: 'folder',
+    planType: 'package',
+    recommendedArtifactPath: packageRoot,
+    rejectedArtifacts: [],
+    requiredArtifacts: requiredFiles.map((entry) => entry.path),
+    requiredFiles,
+    runnable: true,
+    sizeBytes: sumPackageSize(downloadFiles),
+    warning: 'This installs a complete local AudioCraft snapshot. Upstream model-name defaults still work when the pipeline model field is blank.',
+  };
+}
+
+function createWanPackagePlan(options, artifacts) {
+  const rawRepositoryId = String(options && (options.catalogRepositoryId || options.repositoryId) || '').trim().replace(/\\+/g, '/');
+  const repositoryId = normalizeRepositoryId(rawRepositoryId);
+  const profile = WAN_REPOSITORIES.get(repositoryId);
+  if (!profile) {
+    return buildBlockedPackagePlan(options.tool, repositoryId, 'Wan Model Manager installs are limited to known Wan-AI folders that match Local AI Hub\'s current Diffsynth runtime layout. Diffusers-only or component-only Wan repos are blocked for now.', artifacts);
+  }
+  const rootArtifacts = (artifacts || []).filter((artifact) => artifactPath(artifact) && !artifactPath(artifact).includes('/'));
+  const requiredFiles = [];
+  const missingPatterns = [];
+  for (const pattern of profile.requiredPatterns) {
+    const matches = rootArtifacts.filter((artifact) => pattern.test(artifactName(artifact))).sort((left, right) => artifactName(left).localeCompare(artifactName(right)));
+    if (!matches.length) {
+      missingPatterns.push(String(pattern));
+      continue;
+    }
+    requiredFiles.push(...matches.map((artifact) => packageArtifactEntry(artifact, true)));
+  }
+  if (missingPatterns.length) {
+    return buildBlockedPackagePlan(options.tool, repositoryId, 'This Wan snapshot is missing required diffusion, text encoder, VAE, or image encoder files. Local AI Hub will not install a partial Wan model folder.', artifacts);
+  }
+  const seen = new Set();
+  const dedupedRequired = requiredFiles.filter((entry) => {
+    const key = entry.path.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const packageRoot = repositoryFolderName(rawRepositoryId || repositoryId);
+  return {
+    artifactLabel: profile.label,
+    blockingReason: null,
+    compatibleArtifacts: [{ artifactKind: 'wan-model-folder', fileName: packageRoot, modelType: profile.modelType, path: packageRoot, requiredArtifacts: dedupedRequired.map((entry) => entry.path) }],
+    downloadFiles: dedupedRequired,
+    modelType: profile.modelType,
+    optionalArtifacts: [],
+    packageIdentity: 'hf:' + repositoryId + ':wan-model-folder',
+    packageName: packageRoot,
+    packageRoot,
+    packageTargetMode: 'folder',
+    planType: 'package',
+    recommendedArtifactPath: packageRoot,
+    rejectedArtifacts: [],
+    requiredArtifacts: dedupedRequired.map((entry) => entry.path),
+    requiredFiles: dedupedRequired,
+    runnable: true,
+    sizeBytes: sumPackageSize(dedupedRequired),
+    warning: 'This installs the Wan folder layout expected under models\\Wan-AI. Hardware and CUDA readiness warnings still apply.',
+  };
+}
+
+function createUpscaylPackagePlan(options, artifacts) {
+  const pairGroups = new Map();
+  for (const artifact of artifacts || []) {
+    const fileName = artifactName(artifact);
+    const extension = path.extname(fileName).toLowerCase();
+    if (!['.param', '.bin'].includes(extension) || artifactPath(artifact).includes('/')) {
+      continue;
+    }
+    const stem = fileName.slice(0, -extension.length);
+    const group = pairGroups.get(stem.toLowerCase()) || { stem, files: {} };
+    group.files[extension] = artifact;
+    pairGroups.set(stem.toLowerCase(), group);
+  }
+  const completePairs = [...pairGroups.values()].filter((group) => group.files['.param'] && group.files['.bin']);
+  if (!completePairs.length) {
+    return buildBlockedPackagePlan(options.tool, normalizeRepositoryId(options && (options.catalogRepositoryId || options.repositoryId)), 'Upscayl custom models need a matching .param and .bin pair with the same file name stem. Local AI Hub will not install a one-sided Upscayl asset.', artifacts);
+  }
+  completePairs.sort((left, right) => left.stem.localeCompare(right.stem));
+  const selected = completePairs[0];
+  const requiredFiles = [packageArtifactEntry(selected.files['.param'], true, artifactName(selected.files['.param'])), packageArtifactEntry(selected.files['.bin'], true, artifactName(selected.files['.bin']))];
+  return {
+    artifactLabel: 'Upscayl paired model set',
+    blockingReason: null,
+    compatibleArtifacts: completePairs.map((group) => ({ artifactKind: 'upscayl-model-set', fileName: group.stem, modelType: 'Upscaler', path: group.stem, requiredArtifacts: [artifactPath(group.files['.param']), artifactPath(group.files['.bin'])] })),
+    downloadFiles: requiredFiles,
+    modelType: 'Upscaler',
+    optionalArtifacts: [],
+    packageIdentity: 'hf:' + normalizeRepositoryId(options && (options.catalogRepositoryId || options.repositoryId)) + ':upscayl-model-set:' + selected.stem.toLowerCase(),
+    packageName: selected.stem,
+    packageRoot: selected.stem,
+    packageTargetMode: 'flat',
+    planType: 'package',
+    recommendedArtifactPath: selected.stem,
+    rejectedArtifacts: [],
+    requiredArtifacts: requiredFiles.map((entry) => entry.path),
+    requiredFiles,
+    runnable: true,
+    sizeBytes: sumPackageSize(requiredFiles),
+    warning: 'This installs the matching .param and .bin files together so Upscayl can discover the custom model by name.',
+  };
+}
+
+function createPackageDownloadPlan(options, artifacts) {
+  const toolId = String(options && options.tool && options.tool.id || '').trim().toLowerCase();
+  if (toolId === 'audiocraft-webui') return createAudioCraftPackagePlan(options, artifacts);
+  if (toolId === 'wan21-webui') return createWanPackagePlan(options, artifacts);
+  if (toolId === 'upscayl') return createUpscaylPackagePlan(options, artifacts);
+  return null;
+}
 
 function normalizeModelType(value) {
   const normalized = String(value || '').trim().toLowerCase();
   if (!normalized) return 'Checkpoint';
+  if (normalized.includes('rvc') || normalized.includes('retrieval voice conversion') || normalized.includes('voice conversion') || normalized.includes('voice model')) return 'RVC Voice Model';
   if (normalized.includes('gguf') || /\.gguf$/i.test(normalized)) return 'GGUF';
   if (normalized.includes('upscaler') || normalized.includes('esrgan') || normalized.includes('realesrgan')) return 'Upscaler';
-  if (normalized.includes('audio') || normalized.includes('speech') || normalized.includes('musicgen') || normalized.includes('bark')) return 'Audio / Speech';
+  if (normalized.includes('video') || normalized.includes('wan2.1') || normalized.includes('wan-ai')) return 'Video';
+  if (normalized.includes('audio') || normalized.includes('speech') || normalized.includes('musicgen') || normalized.includes('audiogen') || normalized.includes('bark')) return 'Audio / Speech';
   if (normalized.includes('inpaint')) return 'Inpainting';
   if (normalized.includes('lora') || normalized.includes('locon')) return 'LoRA';
   if (normalized.includes('vae')) return 'VAE';
@@ -38,10 +243,12 @@ function normalizeModelTypeFilter(value) {
 }
 
 function targetFamily(tool) {
+  if (tool && PACKAGE_TOOL_IDS.has(tool.id)) return 'package';
   if (tool && tool.id === 'ollama') return 'ollama';
   if (tool && GGUF_TOOL_IDS.has(tool.id)) return 'gguf';
   if (tool && WEBUI_TOOL_IDS.has(tool.id)) return 'sd-webui';
   if (tool && tool.id === 'comfyui') return 'comfyui';
+  if (tool && tool.id === 'rvc') return 'rvc';
   return 'generic-file';
 }
 
@@ -106,6 +313,98 @@ function splitGroupFor(artifact, groups) {
   return split ? groups.get(split.groupKey) || null : null;
 }
 
+function hasLikelyRvcContext(artifact) {
+  const combined = [artifactPath(artifact), artifactName(artifact), artifact && artifact.type, artifact && artifact.modelType]
+    .filter(Boolean)
+    .join(' ');
+  return normalizeModelType(artifact && artifact.modelType) === 'RVC Voice Model' || RVC_CONTEXT_PATTERN.test(combined);
+}
+
+function normalizeRvcMatchToken(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+}
+
+function compactRvcMatchToken(value) {
+  return normalizeRvcMatchToken(value).replace(/\s+/g, '');
+}
+
+function rvcStem(value) {
+  const fileName = artifactName({ rfilename: value });
+  const extension = path.extname(fileName);
+  return extension ? fileName.slice(0, -extension.length) : fileName;
+}
+
+function rvcPathTokens(artifact) {
+  const fullPath = artifactPath(artifact);
+  const segments = fullPath.split('/').filter(Boolean);
+  const fileName = artifactName(artifact);
+  const withoutIndex = fileName.replace(/\.index$/i, '');
+  return [...segments.slice(0, -1), withoutIndex]
+    .map((entry) => ({ compact: compactRvcMatchToken(entry), normalized: normalizeRvcMatchToken(entry) }))
+    .filter((entry) => entry.compact);
+}
+
+function rvcIndexMatchesPrimary(indexArtifact, primaryArtifact, compatibleCount, indexCount) {
+  const primaryStem = rvcStem(artifactPath(primaryArtifact));
+  const primaryCompact = compactRvcMatchToken(primaryStem);
+  if (primaryCompact.length >= 3 && !['model', 'pytorchmodel', 'weight', 'weights'].includes(primaryCompact)) {
+    if (rvcPathTokens(indexArtifact).some((token) => token.compact.includes(primaryCompact) || primaryCompact.includes(token.compact))) {
+      return true;
+    }
+  }
+  return compatibleCount === 1 && indexCount === 1;
+}
+
+function getRvcOptionalCompanions(rejected, recommended, compatible) {
+  if (!recommended || recommended.artifactKind !== 'rvc-voice-model') {
+    return { ambiguous: false, companions: [], indexCount: 0 };
+  }
+  const indexArtifacts = rejected.filter((artifact) => artifact.artifactKind === 'rvc-index');
+  const matches = indexArtifacts.filter((artifact) => rvcIndexMatchesPrimary(artifact, recommended, compatible.length, indexArtifacts.length));
+  if (matches.length !== 1) {
+    return { ambiguous: indexArtifacts.length > 0, companions: [], indexCount: indexArtifacts.length };
+  }
+  return {
+    ambiguous: false,
+    companions: matches.map((artifact) => ({
+      artifactKind: artifact.artifactKind,
+      fileName: artifactName(artifact),
+      modelType: artifact.modelType,
+      path: artifactPath(artifact),
+      sizeBytes: Number(artifact.sizeBytes || 0),
+    })),
+    indexCount: indexArtifacts.length,
+  };
+}
+
+function inferRvcArtifact(artifact) {
+  const relativePath = artifactPath(artifact);
+  const fileName = artifactName(artifact);
+  const extension = path.extname(fileName).toLowerCase();
+  if (hasSupportPath(artifact) || DOCUMENTATION_FILE_PATTERN.test(relativePath) || CONFIG_ONLY_FILE_PATTERN.test(fileName) || IMAGE_FILE_PATTERN.test(fileName) || AUDIO_PREVIEW_FILE_PATTERN.test(fileName)) {
+    return { rejected: true, artifactKind: 'support-file', artifactLabel: 'Support file', modelType: 'Support file', reason: 'Documentation, config, preview, and audio sample files are supporting files, not RVC voice model weights.' };
+  }
+  if (ARCHIVE_FILE_PATTERN.test(fileName)) {
+    return { rejected: true, artifactKind: 'unsupported-archive', artifactLabel: 'Archive', modelType: 'Archive', reason: 'This catalog downloader only installs single RVC voice weight files today, not archive bundles.' };
+  }
+  if (RVC_INDEX_FILE_PATTERN.test(fileName)) {
+    return { rejected: true, artifactKind: 'rvc-index', artifactLabel: 'RVC index', modelType: 'RVC index', reason: 'RVC index files are optional companions. Choose a .pth voice model weight as the primary download.' };
+  }
+  if (!RVC_MODEL_FILE_PATTERN.test(fileName)) {
+    return { rejected: true, artifactKind: 'unsupported', artifactLabel: 'Unsupported', modelType: normalizeModelType(fileName), reason: (fileName || 'This file') + ' is not a recognized RVC voice model weight.' };
+  }
+  if (!hasLikelyRvcContext(artifact)) {
+    return { rejected: true, artifactKind: 'generic-pytorch-weight', artifactLabel: 'Generic PyTorch weight', modelType: 'PyTorch weight', reason: 'This .pth/.pt file is not clearly labeled as an RVC voice model, so Local AI Hub will not install it into RVC automatically.' };
+  }
+  let score = 95;
+  const normalizedPath = relativePath.toLowerCase();
+  if (extension === '.pth') score += 10;
+  if (pathSegments(artifact).includes('weights')) score += 8;
+  if (normalizedPath.includes('rvc')) score += 6;
+  if (artifact && artifact.primary) score += 10;
+  return { artifactKind: 'rvc-voice-model', artifactLabel: 'RVC voice model', modelType: 'RVC Voice Model', score };
+}
+
 function inferImageArtifact(artifact) {
   const relativePath = artifactPath(artifact);
   const fileName = artifactName(artifact);
@@ -138,6 +437,12 @@ function classifyArtifact(tool, artifact, selectedType) {
   if (family === 'gguf') {
     if (extension !== '.gguf') return { artifactKind: 'unsupported', artifactLabel: 'Not GGUF', modelType: normalizeModelType(fileName), runnable: false, reason: 'This target can only run GGUF model files.' };
     return { artifactKind: 'gguf', artifactLabel: 'GGUF', modelType: 'GGUF', runnable: true, score: 100 + Math.min(sizeBytes / (1024 * 1024 * 1024), 20) };
+  }
+  if (family === 'rvc') {
+    const inferred = inferRvcArtifact(artifact);
+    if (inferred.rejected) return Object.assign({}, inferred, { runnable: false });
+    if (!selectedTypeMatches(inferred.modelType, selectedType)) return Object.assign({}, inferred, { runnable: false, reason: inferred.modelType + ' artifacts do not match the selected ' + normalizeModelType(selectedType) + ' filter.' });
+    return Object.assign({}, inferred, { runnable: true });
   }
   if (family === 'sd-webui' || family === 'comfyui') {
     if (extension === '.gguf' && family === 'sd-webui') {
@@ -193,14 +498,20 @@ function summarizePlan(tool, selectedType, annotated) {
   const compatible = annotated.filter((artifact) => artifact.runnable).sort((left, right) => Number(right.score || 0) - Number(left.score || 0) || artifactPath(left).localeCompare(artifactPath(right)));
   const rejected = annotated.filter((artifact) => !artifact.runnable);
   const recommended = compatible[0] || null;
+  const rvcCompanionPlan = getRvcOptionalCompanions(rejected, recommended, compatible);
+  const optionalArtifacts = rvcCompanionPlan.companions;
   const blockingReason = recommended ? null : ((rejected.find((artifact) => artifact.blockingReason) || {}).blockingReason || 'Local AI Hub could not find a runnable artifact for ' + ((tool && tool.name) || 'this target') + '.');
-  const warning = recommended && recommended.modelType === 'Inpainting' && normalizeModelTypeFilter(selectedType) !== 'inpainting'
-    ? 'This looks like an inpainting checkpoint. Base checkpoints are preferred unless you choose the Inpainting filter.'
-    : null;
+  const warning = optionalArtifacts.length
+    ? 'A matching RVC index file will be downloaded as an optional companion for retrieval-index quality.'
+    : rvcCompanionPlan.ambiguous
+      ? 'RVC index files are present, but Local AI Hub could not match one confidently to the selected voice weight. Add the .index file manually if you need retrieval-index quality.'
+      : recommended && recommended.modelType === 'Inpainting' && normalizeModelTypeFilter(selectedType) !== 'inpainting'
+        ? 'This looks like an inpainting checkpoint. Base checkpoints are preferred unless you choose the Inpainting filter.'
+        : null;
   return {
     artifactLabel: recommended ? recommended.artifactLabel : null,
     compatibleArtifacts: compatible.map((artifact) => ({ artifactKind: artifact.artifactKind, fileName: artifactName(artifact), modelType: artifact.modelType, path: artifactPath(artifact), requiredArtifacts: artifact.requiredArtifacts || [] })),
-    optionalArtifacts: [],
+    optionalArtifacts,
     recommendedArtifact: recommended,
     recommendedArtifactPath: recommended ? artifactPath(recommended) : null,
     rejectedArtifacts: rejected.slice(0, 8).map((artifact) => ({ fileName: artifactName(artifact), modelType: artifact.modelType, path: artifactPath(artifact), reason: artifact.blockingReason || 'This artifact is not compatible with the selected target.' })),
@@ -213,6 +524,8 @@ function summarizePlan(tool, selectedType, annotated) {
 
 function createModelDownloadPlan(options) {
   const artifacts = ((options && options.artifacts) || []).filter(Boolean);
+  const packagePlan = createPackageDownloadPlan(options || {}, artifacts);
+  if (packagePlan) return packagePlan;
   const selectedType = options && options.selectedType;
   const tool = options && options.tool;
   const groups = splitGroups(artifacts);
@@ -222,6 +535,19 @@ function createModelDownloadPlan(options) {
 
 function annotateArtifactsForDownloadPlan(options) {
   const artifacts = ((options && options.artifacts) || []).filter(Boolean);
+  const packagePlan = createPackageDownloadPlan(options || {}, artifacts);
+  if (packagePlan) {
+    return artifacts.map((artifact) => Object.assign({}, artifact, {
+      artifactKind: packagePlan.runnable ? 'package-member' : 'package-blocked-member',
+      artifactLabel: packagePlan.artifactLabel || 'Package',
+      blockingReason: packagePlan.runnable ? null : packagePlan.blockingReason,
+      downloadPlan: Object.assign({}, packagePlan),
+      modelType: packagePlan.modelType || 'Package',
+      requiredArtifacts: packagePlan.requiredArtifacts || [],
+      runnable: Boolean(packagePlan.runnable),
+      score: packagePlan.runnable ? 120 : 0,
+    }));
+  }
   const selectedType = options && options.selectedType;
   const tool = options && options.tool;
   const groups = splitGroups(artifacts);

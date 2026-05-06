@@ -3557,6 +3557,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         return generateImageWithLocalImageTool(tool, {
           displayName: node.label,
           instruction: imageRequest.instruction,
+          model,
           nodeLabel: node.label,
           operationId,
           referenceImageArtifact: imageRequest.referenceImageArtifact,

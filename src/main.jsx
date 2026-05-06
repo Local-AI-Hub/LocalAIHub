@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import { installRendererInputFocusDiagnostics } from './lib/focus-guard';
 import './index.css';
 
 function formatRendererError(error) {
@@ -24,6 +25,11 @@ function logRendererEvent(message, context = {}, level = 'error') {
   } catch {
     // Keep renderer diagnostics best-effort only.
   }
+}
+
+function shouldShowRendererFallbackForBootstrap() {
+  const root = document.getElementById('root');
+  return !window.__LOCAL_AI_HUB_RENDERER_READY || !root?.childElementCount;
 }
 
 function showRendererFallback(message) {
@@ -91,14 +97,22 @@ window.addEventListener('error', (event) => {
 });
 
 window.addEventListener('unhandledrejection', (event) => {
+  const focusState = window.__LOCAL_AI_HUB_DESCRIBE_FOCUS__?.();
   logRendererEvent('Renderer promise rejection.', {
+    activeElement: focusState?.activeElement || null,
+    documentHasFocus: document.hasFocus(),
     phase: 'unhandledrejection',
     reason: formatRendererError(event?.reason) || String(event?.reason || ''),
   });
-  showRendererFallback();
+
+  if (shouldShowRendererFallbackForBootstrap()) {
+    showRendererFallback();
+  }
 });
 
 try {
+  installRendererInputFocusDiagnostics({ log: logRendererEvent });
+
   const rootElement = document.getElementById('root');
   if (!rootElement) {
     throw new Error('Local AI Hub could not find its root container.');

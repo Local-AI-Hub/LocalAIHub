@@ -62,7 +62,7 @@ function runCommand(command, args = [], options = {}) {
     try {
       child = spawn(command, args, {
         cwd: options.cwd,
-        env: {
+        env: options.replaceEnv ? (options.env || {}) : {
           ...process.env,
           ...(options.env || {}),
         },

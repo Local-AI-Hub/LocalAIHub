@@ -49,7 +49,7 @@ const {
   uninstallTool,
   updateToolInstallation,
 } = require('./services/installerService');
-const { buildOllamaUnavailableMessage, listOllamaModels, chatWithOllama, finishOllamaSession, prepareOllamaSession, waitForOllamaReady } = require('./services/ollamaService');
+const { buildOllamaUnavailableMessage, listOllamaModels, chatWithOllama, finishOllamaSession, prepareOllamaSession, refreshOwnedOllamaSessionProcesses, waitForOllamaReady } = require('./services/ollamaService');
 const { buildAiderLaunchConfiguration, inspectAiderProject, listAiderLaunchModels } = require('./services/aiderService');
 const {
   disposeAllRuntimes,
@@ -390,6 +390,48 @@ function broadcastWindowActivity(force = false) {
   return nextActivity;
 }
 
+function focusMainWindowFromRenderer(reason = 'renderer-focus-request') {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return getWindowActivityPayload();
+  }
+
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+
+  if (!mainWindow.isVisible()) {
+    mainWindow.show();
+  }
+
+  mainWindow.focus();
+  mainWindow.webContents.focus();
+  const activity = broadcastWindowActivity(true);
+  appendLog('renderer', 'info', 'Renderer requested app window focus.', {
+    focused: activity.focused,
+    reason: String(reason || 'renderer-focus-request').slice(0, 120),
+    visible: activity.visible,
+  }).catch(() => null);
+  return activity;
+}
+function showConfirmDialogFromRenderer(payload = {}) {
+  const message = String(payload?.message || '').trim() || 'Continue?';
+  const result = dialog.showMessageBoxSync(mainWindow || undefined, {
+    buttons: ['Cancel', 'OK'],
+    cancelId: 0,
+    defaultId: 1,
+    message,
+    noLink: true,
+    title: 'Local AI Hub',
+    type: 'question',
+  });
+  const confirmed = result === 1;
+  focusMainWindowFromRenderer('main-process-confirm');
+  appendLog('renderer', 'info', 'Main-process confirm closed.', {
+    confirmed,
+    messageLength: message.length,
+  }).catch(() => null);
+  return confirmed;
+}
 async function updateHealthMonitor(options = {}) {
   const hasRunningTools =
     typeof options.hasRunningTools === 'boolean' ? options.hasRunningTools : await hasConfiguredRunningTools();
@@ -831,6 +873,17 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(buildAppState, 'Local AI Hub could not refresh the dashboard.'),
   );
 
+
+  ipcMain.on('app:confirm-sync', (event, payload) => {
+    try {
+      event.returnValue = { ok: true, data: showConfirmDialogFromRenderer(payload) };
+    } catch (error) {
+      event.returnValue = {
+        ok: false,
+        message: humanizeError(error, 'Local AI Hub could not show that confirmation dialog.'),
+      };
+    }
+  });
   ipcMain.handle('app:log-renderer-event', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const level = String(payload?.level || 'error').trim().toLowerCase();
@@ -855,6 +908,9 @@ function registerIpcHandlers() {
 
   ipcMain.handle('app:get-window-activity', () =>
     withPlainEnglishErrors(async () => getWindowActivityPayload(), 'Local AI Hub could not read the current window activity.'),
+  );
+  ipcMain.handle('app:focus-window', (_event, payload) =>
+    withPlainEnglishErrors(async () => focusMainWindowFromRenderer(payload?.reason), 'Local AI Hub could not restore app focus.'),
   );
 
   ipcMain.handle('app:complete-first-launch', () =>
@@ -979,16 +1035,24 @@ function registerIpcHandlers() {
               autoStart: true,
               launchContext: 'aider-session',
             });
+            let ollamaSessionReleased = false;
+            releaseLaunchSupportRuntime = async () => {
+              if (ollamaSessionReleased) {
+                return;
+              }
+              ollamaSessionReleased = true;
+              await finishOllamaSession(ollamaSession);
+            };
+            await waitForOllamaReady(ollamaSession.tool || ollamaTool, {
+              actionLabel: 'start Aider with the selected Ollama model',
+              alreadyActive: Boolean(ollamaSession.alreadyActive),
+              autoStartAttempted: Boolean(ollamaSession.autoStarted || ollamaSession.launchAttempted),
+            });
             if (ollamaSession.startedByLocalAIHub) {
-              let ollamaSessionReleased = false;
-              releaseLaunchSupportRuntime = async () => {
-                if (ollamaSessionReleased) {
-                  return;
-                }
-                ollamaSessionReleased = true;
-                await finishOllamaSession(ollamaSession);
-              };
+              await refreshOwnedOllamaSessionProcesses(ollamaSession).catch(() => []);
               launchOptions.onStopCleanup = releaseLaunchSupportRuntime;
+            } else {
+              releaseLaunchSupportRuntime = null;
             }
           }
           launchOptions.launchProfileOverride = aiderLaunch.launchProfileOverride;
@@ -1019,7 +1083,9 @@ function registerIpcHandlers() {
             message = `${nextTool.name} is ready. Local AI Hub opened its built-in console.`;
           }
         }
-
+        if (nextTool?.lastLaunchWarning && !message.includes(nextTool.lastLaunchWarning)) {
+          message += '\n\n' + nextTool.lastLaunchWarning;
+        }
         return {
           message,
           state: nextState,

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
+import { logRendererActionDiagnostic } from '../lib/focus-guard';
 const DEFAULT_SOURCE_OPTIONS = [{ id: 'huggingface', label: 'Hugging Face' }];
 const MODEL_TYPE_OPTIONS = [
   { id: 'all', label: 'All types' },
@@ -11,7 +12,9 @@ const MODEL_TYPE_OPTIONS = [
   { id: 'hypernetwork', label: 'Hypernetwork' },
   { id: 'upscaler', label: 'Upscaler' },
   { id: 'gguf', label: 'GGUF / Quantized LLM' },
+  { id: 'rvc-voice', label: 'RVC voice model' },
   { id: 'audio-speech', label: 'Audio / Speech' },
+  { id: 'video', label: 'Video package' },
   { id: 'inpainting', label: 'Inpainting' },
 ];
 const SORT_OPTIONS = [
@@ -27,6 +30,7 @@ const TASK_OPTIONS = [
   { id: 'video-generation', label: 'Video generation' },
   { id: 'image-to-video', label: 'Image to video' },
   { id: 'audio-speech', label: 'Audio / Speech' },
+  { id: 'voice-conversion', label: 'Voice conversion' },
 ];
 const EMPTY_PAGINATION = {
   hasMore: false,
@@ -86,6 +90,20 @@ function getToolDefaults(tool) {
     source: sourceOptions.some((entry) => entry.id === requestedSource) ? requestedSource : firstSourceId,
     taskType: taskOptions.some((entry) => entry.id === requestedTaskType) ? requestedTaskType : taskOptions[0]?.id || (firstSourceId === 'ollama' ? 'all' : 'image-generation'),
   };
+}
+function getPackageNoResultsMessage(tool, query, sourceLabel) {
+  const toolId = String(tool?.id || '').trim().toLowerCase();
+  const searchLabel = query ? `No ${sourceLabel} results matched "${query}".` : `No ${sourceLabel} package results were found.`;
+  if (toolId === 'audiocraft-webui') {
+    return `${searchLabel} Try an exact supported repo such as facebook/musicgen-medium, facebook/musicgen-melody, or facebook/audiogen-medium.`;
+  }
+  if (toolId === 'wan21-webui') {
+    return `${searchLabel} Try Wan2.1, Wan-AI, or a known folder repo such as Wan-AI/Wan2.1-T2V-1.3B.`;
+  }
+  if (toolId === 'upscayl') {
+    return `${searchLabel} Bundled and local Upscayl models appear under Downloaded Models. Remote Upscayl custom models need a matching .param and .bin pair and are limited to exact Hugging Face repository IDs for now; broad remote discovery is disabled so Local AI Hub does not offer incomplete model sets.`;
+  }
+  return '';
 }
 function normalizeMatchKey(value) {
   return String(value || '').trim().replace(/[\\/]+/g, '/').toLowerCase();
@@ -178,7 +196,9 @@ function ModelPreview({ item }) {
 }
 function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, onDownload }) {
   const selectedArtifact = item.downloadPlan?.recommendedArtifactPath || item.installRelativePath || item.fileName || '';
-  const artifactStatus = item.downloadPlan?.runnable === false ? 'Blocked' : item.downloadPlan?.warning ? 'Possible' : 'Selected';
+  const requiredArtifacts = item.downloadPlan?.requiredArtifacts || [];
+  const optionalArtifacts = item.downloadPlan?.optionalArtifacts || [];
+  const artifactStatus = item.downloadPlan?.runnable === false ? 'Blocked' : item.downloadPlan?.planType === 'package' ? 'Package' : item.downloadPlan?.warning ? 'Possible' : 'Selected';
   const targetDirectory = item.downloadPlan?.targetDirectory || item.downloadTarget || '';
   const artifactStatusClass = item.downloadPlan?.runnable === false
     ? 'border-rose-400/25 bg-rose-400/10 text-rose-100'
@@ -219,7 +239,12 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
           <span className={`status-pill ${artifactStatusClass}`}>{artifactStatus}</span>
         </div>
         <p className="mt-2 break-all text-sm font-medium text-white">{selectedArtifact || 'No compatible artifact selected'}</p>
-        <p className="mt-2 text-xs leading-5 text-slate-400">{item.artifactLabel || item.modelType || 'Model artifact'}</p>
+        <p className="mt-2 text-xs leading-5 text-slate-400">{item.downloadPlan?.planType === 'package' ? [item.artifactLabel || 'Package', item.downloadPlan?.packageName].filter(Boolean).join(' | ') : item.artifactLabel || item.modelType || 'Model artifact'}</p>
+        {requiredArtifacts.length || optionalArtifacts.length ? (
+          <p className="mt-3 text-xs leading-5 text-slate-400">
+            {item.downloadPlan?.planType === 'package' ? 'Required files: ' : 'Required: '}{requiredArtifacts.length ? requiredArtifacts.join(', ') : 'selected artifact only'}{optionalArtifacts.length ? ' | Optional files: ' + optionalArtifacts.map((artifact) => artifact.path || artifact.fileName).filter(Boolean).join(', ') : ' | Optional files: none'}
+          </p>
+        ) : null}
         <p className="mt-3 text-xs uppercase tracking-[0.2em] text-slate-500">Install target</p>
         <p className="mt-2 break-all text-xs leading-5 text-slate-400">{targetDirectory || 'No compatible install folder for this target.'}</p>
       </div>
@@ -233,7 +258,11 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
           {item.downloadPlan.blockingReason || item.downloadPlan.warning}
         </div>
       ) : null}
-      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Target</p>
+          <p className="mt-2 text-sm font-medium text-white">{item.targetToolName || item.toolId || 'Selected tool'}</p>
+        </div>
         <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
           <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Source</p>
           <p className="mt-2 text-sm font-medium capitalize text-white">{item.source}</p>
@@ -338,15 +367,22 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
       return;
     }
     setLocalLoading(true);
-    const result = await window.localAIHub.listLocalModels(toolId);
-    if (result?.ok) {
-      setLocalModels(result.data || []);
-    } else {
-      onToast(result?.message || 'Local AI Hub could not load local models for that tool.', 'error');
+    try {
+      const result = await window.localAIHub.listLocalModels(toolId);
+      if (result?.ok) {
+        setLocalModels(result.data || []);
+      } else {
+        onToast(result?.message || 'Local AI Hub could not load local models for that tool.', 'error');
+        setLocalModels([]);
+      }
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not load local models for that tool.', 'error');
       setLocalModels([]);
+    } finally {
+      setLocalLoading(false);
     }
-    setLocalLoading(false);
   }
+
   async function browse(options = {}) {
     const toolId = options.toolId || selectedToolId;
     const source = options.source || selectedSource;
@@ -370,48 +406,64 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
     }
     const requestId = browseRequestIdRef.current + 1;
     browseRequestIdRef.current = requestId;
-    const result = await window.localAIHub.browseModels({
-      cursor: options.cursor || null,
-      modelType,
-      page: options.page || 1,
-      query,
-      sort,
-      source,
-      taskType: effectiveTaskType,
-      toolId,
-    });
-    if (!result?.ok) {
+    logRendererActionDiagnostic('model-manager-search', 'start', { append, queryLength: String(query || '').trim().length, source, toolId });
+    try {
+      const result = await window.localAIHub.browseModels({
+        cursor: options.cursor || null,
+        modelType,
+        page: options.page || 1,
+        query,
+        sort,
+        source,
+        taskType: effectiveTaskType,
+        toolId,
+      });
       if (requestId !== browseRequestIdRef.current) {
         return;
       }
-      const message = result?.message || 'Local AI Hub could not load remote models right now.';
+      if (!result?.ok) {
+        const message = result?.message || 'Local AI Hub could not load remote models right now.';
+        logRendererActionDiagnostic('model-manager-search', 'failure', { append, message, source, toolId }, 'warn');
+        onToast(message, 'error');
+        if (!append) {
+          setRemoteItems([]);
+          setPagination(EMPTY_PAGINATION);
+          setCatalogState({ error: message, query, source });
+        }
+        return;
+      }
+      const nextItems = result.data?.items || [];
+      logRendererActionDiagnostic('model-manager-search', 'success', { append, itemCount: nextItems.length, source, toolId });
+      setRemoteItems((current) => (append ? mergeRemoteItems(current, nextItems) : nextItems));
+      if (!append) {
+        setCatalogState({ error: null, query, source });
+      }
+      setLocalModels(result.data?.localModels || []);
+      setPagination(result.data?.pagination || EMPTY_PAGINATION);
+      if (result.data?.settings) {
+        setSettings(result.data.settings);
+        setCivitaiApiKeyDraft('');
+      }
+    } catch (error) {
+      if (requestId !== browseRequestIdRef.current) {
+        return;
+      }
+      const message = error?.message || 'Local AI Hub could not load remote models right now.';
+      logRendererActionDiagnostic('model-manager-search', 'failure', { append, message, source, toolId }, 'warn');
       onToast(message, 'error');
       if (!append) {
         setRemoteItems([]);
         setPagination(EMPTY_PAGINATION);
         setCatalogState({ error: message, query, source });
       }
-      setBrowseLoading(false);
-      setLoadingMore(false);
-      return;
+    } finally {
+      if (requestId === browseRequestIdRef.current) {
+        setBrowseLoading(false);
+        setLoadingMore(false);
+      }
     }
-    if (requestId !== browseRequestIdRef.current) {
-      return;
-    }
-    const nextItems = result.data?.items || [];
-    setRemoteItems((current) => (append ? mergeRemoteItems(current, nextItems) : nextItems));
-    if (!append) {
-      setCatalogState({ error: null, query, source });
-    }
-    setLocalModels(result.data?.localModels || []);
-    setPagination(result.data?.pagination || EMPTY_PAGINATION);
-    if (result.data?.settings) {
-      setSettings(result.data.settings);
-      setCivitaiApiKeyDraft('');
-    }
-    setBrowseLoading(false);
-    setLoadingMore(false);
   }
+
   async function handleLoadMore() {
     if (!pagination.hasMore) {
       return;
@@ -523,20 +575,25 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
       return;
     }
     setDeleteBusyId(model.id);
-    const result = await window.localAIHub.deleteModel({
-      ...model,
-      toolId: selectedToolId,
-    });
-    if (!result?.ok) {
+    try {
+      const result = await window.localAIHub.deleteModel({
+        ...model,
+        toolId: selectedToolId,
+      });
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not delete that model.', 'error');
+        return;
+      }
+      onToast(result.data?.message || `${displayName} was deleted.`, 'success');
+      setLocalModels(result.data?.localModels || []);
+      browse({ page: 1, cursor: null });
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not delete that model.', 'error');
+    } finally {
       setDeleteBusyId(null);
-      onToast(result?.message || 'Local AI Hub could not delete that model.', 'error');
-      return;
     }
-    onToast(result.data?.message || `${displayName} was deleted.`, 'success');
-    setLocalModels(result.data?.localModels || []);
-    setDeleteBusyId(null);
-    browse({ page: 1, cursor: null });
   }
+
   async function handleSaveCivitaiKey(clearExisting = false) {
     const trimmedKey = civitaiApiKeyDraft.trim();
     if (!clearExisting && !trimmedKey) {
@@ -568,11 +625,14 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
   const emptyQuery = String(catalogState.query || '').trim();
   const emptySource = catalogState.source || selectedSource;
   const selectedSourceLabel = sourceOptions.find((entry) => entry.id === emptySource)?.label || emptySource;
+  const packageNoResultsMessage = getPackageNoResultsMessage(selectedTool, emptyQuery, selectedSourceLabel);
   const emptyCatalogMessage = catalogState.error
     ? `${catalogState.error} Previous catalog results were cleared for this search.`
-    : emptyQuery
-      ? `No ${selectedSourceLabel} results matched "${emptyQuery}". Local AI Hub searched with the selected source and filters; try another source or a shorter model-family query.`
-      : 'No catalog results matched this search. Try another query or filter.';
+    : packageNoResultsMessage
+      ? packageNoResultsMessage
+      : emptyQuery
+        ? `No ${selectedSourceLabel} results matched "${emptyQuery}". Local AI Hub searched with the selected source and filters; try another source or a shorter model-family query.`
+        : 'No catalog results matched this search. Try another query or filter.';
   return (
     <section className="space-y-5">
       <div className="panel p-6">

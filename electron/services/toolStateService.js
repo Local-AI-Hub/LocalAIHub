@@ -1,4 +1,4 @@
-﻿const path = require('path');
+const path = require('path');
 const fs = require('fs-extra');
 
 const { readConfig } = require('./configService');
@@ -99,13 +99,15 @@ async function buildMergedToolStateList(options = {}) {
   const config = options.config || (await readConfig());
   return Promise.all(
     Object.values(config.tools || {})
-      .sort((left, right) => String(left?.name || left?.id || '').localeCompare(String(right?.name || right?.id || '')))
-      .map(async (tool) => {
-        const manifest = getToolManifest(tool.id) || {};
+      .map((tool) => ({ tool, manifest: getToolManifest(tool?.id) }))
+      .filter(({ manifest }) => Boolean(manifest?.id))
+      .sort((left, right) => String(left.tool?.name || left.tool?.id || '').localeCompare(String(right.tool?.name || right.tool?.id || '')))
+      .map(async ({ tool, manifest }) => {
         const normalizedTool = normalizeToolLifecycle({
           ...manifest,
           ...tool,
           compatibility: manifest.installInstructions?.compatibility || manifest.compatibility || tool.compatibility || null,
+          modelManager: manifest.modelManager || tool.modelManager || null,
         }, manifest);
         const recoveredTool = await recoverBrokenManagedToolState(normalizedTool, manifest);
         const mergedTool = refreshManagedLaunchState(recoveredTool, manifest);

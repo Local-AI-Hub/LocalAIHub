@@ -24,18 +24,18 @@ function ProviderCard({ provider, busyMap, onOpenChat, onOpenSettings }) {
             <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-300">
               Messages sent here are processed by {provider.name} and leave your machine. Use Settings to manage the API key stored in Windows Credential Manager.
             </p>
-            <div className="mt-5 grid gap-3 md:grid-cols-3">
-              <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
+            <div className="mt-5 grid min-w-0 gap-3 md:grid-cols-3">
+              <div className="min-w-0 rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Connection</p>
-                <p className="mt-2 text-sm font-medium text-white">{provider.maskedKey || 'Not connected'}</p>
+                <p className="mt-2 min-w-0 truncate text-sm font-medium text-white" title={provider.maskedKey ? 'Saved credential configured' : 'Not connected'}>{provider.maskedKey || 'Not connected'}</p>
               </div>
-              <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
+              <div className="min-w-0 rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Models</p>
-                <p className="mt-2 text-sm font-medium text-white">{provider.modelCount ? `${provider.modelCount} available` : 'Refresh to load'}</p>
+                <p className="mt-2 truncate text-sm font-medium text-white">{provider.modelCount ? `${provider.modelCount} available` : 'Refresh to load'}</p>
               </div>
-              <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
+              <div className="min-w-0 rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Selected model</p>
-                <p className="mt-2 text-sm font-medium text-white break-all">{provider.selectedModel || provider.lastAvailableModelId || 'Choose in chat'}</p>
+                <p className="mt-2 min-w-0 truncate text-sm font-medium text-white" title={provider.selectedModel || provider.lastAvailableModelId || 'Choose in chat'}>{provider.selectedModel || provider.lastAvailableModelId || 'Choose in chat'}</p>
               </div>
             </div>
             {provider.statusMessage || provider.lastTestMessage ? (

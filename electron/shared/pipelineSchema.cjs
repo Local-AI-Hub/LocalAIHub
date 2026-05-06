@@ -3297,9 +3297,6 @@ function getLocalImageBackendCandidateState(toolId, contextMaps = {}, options = 
 function getUnsupportedLocalImageBackendMessage(toolId, contextMaps = {}) {
   const normalizedToolId = String(toolId || '').trim().toLowerCase();
   const label = getContextToolEntry(normalizedToolId, contextMaps)?.name || normalizedToolId || 'This tool';
-  if (normalizedToolId === 'fooocus') {
-    return 'Fooocus is launchable from Library, but this Local AI Hub build does not have a stable Fooocus pipeline adapter yet. Use Forge or Automatic1111 for sequential Image Generation nodes, or keep Fooocus on its full UI surface.';
-  }
   if (normalizedToolId === 'comfyui' || normalizedToolId === 'invokeai') {
     return label + ' stays graph-native in Local AI Hub. Use a Graph Workflow node with an imported workflow instead of the sequential Image Generation backend selector.';
   }
@@ -3829,14 +3826,14 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
     if (compatibilityProfile && (compatibility?.tone === 'danger' || compatibility?.tone === 'warn')) {
       summary.readiness = {
         tone: 'warn',
-        message: tool.name + ' is configured for ' + modeLabel + ', but this machine is below or near the low end of Wan2.1 hardware targets. ' + compatibility.message + ' Wan also needs CUDA toolkit support and local model folders before runtime can succeed.',
+        message: tool.name + ' is configured for ' + modeLabel + ', but this machine is below or near the low end of Wan2.1 hardware targets. ' + compatibility.message + ' Wan generation also needs a CUDA-enabled PyTorch runtime and local model folders; the CUDA Toolkit/nvcc is only relevant to optional acceleration packages such as flash_attn.',
       };
       return true;
     }
 
     summary.readiness = {
       tone: 'info',
-      message: tool.name + ' will run this ' + modeLabel + ' step through its dedicated local backend adapter. Local AI Hub keeps the pipeline sequential, requires CUDA-ready Wan dependencies and model folders, and saves the rendered video back into the run folder.',
+      message: tool.name + ' will run this ' + modeLabel + ' step through its dedicated local backend adapter. Local AI Hub keeps the pipeline sequential, requires a CUDA-enabled PyTorch runtime and Wan model folders, and saves the rendered video back into the run folder.',
     };
     return true;
   }

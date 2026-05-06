@@ -21,6 +21,7 @@ import {
   summarizePreview,
   toneToClassName,
 } from '../lib/pipeline-ui';
+import { expectNextPrintableKeyDiagnostic, isEditableTarget, logRendererActionDiagnostic } from '../lib/focus-guard';
 
 const {
   buildPipelineWizardContext,
@@ -2232,7 +2233,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                 : isLocalImageTransformMode
                   ? 'This mode runs a single local image-to-image transformation and returns a transformed image artifact with source lineage. Use Upscayl for enhancement and upscaling, or FaceFusion when you also connect a Reference Image.'
                   : isLocalVideoMode
-                    ? 'This mode runs a single local Wan video request inside the sequential pipeline. Text input uses text-to-video; image input uses image-to-video and needs motion guidance. Wan also needs CUDA toolkit support, local model folders, and substantially more VRAM than GTX 1060-class hardware. Use the Graph Workflow step when you want graph-native video generation through ComfyUI.'
+                    ? 'This mode runs a single local Wan video request inside the sequential pipeline. Text input uses text-to-video; image input uses image-to-video and needs motion guidance. Wan generation needs a CUDA-enabled PyTorch runtime, local model folders, and substantially more VRAM than GTX 1060-class hardware. CUDA Toolkit/nvcc only affects optional acceleration packages such as flash_attn. Use the Graph Workflow step when you want graph-native video generation through ComfyUI.'
                     : isLocalImageAnalysisMode
                       ? 'This mode runs WebUI image interrogation through the best ready WebUI-compatible backend when Auto is selected and returns text from the Text output port.'
                       : 'This mode runs a single local image request through the best ready WebUI-compatible backend when Auto is selected. Use the Graph Workflow step when you need a graph-native tool such as ComfyUI.'}
@@ -2246,7 +2247,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
 
       <div>
         <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`${node.id}-model`}>
-          {isLocalTranscriptionMode ? 'Transcription model' : isLocalAudioMode ? 'Model override' : isLocalAudioTransformMode ? 'Voice model' : isLocalImageAnalysisMode ? 'Analysis mode' : isLocalImageTransformMode ? 'Optional tool override' : isLocalVideoMode ? 'Model folder override' : executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
+          {isLocalTranscriptionMode ? 'Transcription model' : isLocalAudioMode ? 'AudioCraft model' : isLocalAudioTransformMode ? 'Voice model' : isLocalImageAnalysisMode ? 'Analysis mode' : isLocalImageTransformMode ? 'Model set override' : isLocalVideoMode ? 'Model folder override' : executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
         </label>
         <input
           className="store-input mt-3"
@@ -2260,13 +2261,21 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
               },
             }))
           }
-          placeholder={isLocalTranscriptionMode ? 'base' : isLocalAudioMode ? 'Optional AudioCraft model such as facebook/musicgen-melody' : isLocalAudioTransformMode ? 'Enter or pick an RVC voice model file' : isLocalImageAnalysisMode ? 'clip or deepdanbooru' : isLocalImageTransformMode ? 'Optional future override when this tool exposes one' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? getCloudAudioModelPlaceholder(selectedCloudProviderId) : 'Enter or pick a model'}
+          placeholder={isLocalTranscriptionMode ? 'base' : isLocalAudioMode ? 'Blank for default, or pick a downloaded AudioCraft snapshot' : isLocalAudioTransformMode ? 'Enter or pick an RVC voice model file' : isLocalImageAnalysisMode ? 'clip or deepdanbooru' : isLocalImageTransformMode ? 'Optional Upscayl paired model set' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? getCloudAudioModelPlaceholder(selectedCloudProviderId) : 'Enter or pick a model'}
           value={node.config?.model || ''}
         />
         {isLocalAudioMode ? (
-          <p className="mt-3 text-xs leading-5 text-slate-500">
-            AudioCraft can use its built-in default models for this pass. Leave this blank unless you want to force a specific MusicGen or AudioGen model name.
-          </p>
+          <div className="mt-3 space-y-3">
+            <p className="text-xs leading-5 text-slate-500">
+              AudioCraft can use upstream defaults when this is blank, or a downloaded local snapshot path from Model Manager when selected.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <button className="ghost-button" disabled={modelsBusy} onClick={() => onRefreshModels(node)} type="button">
+                {modelsBusy ? 'Refreshing...' : 'Refresh snapshots'}
+              </button>
+              <span className="text-xs text-slate-500">Loads downloaded AudioCraft snapshots from {selectedLocalTool?.name || 'the selected tool'}.</span>
+            </div>
+          </div>
         ) : isLocalAudioTransformMode ? (
           <div className="mt-3 space-y-3">
             <p className="text-xs leading-5 text-slate-500">
@@ -2280,13 +2289,29 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
             </div>
           </div>
         ) : isLocalImageTransformMode ? (
-          <p className="mt-3 text-xs leading-5 text-slate-500">
-            Upscayl and FaceFusion use tool-managed defaults in this first shared image-transform pass. Leave this blank unless a future tool build exposes a direct override here.
-          </p>
+          <div className="mt-3 space-y-3">
+            <p className="text-xs leading-5 text-slate-500">
+              Upscayl can use a downloaded paired model set when selected. Leave this blank to use the tool-managed default.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <button className="ghost-button" disabled={modelsBusy} onClick={() => onRefreshModels(node)} type="button">
+                {modelsBusy ? 'Refreshing...' : 'Refresh model sets'}
+              </button>
+              <span className="text-xs text-slate-500">Loads downloaded paired model sets from {selectedLocalTool?.name || 'the selected tool'}.</span>
+            </div>
+          </div>
         ) : isLocalVideoMode ? (
-          <p className="mt-3 text-xs leading-5 text-slate-500">
-            Local AI Hub auto-detects Wan model folders from <code>models\Wan-AI</code>. Leave this blank unless you need to force a specific installed model folder.
-          </p>
+          <div className="mt-3 space-y-3">
+            <p className="text-xs leading-5 text-slate-500">
+              Local AI Hub auto-detects Wan model folders from <code>models\Wan-AI</code>. Leave this blank unless you need to force a specific installed model folder.
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <button className="ghost-button" disabled={modelsBusy} onClick={() => onRefreshModels(node)} type="button">
+                {modelsBusy ? 'Refreshing...' : 'Refresh folders'}
+              </button>
+              <span className="text-xs text-slate-500">Loads downloaded Wan model folders from {selectedLocalTool?.name || 'the selected tool'}.</span>
+            </div>
+          </div>
         ) : (
           <div className="mt-3 flex flex-wrap items-center gap-3">
             <button className="ghost-button" disabled={modelsBusy} onClick={() => onRefreshModels(node)} type="button">
@@ -2317,7 +2342,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
             </span>
           </div>
         )}
-        {!isLocalVideoMode && !isLocalAudioMode && !isLocalImageTransformMode && modelOptions?.length ? (
+        {modelOptions?.length ? (
           <div className="mt-3 grid gap-2">
             {modelOptions.slice(0, 8).map((model) => (
               <button
@@ -2740,19 +2765,28 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       setOutputsLoading(true);
     }
 
-    const result = await window.localAIHub.listPipelineOutputs();
-    if (!result?.ok) {
-      setOutputsLoading(false);
+    try {
+      const result = await window.localAIHub.listPipelineOutputs();
+      if (!result?.ok) {
+        if (!options.silent) {
+          onToast(result?.message || 'Local AI Hub could not load the saved pipeline outputs.', 'error');
+        }
+        return [];
+      }
+
+      const nextOutputs = result.data?.outputs || [];
+      setPipelineOutputs(nextOutputs);
+      return nextOutputs;
+    } catch (error) {
       if (!options.silent) {
-        onToast(result?.message || 'Local AI Hub could not load the saved pipeline outputs.', 'error');
+        onToast(error?.message || 'Local AI Hub could not load the saved pipeline outputs.', 'error');
       }
       return [];
+    } finally {
+      if (!options.silent) {
+        setOutputsLoading(false);
+      }
     }
-
-    const nextOutputs = result.data?.outputs || [];
-    setPipelineOutputs(nextOutputs);
-    setOutputsLoading(false);
-    return nextOutputs;
   }
 
   async function loadSavedPipeline(pipelineId, options = {}) {
@@ -2802,16 +2836,25 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     setOutputsBusyPath(outputPath);
-    const result = await window.localAIHub.deletePipelineOutput({ path: outputPath });
-    setOutputsBusyPath('');
-    if (!result?.ok) {
-      onToast(result?.message || 'Local AI Hub could not delete that pipeline output.', 'error');
-      return;
-    }
+    logRendererActionDiagnostic('pipeline-output-delete', 'start', { hasOutputPath: Boolean(outputPath), outputId: String(output?.id || '') });
+    try {
+      const result = await window.localAIHub.deletePipelineOutput({ path: outputPath });
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not delete that pipeline output.', 'error');
+        return;
+      }
 
-    setPipelineOutputs((current) => current.filter((entry) => entry.id !== output.id));
-    onToast(result.data?.message || `${outputLabel} was deleted.`, 'success');
-    await loadPipelineOutputs({ silent: true });
+      setPipelineOutputs((current) => current.filter((entry) => entry.id !== output.id));
+      logRendererActionDiagnostic('pipeline-output-delete', 'success', { outputId: String(output?.id || '') });
+      onToast(result.data?.message || `${outputLabel} was deleted.`, 'success');
+      await loadPipelineOutputs({ silent: true });
+    } catch (error) {
+      logRendererActionDiagnostic('pipeline-output-delete', 'failure', { message: String(error?.message || '') }, 'warn');
+      onToast(error?.message || 'Local AI Hub could not delete that pipeline output.', 'error');
+    } finally {
+      setOutputsBusyPath('');
+      expectNextPrintableKeyDiagnostic('pipeline-output-delete', { outputId: String(output?.id || '') });
+    }
   }
 
   useEffect(() => {
@@ -3036,7 +3079,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     const interactiveTarget = event.target instanceof Element ? event.target.closest('[data-canvas-interactive="true"]') : null;
-    if (interactiveTarget) {
+    if (interactiveTarget || isEditableTarget(event.target)) {
       return;
     }
 
@@ -3146,7 +3189,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   function startDrag(nodeId, event) {
     const node = draft.nodes.find((entry) => entry.id === nodeId);
     const pointer = getCanvasGraphPoint(event);
-    if (!node || !pointer) {
+    if (!node || !pointer || isEditableTarget(event.target)) {
       return;
     }
 
@@ -3239,19 +3282,27 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
   async function handleSavePipeline() {
     setSaveBusy(true);
-    const result = await window.localAIHub.savePipeline(draft);
-    setSaveBusy(false);
+    logRendererActionDiagnostic('pipeline-save', 'start', { edgeCount: draft.edges.length, nodeCount: draft.nodes.length, pipelineId: String(draft.id || '') });
+    try {
+      const result = await window.localAIHub.savePipeline(draft);
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not save that pipeline.', 'error');
+        return;
+      }
 
-    if (!result?.ok) {
-      onToast(result?.message || 'Local AI Hub could not save that pipeline.', 'error');
-      return;
+      setPipelines(result.data?.pipelines || []);
+      logRendererActionDiagnostic('pipeline-save', 'success', { pipelineId: String(result.data?.pipeline?.id || draft.id || '') });
+      replaceDraft(result.data?.pipeline || draft, {
+        dirty: false,
+      });
+      onToast(result.data?.message || 'Pipeline saved.', 'success');
+    } catch (error) {
+      logRendererActionDiagnostic('pipeline-save', 'failure', { message: String(error?.message || ''), pipelineId: String(draft.id || '') }, 'warn');
+      onToast(error?.message || 'Local AI Hub could not save that pipeline.', 'error');
+    } finally {
+      setSaveBusy(false);
+      expectNextPrintableKeyDiagnostic('pipeline-save', { pipelineId: String(draft.id || '') });
     }
-
-    setPipelines(result.data?.pipelines || []);
-    replaceDraft(result.data?.pipeline || draft, {
-      dirty: false,
-    });
-    onToast(result.data?.message || 'Pipeline saved.', 'success');
   }
 
   async function handleDeletePipeline() {
@@ -3266,29 +3317,30 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     setDeleteBusy(true);
-    const result = await window.localAIHub.deletePipeline(draft.id);
-    setDeleteBusy(false);
+    try {
+      const result = await window.localAIHub.deletePipeline(draft.id);
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not delete that pipeline.', 'error');
+        return;
+      }
 
-    if (!result?.ok) {
-      onToast(result?.message || 'Local AI Hub could not delete that pipeline.', 'error');
-      return;
+      const nextPipelines = result.data?.pipelines || [];
+      setPipelines(nextPipelines);
+      onToast(result.data?.message || 'Pipeline deleted.', 'success');
+
+      if (nextPipelines.length > 0) {
+        await loadSavedPipeline(nextPipelines[0].id, {
+          force: true,
+        });
+        return;
+      }
+
+      createNewPipeline();
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not delete that pipeline.', 'error');
+    } finally {
+      setDeleteBusy(false);
     }
-
-    const nextPipelines = result.data?.pipelines || [];
-    setPipelines(nextPipelines);
-    onToast(result.data?.message || 'Pipeline deleted.', 'success');
-
-    if (nextPipelines.length > 0) {
-      await loadSavedPipeline(nextPipelines[0].id, {
-        force: true,
-      });
-      return;
-    }
-
-    replaceDraft(createEmptyPipeline(), {
-      dirty: false,
-      selectedNodeId: '',
-    });
   }
 
   async function refreshNodeModels(node) {
@@ -3417,11 +3469,28 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
           return;
         }
 
-        setModelOptionsByNodeId((current) => ({
-          ...current,
-          [node.id]: [],
-        }));
-        setModelsBusyNodeId('');
+        const result = await window.localAIHub.listToolAssets({ assetKind: 'audiocraft-snapshot', toolId });
+        if (!result?.ok) {
+          setModelsBusyNodeId('');
+          onToast(result?.message || 'Local AI Hub could not load downloaded AudioCraft snapshots for that step.', 'error');
+          return;
+        }
+
+        const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
+        if (result.data?.message) {
+          onToast(result.data.message, assetModels.length ? 'success' : 'info');
+        }
+
+        models = assetModels
+          .map((model) => ({
+            ...model,
+            id: String(model.path || model.packageRootPath || model.relativePath || model.name || model.id || '').trim(),
+            label: model.sourceCatalogRepositoryId || model.name || model.fileName || model.relativePath || model.id,
+            detail: [model.modelType, model.relativePath || model.path].filter(Boolean).join(' | '),
+            toolId,
+          }))
+          .filter((model) => model.id);
+
         if (!String(node.config?.toolId || '').trim()) {
           updateNode(node.id, (currentNode) => ({
             ...currentNode,
@@ -3431,11 +3500,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             },
           }));
         }
-        onToast('AudioCraft uses built-in MusicGen and AudioGen defaults in this first audio-output slice. Leave Model override blank unless you need to force a specific model name.', 'info');
-        return;
-      }
-
-      if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+      } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
         const toolId = String(node.config?.toolId || audioTransformTools[0]?.id || '').trim();
         if (!toolId) {
           setModelsBusyNodeId('');
@@ -3482,11 +3547,33 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
           return;
         }
 
-        setModelOptionsByNodeId((current) => ({
-          ...current,
-          [node.id]: [],
-        }));
-        setModelsBusyNodeId('');
+        const selectedTransformTool = imageTransformTools.find((tool) => tool.id === toolId) || null;
+        if (toolId === 'upscayl') {
+          const result = await window.localAIHub.listToolAssets({ assetKind: 'upscayl-model-set', toolId });
+          if (!result?.ok) {
+            setModelsBusyNodeId('');
+            onToast(result?.message || 'Local AI Hub could not load downloaded Upscayl model sets for that step.', 'error');
+            return;
+          }
+
+          const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
+          if (result.data?.message) {
+            onToast(result.data.message, assetModels.length ? 'success' : 'info');
+          }
+
+          models = assetModels
+            .map((model) => ({
+              ...model,
+              id: String(model.name || model.fileName || model.relativePath || model.id || '').trim(),
+              label: model.name || model.fileName || model.relativePath || model.id,
+              detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
+              toolId,
+            }))
+            .filter((model) => model.id);
+        } else {
+          onToast(`${selectedTransformTool?.name || 'This image transform tool'} does not expose selectable downloaded model sets yet.`, 'info');
+        }
+
         if (!String(node.config?.toolId || '').trim()) {
           updateNode(node.id, (currentNode) => ({
             ...currentNode,
@@ -3496,16 +3583,45 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             },
           }));
         }
-        onToast('Upscayl and FaceFusion use tool-managed defaults and assets in this first shared image-transform slice. Leave Optional tool override blank unless a future tool build exposes one here.', 'info');
-        return;
       } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
-        setModelOptionsByNodeId((current) => ({
-          ...current,
-          [node.id]: [],
-        }));
-        setModelsBusyNodeId('');
-        onToast('Local AI Hub auto-detects Wan model folders from models\\Wan-AI for this first video slice. Enter a model folder name only if you need to override the default.', 'info');
-        return;
+        const toolId = String(node.config?.toolId || videoTools[0]?.id || '').trim();
+        if (!toolId) {
+          setModelsBusyNodeId('');
+          onToast('Install Wan2.1 WebUI before configuring local video generation for this step.', 'error');
+          return;
+        }
+
+        const result = await window.localAIHub.listToolAssets({ assetKind: 'wan-model-folder', toolId });
+        if (!result?.ok) {
+          setModelsBusyNodeId('');
+          onToast(result?.message || 'Local AI Hub could not load downloaded Wan model folders for that step.', 'error');
+          return;
+        }
+
+        const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
+        if (result.data?.message) {
+          onToast(result.data.message, assetModels.length ? 'success' : 'info');
+        }
+
+        models = assetModels
+          .map((model) => ({
+            ...model,
+            id: String(model.name || model.fileName || model.relativePath || model.id || '').trim(),
+            label: model.name || model.fileName || model.relativePath || model.id,
+            detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
+            toolId,
+          }))
+          .filter((model) => model.id);
+
+        if (!String(node.config?.toolId || '').trim()) {
+          updateNode(node.id, (currentNode) => ({
+            ...currentNode,
+            config: {
+              ...currentNode.config,
+              toolId,
+            },
+          }));
+        }
       } else {
         const toolId = String(node.config?.toolId || imageTools[0]?.id || '').trim();
         if (!toolId) {
@@ -3598,54 +3714,55 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   async function refreshWizardModels() {
     setWizardModelsBusy(true);
     setWizardSummary(null);
-    let result = null;
-    if (wizardExecutionMode === 'ollama') {
-      result = await window.localAIHub.listOllamaModels({ includeCapabilities: true, autoStart: true, launchContext: 'pipeline-wizard-model-refresh' });
-      if (!result?.ok) {
-        setWizardModelsBusy(false);
-        onToast(result?.message || 'Local AI Hub could not load Ollama models for the wizard.', 'error');
+    try {
+      let result = null;
+      if (wizardExecutionMode === 'ollama') {
+        result = await window.localAIHub.listOllamaModels({ includeCapabilities: true, autoStart: true, launchContext: 'pipeline-wizard-model-refresh' });
+        if (!result?.ok) {
+          onToast(result?.message || 'Local AI Hub could not load Ollama models for the wizard.', 'error');
+          return;
+        }
+
+        const models = rankLocalWizardModelOptions((result.data?.models || []).map((model) => buildWizardModelOption({
+          id: model.name,
+          label: model.name,
+          detail: buildOllamaModelDetail(model),
+          size: model.size,
+          capabilityLabels: Array.isArray(model.capabilityLabels) ? model.capabilityLabels : [],
+          capabilitySource: model.capabilitySource || '',
+          supportsImageInput: typeof model.supportsImageInput === 'boolean' ? model.supportsImageInput : undefined,
+        })).filter((model) => model.id), hardware);
+        setWizardModelOptions(models);
+        if ((!wizardModel || !models.some((model) => model.id === wizardModel)) && models[0]?.id) {
+          setWizardModel(models[0].id);
+        }
+        if (result.data?.stoppedAfterUse) {
+          onToast('Local AI Hub started Ollama to inspect local models, then stopped it again.', 'info');
+        }
         return;
       }
 
-      const models = rankLocalWizardModelOptions((result.data?.models || []).map((model) => buildWizardModelOption({
-        id: model.name,
-        label: model.name,
-        detail: buildOllamaModelDetail(model),
-        size: model.size,
-        capabilityLabels: Array.isArray(model.capabilityLabels) ? model.capabilityLabels : [],
-        capabilitySource: model.capabilitySource || '',
-        supportsImageInput: typeof model.supportsImageInput === 'boolean' ? model.supportsImageInput : undefined,
-      })).filter((model) => model.id), hardware);
+      if (!wizardProviderId) {
+        onToast('Choose a connected cloud provider for the pipeline wizard first.', 'error');
+        return;
+      }
+
+      result = await window.localAIHub.listProviderModels({ providerId: wizardProviderId, operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT });
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not load wizard models for that provider.', 'error');
+        return;
+      }
+
+      const models = (result.data?.models || []).map((model) => buildWizardModelOption(model)).filter((model) => model.id);
       setWizardModelOptions(models);
-      if ((!wizardModel || !models.some((model) => model.id === wizardModel)) && models[0]?.id) {
-        setWizardModel(models[0].id);
+      if (!wizardModel && (result.data?.selectedModel || models[0]?.id)) {
+        setWizardModel(getWizardModelId(result.data?.selectedModel) || models[0].id);
       }
-      if (result.data?.stoppedAfterUse) {
-        onToast('Local AI Hub started Ollama to inspect local models, then stopped it again.', 'info');
-      }
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not load wizard models.', 'error');
+    } finally {
       setWizardModelsBusy(false);
-      return;
     }
-
-    if (!wizardProviderId) {
-      setWizardModelsBusy(false);
-      onToast('Choose a connected cloud provider for the pipeline wizard first.', 'error');
-      return;
-    }
-
-    result = await window.localAIHub.listProviderModels({ providerId: wizardProviderId, operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT });
-    if (!result?.ok) {
-      setWizardModelsBusy(false);
-      onToast(result?.message || 'Local AI Hub could not load wizard models for that provider.', 'error');
-      return;
-    }
-
-    const models = (result.data?.models || []).map((model) => buildWizardModelOption(model)).filter((model) => model.id);
-    setWizardModelOptions(models);
-    if (!wizardModel && (result.data?.selectedModel || models[0]?.id)) {
-      setWizardModel(getWizardModelId(result.data?.selectedModel) || models[0].id);
-    }
-    setWizardModelsBusy(false);
   }
 
   async function handleGenerateWizardDraft() {
@@ -3817,15 +3934,20 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     setRunBusy(true);
-    const result = await window.localAIHub.runPipeline(draft);
-    setRunBusy(false);
-    if (!result?.ok) {
-      onToast(result?.message || 'Local AI Hub could not run that pipeline.', 'error');
-      return;
-    }
+    try {
+      const result = await window.localAIHub.runPipeline(draft);
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not run that pipeline.', 'error');
+        return;
+      }
 
-    applyRunSnapshot(result.data?.run || null);
-    onToast(result.data?.message || 'Pipeline started. Local AI Hub will launch any required local tools as the run reaches them.', 'success');
+      applyRunSnapshot(result.data?.run || null);
+      onToast(result.data?.message || 'Pipeline started. Local AI Hub will launch any required local tools as the run reaches them.', 'success');
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not run that pipeline.', 'error');
+    } finally {
+      setRunBusy(false);
+    }
   }
 
   async function handleCancelRun() {
@@ -3854,24 +3976,29 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }
 
     setValidationBusy(true);
-    const result = await window.localAIHub.resumePipelineValidation({
-      comment: validationComment,
-      decision,
-      nodeId: pendingValidation.nodeId,
-      requestId: pendingValidation.requestId,
-      runId: runState.runId,
-    });
-    setValidationBusy(false);
-    if (!result?.ok) {
-      onToast(result?.message || 'Local AI Hub could not continue that validation step.', 'error');
-      return;
-    }
+    try {
+      const result = await window.localAIHub.resumePipelineValidation({
+        comment: validationComment,
+        decision,
+        nodeId: pendingValidation.nodeId,
+        requestId: pendingValidation.requestId,
+        runId: runState.runId,
+      });
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not continue that validation step.', 'error');
+        return;
+      }
 
-    if (result.data?.run) {
-      applyRunSnapshot(result.data.run);
+      if (result.data?.run) {
+        applyRunSnapshot(result.data.run);
+      }
+      setValidationComment('');
+      onToast(result.data?.message || 'Validation decision saved.', 'success');
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not continue that validation step.', 'error');
+    } finally {
+      setValidationBusy(false);
     }
-    setValidationComment('');
-    onToast(result.data?.message || 'Validation decision saved.', 'success');
   }
 
   const paletteGroups = getNodePaletteGroups();
@@ -4394,7 +4521,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                           <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-video-size">Video size</label><select className="store-input mt-3" id="llm-local-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="832x480">832 x 480</option><option value="1280x720">1280 x 720</option></select></div>
                           <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-video-steps">Steps</label><input className="store-input mt-3" id="llm-local-video-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-video-seed">Seed</label><input className="store-input mt-3" id="llm-local-video-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
                           <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-local-negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for this local video step." value={selectedNode.config?.negativePrompt || ''} /></div>
-                          <p className="text-xs leading-5 text-slate-400">Wan local video is intentionally limited to 832x480 or 1280x720 in this first slice. Text input renders text-to-video. Image input renders image-to-video and requires motion guidance in the Instruction box. Missing CUDA toolkit support, missing model folders, or low VRAM will be surfaced before or during the run instead of reported as a fake success.</p>
+                          <p className="text-xs leading-5 text-slate-400">Wan local video is intentionally limited to 832x480 or 1280x720 in this first slice. Text input renders text-to-video. Image input renders image-to-video and requires motion guidance in the Instruction box. Missing CUDA-enabled PyTorch runtime support, missing model folders, or low VRAM will be surfaced before or during the run instead of reported as a fake success.</p>
                         </div>
                       ) : (
                         <div className="space-y-4">

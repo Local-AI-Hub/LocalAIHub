@@ -23,14 +23,14 @@ export default function ConnectionsPanel({
         {(providers || []).map((provider) => (
           <div key={provider.id} className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
+              <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-3">
                   <p className="text-xl font-semibold text-white">{provider.name}</p>
                   <span className="status-pill border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Cloud</span>
                 </div>
                 <p className="mt-2 text-sm text-slate-300">{provider.statusLabel}</p>
                 <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-500">{provider.credentialStatusLabel || 'No credential configured'}</p>
-                {provider.maskedKey ? <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-500">{provider.maskedKey}</p> : null}
+                {provider.maskedKey ? <p className="mt-1 max-w-full truncate text-xs uppercase tracking-[0.18em] text-slate-500" title="Saved credential configured">{provider.maskedKey}</p> : null}
               </div>
               <a className="ghost-button" href={provider.docsUrl} rel="noreferrer" target="_blank">
                 Docs

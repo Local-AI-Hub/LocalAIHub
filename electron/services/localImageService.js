@@ -8,6 +8,7 @@ try {
 }
 
 const { runCommand } = require('./commandService');
+const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
 const { PORT_KIND_IMAGE } = require('../shared/pipelineSchema.cjs');
@@ -165,13 +166,18 @@ async function runLocalImageTask(tool, payload, reportProgress, progressMessages
     progressMessages.run || ('Running ' + (payload.nodeLabel || 'this step') + ' with ' + toolLabel + '...'),
   );
 
+  const runtimeEnv = await buildLaunchRuntimeEnv(tool, {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+  }, { launchProfile: tool?.launchProfile || null });
+  await logger.info?.('Local image helper launch environment prepared.', {
+    launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
+  });
   const commandResult = await runCommand(pythonPath, [helperScript, requestPath], {
     allowFailure: true,
     cwd: toolRoot,
-    env: {
-      PYTHONIOENCODING: 'utf-8',
-      PYTHONUTF8: '1',
-    },
+    env: runtimeEnv,
+    replaceEnv: true,
   });
 
   if (Number(commandResult.code || 0) !== 0) {
@@ -259,7 +265,7 @@ async function resolveUpscaylModelDirectory(toolRoot) {
   return '';
 }
 
-async function resolveUpscaylModelName(modelsDirectory) {
+async function resolveUpscaylModelName(modelsDirectory, requestedModel = '') {
   if (!modelsDirectory || !(await fs.pathExists(modelsDirectory))) {
     return 'realesrgan-x4plus';
   }
@@ -268,6 +274,17 @@ async function resolveUpscaylModelName(modelsDirectory) {
   const paramNames = entries
     .filter((entry) => String(entry || '').toLowerCase().endsWith('.param'))
     .map((entry) => entry.slice(0, -6));
+  const requestedName = String(requestedModel || '').trim();
+  if (requestedName) {
+    const requestedStem = path.basename(requestedName, path.extname(requestedName));
+    const hasParam = paramNames.some((entry) => entry.toLowerCase() === requestedStem.toLowerCase());
+    const hasBin = entries.some((entry) => entry.toLowerCase() === (requestedStem.toLowerCase() + '.bin'));
+    if (hasParam && hasBin) {
+      return requestedStem;
+    }
+    throw new Error('The selected Upscayl model set was not found in the Upscayl models folder. Refresh models or choose a paired .param and .bin model set.');
+  }
+
   const preferredNames = [
     'realesrgan-x4plus',
     'realesrgan-x4plus-anime',
@@ -312,13 +329,18 @@ async function resolveUpscaylOutputFile(preferredOutputPath, outputDirectory, so
   return newestEntry?.entry || '';
 }
 
-async function runUpscaylCommand(executablePath, args, cwd, toolLabel, logger) {
+async function runUpscaylCommand(executablePath, args, cwd, toolLabel, logger, tool = null) {
+  const runtimeEnv = await buildLaunchRuntimeEnv(tool, {
+    UPX_NO_LOGO: '1',
+  }, { launchProfile: tool?.launchProfile || null });
+  await logger.info?.('Upscayl launch environment prepared.', {
+    launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
+  });
   const commandResult = await runCommand(executablePath, args, {
     allowFailure: true,
     cwd,
-    env: {
-      UPX_NO_LOGO: '1',
-    },
+    env: runtimeEnv,
+    replaceEnv: true,
   });
 
   if (Number(commandResult.code || 0) === 0) {
@@ -355,7 +377,7 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
   }
 
   const modelsDirectory = await resolveUpscaylModelDirectory(toolRoot);
-  const modelName = await resolveUpscaylModelName(modelsDirectory);
+  const modelName = await resolveUpscaylModelName(modelsDirectory, options.model);
   const transformSubtype = ['upscale', 'enhance'].includes(String(options.transformSubtype || '').trim().toLowerCase())
     ? String(options.transformSubtype || '').trim().toLowerCase()
     : 'upscale';
@@ -395,7 +417,7 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
 
   let commandResult = null;
   for (const args of argSets) {
-    commandResult = await runUpscaylCommand(executablePath, args, toolRoot, toolLabel, logger);
+    commandResult = await runUpscaylCommand(executablePath, args, toolRoot, toolLabel, logger, tool);
     const outputPath = await resolveUpscaylOutputFile(preferredOutputPath, outputDirectory, sourceImagePath);
     if (commandResult && outputPath) {
       const artifact = await buildFileArtifact(outputPath, {

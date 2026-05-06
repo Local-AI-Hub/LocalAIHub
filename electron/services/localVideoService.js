@@ -8,6 +8,7 @@ try {
 }
 
 const { runCommand } = require('./commandService');
+const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
 const { PIPELINE_OPERATION_IDS, PORT_KIND_VIDEO } = require('../shared/pipelineSchema.cjs');
@@ -147,13 +148,18 @@ async function runWanLocalVideoTask(tool, payload, reportProgress) {
     'Running ' + (payload.nodeLabel || 'this step') + ' with ' + toolLabel + '...',
   );
 
+  const runtimeEnv = await buildLaunchRuntimeEnv(tool, {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+  }, { launchProfile: tool?.launchProfile || null });
+  await logger.info?.('Local video helper launch environment prepared.', {
+    launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
+  });
   const commandResult = await runCommand(pythonPath, [helperScript, requestPath], {
     allowFailure: true,
     cwd: toolRoot,
-    env: {
-      PYTHONIOENCODING: 'utf-8',
-      PYTHONUTF8: '1',
-    },
+    env: runtimeEnv,
+    replaceEnv: true,
   });
 
   if (Number(commandResult.code || 0) !== 0) {

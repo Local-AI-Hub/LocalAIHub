@@ -854,6 +854,79 @@ function verifyCloudAudioReadinessStates() {
   assert(readySummary.capabilitySummary.outputKinds.includes('audio'), 'Expected the cloud audio capability summary to produce audio output.');
 }
 
+async function verifyAudiocraftPipelineEnvironmentContract(tempRoot) {
+  const manifestPath = path.resolve(__dirname, '..', 'electron', 'config', 'tools-manifest.json');
+  const manifestTools = JSON.parse(await fsp.readFile(manifestPath, 'utf8'));
+  const audiocraftManifest = manifestTools.find((tool) => tool.id === 'audiocraft-webui');
+  assert(audiocraftManifest, 'AudioCraft WebUI should remain present in the tool manifest.');
+  const pipInstalls = audiocraftManifest.installInstructions?.pipInstalls || [];
+  assert(pipInstalls.some((entry) => entry.kind === 'requirements' && entry.value === 'requirements.txt'), 'AudioCraft install/repair should install the upstream requirements file.');
+  assert(pipInstalls.some((entry) => entry.kind === 'path' && entry.value === '.' && (entry.pipArgs || []).includes('--no-deps')), 'AudioCraft install/repair should install the local audiocraft package into the managed venv for pipeline imports.');
+
+  const installerPath = path.resolve(__dirname, '..', 'electron', 'services', 'installerService.js');
+  const installerSource = await fsp.readFile(installerPath, 'utf8');
+  assert(installerSource.includes('verifyAudiocraftManagedPipelineReadiness'), 'AudioCraft install/repair finalization should verify pipeline imports before registering the tool as usable.');
+  assert(installerSource.includes('buildAudiocraftPipelineInstallFailureMessage'), 'AudioCraft install/repair should report pipeline package failures with a Repair-oriented message.');
+  assert(installerSource.includes('["numpy", "numpy"]'), 'AudioCraft install/repair should verify NumPy because Local AI Hub uses it for pipeline WAV export fallback.');
+
+  const helperPath = path.resolve(__dirname, '..', 'electron', 'helpers', 'run_audiocraft_pipeline_task.py');
+  const helperSource = await fsp.readFile(helperPath, 'utf8');
+  assert(helperSource.includes("load_module('torchaudio'"), 'AudioCraft helper should verify torchaudio before pipeline generation.');
+  assert(helperSource.includes("load_module('audiocraft.models'"), 'AudioCraft helper should verify AudioCraft model loaders before pipeline generation.');
+  assert(helperSource.includes('format_missing_pipeline_packages'), 'AudioCraft helper should report missing pipeline package names without a raw stack trace.');
+  assert(helperSource.includes('validate_requested_model_path'), 'AudioCraft helper should validate selected local snapshot paths before handing them to Hugging Face loaders.');
+  assert(helperSource.includes('summarize_runtime_exception'), 'AudioCraft helper should report the actual runtime exception instead of a generic warning-shaped failure.');
+  assert(helperSource.includes('write_pcm16_wav'), 'AudioCraft helper should save generated pipeline audio through Local AI Hub\'s PCM WAV fallback.');
+  assert(helperSource.includes('load_audio_for_chroma'), 'AudioCraft helper should avoid TorchCodec-only loading for local WAV audio guidance when possible.');
+  assert(!helperSource.includes('audio_write(output_stem'), 'AudioCraft pipeline export should not depend on audiocraft.data.audio.audio_write because recent Torchaudio requires TorchCodec there.');
+
+  const readinessService = loadModuleWithStubs('electron/services/localAudioService.js', {
+    '/electron/services/localAudioService.js': {
+      './commandService': {
+        runCommand: async () => ({
+          code: 3,
+          stderr: '',
+          stdout: '{"ready":false,"missing":["audiocraft","torchaudio"],"failures":[]}\n',
+        }),
+      },
+      './logService': {
+        createLogger: () => ({ info: async () => {}, warn: async () => {} }),
+      },
+      './pipelineArtifactService': {
+        buildFileArtifact: async () => { throw new Error('Not used in AudioCraft readiness verification.'); },
+        summarizeArtifact: () => ({}),
+      },
+      './processService': {
+        buildLaunchRuntimeEnv: async () => ({ PYTHONUTF8: '1' }),
+        summarizeLaunchRuntimeEnv: () => ({ pythonUtf8: true }),
+      },
+    },
+  });
+  const readiness = await readinessService.checkAudiocraftPipelineReadiness(createAudiocraftTool({
+    appDir: tempRoot,
+    installDir: tempRoot,
+    launchProfile: { kind: 'python-script', pythonPath: 'python' },
+    pythonBootstrapPath: 'python',
+  }));
+  assert.strictEqual(readiness.ready, false, 'AudioCraft readiness should fail when pipeline imports are missing.');
+  assert.strictEqual(readiness.reason, 'missing-packages', 'AudioCraft readiness should distinguish missing pipeline packages.');
+  assert(readiness.message.includes('audiocraft') && readiness.message.includes('torchaudio'), 'AudioCraft missing-package readiness should name the missing imports.');
+  assert(readiness.message.includes('Run Repair'), 'AudioCraft missing-package readiness should guide users to Repair.');
+
+  assert(readinessService._test.AUDIOCRAFT_PIPELINE_IMPORT_CHECKS.some((entry) => entry.moduleName === 'numpy'), 'AudioCraft runtime readiness should verify NumPy for the WAV export fallback.');
+  const missingMessage = readinessService._test.buildAudiocraftMissingPipelinePackagesMessage(['audiocraft', 'torchaudio', 'audiocraft']);
+  assert(missingMessage.includes('audiocraft') && missingMessage.includes('torchaudio'), 'AudioCraft missing package helper should keep package names in the user message.');
+  const parsedProbe = readinessService._test.parseProbeJson('noise\n{"ready":false,"missing":["audiocraft"],"failures":[]}\n');
+  assert.deepStrictEqual(parsedProbe.missing, ['audiocraft'], 'AudioCraft readiness should parse the final JSON line from the import probe.');
+
+  const warningOnlyFailure = readinessService._test.resolveCommandFailureMessage({
+    code: 1,
+    stderr: 'WARNING[XFORMERS]: xFormers can\'t load C++/CUDA extensions.\nSet XFORMERS_MORE_DETAILS=1 for more details\n',
+    stdout: '{"message":"The selected AudioCraft snapshot folder could not be found anymore."}\n',
+  }, 'AudioCraft could not finish the local audio request.');
+  assert.strictEqual(warningOnlyFailure, 'The selected AudioCraft snapshot folder could not be found anymore.', 'AudioCraft helper failures should prefer structured helper errors over warning-only stderr.');
+}
+
 async function verifyCloudAudioPipelineRun(tempRoot) {
   const cases = [
     { provider: createGoogleProvider(), providerId: 'google', model: 'models/gemini-2.5-flash-preview-tts', voice: 'Kore' },
@@ -929,6 +1002,7 @@ async function main() {
 
   verifyWhisperReadinessStates(audioPath);
   verifyAudiocraftReadinessStates(tempRoot, audioPath);
+  await verifyAudiocraftPipelineEnvironmentContract(tempRoot);
   verifyRvcReadinessStates(tempRoot, audioPath);
   verifyCloudAudioReadinessStates();
   await verifyWhisperPipelineRun(tempRoot, audioPath);
@@ -945,6 +1019,3 @@ main().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exitCode = 1;
 });
-
-
-

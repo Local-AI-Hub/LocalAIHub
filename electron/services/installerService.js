@@ -25,7 +25,7 @@ const {
   resolveToolUninstallContext,
   runWindowsUninstaller,
 } = require('./windowsUninstallService');
-const { assertPathInside, assertSecureRemoteUrl, findManagedToolsRootForPath, resolveManagedToolPaths } = require('./pathSafetyService');
+const { assertPathInside, assertSecureRemoteUrl, findManagedToolsRootForPath, isPathInside, resolveManagedToolPaths } = require('./pathSafetyService');
 
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const MIN_CACHE_BYTES = 1024;
@@ -1016,6 +1016,157 @@ async function extractArchive(archivePath, targetDirectory, logger) {
   return targetDirectory;
 }
 
+function getUniqueDirectoryRoots(paths = []) {
+  const unique = [];
+  const seen = new Set();
+  for (const entry of paths.map((value) => path.resolve(String(value || ''))).filter(Boolean).sort((left, right) => left.length - right.length)) {
+    const key = entry.toLowerCase();
+    if (seen.has(key) || unique.some((existing) => isPathInside(existing, entry))) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(entry);
+  }
+  return unique;
+}
+
+async function existingDirectoryRoots(paths = []) {
+  const results = [];
+  for (const entry of getUniqueDirectoryRoots(paths)) {
+    const stats = await fs.stat(entry).catch(() => null);
+    if (stats?.isDirectory()) {
+      results.push(entry);
+    }
+  }
+  return results;
+}
+
+function getToolModelAssetDirectories(toolState) {
+  try {
+    const { getToolModelDirectories } = require('./modelService');
+    return Object.values(getToolModelDirectories(toolState) || {}).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function collectRepairPreservedModelAssetRoots(toolState) {
+  if (!isManagedToolState(toolState)) {
+    return [];
+  }
+  const appDir = normalizeOptionalDirectoryPath(toolState?.appDir || '');
+  if (!appDir) {
+    return [];
+  }
+  return existingDirectoryRoots(getToolModelAssetDirectories(toolState).filter((entry) => isPathInside(appDir, entry)));
+}
+
+async function collectManagedModelAssetRootsForUninstall(toolState) {
+  if (!isManagedToolState(toolState)) {
+    return [];
+  }
+  const installDir = normalizeOptionalDirectoryPath(toolState?.installDir || '');
+  const modelsRoot = normalizeOptionalDirectoryPath(getAppPaths().modelsRoot || '');
+  if (!modelsRoot) {
+    return [];
+  }
+  return existingDirectoryRoots(
+    getToolModelAssetDirectories(toolState).filter((entry) => {
+      const resolvedEntry = path.resolve(entry);
+      if (installDir && isPathInside(installDir, resolvedEntry)) {
+        return false;
+      }
+      return isPathInside(modelsRoot, resolvedEntry) && path.resolve(modelsRoot) !== resolvedEntry;
+    }),
+  );
+}
+
+async function preserveModelManagerAssetsForAction(toolState, logger, operationLabel, action) {
+  const appDir = normalizeOptionalDirectoryPath(toolState?.appDir || '');
+  const installDir = normalizeOptionalDirectoryPath(toolState?.installDir || '') || (appDir ? path.dirname(appDir) : '');
+  const assetRoots = await collectRepairPreservedModelAssetRoots(toolState);
+  if (!assetRoots.length || !appDir || !installDir) {
+    return action();
+  }
+
+  const preserveRoot = path.join(
+    installDir,
+    '.localaihub-' + String(operationLabel || 'repair').replace(/[^a-z0-9_-]+/gi, '-') + '-model-assets-' + Date.now(),
+  );
+  const preservedEntries = [];
+
+  try {
+    for (const assetRoot of assetRoots) {
+      if (!(await fs.pathExists(assetRoot))) {
+        continue;
+      }
+      const relativePath = path.relative(appDir, assetRoot);
+      if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+        continue;
+      }
+      const preservedPath = path.join(preserveRoot, relativePath);
+      await fs.ensureDir(path.dirname(preservedPath));
+      await fs.move(assetRoot, preservedPath, { overwrite: true });
+      preservedEntries.push({ preservedPath, restorePath: assetRoot });
+    }
+
+    if (preservedEntries.length) {
+      await logger?.info?.('Preserved Model Manager assets before repairing app files.', {
+        operationLabel,
+        preservedPaths: preservedEntries.map((entry) => entry.restorePath),
+        toolId: toolState?.id || null,
+      });
+    }
+
+    return await action();
+  } finally {
+    for (const entry of preservedEntries.reverse()) {
+      if (!(await fs.pathExists(entry.preservedPath))) {
+        continue;
+      }
+      await fs.ensureDir(path.dirname(entry.restorePath));
+      if (await fs.pathExists(entry.restorePath)) {
+        await mergeDirectoryContents(entry.preservedPath, entry.restorePath);
+      } else {
+        await fs.move(entry.preservedPath, entry.restorePath, { overwrite: false }).catch(async () => {
+          await mergeDirectoryContents(entry.preservedPath, entry.restorePath);
+        });
+      }
+    }
+    await fs.remove(preserveRoot).catch(() => null);
+    if (preservedEntries.length) {
+      await logger?.info?.('Restored Model Manager assets after repairing app files.', {
+        operationLabel,
+        restoredPaths: preservedEntries.map((entry) => entry.restorePath),
+        toolId: toolState?.id || null,
+      });
+    }
+  }
+}
+
+async function removeManagedModelManagerAssets(toolState, logger, operationLabel) {
+  const assetRoots = await collectManagedModelAssetRootsForUninstall(toolState);
+  const removedPaths = [];
+  for (const assetRoot of assetRoots) {
+    if (!(await fs.pathExists(assetRoot))) {
+      continue;
+    }
+    await removePathWithRetries(assetRoot, logger, operationLabel);
+    removedPaths.push(assetRoot);
+  }
+  if (removedPaths.length) {
+    await logger?.info?.('Removed managed Model Manager assets during uninstall.', {
+      operationLabel,
+      removedPaths,
+      toolId: toolState?.id || null,
+    });
+  }
+  return {
+    removedModelAssetRootCount: removedPaths.length,
+    removedModelAssetRoots: removedPaths,
+  };
+}
+
 async function extractArchiveWithRecovery(manifest, archivePath, targetDirectory, onProgress, logger, toolId) {
   try {
     await extractArchive(archivePath, targetDirectory, logger);
@@ -1062,6 +1213,7 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
   ]);
 
   const preflightContext = await resolveInstallPreflightContext(manifest, logger);
+  const optionalInstallWarnings = [];
 
   await advanceStep(
     logger,
@@ -1122,7 +1274,7 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
     const templateContext = resolveInstructionTemplateContext(toolState, pythonPath);
     const pipArgs = resolveInstructionList(instruction.pipArgs, templateContext);
     const instructionEnv = resolveInstructionEnv(instruction, templateContext);
-    const baseEnv = buildManagedProcessEnv(toolState, { ...preflightContext.env, ...instructionEnv }, { requireVirtualEnv: true });
+    let instructionCudaToolkit = null;
     let args = ['-m', 'pip', 'install', ...pipArgs];
     let command = pythonPath;
     let errorMessage = instruction.errorMessage || `Local AI Hub could not install ${manifest.name} dependencies.`;
@@ -1182,6 +1334,46 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
       args = [...args, installTarget];
     }
 
+    if (instruction.requiresCudaToolkit) {
+      instructionCudaToolkit = await resolveCudaToolkitDetails();
+      if (!instructionCudaToolkit) {
+        const warningMessage = buildOptionalDependencyWarning(
+          manifest,
+          instruction,
+          buildMissingCudaToolkitDependencyMessage(manifest, instruction),
+        );
+        if (isOptionalInstruction(instruction)) {
+          optionalInstallWarnings.push(warningMessage);
+          await logger.warn('Skipping optional dependency because the CUDA Toolkit is not available.', {
+            installTarget,
+            warningMessage,
+          });
+          await advanceStep(logger, onProgress, {
+            toolId: toolState.id,
+            percent: baseProgress,
+            stage: 'dependencies',
+            message: warningMessage,
+          });
+          continue;
+        }
+
+        throw new Error(buildMissingCudaToolkitDependencyMessage(manifest, instruction));
+      }
+
+      await logger.info('Dependency step confirmed a usable CUDA toolkit.', {
+        cudaHome: instructionCudaToolkit.cudaHome,
+        installTarget,
+        nvccPath: instructionCudaToolkit.nvccPath,
+        source: instructionCudaToolkit.source,
+      });
+    }
+
+    const baseEnv = buildManagedProcessEnv(
+      toolState,
+      { ...preflightContext.env, ...buildCudaToolkitEnv(instructionCudaToolkit), ...instructionEnv },
+      { requireVirtualEnv: true },
+    );
+
     await advanceStep(
       logger,
       onProgress,
@@ -1204,7 +1396,19 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
         errorMessage,
       });
     } catch (error) {
-      throw buildDependencyInstallFailure(manifest, error, errorMessage);
+      const dependencyError = buildDependencyInstallFailure(manifest, error, errorMessage);
+      if (isOptionalInstruction(instruction)) {
+        const warningMessage = buildOptionalDependencyWarning(manifest, instruction, dependencyError.message);
+        optionalInstallWarnings.push(warningMessage);
+        await logger.warn('Optional dependency installation failed; continuing with fallback behavior.', {
+          error: dependencyError,
+          installTarget,
+          warningMessage,
+        });
+        continue;
+      }
+
+      throw dependencyError;
     }
 
     await logger.info('Dependency installation step finished.', {
@@ -1212,6 +1416,9 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
       pipArgs: pipArgs.length ? pipArgs : undefined,
     });
   }
+
+  toolState.optionalInstallWarnings = optionalInstallWarnings;
+  return optionalInstallWarnings;
 }
 
 async function resolveManagedPythonRuntime(appDir, manifest, logger, onProgress, toolId) {
@@ -1257,6 +1464,114 @@ function resolveLaunchProfileTargetPath(launchProfile) {
   return baseDir ? path.resolve(baseDir, launchProfile.target) : null;
 }
 
+function buildAudiocraftPipelineVerificationScript() {
+  return [
+    'import importlib, json, sys',
+    'checks = [["numpy", "numpy"], ["torchaudio", "torchaudio"], ["audiocraft", "audiocraft"], ["audiocraft.data.audio", "audiocraft.data.audio"], ["audiocraft.models", "audiocraft.models"]]',
+    'missing = []',
+    'failures = []',
+    'for module_name, label in checks:',
+    '    try:',
+    '        importlib.import_module(module_name)',
+    '    except ModuleNotFoundError as exc:',
+    '        missing.append(str(getattr(exc, "name", "") or label))',
+    '    except Exception as exc:',
+    '        failures.append({"module": module_name, "label": label, "errorType": exc.__class__.__name__})',
+    'payload = {"ready": not missing and not failures, "missing": sorted(set(missing)), "failures": failures}',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
+
+function parseAudiocraftPipelineVerification(stdout) {
+  const lastLine = String(stdout || '')
+    .trim()
+    .split(/\r?\n/)
+    .reverse()
+    .find(Boolean);
+  if (!lastLine) {
+    return null;
+  }
+  try {
+    return JSON.parse(lastLine);
+  } catch {
+    return null;
+  }
+}
+
+function buildAudiocraftPipelineInstallFailureMessage(probe) {
+  const missing = [...new Set((probe?.missing || [])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean))];
+  if (missing.length) {
+    return 'Local AI Hub installed AudioCraft WebUI, but its Python environment is missing the packages needed for pipeline audio generation: ' + missing.join(', ') + '. Run Repair or reinstall AudioCraft WebUI, then try again.';
+  }
+
+  return 'Local AI Hub installed AudioCraft WebUI, but it could not load the Python packages needed for pipeline audio generation. Run Repair or reinstall AudioCraft WebUI, then try again.';
+}
+
+async function buildManagedLauncherValidationFailureMessage(toolState, manifest, launchProfile) {
+  if (!launchProfile) {
+    return `${manifest.name} finished installing, but its Store manifest did not produce a launch profile Local AI Hub can use.`;
+  }
+
+  if (launchProfile.kind === 'python-script') {
+    const pythonPath = launchProfile.pythonPath;
+    if (!pythonPath) {
+      return `${manifest.name} finished installing, but its Store manifest did not identify a Python launcher.`;
+    }
+
+    if (!isBareCommand(pythonPath) && !(await fs.pathExists(pythonPath))) {
+      return `${manifest.name} finished installing, but its Python launcher was not found at ${pythonPath}.`;
+    }
+
+    const targetPath = resolveLaunchProfileTargetPath(launchProfile);
+    if (!targetPath) {
+      return `${manifest.name} finished installing, but its Store manifest launch command does not identify a Python script.`;
+    }
+
+    if (!(await fs.pathExists(targetPath))) {
+      const baseDir = toolState.appDir || toolState.installDir || '';
+      const expectedLabel = baseDir && isPathInside(baseDir, targetPath)
+        ? path.relative(baseDir, targetPath)
+        : targetPath;
+      return `${manifest.name} finished installing, but the expected launch script was not found at ${expectedLabel}. The downloaded package may be incomplete, nested differently than expected, or the Store manifest may be pointing at a stale upstream entry point.`;
+    }
+  }
+
+  if (launchProfile.kind === 'binary' && launchProfile.executable && !(await fs.pathExists(launchProfile.executable))) {
+    return `${manifest.name} finished installing, but the expected launcher executable was not found at ${launchProfile.executable}.`;
+  }
+
+  if (launchProfile.kind === 'batch' && launchProfile.command && !(await fs.pathExists(launchProfile.command))) {
+    return `${manifest.name} finished installing, but the expected launcher script was not found at ${launchProfile.command}.`;
+  }
+
+  return `${manifest.name} finished installing, but Local AI Hub still could not find a usable launcher in the managed tool folder.`;
+}
+async function verifyAudiocraftManagedPipelineReadiness(toolState, manifest, logger) {
+  if (manifest?.id !== 'audiocraft-webui') {
+    return;
+  }
+
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  if (!(await fs.pathExists(pythonPath))) {
+    throw new Error('AudioCraft WebUI finished installing, but its Python environment is missing.');
+  }
+
+  const result = await runCommand(pythonPath, ['-c', buildAudiocraftPipelineVerificationScript()], {
+    allowFailure: true,
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+  });
+  const probe = parseAudiocraftPipelineVerification(result.stdout);
+  if (Number(result.code || 0) === 0 && probe?.ready !== false) {
+    await logger.info('AudioCraft pipeline Python packages verified.');
+    return;
+  }
+
+  throw new Error(buildAudiocraftPipelineInstallFailureMessage(probe));
+}
 async function verifyManagedToolInstall(toolState, manifest, logger) {
   const safeToolState = ensureManagedToolStatePaths(toolState);
   const launchProfile = buildManagedLaunchProfile(safeToolState, manifest);
@@ -1265,7 +1580,7 @@ async function verifyManagedToolInstall(toolState, manifest, logger) {
     ...safeToolState,
     launchProfile,
   }))) {
-    throw new Error(`${manifest.name} finished installing, but Local AI Hub still could not find a usable launcher in the managed tool folder.`);
+    throw new Error(await buildManagedLauncherValidationFailureMessage(safeToolState, manifest, launchProfile));
   }
 
   if (getToolRuntime(manifest) === 'python' && safeToolState.venvDir) {
@@ -1279,6 +1594,7 @@ async function verifyManagedToolInstall(toolState, manifest, logger) {
       env: buildManagedProcessEnv(safeToolState, {}, { requireVirtualEnv: true }),
       errorMessage: `Local AI Hub installed ${manifest.name}, but its Python environment still has dependency conflicts.`,
     });
+    await verifyAudiocraftManagedPipelineReadiness(safeToolState, manifest, logger);
   }
 
   return {
@@ -1476,6 +1792,47 @@ function resolveInstructionEnv(instruction, templateContext) {
   );
 }
 
+function isOptionalInstruction(instruction) {
+  return Boolean(instruction?.optional || instruction?.optionalDependency);
+}
+
+function buildCudaToolkitEnv(cudaToolkit) {
+  if (!cudaToolkit?.cudaHome) {
+    return {};
+  }
+
+  return {
+    CUDA_HOME: cudaToolkit.cudaHome,
+    CUDA_PATH: cudaToolkit.cudaHome,
+  };
+}
+
+function buildMissingCudaToolkitDependencyMessage(manifest, instruction) {
+  return instruction?.cudaToolkitMissingMessage
+    || `${manifest.name} needs the NVIDIA CUDA Toolkit only for the ${instruction?.value || 'selected'} acceleration package. Local AI Hub could not find nvcc or CUDA_HOME on this PC.`;
+}
+
+function buildOptionalDependencyWarning(manifest, instruction, fallbackMessage = '') {
+  return String(
+    instruction?.optionalFailureMessage
+      || fallbackMessage
+      || `${manifest.name} skipped an optional dependency. The tool can still install, but some acceleration or runtime paths may be limited.`,
+  ).trim();
+}
+
+function attachOptionalInstallWarnings(toolState, manifest, warnings = []) {
+  const normalizedWarnings = [...new Set((warnings || []).map((entry) => String(entry || '').trim()).filter(Boolean))];
+  if (!normalizedWarnings.length) {
+    return toolState;
+  }
+
+  return {
+    ...toolState,
+    optionalInstallWarnings: normalizedWarnings,
+    installActionMessage: `${manifest.name} was installed. ${normalizedWarnings.join(' ')}`,
+  };
+}
+
 function resolvePackagingBootstrapPackages(manifest) {
   const configuredPackages = Array.isArray(manifest?.installInstructions?.packagingBootstrapPackages)
     ? manifest.installInstructions.packagingBootstrapPackages.map((value) => String(value || '').trim()).filter(Boolean)
@@ -1492,9 +1849,9 @@ ${error?.stdout || ''}`.toLowerCase();
   if (combinedOutput.includes('please use pip<24.1') || (combinedOutput.includes('omegaconf') && combinedOutput.includes('invalid metadata'))) {
     message = `${manifest.name} still relies on older Python package metadata, so this install needs pip 24.0 or older.`;
   } else if (combinedOutput.includes('flash_attn') && (combinedOutput.includes('cuda_home environment variable is not set') || combinedOutput.includes('nvcc was not found'))) {
-    message = `${manifest.name} needs the NVIDIA CUDA toolkit to build flash_attn on Windows, but this PC does not currently expose nvcc or CUDA_HOME.`;
+    message = `${manifest.name} could not build flash_attn because this PC does not currently expose the NVIDIA CUDA Toolkit through nvcc or CUDA_HOME. flash_attn is acceleration-specific for Wan2.1 and should be optional when the manifest marks it optional.`;
   } else if (combinedOutput.includes('failed to build') && combinedOutput.includes('flash_attn')) {
-    message = `${manifest.name} could not build flash_attn on this Windows setup. Local AI Hub stopped before claiming the install was ready.`;
+    message = `${manifest.name} could not build flash_attn acceleration on this Windows setup. Local AI Hub only treats that as an install blocker when the dependency is marked required.`;
   } else if (combinedOutput.includes("cannot import 'scikit_build_core.build'")) {
     message = `${manifest.name} could not build torchmcubes because the scikit-build-core backend was not available in the tool environment.`;
   } else if (combinedOutput.includes('torchmcubes') && (combinedOutput.includes('torchconfig.cmake') || combinedOutput.includes('could not find a package configuration file provided by "torch"'))) {
@@ -2432,7 +2789,7 @@ async function installPipPackageTool(manifest, options, logger) {
     pythonResolution,
   );
 
-  await installPythonDependencies(
+  const optionalInstallWarnings = await installPythonDependencies(
     toolState,
     manifest,
     options.onProgress,
@@ -2440,7 +2797,11 @@ async function installPipPackageTool(manifest, options, logger) {
     pythonResolution.runtime,
   );
 
-  const verifiedToolState = await verifyManagedToolInstall(toolState, manifest, logger);
+  const verifiedToolState = attachOptionalInstallWarnings(
+    await verifyManagedToolInstall(toolState, manifest, logger),
+    manifest,
+    optionalInstallWarnings,
+  );
 
   await advanceStep(logger, options.onProgress, {
     toolId: manifest.id,
@@ -2590,8 +2951,9 @@ async function installTool(toolId, options = {}) {
       pythonResolution,
     );
 
+    let optionalInstallWarnings = [];
     if (getToolRuntime(manifest) === 'python') {
-      await installPythonDependencies(
+      optionalInstallWarnings = await installPythonDependencies(
         toolState,
         manifest,
         options.onProgress,
@@ -2607,7 +2969,11 @@ async function installTool(toolId, options = {}) {
       message: `${manifest.name} is being registered in Local AI Hub.`,
     });
 
-    const verifiedToolState = await verifyManagedToolInstall(toolState, manifest, logger);
+    const verifiedToolState = attachOptionalInstallWarnings(
+      await verifyManagedToolInstall(toolState, manifest, logger),
+      manifest,
+      optionalInstallWarnings,
+    );
 
     await upsertTool(verifiedToolState);
     await logger.info('Tool registration completed.', {
@@ -2752,19 +3118,24 @@ async function repairToolInstallation(toolState, options = {}) {
 
       let repairedTool = null;
       if (toolState.source === 'managed') {
-        const repairedInstaller = await materializeExecutableInstallerTool(
-          manifest,
-          {
-            appDir: toolState.appDir || managedPaths.appDir,
-            archivePath: downloadCachePath,
-            installDir: toolState.installDir || managedPaths.installDir,
-            venvDir: toolState.venvDir || managedPaths.venvDir,
-          },
-          {
-            errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
-            logger,
-            onProgress: options.onProgress,
-          },
+        const repairedInstaller = await preserveModelManagerAssetsForAction(
+          toolState,
+          logger,
+          'official-installer-repair',
+          () => materializeExecutableInstallerTool(
+            manifest,
+            {
+              appDir: toolState.appDir || managedPaths.appDir,
+              archivePath: downloadCachePath,
+              installDir: toolState.installDir || managedPaths.installDir,
+              venvDir: toolState.venvDir || managedPaths.venvDir,
+            },
+            {
+              errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
+              logger,
+              onProgress: options.onProgress,
+            },
+          ),
         );
         repairedTool =
           repairedInstaller.toolState.source === 'managed'
@@ -2846,19 +3217,24 @@ async function repairToolInstallation(toolState, options = {}) {
         stage: 'repairing',
         message: `Running the ${manifest.name} installer again.`,
       });
-      const repairedInstaller = await materializeExecutableInstallerTool(
-        manifest,
-        {
-          appDir: toolState.appDir,
-          archivePath: toolState.downloadCachePath,
-          installDir: toolState.installDir,
-          venvDir: toolState.venvDir,
-        },
-        {
-          errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
-          logger,
-          onProgress: options.onProgress,
-        },
+      const repairedInstaller = await preserveModelManagerAssetsForAction(
+        toolState,
+        logger,
+        'installer-exe-repair',
+        () => materializeExecutableInstallerTool(
+          manifest,
+          {
+            appDir: toolState.appDir,
+            archivePath: toolState.downloadCachePath,
+            installDir: toolState.installDir,
+            venvDir: toolState.venvDir,
+          },
+          {
+            errorMessage: `Local AI Hub could not rerun the ${manifest.name} installer.`,
+            logger,
+            onProgress: options.onProgress,
+          },
+        ),
       );
       Object.assign(toolState, repairedInstaller.toolState);
       repairNotes.push(
@@ -2873,7 +3249,9 @@ async function repairToolInstallation(toolState, options = {}) {
         stage: 'repairing',
         message: 'Restoring the tool files from the cached installer.',
       });
-      await extractArchive(toolState.downloadCachePath, toolState.appDir, logger);
+      await preserveModelManagerAssetsForAction(toolState, logger, 'zip-repair', () =>
+        extractArchive(toolState.downloadCachePath, toolState.appDir, logger),
+      );
       repairNotes.push('restored the application files from the local cache');
     } else if (installKind === 'pip-package') {
       await advanceStep(logger, options.onProgress, {
@@ -2923,13 +3301,16 @@ async function repairToolInstallation(toolState, options = {}) {
         pythonResolution,
       );
 
-      await installPythonDependencies(
+      const optionalInstallWarnings = await installPythonDependencies(
         rebuiltState,
         manifest,
         options.onProgress,
         logger,
         pythonResolution.runtime,
       );
+      if (optionalInstallWarnings.length) {
+        repairNotes.push(...optionalInstallWarnings);
+      }
 
       Object.assign(toolState, rebuiltState);
       repairNotes.push(
@@ -3017,6 +3398,12 @@ function buildUninstallFollowupNotes(options = {}) {
   if (options.removedShortcutCount > 0) {
     notes.push(
       `removed ${options.removedShortcutCount} leftover Windows ${pluralize(options.removedShortcutCount, 'shortcut')}`,
+    );
+  }
+
+  if (options.removedModelAssetRootCount > 0) {
+    notes.push(
+      `removed ${options.removedModelAssetRootCount} managed Model Manager asset ${pluralize(options.removedModelAssetRootCount, 'folder')}`,
     );
   }
 
@@ -3135,12 +3522,15 @@ async function cleanupOwnedToolArtifacts(toolState, logger, operationLabel, opti
     }
   }
 
+  const modelAssetCleanup = await removeManagedModelManagerAssets(toolState, logger, operationLabel + '-model-assets');
   const shortcutCleanup = await removeToolWindowsShortcuts(toolState, logger);
 
   return {
     deferredCleanupCount: deferredCleanupEntries.length,
     deferredCleanupEntries,
     removedInstallDir: Boolean(installCleanup?.removedInstallDir),
+    removedModelAssetRootCount: modelAssetCleanup.removedModelAssetRootCount,
+    removedModelAssetRoots: modelAssetCleanup.removedModelAssetRoots,
     removedShortcutCount: shortcutCleanup.removedCount,
     removedShortcutPaths: shortcutCleanup.removedPaths,
   };
@@ -3299,6 +3689,7 @@ async function uninstallTool(toolState) {
           clearedWindowsEntries: preflightClearedWindowsEntries + Number(windowsReconciliation?.clearedWindowsEntries || 0),
           deferredCleanupCount: Number(artifactCleanup?.deferredCleanupCount || 0),
           removedShortcutCount: Number(artifactCleanup?.removedShortcutCount || 0),
+          removedModelAssetRootCount: Number(artifactCleanup?.removedModelAssetRootCount || 0),
         }),
         {
           lingeringWindowsEntry: Boolean(options.lingeringWindowsEntry),
@@ -3319,6 +3710,7 @@ async function uninstallTool(toolState) {
       }
 
       await removeOwnedInstallCopy(safeToolState, logger, 'managed-uninstall');
+      const modelAssetCleanup = await removeManagedModelManagerAssets(safeToolState, logger, 'managed-uninstall-model-assets');
       const shortcutCleanup = await removeToolWindowsShortcuts(safeToolState, logger);
 
       await removeTool(safeToolState.id);
@@ -3336,7 +3728,7 @@ async function uninstallTool(toolState) {
           status: 'stopped',
           uninstallMessage: buildResultMessage(
             `${manifest.name}'s Local AI Hub-managed copy was removed. A separate install at ${detectedPath} is still available, so Local AI Hub switched back to showing it as a detected install.`,
-            { removedShortcutCount: shortcutCleanup.removedCount },
+            { removedModelAssetRootCount: modelAssetCleanup.removedModelAssetRootCount, removedShortcutCount: shortcutCleanup.removedCount },
           ),
         };
       }
@@ -3345,7 +3737,7 @@ async function uninstallTool(toolState) {
         ...safeToolState,
         lastError: null,
         status: 'stopped',
-        uninstallMessage: buildResultMessage(`${manifest.name} was uninstalled and moved back to Store.`, { removedShortcutCount: shortcutCleanup.removedCount }),
+        uninstallMessage: buildResultMessage(`${manifest.name} was uninstalled and moved back to Store.`, { removedModelAssetRootCount: modelAssetCleanup.removedModelAssetRootCount, removedShortcutCount: shortcutCleanup.removedCount }),
       };
     }
 
@@ -3786,13 +4178,15 @@ async function updateToolInstallation(toolState, options = {}) {
       };
     }
 
+    const updateCompleteMessage = `Local AI Hub updated ${manifest.name}.`;
+
     updatedState = {
       ...updatedState,
       ...(resolvedInstalledVersion ? { installedVersion: resolvedInstalledVersion } : {}),
       downloadCachePath,
       lastError: null,
       lastRepairMessage: null,
-      lastUpdateMessage: `Local AI Hub updated ${manifest.name}.`,
+      lastUpdateMessage: null,
       status: 'stopped',
     };
 
@@ -3811,10 +4205,13 @@ async function updateToolInstallation(toolState, options = {}) {
       toolId: safeToolState.id,
       percent: 100,
       stage: 'complete',
-      message: updatedState.lastUpdateMessage,
+      message: updateCompleteMessage,
     });
 
-    return updatedState;
+    return {
+      ...updatedState,
+      lastUpdateMessage: updateCompleteMessage,
+    };
   } catch (error) {
     const readableMessage = humanizeError(error, `Local AI Hub could not update ${manifest.name}.`);
     const failedState = toolState?.source === 'managed'
@@ -3845,4 +4242,10 @@ module.exports = {
   repairToolInstallation,
   uninstallTool,
   updateToolInstallation,
+  _test: {
+    collectManagedModelAssetRootsForUninstall,
+    collectRepairPreservedModelAssetRoots,
+    preserveModelManagerAssetsForAction,
+    removeManagedModelManagerAssets,
+  },
 };

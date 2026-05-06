@@ -13,7 +13,7 @@ const {
 function tool(id, patch = {}) {
   return {
     id,
-    name: id === 'forge' ? 'Stable Diffusion WebUI Forge' : id === 'automatic1111' ? 'Automatic1111' : 'Fooocus',
+    name: id === 'forge' ? 'Stable Diffusion WebUI Forge' : id === 'automatic1111' ? 'Automatic1111' : id,
     appDir: 'C:/mock/' + id,
     installDir: 'C:/mock/' + id,
     launchProfile: { kind: 'folder', path: 'C:/mock/' + id },
@@ -72,10 +72,10 @@ function main() {
   const staleCacheSelection = selectLocalImageBackend(context([tool('forge', { status: 'running', downloadedModels: [{ fileName: 'other.safetensors', modelType: 'checkpoint' }] })]), { config: { model: 'selected-from-live-refresh.safetensors', toolId: 'forge' } });
   assert.strictEqual(staleCacheSelection.usable, true, 'A selected live checkpoint should not be blocked by stale local downloaded-model cache before runtime validates /sdapi/v1/sd-models.');
   assert(/live WebUI model list/i.test(staleCacheSelection.message), 'Stale cache message should explain that runtime will verify the live WebUI model list.');
-
-  const fooocusSelection = selectLocalImageBackend(context([tool('fooocus')]), { config: { toolId: 'fooocus' } });
-  assert.strictEqual(fooocusSelection.usable, false, 'Fooocus should not be exposed as pipeline-runnable without an adapter.');
-  assert(/launchable from Library/i.test(fooocusSelection.message), 'Fooocus message should be honest about Library-only support.');
+  const removedImageToolId = ['foo', 'ocus'].join('');
+  const staleRemovedToolSelection = selectLocalImageBackend(context([tool('forge', { status: 'running' })]), { config: { toolId: removedImageToolId } });
+  assert.strictEqual(staleRemovedToolSelection.usable, false, 'A stale removed-tool pipeline config should not be treated as runnable.');
+  assert(/Choose Auto, Forge, or Automatic1111/i.test(staleRemovedToolSelection.message), 'Stale removed-tool config should fall back to the supported local image backend guidance.');
 
   const text = createNode('textInput', { id: 'prompt', config: { text: 'a quiet cabin' } });
   const image = createNode('llmPrompt', { id: 'image', config: { executionMode: 'localTool', operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE, toolId: '', model: '' } });

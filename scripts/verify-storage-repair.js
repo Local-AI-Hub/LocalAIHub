@@ -33,7 +33,7 @@ async function main() {
   const migratedConfig = await readConfig();
   const discoveredTools = await syncDiscoveredTools({ force: true });
 
-  for (const toolId of ['comfyui', 'fooocus']) {
+  for (const toolId of ['comfyui', 'forge']) {
     const toolState = discoveredTools[toolId] || migratedConfig.tools?.[toolId];
     if (!toolState) {
       throw new Error(`Missing tracked tool state for ${toolId}.`);

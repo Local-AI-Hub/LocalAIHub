@@ -154,12 +154,31 @@ def main():
         if reference_image_path and not os.path.isfile(reference_image_path):
             fail('The reference image for the Wan video step could not be found anymore.')
 
-        import torch
-        from diffsynth import ModelManager, WanVideoPipeline, save_video
-        from PIL import Image
+        try:
+            import torch
+        except ModuleNotFoundError:
+            fail('Wan2.1 is missing PyTorch in its Python environment. Run Repair to reinstall the Wan dependencies.')
+
+        try:
+            from diffsynth import ModelManager, WanVideoPipeline, save_video
+        except ModuleNotFoundError:
+            fail('Wan2.1 is missing the DiffSynth runtime used by Local AI Hub for local video generation. Run Repair to reinstall the Wan dependencies.')
+
+        try:
+            from PIL import Image
+        except ModuleNotFoundError:
+            fail('Wan2.1 is missing Pillow in its Python environment. Run Repair to reinstall the Wan dependencies.')
 
         if not torch.cuda.is_available():
-            fail('Wan2.1 local video generation currently needs a CUDA-capable GPU on this PC.')
+            fail('Wan2.1 local video generation needs a working NVIDIA driver and CUDA-enabled PyTorch runtime. The CUDA Toolkit or nvcc is separate and is only needed for optional build acceleration such as flash_attn.')
+
+        total_vram_mb = 0
+        try:
+            total_vram_mb = int(torch.cuda.get_device_properties(0).total_memory // (1024 * 1024))
+        except Exception:
+            total_vram_mb = 0
+        if total_vram_mb and total_vram_mb < 12288:
+            fail('Wan2.1 local video generation is not practical on this GPU: Local AI Hub detected about ' + str(round(total_vram_mb / 1024, 1)) + ' GB of VRAM, while Wan2.1 is aimed at 12 GB or more. The install can stay in place, but use a higher-VRAM GPU or a lighter video workflow for generation.')
 
         base_models_dir = resolve_base_models_dir(tool_root)
         model_dir = pick_model_dir(base_models_dir, request.get('model'), reference_image_path, normalized_size)

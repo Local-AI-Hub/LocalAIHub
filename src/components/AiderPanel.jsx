@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { logRendererActionDiagnostic } from '../lib/focus-guard';
 
 const CONSOLE_OUTPUT_LIMIT = 48000;
 const AIDER_SUPPORTED_PROVIDER_PROTOCOLS = new Set(['openai-compatible', 'anthropic', 'google-gemini']);
@@ -33,6 +34,10 @@ function getSessionBadge(sessionState, status) {
 
   if (sessionState?.phase === 'settling') {
     return { label: 'Settling', tone: 'text-amber-200' };
+  }
+
+  if (sessionState?.phase === 'error') {
+    return { label: 'Error', tone: 'text-rose-200' };
   }
 
   if (sessionState?.phase === 'waiting') {
@@ -261,24 +266,34 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
     }
 
     setProjectLoading(true);
-    const result = await window.localAIHub.inspectAiderProject(normalizedPath);
-    if (!result?.ok) {
-      const message = result?.message || 'Local AI Hub could not inspect that Aider project folder.';
+    try {
+      const result = await window.localAIHub.inspectAiderProject(normalizedPath);
+      if (!result?.ok) {
+        const message = result?.message || 'Local AI Hub could not inspect that Aider project folder.';
+        setProjectStatus(null);
+        setNotice(message);
+        if (!options.silent) {
+          pushToast(message, 'error');
+        }
+        return null;
+      }
+
+      setProjectStatus(result.data || null);
+      if (!options.preserveNotice) {
+        setNotice(result.data?.message || `Aider will start in ${normalizedPath}.`);
+      }
+      return result.data || null;
+    } catch (error) {
+      const message = error?.message || 'Local AI Hub could not inspect that Aider project folder.';
       setProjectStatus(null);
       setNotice(message);
       if (!options.silent) {
         pushToast(message, 'error');
       }
-      setProjectLoading(false);
       return null;
+    } finally {
+      setProjectLoading(false);
     }
-
-    setProjectStatus(result.data || null);
-    if (!options.preserveNotice) {
-      setNotice(result.data?.message || `Aider will start in ${normalizedPath}.`);
-    }
-    setProjectLoading(false);
-    return result.data || null;
   }
 
   async function loadModels(options = {}) {
@@ -290,47 +305,60 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
     }
 
     setModelsLoading(true);
-    const result = await window.localAIHub.listAiderModels({
-      providerId: nextProviderId,
-      preferredModelId: options.preferredModelId || selectedModelId || tool?.aiderModelId || '',
-    });
+    try {
+      const result = await window.localAIHub.listAiderModels({
+        providerId: nextProviderId,
+        preferredModelId: options.preferredModelId || selectedModelId || tool?.aiderModelId || '',
+      });
 
-    if (!result?.ok) {
-      const message = result?.message || 'Local AI Hub could not load models for that Aider provider.';
+      if (!result?.ok) {
+        const message = result?.message || 'Local AI Hub could not load models for that Aider provider.';
+        setModels([]);
+        setSelectedModelId('');
+        setNotice(message);
+        if (!options.silent) {
+          pushToast(message, 'error');
+        }
+        return;
+      }
+
+      const nextModels = result.data?.models || [];
+      setModels(nextModels);
+      setSelectedModelId(result.data?.selectedModelId || nextModels[0]?.id || '');
+      if (!options.preserveNotice) {
+        setNotice(result.data?.message || 'Choose a model and launch Aider to begin.');
+      }
+    } catch (error) {
+      const message = error?.message || 'Local AI Hub could not load models for that Aider provider.';
       setModels([]);
       setSelectedModelId('');
       setNotice(message);
       if (!options.silent) {
         pushToast(message, 'error');
       }
+    } finally {
       setModelsLoading(false);
-      return;
     }
-
-    const nextModels = result.data?.models || [];
-    setModels(nextModels);
-    setSelectedModelId(result.data?.selectedModelId || nextModels[0]?.id || '');
-    if (!options.preserveNotice) {
-      setNotice(result.data?.message || 'Choose a model and launch Aider to begin.');
-    }
-    setModelsLoading(false);
   }
 
   async function chooseProjectFolder() {
     setBusy(true);
-    const result = await window.localAIHub.pickAiderProjectFolder();
-    if (!result?.ok) {
-      pushToast(result?.message || 'Local AI Hub could not open the project folder picker.', 'error');
+    try {
+      const result = await window.localAIHub.pickAiderProjectFolder();
+      if (!result?.ok) {
+        pushToast(result?.message || 'Local AI Hub could not open the project folder picker.', 'error');
+        return;
+      }
+
+      if (!result.data?.canceled && result.data?.folderPath) {
+        setProjectDir(result.data.folderPath);
+        await inspectProject(result.data.folderPath);
+      }
+    } catch (error) {
+      pushToast(error?.message || 'Local AI Hub could not open the project folder picker.', 'error');
+    } finally {
       setBusy(false);
-      return;
     }
-
-    if (!result.data?.canceled && result.data?.folderPath) {
-      setProjectDir(result.data.folderPath);
-      await inspectProject(result.data.folderPath);
-    }
-
-    setBusy(false);
   }
 
   async function launchSession() {
@@ -368,26 +396,31 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
     setOutput('');
     setSessionState(null);
     setBusy(true);
-    const launched = await runAction('launch:aider', () =>
-      window.localAIHub.launchTool({
-        toolId: 'aider',
-        projectDir,
-        aiderSession: {
-          providerId,
-          modelId: selectedModelId,
-          initializeGit: currentProjectStatus.hasGitRepo ? false : initializeGit,
-        },
-      }),
-    );
-    if (launched) {
-      setNotice(`Aider is running in ${projectDir} with ${selectedModel?.label || selectedModelId} from ${selectedProvider?.label || 'the selected provider'}.`);
-      const runtimeOutput = await window.localAIHub.getToolRuntimeOutput('aider');
-      if (runtimeOutput?.ok) {
-        setOutput(combineRuntimeOutput(runtimeOutput.data));
-        setSessionState(runtimeOutput.data?.sessionState || null);
+    try {
+      const launched = await runAction('launch:aider', () =>
+        window.localAIHub.launchTool({
+          toolId: 'aider',
+          projectDir,
+          aiderSession: {
+            providerId,
+            modelId: selectedModelId,
+            initializeGit: currentProjectStatus.hasGitRepo ? false : initializeGit,
+          },
+        }),
+      );
+      if (launched) {
+        setNotice(`Aider is running in ${projectDir} with ${selectedModel?.label || selectedModelId} from ${selectedProvider?.label || 'the selected provider'}.`);
+        const runtimeOutput = await window.localAIHub.getToolRuntimeOutput('aider');
+        if (runtimeOutput?.ok) {
+          setOutput(combineRuntimeOutput(runtimeOutput.data));
+          setSessionState(runtimeOutput.data?.sessionState || null);
+        }
       }
+    } catch (error) {
+      pushToast(error?.message || 'Local AI Hub could not launch Aider.', 'error');
+    } finally {
+      setBusy(false);
     }
-    setBusy(false);
   }
 
   async function stopSession() {
@@ -396,12 +429,17 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
     }
 
     setBusy(true);
-    const stopped = await runAction(`stop:${tool.id}`, () => window.localAIHub.stopTool(tool.id));
-    if (stopped) {
-      setSessionState(null);
-      setNotice('Aider stopped. Launch it again to continue coding.');
+    try {
+      const stopped = await runAction(`stop:${tool.id}`, () => window.localAIHub.stopTool(tool.id));
+      if (stopped) {
+        setSessionState(null);
+        setNotice('Aider stopped. Launch it again to continue coding.');
+      }
+    } catch (error) {
+      pushToast(error?.message || 'Local AI Hub could not stop Aider.', 'error');
+    } finally {
+      setBusy(false);
     }
-    setBusy(false);
   }
 
   async function sendInput() {
@@ -416,22 +454,30 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
     }
 
     setSending(true);
+    logRendererActionDiagnostic('aider-console-input', 'start', { inputLength: message.length, isRunning });
     setOutput((current) => trimConsoleOutput(`${current}${current ? '\n' : ''}> ${message}\n`));
 
-    const result = await window.localAIHub.sendToolInput({
-      toolId: 'aider',
-      input: message,
-    });
+    try {
+      const result = await window.localAIHub.sendToolInput({
+        toolId: 'aider',
+        input: message,
+      });
 
-    if (!result?.ok) {
-      pushToast(result?.message || 'Local AI Hub could not send that input to Aider.', 'error');
+      if (!result?.ok) {
+        logRendererActionDiagnostic('aider-console-input', 'failure', { message: String(result?.message || '') }, 'warn');
+        pushToast(result?.message || 'Local AI Hub could not send that input to Aider.', 'error');
+        return;
+      }
+
+      setDraft('');
+      logRendererActionDiagnostic('aider-console-input', 'success', { inputLength: message.length });
+      setNotice('Aider is working on your last instruction.');
+    } catch (error) {
+      logRendererActionDiagnostic('aider-console-input', 'failure', { message: String(error?.message || '') }, 'warn');
+      pushToast(error?.message || 'Local AI Hub could not send that input to Aider.', 'error');
+    } finally {
       setSending(false);
-      return;
     }
-
-    setDraft('');
-    setNotice('Aider is working on your last instruction.');
-    setSending(false);
   }
 
   const launchDisabled =
@@ -601,6 +647,8 @@ export default function AiderPanel({ connectedProviders, ollamaTool, onHide, pus
             <div className="mt-4 grid gap-3 md:grid-cols-[1fr,140px]">
               <textarea
                 className="store-input min-h-[110px] resize-none"
+                data-console-input="true"
+                data-terminal-input="true"
                 disabled={!isRunning || busy || sending}
                 onChange={(event) => setDraft(event.target.value)}
                 placeholder={isRunning ? 'Ask Aider to inspect files, suggest a fix, or apply a change.' : 'Launch Aider to enable console input.'}

@@ -29,6 +29,8 @@ contextBridge.exposeInMainWorld('localAIHub', {
   getToolInstallPreflight: (payload) => invoke('tools:get-install-preflight', payload),
   getToolRuntimeOutput: (toolId) => invoke('tools:get-runtime-output', toolId),
   getWindowActivity: () => invoke('app:get-window-activity'),
+  focusWindow: (payload) => invoke('app:focus-window', payload),
+  showConfirmDialog: (payload) => ipcRenderer.sendSync('app:confirm-sync', payload),
   installTool: (payload) => invoke('tools:install', payload),
   launchTool: (payload) => invoke('tools:launch', payload),
   listLocalModels: (toolId) => invoke('models:list-local', { toolId }),

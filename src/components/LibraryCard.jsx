@@ -356,9 +356,6 @@ function LibraryCard({
         </div>
       ) : null}
 
-      {tool.lastUpdateMessage && !tool.lastError ? (
-        <div className="mt-5 rounded-3xl border border-cyan-300/20 bg-cyan-300/10 p-4 text-sm text-cyan-50">{tool.lastUpdateMessage}</div>
-      ) : null}
 
       {tool.lastRepairMessage && !tool.lastError ? (
         <div className="mt-5 rounded-3xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-sm text-emerald-100">

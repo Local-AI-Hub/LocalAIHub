@@ -9,7 +9,7 @@ const { killProcessTree, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { buildOllamaAllocationFailureMessage, isOllamaAllocationFailureMessage } = require('./ollamaFailureService');
 const { attemptAutomaticLaunchRecovery, diagnoseLaunchFailure, selectPyTorchRepairCandidates } = require('./runtimeRecoveryService');
-const { getNvidiaRuntimeDetails, detectHardwareSnapshot } = require('./hardwareService');
+const { assessDiskSpace, detectStorageSnapshot, findDiskForPath, getNvidiaRuntimeDetails, detectHardwareSnapshot } = require('./hardwareService');
 const { assertLoopbackUrl, assertPathInside } = require('./pathSafetyService');
 
 const runtimes = new Map();
@@ -18,6 +18,7 @@ const SUCCESS_CONFIRM_TIMEOUT_MS = 15000;
 const OUTPUT_BUFFER_LIMIT = 64000;
 const OUTPUT_LOG_LIMIT = 1024 * 1024;
 const PROCESS_SHUTDOWN_WAIT_MS = 15000;
+const PROCESS_GRACEFUL_STOP_MS = 5000;
 const PROCESS_RELEASE_SETTLE_MS = 1500;
 const STARTUP_PENDING_GRACE_MS = 5 * 60 * 1000;
 const STARTUP_DOWNLOAD_ACTIVITY_GRACE_MS = 15 * 60 * 1000;
@@ -26,6 +27,39 @@ const DOWNLOAD_KEYWORD_PATTERN = /\b(download(?:ing|ed)?|fetch(?:ing|ed)?|retrie
 const DOWNLOAD_SOURCE_PATTERN = /(https?:\/\/|huggingface|civitai|modelscope|\.safetensors\b|\.ckpt\b|\.pth\b|\.bin\b|\.onnx\b|\.gguf\b|\.pt\b)/i;
 const DOWNLOAD_PROGRESS_PATTERN = /(?:^|[\s|])(\d{1,3})%(?=\s|\||$)/g;
 const MANAGED_STABLE_DIFFUSION_TOOL_IDS = new Set(['automatic1111', 'forge']);
+const GIB = 1024 * 1024 * 1024;
+const MIB = 1024 * 1024;
+const HEAVY_LOCAL_AI_TOOL_IDS = new Set([
+  'audiocraft-webui',
+  'automatic1111',
+  'comfyui',
+  'facefusion',
+  'forge',
+  'invokeai',
+  'rvc',
+  'triposr',
+  'wan21-webui',
+]);
+const MANAGED_LAUNCH_ENV_KEYS = Object.freeze([
+  'TEMP',
+  'TMP',
+  'TMPDIR',
+  'PIP_CACHE_DIR',
+  'PYTHONPYCACHEPREFIX',
+  'XDG_CACHE_HOME',
+  'HF_HOME',
+  'HUGGINGFACE_HUB_CACHE',
+  'TRANSFORMERS_CACHE',
+  'TORCH_HOME',
+  'GRADIO_TEMP_DIR',
+  'MPLCONFIGDIR',
+  'OLLAMA_MODELS',
+  'DATA_DIR',
+  'FRONTEND_BUILD_DIR',
+  'LOCALAIHUB_CACHE_ROOT',
+  'LOCALAIHUB_TEMP_ROOT',
+  'LOCALAIHUB_TOOL_ROOT',
+]);
 const MANAGED_STABLE_DIFFUSION_CLIP_PACKAGE = '--no-build-isolation git+https://github.com/openai/CLIP.git@d50d76daa670286dd6cacf3bcd80b5e4823fc8e1#egg=clip';
 const MANAGED_STABLE_DIFFUSION_REPO_URL = 'https://github.com/w-e-w/stablediffusion.git';
 const MANAGED_STABLE_DIFFUSION_NUMPY_PIN = 'numpy==1.26.2';
@@ -251,12 +285,53 @@ function isAiderOllamaSession(runtimeState) {
   return Boolean(runtimeState?.launchProfile?.env?.OLLAMA_API_BASE);
 }
 
+function getAiderCombinedOutput(runtimeState) {
+  return stripAnsiText(`${runtimeState?.stdoutBuffer || ''}\n${runtimeState?.stderrBuffer || ''}`);
+}
+
+function getAiderOllamaTimeoutRetryClassification(runtimeState) {
+  if (!isAiderOllamaSession(runtimeState)) {
+    return null;
+  }
+
+  const combinedOutput = getAiderCombinedOutput(runtimeState).slice(-16000);
+  if (!combinedOutput.trim()) {
+    return null;
+  }
+
+  const normalizedOutput = combinedOutput.toLowerCase();
+  const hasModelTimeout = normalizedOutput.includes('litellm.timeout')
+    || /connection\s+timed\s+out\s+after\s+\d+(?:\.\d+)?\s+seconds?/i.test(combinedOutput);
+  const hasRetryMarker = /retrying\s+in\s+\d+(?:\.\d+)?\s+seconds?/i.test(combinedOutput);
+  const hasAiderOllamaMarker = normalizedOutput.includes('ollama_chatexception')
+    || normalizedOutput.includes('ollamaexception')
+    || normalizedOutput.includes('api connectionerror')
+    || normalizedOutput.includes('apiconnectionerror')
+    || normalizedOutput.includes('ollama_chat');
+
+  if (!hasModelTimeout || !hasRetryMarker || !hasAiderOllamaMarker) {
+    return null;
+  }
+
+  const timeoutMatch = combinedOutput.match(/connection\s+timed\s+out\s+after\s+(\d+(?:\.\d+)?)\s+seconds?/i);
+  const timeoutSeconds = timeoutMatch ? Number(timeoutMatch[1]) : null;
+  const timeoutLabel = Number.isFinite(timeoutSeconds) && timeoutSeconds > 0
+    ? ` after ${timeoutSeconds} seconds`
+    : '';
+
+  return {
+    kind: 'aider-ollama-timeout-retry',
+    timeoutSeconds,
+    message: `Aider's Ollama model request timed out${timeoutLabel} and Aider started retrying instead of making progress. Local AI Hub stopped this Aider session so it would not stay stuck. Try a smaller Ollama model, restart Ollama, or launch Aider again when the model is ready.`,
+  };
+}
+
 function detectAiderHardFailureMessage(runtimeState) {
   if (!isAiderOllamaSession(runtimeState)) {
     return '';
   }
 
-  const combinedOutput = stripAnsiText(`${runtimeState?.stdoutBuffer || ''}\n${runtimeState?.stderrBuffer || ''}`);
+  const combinedOutput = getAiderCombinedOutput(runtimeState);
   if (!combinedOutput.trim()) {
     return '';
   }
@@ -277,6 +352,12 @@ function detectAiderHardFailureMessage(runtimeState) {
       context: 'aider-turn',
       runtimePolicy: runtimeState?.launchProfile?.localAIHubAiderRuntimePolicy || null,
     });
+  }
+
+  const timeoutRetry = getAiderOllamaTimeoutRetryClassification(runtimeState);
+  if (timeoutRetry?.message) {
+    runtimeState.aiderFailureScope = 'session';
+    return timeoutRetry.message;
   }
 
   return '';
@@ -302,8 +383,14 @@ async function maybeStopAiderForHardFailure(toolState, runtimeState) {
     emitRuntimeSessionState(runtimeState);
   }
 
+  const sessionOnlyFailure = runtimeState.aiderFailureScope === 'session';
   await stopRuntimeProcess(toolState.id, runtimeState, {
+    cleanupContext: 'aider-terminal-output',
+    finalError: sessionOnlyFailure ? null : message,
+    finalStatus: sessionOnlyFailure ? 'stopped' : 'error',
+    sessionError: true,
     sessionMessage: message,
+    unexpectedStop: !sessionOnlyFailure,
   });
 }
 
@@ -708,7 +795,164 @@ function ensureManagedRuntimePath(toolState, candidatePath, label) {
   );
 }
 
-async function buildLaunchRuntimeEnv(toolState, extraEnv = {}) {
+function sanitizePathSegment(value, fallback = 'tool') {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '') || fallback;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '0 B';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${size >= 10 || unitIndex === 0 ? Math.round(size) : Math.round(size * 10) / 10} ${units[unitIndex]}`;
+}
+
+function getLaunchEnvironmentPolicy(toolState) {
+  return toolState?.launchEnvironment && typeof toolState.launchEnvironment === 'object' && !Array.isArray(toolState.launchEnvironment)
+    ? toolState.launchEnvironment
+    : {};
+}
+
+function getPolicyBoolean(policy, key, fallback) {
+  return typeof policy?.[key] === 'boolean' ? policy[key] : fallback;
+}
+
+function isPythonCacheCandidate(toolState, launchProfile = null) {
+  const launchKind = String(launchProfile?.kind || toolState?.launchProfile?.kind || '').trim().toLowerCase();
+  const runtime = String(toolState?.installInstructions?.runtime || '').trim().toLowerCase();
+  return runtime === 'python' || launchKind === 'python-script' || launchKind === 'python-module' || HEAVY_LOCAL_AI_TOOL_IDS.has(String(toolState?.id || '').trim().toLowerCase());
+}
+
+function buildManagedLaunchRuntimePaths(toolState) {
+  const appPaths = getAppPaths();
+  const managedRoot = appPaths.managedRoot;
+  const cacheRoot = appPaths.cacheRoot || path.join(managedRoot, 'cache');
+  const tempRoot = appPaths.tempRoot || path.join(managedRoot, 'temp');
+  const toolSegment = sanitizePathSegment(toolState?.id || path.basename(getManagedToolRoot(toolState) || ''), 'tool');
+  const huggingFaceRoot = path.join(cacheRoot, 'huggingface');
+
+  return {
+    cacheRoot,
+    gradioTempDir: path.join(cacheRoot, 'gradio'),
+    hfHubCacheDir: path.join(huggingFaceRoot, 'hub'),
+    huggingFaceRoot,
+    managedRoot,
+    matplotlibConfigDir: path.join(cacheRoot, 'matplotlib'),
+    pipCacheDir: path.join(cacheRoot, 'pip'),
+    pycacheDir: path.join(cacheRoot, 'python-pycache', toolSegment),
+    tempRoot,
+    toolTempDir: path.join(tempRoot, toolSegment),
+    torchHomeDir: path.join(cacheRoot, 'torch'),
+    transformersCacheDir: path.join(huggingFaceRoot, 'transformers'),
+    xdgCacheDir: path.join(cacheRoot, 'xdg'),
+  };
+}
+
+function buildManagedLaunchEnvDefaults(toolState, launchProfile = null) {
+  const managedRoot = getManagedToolRoot(toolState);
+  if (!managedRoot) {
+    return { env: {}, paths: null };
+  }
+
+  const policy = getLaunchEnvironmentPolicy(toolState);
+  if (getPolicyBoolean(policy, 'managedTempCache', true) === false) {
+    return { env: {}, paths: buildManagedLaunchRuntimePaths(toolState) };
+  }
+
+  const paths = buildManagedLaunchRuntimePaths(toolState);
+  const applyTempEnv = getPolicyBoolean(policy, 'setTempEnv', true);
+  const applyPythonCacheEnv = getPolicyBoolean(policy, 'setPythonCacheEnv', isPythonCacheCandidate(toolState, launchProfile));
+  const applyHuggingFaceEnv = getPolicyBoolean(policy, 'setHuggingFaceCacheEnv', applyPythonCacheEnv);
+  const applyTorchEnv = getPolicyBoolean(policy, 'setTorchCacheEnv', applyPythonCacheEnv);
+  const applyGradioEnv = getPolicyBoolean(policy, 'setGradioTempEnv', applyPythonCacheEnv);
+  const applyMatplotlibEnv = getPolicyBoolean(policy, 'setMatplotlibEnv', applyPythonCacheEnv);
+  const ollamaModelsDir = toolState.id === 'ollama' ? path.join(getAppPaths().modelsRoot, 'ollama') : null;
+
+  const env = {
+    LOCALAIHUB_TOOL_ID: toolState.id,
+    LOCALAIHUB_TOOL_ROOT: managedRoot,
+    LOCALAIHUB_CACHE_ROOT: paths.cacheRoot,
+    LOCALAIHUB_TEMP_ROOT: paths.tempRoot,
+    NESTAI_TOOL_ID: toolState.id,
+    ...(applyTempEnv ? {
+      TEMP: paths.toolTempDir,
+      TMP: paths.toolTempDir,
+      TMPDIR: paths.toolTempDir,
+    } : {}),
+    ...(applyPythonCacheEnv ? {
+      PIP_CACHE_DIR: paths.pipCacheDir,
+      PIP_DISABLE_PIP_VERSION_CHECK: '1',
+      PYTHONNOUSERSITE: '1',
+      PYTHONPYCACHEPREFIX: paths.pycacheDir,
+      XDG_CACHE_HOME: paths.xdgCacheDir,
+    } : {}),
+    ...(applyHuggingFaceEnv ? {
+      HF_HOME: paths.huggingFaceRoot,
+      HUGGINGFACE_HUB_CACHE: paths.hfHubCacheDir,
+      TRANSFORMERS_CACHE: paths.transformersCacheDir,
+    } : {}),
+    ...(applyTorchEnv ? { TORCH_HOME: paths.torchHomeDir } : {}),
+    ...(applyGradioEnv ? { GRADIO_TEMP_DIR: paths.gradioTempDir } : {}),
+    ...(applyMatplotlibEnv ? { MPLCONFIGDIR: paths.matplotlibConfigDir } : {}),
+    ...(ollamaModelsDir ? { OLLAMA_MODELS: ollamaModelsDir } : {}),
+  };
+
+  return { env, paths };
+}
+
+async function ensureManagedLaunchRuntimePaths(toolState, launchProfile = null) {
+  const { env, paths } = buildManagedLaunchEnvDefaults(toolState, launchProfile);
+  if (!paths) {
+    return { env, paths };
+  }
+
+  const directories = new Set([
+    paths.cacheRoot,
+    paths.tempRoot,
+    ...Object.values(env).filter((value) => typeof value === 'string' && path.isAbsolute(value)),
+  ]);
+  await Promise.all([...directories].map((directoryPath) => fs.ensureDir(directoryPath)));
+  return { env, paths };
+}
+
+function removeUnsetEnvironmentKeys(env, unsetEnv = []) {
+  for (const key of unsetEnv || []) {
+    const normalizedKey = String(key || '').trim();
+    if (!normalizedKey) {
+      continue;
+    }
+
+    const matchingKey = Object.keys(env).find((entry) => entry.toLowerCase() === normalizedKey.toLowerCase());
+    if (matchingKey) {
+      delete env[matchingKey];
+    }
+  }
+  return env;
+}
+
+function summarizeLaunchRuntimeEnv(runtimeEnv = {}) {
+  return Object.fromEntries(
+    MANAGED_LAUNCH_ENV_KEYS
+      .filter((key) => runtimeEnv[key])
+      .map((key) => [key, runtimeEnv[key]]),
+  );
+}
+
+async function buildLaunchRuntimeEnv(toolState, extraEnv = {}, options = {}) {
   const managedRoot = getManagedToolRoot(toolState);
   if (!managedRoot) {
     return {
@@ -717,13 +961,9 @@ async function buildLaunchRuntimeEnv(toolState, extraEnv = {}) {
     };
   }
 
-  const stateRoot = getManagedToolStateRoot(toolState);
-  const cacheDir = path.join(stateRoot, 'cache');
-  const tempDir = path.join(stateRoot, 'tmp');
-  const pycacheDir = path.join(stateRoot, 'pycache');
-  const hfCacheDir = path.join(cacheDir, 'huggingface');
-  const transformersCacheDir = path.join(cacheDir, 'transformers');
-  const ollamaModelsDir = toolState.id === 'ollama' ? path.join(getAppPaths().modelsRoot, 'ollama') : null;
+  const launchProfile = options.launchProfile || null;
+  const { env: managedEnv } = await ensureManagedLaunchRuntimePaths(toolState, launchProfile);
+  const policy = getLaunchEnvironmentPolicy(toolState);
   const openWebUiDataDir = toolState.id === 'openwebui' ? path.join(toolState.appDir || managedRoot, 'data') : null;
   const openWebUiFrontendDirCandidate = toolState.id === 'openwebui'
     ? path.join(managedRoot, '.venv', 'Lib', 'site-packages', 'open_webui', 'frontend')
@@ -740,38 +980,127 @@ async function buildLaunchRuntimeEnv(toolState, extraEnv = {}) {
       }
     : {};
 
-  await Promise.all([
-    fs.ensureDir(cacheDir),
-    fs.ensureDir(tempDir),
-    fs.ensureDir(pycacheDir),
-    fs.ensureDir(hfCacheDir),
-    fs.ensureDir(transformersCacheDir),
-    ollamaModelsDir ? fs.ensureDir(ollamaModelsDir) : Promise.resolve(),
-    openWebUiDataDir ? fs.ensureDir(openWebUiDataDir) : Promise.resolve(),
-  ]);
+  if (openWebUiDataDir) {
+    await fs.ensureDir(openWebUiDataDir);
+  }
 
-  return {
+  return removeUnsetEnvironmentKeys({
     ...process.env,
-    ...extraEnv,
-    LOCALAIHUB_TOOL_ID: toolState.id,
-    LOCALAIHUB_TOOL_ROOT: managedRoot,
-    NESTAI_TOOL_ID: toolState.id,
-    PIP_CACHE_DIR: cacheDir,
-    PIP_DISABLE_PIP_VERSION_CHECK: '1',
-    PYTHONNOUSERSITE: '1',
-    PYTHONPYCACHEPREFIX: pycacheDir,
-    TEMP: tempDir,
-    TMP: tempDir,
-    TMPDIR: tempDir,
-    XDG_CACHE_HOME: cacheDir,
-    HF_HOME: hfCacheDir,
-    TRANSFORMERS_CACHE: transformersCacheDir,
-    ...(ollamaModelsDir ? { OLLAMA_MODELS: ollamaModelsDir } : {}),
+    ...managedEnv,
     ...(openWebUiDataDir ? { DATA_DIR: openWebUiDataDir } : {}),
     ...openWebUiPythonEnv,
+    ...extraEnv,
+    ...(policy.extraEnv && typeof policy.extraEnv === 'object' && !Array.isArray(policy.extraEnv) ? policy.extraEnv : {}),
+  }, policy.unsetEnv || policy.removeEnv || []);
+}
+
+function getOsTempDirectory() {
+  return String(process.env.TEMP || process.env.TMP || '').trim() || path.join(getAppPaths().localRoot, 'temp');
+}
+
+function getLaunchStorageProfile(toolState) {
+  const policy = getLaunchEnvironmentPolicy(toolState);
+  const explicitProfile = String(policy.diskProfile || '').trim().toLowerCase();
+  if (explicitProfile === 'light' || explicitProfile === 'heavy') {
+    return explicitProfile;
+  }
+
+  return HEAVY_LOCAL_AI_TOOL_IDS.has(String(toolState?.id || '').trim().toLowerCase()) ? 'heavy' : 'light';
+}
+
+function buildDiskPressureMessage(label, assessment, severity, context = {}) {
+  const mount = assessment?.mount || 'that drive';
+  const available = formatBytes(assessment?.availableBytes || 0);
+  const needed = formatBytes(context.blockBytes || assessment?.requiredBytes || 0);
+  if (severity === 'block') {
+    return `${label} needs more working space on ${mount}. Only ${available} is free, and Local AI Hub needs at least ${needed} available before starting this workload.`;
+  }
+
+  return `${label} may need a lot of working space. ${mount} has ${available} free, so this run may fail if the tool has to unpack models, compile extensions, or write large temporary files.`;
+}
+
+async function assessManagedLaunchStoragePressure(toolState, options = {}) {
+  if (!getManagedToolRoot(toolState) || getPolicyBoolean(getLaunchEnvironmentPolicy(toolState), 'managedTempCache', true) === false) {
+    return {
+      blocked: false,
+      blockingMessage: '',
+      managedDisk: null,
+      osTempDisk: null,
+      paths: null,
+      profile: 'external',
+      warningMessage: '',
+      warnings: [],
+    };
+  }
+
+  const paths = buildManagedLaunchRuntimePaths(toolState);
+  const disks = Array.isArray(options.disks) ? options.disks : await detectStorageSnapshot().catch(() => []);
+  const managedDisk = findDiskForPath(disks, paths.tempRoot);
+  const osTempDir = String(options.osTempDir || getOsTempDirectory()).trim();
+  const osTempDisk = osTempDir ? findDiskForPath(disks, osTempDir) : null;
+  const profile = getLaunchStorageProfile(toolState);
+  const heavy = profile === 'heavy';
+  const blockBytes = Number(options.blockBytes || (heavy ? 4 * GIB : 256 * MIB));
+  const warnBytes = Number(options.warnBytes || (heavy ? 12 * GIB : GIB));
+  const osWarnBytes = Number(options.osWarnBytes || (heavy ? 2 * GIB : 512 * MIB));
+  const osCriticalBytes = Number(options.osCriticalBytes || 512 * MIB);
+  const managedAssessment = assessDiskSpace(managedDisk, blockBytes, { minimumRemainingRatio: 0 });
+  const warnings = [];
+  const toolName = toolState?.name || 'This tool';
+
+  if (managedDisk && (managedAssessment.blocked || Number(managedAssessment.availableBytes || 0) < blockBytes)) {
+    return {
+      blocked: true,
+      blockingMessage: buildDiskPressureMessage(toolName, managedAssessment, 'block', { blockBytes }),
+      managedDisk,
+      osTempDisk,
+      paths,
+      profile,
+      warningMessage: '',
+      warnings,
+    };
+  }
+
+  if (managedDisk && Number(managedDisk.freeBytes || 0) < warnBytes) {
+    warnings.push({
+      kind: 'managed-temp-cache-low-space',
+      message: buildDiskPressureMessage(toolName, managedAssessment, 'warn', { blockBytes, warnBytes }),
+      mount: managedDisk.mount,
+    });
+  }
+
+  const managedMount = String(managedDisk?.mount || '').toLowerCase();
+  const osMount = String(osTempDisk?.mount || '').toLowerCase();
+  if (osTempDisk && osMount && osMount !== managedMount && Number(osTempDisk.freeBytes || 0) < osWarnBytes) {
+    const severity = Number(osTempDisk.freeBytes || 0) < osCriticalBytes ? 'critical' : 'warning';
+    warnings.push({
+      kind: 'os-temp-low-space',
+      message: `${toolName} will use Local AI Hub managed temp/cache folders on ${managedDisk?.mount || 'the managed storage drive'}, but Windows or third-party runtimes may still touch ${osTempDisk.mount}. Only ${formatBytes(osTempDisk.freeBytes)} is free there.`,
+      mount: osTempDisk.mount,
+      severity,
+    });
+  }
+
+  return {
+    blocked: false,
+    blockingMessage: '',
+    managedDisk,
+    osTempDisk,
+    paths,
+    profile,
+    warningMessage: warnings[0]?.message || '',
+    warnings,
   };
 }
 
+async function preflightManagedToolLaunchStorage(toolState, options = {}) {
+  const result = await assessManagedLaunchStoragePressure(toolState, options);
+  if (result.blocked) {
+    throw new Error(result.blockingMessage || `${toolState?.name || 'This tool'} needs more disk space before it can start.`);
+  }
+
+  return result;
+}
 function isStableDiffusionApiTool(toolState) {
   return Boolean(toolState?.id && MANAGED_STABLE_DIFFUSION_TOOL_IDS.has(toolState.id));
 }
@@ -1284,25 +1613,6 @@ function buildAutomatic1111NativeCrashMessage(toolState, runtimeState, exitConte
   return `${stageMessage} ${lowVramMessage}${xformersMessage}Local AI Hub did not capture a Python traceback, so this points to Automatic1111's native CUDA or PyTorch runtime stack on this machine rather than its install or first-run download state. Windows reported exit code ${exitContext.unsignedExitCode} (${exitContext.hexExitCode}), which usually means ${exitContext.exitDescription}. Open the logs folder for the full launch details.`;
 }
 
-function buildFooocusNativeCrashMessage(toolState, runtimeState, exitContext) {
-  if (toolState?.id !== 'fooocus' || exitContext.unsignedExitCode !== 3221225477) {
-    return '';
-  }
-
-  const combinedOutput = getCombinedRuntimeOutput(runtimeState);
-  if (hasStructuredPythonFailure(combinedOutput)) {
-    return '';
-  }
-
-  const reachedCudaStartup = /device:\s*cuda:/i.test(combinedOutput) || /vae dtype:/i.test(combinedOutput);
-  const stageMessage = exitContext.reachedLocalUrl
-    ? `${toolState.name} reached its local URL and then a native Windows component inside Fooocus crashed.`
-    : reachedCudaStartup
-      ? `${toolState.name} finished its initial CUDA startup steps and then a native Windows component inside Fooocus crashed before the web UI became available.`
-      : `${toolState.name} hit a native Windows crash before its web UI became available.`;
-
-  return `${stageMessage} Local AI Hub did not receive a Python traceback, so this points to Fooocus's embedded runtime rather than its install or library state. Windows reported exit code ${exitContext.unsignedExitCode} (${exitContext.hexExitCode}), which usually means ${exitContext.exitDescription}. Open the logs folder for the full launch details.`;
-}
 function buildExitCodeContextMessage(toolState, runtimeState) {
   const exitCode = Number(runtimeState?.process?.exitCode);
   if (!Number.isFinite(exitCode) || exitCode === 0) {
@@ -1322,16 +1632,6 @@ function buildExitCodeContextMessage(toolState, runtimeState) {
   });
   if (automatic1111NativeCrashMessage) {
     return automatic1111NativeCrashMessage;
-  }
-
-  const fooocusNativeCrashMessage = buildFooocusNativeCrashMessage(toolState, runtimeState, {
-    unsignedExitCode,
-    hexExitCode,
-    reachedLocalUrl,
-    exitDescription,
-  });
-  if (fooocusNativeCrashMessage) {
-    return fooocusNativeCrashMessage;
   }
   const stageVerb = exitDescription ? 'crashed' : 'stopped';
   const stageMessage = reachedLocalUrl
@@ -1423,18 +1723,27 @@ function getPendingStartupTimeoutMs(toolState) {
 }
 
 async function persistToolRuntimeState(toolState, status, extra = {}) {
-  await upsertTool({
+  const payload = {
     id: toolState.id,
     status,
     lastError: Object.prototype.hasOwnProperty.call(extra, 'lastError') ? extra.lastError : null,
     lastRepairMessage: Object.prototype.hasOwnProperty.call(extra, 'lastRepairMessage') ? extra.lastRepairMessage : null,
-  });
+  };
+  if (Object.prototype.hasOwnProperty.call(extra, 'lastLaunchWarning')) {
+    payload.lastLaunchWarning = extra.lastLaunchWarning || null;
+  }
 
-  emitToolState(toolState.id, {
+  await upsertTool(payload);
+
+  const eventPayload = {
     status,
-    lastError: Object.prototype.hasOwnProperty.call(extra, 'lastError') ? extra.lastError : null,
-    lastRepairMessage: Object.prototype.hasOwnProperty.call(extra, 'lastRepairMessage') ? extra.lastRepairMessage : null,
-  });
+    lastError: payload.lastError,
+    lastRepairMessage: payload.lastRepairMessage,
+  };
+  if (Object.prototype.hasOwnProperty.call(payload, 'lastLaunchWarning')) {
+    eventPayload.lastLaunchWarning = payload.lastLaunchWarning;
+  }
+  emitToolState(toolState.id, eventPayload);
 }
 async function getRunningProcessNames(processNames = []) {
   const matches = [];
@@ -1886,26 +2195,68 @@ function buildPendingStartupFailureMessage(toolState, target) {
   return `${toolState.name} is still not answering on ${target}. Local AI Hub stopped waiting in the background. Open the logs folder for the full launch details.`;
 }
 
+async function stopRuntimeProcessTree(runtimeState, options = {}) {
+  const pid = runtimeState?.process?.pid;
+  if (!pid) {
+    return true;
+  }
+
+  const gracefulStopMs = Number.isFinite(Number(options.gracefulStopMs)) && Number(options.gracefulStopMs) > 0
+    ? Number(options.gracefulStopMs)
+    : PROCESS_GRACEFUL_STOP_MS;
+
+  await runCommand('taskkill', ['/pid', String(pid), '/t'], {
+    allowFailure: true,
+  }).catch(() => null);
+
+  const stoppedGracefully = await waitForRuntimeExit(runtimeState, gracefulStopMs).catch(() => false);
+  if (stoppedGracefully) {
+    return true;
+  }
+
+  await killProcessTree(pid).catch(() => null);
+  return waitForRuntimeExit(runtimeState, PROCESS_SHUTDOWN_WAIT_MS).catch(() => false);
+}
+
 async function stopRuntimeProcess(toolId, runtimeState, options = {}) {
   pendingStartupMonitors.delete(toolId);
   const sessionMessage = options.sessionMessage || runtimeState?.hardFailureMessage || 'Aider stopped. Launch it again to continue coding.';
 
-  if (!runtimeState?.process?.pid) {
-    markRuntimeSessionStopped(runtimeState, sessionMessage);
-    disposeRuntimeSessionTracking(runtimeState);
-    clearLaunchProgress(runtimeState);
-    clearRuntime(toolId, runtimeState);
-    return;
-  }
-
   runtimeState.stopping = true;
-  markRuntimeSessionStopped(runtimeState, sessionMessage);
+  if (options.sessionError && runtimeState?.sessionState) {
+    clearAiderWaitingTimer(runtimeState);
+    runtimeState.sessionState.phase = 'error';
+    runtimeState.sessionState.waitingForUser = false;
+    runtimeState.sessionState.activeTurn = false;
+    runtimeState.sessionState.message = sessionMessage;
+    emitRuntimeSessionState(runtimeState);
+  } else {
+    markRuntimeSessionStopped(runtimeState, sessionMessage);
+  }
   disposeRuntimeSessionTracking(runtimeState);
   clearLaunchProgress(runtimeState);
-  await killProcessTree(runtimeState.process.pid).catch(() => null);
-  await waitForRuntimeExit(runtimeState).catch(() => false);
+
+  if (runtimeState?.process?.pid) {
+    await stopRuntimeProcessTree(runtimeState, options);
+  }
+
   clearRuntime(toolId, runtimeState);
-  await runRuntimeStopCleanup(runtimeState).catch((error) => logRuntimeStopCleanupFailure(runtimeState, 'internal-stop', error));
+  await runRuntimeStopCleanup(runtimeState).catch((error) => logRuntimeStopCleanupFailure(runtimeState, options.cleanupContext || 'internal-stop', error));
+
+  if (options.finalStatus && !runtimeState?.exitHandled) {
+    await persistToolRuntimeState({ id: toolId, name: runtimeState?.toolName || 'Aider' }, options.finalStatus, {
+      lastError: options.finalError || null,
+      lastRepairMessage: null,
+    });
+    settleRuntimeStartupOutcome(runtimeState, {
+      status: options.finalStatus,
+      recovered: false,
+      message: options.finalError || sessionMessage,
+    });
+    if (options.unexpectedStop) {
+      emitUnexpectedStop({ id: toolId, name: runtimeState?.toolName || 'Aider' }, options.finalError || sessionMessage);
+    }
+  }
 }
 
 async function monitorPendingLaunch(toolState, runtimeState = null, options = {}) {
@@ -2137,7 +2488,7 @@ async function handleRuntimeExit(toolState, runtimeState, code, signal, runtimeO
 ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
 
     if (runtimeState.stopping) {
-      if (runtimeState.hardFailureMessage) {
+      if (runtimeState.hardFailureMessage && runtimeState.aiderFailureScope !== 'session') {
         await logger.warn('Tool runtime was stopped by Local AI Hub after a hard runtime failure.', {
           exitCode: code,
           signal,
@@ -2154,6 +2505,7 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
           lastError: runtimeState.hardFailureMessage,
           lastRepairMessage: null,
         });
+        await runRuntimeStopCleanup(runtimeState).catch((error) => logRuntimeStopCleanupFailure(runtimeState, 'hard-failure-stop', error));
         settleRuntimeStartupOutcome(runtimeState, {
           status: 'error',
           recovered: false,
@@ -2185,30 +2537,32 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
       return;
     }
 
-    const launchState = await confirmLaunchAfterExit(toolState, runtimeState);
-    if (launchState.running) {
-      await logger.info(runtimeState.launchConfirmed
-        ? 'Launcher process exited, but the tool is still available.'
-        : 'Launch process exited after the tool became available.', {
-        exitCode: code,
-        signal,
-        runningProcessNames: launchState.runningProcessNames || [],
-      });
-      await upsertTool({
-        id: toolState.id,
-        status: 'running',
-        lastError: null,
-        lastRepairMessage: null,
-      });
-      emitToolState(toolState.id, {
-        status: 'running',
-        lastError: null,
-        lastRepairMessage: null,
-      });
-      settleRuntimeStartupOutcome(runtimeState, {
-        status: 'running',
-      });
-      return;
+    if (!shouldTrackAiderSession(toolState)) {
+      const launchState = await confirmLaunchAfterExit(toolState, runtimeState);
+      if (launchState.running) {
+        await logger.info(runtimeState.launchConfirmed
+          ? 'Launcher process exited, but the tool is still available.'
+          : 'Launch process exited after the tool became available.', {
+          exitCode: code,
+          signal,
+          runningProcessNames: launchState.runningProcessNames || [],
+        });
+        await upsertTool({
+          id: toolState.id,
+          status: 'running',
+          lastError: null,
+          lastRepairMessage: null,
+        });
+        emitToolState(toolState.id, {
+          status: 'running',
+          lastError: null,
+          lastRepairMessage: null,
+        });
+        settleRuntimeStartupOutcome(runtimeState, {
+          status: 'running',
+        });
+        return;
+      }
     }
 
     const wasRunning = Boolean(runtimeState.launchConfirmed);
@@ -2300,6 +2654,7 @@ ${runtimeState.stderrLogBuffer || runtimeState.stderrBuffer || ''}`.trim();
 
     if (!wasRunning && runtimeState.startupCheckPending) {
       runtimeState.startupFailureMessage = message;
+      await runRuntimeStopCleanup(runtimeState).catch((error) => logRuntimeStopCleanupFailure(runtimeState, 'startup-failure-before-confirmed', error));
       settleRuntimeStartupOutcome(runtimeState, {
         status: 'error',
         recovered: false,
@@ -2365,13 +2720,15 @@ async function launchPythonProfile(toolState, launchProfile, runtimeOptions = {}
     throw new Error('Local AI Hub is missing its Python launcher helper. Reinstall the app to restore it.');
   }
 
-  const runtimeEnv = await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {});
+  const runtimeEnv = await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {}, { launchProfile: safeLaunchProfile });
   const logger = createRuntimeLogger(toolState, safeLaunchProfile, runtimeOptions);
   await logger.info('Starting tool runtime.', {
     launch: buildLaunchCommandSummary(safeLaunchProfile, {
       helperScript,
       helperMode: safeLaunchProfile.kind === 'python-module' ? 'module' : 'script',
     }),
+    launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
+    storagePreflight: runtimeOptions.launchStoragePreflight || null,
   });
 
   const shellInstance = new PythonShell(path.basename(helperScript), {
@@ -2423,8 +2780,11 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
   }
 
   const logger = createRuntimeLogger(toolState, safeLaunchProfile, runtimeOptions);
+  const runtimeEnv = await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {}, { launchProfile: safeLaunchProfile });
   await logger.info('Starting tool runtime.', {
     launch: buildLaunchCommandSummary(safeLaunchProfile),
+    launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
+    storagePreflight: runtimeOptions.launchStoragePreflight || null,
   });
 
   if (getToolInterfaceMode(toolState) === 'desktop-app') {
@@ -2456,7 +2816,7 @@ async function launchBinaryProfile(toolState, launchProfile, runtimeOptions = {}
   const child = spawn(safeLaunchProfile.executable, safeLaunchProfile.args || [], {
     cwd: safeLaunchProfile.workingDir || path.dirname(safeLaunchProfile.executable),
     windowsHide: true,
-    env: await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {}),
+    env: runtimeEnv,
   });
 
   const runtimeState = rememberRuntime(toolState.id, {
@@ -2490,16 +2850,19 @@ async function launchBatchProfile(toolState, launchProfile, runtimeOptions = {})
   }
 
   const logger = createRuntimeLogger(toolState, safeLaunchProfile, runtimeOptions);
+  const runtimeEnv = await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {}, { launchProfile: safeLaunchProfile });
   await logger.info('Starting tool runtime.', {
     launch: buildLaunchCommandSummary(safeLaunchProfile, {
       commandShell: 'cmd.exe',
     }),
+    launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
+    storagePreflight: runtimeOptions.launchStoragePreflight || null,
   });
 
   const child = spawn('cmd.exe', ['/c', safeLaunchProfile.command, ...(safeLaunchProfile.args || [])], {
     cwd: safeLaunchProfile.workingDir || path.dirname(safeLaunchProfile.command),
     windowsHide: true,
-    env: await buildLaunchRuntimeEnv(toolState, safeLaunchProfile.env || {}),
+    env: runtimeEnv,
   });
 
   const runtimeState = rememberRuntime(toolState.id, {
@@ -2547,15 +2910,18 @@ async function launchToolInternal(toolState, options = {}) {
     throw new Error('Local AI Hub could not find that tool in its installed list.');
   }
 
+  let launchStoragePreflight = null;
   const markStarting = async () => {
     await persistToolRuntimeState(toolState, 'starting', {
       lastError: null,
+      lastLaunchWarning: launchStoragePreflight?.warningMessage || null,
       lastRepairMessage: null,
     });
     return {
       ...toolState,
       status: 'starting',
       lastError: null,
+      lastLaunchWarning: launchStoragePreflight?.warningMessage || null,
       lastRepairMessage: null,
     };
   };
@@ -2589,6 +2955,7 @@ async function launchToolInternal(toolState, options = {}) {
       ...toolState,
       status: 'running',
       lastError: null,
+      lastLaunchWarning: launchStoragePreflight?.warningMessage || null,
     };
   }
 
@@ -2633,6 +3000,11 @@ async function launchToolInternal(toolState, options = {}) {
 
   launchProfile = await prepareManagedStableDiffusionLaunchProfile(toolState, launchProfile);
   launchProfile = ensureStableDiffusionApiLaunchProfile(toolState, launchProfile);
+  launchStoragePreflight = await preflightManagedToolLaunchStorage(toolState, { launchProfile });
+  const runtimeOptions = {
+    ...options,
+    launchStoragePreflight,
+  };
 
   if (launchProfile.kind === 'embedded') {
     await persistToolRuntimeState(toolState, 'running', {
@@ -2656,24 +3028,25 @@ async function launchToolInternal(toolState, options = {}) {
 
   try {
     if (launchProfile.kind === 'python-script' || launchProfile.kind === 'python-module') {
-      runtimeState = await launchPythonProfile(toolState, launchProfile, options);
+      runtimeState = await launchPythonProfile(toolState, launchProfile, runtimeOptions);
     } else if (launchProfile.kind === 'binary') {
-      runtimeState = await launchBinaryProfile(toolState, launchProfile, options);
+      runtimeState = await launchBinaryProfile(toolState, launchProfile, runtimeOptions);
     } else if (launchProfile.kind === 'batch') {
-      runtimeState = await launchBatchProfile(toolState, launchProfile, options);
+      runtimeState = await launchBatchProfile(toolState, launchProfile, runtimeOptions);
     } else {
       throw new Error(`Local AI Hub does not know how to launch ${toolState.name}.`);
     }
 
     await persistToolRuntimeState(toolState, 'starting', {
       lastError: null,
+      lastLaunchWarning: launchStoragePreflight?.warningMessage || null,
       lastRepairMessage: null,
     });
 
     runtimeState.startupCheckPending = true;
     let launchResult = null;
     try {
-      launchResult = await waitForLaunchConfirmation(toolState, runtimeState, runtimeState.logger, options);
+      launchResult = await waitForLaunchConfirmation(toolState, runtimeState, runtimeState.logger, runtimeOptions);
     } finally {
       if (runtimeState) {
         runtimeState.startupCheckPending = false;
@@ -2688,11 +3061,13 @@ async function launchToolInternal(toolState, options = {}) {
         ...toolState,
         status: 'starting',
         lastError: null,
+        lastLaunchWarning: launchStoragePreflight?.warningMessage || null,
       };
     }
 
     await persistToolRuntimeState(toolState, 'running', {
       lastError: null,
+      lastLaunchWarning: launchStoragePreflight?.warningMessage || null,
       lastRepairMessage: null,
     });
     markRuntimeSessionReady(runtimeState);
@@ -2705,6 +3080,7 @@ async function launchToolInternal(toolState, options = {}) {
       ...toolState,
       status: 'running',
       lastError: null,
+      lastLaunchWarning: launchStoragePreflight?.warningMessage || null,
     };
   } catch (error) {
     let startupOutcome = null;
@@ -2756,20 +3132,14 @@ async function stopTool(toolState) {
 
   const runtime = runtimes.get(toolState.id);
   if (runtime?.process?.pid) {
-    runtime.stopping = true;
-    clearLaunchProgress(runtime);
-    await killProcessTree(runtime.process.pid);
-    await waitForRuntimeExit(runtime).catch(() => false);
-    clearRuntime(toolState.id, runtime);
+    await stopRuntimeProcess(toolState.id, runtime, {
+      cleanupContext: 'user-stop',
+      sessionMessage: 'Aider stopped. Launch it again to continue coding.',
+    });
     await persistToolRuntimeState(toolState, 'stopped', {
       lastError: null,
       lastRepairMessage: null,
     });
-    try {
-      await runRuntimeStopCleanup(runtime);
-    } catch (error) {
-      throw new Error(humanizeError(error, toolState.name + ' stopped, but Local AI Hub could not shut down the supporting runtime it started for this session.'));
-    }
     return;
   }
 
@@ -2813,14 +3183,18 @@ async function prepareToolForMaintenance(toolState) {
   };
 }
 async function disposeAllRuntimes() {
+  const runtimeEntries = [...runtimes.entries()];
   await Promise.all(
-    [...runtimes.values()].map(async (runtime) => {
+    runtimeEntries.map(async ([toolId, runtime]) => {
       runtime.stopping = true;
       clearLaunchProgress(runtime);
-      await killProcessTree(runtime.process?.pid).catch(() => null);
+      markRuntimeSessionStopped(runtime, 'Aider stopped because Local AI Hub is shutting down.');
+      disposeRuntimeSessionTracking(runtime);
+      await stopRuntimeProcessTree(runtime).catch(() => false);
+      clearRuntime(toolId, runtime);
+      await runRuntimeStopCleanup(runtime).catch((error) => logRuntimeStopCleanupFailure(runtime, 'app-shutdown', error));
     }),
   );
-  runtimes.clear();
 }
 
 function getRunningToolIds() {
@@ -2828,6 +3202,9 @@ function getRunningToolIds() {
 }
 
 module.exports = {
+  assessManagedLaunchStoragePressure,
+  buildLaunchRuntimeEnv,
+  buildManagedLaunchRuntimePaths,
   disposeAllRuntimes,
   getRunningToolIds,
   getRuntimeOutputSnapshot,
@@ -2840,4 +3217,9 @@ module.exports = {
   sendInputToTool,
   setRuntimeEventSink,
   stopTool,
+  summarizeLaunchRuntimeEnv,
+  __testing: {
+    getAiderOllamaTimeoutRetryClassification,
+    stopRuntimeProcessTree,
+  },
 };

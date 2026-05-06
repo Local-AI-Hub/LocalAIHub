@@ -286,6 +286,7 @@ function normalizeToolDefinition(tool) {
     interfaceMode: tool.interfaceMode || 'external-browser',
     launchEnv: tool.launchEnv || {},
     externalLaunchEnv: tool.externalLaunchEnv || tool.launchEnv || {},
+    launchEnvironment: tool.launchEnvironment && typeof tool.launchEnvironment === 'object' && !Array.isArray(tool.launchEnvironment) ? tool.launchEnvironment : {},
     installContract,
     installInstructions: normalizedInstallInstructions,
     launchCommand,
