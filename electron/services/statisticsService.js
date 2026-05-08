@@ -5,10 +5,13 @@ const { ensureStorage, getAppPaths, readConfig } = require('./configService');
 const { detectStorageSnapshot, findDiskForPath, getLiveResourceUsage } = require('./hardwareService');
 const { listDownloadedModels, supportsModelManager } = require('./modelService');
 const { calculatePathSize } = require('./storageLocationService');
+const { createLogger } = require('./logService');
 
 const STATISTICS_FILE = 'statistics.json';
 const STATISTICS_VERSION = 1;
 const MAX_VRAM_HISTORY_SAMPLES = 360;
+
+const logger = createLogger('statistics');
 
 let statisticsQueue = Promise.resolve();
 
@@ -140,6 +143,30 @@ function getUniqueTrackedRoots(rootCandidates = []) {
   return uniqueRoots;
 }
 
+function elapsedMs(startedAt) {
+  return Math.round(Number(process.hrtime.bigint() - startedAt) / 1000000);
+}
+
+async function measureStatisticsSection(timings, name, operation) {
+  const startedAt = process.hrtime.bigint();
+  try {
+    return await operation();
+  } finally {
+    timings[name] = elapsedMs(startedAt);
+  }
+}
+
+function buildLaunchRanking(statistics, trackedTools = []) {
+  return Object.entries(statistics.toolLaunchCounts || {})
+    .map(([toolId, entry]) => ({
+      toolId,
+      toolName: entry?.name || trackedTools.find((tool) => tool.id === toolId)?.name || toolId,
+      count: Number(entry?.count || 0),
+      lastLaunchedAt: entry?.lastLaunchedAt || null,
+    }))
+    .sort((left, right) => right.count - left.count || left.toolName.localeCompare(right.toolName));
+}
+
 async function getToolInstallSize(tool) {
   if (!tool?.installDir) {
     return 0;
@@ -166,49 +193,77 @@ async function getTrackedTools(tools = null) {
   return Object.values(config.tools || {});
 }
 
-async function getStatisticsSnapshot(tools = null) {
-  const [statistics, trackedTools] = await Promise.all([readStatistics(), getTrackedTools(tools)]);
+async function getStatisticsCoreSnapshot(tools = null, options = {}) {
+  const totalStartedAt = process.hrtime.bigint();
+  const timings = {};
+  const [statistics, trackedTools] = await measureStatisticsSection(timings, 'readStatisticsAndToolsMs', () =>
+    Promise.all([readStatistics(), getTrackedTools(tools)]),
+  );
   const paths = getAppPaths();
-  const disks = await detectStorageSnapshot().catch(() => []);
+  const disks = await measureStatisticsSection(timings, 'detectStorageMs', () => detectStorageSnapshot().catch(() => []));
+  const storageDrive = findDiskForPath(disks, paths.managedRoot) || findDiskForPath(disks, paths.appInstallDir);
+  const snapshot = {
+    generatedAt: new Date().toISOString(),
+    launchRanking: buildLaunchRanking(statistics, trackedTools),
+    totalDiskUsage: {
+      freeBytes: storageDrive?.freeBytes || 0,
+      installDrive: storageDrive?.mount || '',
+      localAIHubBytes: null,
+      totalBytes: storageDrive?.sizeBytes || 0,
+    },
+    vramHistory: (statistics.vramHistory || []).slice(-MAX_VRAM_HISTORY_SAMPLES),
+  };
+
+  logger.info('Statistics core snapshot loaded.', {
+    totalMs: elapsedMs(totalStartedAt),
+    timings,
+    cacheMode: options.cacheMode || 'miss',
+    toolCount: trackedTools.length,
+    launchCountEntries: snapshot.launchRanking.length,
+    vramHistorySamples: snapshot.vramHistory.length,
+  }).catch(() => null);
+
+  return snapshot;
+}
+
+async function getStatisticsStorageSnapshot(tools = null, options = {}) {
+  const totalStartedAt = process.hrtime.bigint();
+  const timings = {};
+  const trackedTools = await measureStatisticsSection(timings, 'readToolsMs', () => getTrackedTools(tools));
+  const paths = getAppPaths();
+  const disks = await measureStatisticsSection(timings, 'detectStorageMs', () => detectStorageSnapshot().catch(() => []));
   const storageDrive = findDiskForPath(disks, paths.managedRoot) || findDiskForPath(disks, paths.appInstallDir);
   const trackedRoots = getUniqueTrackedRoots([paths.configRoot, paths.localRoot, paths.managedRoot, paths.appInstallDir]);
 
   const [toolBreakdown, storageRoots] = await Promise.all([
-    Promise.all(
-      trackedTools.map(async (tool) => {
-        const [installBytes, modelBytes] = await Promise.all([getToolInstallSize(tool), getToolModelSize(tool)]);
-        return {
-          toolId: tool.id,
-          toolName: tool.name,
-          installBytes,
-          modelBytes,
-          totalBytes: installBytes + modelBytes,
-          status: tool.status || 'stopped',
-        };
-      }),
+    measureStatisticsSection(timings, 'toolBreakdownMs', () =>
+      Promise.all(
+        trackedTools.map(async (tool) => {
+          const [installBytes, modelBytes] = await Promise.all([getToolInstallSize(tool), getToolModelSize(tool)]);
+          return {
+            toolId: tool.id,
+            toolName: tool.name,
+            installBytes,
+            modelBytes,
+            totalBytes: installBytes + modelBytes,
+            status: tool.status || 'stopped',
+          };
+        }),
+      ),
     ),
-    Promise.all(
-      trackedRoots.map(async (rootPath) => ({
-        path: rootPath,
-        sizeBytes: await calculatePathSize(rootPath).catch(() => 0),
-      })),
+    measureStatisticsSection(timings, 'storageRootsMs', () =>
+      Promise.all(
+        trackedRoots.map(async (rootPath) => ({
+          path: rootPath,
+          sizeBytes: await calculatePathSize(rootPath).catch(() => 0),
+        })),
+      ),
     ),
   ]);
 
-  const launchRanking = Object.entries(statistics.toolLaunchCounts || {})
-    .map(([toolId, entry]) => ({
-      toolId,
-      toolName: entry?.name || trackedTools.find((tool) => tool.id === toolId)?.name || toolId,
-      count: Number(entry?.count || 0),
-      lastLaunchedAt: entry?.lastLaunchedAt || null,
-    }))
-    .sort((left, right) => right.count - left.count || left.toolName.localeCompare(right.toolName));
-
   const totalLocalAIHubBytes = storageRoots.reduce((total, entry) => total + Number(entry.sizeBytes || 0), 0);
-
-  return {
+  const snapshot = {
     generatedAt: new Date().toISOString(),
-    launchRanking,
     storageRoots,
     toolBreakdown: toolBreakdown.sort((left, right) => right.totalBytes - left.totalBytes || left.toolName.localeCompare(right.toolName)),
     totalDiskUsage: {
@@ -217,12 +272,48 @@ async function getStatisticsSnapshot(tools = null) {
       localAIHubBytes: totalLocalAIHubBytes,
       totalBytes: storageDrive?.sizeBytes || 0,
     },
-    vramHistory: (statistics.vramHistory || []).slice(-MAX_VRAM_HISTORY_SAMPLES),
   };
+
+  logger.info('Statistics storage snapshot loaded.', {
+    totalMs: elapsedMs(totalStartedAt),
+    timings,
+    cacheMode: options.cacheMode || 'miss',
+    toolCount: trackedTools.length,
+    storageRootCount: trackedRoots.length,
+  }).catch(() => null);
+
+  return snapshot;
+}
+
+async function getStatisticsSnapshot(tools = null) {
+  const totalStartedAt = process.hrtime.bigint();
+  const [core, storage] = await Promise.all([
+    getStatisticsCoreSnapshot(tools),
+    getStatisticsStorageSnapshot(tools),
+  ]);
+  const snapshot = {
+    ...core,
+    storageRoots: storage.storageRoots,
+    toolBreakdown: storage.toolBreakdown,
+    totalDiskUsage: storage.totalDiskUsage,
+    generatedAt: new Date().toISOString(),
+  };
+
+  logger.info('Statistics full snapshot loaded.', {
+    totalMs: elapsedMs(totalStartedAt),
+    toolBreakdownCount: snapshot.toolBreakdown.length,
+    storageRootCount: snapshot.storageRoots.length,
+    launchCountEntries: snapshot.launchRanking.length,
+    vramHistorySamples: snapshot.vramHistory.length,
+  }).catch(() => null);
+
+  return snapshot;
 }
 
 module.exports = {
+  getStatisticsCoreSnapshot,
   getStatisticsSnapshot,
+  getStatisticsStorageSnapshot,
   readStatistics,
   recordToolLaunch,
   recordVramSample,

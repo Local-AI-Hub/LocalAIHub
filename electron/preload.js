@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('localAIHub', {
   getPipeline: (pipelineId) => invoke('pipelines:get', pipelineId),
   getRepairPreview: (toolId) => invoke('tools:get-repair-preview', toolId),
   getStatistics: () => invoke('settings:get-statistics'),
+  getStatisticsCore: () => invoke('settings:get-statistics-core'),
+  getStatisticsStorage: () => invoke('settings:get-statistics-storage'),
   getToolInstallPreflight: (payload) => invoke('tools:get-install-preflight', payload),
   getToolRuntimeOutput: (toolId) => invoke('tools:get-runtime-output', toolId),
   getWindowActivity: () => invoke('app:get-window-activity'),

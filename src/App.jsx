@@ -51,6 +51,7 @@ const CONSOLE_OUTPUT_LIMIT = 48000;
 const FOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 10000;
 const UNFOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 30000;
 const DISK_RESOURCE_REFRESH_INTERVAL_MS = 60000;
+const STATISTICS_CACHE_MS = 60000;
 
 function trimConsoleOutput(value) {
   const text = String(value || '');
@@ -173,8 +174,23 @@ export default function App() {
   const [koboldSetupNotice, setKoboldSetupNotice] = useState('');
   const [koboldAutoLaunchAfterSave, setKoboldAutoLaunchAfterSave] = useState(false);
   const [statisticsData, setStatisticsData] = useState(null);
+  const [statisticsSectionStatus, setStatisticsSectionStatus] = useState({
+    core: 'idle',
+    storage: 'idle',
+  });
+  const [statisticsSectionErrors, setStatisticsSectionErrors] = useState({
+    core: '',
+    storage: '',
+  });
   const [statisticsManualBusy, setStatisticsManualBusy] = useState(false);
-  const statisticsRefreshInFlightRef = useRef(false);
+  const statisticsSectionInFlightRef = useRef({
+    core: false,
+    storage: false,
+  });
+  const statisticsSectionLoadedAtRef = useRef({
+    core: 0,
+    storage: 0,
+  });
   const [cloudChatProviderId, setCloudChatProviderId] = useState('');
   const [cloudModels, setCloudModels] = useState([]);
   const [cloudSelectedModel, setCloudSelectedModel] = useState('');
@@ -833,43 +849,159 @@ export default function App() {
     setAiderBusy(false);
   }
 
+  function logStatisticsCacheEvent(message, context = {}) {
+    window.localAIHub.logRendererEvent({
+      level: 'info',
+      message,
+      source: 'statistics',
+      context,
+    }).catch(() => null);
+  }
+  function mergeStatisticsSection(section, payload) {
+    setStatisticsData((current) => {
+      const next = {
+        ...(current || {}),
+        ...(payload || {}),
+        generatedAt: payload?.generatedAt || current?.generatedAt || new Date().toISOString(),
+      };
+
+      if (current?.totalDiskUsage || payload?.totalDiskUsage) {
+        next.totalDiskUsage = {
+          ...(current?.totalDiskUsage || {}),
+          ...(payload?.totalDiskUsage || {}),
+        };
+      }
+
+      if (section === 'core') {
+        next.storageRoots = current?.storageRoots || [];
+        next.toolBreakdown = current?.toolBreakdown || [];
+      }
+
+      return next;
+    });
+  }
+
+  async function loadStatisticsSection(section, options = {}) {
+    const manual = Boolean(options.manual);
+    const silent = Boolean(options.silent);
+    const loadedAt = statisticsSectionLoadedAtRef.current[section] || 0;
+    const hasFreshSection = loadedAt && Date.now() - loadedAt < STATISTICS_CACHE_MS;
+
+    if (!manual && hasFreshSection) {
+      logStatisticsCacheEvent('Statistics section cache hit.', {
+        section,
+        ageMs: Date.now() - loadedAt,
+        cacheMs: STATISTICS_CACHE_MS,
+      });
+      return true;
+    }
+
+    logStatisticsCacheEvent('Statistics section cache miss.', {
+      section,
+      manual,
+      ageMs: loadedAt ? Date.now() - loadedAt : null,
+      cacheMs: STATISTICS_CACHE_MS,
+    });
+
+    if (statisticsSectionInFlightRef.current[section]) {
+      logStatisticsCacheEvent('Statistics section in-flight request reused.', { section, manual });
+      return false;
+    }
+
+    statisticsSectionInFlightRef.current = {
+      ...statisticsSectionInFlightRef.current,
+      [section]: true,
+    };
+    setStatisticsSectionStatus((current) => ({
+      ...current,
+      [section]: 'loading',
+    }));
+    setStatisticsSectionErrors((current) => ({
+      ...current,
+      [section]: '',
+    }));
+
+    try {
+      const request = section === 'storage' ? window.localAIHub.getStatisticsStorage : window.localAIHub.getStatisticsCore;
+      const result = await request();
+      if (!result?.ok) {
+        const fallback = section === 'storage'
+          ? 'Local AI Hub could not load storage statistics right now.'
+          : 'Local AI Hub could not load the main statistics right now.';
+        const message = result?.message || fallback;
+        setStatisticsSectionStatus((current) => ({
+          ...current,
+          [section]: 'error',
+        }));
+        setStatisticsSectionErrors((current) => ({
+          ...current,
+          [section]: message,
+        }));
+        if (!silent) {
+          pushToast(message, 'error');
+        }
+        return false;
+      }
+
+      mergeStatisticsSection(section, result.data);
+      statisticsSectionLoadedAtRef.current = {
+        ...statisticsSectionLoadedAtRef.current,
+        [section]: Date.now(),
+      };
+      setStatisticsSectionStatus((current) => ({
+        ...current,
+        [section]: 'ready',
+      }));
+      setStatisticsSectionErrors((current) => ({
+        ...current,
+        [section]: '',
+      }));
+      return true;
+    } catch (error) {
+      const fallback = section === 'storage'
+        ? 'Local AI Hub could not load storage statistics right now.'
+        : 'Local AI Hub could not load the main statistics right now.';
+      const message = error?.message || fallback;
+      setStatisticsSectionStatus((current) => ({
+        ...current,
+        [section]: 'error',
+      }));
+      setStatisticsSectionErrors((current) => ({
+        ...current,
+        [section]: message,
+      }));
+      if (!silent) {
+        pushToast(message, 'error');
+      }
+      return false;
+    } finally {
+      statisticsSectionInFlightRef.current = {
+        ...statisticsSectionInFlightRef.current,
+        [section]: false,
+      };
+    }
+  }
+
   async function loadStatistics(options = {}) {
     const manual = Boolean(options.manual);
     const silent = Boolean(options.silent);
 
-    if (statisticsRefreshInFlightRef.current) {
-      return false;
-    }
-
-    statisticsRefreshInFlightRef.current = true;
     if (manual) {
       setStatisticsManualBusy(true);
     }
 
     try {
-      const result = await window.localAIHub.getStatistics();
-      if (!result?.ok) {
-        if (!silent) {
-          pushToast(result?.message || 'Local AI Hub could not load the statistics screen right now.', 'error');
-        }
-        return false;
-      }
-
-      setStatisticsData(result.data);
-      return true;
-    } catch (error) {
-      if (!silent) {
-        pushToast(error?.message || 'Local AI Hub could not load the statistics screen right now.', 'error');
-      }
-      return false;
+      const results = await Promise.allSettled([
+        loadStatisticsSection('core', { manual, silent }),
+        loadStatisticsSection('storage', { manual, silent }),
+      ]);
+      return results.some((result) => result.status === 'fulfilled' && result.value);
     } finally {
-      statisticsRefreshInFlightRef.current = false;
       if (manual) {
         setStatisticsManualBusy(false);
       }
     }
   }
-
   function changeProviderDraft(providerId, value) {
     setProviderKeyDrafts((current) => ({
       ...current,
@@ -2070,7 +2202,11 @@ export default function App() {
           ) : activeTab === 'statistics' ? (
             <StatisticsPanel
               busy={statisticsManualBusy}
-              data={statisticsData || {}}
+              data={statisticsData}
+              error={statisticsSectionErrors.core}
+              loading={statisticsSectionStatus.core === 'loading' || statisticsSectionStatus.storage === 'loading'}
+              sectionErrors={statisticsSectionErrors}
+              sectionStatus={statisticsSectionStatus}
               onOpenCleanup={() => setActiveTab('settings')}
               onRefresh={() => loadStatistics({ manual: true })}
             />

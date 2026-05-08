@@ -77,7 +77,7 @@ const {
   setProviderStateChangeSink,
   testProviderConnection,
 } = require('./services/providerService');
-const { getStatisticsSnapshot, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
+const { getStatisticsCoreSnapshot, getStatisticsSnapshot, getStatisticsStorageSnapshot, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
 const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./services/toolUpdateService');
 const { transcribeWithWhisper } = require('./services/whisperService');
 const { buildMergedToolStateList } = require('./services/toolStateService');
@@ -1298,20 +1298,82 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not remove those leftover files.'),
   );
 
-  ipcMain.handle('settings:get-statistics', () =>
+  ipcMain.handle('settings:get-statistics-core', () =>
     withPlainEnglishErrors(async () => {
+      const startedAt = Date.now();
+      const configStartedAt = Date.now();
+      const config = await readConfig();
+      const tools = Object.values(config.tools || {});
+      const configMs = Date.now() - configStartedAt;
+      const runningTools = tools.filter((tool) => tool.status === 'running');
+      const vramStartedAt = Date.now();
+      if (runningTools.length > 0) {
+        await recordVramSample(runningTools).catch(() => null);
+      }
+      const vramSampleMs = Date.now() - vramStartedAt;
+      const snapshotStartedAt = Date.now();
+      const snapshot = await getStatisticsCoreSnapshot(tools);
+      appendLog('statistics', 'info', 'Statistics core IPC request completed.', {
+        totalMs: Date.now() - startedAt,
+        configMs,
+        vramSampleMs,
+        snapshotMs: Date.now() - snapshotStartedAt,
+        toolCount: tools.length,
+        runningToolCount: runningTools.length,
+      }).catch(() => null);
+      return snapshot;
+    }, 'Local AI Hub could not load the main statistics right now.'),
+  );
+
+  ipcMain.handle('settings:get-statistics-storage', () =>
+    withPlainEnglishErrors(async () => {
+      const startedAt = Date.now();
+      const toolsStartedAt = Date.now();
       const tools = await buildMergedToolStateList({
         includeSnapshots: false,
         resolveStatuses: false,
       });
+      const toolStateMs = Date.now() - toolsStartedAt;
+      const snapshotStartedAt = Date.now();
+      const snapshot = await getStatisticsStorageSnapshot(tools);
+      appendLog('statistics', 'info', 'Statistics storage IPC request completed.', {
+        totalMs: Date.now() - startedAt,
+        toolStateMs,
+        snapshotMs: Date.now() - snapshotStartedAt,
+        toolCount: tools.length,
+      }).catch(() => null);
+      return snapshot;
+    }, 'Local AI Hub could not load storage statistics right now.'),
+  );
+
+  ipcMain.handle('settings:get-statistics', () =>
+    withPlainEnglishErrors(async () => {
+      const startedAt = Date.now();
+      const toolsStartedAt = Date.now();
+      const tools = await buildMergedToolStateList({
+        includeSnapshots: false,
+        resolveStatuses: false,
+      });
+      const toolStateMs = Date.now() - toolsStartedAt;
       const runningTools = tools.filter((tool) => tool.status === 'running');
+      const vramStartedAt = Date.now();
       if (runningTools.length > 0) {
         await recordVramSample(runningTools).catch(() => null);
       }
-      return getStatisticsSnapshot(tools);
+      const vramSampleMs = Date.now() - vramStartedAt;
+      const snapshotStartedAt = Date.now();
+      const snapshot = await getStatisticsSnapshot(tools);
+      appendLog('statistics', 'info', 'Statistics full IPC request completed.', {
+        totalMs: Date.now() - startedAt,
+        toolStateMs,
+        vramSampleMs,
+        snapshotMs: Date.now() - snapshotStartedAt,
+        toolCount: tools.length,
+        runningToolCount: runningTools.length,
+      }).catch(() => null);
+      return snapshot;
     }, 'Local AI Hub could not load the statistics screen right now.'),
   );
-
   ipcMain.handle('providers:list', () =>
     withPlainEnglishErrors(async () => listProviderConnections(), 'Local AI Hub could not load the cloud provider list.'),
   );
