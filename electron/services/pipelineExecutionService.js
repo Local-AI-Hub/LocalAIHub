@@ -78,6 +78,10 @@ const {
   buildContextMaps,
   createUniqueId,
   getGraphWorkflowToolId,
+  getCollectionMapInputKind,
+  getCollectionMapMapping,
+  getCollectionMapOperationId,
+  getCollectionMapOutputKind,
   getLocalImageBackendOperationId,
   getModelStepLocalToolId,
   getModelStepOperationId,
@@ -1879,76 +1883,616 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
   });
 }
 
+function getCollectionMapExecutionModeForRun(node) {
+  if (node?.config?.executionMode === 'localTool') {
+    return 'localTool';
+  }
+  if (node?.config?.executionMode === 'graphWorkflow') {
+    return 'graphWorkflow';
+  }
+  return 'cloud';
+}
+
+
+const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
+
+function getCollectionMapEffectiveInstruction(node, operationId) {
+  const instruction = String(node?.config?.instruction || '').trim();
+  if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE && instruction === COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION) {
+    return '';
+  }
+  return instruction;
+}
+
+function buildCollectionMapOperationNode(node, operationId) {
+  return {
+    ...node,
+    config: {
+      ...(node?.config || {}),
+      instruction: getCollectionMapEffectiveInstruction(node, operationId),
+    },
+  };
+}
+
+function buildCollectionMapMetadata(mapping, node, executionMode) {
+  const perItemValidation = getCollectionMapPerItemValidationConfig(node);
+  return {
+    executionMode: String(executionMode || '').trim(),
+    inputKind: String(mapping?.inputKind || '').trim(),
+    label: String(mapping?.label || node?.label || 'Map Collection').trim(),
+    mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+    nodeId: String(node?.id || '').trim(),
+    nodeLabel: String(node?.label || '').trim(),
+    operationId: String(mapping?.operationId || getCollectionMapOperationId(node)).trim(),
+    outputKind: String(mapping?.outputKind || getCollectionMapOutputKind(node)).trim(),
+    perItemValidation: perItemValidation.enabled ? {
+      enabled: true,
+      failMode: perItemValidation.failMode,
+      maxAttempts: perItemValidation.maxAttempts,
+      mode: perItemValidation.mode,
+    } : { enabled: false },
+    toolId: String(node?.config?.toolId || '').trim(),
+    providerId: String(node?.config?.providerId || '').trim(),
+  };
+}
+const COLLECTION_MAP_PER_ITEM_VALIDATION_MAX_ATTEMPTS = 8;
+
+function getCollectionMapPerItemValidationConfig(node) {
+  const raw = node?.config?.perItemValidation && typeof node.config.perItemValidation === 'object'
+    ? node.config.perItemValidation
+    : {};
+  const maxAttempts = Math.max(1, Math.min(
+    COLLECTION_MAP_PER_ITEM_VALIDATION_MAX_ATTEMPTS,
+    Math.floor(Number(raw.maxAttempts || 1) || 1),
+  ));
+  return {
+    enabled: Boolean(raw.enabled),
+    failMode: 'fail-fast',
+    llmExecutionMode: raw.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud',
+    maxAttempts,
+    mode: raw.mode === 'user' ? 'user' : 'llm',
+    model: String(raw.model || '').trim(),
+    providerId: String(raw.providerId || '').trim(),
+    retryInstruction: String(raw.retryInstruction || '').trim(),
+    ruleset: String(raw.ruleset || '').trim(),
+    systemPrompt: String(raw.systemPrompt || '').trim(),
+  };
+}
+
+function buildCollectionMapValidationNode(node, validationConfig) {
+  return {
+    id: node.id + ':perItemValidation',
+    label: node.label + ' per-item validation',
+    type: 'validation',
+    config: {
+      llmExecutionMode: validationConfig.llmExecutionMode,
+      mode: 'llm',
+      model: validationConfig.model,
+      providerId: validationConfig.providerId,
+      ruleset: validationConfig.ruleset,
+      systemPrompt: validationConfig.systemPrompt,
+    },
+  };
+}
+
+function assertCollectionMapPerItemValidationSupported(node, outputKind, contextMaps) {
+  const validationConfig = getCollectionMapPerItemValidationConfig(node);
+  if (!validationConfig.enabled) {
+    return validationConfig;
+  }
+
+  if (validationConfig.mode === 'user') {
+    return validationConfig;
+  }
+
+  if (!validationConfig.ruleset) {
+    throw new Error('Describe the pass and fail rules before enabling per-item validation for Map Collection.');
+  }
+
+  const validationNode = buildCollectionMapValidationNode(node, validationConfig);
+  const profile = getValidationCapabilityProfile(validationNode);
+  if (!profile.capability || !profile.inputKinds.includes(outputKind)) {
+    const targetLabel = validationConfig.llmExecutionMode === 'ollama'
+      ? 'Ollama'
+      : (contextMaps.providersById[validationConfig.providerId]?.name || 'The selected validator');
+    throw new Error(targetLabel + ' cannot validate ' + outputKind + ' items inside Map Collection yet. Choose a validator that supports this output kind or validate the collection after mapping.');
+  }
+
+  if (validationConfig.llmExecutionMode === 'ollama') {
+    if (!validationConfig.model) {
+      throw new Error('Choose or enter an Ollama model for per-item Map Collection validation.');
+    }
+    return validationConfig;
+  }
+
+  const providerId = validationConfig.providerId;
+  if (!providerId) {
+    throw new Error('Choose a connected cloud provider for per-item Map Collection validation.');
+  }
+  const provider = contextMaps.providersById[providerId] || null;
+  if (!provider?.isConnected) {
+    throw new Error('That per-item validation provider is not connected on this PC yet. Open Settings to save its API key first.');
+  }
+  if (doesProviderOperationRequireExplicitModel(providerId, PIPELINE_OPERATION_IDS.VALIDATION_LLM) && !validationConfig.model) {
+    throw new Error('Choose or enter a model for per-item Map Collection validation.');
+  }
+
+  return validationConfig;
+}
+
+function buildCollectionMapAttemptNode(node, attemptNumber, validationConfig) {
+  if (!validationConfig?.retryInstruction || attemptNumber <= 1) {
+    return node;
+  }
+
+  const instruction = String(node?.config?.instruction || '').trim();
+  return {
+    ...node,
+    config: {
+      ...(node?.config || {}),
+      instruction: [
+        instruction,
+        'Retry guidance for this mapped item attempt ' + attemptNumber + ':',
+        validationConfig.retryInstruction,
+      ].filter(Boolean).join('\n\n'),
+    },
+  };
+}
+
+function buildUserValidationResult(artifact, decision, reviewContext = {}) {
+  const selectedBranch = decision?.decision === 'pass' ? 'pass' : 'fail';
+  const reason = decision?.comment ? 'User note: ' + decision.comment : 'User selected ' + selectedBranch + '.';
+  return {
+    decision: selectedBranch,
+    evidenceMode: String(reviewContext.evidenceMode || '').trim() || getUserValidationEvidenceMode(artifact, null),
+    mode: 'user',
+    reason,
+    reviewContext: serializeArtifactForUi(reviewContext),
+    summary: reason,
+  };
+}
+
+function buildCollectionMapAttemptMetadata({ attemptNumber, artifact, mapping, node, sourceEntry, sourceIndex, validation, validationMode }) {
+  return {
+    attemptNumber,
+    artifact: artifact ? {
+      displayName: String(artifact.displayName || '').trim(),
+      fileName: String(artifact.fileName || '').trim(),
+      filePath: String(artifact.filePath || '').trim(),
+      kind: String(artifact.kind || '').trim(),
+      summary: summarizeArtifact(artifact),
+    } : null,
+    mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+    operationId: String(mapping?.operationId || getCollectionMapOperationId(node)).trim(),
+    sourceItemId: String(sourceEntry?.itemId || '').trim(),
+    sourceItemIndex: sourceIndex,
+    validation: validation ? {
+      confidence: validation.confidence ?? null,
+      decision: String(validation.decision || '').trim(),
+      evidenceLimitations: String(validation.evidenceLimitations || '').trim(),
+      evidenceMode: String(validation.evidenceMode || '').trim(),
+      mode: validationMode || String(validation.mode || '').trim(),
+      reason: String(validation.reason || validation.summary || '').trim(),
+      summary: String(validation.summary || '').trim(),
+    } : null,
+    validationMode: validationMode || '',
+    validationPassed: validation ? validation.decision === 'pass' : null,
+  };
+}
+
+async function executeMappedCollectionItemWithPerItemValidation(node, sourceArtifact, options = {}) {
+  const validationConfig = options.validationConfig || getCollectionMapPerItemValidationConfig(node);
+  const mapping = options.mapping || getCollectionMapMapping(node);
+  const outputKind = options.outputKind || getCollectionMapOutputKind(node);
+  if (!validationConfig.enabled) {
+    const mappedArtifact = await executeMappedCollectionItemArtifact(node, sourceArtifact, options);
+    return {
+      artifact: mappedArtifact,
+      attempts: [],
+      validation: null,
+    };
+  }
+
+  const validationNode = buildCollectionMapValidationNode(node, validationConfig);
+  const attempts = [];
+  const itemIndex = Number(options.itemIndex || 0) || 0;
+  const itemCount = Number(options.itemCount || 0) || 0;
+  const sourceEntry = options.sourceEntry || null;
+  const itemId = String(sourceEntry?.itemId || '').trim();
+  const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '') + (itemId ? ' (' + itemId + ')' : '');
+
+  for (let attemptNumber = 1; attemptNumber <= validationConfig.maxAttempts; attemptNumber += 1) {
+    const attemptNode = buildCollectionMapAttemptNode(node, attemptNumber, validationConfig);
+    const mappedArtifact = await executeMappedCollectionItemArtifact(attemptNode, sourceArtifact, options);
+    if (!mappedArtifact || mappedArtifact.kind !== outputKind) {
+      throw new Error('The mapped operation finished, but it did not return a ' + outputKind + ' artifact.');
+    }
+
+    let review = null;
+    if (validationConfig.mode === 'user') {
+      const reviewContext = {
+        artifactKind: String(mappedArtifact?.kind || '').trim(),
+        evidenceMode: getUserValidationEvidenceMode(mappedArtifact, null),
+        limitations: [],
+        mapCollection: {
+          attemptNumber,
+          itemCount,
+          itemId,
+          itemIndex,
+          maxAttempts: validationConfig.maxAttempts,
+          nodeId: node.id,
+          nodeLabel: node.label,
+        },
+      };
+      const decision = await waitForUserValidation(options.run, node, mappedArtifact, {
+        attemptNumber,
+        itemCount,
+        itemId,
+        itemIndex,
+        maxAttempts: validationConfig.maxAttempts,
+        message: 'Paused at ' + node.label + ' for ' + itemLabel + ' attempt ' + attemptNumber + ' of ' + validationConfig.maxAttempts + '. Local AI Hub is waiting for your decision.',
+        nodeMessage: 'Waiting for your pass or fail decision for ' + itemLabel + ' attempt ' + attemptNumber + ' of ' + validationConfig.maxAttempts + '.',
+        pendingContext: {
+          collectionMap: {
+            attemptNumber,
+            itemCount,
+            itemId,
+            itemIndex,
+            maxAttempts: validationConfig.maxAttempts,
+          },
+        },
+        reviewContext,
+      });
+      const validation = buildUserValidationResult(mappedArtifact, decision, reviewContext);
+      review = {
+        selectedBranch: validation.decision === 'pass' ? 'pass' : 'fail',
+        validation,
+      };
+    } else {
+      review = await executeLlmValidationReview(validationNode, mappedArtifact, options.contextMaps || {}, options.reportProgress, {
+        progressMessage: 'Validating ' + itemLabel + ' attempt ' + attemptNumber + ' of ' + validationConfig.maxAttempts + '.',
+        progressTitle: 'Running ' + node.label + ' per-item validation...',
+      });
+    }
+    attempts.push(buildCollectionMapAttemptMetadata({
+      attemptNumber,
+      artifact: mappedArtifact,
+      mapping,
+      node,
+      sourceEntry,
+      sourceIndex: itemIndex,
+      validation: review.validation,
+      validationMode: validationConfig.mode,
+    }));
+
+    if (review.selectedBranch === 'pass') {
+      return {
+        artifact: mappedArtifact,
+        attempts,
+        validation: review.validation,
+      };
+    }
+
+    if (attemptNumber < validationConfig.maxAttempts) {
+      const failureReason = review.validation.reason || (validationConfig.mode === 'user' ? 'User selected fail.' : 'The validator selected fail.');
+      options.reportProgress?.('Retrying ' + itemLabel + ' after validation failed: ' + failureReason, 'Running ' + node.label + '...');
+      continue;
+    }
+
+    const reason = review.validation.reason || review.validation.summary || (validationConfig.mode === 'user' ? 'User selected fail.' : 'The validator selected fail.');
+    const manualLabel = validationConfig.mode === 'user' ? 'manual ' : '';
+    throw new Error('Map Collection item ' + String(itemIndex + 1) + ' of ' + itemCount + (itemId ? ' (' + itemId + ')' : '') + ' failed ' + manualLabel + 'validation after ' + validationConfig.maxAttempts + ' attempt' + (validationConfig.maxAttempts === 1 ? '' : 's') + ': ' + reason);
+  }
+
+  throw new Error('Map Collection could not finish validating ' + itemLabel + '.');
+}
+
+async function executeMappedCollectionItemArtifact(node, inputArtifact, options = {}) {
+  const operationId = getCollectionMapOperationId(node);
+  const outputKind = getCollectionMapOutputKind(node);
+  const executionMode = getCollectionMapExecutionModeForRun(node);
+  const contextMaps = options.contextMaps || {};
+  const run = options.run || null;
+  const reportProgress = options.reportProgress;
+  const itemIndex = Number(options.itemIndex || 0) || 0;
+  const itemCount = Number(options.itemCount || 0) || 0;
+  const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '');
+  const operationNode = buildCollectionMapOperationNode(node, operationId);
+  const model = String(operationNode.config?.model || '').trim();
+
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+    return generateMappedImageArtifact(node, inputArtifact, options);
+  }
+
+  if (executionMode === 'graphWorkflow') {
+    throw new Error('Configured graph workflow collection mapping is currently limited to text-to-image workflows.');
+  }
+
+  if (executionMode === 'localTool') {
+    if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+      const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'collection audio generation');
+      const audioRequest = await buildAudioGenerationRequest(operationNode, inputArtifact);
+      reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for local audio generation.', 'Running ' + node.label + '...');
+      const result = await generateAudioWithLocalAudioTool(tool, {
+        audioMode: audioRequest.audioMode,
+        displayName: node.label + ' item ' + String(itemIndex + 1),
+        durationSeconds: audioRequest.durationSeconds,
+        model,
+        nodeLabel: node.label,
+        operationId,
+        prompt: audioRequest.prompt,
+        reportProgress,
+        runDirectories: run.directories,
+        sourceAudioArtifact: audioRequest.sourceAudioArtifact,
+        sourceAudioPath: audioRequest.sourceAudioPath,
+      });
+      return result?.outputs?.audio || null;
+    }
+
+    if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
+      const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'collection audio transcription');
+      if (!inputArtifact?.filePath || inputArtifact.kind !== PORT_KIND_AUDIO) {
+        throw new Error('This mapped transcription item did not receive an audio file.');
+      }
+      reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for transcription.', 'Running ' + node.label + '...');
+      const result = await transcribeWithWhisper(tool, {
+        audioPath: inputArtifact.filePath,
+        model: model || DEFAULT_WHISPER_MODEL,
+      });
+      const transcript = String(result?.text || '').trim();
+      if (!transcript) {
+        throw new Error(tool.name + ' finished, but it did not return any transcript text for this item.');
+      }
+      return buildWhisperTranscriptArtifact({ ...node, label: node.label + ' item ' + String(itemIndex + 1) }, inputArtifact, result);
+    }
+
+    if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+      const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'collection audio transformation');
+      const audioRequest = await buildAudioTransformRequest(operationNode, inputArtifact);
+      if (!model) {
+        throw new Error('Choose an RVC voice model before mapping this audio collection.');
+      }
+      const selectedVoiceModel = getDownloadedToolModelEntry(tool, model);
+      if (Array.isArray(tool?.downloadedModels) && tool.downloadedModels.length && !selectedVoiceModel) {
+        throw new Error(tool.name + ' does not have the selected RVC voice model available locally. Refresh the local model list or choose a model file from the weights folder before running this map.');
+      }
+      reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for local audio transformation.', 'Running ' + node.label + '...');
+      const result = await generateAudioWithLocalAudioTool(tool, {
+        displayName: node.label + ' item ' + String(itemIndex + 1),
+        instruction: audioRequest.instruction,
+        model,
+        nodeLabel: node.label,
+        operationId,
+        reportProgress,
+        runDirectories: run.directories,
+        sourceAudioArtifact: audioRequest.sourceAudioArtifact,
+        sourceAudioPath: audioRequest.sourceAudioPath,
+        voiceModel: selectedVoiceModel,
+      });
+      return result?.outputs?.audio || null;
+    }
+
+    if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
+      if (!inputArtifact?.filePath || inputArtifact.kind !== PORT_KIND_IMAGE) {
+        throw new Error('This mapped image analysis item did not receive an image file.');
+      }
+      const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'collection image analysis');
+      reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for image analysis.', 'Running ' + node.label + '...');
+      const result = await interrogateImageWithWorkflowTool(tool, {
+        analysisMode: operationNode.config?.analysisMode || model || 'clip',
+        imagePath: inputArtifact.filePath,
+      });
+      const description = String(result?.text || '').trim();
+      if (!description) {
+        throw new Error((tool?.name || 'The selected image tool') + ' did not return an image description for this item.');
+      }
+      return createTextArtifact(description, {
+        displayName: node.label + ' item ' + String(itemIndex + 1),
+        imageAnalysis: {
+          backend: tool?.id || '',
+          backendLabel: tool?.name || 'Image analysis tool',
+          mode: operationNode.config?.analysisMode || model || 'clip',
+          operationId,
+          sourceImage: summarizeArtifact(inputArtifact),
+        },
+        role: 'generated',
+      });
+    }
+
+    if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+      const tool = await getInstalledToolOrThrow(contextMaps, 'upscayl', 'Install Upscayl before using image-to-image Map Collection. FaceFusion collection mapping is deferred until a shared reference image can be configured.');
+      const imageRequest = await buildImageTransformRequest(operationNode, inputArtifact, null, tool);
+      reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for local image transformation.', 'Running ' + node.label + '...');
+      const result = await generateImageWithLocalImageTool(tool, {
+        displayName: node.label + ' item ' + String(itemIndex + 1),
+        instruction: imageRequest.instruction,
+        model,
+        nodeLabel: node.label,
+        operationId,
+        referenceImageArtifact: null,
+        referenceImagePath: '',
+        reportProgress,
+        runDirectories: run.directories,
+        sourceImageArtifact: imageRequest.sourceImageArtifact,
+        sourceImagePath: imageRequest.sourceImagePath,
+        transformSubtype: imageRequest.transformSubtype,
+      });
+      return result?.outputs?.image || null;
+    }
+
+    throw new Error('Map Collection does not support that local operation yet.');
+  }
+
+  const providerId = String(node.config?.providerId || '').trim();
+  if (!providerId) {
+    throw new Error('Choose a connected cloud provider before running this collection map.');
+  }
+  if (doesProviderOperationRequireExplicitModel(providerId, operationId) && !model) {
+    throw new Error('Choose or enter a model before running this collection map.');
+  }
+  const provider = contextMaps.providersById[providerId] || null;
+  if (!provider?.isConnected) {
+    throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+    const audioRequest = await buildCloudAudioGenerationRequest(operationNode, inputArtifact);
+    reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + ' for speech generation.', 'Running ' + node.label + '...');
+    const result = await runProviderOperation(providerId, {
+      instruction: audioRequest.instruction,
+      model,
+      operationId,
+      prompt: audioRequest.prompt,
+      providerId,
+      spokenText: audioRequest.spokenText,
+      voice: audioRequest.voice,
+    });
+    const generatedAudio = result?.audios?.[0] || null;
+    if (!generatedAudio?.buffer) {
+      throw new Error(provider.name + ' finished the request, but it did not return an audio file for this item.');
+    }
+    return saveBufferArtifact(run.directories, generatedAudio.buffer, {
+      audio: {
+        bitDepth: generatedAudio.bitDepth,
+        channelCount: generatedAudio.channelCount,
+        sampleRate: generatedAudio.sampleRate,
+      },
+      audioGeneration: {
+        backend: providerId,
+        backendLabel: provider.name,
+        mode: 'speech',
+        model,
+        operationId,
+        operationSubtype: 'speech',
+        prompt: audioRequest.spokenText,
+        voice: generatedAudio.voice || audioRequest.voice,
+      },
+      baseName: node.label + '-item-' + String(itemIndex + 1).padStart(3, '0') + '-' + Date.now(),
+      displayName: node.label + ' item ' + String(itemIndex + 1),
+      extension: String(generatedAudio.extension || '.wav').trim() || '.wav',
+      kind: PORT_KIND_AUDIO,
+      role: 'generated',
+    });
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
+    const messages = await buildLlmMessages(operationNode, inputArtifact);
+    reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + ' for image analysis.', 'Running ' + node.label + '...');
+    const result = await runProviderOperation(providerId, {
+      messages,
+      model,
+      operationId,
+      providerId,
+    });
+    const content = String(result?.message?.content || '').trim();
+    if (!content) {
+      throw new Error(provider.name + ' returned an empty image description for this item.');
+    }
+    return createTextArtifact(content, {
+      displayName: node.label + ' item ' + String(itemIndex + 1),
+      imageAnalysis: {
+        backend: providerId,
+        backendLabel: provider.name,
+        mode: 'vision',
+        model,
+        operationId,
+        sourceImage: summarizeArtifact(inputArtifact),
+      },
+      role: 'generated',
+    });
+  }
+
+  throw new Error('Map Collection does not support that cloud operation yet.');
+}
+
 async function executeCollectionMapNode(node, graph, run, contextMaps, reportProgress) {
-  const operationId = String(node.config?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE).trim() || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
-  if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-    throw new Error('Map Collection currently supports text collection to image collection only. Choose Image generation or use another explicit pipeline step.');
+  const mapping = getCollectionMapMapping(node);
+  if (!mapping) {
+    throw new Error('Map Collection does not support that input/output operation pair yet. Choose a listed mapping or use an explicit Model Step for a single artifact.');
+  }
+
+  const executionMode = getCollectionMapExecutionModeForRun(node);
+  const outputKind = getCollectionMapOutputKind(node);
+  if (!mapping.modes.includes(executionMode)) {
+    throw new Error(mapping.label + ' is not available through the selected execution mode. Choose a supported mode for this mapping.');
   }
 
   const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
   if (!isArtifactCollection(sourceCollection)) {
-    throw new Error('This Map Collection step needs an ordered text collection before it can run.');
+    throw new Error('This Map Collection step needs an ordered ' + getCollectionMapInputKind(node) + ' collection before it can run.');
   }
-  if (String(sourceCollection.itemKind || '').trim() !== PORT_KIND_TEXT) {
-    throw new Error('This Map Collection step currently maps text collections to image collections. Connect an ordered text collection.');
+  if (String(sourceCollection.itemKind || '').trim() !== mapping.inputKind) {
+    throw new Error('This Map Collection step maps ' + mapping.inputKind + ' collections to ' + mapping.outputKind + ' collections. Connect an ordered ' + mapping.inputKind + ' collection.');
   }
 
   const sourceItems = Array.isArray(sourceCollection.items) ? sourceCollection.items.filter((entry) => entry?.artifact) : [];
   if (!sourceItems.length) {
-    throw new Error('This Map Collection step received an empty collection. Add at least one text item before mapping.');
+    throw new Error('This Map Collection step received an empty collection. Add at least one item before mapping.');
   }
 
-  const executionMode = node.config?.executionMode === 'localTool'
-    ? 'localTool'
-    : node.config?.executionMode === 'graphWorkflow'
-      ? 'graphWorkflow'
-      : 'cloud';
-  const localTool = executionMode === 'localTool'
+  const graphWorkflowTool = executionMode === 'graphWorkflow'
+    ? await getGraphWorkflowBackendToolOrThrow(contextMaps, node, 'collection mapping')
+    : null;
+  const localTool = executionMode === 'localTool' && mapping.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
     ? await getSelectedImageToolOrThrow(contextMaps, node, 'collection image mapping')
     : null;
-  const graphWorkflowTool = executionMode === 'graphWorkflow'
-    ? await getGraphWorkflowBackendToolOrThrow(contextMaps, node, 'collection image mapping')
-    : null;
+  const validationConfig = assertCollectionMapPerItemValidationSupported(node, outputKind, contextMaps);
   const mappedItems = [];
   for (let index = 0; index < sourceItems.length; index += 1) {
     const entry = sourceItems[index];
     const sourceArtifact = entry?.artifact || null;
     try {
-      if (!sourceArtifact || sourceArtifact.kind !== PORT_KIND_TEXT) {
-        throw new Error('That collection item is not a text prompt.');
+      if (!sourceArtifact || sourceArtifact.kind !== mapping.inputKind) {
+        throw new Error('That collection item is not a ' + mapping.inputKind + ' artifact.');
       }
-      const imageArtifact = await generateMappedImageArtifact(node, sourceArtifact, {
+      const mappedResult = await executeMappedCollectionItemWithPerItemValidation(node, sourceArtifact, {
         contextMaps,
         itemCount: sourceItems.length,
         itemIndex: index,
         graphWorkflowTool,
         localTool,
+        mapping,
+        outputKind,
         reportProgress,
         run,
+        sourceEntry: entry,
+        validationConfig,
       });
+      const mappedArtifact = mappedResult.artifact;
+      if (!mappedArtifact || mappedArtifact.kind !== outputKind) {
+        throw new Error('The mapped operation finished, but it did not return a ' + outputKind + ' artifact.');
+      }
+      const itemId = String(entry?.itemId || '').trim();
       mappedItems.push({
-        artifact: imageArtifact,
-        itemId: String(entry?.itemId || '').trim(),
+        artifact: mappedArtifact,
+        attempts: mappedResult.attempts,
+        itemId,
         lineage: {
           sourceNodeId: node.id,
           sourceNodeLabel: node.label,
           sourcePortId: 'collection',
-          sourcePortLabel: 'Image Collection',
-          sourceItemId: String(entry?.itemId || '').trim(),
+          sourcePortLabel: formatArtifactCollectionLineageLabel(outputKind),
+          sourceItemId: itemId,
           sourceItemIndex: index,
           parentLineage: entry?.lineage || null,
         },
+        validation: mappedResult.validation,
       });
     } catch (error) {
       const itemId = String(entry?.itemId || '').trim();
       const itemLabel = 'item ' + String(index + 1) + ' of ' + sourceItems.length + (itemId ? ' (' + itemId + ')' : '');
-      throw new Error(node.label + ' failed on ' + itemLabel + ': ' + (error?.message || 'The mapped image generation step failed.'));
+      const message = String(error?.message || 'The mapped operation failed.');
+      if (/^Map Collection item \d+ of \d+/.test(message)) {
+        throw new Error(message);
+      }
+      throw new Error(node.label + ' failed on ' + itemLabel + ': ' + message);
     }
   }
 
   const collection = createArtifactCollection(mappedItems, {
+    collectionMapping: buildCollectionMapMetadata(mapping, node, executionMode),
     displayName: node.label,
-    itemKind: PORT_KIND_IMAGE,
+    itemKind: outputKind,
     role: 'generated',
   });
   const persistedCollection = await persistArtifactCollection(run.directories, collection, {
@@ -1958,12 +2502,20 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
     target: 'artifacts',
   });
   return {
-    message: node.label + ' generated ' + persistedCollection.itemCount + ' image' + (persistedCollection.itemCount === 1 ? '' : 's') + ' from the ordered text collection.',
+    message: node.label + ' mapped ' + persistedCollection.itemCount + ' item' + (persistedCollection.itemCount === 1 ? '' : 's') + ' into an ordered ' + outputKind + ' collection.',
     outputs: {
       collection: persistedCollection,
     },
     preview: summarizeArtifact(persistedCollection),
   };
+}
+
+function formatArtifactCollectionLineageLabel(kind) {
+  if (kind === PORT_KIND_IMAGE) return 'Image Collection';
+  if (kind === PORT_KIND_AUDIO) return 'Audio Collection';
+  if (kind === PORT_KIND_VIDEO) return 'Video Collection';
+  if (kind === PORT_KIND_FILE) return 'File Collection';
+  return 'Text Collection';
 }
 async function buildVideoGenerationRequest(node, inputArtifact) {
   if (!inputArtifact) {
@@ -2466,9 +3018,11 @@ async function getSelectedLocalAudioToolOrThrow(contextMaps, node, actionLabel) 
       ? 'rvc'
       : 'audiocraft-webui';
   const selectedToolId = String(getModelStepLocalToolId(node, contextMaps) || fallbackToolId).trim().toLowerCase() || fallbackToolId;
-  const installMessage = operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
-    ? 'Install RVC before using the ' + actionLabel + ' step.'
-    : 'Install AudioCraft WebUI before using the ' + actionLabel + ' step.';
+  const installMessage = operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
+    ? 'Install Whisper before using the ' + actionLabel + ' step.'
+    : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+      ? 'Install RVC before using the ' + actionLabel + ' step.'
+      : 'Install AudioCraft WebUI before using the ' + actionLabel + ' step.';
   return getInstalledToolOrThrow(
     contextMaps,
     selectedToolId,
@@ -2543,28 +3097,36 @@ async function buildValidationArtifactDescription(artifact, contextMaps) {
 
   return description;
 }
-async function waitForUserValidation(run, node, artifact) {
+async function waitForUserValidation(run, node, artifact, options = {}) {
   if (pendingValidationControl) {
     throw new Error('Local AI Hub is already waiting on another validation decision.');
   }
 
   const nodeState = run.nodeStates[node.id];
   const planReview = buildPlanValidationReview(artifact);
-  const evidenceMode = getUserValidationEvidenceMode(artifact, planReview);
-  const iteration = Number(nodeState?.iteration || 1);
-  const loopMaxAttempts = Number(nodeState?.loopMaxAttempts || 0) || null;
+  const reviewContext = options.reviewContext && typeof options.reviewContext === 'object'
+    ? options.reviewContext
+    : null;
+  const evidenceMode = String(reviewContext?.evidenceMode || '').trim() || getUserValidationEvidenceMode(artifact, planReview);
+  const iteration = Number(options.attemptNumber || nodeState?.iteration || 1) || 1;
+  const loopMaxAttempts = Number(options.maxAttempts || nodeState?.loopMaxAttempts || 0) || null;
   const loopPathLabel = String(nodeState?.loopPathLabel || '').trim();
-  const attemptLabel = loopPathLabel || (loopMaxAttempts ? 'Attempt ' + iteration + ' of ' + loopMaxAttempts : iteration > 1 ? 'Attempt ' + iteration : '');
+  const mapContext = options.pendingContext?.collectionMap || null;
+  const mapAttemptLabel = mapContext
+    ? 'Map item ' + String(Number(mapContext.itemIndex || 0) + 1) + ' of ' + mapContext.itemCount + (mapContext.itemId ? ' (' + mapContext.itemId + ')' : '') + ' | Attempt ' + mapContext.attemptNumber + ' of ' + mapContext.maxAttempts
+    : '';
+  const attemptLabel = mapAttemptLabel || loopPathLabel || (loopMaxAttempts ? 'Attempt ' + iteration + ' of ' + loopMaxAttempts : iteration > 1 ? 'Attempt ' + iteration : '');
   const pendingValidation = {
     activeLoops: cloneLoopContexts(nodeState?.activeLoops),
     artifact: serializeArtifactForUi(artifact),
+    collectionMap: mapContext ? serializeArtifactForUi(mapContext) : null,
     iteration,
     loopMaxAttempts,
     loopPathLabel,
     mode: 'user',
     nodeId: node.id,
     planReview: planReview ? serializeArtifactForUi(planReview) : null,
-    reviewContext: {
+    reviewContext: reviewContext ? serializeArtifactForUi(reviewContext) : {
       artifactKind: String(artifact?.kind || '').trim(),
       evidenceMode,
       limitations: [],
@@ -2583,14 +3145,15 @@ async function waitForUserValidation(run, node, artifact) {
       runId: run.runId,
     };
     run.status = 'paused';
-    run.message = attemptLabel
+    run.message = options.message || (attemptLabel
       ? `Paused at ${node.label} (${attemptLabel}). Local AI Hub is waiting for your decision.`
-      : `Paused at ${node.label}. Local AI Hub is waiting for your decision.`;
+      : `Paused at ${node.label}. Local AI Hub is waiting for your decision.`);
     run.pendingValidation = pendingValidation;
     nodeState.status = 'paused';
-    nodeState.message = attemptLabel
+    nodeState.message = options.nodeMessage || (attemptLabel
       ? 'Waiting for your pass or fail decision for ' + attemptLabel.toLowerCase() + '.'
-      : 'Waiting for your pass or fail decision.';
+      : 'Waiting for your pass or fail decision.');
+    nodeState.pendingValidationContext = mapContext ? serializeArtifactForUi({ collectionMap: mapContext }) : null;
     nodeState.preview = summarizeArtifact(artifact);
     emitPipelineEvent();
   });
@@ -2608,6 +3171,75 @@ async function waitForUserValidation(run, node, artifact) {
     emitPipelineEvent();
   }
   return decision;
+}
+
+async function executeLlmValidationReview(node, artifact, contextMaps, reportProgress, options = {}) {
+  const validationRequest = await buildValidationMessages(node, artifact, contextMaps);
+  const messages = validationRequest.messages;
+  const reviewContext = validationRequest.reviewContext;
+  const model = String(node.config?.model || '').trim();
+  if (!model) {
+    throw new Error('Choose or enter a model for this validator before running the pipeline.');
+  }
+
+  let reply = '';
+  if (node.config?.llmExecutionMode === 'ollama') {
+    reportProgress?.(options.progressMessage || 'Sending the content to Ollama for validation.', options.progressTitle || `Running ${node.label} with Ollama...`);
+    const ollamaTool = await getInstalledToolOrThrow(
+      contextMaps,
+      'ollama',
+      'Install Ollama before using a local validation step in a pipeline.',
+    );
+    if (artifact.kind === PORT_KIND_IMAGE) {
+      await ensureOllamaImageModelSupport(contextMaps, ollamaTool, model);
+    }
+    const result = await chatWithOllama(ollamaTool, {
+      messages,
+      model,
+    });
+    reply = String(result?.message?.content || '').trim();
+  } else {
+    const providerId = String(node.config?.providerId || '').trim();
+    if (!providerId) {
+      throw new Error('Choose a connected cloud provider before running this validation step.');
+    }
+
+    const provider = contextMaps.providersById[providerId] || null;
+    if (!provider?.isConnected) {
+      throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
+    }
+
+    reportProgress?.(options.progressMessage || `Sending the content to ${provider.name} for validation.`, options.progressTitle || `Running ${node.label} with ${provider.name}...`);
+    const result = await chatWithProvider(providerId, {
+      messages,
+      model,
+      providerId,
+    });
+    reply = String(result?.message?.content || '').trim();
+  }
+
+  const parsed = parseValidationDecision(reply);
+  const selectedBranch = parsed.decision === 'pass' ? 'pass' : 'fail';
+  const reason = parsed.reason || `Validator selected ${selectedBranch}.`;
+  const evidenceLimitations = parsed.evidenceLimitations || (reviewContext.limitations || []).join(' ');
+  const validationResult = {
+    confidence: parsed.confidence,
+    criteriaResults: parsed.criteriaResults,
+    decision: selectedBranch,
+    evidenceLimitations,
+    evidenceMode: parsed.evidenceMode || reviewContext.evidenceMode,
+    mode: 'llm',
+    planReview: reviewContext.planReview || null,
+    rawReply: reply,
+    reason,
+    reviewContext,
+    summary: parsed.summary || '',
+  };
+  return {
+    preview: buildValidationPreview(parsed, reviewContext),
+    selectedBranch,
+    validation: validationResult,
+  };
 }
 
 async function executeValidationNode(node, graph, run, contextMaps, reportProgress) {
@@ -2647,75 +3279,15 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
     };
   }
 
-  const validationRequest = await buildValidationMessages(node, artifact, contextMaps);
-  const messages = validationRequest.messages;
-  const reviewContext = validationRequest.reviewContext;
-  const model = String(node.config?.model || '').trim();
-  if (!model) {
-    throw new Error('Choose or enter a model for this validator before running the pipeline.');
-  }
-
-  let reply = '';
-  if (node.config?.llmExecutionMode === 'ollama') {
-    reportProgress?.('Sending the content to Ollama for validation.', `Running ${node.label} with Ollama...`);
-    const ollamaTool = await getInstalledToolOrThrow(
-      contextMaps,
-      'ollama',
-      'Install Ollama before using a local validation step in a pipeline.',
-    );
-    if (artifact.kind === PORT_KIND_IMAGE) {
-      await ensureOllamaImageModelSupport(contextMaps, ollamaTool, model);
-    }
-    const result = await chatWithOllama(ollamaTool, {
-      messages,
-      model,
-    });
-    reply = String(result?.message?.content || '').trim();
-  } else {
-    const providerId = String(node.config?.providerId || '').trim();
-    if (!providerId) {
-      throw new Error('Choose a connected cloud provider before running this validation step.');
-    }
-
-    const provider = contextMaps.providersById[providerId] || null;
-    if (!provider?.isConnected) {
-      throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
-    }
-
-    reportProgress?.(`Sending the content to ${provider.name} for validation.`, `Running ${node.label} with ${provider.name}...`);
-    const result = await chatWithProvider(providerId, {
-      messages,
-      model,
-      providerId,
-    });
-    reply = String(result?.message?.content || '').trim();
-  }
-
-  const parsed = parseValidationDecision(reply);
-  const selectedBranch = parsed.decision === 'pass' ? 'pass' : 'fail';
-  const reason = parsed.reason || `Validator selected ${selectedBranch}.`;
-  const evidenceLimitations = parsed.evidenceLimitations || (reviewContext.limitations || []).join(' ');
-  const validationResult = {
-    confidence: parsed.confidence,
-    criteriaResults: parsed.criteriaResults,
-    decision: selectedBranch,
-    evidenceLimitations,
-    evidenceMode: parsed.evidenceMode || reviewContext.evidenceMode,
-    mode: 'llm',
-    planReview: reviewContext.planReview || null,
-    rawReply: reply,
-    reason,
-    reviewContext,
-    summary: parsed.summary || '',
-  };
+  const review = await executeLlmValidationReview(node, artifact, contextMaps, reportProgress);
   return {
-    message: `Validator routed this item to ${selectedBranch}.`,
+    message: `Validator routed this item to ${review.selectedBranch}.`,
     outputs: {
-      [selectedBranch]: attachPlanValidationResult(artifact, validationResult),
+      [review.selectedBranch]: attachPlanValidationResult(artifact, review.validation),
     },
-    preview: buildValidationPreview(parsed, reviewContext),
-    selectedBranch,
-    validation: validationResult,
+    preview: review.preview,
+    selectedBranch: review.selectedBranch,
+    validation: review.validation,
   };
 }
 
@@ -3291,6 +3863,115 @@ async function executeMediaExportNode(node, graph, run, reportProgress) {
   };
 }
 
+const COLLECTION_INPUT_ITEM_KINDS = new Set([
+  PORT_KIND_TEXT,
+  PORT_KIND_IMAGE,
+  PORT_KIND_AUDIO,
+  PORT_KIND_VIDEO,
+  PORT_KIND_FILE,
+]);
+
+function isValidCollectionInputItemType(value) {
+  return COLLECTION_INPUT_ITEM_KINDS.has(String(value || '').trim().toLowerCase());
+}
+
+function normalizeCollectionInputItemType(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return COLLECTION_INPUT_ITEM_KINDS.has(normalized) ? normalized : PORT_KIND_TEXT;
+}
+
+function getCollectionInputItemId(node, item, index) {
+  const explicitId = String(item?.id || item?.itemId || '').trim();
+  if (explicitId) {
+    return explicitId;
+  }
+
+  return String(node.id || 'collection-input') + '-item-' + String(index + 1).padStart(3, '0');
+}
+
+function buildCollectionInputLineage(node, itemId, index) {
+  return {
+    sourceItemId: itemId,
+    sourceItemIndex: index,
+    sourceNodeId: node.id,
+    sourceNodeLabel: node.label,
+    sourcePortId: 'collection',
+    sourcePortLabel: 'Collection',
+  };
+}
+
+async function executeCollectionInputNode(node, run) {
+  if (!isValidCollectionInputItemType(node.config?.itemType)) {
+    throw new Error('Choose a collection item type before running this pipeline.');
+  }
+
+  const itemType = normalizeCollectionInputItemType(node.config?.itemType);
+  const rawItems = Array.isArray(node.config?.items) ? node.config.items : [];
+  if (!rawItems.length) {
+    throw new Error('Add at least one item to this Collection Input before running the pipeline.');
+  }
+
+  const collectionItems = [];
+  for (let index = 0; index < rawItems.length; index += 1) {
+    const item = rawItems[index] || {};
+    const itemId = getCollectionInputItemId(node, item, index);
+    if (itemType === PORT_KIND_TEXT) {
+      const text = String(item.text || item.value || '').trim();
+      if (!text) {
+        throw new Error('Collection Input item ' + (index + 1) + ' needs text before running the pipeline.');
+      }
+
+      collectionItems.push({
+        artifact: createTextArtifact(text, {
+          displayName: String(item.label || item.title || node.label + ' item ' + (index + 1)).trim() || node.label,
+          role: 'input',
+        }),
+        itemId,
+        lineage: buildCollectionInputLineage(node, itemId, index),
+      });
+      continue;
+    }
+
+    const rawPath = String(item.filePath || item.path || '').trim();
+    if (!rawPath) {
+      throw new Error('Collection Input item ' + (index + 1) + ' needs a selected ' + itemType + ' file before running the pipeline.');
+    }
+
+    const filePath = path.resolve(rawPath);
+    if (!(await fs.pathExists(filePath))) {
+      throw new Error('Collection Input item ' + (index + 1) + ' points to a file Local AI Hub cannot find. Choose it again and try the pipeline one more time.');
+    }
+
+    collectionItems.push({
+      artifact: await buildFileArtifact(filePath, {
+        displayName: String(item.label || item.title || item.displayName || path.basename(filePath)).trim() || path.basename(filePath),
+        kind: itemType,
+        role: 'input',
+      }),
+      itemId,
+      lineage: buildCollectionInputLineage(node, itemId, index),
+    });
+  }
+
+  const collection = createArtifactCollection(collectionItems, {
+    displayName: node.label,
+    itemKind: itemType,
+    role: 'input',
+  });
+  const persistedCollection = await persistArtifactCollection(run.directories, collection, {
+    baseName: node.label,
+    displayName: node.label,
+    role: 'input',
+    target: 'artifacts',
+  });
+  return {
+    message: 'Prepared an ordered ' + itemType + ' collection with ' + persistedCollection.itemCount + ' item' + (persistedCollection.itemCount === 1 ? '' : 's') + '.',
+    outputs: {
+      collection: persistedCollection,
+    },
+    preview: summarizeArtifact(persistedCollection),
+  };
+}
 async function executeOutputNode(node, inputPortId, graph, run) {
   const artifact = getNodeInputArtifact(node.id, inputPortId, graph, run.resultsByNodeId, run);
   if (!artifact) {
@@ -3317,6 +3998,9 @@ async function executeOutputNode(node, inputPortId, graph, run) {
 }
 
 async function executeNode(node, graph, run, contextMaps, reportProgress) {
+  if (node.type === 'collectionInput') {
+    return executeCollectionInputNode(node, run);
+  }
   if (node.type === 'textInput') {
     const text = String(node.config?.text || '').trim();
     if (!text) {

@@ -21,6 +21,7 @@ import {
   summarizePreview,
   toneToClassName,
 } from '../lib/pipeline-ui';
+import collectionInputState from '../lib/pipeline-collection-input-state.cjs';
 import { expectNextPrintableKeyDiagnostic, isEditableTarget, logRendererActionDiagnostic } from '../lib/focus-guard';
 
 const {
@@ -55,7 +56,9 @@ const {
   getGraphWorkflowOutputBinding,
   getGraphWorkflowOutputNodeOptions,
   getGraphWorkflowOperationBackendSupport,
+  getCollectionMapMapping,
   getPipelineNodePorts,
+  COLLECTION_MAP_MAPPING_OPTIONS,
   getPortDefinition,
   parseGraphWorkflowDefinitionText,
   AUDIO_TRANSFORM_TOOL_IDS,
@@ -86,7 +89,78 @@ const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
   savedPipelines: true,
 });
 const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ? getPlanningSchemaOptions() : [];
+const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
 
+function getCollectionMapDefaultInstruction(operationId) {
+  return operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION : '';
+}
+
+function getCollectionMapInstructionValue(node, operationId) {
+  const instruction = String(node?.config?.instruction || '');
+  if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE && instruction.trim() === COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION) {
+    return '';
+  }
+  return instruction;
+}
+
+function getCollectionMapModelFieldLabel(operationId) {
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return 'AudioCraft model';
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Voice model';
+  if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return 'Transcription model';
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return 'Model set override';
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Analysis mode';
+  return 'Checkpoint';
+}
+
+function getCollectionMapModelPlaceholder(operationId) {
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return 'Blank for default, or pick a downloaded AudioCraft snapshot';
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Enter or pick an RVC voice model file';
+  if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return 'base';
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return 'Optional Upscayl paired model set';
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'clip or deepdanbooru';
+  return 'Enter or pick a checkpoint file name';
+}
+
+function getCollectionMapRefreshLabel(operationId) {
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return 'Refresh snapshots';
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Refresh voice models';
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return 'Refresh model sets';
+  if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return 'Refresh models';
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Refresh modes';
+  return 'Refresh models';
+}
+
+function getCollectionMapInstructionLabel(operationId, executionMode) {
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) return 'Prompt prefix / style guidance';
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return executionMode === 'localTool' ? 'Prompt shaping / audio guidance' : 'Speech guidance / delivery hint';
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Transformation note';
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Analysis instruction';
+  return 'Shared instruction';
+}
+
+function getCollectionMapInstructionPlaceholder(operationId, executionMode) {
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) return 'Optional style or scene guidance to prepend to each text prompt.';
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return executionMode === 'localTool' ? 'Optional genre, mood, instrumentation, or sound-design guidance prepended to each text item.' : 'Optional delivery guidance for each speech request.';
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Optional note stored with each transformed audio item.';
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Optional analysis request for each image.';
+  return 'Optional instruction applied to each mapped item.';
+}
+
+const {
+  COLLECTION_INPUT_ITEM_TYPE_OPTIONS: COLLECTION_INPUT_ITEM_BASE_OPTIONS,
+  addCollectionInputFileItemToNode,
+  addCollectionInputTextItemToNode,
+  getCollectionInputItemId,
+  getCollectionInputItems,
+  moveCollectionInputItemInNode,
+  normalizeCollectionInputItemType,
+  removeCollectionInputItemFromNode,
+  updateCollectionInputItemInNode,
+} = collectionInputState;
+const COLLECTION_INPUT_ITEM_TYPE_OPTIONS = Object.freeze(COLLECTION_INPUT_ITEM_BASE_OPTIONS.map((option) => ({
+  ...option,
+  label: PIPELINE_PORT_KIND_LABELS[option.kind] || option.kind,
+})));
 function formatRendererDiagnosticError(error) {
   if (!error) {
     return null;
@@ -576,6 +650,13 @@ function buildNodePreview(node, runState) {
   if (node.type === 'imageInput' || node.type === 'audioInput' || node.type === 'videoInput' || node.type === 'fileInput') {
     return fileNameFromPath(node.config?.filePath || '') || 'No file selected yet.';
   }
+  if (node.type === 'collectionInput') {
+    const itemType = normalizeCollectionInputItemType(node.config?.itemType);
+    const itemCount = getCollectionInputItems(node).length;
+    return itemCount
+      ? itemCount + ' ' + (PIPELINE_PORT_KIND_LABELS[itemType] || itemType).toLowerCase() + ' item' + (itemCount === 1 ? '' : 's')
+      : 'No collection items yet.';
+  }
   if (node.type === 'llmPrompt') {
     const selectedOperationId = getSelectedModelStepOperationId(node);
     const localToolFallbackLabel = selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
@@ -639,8 +720,9 @@ function buildNodePreview(node, runState) {
     return 'Target ' + Math.max(1, Number(node.config?.targetCount || 3) || 3) + ' | keeps accepted items from one or more branches until the collection is ready';
   }
   if (node.type === 'collectionMap') {
-    const modeLabel = node.config?.executionMode === 'localTool' ? (node.config?.toolId || 'Local image tool') : (node.config?.providerId || 'Cloud provider');
-    return 'Text collection to image collection | ' + modeLabel;
+    const mapping = getCollectionMapMapping(node);
+    const modeLabel = node.config?.executionMode === 'graphWorkflow' ? 'Graph workflow' : node.config?.executionMode === 'localTool' ? (node.config?.toolId || 'Local tool') : (node.config?.providerId || 'Cloud provider');
+    return (mapping?.label || 'Unsupported mapping') + ' | ' + modeLabel;
   }
 
 
@@ -1776,6 +1858,10 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
   const artifactName = artifact?.displayName || artifact?.fileName || '';
   const artifactPath = getArtifactStoragePath(artifact);
   const attemptLabel = formatAttemptLabel(pendingValidation.iteration, pendingValidation.loopMaxAttempts);
+  const collectionMapContext = pendingValidation.collectionMap || pendingValidation.reviewContext?.mapCollection || null;
+  const collectionMapLabel = collectionMapContext
+    ? 'Map item ' + String(Number(collectionMapContext.itemIndex || 0) + 1) + ' of ' + collectionMapContext.itemCount + (collectionMapContext.itemId ? ' (' + collectionMapContext.itemId + ')' : '')
+    : '';
   return (
     <div className="rounded-[26px] border border-violet-400/30 bg-violet-400/10 p-4 text-violet-50">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1783,6 +1869,7 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
           <p className="text-xs uppercase tracking-[0.22em] text-violet-100/80">Awaiting validation</p>
           <p className="mt-2 text-lg font-semibold text-white">{pendingValidation.nodeLabel}</p>
           {attemptLabel ? <p className="mt-2 text-xs uppercase tracking-[0.18em] text-violet-100/80">{attemptLabel}</p> : null}
+          {collectionMapLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-violet-100/70">{collectionMapLabel}</p> : null}
           {pendingValidation.loopPathLabel ? <p className="mt-2 text-[11px] uppercase tracking-[0.16em] text-violet-100/70">Loop path: {pendingValidation.loopPathLabel}</p> : null}
           {artifactName ? <p className="mt-2 text-sm leading-6 text-violet-50/90">Reviewing {artifactLabel.toLowerCase()}: {artifactName}</p> : null}
         </div>
@@ -1793,7 +1880,7 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
           </span>
         </div>
       </div>
-      <p className="mt-3 text-sm leading-6 text-violet-50/90">{artifact?.kind === 'collection' ? 'Review the received collection as a whole below. Local AI Hub shows the ordered collection preview before you choose pass or fail.' : 'Review the received artifact below. If a preview is available, Local AI Hub shows it here before you choose pass or fail.'}</p>
+      <p className="mt-3 text-sm leading-6 text-violet-50/90">{collectionMapContext ? 'Review this mapped item attempt below. Pass accepts it into the final ordered collection; Fail retries only this source item while attempts remain.' : artifact?.kind === 'collection' ? 'Review the received collection as a whole below. Local AI Hub shows the ordered collection preview before you choose pass or fail.' : 'Review the received artifact below. If a preview is available, Local AI Hub shows it here before you choose pass or fail.'}</p>
       <ArtifactFacts artifact={artifact} className="mt-4" />
       <div className="mt-4">
         <ArtifactPreview artifact={artifact} />
@@ -2564,6 +2651,18 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowOperationBackendSupport(selectedNode) : null),
     [selectedNode],
   );
+  const selectedCollectionMapMapping = useMemo(
+    () => (selectedNode?.type === 'collectionMap' ? getCollectionMapMapping(selectedNode) : null),
+    [selectedNode],
+  );
+  const collectionMapLocalTools = useMemo(() => {
+    if (!selectedCollectionMapMapping) return [];
+    if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return audioTools;
+    if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return audioTransformTools;
+    if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return transcriptionTools;
+    if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return imageTransformTools.filter((tool) => tool.id === 'upscayl');
+    return imageTools;
+  }, [audioTools, audioTransformTools, imageTools, imageTransformTools, selectedCollectionMapMapping, transcriptionTools]);
   const collectionMapGraphWorkflowNodeOptions = collectionMapGraphWorkflowDefinition?.nodeEntries || [];
   const collectionMapGraphWorkflowTextBinding = useMemo(
     () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowInputBinding(selectedNode, 'text') : null),
@@ -2694,24 +2793,81 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     markDirty();
   }
 
+  function getDefaultCollectionMapLocalToolId(operationId) {
+    if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return audioTools[0]?.id || 'audiocraft-webui';
+    if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return audioTransformTools[0]?.id || 'rvc';
+    if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return transcriptionTools[0]?.id || 'whisper';
+    if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return imageTransformTools.find((tool) => tool.id === 'upscayl')?.id || 'upscayl';
+    if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE || operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) return imageTools[0]?.id || '';
+    return '';
+  }
+
+  function buildCollectionMapConfigForMapping(currentConfig = {}, mapping, executionMode) {
+    const operationId = mapping?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+    const graphToolId = String(currentConfig.graphWorkflowToolId || graphWorkflowTools[0]?.id || 'comfyui').trim();
+    const graphDefaults = getDefaultGraphWorkflowBindings(graphToolId);
+    const nextConfig = {
+      mappingId: mapping?.id || 'textToImage',
+      operationId,
+      executionMode,
+      providerId: executionMode === 'cloud' ? currentConfig.providerId || '' : '',
+      toolId: executionMode === 'localTool' ? getDefaultCollectionMapLocalToolId(operationId) : '',
+      graphWorkflowToolId: executionMode === 'graphWorkflow' ? graphToolId : currentConfig.graphWorkflowToolId || '',
+      workflowText: executionMode === 'graphWorkflow' ? currentConfig.workflowText || '' : currentConfig.workflowText || '',
+      inputBindings: executionMode === 'graphWorkflow' ? currentConfig.inputBindings || graphDefaults.inputBindings : currentConfig.inputBindings,
+      outputBindings: executionMode === 'graphWorkflow' ? currentConfig.outputBindings || graphDefaults.outputBindings : currentConfig.outputBindings,
+      workflowFormat: executionMode === 'graphWorkflow' ? currentConfig.workflowFormat || graphDefaults.workflowFormat : currentConfig.workflowFormat,
+      model: '',
+      instruction: getCollectionMapDefaultInstruction(operationId),
+      perItemValidation: currentConfig.perItemValidation && typeof currentConfig.perItemValidation === 'object'
+        ? currentConfig.perItemValidation
+        : { enabled: false, mode: 'llm', llmExecutionMode: 'cloud', providerId: '', model: '', ruleset: '', systemPrompt: '', maxAttempts: 2, retryInstruction: '', failMode: 'fail-fast' },
+    };
+
+    if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
+      nextConfig.imageSize = currentConfig.imageSize || '1024x1024';
+      nextConfig.imageQuality = currentConfig.imageQuality || 'auto';
+      nextConfig.imageBackground = currentConfig.imageBackground || 'auto';
+      nextConfig.negativePrompt = currentConfig.negativePrompt || '';
+      nextConfig.width = Number(currentConfig.width || 832) || 832;
+      nextConfig.height = Number(currentConfig.height || 832) || 832;
+      nextConfig.steps = Number(currentConfig.steps || 24) || 24;
+      nextConfig.cfgScale = Number(currentConfig.cfgScale || 7) || 7;
+      nextConfig.seed = Number(currentConfig.seed ?? -1);
+    } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+      nextConfig.audioMode = currentConfig.audioMode || 'music';
+      nextConfig.durationSeconds = Number(currentConfig.durationSeconds || 8) || 8;
+      nextConfig.audioVoice = currentConfig.audioVoice || '';
+    } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+      nextConfig.transformSubtype = currentConfig.transformSubtype || 'upscale';
+      nextConfig.scale = Number(currentConfig.scale || 4) || 4;
+    } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
+      nextConfig.analysisMode = currentConfig.analysisMode || 'clip';
+    }
+
+    return nextConfig;
+  }
+
   function updateCollectionMapExecutionMode(nodeId, nextMode) {
     updateNode(nodeId, (currentNode) => {
-      const executionMode = nextMode === 'localTool' ? 'localTool' : nextMode === 'graphWorkflow' ? 'graphWorkflow' : 'cloud';
-      const graphToolId = String(currentNode.config?.graphWorkflowToolId || graphWorkflowTools[0]?.id || 'comfyui').trim();
-      const graphDefaults = getDefaultGraphWorkflowBindings(graphToolId);
+      const mapping = getCollectionMapMapping(currentNode) || COLLECTION_MAP_MAPPING_OPTIONS[0];
+      const requestedMode = nextMode === 'localTool' ? 'localTool' : nextMode === 'graphWorkflow' ? 'graphWorkflow' : 'cloud';
+      const executionMode = mapping.modes.includes(requestedMode) ? requestedMode : mapping.modes[0] || 'cloud';
       return {
         ...currentNode,
-        config: {
-          ...currentNode.config,
-          executionMode,
-          graphWorkflowToolId: executionMode === 'graphWorkflow' ? graphToolId : currentNode.config?.graphWorkflowToolId || '',
-          inputBindings: executionMode === 'graphWorkflow' ? (currentNode.config?.inputBindings || graphDefaults.inputBindings) : currentNode.config?.inputBindings,
-          outputBindings: executionMode === 'graphWorkflow' ? (currentNode.config?.outputBindings || graphDefaults.outputBindings) : currentNode.config?.outputBindings,
-          providerId: executionMode === 'cloud' ? currentNode.config?.providerId || '' : '',
-          toolId: executionMode === 'localTool' ? currentNode.config?.toolId || '' : '',
-          workflowFormat: executionMode === 'graphWorkflow' ? currentNode.config?.workflowFormat || graphDefaults.workflowFormat : currentNode.config?.workflowFormat,
-          workflowText: executionMode === 'graphWorkflow' ? currentNode.config?.workflowText || '' : currentNode.config?.workflowText,
-        },
+        config: buildCollectionMapConfigForMapping(currentNode.config || {}, mapping, executionMode),
+      };
+    });
+  }
+
+  function updateCollectionMapMapping(nodeId, mappingId) {
+    const mapping = COLLECTION_MAP_MAPPING_OPTIONS.find((entry) => entry.id === mappingId) || COLLECTION_MAP_MAPPING_OPTIONS[0];
+    updateNode(nodeId, (currentNode) => {
+      const currentMode = currentNode.config?.executionMode === 'graphWorkflow' ? 'graphWorkflow' : currentNode.config?.executionMode === 'localTool' ? 'localTool' : 'cloud';
+      const executionMode = mapping.modes.includes(currentMode) ? currentMode : mapping.modes[0] || 'cloud';
+      return {
+        ...currentNode,
+        config: buildCollectionMapConfigForMapping(currentNode.config || {}, mapping, executionMode),
       };
     });
   }
@@ -3346,48 +3502,77 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   async function refreshNodeModels(node) {
     const modelConfig = getModelTargetConfig(node);
     if (!modelConfig) {
-      const isDirectImageToolNode = node.type === 'collectionMap' && node.config?.executionMode === 'localTool';
-      if (!isDirectImageToolNode) {
+      const isCollectionMapLocalToolNode = node.type === 'collectionMap' && node.config?.executionMode === 'localTool';
+      if (!isCollectionMapLocalToolNode) return;
+
+      const operationId = getCollectionMapMapping(node)?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+      let models = [];
+      if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
+        const toolId = String(node.config?.toolId || transcriptionTools[0]?.id || 'whisper').trim();
+        models = WHISPER_MODELS.map((model) => ({ ...model, detail: 'Local Whisper transcription model', toolId }));
+        setModelOptionsByNodeId((current) => ({ ...current, [node.id]: models }));
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
+        onToast('Whisper model sizes are ready for this collection map.', 'success');
+        return;
+      }
+      if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
+        const toolId = String(node.config?.toolId || imageTools[0]?.id || '').trim();
+        if (!toolId) {
+          onToast('Install Automatic1111 or Forge before configuring local image analysis for this collection map.', 'error');
+          return;
+        }
+        models = [
+          { id: 'clip', label: 'CLIP caption', detail: 'Stable Diffusion WebUI interrogate mode', toolId },
+          { id: 'deepdanbooru', label: 'DeepDanbooru tags', detail: 'Stable Diffusion WebUI interrogate mode', toolId },
+        ];
+        setModelOptionsByNodeId((current) => ({ ...current, [node.id]: models }));
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
+        onToast('Image analysis modes are ready for this collection map.', 'success');
         return;
       }
 
-      const toolId = String(node.config?.toolId || imageTools[0]?.id || '').trim();
+      const assetConfig = operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+        ? { assetKind: 'audiocraft-snapshot', defaultToolId: audioTools[0]?.id || '', emptyMessage: 'No downloaded AudioCraft snapshots were found.', errorMessage: 'Local AI Hub could not load downloaded AudioCraft snapshots for that collection map.', installMessage: 'Install AudioCraft WebUI before configuring local audio generation for this collection map.', successMessage: 'AudioCraft snapshots refreshed.' }
+        : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+          ? { assetKind: 'rvc-voice-model', defaultToolId: audioTransformTools[0]?.id || 'rvc', emptyMessage: 'No RVC voice models were found.', errorMessage: 'Local AI Hub could not load local RVC voice models for that collection map.', installMessage: 'Install RVC before refreshing voice models for this collection map.', successMessage: 'RVC voice models refreshed.' }
+          : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
+            ? { assetKind: 'upscayl-model-set', defaultToolId: imageTransformTools.find((tool) => tool.id === 'upscayl')?.id || imageTransformTools[0]?.id || 'upscayl', emptyMessage: 'No downloaded Upscayl model sets were found.', errorMessage: 'Local AI Hub could not load downloaded Upscayl model sets for that collection map.', installMessage: 'Install Upscayl before configuring image-to-image collection mapping.', successMessage: 'Upscayl model sets refreshed.' }
+            : { assetKind: 'stable-diffusion-checkpoint', defaultToolId: imageTools[0]?.id || '', emptyMessage: 'No backend-visible checkpoints were found.', errorMessage: 'Local AI Hub could not refresh live checkpoints for that image tool.', installMessage: 'Install Automatic1111 or Forge before refreshing local image checkpoints for this collection map.', successMessage: 'Checkpoints refreshed from the live backend.' };
+      const toolId = String(node.config?.toolId || assetConfig.defaultToolId || '').trim();
       if (!toolId) {
-        onToast('Install Automatic1111 or Forge before refreshing local image checkpoints for this step.', 'error');
+        onToast(assetConfig.installMessage, 'error');
+        return;
+      }
+      if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM && toolId !== 'upscayl') {
+        const selectedTransformTool = imageTransformTools.find((tool) => tool.id === toolId) || null;
+        onToast((selectedTransformTool?.name || 'This image transform tool') + ' does not expose selectable downloaded model sets yet.', 'info');
         return;
       }
 
       setModelsBusyNodeId(node.id);
-      const result = await window.localAIHub.listToolAssets({ assetKind: 'stable-diffusion-checkpoint', toolId });
+      const result = await window.localAIHub.listToolAssets({ assetKind: assetConfig.assetKind, toolId });
       if (!result?.ok) {
         setModelsBusyNodeId('');
-        onToast(result?.message || 'Local AI Hub could not refresh live checkpoints for that image tool.', 'error');
+        onToast(result?.message || assetConfig.errorMessage, 'error');
         return;
       }
-
       const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
-      const models = assetModels
-        .filter((model) => {
+      if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+        models = assetModels.map((model) => ({ ...model, id: String(model.path || model.packageRootPath || model.relativePath || model.name || model.id || '').trim(), label: model.sourceCatalogRepositoryId || model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath || model.path].filter(Boolean).join(' | '), toolId })).filter((model) => model.id);
+      } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+        models = assetModels.map((model) => ({ ...model, id: String(model.relativePath || model.fileName || model.name || model.id || '').trim(), label: model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '), toolId })).filter((model) => model.id && model.backendVisible !== false);
+      } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+        models = assetModels.map((model) => ({ ...model, id: String(model.name || model.fileName || model.relativePath || model.id || '').trim(), label: model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '), toolId })).filter((model) => model.id);
+      } else {
+        models = assetModels.filter((model) => {
           const modelType = String(model?.modelType || '').trim().toLowerCase();
           return (modelType === 'checkpoint' || modelType === 'inpainting') && model.backendVisible !== false;
-        })
-        .map((model) => buildStableDiffusionCheckpointOption(model, toolId))
-        .filter((model) => model.id);
-      setModelOptionsByNodeId((current) => ({
-        ...current,
-        [node.id]: models,
-      }));
-      if (!String(node.config?.toolId || '').trim()) {
-        updateNode(node.id, (currentNode) => ({
-          ...currentNode,
-          config: {
-            ...currentNode.config,
-            toolId,
-          },
-        }));
+        }).map((model) => buildStableDiffusionCheckpointOption(model, toolId)).filter((model) => model.id);
       }
+      setModelOptionsByNodeId((current) => ({ ...current, [node.id]: models }));
+      if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
       setModelsBusyNodeId('');
-      onToast(result.data?.message || (models.length ? 'Checkpoints refreshed from the live backend.' : 'No backend-visible checkpoints were found.'), models.length ? 'success' : 'info');
+      onToast(result.data?.message || (models.length ? assetConfig.successMessage : assetConfig.emptyMessage), models.length ? 'success' : 'info');
       return;
     }
 
@@ -3406,7 +3591,6 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
         onToast(result?.message || 'Local AI Hub could not load your local Ollama models.', 'error');
         return;
       }
-
       models = (result.data?.models || []).map((model) => ({
         id: model.name,
         label: model.name,
@@ -3419,295 +3603,94 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       const operationId = getSelectedModelStepOperationId(node);
       if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
         const toolId = String(node.config?.toolId || transcriptionTools[0]?.id || 'whisper').trim();
-        if (!toolId) {
-          setModelsBusyNodeId('');
-          onToast('Install Whisper before configuring local audio transcription for this step.', 'error');
-          return;
-        }
-
-        models = WHISPER_MODELS.map((model) => ({
-          id: model.id,
-          label: model.label,
-          detail: 'Local Whisper transcription model',
-          toolId,
-        }));
-        if (!String(node.config?.toolId || '').trim()) {
-          updateNode(node.id, (currentNode) => ({
-            ...currentNode,
-            config: {
-              ...currentNode.config,
-              toolId,
-            },
-          }));
-        }
+        if (!toolId) { setModelsBusyNodeId(''); onToast('Install Whisper before configuring local audio transcription for this step.', 'error'); return; }
+        models = WHISPER_MODELS.map((model) => ({ id: model.id, label: model.label, detail: 'Local Whisper transcription model', toolId }));
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
       } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
         const toolId = String(node.config?.toolId || imageTools[0]?.id || '').trim();
-        if (!toolId) {
-          setModelsBusyNodeId('');
-          onToast('Install Automatic1111 or Forge before configuring local image analysis for this step.', 'error');
-          return;
-        }
-
+        if (!toolId) { setModelsBusyNodeId(''); onToast('Install Automatic1111 or Forge before configuring local image analysis for this step.', 'error'); return; }
         models = [
           { id: 'clip', label: 'CLIP caption', detail: 'Stable Diffusion WebUI interrogate mode', toolId },
           { id: 'deepdanbooru', label: 'DeepDanbooru tags', detail: 'Stable Diffusion WebUI interrogate mode', toolId },
         ];
-        if (!String(node.config?.toolId || '').trim()) {
-          updateNode(node.id, (currentNode) => ({
-            ...currentNode,
-            config: {
-              ...currentNode.config,
-              toolId,
-            },
-          }));
-        }
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
       } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
         const toolId = String(node.config?.toolId || audioTools[0]?.id || '').trim();
-        if (!toolId) {
-          setModelsBusyNodeId('');
-          onToast('Install AudioCraft WebUI before configuring local audio generation for this step.', 'error');
-          return;
-        }
-
+        if (!toolId) { setModelsBusyNodeId(''); onToast('Install AudioCraft WebUI before configuring local audio generation for this step.', 'error'); return; }
         const result = await window.localAIHub.listToolAssets({ assetKind: 'audiocraft-snapshot', toolId });
-        if (!result?.ok) {
-          setModelsBusyNodeId('');
-          onToast(result?.message || 'Local AI Hub could not load downloaded AudioCraft snapshots for that step.', 'error');
-          return;
-        }
-
+        if (!result?.ok) { setModelsBusyNodeId(''); onToast(result?.message || 'Local AI Hub could not load downloaded AudioCraft snapshots for that step.', 'error'); return; }
         const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
-        if (result.data?.message) {
-          onToast(result.data.message, assetModels.length ? 'success' : 'info');
-        }
-
-        models = assetModels
-          .map((model) => ({
-            ...model,
-            id: String(model.path || model.packageRootPath || model.relativePath || model.name || model.id || '').trim(),
-            label: model.sourceCatalogRepositoryId || model.name || model.fileName || model.relativePath || model.id,
-            detail: [model.modelType, model.relativePath || model.path].filter(Boolean).join(' | '),
-            toolId,
-          }))
-          .filter((model) => model.id);
-
-        if (!String(node.config?.toolId || '').trim()) {
-          updateNode(node.id, (currentNode) => ({
-            ...currentNode,
-            config: {
-              ...currentNode.config,
-              toolId,
-            },
-          }));
-        }
+        if (result.data?.message) onToast(result.data.message, assetModels.length ? 'success' : 'info');
+        models = assetModels.map((model) => ({ ...model, id: String(model.path || model.packageRootPath || model.relativePath || model.name || model.id || '').trim(), label: model.sourceCatalogRepositoryId || model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath || model.path].filter(Boolean).join(' | '), toolId })).filter((model) => model.id);
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
       } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
         const toolId = String(node.config?.toolId || audioTransformTools[0]?.id || '').trim();
-        if (!toolId) {
-          setModelsBusyNodeId('');
-          onToast('Install RVC before refreshing voice models for this audio transformation step.', 'error');
-          return;
-        }
-
+        if (!toolId) { setModelsBusyNodeId(''); onToast('Install RVC before refreshing voice models for this audio transformation step.', 'error'); return; }
         const result = await window.localAIHub.listToolAssets({ assetKind: 'rvc-voice-model', toolId });
-        if (!result?.ok) {
-          setModelsBusyNodeId('');
-          onToast(result?.message || 'Local AI Hub could not load local RVC voice models for that step.', 'error');
-          return;
-        }
-
+        if (!result?.ok) { setModelsBusyNodeId(''); onToast(result?.message || 'Local AI Hub could not load local RVC voice models for that step.', 'error'); return; }
         const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
-        if (result.data?.message) {
-          onToast(result.data.message, assetModels.length ? 'success' : 'info');
-        }
-
-        models = assetModels
-          .map((model) => ({
-            ...model,
-            id: String(model.relativePath || model.fileName || model.name || model.id || '').trim(),
-            label: model.name || model.fileName || model.relativePath || model.id,
-            detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
-            toolId,
-          }))
-          .filter((model) => model.id && model.backendVisible !== false);
-
-        if (!String(node.config?.toolId || '').trim()) {
-          updateNode(node.id, (currentNode) => ({
-            ...currentNode,
-            config: {
-              ...currentNode.config,
-              toolId,
-            },
-          }));
-        }
+        if (result.data?.message) onToast(result.data.message, assetModels.length ? 'success' : 'info');
+        models = assetModels.map((model) => ({ ...model, id: String(model.relativePath || model.fileName || model.name || model.id || '').trim(), label: model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '), toolId })).filter((model) => model.id && model.backendVisible !== false);
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
       } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
         const toolId = String(node.config?.toolId || imageTransformTools[0]?.id || '').trim();
-        if (!toolId) {
-          setModelsBusyNodeId('');
-          onToast('Install Upscayl or FaceFusion before configuring local image transformation for this step.', 'error');
-          return;
-        }
-
+        if (!toolId) { setModelsBusyNodeId(''); onToast('Install Upscayl or FaceFusion before configuring local image transformation for this step.', 'error'); return; }
         const selectedTransformTool = imageTransformTools.find((tool) => tool.id === toolId) || null;
         if (toolId === 'upscayl') {
           const result = await window.localAIHub.listToolAssets({ assetKind: 'upscayl-model-set', toolId });
-          if (!result?.ok) {
-            setModelsBusyNodeId('');
-            onToast(result?.message || 'Local AI Hub could not load downloaded Upscayl model sets for that step.', 'error');
-            return;
-          }
-
+          if (!result?.ok) { setModelsBusyNodeId(''); onToast(result?.message || 'Local AI Hub could not load downloaded Upscayl model sets for that step.', 'error'); return; }
           const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
-          if (result.data?.message) {
-            onToast(result.data.message, assetModels.length ? 'success' : 'info');
-          }
-
-          models = assetModels
-            .map((model) => ({
-              ...model,
-              id: String(model.name || model.fileName || model.relativePath || model.id || '').trim(),
-              label: model.name || model.fileName || model.relativePath || model.id,
-              detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
-              toolId,
-            }))
-            .filter((model) => model.id);
+          if (result.data?.message) onToast(result.data.message, assetModels.length ? 'success' : 'info');
+          models = assetModels.map((model) => ({ ...model, id: String(model.name || model.fileName || model.relativePath || model.id || '').trim(), label: model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '), toolId })).filter((model) => model.id);
         } else {
-          onToast(`${selectedTransformTool?.name || 'This image transform tool'} does not expose selectable downloaded model sets yet.`, 'info');
+          onToast((selectedTransformTool?.name || 'This image transform tool') + ' does not expose selectable downloaded model sets yet.', 'info');
         }
-
-        if (!String(node.config?.toolId || '').trim()) {
-          updateNode(node.id, (currentNode) => ({
-            ...currentNode,
-            config: {
-              ...currentNode.config,
-              toolId,
-            },
-          }));
-        }
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
       } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
         const toolId = String(node.config?.toolId || videoTools[0]?.id || '').trim();
-        if (!toolId) {
-          setModelsBusyNodeId('');
-          onToast('Install Wan2.1 WebUI before configuring local video generation for this step.', 'error');
-          return;
-        }
-
+        if (!toolId) { setModelsBusyNodeId(''); onToast('Install Wan2.1 WebUI before configuring local video generation for this step.', 'error'); return; }
         const result = await window.localAIHub.listToolAssets({ assetKind: 'wan-model-folder', toolId });
-        if (!result?.ok) {
-          setModelsBusyNodeId('');
-          onToast(result?.message || 'Local AI Hub could not load downloaded Wan model folders for that step.', 'error');
-          return;
-        }
-
+        if (!result?.ok) { setModelsBusyNodeId(''); onToast(result?.message || 'Local AI Hub could not load downloaded Wan model folders for that step.', 'error'); return; }
         const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
-        if (result.data?.message) {
-          onToast(result.data.message, assetModels.length ? 'success' : 'info');
-        }
-
-        models = assetModels
-          .map((model) => ({
-            ...model,
-            id: String(model.name || model.fileName || model.relativePath || model.id || '').trim(),
-            label: model.name || model.fileName || model.relativePath || model.id,
-            detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '),
-            toolId,
-          }))
-          .filter((model) => model.id);
-
-        if (!String(node.config?.toolId || '').trim()) {
-          updateNode(node.id, (currentNode) => ({
-            ...currentNode,
-            config: {
-              ...currentNode.config,
-              toolId,
-            },
-          }));
-        }
+        if (result.data?.message) onToast(result.data.message, assetModels.length ? 'success' : 'info');
+        models = assetModels.map((model) => ({ ...model, id: String(model.name || model.fileName || model.relativePath || model.id || '').trim(), label: model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '), toolId })).filter((model) => model.id);
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
       } else {
         const toolId = String(node.config?.toolId || imageTools[0]?.id || '').trim();
-        if (!toolId) {
-          setModelsBusyNodeId('');
-          onToast('Install Automatic1111 or Forge before refreshing local image checkpoints for this step.', 'error');
-          return;
-        }
-
+        if (!toolId) { setModelsBusyNodeId(''); onToast('Install Automatic1111 or Forge before refreshing local image checkpoints for this step.', 'error'); return; }
         const result = await window.localAIHub.listToolAssets({ assetKind: 'stable-diffusion-checkpoint', toolId });
-        if (!result?.ok) {
-          setModelsBusyNodeId('');
-          onToast(result?.message || 'Local AI Hub could not refresh live checkpoints for that image tool.', 'error');
-          return;
-        }
-
+        if (!result?.ok) { setModelsBusyNodeId(''); onToast(result?.message || 'Local AI Hub could not refresh live checkpoints for that image tool.', 'error'); return; }
         const assetModels = Array.isArray(result.data?.models) ? result.data.models : Array.isArray(result.data) ? result.data : [];
-        if (result.data?.message) {
-          onToast(result.data.message, assetModels.some((model) => model.backendVisible !== false) ? 'success' : 'info');
-        }
-
-        models = assetModels
-          .filter((model) => {
-            const modelType = String(model?.modelType || '').trim().toLowerCase();
-            return modelType === 'checkpoint' || modelType === 'inpainting';
-          })
-          .map((model) => buildStableDiffusionCheckpointOption(model, toolId))
-          .filter((model) => model.id && model.backendVisible !== false);
-
-        if (!String(node.config?.toolId || '').trim()) {
-          updateNode(node.id, (currentNode) => ({
-            ...currentNode,
-            config: {
-              ...currentNode.config,
-              toolId,
-            },
-          }));
-        }
+        if (result.data?.message) onToast(result.data.message, assetModels.some((model) => model.backendVisible !== false) ? 'success' : 'info');
+        models = assetModels.filter((model) => {
+          const modelType = String(model?.modelType || '').trim().toLowerCase();
+          return modelType === 'checkpoint' || modelType === 'inpainting';
+        }).map((model) => buildStableDiffusionCheckpointOption(model, toolId)).filter((model) => model.id && model.backendVisible !== false);
+        if (!String(node.config?.toolId || '').trim()) updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, toolId } }));
       }
     } else {
       const providerId = String(node.config?.[modelConfig.providerIdKey] || '').trim();
-      if (!providerId) {
-        setModelsBusyNodeId('');
-        onToast('Choose a connected cloud provider before refreshing models for this step.', 'error');
-        return;
-      }
-
+      if (!providerId) { setModelsBusyNodeId(''); onToast('Choose a connected cloud provider before refreshing models for this step.', 'error'); return; }
       const modelRequest = node.type === 'llmPrompt'
         ? { operationId: getSelectedModelStepOperationId(node), providerId }
         : node.type === 'planner'
           ? { operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, providerId }
           : providerId;
       const result = await window.localAIHub.listProviderModels(modelRequest);
-      if (!result?.ok) {
-        setModelsBusyNodeId('');
-        onToast(result?.message || 'Local AI Hub could not load models for that cloud provider.', 'error');
-        return;
-      }
-
+      if (!result?.ok) { setModelsBusyNodeId(''); onToast(result?.message || 'Local AI Hub could not load models for that cloud provider.', 'error'); return; }
       models = result.data?.models || [];
       if (node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && providerId === 'xai' && !models.length) {
         onToast('xAI text-to-speech currently runs through a provider-managed speech runtime in this step. Leave Model blank and choose a voice if you want to use xAI.', 'info');
       }
       if (!String(node.config?.model || '').trim() && result.data?.selectedModel) {
-        updateNode(node.id, (currentNode) => ({
-          ...currentNode,
-          config: {
-            ...currentNode.config,
-            model: result.data.selectedModel,
-          },
-        }));
+        updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: result.data.selectedModel } }));
       }
     }
 
-    setModelOptionsByNodeId((current) => ({
-      ...current,
-      [node.id]: models,
-    }));
+    setModelOptionsByNodeId((current) => ({ ...current, [node.id]: models }));
     const shouldAutoSelectModel = !(executionMode === 'localTool' && node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE);
     if (shouldAutoSelectModel && !String(node.config?.model || '').trim() && models[0]?.id) {
-      updateNode(node.id, (currentNode) => ({
-        ...currentNode,
-        config: {
-          ...currentNode.config,
-          model: models[0].id,
-        },
-      }));
+      updateNode(node.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: models[0].id } }));
     }
     setModelsBusyNodeId('');
   }
@@ -3913,6 +3896,54 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     }));
   }
 
+  function updateCollectionInputType(nodeId, nextItemType) {
+    const normalizedItemType = normalizeCollectionInputItemType(nextItemType);
+    updateNode(nodeId, (currentNode) => {
+      const currentItemType = normalizeCollectionInputItemType(currentNode.config?.itemType);
+      return {
+        ...currentNode,
+        config: {
+          ...currentNode.config,
+          itemType: normalizedItemType,
+          items: currentItemType === normalizedItemType ? getCollectionInputItems(currentNode) : [],
+        },
+      };
+    });
+    onToast('Collection Input item type set to ' + (PIPELINE_PORT_KIND_LABELS[normalizedItemType] || normalizedItemType) + '.', 'info');
+  }
+
+  function addCollectionInputTextItem(nodeId) {
+    updateNode(nodeId, (currentNode) => addCollectionInputTextItemToNode(currentNode));
+  }
+
+  async function addCollectionInputFileItem(nodeId, itemType) {
+    const normalizedItemType = normalizeCollectionInputItemType(itemType);
+    const result = await window.localAIHub.pickPipelineFile({ kind: normalizedItemType });
+    if (!result?.ok) {
+      onToast(result?.message || 'Local AI Hub could not open that file picker.', 'error');
+      return;
+    }
+
+    if (result.data?.canceled || !result.data?.filePath) {
+      return;
+    }
+
+    updateNode(nodeId, (currentNode) => addCollectionInputFileItemToNode(currentNode, result.data.filePath, normalizedItemType, {
+      displayName: fileNameFromPath(result.data.filePath),
+    }));
+  }
+
+  function updateCollectionInputItem(nodeId, itemId, patch) {
+    updateNode(nodeId, (currentNode) => updateCollectionInputItemInNode(currentNode, itemId, patch));
+  }
+
+  function removeCollectionInputItem(nodeId, itemId) {
+    updateNode(nodeId, (currentNode) => removeCollectionInputItemFromNode(currentNode, itemId));
+  }
+
+  function moveCollectionInputItem(nodeId, itemId, direction) {
+    updateNode(nodeId, (currentNode) => moveCollectionInputItemInNode(currentNode, itemId, direction));
+  }
   async function handleRunPipeline() {
     if (!analysis.executable) {
       onToast(analysis.primaryIssue?.message || 'This pipeline is not ready to run yet.', 'error');
@@ -4339,6 +4370,73 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                   </div>
                 ) : null}
 
+                {selectedNode.type === 'collectionInput' ? (() => {
+                  const itemType = normalizeCollectionInputItemType(selectedNode.config?.itemType);
+                  const items = getCollectionInputItems(selectedNode);
+                  const itemTypeLabel = PIPELINE_PORT_KIND_LABELS[itemType] || itemType;
+                  return (
+                    <div className="space-y-4">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-input-type">Item type</label>
+                        <select
+                          className="store-input mt-3"
+                          id="collection-input-type"
+                          onChange={(event) => updateCollectionInputType(selectedNode.id, event.target.value)}
+                          value={itemType}
+                        >
+                          {COLLECTION_INPUT_ITEM_TYPE_OPTIONS.map((option) => <option key={option.kind} value={option.kind}>{option.label}</option>)}
+                        </select>
+                      </div>
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <p className="text-xs uppercase tracking-[0.18em] text-slate-500">{items.length} {itemTypeLabel.toLowerCase()} item{items.length === 1 ? '' : 's'}</p>
+                        <button
+                          className="ghost-button"
+                          onClick={() => (itemType === 'text' ? addCollectionInputTextItem(selectedNode.id) : addCollectionInputFileItem(selectedNode.id, itemType))}
+                          type="button"
+                        >
+                          Add item
+                        </button>
+                      </div>
+                      {items.length ? (
+                        <div className="space-y-3">
+                          {items.map((item, index) => {
+                            const itemId = getCollectionInputItemId(item, index);
+                            const filePath = String(item.filePath || item.path || '').trim();
+                            return (
+                              <div className="rounded-[18px] border border-white/10 bg-slate-950/35 px-3 py-3" key={itemId}>
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Item {index + 1}</p>
+                                  <div className="flex flex-wrap gap-2">
+                                    <button className="ghost-button px-2 py-1 text-xs" disabled={index === 0} onClick={() => moveCollectionInputItem(selectedNode.id, itemId, 'up')} type="button">Up</button>
+                                    <button className="ghost-button px-2 py-1 text-xs" disabled={index === items.length - 1} onClick={() => moveCollectionInputItem(selectedNode.id, itemId, 'down')} type="button">Down</button>
+                                    <button className="ghost-button px-2 py-1 text-xs" onClick={() => removeCollectionInputItem(selectedNode.id, itemId)} type="button">Remove</button>
+                                  </div>
+                                </div>
+                                {itemType === 'text' ? (
+                                  <textarea
+                                    className="store-input mt-3 min-h-[88px] resize-none"
+                                    onChange={(event) => updateCollectionInputItem(selectedNode.id, itemId, { text: event.target.value })}
+                                    placeholder="Text item"
+                                    value={item.text || item.value || ''}
+                                  />
+                                ) : (
+                                  <div className="mt-3 space-y-2">
+                                    <input className="store-input" readOnly value={filePath} />
+                                    <p className="text-xs leading-5 text-slate-400">{fileNameFromPath(filePath) || 'No file selected.'}</p>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="rounded-[18px] border border-dashed border-white/10 bg-white/5 px-4 py-5 text-sm leading-6 text-slate-400">
+                          Add one or more {itemTypeLabel.toLowerCase()} items before running this pipeline.
+                        </div>
+                      )}
+                    </div>
+                  );
+                })() : null}
                 {selectedNode.type === 'llmPrompt' ? (
                   <div className="space-y-4">
                     <div>
@@ -5053,26 +5151,69 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                   </div>
                 ) : null}
 
-                {selectedNode.type === 'collectionMap' ? (
+                {selectedNode.type === 'collectionMap' ? (() => {
+                  const collectionMapOperationId = selectedCollectionMapMapping?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+                  const collectionMapExecutionMode = selectedNode.config?.executionMode === 'graphWorkflow' ? 'graphWorkflow' : selectedNode.config?.executionMode === 'localTool' ? 'localTool' : 'cloud';
+                  const showCollectionMapImageGenerationFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+                  const showCollectionMapLocalImageGenerationFields = showCollectionMapImageGenerationFields && collectionMapExecutionMode === 'localTool';
+                  const showCollectionMapCloudImageGenerationFields = showCollectionMapImageGenerationFields && collectionMapExecutionMode === 'cloud';
+                  const showCollectionMapAudioGenerationFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE;
+                  const showCollectionMapImageTransformFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM;
+                  const showCollectionMapTranscriptionFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE;
+                  const showCollectionMapAudioTransformFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM;
+                  const showCollectionMapImageAnalysisFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE;
+                  const showCollectionMapLocalModelField = collectionMapExecutionMode === 'localTool';
+                  const showCollectionMapCloudModelField = collectionMapExecutionMode === 'cloud';
+                  const showCollectionMapInstructionField = showCollectionMapImageGenerationFields || showCollectionMapAudioGenerationFields || showCollectionMapAudioTransformFields || (showCollectionMapImageAnalysisFields && collectionMapExecutionMode === 'cloud');
+                  const collectionMapTransformSubtypeOptions = getImageTransformSubtypeOptions(selectedNode.config?.toolId || 'upscayl');
+                  const collectionMapInstructionValue = getCollectionMapInstructionValue(selectedNode, collectionMapOperationId);
+                  const collectionMapModelOptions = modelOptionsByNodeId[selectedNode.id] || [];
+                  const perItemValidation = selectedNode.config?.perItemValidation || {};
+                  const perItemValidationEnabled = Boolean(perItemValidation.enabled);
+                  const perItemValidationOutputKind = selectedCollectionMapMapping?.outputKind || 'image';
+                  const perItemValidationOutputLabel = PIPELINE_PORT_KIND_LABELS[perItemValidationOutputKind] || perItemValidationOutputKind;
+                  const perItemValidationLlmSupported = perItemValidationOutputKind === 'text' || perItemValidationOutputKind === 'image' || perItemValidationOutputKind === 'file';
+                  const updatePerItemValidation = (patch) => updateNode(selectedNode.id, (currentNode) => ({
+                    ...currentNode,
+                    config: {
+                      ...currentNode.config,
+                      perItemValidation: {
+                        enabled: false,
+                        mode: 'llm',
+                        llmExecutionMode: 'cloud',
+                        providerId: '',
+                        model: '',
+                        ruleset: '',
+                        systemPrompt: '',
+                        maxAttempts: 2,
+                        retryInstruction: '',
+                        failMode: 'fail-fast',
+                        ...(currentNode.config?.perItemValidation || {}),
+                        ...patch,
+                      },
+                    },
+                  }));
+                  return (
                   <div className="space-y-4">
-                    <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-mode">Execution mode</label>
-                      <select
-                        className="store-input mt-3"
-                        id="collection-map-mode"
-                        onChange={(event) => updateCollectionMapExecutionMode(selectedNode.id, event.target.value)}
-                        value={selectedNode.config?.executionMode === 'graphWorkflow' ? 'graphWorkflow' : selectedNode.config?.executionMode === 'localTool' ? 'localTool' : 'cloud'}
-                      >
-                        <option value="cloud">Cloud image provider</option>
-                        <option value="localTool">Local image tool</option>
-                        <option value="graphWorkflow">Configured graph workflow</option>
-                      </select>
+                    <div className="grid gap-4 xl:grid-cols-2">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-mapping">Mapping</label>
+                        <select className="store-input mt-3" id="collection-map-mapping" onChange={(event) => updateCollectionMapMapping(selectedNode.id, event.target.value)} value={selectedCollectionMapMapping?.id || selectedNode.config?.mappingId || 'textToImage'}>
+                          {COLLECTION_MAP_MAPPING_OPTIONS.map((mapping) => <option key={mapping.id} value={mapping.id}>{mapping.label}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-mode">Execution mode</label>
+                        <select className="store-input mt-3" id="collection-map-mode" onChange={(event) => updateCollectionMapExecutionMode(selectedNode.id, event.target.value)} value={collectionMapExecutionMode}>
+                          <option disabled={selectedCollectionMapMapping ? !selectedCollectionMapMapping.modes.includes('cloud') : false} value="cloud">Cloud provider</option>
+                          <option disabled={selectedCollectionMapMapping ? !selectedCollectionMapMapping.modes.includes('localTool') : false} value="localTool">Local tool</option>
+                          <option disabled={selectedCollectionMapMapping ? !selectedCollectionMapMapping.modes.includes('graphWorkflow') : false} value="graphWorkflow">Configured graph workflow</option>
+                        </select>
+                      </div>
                     </div>
-                    {selectedNode.config?.executionMode === 'graphWorkflow' ? (
+                    {collectionMapExecutionMode === 'graphWorkflow' ? (
                       <div className="space-y-4">
-                        <div className="rounded-[24px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3 text-sm leading-6 text-cyan-100">
-                          Use a real graph workflow boundary here. Paste the workflow JSON, map the Text input, and choose a final Image output node; Local AI Hub will run that workflow once per collection item.
-                        </div>
+                        <div className="rounded-[24px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3 text-sm leading-6 text-cyan-100">Use a real graph workflow boundary here. Paste the workflow JSON, map the Text input, and choose a final Image output node; Local AI Hub will run that workflow once per collection item.</div>
                         <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-tool">Graph workflow tool</label><select className="store-input mt-3" id="collection-map-graph-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => { const nextToolId = event.target.value; const nextBindings = getDefaultGraphWorkflowBindings(nextToolId); return { ...currentNode, config: { ...currentNode.config, graphWorkflowToolId: nextToolId, inputBindings: nextBindings.inputBindings, outputBindings: nextBindings.outputBindings, toolId: '', workflowFormat: nextBindings.workflowFormat, workflowText: '' } }; })} value={selectedNode.config?.graphWorkflowToolId || graphWorkflowTools[0]?.id || ''}><option value="">Choose a graph workflow tool</option>{graphWorkflowTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select><p className="mt-2 text-xs leading-5 text-slate-500">ComfyUI and InvokeAI stay graph-native. They are only usable here after this workflow boundary is configured.</p></div>
                         <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-json">Workflow definition</label><textarea className="store-input mt-3 min-h-[180px] resize-none font-mono text-xs leading-6" id="collection-map-graph-json" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, workflowText: event.target.value } }))} placeholder={collectionMapGraphWorkflowContract?.workflowFormat?.placeholder || 'Paste the workflow definition here.'} value={selectedNode.config?.workflowText || ''} />{collectionMapGraphWorkflowDefinition ? <p className={'mt-2 text-xs leading-5 ' + (collectionMapGraphWorkflowDefinition.ok ? 'text-emerald-200' : 'text-amber-200')}>{collectionMapGraphWorkflowDefinition.message}</p> : null}</div>
                         <div className="grid gap-4 xl:grid-cols-2">
@@ -5081,27 +5222,42 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         </div>
                         {collectionMapGraphWorkflowSupport ? <p className={'text-xs leading-5 ' + (collectionMapGraphWorkflowSupport.usable ? 'text-emerald-200' : 'text-amber-200')}>{collectionMapGraphWorkflowSupport.message}</p> : null}
                       </div>
-                    ) : selectedNode.config?.executionMode === 'localTool' ? (
+                    ) : collectionMapExecutionMode === 'localTool' ? (
                       <div className="space-y-4">
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-tool">Local backend</label><select className="store-input mt-3" id="collection-map-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: '', toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto (best ready local backend)</option>{imageTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-checkpoint">Checkpoint override</label><input className="store-input mt-3" id="collection-map-checkpoint" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder="Use backend's currently loaded checkpoint" value={selectedNode.config?.model || ''} /><div className="mt-3 flex flex-wrap items-center gap-3"><button className="ghost-button" disabled={modelsBusyNodeId === selectedNode.id} onClick={() => refreshNodeModels(selectedNode)} type="button">{modelsBusyNodeId === selectedNode.id ? 'Refreshing...' : 'Refresh checkpoints'}</button><span className="text-xs text-slate-500">Queries the live WebUI checkpoint list for mapped prompts.</span></div>{modelOptionsByNodeId[selectedNode.id]?.length ? <div className="mt-3 grid gap-2">{modelOptionsByNodeId[selectedNode.id].slice(0, 8).map((model) => (<button className={`rounded-2xl border px-3 py-3 text-left transition ${String(selectedNode.config?.model || '').trim().toLowerCase() === String(model.id || '').trim().toLowerCase() ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/20 hover:bg-white/10'}`} key={model.id} onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: model.id } }))} type="button"><p className="text-sm font-medium text-white">{model.label || model.id}</p>{buildModelOptionDetail(model) ? <p className="mt-1 text-xs leading-5 text-slate-400">{buildModelOptionDetail(model)}</p> : null}</button>))}</div> : null}<p className="mt-2 text-xs leading-5 text-slate-500">Leave blank to use the backend's current checkpoint for every mapped prompt.</p></div>
-                        <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-width">Width</label><input className="store-input mt-3" id="collection-map-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-height">Height</label><input className="store-input mt-3" id="collection-map-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div>
-                        <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-steps">Steps</label><input className="store-input mt-3" id="collection-map-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cfg">CFG scale</label><input className="store-input mt-3" id="collection-map-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-seed">Seed</label><input className="store-input mt-3" id="collection-map-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-tool">Local backend</label><select className="store-input mt-3" id="collection-map-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: '', toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto / required local backend</option>{collectionMapLocalTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                        {showCollectionMapLocalModelField ? (
+                          <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model-local">{getCollectionMapModelFieldLabel(collectionMapOperationId)}</label><input className="store-input mt-3" id="collection-map-model-local" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value, analysisMode: showCollectionMapImageAnalysisFields ? event.target.value || 'clip' : currentNode.config?.analysisMode } }))} placeholder={getCollectionMapModelPlaceholder(collectionMapOperationId)} value={selectedNode.config?.model || (showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || 'clip' : '')} /><div className="mt-3 flex flex-wrap items-center gap-3"><button className="ghost-button" disabled={modelsBusyNodeId === selectedNode.id} onClick={() => refreshNodeModels(selectedNode)} type="button">{modelsBusyNodeId === selectedNode.id ? 'Refreshing...' : getCollectionMapRefreshLabel(collectionMapOperationId)}</button><span className="text-xs text-slate-500">{showCollectionMapAudioGenerationFields ? 'Loads downloaded AudioCraft snapshots from the selected tool.' : showCollectionMapAudioTransformFields ? 'Loads local RVC voice models from the selected tool.' : showCollectionMapImageTransformFields ? 'Loads downloaded Upscayl model sets from the selected tool.' : showCollectionMapTranscriptionFields ? 'Shows local Whisper model size options.' : showCollectionMapImageAnalysisFields ? 'Shows WebUI interrogation modes.' : 'Loads local checkpoints from the selected image backend.'}</span></div>{collectionMapModelOptions.length ? <div className="mt-3 grid gap-2">{collectionMapModelOptions.slice(0, 8).map((model) => (<button className={'rounded-2xl border px-3 py-3 text-left transition ' + (String((showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || selectedNode.config?.model : selectedNode.config?.model) || '').trim().toLowerCase() === String(model.id || '').trim().toLowerCase() ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/20 hover:bg-white/10')} key={model.id} onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: showCollectionMapImageAnalysisFields ? model.id : currentNode.config?.analysisMode, model: model.id } }))} type="button"><p className="text-sm font-medium text-white">{model.label || model.id}</p>{buildModelOptionDetail(model) ? <p className="mt-1 text-xs leading-5 text-slate-400">{buildModelOptionDetail(model)}</p> : null}</button>))}</div> : null}</div>
+                        ) : null}
+                        {showCollectionMapAudioGenerationFields ? <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div></div> : null}
+                        {showCollectionMapImageTransformFields ? <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-transform-subtype">Transform</label><select className="store-input mt-3" id="collection-map-transform-subtype" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, transformSubtype: event.target.value } }))} value={selectedNode.config?.transformSubtype || 'upscale'}>{collectionMapTransformSubtypeOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-scale">Scale</label><input className="store-input mt-3" id="collection-map-scale" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, scale: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.scale || 4} /></div></div> : null}
+                        {showCollectionMapLocalImageGenerationFields ? <><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-width">Width</label><input className="store-input mt-3" id="collection-map-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-height">Height</label><input className="store-input mt-3" id="collection-map-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div><div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-steps">Steps</label><input className="store-input mt-3" id="collection-map-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cfg">CFG scale</label><input className="store-input mt-3" id="collection-map-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-seed">Seed</label><input className="store-input mt-3" id="collection-map-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div></> : null}
                       </div>
                     ) : (
-                      <div className="space-y-4">
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-provider">Provider</label><select className="store-input mt-3" id="collection-map-provider" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, providerId: event.target.value } }))} value={selectedNode.config?.providerId || ''}><option value="">Choose provider</option>{connectedProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></div>
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model">Image model</label><input className="store-input mt-3" id="collection-map-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder="Provider image model" value={selectedNode.config?.model || ''} /></div>
-                        <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-size">Image size</label><select className="store-input mt-3" id="collection-map-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-quality">Quality</label><select className="store-input mt-3" id="collection-map-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-background">Background</label><select className="store-input mt-3" id="collection-map-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div></div>
-                      </div>
+                      <div className="space-y-4"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-provider">Provider</label><select className="store-input mt-3" id="collection-map-provider" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, providerId: event.target.value, model: '' } }))} value={selectedNode.config?.providerId || ''}><option value="">Choose provider</option>{connectedProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></div>{showCollectionMapCloudModelField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model">Model</label><input className="store-input mt-3" id="collection-map-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder={showCollectionMapAudioGenerationFields ? 'Provider audio model' : showCollectionMapImageAnalysisFields ? 'Provider vision model' : 'Provider image model'} value={selectedNode.config?.model || ''} /></div> : null}{showCollectionMapCloudImageGenerationFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-size">Image size</label><select className="store-input mt-3" id="collection-map-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-quality">Quality</label><select className="store-input mt-3" id="collection-map-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-background">Background</label><select className="store-input mt-3" id="collection-map-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div></div> : null}{showCollectionMapAudioGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-voice">Voice</label><input className="store-input mt-3" id="collection-map-voice" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioVoice: event.target.value } }))} placeholder="Provider voice" value={selectedNode.config?.audioVoice || ''} /></div> : null}</div>
                     )}
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-instruction">Prompt prefix / style guidance</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="collection-map-instruction" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder="Optional style or scene guidance to prepend to every text item." value={selectedNode.config?.instruction || ''} /></div>
-                    <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[100px] resize-none" id="collection-map-negative" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for every mapped image." value={selectedNode.config?.negativePrompt || ''} /></div>
+                    {showCollectionMapInstructionField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-instruction">{getCollectionMapInstructionLabel(collectionMapOperationId, collectionMapExecutionMode)}</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="collection-map-instruction" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder={getCollectionMapInstructionPlaceholder(collectionMapOperationId, collectionMapExecutionMode)} value={collectionMapInstructionValue} /></div> : null}
+                    {showCollectionMapLocalImageGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[100px] resize-none" id="collection-map-negative" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for every mapped image." value={selectedNode.config?.negativePrompt || ''} /></div> : null}
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      This node maps an ordered text collection into an ordered image collection. It fails the mapped step if any item fails, and the run message identifies the item so the collection is never marked complete with hidden partial results.
+                      <label className="flex items-center gap-3 text-sm font-medium text-white" htmlFor="collection-map-per-item-validation"><input checked={perItemValidationEnabled} className="h-4 w-4 accent-cyan-300" id="collection-map-per-item-validation" onChange={(event) => updatePerItemValidation({ enabled: event.target.checked })} type="checkbox" />Validate each mapped item</label>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">When enabled, Local AI Hub validates one mapped {perItemValidationOutputLabel.toLowerCase()} item at a time and retries only that source item. Final collection output is still all-or-fail.</p>
+                      {perItemValidationEnabled ? (
+                        <div className="mt-4 space-y-3">
+                          <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-mode">Validation mode</label><select className="store-input mt-3" id="collection-map-validation-mode" onChange={(event) => updatePerItemValidation({ mode: event.target.value === 'user' ? 'user' : 'llm' })} value={perItemValidation.mode === 'user' ? 'user' : 'llm'}><option disabled={!perItemValidationLlmSupported} value="llm">LLM validator</option><option value="user">User approval</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-attempts">Max attempts per item</label><input className="store-input mt-3" id="collection-map-validation-attempts" max={PIPELINE_RETRY_LOOP_MAX_ATTEMPTS} min="1" onChange={(event) => updatePerItemValidation({ maxAttempts: Math.max(1, Math.min(PIPELINE_RETRY_LOOP_MAX_ATTEMPTS, Number(event.target.value || 1) || 1)) })} type="number" value={Math.max(1, Math.min(PIPELINE_RETRY_LOOP_MAX_ATTEMPTS, Number(perItemValidation.maxAttempts || 2) || 2))} /></div></div>
+                          {perItemValidation.mode === 'user' ? <div className="rounded-[18px] border border-violet-300/20 bg-violet-300/10 px-4 py-3 text-xs leading-5 text-violet-100">The run will pause for each mapped item so you can choose Pass or Fail. A failed item retries only that item until the per-item attempt limit is reached.</div> : !perItemValidationLlmSupported ? <div className="rounded-[18px] border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-xs leading-5 text-amber-100">Per-item LLM validation for mapped {perItemValidationOutputLabel.toLowerCase()} artifacts is not supported by the current validator capability model. Validate manually here, validate the final collection after mapping, or map to text/image first.</div> : (
+                            <>
+                              <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-runtime">Validator runtime</label><select className="store-input mt-3" id="collection-map-validation-runtime" onChange={(event) => updatePerItemValidation({ llmExecutionMode: event.target.value === 'ollama' ? 'ollama' : 'cloud', providerId: event.target.value === 'ollama' ? '' : perItemValidation.providerId || '' })} value={perItemValidation.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud'}><option value="cloud">Cloud provider</option><option value="ollama">Ollama (local)</option></select></div>{perItemValidation.llmExecutionMode === 'ollama' ? null : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-provider">Provider</label><select className="store-input mt-3" id="collection-map-validation-provider" onChange={(event) => updatePerItemValidation({ providerId: event.target.value })} value={perItemValidation.providerId || ''}><option value="">Choose provider</option>{connectedProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></div>}<div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-model">Validator model</label><input className="store-input mt-3" id="collection-map-validation-model" onChange={(event) => updatePerItemValidation({ model: event.target.value })} placeholder={perItemValidation.llmExecutionMode === 'ollama' ? 'Vision/text model' : 'Provider validator model'} value={perItemValidation.model || ''} /></div></div>
+                              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-rules">Per-item validation rules</label><textarea className="store-input mt-3 min-h-[110px] resize-none" id="collection-map-validation-rules" onChange={(event) => updatePerItemValidation({ ruleset: event.target.value })} placeholder="Describe what should count as pass or fail for each mapped item." value={perItemValidation.ruleset || ''} /></div>
+                              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-retry">Retry guidance</label><textarea className="store-input mt-3 min-h-[90px] resize-none" id="collection-map-validation-retry" onChange={(event) => updatePerItemValidation({ retryInstruction: event.target.value })} placeholder="Optional instruction appended only to retry attempts for a failed item." value={perItemValidation.retryInstruction || ''} /></div>
+                            </>
+                          )}
+                          <div className="rounded-[18px] border border-white/10 bg-slate-950/35 px-4 py-3 text-xs leading-5 text-slate-400">User validation uses the same real pause/resume path as the standalone Validation node. LLM validation applies the same rules independently to each item and stays limited to validator-supported artifact kinds.</div>
+                        </div>
+                      ) : null}
                     </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This node maps an ordered typed collection into another ordered typed collection. It fails the whole mapped step on the first failed item and identifies the item number and id, so hidden partial results are never marked complete.</div>
                   </div>
-                ) : null}
+                  );
+                })() : null}
                 {selectedNode.type === 'mediaComposition' ? (
                   <div className="space-y-4">
                     <div>
@@ -5426,5 +5582,3 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     </section>
   );
 }
-
-

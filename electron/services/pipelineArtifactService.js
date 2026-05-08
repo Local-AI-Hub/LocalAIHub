@@ -926,8 +926,11 @@ function summarizeArtifact(artifact, limit = 180) {
 
   if (artifact.kind === PORT_KIND_TEXT) {
     const transcriptionSummary = buildTranscriptionSummary(artifact.transcription, limit);
-    const textSummary = trimPreviewText(artifact.text || artifact.previewText || '', transcriptionSummary ? Math.max(48, Math.floor(limit / 2)) : limit);
-    return trimPreviewText([transcriptionSummary, textSummary].filter(Boolean).join(' | '), limit);
+    const imageAnalysis = artifact.imageAnalysis && typeof artifact.imageAnalysis === 'object' ? artifact.imageAnalysis : null;
+    const imageAnalysisSummary = imageAnalysis ? ['Image analysis', imageAnalysis.backendLabel || imageAnalysis.backend || '', imageAnalysis.mode || ''].filter(Boolean).join(' | ') : '';
+    const contextSummary = transcriptionSummary || imageAnalysisSummary;
+    const textSummary = trimPreviewText(artifact.text || artifact.previewText || '', contextSummary ? Math.max(48, Math.floor(limit / 2)) : limit);
+    return trimPreviewText([contextSummary, textSummary].filter(Boolean).join(' | '), limit);
   }
 
   if (artifact.kind === PORT_KIND_AUDIO) {
@@ -1060,13 +1063,20 @@ function createArtifactCollection(items, options = {}) {
         return null;
       }
 
-      return {
+      const normalizedEntry = {
         artifact: itemArtifact,
         index,
         itemId: String(entry?.itemId || buildCollectionItemId(itemArtifact, index)).trim() || buildCollectionItemId(itemArtifact, index),
         lineage: normalizeCollectionLineage(entry?.lineage),
         summary: summarizeArtifact(itemArtifact),
       };
+      if (Array.isArray(entry?.attempts) && entry.attempts.length) {
+        normalizedEntry.attempts = serializeArtifactForUi(entry.attempts);
+      }
+      if (entry?.validation && typeof entry.validation === 'object') {
+        normalizedEntry.validation = serializeArtifactForUi(entry.validation);
+      }
+      return normalizedEntry;
     })
     .filter(Boolean);
 
@@ -1108,6 +1118,9 @@ function createArtifactCollection(items, options = {}) {
   }
   if (options.accumulation) {
     collection.accumulation = normalizeCollectionAccumulation(options.accumulation);
+  }
+  if (options.collectionMapping && typeof options.collectionMapping === 'object') {
+    collection.collectionMapping = serializeArtifactForUi(options.collectionMapping);
   }
 
   collection.summary = summarizeArtifact(collection);
@@ -1334,6 +1347,9 @@ function createTextArtifact(text, options = {}) {
   if (options.transcription) {
     artifact.transcription = serializeArtifactForUi(options.transcription);
   }
+  if (options.imageAnalysis) {
+    artifact.imageAnalysis = serializeArtifactForUi(options.imageAnalysis);
+  }
 
   if (Array.isArray(options.metadataPaths) && options.metadataPaths.length) {
     artifact.metadataPaths = [...new Set(options.metadataPaths.map((entry) => String(entry || '').trim()).filter(Boolean))];
@@ -1524,37 +1540,56 @@ async function saveBufferArtifact(runDirectories, bufferPayload, options = {}) {
 
 async function saveTextArtifactMetadata(filePath, artifact) {
   const transcription = artifact?.transcription || null;
-  if (!transcription) {
+  const imageAnalysis = artifact?.imageAnalysis || null;
+  if (!transcription && !imageAnalysis) {
     return [];
   }
 
-  const metadataPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.transcription.json`);
-  const segments = Array.isArray(transcription.segments) ? transcription.segments : [];
-  await fs.writeJson(metadataPath, {
-    backend: String(transcription.backend || '').trim() || 'whisper',
-    backendLabel: String(transcription.backendLabel || '').trim() || 'Whisper (faster-whisper)',
-    durationSeconds: Number.isFinite(Number(transcription.durationSeconds)) && Number(transcription.durationSeconds) > 0
-      ? Math.round(Number(transcription.durationSeconds) * 100) / 100
-      : null,
-    language: String(transcription.language || '').trim() || 'unknown',
-    model: String(transcription.model || '').trim() || '',
-    runtime: transcription.runtime ? serializeArtifactForUi(transcription.runtime) : null,
-    segmentCount: Number(transcription.segmentCount || segments.length) || segments.length,
-    segments: serializeArtifactForUi(segments),
-    sourceAudio: transcription.sourceAudio
-      ? serializeArtifactForUi({
-          displayName: transcription.sourceAudio.displayName || '',
-          fileName: transcription.sourceAudio.fileName || '',
-          filePath: transcription.sourceAudio.filePath || '',
-          formatLabel: transcription.sourceAudio.formatLabel || '',
-          mimeType: transcription.sourceAudio.mimeType || '',
-          sizeBytes: Number(transcription.sourceAudio.sizeBytes || 0) || 0,
-        })
-      : null,
-    text: String(artifact.text || ''),
-  }, { spaces: 2 });
+  const metadataPaths = [];
+  if (transcription) {
+    const metadataPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.transcription.json`);
+    const segments = Array.isArray(transcription.segments) ? transcription.segments : [];
+    await fs.writeJson(metadataPath, {
+      backend: String(transcription.backend || '').trim() || 'whisper',
+      backendLabel: String(transcription.backendLabel || '').trim() || 'Whisper (faster-whisper)',
+      durationSeconds: Number.isFinite(Number(transcription.durationSeconds)) && Number(transcription.durationSeconds) > 0
+        ? Math.round(Number(transcription.durationSeconds) * 100) / 100
+        : null,
+      language: String(transcription.language || '').trim() || 'unknown',
+      model: String(transcription.model || '').trim() || '',
+      runtime: transcription.runtime ? serializeArtifactForUi(transcription.runtime) : null,
+      segmentCount: Number(transcription.segmentCount || segments.length) || segments.length,
+      segments: serializeArtifactForUi(segments),
+      sourceAudio: transcription.sourceAudio
+        ? serializeArtifactForUi({
+            displayName: transcription.sourceAudio.displayName || '',
+            fileName: transcription.sourceAudio.fileName || '',
+            filePath: transcription.sourceAudio.filePath || '',
+            formatLabel: transcription.sourceAudio.formatLabel || '',
+            mimeType: transcription.sourceAudio.mimeType || '',
+            sizeBytes: Number(transcription.sourceAudio.sizeBytes || 0) || 0,
+          })
+        : null,
+      text: String(artifact.text || ''),
+    }, { spaces: 2 });
+    metadataPaths.push(metadataPath);
+  }
 
-  return [metadataPath];
+  if (imageAnalysis) {
+    const metadataPath = path.join(path.dirname(filePath), `${path.basename(filePath, path.extname(filePath))}.image-analysis.json`);
+    await fs.writeJson(metadataPath, {
+      backend: String(imageAnalysis.backend || '').trim(),
+      backendLabel: String(imageAnalysis.backendLabel || '').trim(),
+      mode: String(imageAnalysis.mode || '').trim(),
+      model: String(imageAnalysis.model || '').trim(),
+      operationId: String(imageAnalysis.operationId || '').trim(),
+      sourceImage: imageAnalysis.sourceImage ? serializeArtifactForUi(imageAnalysis.sourceImage) : null,
+      text: String(artifact.text || ''),
+    }, { spaces: 2 });
+    metadataPaths.push(metadataPath);
+  }
+
+  return metadataPaths;
 }
 
 
@@ -1635,6 +1670,7 @@ async function saveArtifactIntoDirectory(directoryPath, artifact, options = {}) 
     const metadataPaths = await saveTextArtifactMetadata(filePath, artifact);
     const savedArtifact = createTextArtifact(artifact.text || '', {
       displayName: artifact.displayName || options.baseName || 'Text',
+      imageAnalysis: artifact.imageAnalysis,
       role: options.role || artifact.role || 'artifact',
       transcription: artifact.transcription,
       metadataPaths,
@@ -1691,6 +1727,8 @@ function buildCollectionManifestItem(entry, directoryPath) {
     index: Number(entry?.index || 0) || 0,
     summary: String(entry?.summary || summarizeArtifact(artifact)).trim(),
     lineage: entry?.lineage ? serializeArtifactForUi(entry.lineage) : null,
+    attempts: Array.isArray(entry?.attempts) ? serializeArtifactForUi(entry.attempts) : [],
+    validation: entry?.validation ? serializeArtifactForUi(entry.validation) : null,
     artifact: serializeArtifactForUi(artifact),
     artifactPath: String(artifact?.filePath || '').trim(),
     relativeArtifactPath: artifact?.filePath ? path.relative(directoryPath, artifact.filePath) : '',
@@ -1817,16 +1855,24 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
     if (savedArtifact) {
       savedArtifact.summary = summarizeArtifact(savedArtifact);
     }
-    normalizedItems.push({
+    const normalizedEntry = {
       artifact: savedArtifact,
       itemId: String(entry?.itemId || buildCollectionItemId(savedArtifact, index)).trim() || buildCollectionItemId(savedArtifact, index),
       lineage: normalizeCollectionLineage(entry?.lineage),
-    });
+    };
+    if (Array.isArray(entry?.attempts) && entry.attempts.length) {
+      normalizedEntry.attempts = serializeArtifactForUi(entry.attempts);
+    }
+    if (entry?.validation && typeof entry.validation === 'object') {
+      normalizedEntry.validation = serializeArtifactForUi(entry.validation);
+    }
+    normalizedItems.push(normalizedEntry);
   }
 
   const manifestPath = path.join(directoryPath, 'manifest.json');
   const savedCollection = createArtifactCollection(normalizedItems, {
     accumulation: artifact?.accumulation,
+    collectionMapping: artifact?.collectionMapping,
     destinationPath: options.target === 'outputs' ? directoryPath : '',
     directoryPath,
     displayName: options.displayName || options.title || artifact?.displayName || 'Collection',
@@ -1856,6 +1902,7 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
     runId: savedCollection.runId || '',
     summary: savedCollection.summary,
     accumulation: savedCollection.accumulation ? serializeArtifactForUi(savedCollection.accumulation) : null,
+    collectionMapping: savedCollection.collectionMapping ? serializeArtifactForUi(savedCollection.collectionMapping) : null,
     items: savedCollection.items.map((entry) => buildCollectionManifestItem(entry, directoryPath)),
   }, { spaces: 2 });
 
@@ -1958,6 +2005,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     const metadataPaths = await saveTextArtifactMetadata(filePath, artifact);
     const savedArtifact = createTextArtifact(artifact.text || '', {
       displayName: title,
+      imageAnalysis: artifact.imageAnalysis,
       role: 'output',
       transcription: artifact.transcription,
       metadataPaths,
@@ -2025,6 +2073,7 @@ function buildTerminalResult(node, artifact) {
     fileUrl: artifact?.fileUrl || '',
     itemCount: Number(artifact?.itemCount || 0) || 0,
     itemKind: String(artifact?.itemKind || '').trim(),
+    collectionMapping: artifact?.collectionMapping ? serializeArtifactForUi(artifact.collectionMapping) : null,
     kind: artifact?.kind || PORT_KIND_FILE,
     manifestPath: artifact?.manifestPath || '',
     nodeId: node.id,

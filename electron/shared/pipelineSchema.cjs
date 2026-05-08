@@ -134,6 +134,56 @@ const GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getGraphWorkflowToolIds());
 const RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getRunnableGraphWorkflowToolIds());
 const DEFAULT_GRAPH_WORKFLOW_TOOL_ID = RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS[0] || GRAPH_WORKFLOW_TOOL_IDS[0] || 'comfyui';
 const DEFAULT_GRAPH_WORKFLOW_BINDINGS = Object.freeze(getDefaultGraphWorkflowBindings(DEFAULT_GRAPH_WORKFLOW_TOOL_ID));
+const COLLECTION_MAP_MAPPING_OPTIONS = Object.freeze([
+  Object.freeze({
+    id: 'textToImage',
+    label: 'Text to image',
+    inputKind: PORT_KIND_TEXT,
+    outputKind: PORT_KIND_IMAGE,
+    operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+    modes: Object.freeze(['cloud', 'localTool', 'graphWorkflow']),
+  }),
+  Object.freeze({
+    id: 'textToAudio',
+    label: 'Text to audio',
+    inputKind: PORT_KIND_TEXT,
+    outputKind: PORT_KIND_AUDIO,
+    operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+    modes: Object.freeze(['cloud', 'localTool']),
+  }),
+  Object.freeze({
+    id: 'imageToImage',
+    label: 'Image to image',
+    inputKind: PORT_KIND_IMAGE,
+    outputKind: PORT_KIND_IMAGE,
+    operationId: PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM,
+    modes: Object.freeze(['localTool']),
+  }),
+  Object.freeze({
+    id: 'audioToText',
+    label: 'Audio to text',
+    inputKind: PORT_KIND_AUDIO,
+    outputKind: PORT_KIND_TEXT,
+    operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE,
+    modes: Object.freeze(['localTool']),
+  }),
+  Object.freeze({
+    id: 'audioToAudio',
+    label: 'Audio to audio',
+    inputKind: PORT_KIND_AUDIO,
+    outputKind: PORT_KIND_AUDIO,
+    operationId: PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM,
+    modes: Object.freeze(['localTool']),
+  }),
+  Object.freeze({
+    id: 'imageToText',
+    label: 'Image to text',
+    inputKind: PORT_KIND_IMAGE,
+    outputKind: PORT_KIND_TEXT,
+    operationId: PIPELINE_OPERATION_IDS.IMAGE_ANALYZE,
+    modes: Object.freeze(['cloud', 'localTool']),
+  }),
+]);
 
 const WHISPER_MODELS = [
   { id: 'tiny', label: 'Tiny' },
@@ -232,6 +282,26 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       filePath: '',
+    },
+  }),
+  collectionInput: Object.freeze({
+    type: 'collectionInput',
+    label: 'Collection Input',
+    category: 'Inputs',
+    description: 'Defines an ordered same-type collection manually before a workflow run.',
+    inputPorts: [],
+    outputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_ANY,
+        allowedKinds: COLLECTION_ITEM_PORT_KINDS,
+        collectionBehavior: 'only',
+        label: 'Collection',
+      },
+    ],
+    configDefaults: {
+      itemType: PORT_KIND_TEXT,
+      items: [],
     },
   }),
   planningPacket: Object.freeze({
@@ -619,7 +689,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'collectionMap',
     label: 'Map Collection',
     category: 'Flow',
-    description: 'Applies one supported operation to every item in an ordered collection and emits a same-order collection with item lineage preserved. This first slice supports text prompts to generated images.',
+    description: 'Applies one supported operation to every item in an ordered typed collection and emits a same-order typed collection with item lineage preserved.',
     inputPorts: [
       {
         id: 'collection',
@@ -638,6 +708,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       },
     ],
     configDefaults: {
+      mappingId: 'textToImage',
       operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
       executionMode: 'cloud',
       providerId: '',
@@ -658,6 +729,24 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       steps: 24,
       cfgScale: 7,
       seed: -1,
+      audioMode: 'music',
+      durationSeconds: 8,
+      audioVoice: '',
+      transformSubtype: 'upscale',
+      analysisMode: 'clip',
+      scale: 4,
+      perItemValidation: {
+        enabled: false,
+        mode: 'llm',
+        llmExecutionMode: 'cloud',
+        providerId: '',
+        model: '',
+        ruleset: '',
+        systemPrompt: '',
+        maxAttempts: 2,
+        retryInstruction: '',
+        failMode: 'fail-fast',
+      },
     },
   }),
   collectionAccumulator: Object.freeze({
@@ -940,6 +1029,22 @@ function getSupportedPortKinds() {
   return [...SUPPORTED_PORT_KINDS];
 }
 
+function isValidCollectionInputItemType(value) {
+  return COLLECTION_ITEM_PORT_KINDS.includes(normalizePortKind(value));
+}
+
+function normalizeCollectionInputItemType(value) {
+  const normalized = normalizePortKind(value);
+  return COLLECTION_ITEM_PORT_KINDS.includes(normalized) ? normalized : PORT_KIND_TEXT;
+}
+
+function getCollectionInputItemType(node) {
+  return normalizeCollectionInputItemType(node?.config?.itemType);
+}
+
+function getCollectionInputItems(node) {
+  return Array.isArray(node?.config?.items) ? node.config.items : [];
+}
 function getPortCollectionBehavior(port) {
   const behavior = String(port?.collectionBehavior || '').trim().toLowerCase();
   return behavior === 'allow' || behavior === 'only' ? behavior : 'single';
@@ -1047,7 +1152,7 @@ function resolveDynamicInputKinds(node, port) {
   }
 
   if (node.type === 'collectionMap' && port.id === 'collection') {
-    return isSupportedCollectionMapOperation(node) ? [PORT_KIND_TEXT] : [];
+    return isSupportedCollectionMapOperation(node) ? [getCollectionMapInputKind(node)] : [];
   }
   if (node.type === 'validation' && port.id === 'input' && node.config?.mode === 'llm') {
     const executionMode = node?.config?.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud';
@@ -1234,13 +1339,85 @@ function getCollectionMapExecutionMode(node) {
   return 'cloud';
 }
 
+function inferCollectionMapMappingId(node) {
+  const requestedMappingId = String(node?.config?.mappingId || '').trim();
+  const requestedOperationId = String(node?.config?.operationId || '').trim();
+  const requestedMapping = COLLECTION_MAP_MAPPING_OPTIONS.find((entry) => entry.id === requestedMappingId) || null;
+  if (requestedMapping && (!requestedOperationId || requestedMapping.operationId === requestedOperationId)) {
+    return requestedMappingId;
+  }
+
+  const operationId = getCollectionMapOperationId(node);
+  const inputKind = normalizePortKind(node?.config?.inputItemKind || node?.config?.inputKind || '');
+  const outputKind = normalizePortKind(node?.config?.outputItemKind || node?.config?.outputKind || '');
+  const matched = COLLECTION_MAP_MAPPING_OPTIONS.find((entry) => (
+    entry.operationId === operationId
+    && (!inputKind || entry.inputKind === inputKind)
+    && (!outputKind || entry.outputKind === outputKind)
+  ));
+  return matched?.id || '';
+}
+
+function getCollectionMapMapping(node) {
+  const mappingId = inferCollectionMapMappingId(node);
+  return COLLECTION_MAP_MAPPING_OPTIONS.find((entry) => entry.id === mappingId) || null;
+}
+
 function getCollectionMapOperationId(node) {
   const requestedOperationId = String(node?.config?.operationId || '').trim();
-  return requestedOperationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  if (requestedOperationId) {
+    return requestedOperationId;
+  }
+
+  const requestedMappingId = String(node?.config?.mappingId || '').trim();
+  const mapping = COLLECTION_MAP_MAPPING_OPTIONS.find((entry) => entry.id === requestedMappingId);
+  return mapping?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+}
+
+function getCollectionMapInputKind(node) {
+  return getCollectionMapMapping(node)?.inputKind || PORT_KIND_TEXT;
+}
+
+function getCollectionMapOutputKind(node) {
+  return getCollectionMapMapping(node)?.outputKind || PORT_KIND_IMAGE;
+}
+
+function getCollectionMapLocalToolIds(node) {
+  const operationId = getCollectionMapOperationId(node);
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+    return ['upscayl'];
+  }
+  if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
+    return ['whisper'];
+  }
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+    return ['rvc'];
+  }
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+    return AUDIO_WORKFLOW_TOOL_IDS;
+  }
+  return IMAGE_WORKFLOW_TOOL_IDS;
+}
+
+function getCollectionMapFallbackTargetLabel(node) {
+  const operationId = getCollectionMapOperationId(node);
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+    return 'AudioCraft WebUI';
+  }
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
+    return 'RVC';
+  }
+  if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
+    return 'Whisper';
+  }
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+    return 'Upscayl';
+  }
+  return 'Automatic1111 or Forge';
 }
 
 function isSupportedCollectionMapOperation(node) {
-  return getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+  return Boolean(getCollectionMapMapping(node));
 }
 function getImageTransformSubtypeOptions(toolId = '') {
   const normalizedToolId = String(toolId || '').trim().toLowerCase();
@@ -1481,6 +1658,30 @@ function getPipelineNodePorts(nodeOrType, direction) {
     return (specs || []).map(buildGraphWorkflowPortDefinition).filter(Boolean);
   }
 
+  if (node?.type === 'collectionInput' && direction === 'output') {
+    const itemType = getCollectionInputItemType(node);
+    return [
+      {
+        id: 'collection',
+        kind: itemType,
+        collectionBehavior: 'only',
+        label: formatPortKindLabel(createCollectionPortKind(itemType)),
+      },
+    ];
+  }
+
+  if (node?.type === 'collectionMap') {
+    const itemType = direction === 'input' ? getCollectionMapInputKind(node) : getCollectionMapOutputKind(node);
+    return [
+      {
+        id: 'collection',
+        kind: itemType,
+        collectionBehavior: 'only',
+        label: formatPortKindLabel(createCollectionPortKind(itemType)),
+        required: direction === 'input',
+      },
+    ];
+  }
   const portList = direction === 'input' ? definition?.inputPorts : definition?.outputPorts;
   return portList || [];
 }
@@ -1488,6 +1689,43 @@ function getPipelineNodePorts(nodeOrType, direction) {
 function getPortDefinition(nodeOrType, direction, portId) {
   return getPipelineNodePorts(nodeOrType, direction).find((port) => port.id === portId) || null;
 }
+
+function resolveCollectionOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) {
+  if (!sourceNode || !sourcePort || !graph || sourcePort.id !== 'collection') {
+    return [];
+  }
+
+  if (sourceNode.type === 'collectionInput') {
+    const itemType = getCollectionInputItemType(sourceNode);
+    return itemType ? [createCollectionPortKind(itemType)].filter(Boolean) : [];
+  }
+  if (sourceNode.type === 'collectionMap') {
+    const itemType = getCollectionMapOutputKind(sourceNode);
+    return itemType ? [createCollectionPortKind(itemType)].filter(Boolean) : [];
+  }
+
+  if (sourceNode.type === 'collectionBuilder') {
+    const itemKinds = getIncomingKindsForNodePort(sourceNode, 'items', graph)
+      .filter((kind) => !isCollectionPortKind(kind));
+    const existingItemKinds = getIncomingKindsForNodePort(sourceNode, 'existing', graph)
+      .map((kind) => getCollectionItemKind(kind))
+      .filter(Boolean);
+    return uniqueKindList([...(itemKinds.length ? itemKinds : []), ...existingItemKinds])
+      .map((kind) => createCollectionPortKind(kind))
+      .filter(Boolean);
+  }
+
+  if (sourceNode.type === 'collectionAccumulator') {
+    return uniqueKindList(
+      getIncomingKindsForNodePort(sourceNode, 'item', graph).filter((kind) => !isCollectionPortKind(kind)),
+    )
+      .map((kind) => createCollectionPortKind(kind))
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
 function resolveOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) {
   if (!sourcePort) {
     return [];
@@ -1495,6 +1733,11 @@ function resolveOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) 
 
   const normalizedKind = normalizePortKind(sourcePort.kind);
   const explicitKinds = getPortAllowedKinds(sourcePort, { direction: 'output', node: sourceNode || null });
+  const resolvedCollectionKinds = resolveCollectionOutputKinds(sourceNode, sourcePort, graph, visited);
+  if (resolvedCollectionKinds.length) {
+    return resolvedCollectionKinds;
+  }
+
   if (normalizedKind && normalizedKind !== PORT_KIND_PASSTHROUGH && normalizedKind !== PORT_KIND_ANY) {
     return explicitKinds.length ? explicitKinds : [normalizedKind];
   }
@@ -1502,7 +1745,6 @@ function resolveOutputKinds(sourceNode, sourcePort, graph, visited = new Set()) 
   if (normalizedKind === PORT_KIND_ANY) {
     return explicitKinds.length ? explicitKinds : getSupportedPortKinds();
   }
-
   if (!sourceNode || !graph) {
     return [];
   }
@@ -2305,7 +2547,8 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
 
   if (node.type === 'collectionMap') {
     const operationId = getCollectionMapOperationId(node);
-    if (!isSupportedCollectionMapOperation(node)) {
+    const mapping = getCollectionMapMapping(node);
+    if (!mapping) {
       return {
         capability: null,
         operationId,
@@ -2315,15 +2558,26 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
       };
     }
 
-    if (getCollectionMapExecutionMode(node) === 'graphWorkflow') {
+    const executionMode = getCollectionMapExecutionMode(node);
+    if (!mapping.modes.includes(executionMode)) {
+      return {
+        capability: null,
+        operationId,
+        targetId: '',
+        targetKind: 'collection-map',
+        targetLabel: 'Map Collection',
+      };
+    }
+
+    if (executionMode === 'graphWorkflow') {
       const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
       const tool = support.toolId ? getContextToolEntry(support.toolId, contextMaps) : null;
       return {
         capability: support.usable
           ? {
-              inputKinds: [PORT_KIND_TEXT],
+              inputKinds: [mapping.inputKind],
               notes: support.message,
-              outputKinds: [PORT_KIND_IMAGE],
+              outputKinds: [mapping.outputKind],
             }
           : null,
         operationId,
@@ -2333,16 +2587,22 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
       };
     }
 
-    if (getCollectionMapExecutionMode(node) === 'localTool') {
-      const effectiveToolId = getImageToolIdForNode(node, contextMaps);
-      const toolIds = effectiveToolId ? [effectiveToolId] : IMAGE_WORKFLOW_TOOL_IDS;
+    if (executionMode === 'localTool') {
+      const selectedToolId = String(node?.config?.toolId || '').trim().toLowerCase();
+      const supportedToolIds = getCollectionMapLocalToolIds(node);
+      const effectiveToolId = selectedToolId && supportedToolIds.includes(selectedToolId)
+        ? selectedToolId
+        : operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE || operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE
+          ? getImageToolIdForNode(node, contextMaps)
+          : pickAvailableToolId(supportedToolIds, contextMaps);
+      const toolIds = effectiveToolId ? [effectiveToolId] : supportedToolIds;
       const tool = effectiveToolId ? getContextToolEntry(effectiveToolId, contextMaps) : null;
       return {
         capability: mergeCapabilityOperations(toolIds.map((toolId) => getContextToolOperation(toolId, operationId, contextMaps))),
         operationId,
         targetId: effectiveToolId || '',
         targetKind: 'tool',
-        targetLabel: tool?.name || 'Automatic1111 or Forge',
+        targetLabel: tool?.name || getCollectionMapFallbackTargetLabel(node),
       };
     }
 
@@ -2727,6 +2987,106 @@ function getValidationModalitySupportState(node, capabilitySummary, contextMaps 
     status: 'supported',
     message: '',
   };
+}
+
+function getCollectionMapPerItemValidationConfig(node) {
+  const raw = node?.config?.perItemValidation && typeof node.config.perItemValidation === 'object'
+    ? node.config.perItemValidation
+    : {};
+  return {
+    enabled: Boolean(raw.enabled),
+    llmExecutionMode: raw.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud',
+    maxAttempts: Math.floor(Number(raw.maxAttempts || 1) || 1),
+    mode: raw.mode === 'user' ? 'user' : 'llm',
+    model: String(raw.model || '').trim(),
+    providerId: String(raw.providerId || '').trim(),
+    ruleset: String(raw.ruleset || '').trim(),
+  };
+}
+
+function getCollectionMapPerItemValidationIssue(node, mapping, contextMaps = {}) {
+  const config = getCollectionMapPerItemValidationConfig(node);
+  if (!config.enabled) {
+    return null;
+  }
+
+  if (!Number.isInteger(config.maxAttempts) || config.maxAttempts < 1 || config.maxAttempts > PIPELINE_RETRY_LOOP_MAX_ATTEMPTS) {
+    return {
+      tone: 'error',
+      message: 'Set per-item Map Collection attempts to a whole number from 1 to ' + PIPELINE_RETRY_LOOP_MAX_ATTEMPTS + '.',
+    };
+  }
+
+  if (config.mode === 'user') {
+    return null;
+  }
+
+  if (!config.ruleset) {
+    return {
+      tone: 'error',
+      message: 'Describe the pass and fail rules before enabling per-item validation for Map Collection.',
+    };
+  }
+
+  const validationNode = {
+    ...node,
+    type: 'validation',
+    config: {
+      llmExecutionMode: config.llmExecutionMode,
+      mode: 'llm',
+      model: config.model,
+      providerId: config.providerId,
+      ruleset: config.ruleset,
+    },
+  };
+  const capabilitySummary = buildNodeCapabilitySummary(validationNode, contextMaps);
+  if (capabilitySummary?.supported === false) {
+    return {
+      tone: 'error',
+      message: capabilitySummary.message,
+    };
+  }
+
+  if (!doesValidationCapabilityAcceptKind(capabilitySummary, mapping.outputKind)) {
+    return {
+      tone: 'error',
+      message: (capabilitySummary?.targetLabel || 'This validator') + ' cannot validate mapped ' + formatPortKindLabel(mapping.outputKind).toLowerCase() + ' items inside Map Collection yet. Choose a validator that supports this output kind or validate the collection after mapping.',
+    };
+  }
+
+  if (config.llmExecutionMode === 'ollama') {
+    if (!config.model) {
+      return {
+        tone: 'error',
+        message: 'Choose or enter an Ollama model for per-item Map Collection validation.',
+      };
+    }
+    const tool = getContextToolEntry('ollama', contextMaps);
+    if (!tool) {
+      return {
+        tone: 'error',
+        message: 'Install Ollama before using local per-item Map Collection validation.',
+      };
+    }
+    return null;
+  }
+
+  const providerStatus = getSelectedProviderStatus(config.providerId, contextMaps);
+  if (providerStatus.tone === 'error') {
+    return {
+      tone: 'error',
+      message: providerStatus.message || 'Choose a connected cloud provider for per-item Map Collection validation.',
+    };
+  }
+
+  if (doesProviderOperationRequireExplicitModel(config.providerId, PIPELINE_OPERATION_IDS.VALIDATION_LLM) && !config.model) {
+    return {
+      tone: 'error',
+      message: 'Choose or enter a model for per-item Map Collection validation.',
+    };
+  }
+
+  return null;
 }
 
 function getConnectedOutputPortEntries(node, graph) {
@@ -3381,7 +3741,15 @@ function getLocalToolRequirement(node, contextMaps = {}) {
   }
 
   if (node.type === 'collectionMap' && getCollectionMapExecutionMode(node) === 'localTool') {
-    return getImageToolIdForNode(node, contextMaps);
+    const operationId = getCollectionMapOperationId(node);
+    if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE || operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
+      return getImageToolIdForNode(node, contextMaps);
+    }
+    const selectedToolId = String(node?.config?.toolId || '').trim().toLowerCase();
+    const supportedToolIds = getCollectionMapLocalToolIds(node);
+    return selectedToolId && supportedToolIds.includes(selectedToolId)
+      ? selectedToolId
+      : pickAvailableToolId(supportedToolIds, contextMaps);
   }
 
   if (node.type === 'collectionMap' && getCollectionMapExecutionMode(node) === 'graphWorkflow') {
@@ -3505,6 +3873,50 @@ function analyzeInputFileNode(node, summary) {
   return true;
 }
 
+function analyzeCollectionInputNode(node, summary) {
+  if (!isValidCollectionInputItemType(node?.config?.itemType)) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Choose a collection item type before running this pipeline.',
+    };
+    return false;
+  }
+
+  const itemType = getCollectionInputItemType(node);
+  const items = getCollectionInputItems(node);
+  if (!items.length) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'Add at least one item to this Collection Input before running the pipeline.',
+    };
+    return false;
+  }
+
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index] || {};
+    if (itemType === PORT_KIND_TEXT) {
+      if (!String(item.text || item.value || '').trim()) {
+        summary.readiness = {
+          tone: 'error',
+          message: 'Collection Input item ' + (index + 1) + ' needs text before running the pipeline.',
+        };
+        return false;
+      }
+    } else if (!String(item.filePath || item.path || '').trim()) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Collection Input item ' + (index + 1) + ' needs a selected ' + formatPortKindLabel(itemType).toLowerCase() + ' file before running the pipeline.',
+      };
+      return false;
+    }
+  }
+
+  summary.readiness = {
+    tone: 'info',
+    message: 'This node will emit an ordered ' + formatPortKindLabel(createCollectionPortKind(itemType)).toLowerCase() + ' with ' + items.length + ' item' + (items.length === 1 ? '' : 's') + '.',
+  };
+  return true;
+}
 function canToolLikelyLaunch(tool) {
   if (!tool || tool.launchSupported === false) {
     return false;
@@ -4112,6 +4524,11 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
+      if (node.type === 'collectionInput') {
+        if (!analyzeCollectionInputNode(node, summary)) {
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        }
+      }
       if (node.type === 'llmPrompt') {
         const executionMode = getModelStepExecutionMode(node);
         const operationId = getModelStepOperationId(node);
@@ -4576,18 +4993,32 @@ function analyzePipeline(definition = {}, context = {}) {
         const connectedKinds = getIncomingKindsForNodePort(node, 'collection', graph);
         const executionMode = getCollectionMapExecutionMode(node);
         const operationId = getCollectionMapOperationId(node);
-        if (!isSupportedCollectionMapOperation(node)) {
+        const mapping = getCollectionMapMapping(node);
+        if (!mapping) {
           summary.readiness = {
             tone: 'error',
-            message: 'Map Collection currently supports text collection to image collection only. Choose Image generation or use another explicit pipeline step.',
+            message: 'Map Collection does not support that input/output operation pair yet. Choose a listed mapping or use an explicit Model Step for a single artifact.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (!connectedKinds.includes(createCollectionPortKind(PORT_KIND_TEXT))) {
+        } else if (!connectedKinds.includes(createCollectionPortKind(mapping.inputKind))) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect an ordered text collection before mapping it through image generation.',
+            message: 'Connect an ordered ' + formatPortKindLabel(createCollectionPortKind(mapping.inputKind)).toLowerCase() + ' before running this map.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!mapping.modes.includes(executionMode)) {
+          summary.readiness = {
+            tone: 'error',
+            message: mapping.label + ' is not available through ' + (executionMode === 'localTool' ? 'local tool' : executionMode === 'graphWorkflow' ? 'graph workflow' : 'cloud provider') + ' mode. Choose a supported mode for this mapping.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (getCollectionMapPerItemValidationIssue(node, mapping, contextMaps)) {
+          const validationIssue = getCollectionMapPerItemValidationIssue(node, mapping, contextMaps);
+          summary.readiness = {
+            tone: validationIssue.tone,
+            message: validationIssue.message,
+          };
+          issues.push(buildNodeIssue(node, validationIssue.tone, validationIssue.message));
         } else if (executionMode === 'graphWorkflow') {
           const ready = analyzeCollectionMapGraphWorkflowNode(node, summary, contextMaps);
           if (!ready || summary.readiness.tone === 'error') {
@@ -4598,22 +5029,48 @@ function analyzePipeline(definition = {}, context = {}) {
             issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
           }
         } else if (executionMode === 'localTool') {
-          if (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256) {
+          const selectedToolId = String(node.config?.toolId || '').trim().toLowerCase();
+          const supportedToolIds = getCollectionMapLocalToolIds(node);
+          if (selectedToolId && !supportedToolIds.includes(selectedToolId)) {
+            summary.readiness = {
+              tone: 'error',
+              message: mapping.label + ' is not supported by the selected local tool in Map Collection. Choose ' + getCollectionMapFallbackTargetLabel(node) + ' or use an explicit Model Step for this item.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE && (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256)) {
             summary.readiness = {
               tone: 'error',
               message: 'Use at least 256 by 256 for mapped local image generation.',
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM && !selectedToolId && !pickAvailableToolId(supportedToolIds, contextMaps)) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Install Upscayl before using image-to-image Map Collection. FaceFusion collection mapping is deferred until a shared reference image can be configured.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
           } else {
-            const ready = analyzeImageToolNode(node, summary, contextMaps);
+            const localNode = {
+              ...node,
+              type: 'llmPrompt',
+              config: {
+                ...node.config,
+                toolId: selectedToolId || pickAvailableToolId(supportedToolIds, contextMaps) || '',
+              },
+            };
+            const ready = analyzeModelStepLocalToolNode(localNode, summary, contextMaps, [mapping.inputKind], []);
             if (!ready || summary.readiness.tone === 'error') {
               issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
             } else if (summary.readiness.tone === 'warn') {
+              summary.readiness = {
+                tone: 'warn',
+                message: summary.readiness.message + ' Map Collection will run this once per item and stop on the first failed item.',
+              };
               issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
             } else {
               summary.readiness = {
                 tone: 'info',
-                message: summary.readiness.message + ' Map Collection will generate one image for each text item and keep the original order.',
+                message: summary.readiness.message + ' Map Collection will emit an ordered ' + formatPortKindLabel(createCollectionPortKind(mapping.outputKind)).toLowerCase() + ' and keep item lineage.',
               };
               issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
             }
@@ -4624,23 +5081,46 @@ function analyzePipeline(definition = {}, context = {}) {
             message: summary.capabilitySummary.message,
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!(summary.capabilitySummary?.inputKinds || []).includes(mapping.inputKind)) {
+          summary.readiness = {
+            tone: 'error',
+            message: (summary.capabilitySummary?.targetLabel || 'This target') + ' does not accept ' + formatPortKindLabel(mapping.inputKind).toLowerCase() + ' items for ' + mapping.label.toLowerCase() + '.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!(summary.capabilitySummary?.outputKinds || []).includes(mapping.outputKind)) {
+          summary.readiness = {
+            tone: 'error',
+            message: (summary.capabilitySummary?.targetLabel || 'This target') + ' does not return ' + formatPortKindLabel(mapping.outputKind).toLowerCase() + ' items for ' + mapping.label.toLowerCase() + '.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (doesProviderOperationRequireExplicitModel(String(node.config?.providerId || '').trim(), operationId) && !String(node.config?.model || '').trim()) {
           summary.readiness = {
             tone: 'error',
-            message: 'Choose or enter an image model before mapping this text collection.',
+            message: 'Choose or enter a model before mapping this collection.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else {
           const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
-          summary.readiness = providerStatus.tone === 'good'
+          const modelSupport = getModelStepSupportState(node, summary.capabilitySummary, contextMaps, [mapping.inputKind]);
+          summary.readiness = providerStatus.tone !== 'good'
             ? {
-                tone: 'info',
-                message: (providerStatus.provider?.name || 'That provider') + ' will generate one image for each text item and keep the original collection order.',
-              }
-            : {
                 tone: providerStatus.tone,
                 message: providerStatus.message,
-              };
+              }
+            : modelSupport.status === 'unsupported'
+              ? {
+                  tone: 'error',
+                  message: modelSupport.message,
+                }
+              : modelSupport.status === 'unknown'
+                ? {
+                    tone: 'warn',
+                    message: modelSupport.message || providerStatus.message,
+                  }
+                : {
+                    tone: 'info',
+                    message: (providerStatus.provider?.name || 'That provider') + ' will run ' + mapping.label.toLowerCase() + ' once per item and keep the original collection order.',
+                  };
           issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
         }
       }
@@ -4840,6 +5320,7 @@ module.exports = {
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
   AUDIO_WORKFLOW_TOOL_IDS,
   AUDIO_TRANSFORM_TOOL_IDS,
+  COLLECTION_MAP_MAPPING_OPTIONS,
   IMAGE_TRANSFORM_TOOL_IDS,
   PORT_KIND_ANY,
   PORT_KIND_AUDIO,
@@ -4885,6 +5366,10 @@ module.exports = {
   getGraphWorkflowOperationBackendSupport,
   getGraphWorkflowToolId,
   getImageToolIdForNode,
+  getCollectionMapInputKind,
+  getCollectionMapMapping,
+  getCollectionMapOperationId,
+  getCollectionMapOutputKind,
   getDefaultImageTransformSubtype,
   getImageTransformSubtypeLabel,
   getImageTransformSubtypeOptions,

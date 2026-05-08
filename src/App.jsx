@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AiderPanel from './components/AiderPanel';
 import CloudChatPanel from './components/CloudChatPanel';
 import ConnectionsPanel from './components/ConnectionsPanel';
@@ -7,7 +7,6 @@ import KoboldCppSetupDialog from './components/KoboldCppSetupDialog';
 import LibraryCard from './components/LibraryCard';
 import ModelManager from './components/ModelManager';
 import OllamaChatPanel from './components/OllamaChatPanel';
-import PipelineBuilderPanel from './components/PipelineBuilderPanel';
 import ProviderCard from './components/ProviderCard';
 import ResourceStrip from './components/ResourceStrip';
 import SettingsPanel from './components/SettingsPanel';
@@ -18,6 +17,8 @@ import ToolUpdatesPanel from './components/ToolUpdatesPanel';
 import WhisperPanel from './components/WhisperPanel';
 import { formatBytes, formatUsage } from './lib/formatters';
 import { evaluateCompatibility, toolSearchText } from './lib/tool-ui';
+
+const PipelineBuilderPanel = lazy(() => import('./components/PipelineBuilderPanel'));
 
 const EMPTY_STATE = {
   appDataPath: '',
@@ -2057,13 +2058,15 @@ export default function App() {
           ) : activeTab === 'models' ? (
             <ModelManager onToast={pushToast} tools={tools} />
           ) : activeTab === 'pipelines' ? (
-            <PipelineBuilderPanel
-              hardware={appState.hardware}
-              manifests={appState.manifests}
-              onToast={pushToast}
-              providers={providers}
-              tools={tools}
-            />
+            <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-slate-300">Loading Pipelines...</div>}>
+              <PipelineBuilderPanel
+                hardware={appState.hardware}
+                manifests={appState.manifests}
+                onToast={pushToast}
+                providers={providers}
+                tools={tools}
+              />
+            </Suspense>
           ) : activeTab === 'statistics' ? (
             <StatisticsPanel
               busy={statisticsManualBusy}
