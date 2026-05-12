@@ -635,6 +635,43 @@ async function main() {
   assert(/Map Collection item 2 of 2.*failed validation after 1 attempt.*Mock validator rejected item 2/i.test(perItemValidationFailureSnapshot.message), 'validation failure should report item index/id and reason: ' + perItemValidationFailureSnapshot.message);
 
   providerImageGenerationPrompts.length = 0;
+  perItemValidationRequests.length = 0;
+  perItemValidationDecisionsByItemLabel.clear();
+  const partialValidationFailurePipeline = buildCollectionMapPipeline({
+    mapConfig: {
+      failureMode: 'partial',
+      perItemValidation: {
+        enabled: true,
+        mode: 'llm',
+        llmExecutionMode: 'cloud',
+        providerId: 'openai',
+        model: 'gpt-4o',
+        ruleset: 'Pass only if the generated image satisfies the source prompt.',
+        maxAttempts: 1,
+      },
+    },
+  });
+  await runPipeline(partialValidationFailurePipeline);
+  const partialValidationFailureSnapshot = await waitForRunToFinish();
+  assert.strictEqual(partialValidationFailureSnapshot.status, 'completed', partialValidationFailureSnapshot.message);
+  const partialValidationMapState = partialValidationFailureSnapshot.nodeStates['map-prompts'];
+  assert.strictEqual(partialValidationMapState.selectedBranch, 'partial', 'partial validation failure should mark the map branch as partial.');
+  const partialValidationCollection = partialValidationMapState.outputs.collection;
+  assert.strictEqual(partialValidationCollection.collectionStatus, 'partial', 'partial validation output should be marked partial.');
+  assert.strictEqual(partialValidationCollection.partial, true, 'partial validation output should carry a partial flag.');
+  assert.strictEqual(partialValidationCollection.itemCount, 1, 'partial validation output should include only previous successful items.');
+  assert.strictEqual(partialValidationCollection.sourceItemCount, 2, 'partial validation manifest should record the original source count.');
+  assert.strictEqual(partialValidationCollection.failedItemCount, 1, 'partial validation manifest should record one failed item.');
+  assert.strictEqual(partialValidationCollection.failedItems[0].sourceItemIndex, 1, 'failed validation metadata should preserve the failed source index.');
+  assert(partialValidationCollection.failedItems[0].sourceItemId, 'failed validation metadata should include the failed source item id.');
+  assert.strictEqual(partialValidationCollection.failedItems[0].failureKind, 'validation', 'failed validation metadata should identify validation failures.');
+  assert.strictEqual(partialValidationCollection.failedItems[0].attempts.length, 1, 'failed validation metadata should keep attempt metadata.');
+  assert.strictEqual(partialValidationCollection.items[0].lineage.sourceItemIndex, 0, 'partial validation output should preserve successful item lineage.');
+  assert.strictEqual(partialValidationCollection.items.some((entry) => entry.lineage.sourceItemIndex === 1), false, 'failed validation artifact should not be included as a successful final item.');
+  const partialValidationOutput = partialValidationFailureSnapshot.nodeStates['image-output'].outputs.collection;
+  assert.strictEqual(partialValidationOutput.collectionStatus, 'partial', 'Collection Output should preserve partial status for explicit partial inputs.');
+  assert.strictEqual(partialValidationOutput.failedItemCount, 1, 'Collection Output should preserve failed item metadata count.');
+  providerImageGenerationPrompts.length = 0;
   const manualPerItemValidationPipeline = buildCollectionMapPipeline({
     mapConfig: {
       perItemValidation: {
@@ -745,6 +782,47 @@ async function main() {
   const unsupportedImageAudioAnalysis = analyzePipeline(unsupportedImageAudio, { tools: [createTool('audiocraft-webui', 'AudioCraft WebUI')], toolCatalog: [createTool('audiocraft-webui', 'AudioCraft WebUI')] });
   assert(unsupportedImageAudioAnalysis.issues.some((issue) => /does not support that input\/output operation pair|does not accept image/i.test(issue.message)), 'unsupported collection mappings should be rejected honestly.');
 
+  mockedInstalledTools = [createTool('audiocraft-webui', 'AudioCraft WebUI')];
+  const partialTextToAudioPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'partial-a', text: 'soft rain on glass' },
+      { id: 'partial-b', text: 'city street at sunrise' },
+      { id: 'partial-c', text: 'distant thunder' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      failureMode: 'partial',
+      mappingId: 'textToAudio',
+      operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'audiocraft-webui',
+      audioMode: 'music',
+      durationSeconds: 2,
+      instruction: 'Short ambient loop.',
+    },
+  });
+  failSecondAudioGeneration = true;
+  await runPipeline(partialTextToAudioPipeline);
+  const partialOperationSnapshot = await waitForRunToFinish();
+  failSecondAudioGeneration = false;
+  assert.strictEqual(partialOperationSnapshot.status, 'completed', partialOperationSnapshot.message);
+  const partialOperationMapState = partialOperationSnapshot.nodeStates['map-collection'];
+  assert.strictEqual(partialOperationMapState.selectedBranch, 'partial', 'partial operation failure should mark the map branch as partial.');
+  const partialOperationCollection = partialOperationMapState.outputs.collection;
+  assert.strictEqual(partialOperationCollection.collectionStatus, 'partial', 'partial operation output should be marked partial.');
+  assert.strictEqual(partialOperationCollection.itemCount, 1, 'partial operation output should keep only successful items before the failure.');
+  assert.strictEqual(partialOperationCollection.sourceItemCount, 3, 'partial operation manifest should record all source items.');
+  assert.strictEqual(partialOperationCollection.successfulItemCount, 1, 'partial operation manifest should record successful item count.');
+  assert.strictEqual(partialOperationCollection.failedItemCount, 1, 'partial operation manifest should record failed item count.');
+  assert.strictEqual(partialOperationCollection.items[0].itemId, 'partial-a', 'partial operation output should preserve successful source item ids.');
+  assert.deepStrictEqual(partialOperationCollection.items.map((entry) => entry.lineage.sourceItemIndex), [0], 'partial operation output should preserve successful item order.');
+  assert.strictEqual(partialOperationCollection.failedItems[0].sourceItemIndex, 1, 'partial operation failure metadata should include failed item index.');
+  assert.strictEqual(partialOperationCollection.failedItems[0].sourceItemId, 'partial-b', 'partial operation failure metadata should include failed item id.');
+  assert(/mock AudioCraft failure/i.test(partialOperationCollection.failedItems[0].reason), 'partial operation failure metadata should include the plain-English reason.');
+  assert.strictEqual(partialOperationCollection.items.some((entry) => /partial-b/.test(entry.itemId)), false, 'failed operation item should not be included as a successful final item.');
+  const partialOperationOutput = partialOperationSnapshot.nodeStates['mapped-output'].outputs.collection;
+  assert.strictEqual(partialOperationOutput.collectionStatus, 'partial', 'Collection Output should save partial operation collections honestly.');
+  assert.strictEqual(partialOperationOutput.failedItems[0].sourceItemId, 'partial-b', 'Collection Output should preserve failed item details.');
   mockedInstalledTools = [createTool('audiocraft-webui', 'AudioCraft WebUI')];
   failSecondAudioGeneration = true;
   await runPipeline(textToAudioPipeline);

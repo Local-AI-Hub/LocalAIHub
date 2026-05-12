@@ -870,8 +870,18 @@ export default function App() {
           ...(current?.totalDiskUsage || {}),
           ...(payload?.totalDiskUsage || {}),
         };
+        if (payload?.totalDiskUsage?.localAIHubBytes === null && typeof current?.totalDiskUsage?.localAIHubBytes === 'number') {
+          next.totalDiskUsage.localAIHubBytes = current.totalDiskUsage.localAIHubBytes;
+        }
       }
 
+
+      if (current?.sectionFreshness || payload?.sectionFreshness) {
+        next.sectionFreshness = {
+          ...(current?.sectionFreshness || {}),
+          ...(payload?.sectionFreshness || {}),
+        };
+      }
       if (section === 'core') {
         next.storageRoots = current?.storageRoots || [];
         next.toolBreakdown = current?.toolBreakdown || [];
@@ -885,7 +895,7 @@ export default function App() {
     const manual = Boolean(options.manual);
     const silent = Boolean(options.silent);
     const loadedAt = statisticsSectionLoadedAtRef.current[section] || 0;
-    const hasFreshSection = loadedAt && Date.now() - loadedAt < STATISTICS_CACHE_MS;
+    const hasFreshSection = section !== 'storage' && loadedAt && Date.now() - loadedAt < STATISTICS_CACHE_MS;
 
     if (!manual && hasFreshSection) {
       logStatisticsCacheEvent('Statistics section cache hit.', {
@@ -923,7 +933,8 @@ export default function App() {
 
     try {
       const request = section === 'storage' ? window.localAIHub.getStatisticsStorage : window.localAIHub.getStatisticsCore;
-      const result = await request();
+      const requestPayload = section === 'storage' ? { forceRefresh: manual } : undefined;
+      const result = await request(requestPayload);
       if (!result?.ok) {
         const fallback = section === 'storage'
           ? 'Local AI Hub could not load storage statistics right now.'
@@ -1929,12 +1940,17 @@ export default function App() {
     );
   }
 
+  const containedTab = ['library', 'store', 'models', 'pipelines', 'statistics', 'settings'].includes(activeTab);
   const shellGridClassName = activeTab === 'pipelines'
-    ? 'mx-auto grid max-w-[1760px] gap-5 xl:grid-cols-[280px,minmax(0,1fr)]'
-    : 'mx-auto grid max-w-[1600px] gap-5 xl:grid-cols-[280px,1fr]';
+    ? `mx-auto grid max-w-[1760px] gap-5 xl:grid-cols-[280px,minmax(0,1fr)] ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`
+    : `mx-auto grid max-w-[1600px] gap-5 xl:grid-cols-[280px,1fr] ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`;
+  const appShellClassName = containedTab
+    ? 'min-h-screen bg-shell px-5 py-5 text-white xl:h-[calc(100dvh-32px)] xl:max-h-[calc(100dvh-32px)] xl:min-h-0 xl:overflow-hidden lg:px-6'
+    : 'min-h-screen bg-shell px-5 py-5 text-white lg:px-6';
+  const mainClassName = containedTab ? 'flex min-h-0 min-w-0 flex-col gap-5 overflow-hidden' : 'min-w-0 space-y-5';
 
   return (
-    <div className="min-h-screen bg-shell px-5 py-5 text-white lg:px-6">
+    <div className={appShellClassName}>
       <div className={shellGridClassName}>
         <Sidebar
           activeTab={activeTab}
@@ -1948,7 +1964,7 @@ export default function App() {
           storeCount={availableStoreTools.length}
         />
 
-        <main className="min-w-0 space-y-5">
+        <main className={mainClassName}>
           <ResourceStrip
             activeTab={activeTab}
             installedCount={libraryCount}
@@ -1959,8 +1975,9 @@ export default function App() {
           />
 
           {activeTab === 'library' ? (
-            <section className="space-y-4">
-              <ToolUpdatesPanel busyMap={busyMap} onUpdateTool={updateLibraryTool} summary={toolUpdateSummary} />
+            <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+              <div className="flex-none space-y-3 overflow-y-auto pb-3 pr-1 [max-height:45vh]">
+                <ToolUpdatesPanel busyMap={busyMap} onUpdateTool={updateLibraryTool} summary={toolUpdateSummary} />
 
               {activeCloudProvider ? (
                 <CloudChatPanel
@@ -2029,52 +2046,55 @@ export default function App() {
                   tool={aiderTool}
                 />
               ) : null}
+              </div>
 
-              {connectedProviders.map((provider) => (
-                <ProviderCard
-                  key={provider.id}
-                  busyMap={busyMap}
-                  onOpenChat={openCloudProviderChat}
-                  onOpenSettings={() => setActiveTab('settings')}
-                  provider={provider}
-                />
-              ))}
+              <div className="min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
+                <div className="grid gap-3 xl:grid-cols-2">
+                {connectedProviders.map((provider) => (
+                  <ProviderCard
+                    key={provider.id}
+                    busyMap={busyMap}
+                    onOpenChat={openCloudProviderChat}
+                    onOpenSettings={() => setActiveTab('settings')}
+                    provider={provider}
+                  />
+                ))}
 
-              {tools.map((tool) => (
-                <LibraryCard
-                  key={tool.id}
-                  busyMap={busyMap}
-                  launchProgress={launchProgressMap[tool.id]}
-                  migrationBusy={busyMap['settings:migrate-legacy']}
-                  migrationEligible={migratableToolIds.has(tool.id)}
-                  onLaunch={launchLibraryTool}
-                  onOpenKoboldSetup={() =>
-                    openKoboldSetup({
-                      autoLaunch: false,
-                      notice: 'Choose the GGUF file Local AI Hub should use for future KoboldCpp launches.',
-                    })
-                  }
-                  onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
-                  onMigrateManagedData={migrateLegacyStorage}
-                  onOpenInterface={openEmbeddedToolUi}
-                  onRepair={() => repairLibraryTool(tool)}
-                  onRestoreSnapshot={(toolId, snapshotFileName) =>
-                    runAction(`restore:${toolId}`, () => window.localAIHub.restoreSnapshot({ toolId, snapshotFileName }))
-                  }
-                  onSaveSnapshot={(toolId) => runAction(`snapshot:${toolId}`, () => window.localAIHub.saveSnapshot(toolId))}
-                  onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
-                  onToggleSettings={toggleLibraryToolSettings}
-                  onUninstall={uninstallLibraryTool}
-                  onUpdate={updateLibraryTool}
-                  progress={progressMap[tool.id]}
-                  runningUsageLabel={runningUsageLabel}
-                  settingsOpen={settingsToolId === tool.id}
-                  tool={tool}
-                  updateInfo={toolUpdateMap[tool.id]}
-                  updateProgress={updateProgressMap[tool.id]}
-                />
-              ))}
-
+                {tools.map((tool) => (
+                  <LibraryCard
+                    key={tool.id}
+                    busyMap={busyMap}
+                    launchProgress={launchProgressMap[tool.id]}
+                    migrationBusy={busyMap['settings:migrate-legacy']}
+                    migrationEligible={migratableToolIds.has(tool.id)}
+                    onLaunch={launchLibraryTool}
+                    onOpenKoboldSetup={() =>
+                      openKoboldSetup({
+                        autoLaunch: false,
+                        notice: 'Choose the GGUF file Local AI Hub should use for future KoboldCpp launches.',
+                      })
+                    }
+                    onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
+                    onMigrateManagedData={migrateLegacyStorage}
+                    onOpenInterface={openEmbeddedToolUi}
+                    onRepair={() => repairLibraryTool(tool)}
+                    onRestoreSnapshot={(toolId, snapshotFileName) =>
+                      runAction(`restore:${toolId}`, () => window.localAIHub.restoreSnapshot({ toolId, snapshotFileName }))
+                    }
+                    onSaveSnapshot={(toolId) => runAction(`snapshot:${toolId}`, () => window.localAIHub.saveSnapshot(toolId))}
+                    onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
+                    onToggleSettings={toggleLibraryToolSettings}
+                    onUninstall={uninstallLibraryTool}
+                    onUpdate={updateLibraryTool}
+                    progress={progressMap[tool.id]}
+                    runningUsageLabel={runningUsageLabel}
+                    settingsOpen={settingsToolId === tool.id}
+                    tool={tool}
+                    updateInfo={toolUpdateMap[tool.id]}
+                    updateProgress={updateProgressMap[tool.id]}
+                  />
+                ))}
+              </div>
               {!libraryCount ? (
                 <div className="panel p-10 text-center">
                   <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Library</p>
@@ -2092,6 +2112,8 @@ export default function App() {
                   </div>
                 </div>
               ) : null}
+
+              </div>
 
               {koboldSetupOpen && koboldTool ? (
                 <KoboldCppSetupDialog
@@ -2112,13 +2134,13 @@ export default function App() {
               ) : null}
             </section>
           ) : activeTab === 'store' ? (
-            <section className="panel p-6">
-              <div className="flex flex-wrap items-end justify-between gap-4">
+            <section className="panel flex min-h-0 flex-1 flex-col overflow-hidden p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Store</p>
-                  <h3 className="mt-3 text-3xl font-semibold text-white">Browse tools that Local AI Hub can install for you</h3>
+                  <p className="text-[10px] uppercase tracking-[0.22em] text-slate-500">Store</p>
+                  <h3 className="mt-1 text-2xl font-semibold text-white">Browse tools that Local AI Hub can install for you</h3>
                 </div>
-                <div className="grid gap-3 md:grid-cols-[1fr,220px]">
+                <div className="grid gap-2 md:grid-cols-[1fr,200px]">
                   <input
                     className="store-input"
                     onChange={(event) => setStoreSearch(event.target.value)}
@@ -2136,8 +2158,8 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="mt-6 grid gap-4 xl:grid-cols-[1.2fr,0.8fr]">
-                <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
+              <div className="mt-3 grid gap-3 xl:grid-cols-[1.2fr,0.8fr]">
+                <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
                   <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Next install location</p>
                   <input
                     className="store-input mt-4"
@@ -2146,7 +2168,7 @@ export default function App() {
                     type="text"
                     value={storeInstallRootDraft}
                   />
-                  <div className="mt-4 flex flex-wrap gap-3">
+                  <div className="mt-3 flex flex-wrap gap-2">
                     <button className="ghost-button" disabled={busyMap['store:pick-install-folder']} onClick={chooseStoreInstallFolder} type="button">
                       {busyMap['store:pick-install-folder'] ? 'Opening...' : 'Browse folder'}
                     </button>
@@ -2154,21 +2176,22 @@ export default function App() {
                       Use saved default
                     </button>
                   </div>
-                  <p className="mt-4 text-sm leading-7 text-slate-300">
+                  <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-300">
                     Local AI Hub will use this folder for the next Store install. Direct-managed tools go there automatically. Tools that rely on an official installer may still ask you to confirm or change the final destination in the installer window.
                   </p>
                 </div>
 
-                <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
+                <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
                   <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Saved default</p>
                   <p className="mt-3 break-all text-sm font-medium text-white">{savedPreferredInstallRoot || 'Not available'}</p>
-                  <p className="mt-3 text-sm leading-7 text-slate-300">
+                  <p className="mt-2 text-xs leading-5 text-slate-300">
                     Managed storage currently lives at {appState.storage?.managedRoot || 'Not available'}. Change the saved default in Settings if you want every new Store install to start from a different drive.
                   </p>
                 </div>
               </div>
 
-              <div className="mt-6 grid gap-4 2xl:grid-cols-2">
+              <div className="mt-3 min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
+                <div className="grid gap-3 xl:grid-cols-2 2xl:grid-cols-3">
                 {storeTools.length ? (
                   storeTools.map((manifest) => (
                     <StoreCard
@@ -2185,6 +2208,7 @@ export default function App() {
                     No Store results match that filter. Clear the search or category filter to see the full catalog.
                   </div>
                 )}
+              </div>
               </div>
             </section>
           ) : activeTab === 'models' ? (
@@ -2211,7 +2235,8 @@ export default function App() {
               onRefresh={() => loadStatistics({ manual: true })}
             />
           ) : (
-            <section className="space-y-5">
+            <section className="min-h-0 flex-1 overflow-y-auto pb-6 pr-1">
+              <div className="space-y-3">
               <SettingsPanel
                 busyMap={busyMap}
                 cleanupPreview={cleanupPreview}
@@ -2244,6 +2269,7 @@ export default function App() {
                 onTest={testProvider}
                 providers={providers}
               />
+              </div>
             </section>
           )}
         </main>

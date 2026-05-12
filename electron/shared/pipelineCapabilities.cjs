@@ -172,8 +172,8 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
     operations: Object.freeze({
       [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_AUDIO]),
-        notes: 'Runs AudioCraft through a dedicated direct Python adapter. Text input produces generated audio. Audio input reuses the connected clip as music guidance in Music mode for this first audio-output pipeline slice.',
-        operationSubtypes: Object.freeze(['music', 'sound']),
+        notes: 'Runs AudioCraft through a dedicated direct Python adapter. Text input produces generated audio. Audio input can guide Music mode or seed real continuation mode from the end of the connected clip.',
+        operationSubtypes: Object.freeze(['music', 'sound', 'continuation']),
         outputKinds: Object.freeze([MODALITY_AUDIO]),
       }),
     }),

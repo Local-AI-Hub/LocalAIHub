@@ -1916,6 +1916,7 @@ function buildCollectionMapOperationNode(node, operationId) {
 
 function buildCollectionMapMetadata(mapping, node, executionMode) {
   const perItemValidation = getCollectionMapPerItemValidationConfig(node);
+  const failureMode = getCollectionMapFailureMode(node);
   return {
     executionMode: String(executionMode || '').trim(),
     inputKind: String(mapping?.inputKind || '').trim(),
@@ -1925,6 +1926,10 @@ function buildCollectionMapMetadata(mapping, node, executionMode) {
     nodeLabel: String(node?.label || '').trim(),
     operationId: String(mapping?.operationId || getCollectionMapOperationId(node)).trim(),
     outputKind: String(mapping?.outputKind || getCollectionMapOutputKind(node)).trim(),
+    failureMode,
+    partialSuccess: {
+      enabled: failureMode === 'partial',
+    },
     perItemValidation: perItemValidation.enabled ? {
       enabled: true,
       failMode: perItemValidation.failMode,
@@ -1957,6 +1962,22 @@ function getCollectionMapPerItemValidationConfig(node) {
     ruleset: String(raw.ruleset || '').trim(),
     systemPrompt: String(raw.systemPrompt || '').trim(),
   };
+}
+
+function getCollectionMapFailureMode(node) {
+  const explicitMode = String(node?.config?.failureMode || '').trim();
+  if (explicitMode === 'partial') {
+    return 'partial';
+  }
+
+  const partialSuccess = node?.config?.partialSuccess && typeof node.config.partialSuccess === 'object'
+    ? node.config.partialSuccess
+    : null;
+  return partialSuccess?.enabled ? 'partial' : 'fail-fast';
+}
+
+function isCollectionMapPartialOutputEnabled(node) {
+  return getCollectionMapFailureMode(node) === 'partial';
 }
 
 function buildCollectionMapValidationNode(node, validationConfig) {
@@ -2079,6 +2100,73 @@ function buildCollectionMapAttemptMetadata({ attemptNumber, artifact, mapping, n
     validationPassed: validation ? validation.decision === 'pass' : null,
   };
 }
+function getCollectionMapFailureMetadataFromError(error) {
+  return error?.collectionMapItemFailure && typeof error.collectionMapItemFailure === 'object'
+    ? serializeArtifactForUi(error.collectionMapItemFailure)
+    : null;
+}
+
+function attachCollectionMapFailureMetadata(error, metadata = {}) {
+  if (error && typeof error === 'object') {
+    error.collectionMapItemFailure = serializeArtifactForUi(metadata);
+  }
+  return error;
+}
+
+function buildCollectionMapFailedItemMetadata({ error, failureKind, itemCount, itemId, itemIndex, mapping, node, sourceEntry }) {
+  const embedded = getCollectionMapFailureMetadataFromError(error) || {};
+  const sourceIndex = Number.isInteger(Number(embedded.sourceItemIndex)) ? Number(embedded.sourceItemIndex) : itemIndex;
+  const sourceItemId = String(embedded.sourceItemId || itemId || sourceEntry?.itemId || '').trim();
+  const attempts = Array.isArray(embedded.attempts) ? serializeArtifactForUi(embedded.attempts) : [];
+  const message = String(error?.message || embedded.reason || 'The mapped operation failed.').trim();
+  const reason = String(embedded.reason || message).trim();
+  return {
+    itemId: sourceItemId,
+    itemIndex: sourceIndex,
+    sourceItemId,
+    sourceItemIndex: sourceIndex,
+    itemCount: Number(itemCount || 0) || 0,
+    failureKind: String(embedded.failureKind || failureKind || 'operation').trim() || 'operation',
+    reason,
+    message,
+    attemptCount: Number(embedded.attemptCount || attempts.length || 1) || 1,
+    attempts,
+    validationMode: String(embedded.validationMode || '').trim(),
+    validationFailure: Boolean(embedded.validationFailure),
+    mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+    operationId: String(mapping?.operationId || getCollectionMapOperationId(node)).trim(),
+    inputKind: String(mapping?.inputKind || getCollectionMapInputKind(node)).trim(),
+    outputKind: String(mapping?.outputKind || getCollectionMapOutputKind(node)).trim(),
+  };
+}
+
+async function persistPartialCollectionMapArtifact({ executionMode, failedItems, mappedItems, mapping, node, outputKind, run, sourceCollection, sourceItems }) {
+  const collection = createArtifactCollection(mappedItems, {
+    collectionMapping: {
+      ...buildCollectionMapMetadata(mapping, node, executionMode),
+      partialReason: String(failedItems?.[0]?.reason || '').trim(),
+    },
+    collectionStatus: 'partial',
+    displayName: node.label,
+    failedItems,
+    itemKind: outputKind,
+    role: 'generated',
+    sourceItemCount: sourceItems.length,
+  });
+  collection.sourceCollection = {
+    directoryPath: String(sourceCollection?.directoryPath || '').trim(),
+    displayName: String(sourceCollection?.displayName || '').trim(),
+    itemCount: Number(sourceCollection?.itemCount || sourceItems.length) || sourceItems.length,
+    itemKind: String(sourceCollection?.itemKind || mapping?.inputKind || '').trim(),
+    manifestPath: String(sourceCollection?.manifestPath || '').trim(),
+  };
+  return persistArtifactCollection(run.directories, collection, {
+    baseName: node.label + '-partial',
+    displayName: node.label + ' partial',
+    role: 'generated',
+    target: 'artifacts',
+  });
+}
 
 async function executeMappedCollectionItemWithPerItemValidation(node, sourceArtifact, options = {}) {
   const validationConfig = options.validationConfig || getCollectionMapPerItemValidationConfig(node);
@@ -2103,9 +2191,21 @@ async function executeMappedCollectionItemWithPerItemValidation(node, sourceArti
 
   for (let attemptNumber = 1; attemptNumber <= validationConfig.maxAttempts; attemptNumber += 1) {
     const attemptNode = buildCollectionMapAttemptNode(node, attemptNumber, validationConfig);
-    const mappedArtifact = await executeMappedCollectionItemArtifact(attemptNode, sourceArtifact, options);
-    if (!mappedArtifact || mappedArtifact.kind !== outputKind) {
-      throw new Error('The mapped operation finished, but it did not return a ' + outputKind + ' artifact.');
+    let mappedArtifact = null;
+    try {
+      mappedArtifact = await executeMappedCollectionItemArtifact(attemptNode, sourceArtifact, options);
+      if (!mappedArtifact || mappedArtifact.kind !== outputKind) {
+        throw new Error('The mapped operation finished, but it did not return a ' + outputKind + ' artifact.');
+      }
+    } catch (error) {
+      throw attachCollectionMapFailureMetadata(error, {
+        attemptCount: attemptNumber,
+        attempts,
+        failureKind: 'operation',
+        reason: String(error?.message || 'The mapped operation failed.').trim(),
+        sourceItemId: itemId,
+        sourceItemIndex: itemIndex,
+      });
     }
 
     let review = null;
@@ -2181,7 +2281,17 @@ async function executeMappedCollectionItemWithPerItemValidation(node, sourceArti
 
     const reason = review.validation.reason || review.validation.summary || (validationConfig.mode === 'user' ? 'User selected fail.' : 'The validator selected fail.');
     const manualLabel = validationConfig.mode === 'user' ? 'manual ' : '';
-    throw new Error('Map Collection item ' + String(itemIndex + 1) + ' of ' + itemCount + (itemId ? ' (' + itemId + ')' : '') + ' failed ' + manualLabel + 'validation after ' + validationConfig.maxAttempts + ' attempt' + (validationConfig.maxAttempts === 1 ? '' : 's') + ': ' + reason);
+    const error = new Error('Map Collection item ' + String(itemIndex + 1) + ' of ' + itemCount + (itemId ? ' (' + itemId + ')' : '') + ' failed ' + manualLabel + 'validation after ' + validationConfig.maxAttempts + ' attempt' + (validationConfig.maxAttempts === 1 ? '' : 's') + ': ' + reason);
+    throw attachCollectionMapFailureMetadata(error, {
+      attemptCount: validationConfig.maxAttempts,
+      attempts,
+      failureKind: 'validation',
+      reason,
+      sourceItemId: itemId,
+      sourceItemIndex: itemIndex,
+      validationFailure: true,
+      validationMode: validationConfig.mode,
+    });
   }
 
   throw new Error('Map Collection could not finish validating ' + itemLabel + '.');
@@ -2437,7 +2547,9 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
     ? await getSelectedImageToolOrThrow(contextMaps, node, 'collection image mapping')
     : null;
   const validationConfig = assertCollectionMapPerItemValidationSupported(node, outputKind, contextMaps);
+  const partialOutputEnabled = isCollectionMapPartialOutputEnabled(node);
   const mappedItems = [];
+  const failedItems = [];
   for (let index = 0; index < sourceItems.length; index += 1) {
     const entry = sourceItems[index];
     const sourceArtifact = entry?.artifact || null;
@@ -2481,16 +2593,54 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
     } catch (error) {
       const itemId = String(entry?.itemId || '').trim();
       const itemLabel = 'item ' + String(index + 1) + ' of ' + sourceItems.length + (itemId ? ' (' + itemId + ')' : '');
-      const message = String(error?.message || 'The mapped operation failed.');
-      if (/^Map Collection item \d+ of \d+/.test(message)) {
+      const rawMessage = String(error?.message || 'The mapped operation failed.');
+      const message = /^Map Collection item \d+ of \d+/.test(rawMessage)
+        ? rawMessage
+        : node.label + ' failed on ' + itemLabel + ': ' + rawMessage;
+      const failedItem = buildCollectionMapFailedItemMetadata({
+        error,
+        failureKind: getCollectionMapFailureMetadataFromError(error)?.failureKind || 'operation',
+        itemCount: sourceItems.length,
+        itemId,
+        itemIndex: index,
+        mapping,
+        node,
+        sourceEntry: entry,
+      });
+      failedItem.message = message;
+      failedItem.reason = String(failedItem.reason || rawMessage).trim();
+      failedItems.push(failedItem);
+
+      if (!partialOutputEnabled || !mappedItems.length) {
         throw new Error(message);
       }
-      throw new Error(node.label + ' failed on ' + itemLabel + ': ' + message);
+
+      const persistedPartialCollection = await persistPartialCollectionMapArtifact({
+        executionMode,
+        failedItems,
+        mappedItems,
+        mapping,
+        node,
+        outputKind,
+        run,
+        sourceCollection,
+        sourceItems,
+      });
+      return {
+        message: node.label + ' stopped on ' + itemLabel + ' and output a partial ' + outputKind + ' collection with ' + persistedPartialCollection.itemCount + ' successful item' + (persistedPartialCollection.itemCount === 1 ? '' : 's') + '. Failed item details are recorded in the collection manifest.',
+        outputs: {
+          collection: persistedPartialCollection,
+        },
+        preview: summarizeArtifact(persistedPartialCollection),
+        selectedBranch: 'partial',
+      };
     }
   }
 
   const collection = createArtifactCollection(mappedItems, {
     collectionMapping: buildCollectionMapMetadata(mapping, node, executionMode),
+    collectionStatus: 'complete',
+    sourceItemCount: sourceItems.length,
     displayName: node.label,
     itemKind: outputKind,
     role: 'generated',
@@ -2575,14 +2725,28 @@ async function buildVideoGenerationRequest(node, inputArtifact) {
   throw new Error('This video generation step currently accepts text or image input only.');
 }
 
+function getAudiocraftGenerationSettings(node) {
+  return {
+    audiocraftCfgCoef: Number.isFinite(Number(node.config?.audiocraftCfgCoef)) ? Number(node.config.audiocraftCfgCoef) : 3,
+    audiocraftTemperature: Number.isFinite(Number(node.config?.audiocraftTemperature)) ? Number(node.config.audiocraftTemperature) : 1,
+    audiocraftTopK: Math.max(0, Math.floor(Number(node.config?.audiocraftTopK ?? 250) || 0)),
+    audiocraftTopP: Math.max(0, Math.min(1, Number(node.config?.audiocraftTopP || 0) || 0)),
+    audiocraftTwoStepCfg: Boolean(node.config?.audiocraftTwoStepCfg),
+    appendSource: Boolean(node.config?.appendSource),
+  };
+}
+
 async function buildAudioGenerationRequest(node, inputArtifact) {
   if (!inputArtifact) {
     throw new Error('This audio generation step did not receive any input.');
   }
 
-  const audioMode = String(node.config?.audioMode || 'music').trim() === 'sound' ? 'sound' : 'music';
+  const requestedAudioMode = String(node.config?.audioMode || 'music').trim().toLowerCase();
+  const audioMode = requestedAudioMode === 'sound' ? 'sound' : requestedAudioMode === 'continuation' ? 'continuation' : 'music';
   const durationSeconds = Math.max(1, Number(node.config?.durationSeconds || 8) || 8);
+  const continuationSeedSeconds = Math.max(0.25, Number(node.config?.continuationSeedSeconds || 12) || 12);
   const instruction = String(node.config?.instruction || '').trim();
+  const generationSettings = getAudiocraftGenerationSettings(node);
 
   if (inputArtifact.kind === PORT_KIND_TEXT) {
     const promptText = String(inputArtifact.text || '').trim();
@@ -2590,8 +2754,14 @@ async function buildAudioGenerationRequest(node, inputArtifact) {
       throw new Error('This audio generation step did not receive any text prompt.');
     }
 
+    if (audioMode === 'continuation') {
+      throw new Error('AudioCraft continuation mode needs a source audio clip. Connect an Audio File node or an earlier audio output to this Model Step.');
+    }
+
     return {
+      ...generationSettings,
       audioMode,
+      continuationSeedSeconds,
       durationSeconds,
       prompt: instruction ? instruction + '\n\nPrompt:\n' + promptText : promptText,
       sourceAudioArtifact: null,
@@ -2601,7 +2771,7 @@ async function buildAudioGenerationRequest(node, inputArtifact) {
 
   if (inputArtifact.kind === PORT_KIND_AUDIO && inputArtifact.filePath) {
     if (audioMode === 'sound') {
-      throw new Error('This audio generation step is set to Sound mode, which currently needs text input. Switch to Music mode to guide generation from an audio file.');
+      throw new Error('This audio generation step is set to Sound mode, which currently needs text input. Switch to Music or Continuation mode to use an audio file.');
     }
 
     const sourceAudioPath = path.resolve(String(inputArtifact.filePath || '').trim());
@@ -2610,9 +2780,11 @@ async function buildAudioGenerationRequest(node, inputArtifact) {
     }
 
     return {
+      ...generationSettings,
       audioMode,
+      continuationSeedSeconds,
       durationSeconds,
-      prompt: instruction || 'Create music guided by the supplied audio.',
+      prompt: audioMode === 'continuation' ? instruction : instruction || 'Create music guided by the supplied audio.',
       sourceAudioArtifact: inputArtifact,
       sourceAudioPath,
     };
@@ -3986,9 +4158,13 @@ async function executeOutputNode(node, inputPortId, graph, run) {
     title: String(node.config?.title || node.label || 'output').trim() || 'output',
   });
   const destinationPath = savedArtifact.destinationPath || savedArtifact.directoryPath || savedArtifact.filePath || '';
+  const outputTitle = String(node.config?.title || node.label || 'Output').trim() || 'Output';
+  const outputMessage = isArtifactCollection(savedArtifact) && savedArtifact.partial
+    ? `${outputTitle} saved as a partial collection to ${destinationPath}.`
+    : `${outputTitle} saved to ${destinationPath}.`;
   return {
     destinationPath,
-    message: `${String(node.config?.title || node.label || 'Output').trim() || 'Output'} saved to ${destinationPath}.`,
+    message: outputMessage,
     outputs: {
       [inputPortId]: savedArtifact,
     },
@@ -4120,7 +4296,14 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         const audioRequest = await buildAudioGenerationRequest(node, promptArtifact);
         reportProgress?.('Sending the request to ' + tool.name + ' for local audio generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
         return generateAudioWithLocalAudioTool(tool, {
+          appendSource: audioRequest.appendSource,
           audioMode: audioRequest.audioMode,
+          audiocraftCfgCoef: audioRequest.audiocraftCfgCoef,
+          audiocraftTemperature: audioRequest.audiocraftTemperature,
+          audiocraftTopK: audioRequest.audiocraftTopK,
+          audiocraftTopP: audioRequest.audiocraftTopP,
+          audiocraftTwoStepCfg: audioRequest.audiocraftTwoStepCfg,
+          continuationSeedSeconds: audioRequest.continuationSeedSeconds,
           displayName: node.label,
           durationSeconds: audioRequest.durationSeconds,
           model,

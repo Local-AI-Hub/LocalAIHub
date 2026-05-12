@@ -203,96 +203,108 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
   const artifactStatusClass = item.downloadPlan?.runnable === false
     ? 'border-rose-400/25 bg-rose-400/10 text-rose-100'
     : 'border-emerald-400/20 bg-emerald-400/10 text-emerald-100';
+  const diskLabel = item.diskWarning?.tone === 'danger' ? 'Low space' : item.diskWarning?.tone === 'warn' ? 'Watch space' : 'Looks safe';
+  const planMessage = item.downloadPlan?.blockingReason || item.downloadPlan?.warning || '';
+
   return (
-    <article className="rounded-[28px] border border-white/10 bg-slate-950/35 p-4">
-      <div className="aspect-[16/9] overflow-hidden rounded-[22px] border border-white/10 bg-white/5">
-        <ModelPreview item={item} />
-      </div>
-      <div className="mt-4 flex flex-wrap items-center gap-2">
-        <h4 className="text-lg font-semibold text-white">{item.name}</h4>
-        {item.catalogEntityLabel ? (
-          <span className="status-pill border-cyan-400/20 bg-cyan-400/10 text-cyan-100">{item.catalogEntityLabel}</span>
-        ) : null}
-        <span className="status-pill border-white/10 bg-white/5 text-slate-300">{item.modelType}</span>
-        {item.artifactLabel && item.artifactLabel !== item.modelType ? (
-          <span className="status-pill border-cyan-400/20 bg-cyan-400/10 text-cyan-100">{item.artifactLabel}</span>
-        ) : null}
-        {item.downloadPlan?.runnable === false ? (
-          <span className="status-pill border-rose-400/25 bg-rose-400/10 text-rose-100">Not compatible</span>
-        ) : null}
-        {item.hardwareFit ? <span className={`status-pill ${badgeClass(item.hardwareFit.tone)}`}>{item.hardwareFit.label}</span> : null}
-        {item.highVramWarning ? (
-          <span className="status-pill border-rose-400/25 bg-rose-400/10 text-rose-100">{item.highVramWarning.warningLabel}</span>
-        ) : null}
-        {localMatch ? <span className="status-pill border-emerald-400/20 bg-emerald-400/10 text-emerald-100">Downloaded</span> : null}
-      </div>
-      <p className="mt-3 line-clamp-3 text-sm leading-6 text-slate-300">{item.description}</p>
-      {item.catalogParentLabel || item.catalogContext ? (
-        <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-          <p className="text-sm font-medium text-white">{item.catalogParentLabel ? `From ${item.catalogParentLabel}` : item.catalogContext}</p>
-          {item.catalogParentLabel && item.catalogContext ? <p className="mt-2 text-xs leading-5 text-slate-400">{item.catalogContext}</p> : null}
+    <article className="rounded-[24px] border border-white/10 bg-slate-950/35 p-3">
+      <div className="flex gap-3">
+        <div className="h-20 w-28 shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-white/5 sm:h-24 sm:w-36">
+          <ModelPreview item={item} />
         </div>
-      ) : null}
-      <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <h4 className="min-w-0 truncate text-base font-semibold text-white" title={item.name}>{item.name}</h4>
+            {item.catalogEntityLabel ? (
+              <span className="status-pill border-cyan-400/20 bg-cyan-400/10 text-cyan-100">{item.catalogEntityLabel}</span>
+            ) : null}
+            <span className="status-pill border-white/10 bg-white/5 text-slate-300">{item.modelType}</span>
+            {item.artifactLabel && item.artifactLabel !== item.modelType ? (
+              <span className="status-pill border-cyan-400/20 bg-cyan-400/10 text-cyan-100">{item.artifactLabel}</span>
+            ) : null}
+            {item.downloadPlan?.runnable === false ? (
+              <span className="status-pill border-rose-400/25 bg-rose-400/10 text-rose-100">Not compatible</span>
+            ) : null}
+            {item.hardwareFit ? <span className={`status-pill ${badgeClass(item.hardwareFit.tone)}`}>{item.hardwareFit.label}</span> : null}
+            {item.highVramWarning ? (
+              <span className="status-pill border-rose-400/25 bg-rose-400/10 text-rose-100">{item.highVramWarning.warningLabel}</span>
+            ) : null}
+            {localMatch ? <span className="status-pill border-emerald-400/20 bg-emerald-400/10 text-emerald-100">Downloaded</span> : null}
+          </div>
+          <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-300">{item.description}</p>
+        </div>
+      </div>
+
+      <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Selected artifact</p>
+          <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Artifact</p>
           <span className={`status-pill ${artifactStatusClass}`}>{artifactStatus}</span>
         </div>
-        <p className="mt-2 break-all text-sm font-medium text-white">{selectedArtifact || 'No compatible artifact selected'}</p>
-        <p className="mt-2 text-xs leading-5 text-slate-400">{item.downloadPlan?.planType === 'package' ? [item.artifactLabel || 'Package', item.downloadPlan?.packageName].filter(Boolean).join(' | ') : item.artifactLabel || item.modelType || 'Model artifact'}</p>
-        {requiredArtifacts.length || optionalArtifacts.length ? (
-          <p className="mt-3 text-xs leading-5 text-slate-400">
-            {item.downloadPlan?.planType === 'package' ? 'Required files: ' : 'Required: '}{requiredArtifacts.length ? requiredArtifacts.join(', ') : 'selected artifact only'}{optionalArtifacts.length ? ' | Optional files: ' + optionalArtifacts.map((artifact) => artifact.path || artifact.fileName).filter(Boolean).join(', ') : ' | Optional files: none'}
-          </p>
-        ) : null}
-        <p className="mt-3 text-xs uppercase tracking-[0.2em] text-slate-500">Install target</p>
-        <p className="mt-2 break-all text-xs leading-5 text-slate-400">{targetDirectory || 'No compatible install folder for this target.'}</p>
+        <p className="mt-1 truncate text-sm font-medium text-white" title={selectedArtifact || 'No compatible artifact selected'}>{selectedArtifact || 'No compatible artifact selected'}</p>
+        <p className="mt-1 text-xs leading-5 text-slate-400">
+          {item.downloadPlan?.planType === 'package' ? [item.artifactLabel || 'Package', item.downloadPlan?.packageName].filter(Boolean).join(' | ') : item.artifactLabel || item.modelType || 'Model artifact'}
+        </p>
       </div>
+
       {item.highVramWarning ? (
-        <div className="mt-4 rounded-2xl border border-rose-400/20 bg-rose-400/10 px-3 py-3 text-sm text-rose-100">
+        <div className="mt-3 rounded-2xl border border-rose-400/20 bg-rose-400/10 px-3 py-2 text-xs leading-5 text-rose-100">
           {item.highVramWarning.warningMessage}
         </div>
       ) : null}
-      {item.downloadPlan?.blockingReason || item.downloadPlan?.warning ? (
-        <div className={`mt-4 rounded-2xl border px-3 py-3 text-sm ${item.downloadPlan?.blockingReason ? 'border-rose-400/20 bg-rose-400/10 text-rose-100' : 'border-amber-400/25 bg-amber-400/10 text-amber-100'}`}>
-          {item.downloadPlan.blockingReason || item.downloadPlan.warning}
+      {planMessage ? (
+        <div className={`mt-3 rounded-2xl border px-3 py-2 text-xs leading-5 ${item.downloadPlan?.blockingReason ? 'border-rose-400/20 bg-rose-400/10 text-rose-100' : 'border-amber-400/25 bg-amber-400/10 text-amber-100'}`}>
+          {planMessage}
         </div>
       ) : null}
-      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Target</p>
-          <p className="mt-2 text-sm font-medium text-white">{item.targetToolName || item.toolId || 'Selected tool'}</p>
+
+      <details className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-300">
+        <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Package, fit, and target details</summary>
+        <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {item.catalogParentLabel || item.catalogContext ? (
+            <div>
+              <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Package source</p>
+              <p className="mt-1 text-sm font-medium text-white">{item.catalogParentLabel ? `From ${item.catalogParentLabel}` : item.catalogContext}</p>
+              {item.catalogParentLabel && item.catalogContext ? <p className="mt-1 text-xs leading-5 text-slate-400">{item.catalogContext}</p> : null}
+            </div>
+          ) : null}
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Required files</p>
+            <p className="mt-1 break-words text-xs leading-5 text-slate-400">
+              {requiredArtifacts.length ? requiredArtifacts.join(', ') : 'Selected artifact only'}{optionalArtifacts.length ? ' | Optional: ' + optionalArtifacts.map((artifact) => artifact.path || artifact.fileName).filter(Boolean).join(', ') : ' | Optional: none'}
+            </p>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Install target</p>
+            <p className="mt-1 break-all text-xs leading-5 text-slate-400">{targetDirectory || 'No compatible install folder for this target.'}</p>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Target</p>
+            <p className="mt-1 text-sm font-medium text-white">{item.targetToolName || item.toolId || 'Selected tool'}</p>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Source / size</p>
+            <p className="mt-1 text-sm font-medium capitalize text-white">{item.source} | {item.sizeBytes ? formatBytes(item.sizeBytes) : item.sizeLabel || 'Unknown'}</p>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Hardware fit</p>
+            <p className="mt-1 text-sm font-medium text-white">{item.hardwareFit?.label || 'Unknown'}</p>
+            <p className="mt-1 text-xs leading-5 text-slate-400">{item.hardwareFit?.message || 'No GPU fit estimate yet.'}</p>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Disk headroom</p>
+            <p className="mt-1 text-sm font-medium text-white">{diskLabel}</p>
+            <p className="mt-1 text-xs leading-5 text-slate-400">{item.diskWarning?.message || 'This download should leave enough free space on the target drive.'}</p>
+          </div>
         </div>
-        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Source</p>
-          <p className="mt-2 text-sm font-medium capitalize text-white">{item.source}</p>
-        </div>
-        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">File size</p>
-          <p className="mt-2 text-sm font-medium text-white">{item.sizeBytes ? formatBytes(item.sizeBytes) : item.sizeLabel || 'Unknown'}</p>
-        </div>
-        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Hardware fit</p>
-          <p className="mt-2 text-sm font-medium text-white">{item.hardwareFit?.label || 'Unknown'}</p>
-          <p className="mt-2 text-xs leading-5 text-slate-400">{item.hardwareFit?.message || 'No GPU fit estimate yet.'}</p>
-        </div>
-        <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3">
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Disk headroom</p>
-          <p className="mt-2 text-sm font-medium text-white">
-            {item.diskWarning?.tone === 'danger' ? 'Low space' : item.diskWarning?.tone === 'warn' ? 'Watch space' : 'Looks safe'}
-          </p>
-          <p className="mt-2 text-xs leading-5 text-slate-400">
-            {item.diskWarning?.message || 'This download should leave enough free space on the target drive.'}
-          </p>
-        </div>
-      </div>
+      </details>
+
       {downloadProgress ? (
-        <div className="mt-4 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 px-3 py-3 text-sm text-cyan-50">
+        <div className="mt-3 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 px-3 py-2 text-sm text-cyan-50">
           <div className="flex items-center justify-between gap-3">
             <span>{downloadProgress.message}</span>
             <span>{Number.isFinite(downloadProgress.percent) ? `${downloadProgress.percent}%` : '...'}</span>
           </div>
-          <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-950/40">
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-950/40">
             <div
               className="h-full rounded-full bg-cyan-300 transition-all"
               style={{ width: `${Math.max(5, Math.min(100, downloadProgress.percent || 5))}%` }}
@@ -300,7 +312,7 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
           </div>
         </div>
       ) : null}
-      <div className="mt-4 flex flex-wrap gap-3">
+      <div className="mt-3 flex flex-wrap gap-2">
         {localMatch ? (
           <button className="ghost-button" disabled={deleteBusy} onClick={() => onDelete(localMatch, item)} type="button">
             {deleteBusy ? 'Deleting...' : 'Delete'}
@@ -313,7 +325,8 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
       </div>
     </article>
   );
-}export default function ModelManager({ tools, onToast }) {
+}
+export default function ModelManager({ tools, onToast }) {
   const modelTools = useMemo(() => (tools || []).filter((tool) => getModelManagerConfig(tool)), [tools]);
   const [selectedToolId, setSelectedToolId] = useState(modelTools[0]?.id || '');
   const [selectedSource, setSelectedSource] = useState(getToolDefaults(modelTools[0]).source);
@@ -634,25 +647,25 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
         ? `No ${selectedSourceLabel} results matched "${emptyQuery}". Local AI Hub searched with the selected source and filters; try another source or a shorter model-family query.`
         : 'No catalog results matched this search. Try another query or filter.';
   return (
-    <section className="space-y-5">
-      <div className="panel p-6">
-        <div className="flex flex-wrap items-end justify-between gap-4">
+    <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+      <div className="panel flex-none p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Model Manager</p>
-            <h3 className="mt-3 text-3xl font-semibold text-white">Browse live model catalogs with local fit checks</h3>
-            <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
-              Search full Hugging Face and CivitAI catalogs, keep normal model browsing intact, and surface exact downloadable artifacts when the provider data makes that possible before you download.
+            <p className="text-[10px] uppercase tracking-[0.22em] text-slate-500">Model Manager</p>
+            <h3 className="mt-1 text-2xl font-semibold text-white">Browse live model catalogs with local fit checks</h3>
+            <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-300">
+              Search remote catalogs, check compatibility, and download the right artifacts for each local tool.
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-3">
-            <select className="store-input min-w-[220px]" onChange={(event) => applyToolDefaults(event.target.value)} value={selectedToolId}>
+          <div className="grid min-w-[280px] flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-6">
+            <select className="store-input" onChange={(event) => applyToolDefaults(event.target.value)} value={selectedToolId}>
               {modelTools.map((tool) => (
                 <option key={tool.id} value={tool.id}>
                   {tool.name}
                 </option>
               ))}
             </select>
-            <select className="store-input min-w-[220px]" onChange={(event) => setSelectedSource(event.target.value)} value={selectedSource}>
+            <select className="store-input" onChange={(event) => setSelectedSource(event.target.value)} value={selectedSource}>
               {sourceOptions.map((source) => (
                 <option key={source.id} value={source.id}>
                   {source.label}
@@ -660,7 +673,7 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
               ))}
             </select>
             {filterOptionsVisible ? (
-              <select className="store-input min-w-[220px]" onChange={(event) => setModelType(event.target.value)} value={modelType}>
+              <select className="store-input" onChange={(event) => setModelType(event.target.value)} value={modelType}>
                 {modelTypeOptions.map((option) => (
                   <option key={option.id} value={option.id}>
                     {option.label}
@@ -669,7 +682,7 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
               </select>
             ) : null}
             {taskOptionsVisible ? (
-              <select className="store-input min-w-[220px]" onChange={(event) => setTaskType(event.target.value)} value={taskType}>
+              <select className="store-input" onChange={(event) => setTaskType(event.target.value)} value={taskType}>
                 {taskOptions.map((option) => (
                   <option key={option.id} value={option.id}>
                     {option.label}
@@ -677,37 +690,39 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
                 ))}
               </select>
             ) : null}
-            <select className="store-input min-w-[190px]" onChange={(event) => setSort(event.target.value)} value={sort}>
+            <select className="store-input" onChange={(event) => setSort(event.target.value)} value={sort}>
               {SORT_OPTIONS.map((option) => (
                 <option key={option.id} value={option.id}>
                   {option.label}
                 </option>
               ))}
             </select>
-            <input
-              className="store-input min-w-[260px]"
-              onChange={(event) => setSearch(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  browse({ page: 1, cursor: null, query: event.currentTarget.value });
-                }
-              }}
-              placeholder={selectedSource === 'ollama' ? 'Search Ollama models' : 'Search remote catalogs'}
-              type="search"
-              value={search}
-            />
-            <button className="primary-button" disabled={browseLoading} onClick={() => browse({ page: 1, cursor: null })} type="button">
-              {browseLoading ? 'Loading...' : 'Search'}
-            </button>
+            <div className="grid gap-2 sm:col-span-2 sm:grid-cols-[1fr,auto] xl:col-span-2">
+              <input
+                className="store-input"
+                onChange={(event) => setSearch(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    browse({ page: 1, cursor: null, query: event.currentTarget.value });
+                  }
+                }}
+                placeholder={selectedSource === 'ollama' ? 'Search Ollama models' : 'Search remote catalogs'}
+                type="search"
+                value={search}
+              />
+              <button className="primary-button" disabled={browseLoading} onClick={() => browse({ page: 1, cursor: null })} type="button">
+                {browseLoading ? 'Loading...' : 'Search'}
+              </button>
+            </div>
           </div>
         </div>
         {selectedSource === 'civitai' ? (
-          <div className="mt-5 rounded-[26px] border border-white/10 bg-slate-950/35 p-4">
-            <div className="flex flex-wrap items-end gap-3">
-              <div className="min-w-[280px] flex-1">
-                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">CivitAI API key</p>
+          <details className="mt-3 rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2 text-sm text-slate-300">
+            <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">CivitAI API key</summary>
+            <div className="mt-3 flex flex-wrap items-end gap-3">
+              <div className="min-w-[260px] flex-1">
                 <input
-                  className="store-input mt-3"
+                  className="store-input"
                   onChange={(event) => setCivitaiApiKeyDraft(event.target.value)}
                   placeholder={settings.hasSavedCivitaiApiKey ? 'Saved in Windows Credential Manager. Paste a new key to replace it.' : 'Paste your CivitAI API key'}
                   type="password"
@@ -723,43 +738,45 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
                 </button>
               ) : null}
             </div>
-            <div className="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-400">
-              <p className="leading-6">Uses CIVITAI_API_KEY when it is present for this app session, otherwise uses Windows Credential Manager. Public browsing still works without a key.</p>
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+              <p className="leading-5">Uses CIVITAI_API_KEY when present, otherwise Windows Credential Manager. Public browsing works without a key.</p>
               {settings.civitaiCredentialSource === 'environment' ? <span className="status-pill border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Using environment variable</span> : null}
               {settings.civitaiCredentialSource === 'saved' ? <span className="status-pill border-emerald-400/20 bg-emerald-400/10 text-emerald-100">Saved</span> : null}
             </div>
-          </div>
+          </details>
         ) : null}
       </div>
-      <div className="grid gap-5 xl:grid-cols-[320px,1fr]">
-        <aside className="panel p-5">
+      <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[280px,1fr]">
+        <aside className="panel flex min-h-0 flex-col p-4">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Downloaded</p>
-              <h4 className="mt-2 text-xl font-semibold text-white">Downloaded models</h4>
+              <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Downloaded</p>
+              <h4 className="mt-1 text-lg font-semibold text-white">Downloaded models</h4>
             </div>
             <button className="ghost-button" disabled={localLoading} onClick={() => loadLocalModels()} type="button">
               {localLoading ? 'Refreshing...' : 'Refresh'}
             </button>
           </div>
-          <div className="mt-4 space-y-3">
+          <div className="mt-3 min-h-0 flex-1 space-y-2 overflow-y-auto pb-4 pr-1">
             {localModels.length ? (
               localModels.map((model) => (
-                <div key={model.id} className="rounded-2xl border border-white/10 bg-white/5 px-4 py-4">
+                <div key={model.id} className="rounded-2xl border border-white/10 bg-white/5 px-3 py-2">
                   <div className="flex flex-wrap items-center gap-2">
-                    <p className="text-sm font-semibold text-white">{model.name}</p>
+                    <p className="min-w-0 flex-1 truncate text-sm font-semibold text-white" title={model.name}>{model.name}</p>
                     <span className="status-pill border-white/10 bg-slate-950/40 text-slate-300">{model.modelType}</span>
                   </div>
-                  <p className="mt-2 break-all text-xs leading-6 text-slate-400">{model.relativePath || model.fileName}</p>
-                  <p className="mt-2 text-sm text-slate-300">{model.sizeBytes ? formatBytes(model.sizeBytes) : 'Unknown size'}</p>
-                  <button
-                    className="ghost-button mt-3 w-full justify-center"
-                    disabled={deleteBusyId === model.id}
-                    onClick={() => handleDelete(model)}
-                    type="button"
-                  >
-                    {deleteBusyId === model.id ? 'Deleting...' : 'Delete'}
-                  </button>
+                  <p className="mt-1 truncate text-xs leading-5 text-slate-400" title={model.relativePath || model.fileName}>{model.relativePath || model.fileName}</p>
+                  <div className="mt-2 flex items-center justify-between gap-2">
+                    <p className="text-xs text-slate-300">{model.sizeBytes ? formatBytes(model.sizeBytes) : 'Unknown size'}</p>
+                    <button
+                      className="ghost-button"
+                      disabled={deleteBusyId === model.id}
+                      onClick={() => handleDelete(model)}
+                      type="button"
+                    >
+                      {deleteBusyId === model.id ? 'Deleting...' : 'Delete'}
+                    </button>
+                  </div>
                 </div>
               ))
             ) : (
@@ -769,15 +786,15 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
             )}
           </div>
         </aside>
-        <div className="panel p-5">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="panel flex min-h-0 flex-col p-4">
+          <div className="flex flex-none flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Remote catalog</p>
-              <h4 className="mt-2 text-xl font-semibold text-white">Available catalog results</h4>
+              <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Remote catalog</p>
+              <h4 className="mt-1 text-lg font-semibold text-white">Available catalog results</h4>
             </div>
             <p className="text-sm text-slate-400">{remoteItems.length} loaded</p>
           </div>
-          <div className="mt-5 grid gap-4 2xl:grid-cols-2">
+          <div className="mt-3 grid min-h-0 flex-1 gap-3 overflow-y-auto pb-4 pr-1 2xl:grid-cols-2">
             {remoteItems.length ? (
               remoteItems.map((item) => {
                 const localMatch = matchingLocalModel(item, localModels);
@@ -794,13 +811,13 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
                 );
               })
             ) : (
-              <div className="rounded-[28px] border border-dashed border-white/15 bg-white/5 p-10 text-center text-slate-400 2xl:col-span-2">
+              <div className="rounded-[24px] border border-dashed border-white/15 bg-white/5 p-8 text-center text-slate-400 2xl:col-span-2">
                 {browseLoading ? 'Loading remote catalog results...' : emptyCatalogMessage}
               </div>
             )}
           </div>
           {pagination.hasMore ? (
-            <div className="mt-5 flex justify-center">
+            <div className="mt-3 flex flex-none justify-center">
               <button className="ghost-button" disabled={loadingMore} onClick={handleLoadMore} type="button">
                 {loadingMore ? 'Loading more...' : 'Load more'}
               </button>

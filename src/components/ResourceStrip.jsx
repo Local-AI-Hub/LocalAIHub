@@ -1,12 +1,12 @@
-﻿import { memo } from 'react';
+import { memo } from 'react';
 import { formatDiskAvailability, formatUsage } from '../lib/formatters';
 
-function MetricCard({ label, value, detail, accent }) {
+function MetricCard({ label, value, detail, accent, compact = false }) {
   return (
-    <div className="metric-card">
-      <p className="text-xs uppercase tracking-[0.22em] text-slate-500">{label}</p>
-      <p className="mt-3 text-2xl font-semibold text-white">{value}</p>
-      <p className={`mt-2 text-sm ${accent}`}>{detail}</p>
+    <div className={compact ? 'rounded-2xl border border-white/10 bg-slate-950/30 px-3 py-2.5' : 'metric-card'}>
+      <p className={compact ? 'text-[10px] uppercase tracking-[0.18em] text-slate-500' : 'text-xs uppercase tracking-[0.22em] text-slate-500'}>{label}</p>
+      <p className={compact ? 'mt-1 text-lg font-semibold text-white' : 'mt-3 text-2xl font-semibold text-white'}>{value}</p>
+      <p className={`${compact ? 'mt-1 text-xs' : 'mt-2 text-sm'} ${accent}`}>{detail}</p>
     </div>
   );
 }
@@ -53,6 +53,43 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
     : storage?.managedRoot
       ? 'Managed storage drive'
       : 'Storage drive';
+  const compact = ['library', 'store', 'models', 'pipelines', 'statistics', 'settings'].includes(activeTab);
+  const metrics = [
+    { accent: 'text-slate-400', detail: 'Installed now', label: 'Tools', value: String(installedCount) },
+    { accent: 'text-emerald-300', detail: 'Active right now', label: 'Running', value: String(runningCount) },
+    { accent: 'text-cyan-200', detail: 'Live system RAM', label: 'RAM', value: formatUsage(resources?.ramUsedMb, resources?.ramTotalMb) },
+    {
+      accent: 'text-cyan-200',
+      detail: resources?.vramUsedMb ? 'Live GPU usage' : 'Total GPU memory',
+      label: 'VRAM',
+      value: formatUsage(resources?.vramUsedMb, resources?.vramTotalMb),
+    },
+    {
+      accent: updateCount > 0 ? 'text-amber-200' : Number(resources?.diskUsePercent) >= 90 ? 'text-amber-200' : 'text-cyan-200',
+      detail: updateCount > 0 ? `${updateCount} update${updateCount === 1 ? '' : 's'} available` : diskDetail,
+      label: updateCount > 0 ? 'Updates' : 'Disk',
+      value: updateCount > 0 ? String(updateCount) : formatDiskAvailability(resources?.diskFreeBytes, resources?.diskTotalBytes),
+    },
+  ];
+
+  if (compact) {
+    return (
+      <section className="panel flex shrink-0 flex-wrap items-center justify-between gap-3 px-4 py-3">
+        <div className="min-w-[240px] flex-1">
+          <div className="flex flex-wrap items-center gap-3">
+            <p className="text-[10px] uppercase tracking-[0.24em] text-slate-500">{activeLabel}</p>
+            <h2 className="text-2xl font-semibold tracking-tight text-white">{heading}</h2>
+          </div>
+          <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-300">{summary}</p>
+        </div>
+        <div className="grid min-w-[280px] flex-[1.5] grid-cols-2 gap-2 sm:grid-cols-3 2xl:grid-cols-5">
+          {metrics.map((metric) => (
+            <MetricCard key={metric.label} compact {...metric} />
+          ))}
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="hero-strip">
@@ -63,21 +100,9 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
       </div>
 
       <div className="grid gap-4 xl:grid-cols-5">
-        <MetricCard accent="text-slate-400" detail="Installed now" label="Tools" value={String(installedCount)} />
-        <MetricCard accent="text-emerald-300" detail="Active right now" label="Running" value={String(runningCount)} />
-        <MetricCard accent="text-cyan-200" detail="Live system RAM" label="RAM" value={formatUsage(resources?.ramUsedMb, resources?.ramTotalMb)} />
-        <MetricCard
-          accent="text-cyan-200"
-          detail={resources?.vramUsedMb ? 'Live GPU usage' : 'Total GPU memory'}
-          label="VRAM"
-          value={formatUsage(resources?.vramUsedMb, resources?.vramTotalMb)}
-        />
-        <MetricCard
-          accent={updateCount > 0 ? 'text-amber-200' : Number(resources?.diskUsePercent) >= 90 ? 'text-amber-200' : 'text-cyan-200'}
-          detail={updateCount > 0 ? `${updateCount} update${updateCount === 1 ? '' : 's'} available` : diskDetail}
-          label={updateCount > 0 ? 'Updates' : 'Disk'}
-          value={updateCount > 0 ? String(updateCount) : formatDiskAvailability(resources?.diskFreeBytes, resources?.diskTotalBytes)}
-        />
+        {metrics.map((metric) => (
+          <MetricCard key={metric.label} {...metric} />
+        ))}
       </div>
     </section>
   );

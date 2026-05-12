@@ -253,6 +253,42 @@ function createAudiocraftAudioGuidancePipeline(audioPath, audioMode = 'music') {
   };
 }
 
+function createAudiocraftContinuationPipeline(audioPath, overrides = {}) {
+  return {
+    id: 'audiocraft-continuation-pipeline',
+    name: 'Audiocraft Continuation Pipeline',
+    nodes: [
+      { id: 'audio-input', type: 'audioInput', label: 'Source Audio', config: { filePath: audioPath } },
+      {
+        id: 'audio-generate',
+        type: 'llmPrompt',
+        label: 'Continue Audio',
+        config: {
+          executionMode: 'localTool',
+          operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+          toolId: 'audiocraft-webui',
+          audioMode: 'continuation',
+          continuationSeedSeconds: 10,
+          durationSeconds: 12,
+          instruction: 'Keep the harmony stable and add a gentle new phrase.',
+          model: 'facebook/musicgen-small',
+          audiocraftTemperature: 0.85,
+          audiocraftTopK: 120,
+          audiocraftTopP: 0.2,
+          audiocraftCfgCoef: 2.5,
+          audiocraftTwoStepCfg: true,
+          ...(overrides.config || {}),
+        },
+      },
+      { id: 'audio-output', type: 'audioOutput', label: 'Continuation Output', config: { title: 'Continuation result' } },
+    ],
+    edges: [
+      { id: 'edge-source-audio', source: { nodeId: 'audio-input', portId: 'audio' }, target: { nodeId: 'audio-generate', portId: 'prompt' } },
+      { id: 'edge-audio-output', source: { nodeId: 'audio-generate', portId: 'audio' }, target: { nodeId: 'audio-output', portId: 'audio' } },
+    ],
+  };
+}
+
 function createRvcVoiceConversionPipeline(sourceAudioPath, overrides = {}) {
   return {
     id: 'rvc-voice-conversion-pipeline',
@@ -499,7 +535,33 @@ function verifyAudiocraftReadinessStates(tempRoot, audioPath) {
   assert(readySummary.capabilitySummary.inputKinds.includes('text'), 'Expected AudioCraft capability summary to accept text input.');
   assert(readySummary.capabilitySummary.inputKinds.includes('audio'), 'Expected AudioCraft capability summary to accept audio guidance input.');
   assert(readySummary.capabilitySummary.outputKinds.includes('audio'), 'Expected AudioCraft capability summary to produce audio output.');
-  assert.deepStrictEqual(readySummary.capabilitySummary.operationSubtypes, ['music', 'sound'], 'Expected AudioCraft capability summary to expose supported audio generation subtypes.');
+  assert.deepStrictEqual(readySummary.capabilitySummary.operationSubtypes, ['music', 'sound', 'continuation'], 'Expected AudioCraft capability summary to expose supported audio generation subtypes.');
+
+  const continuationReadyAnalysis = pipelineSchema.analyzePipeline(createAudiocraftContinuationPipeline(audioPath), {
+    tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
+  });
+  assert.strictEqual(continuationReadyAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'info', 'Expected AudioCraft continuation readiness to pass when audio input is connected.');
+  assert(continuationReadyAnalysis.nodeSummaries['audio-generate'].readiness.message.includes('Continuation mode'), 'Expected AudioCraft continuation readiness to describe continuation mode.');
+
+  const continuationWithoutAudio = createAudiocraftTextToAudioPipeline('Continue this idea.');
+  continuationWithoutAudio.nodes.find((node) => node.id === 'audio-generate').config.audioMode = 'continuation';
+  const continuationMissingSourceAnalysis = pipelineSchema.analyzePipeline(continuationWithoutAudio, {
+    tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
+  });
+  assert.strictEqual(continuationMissingSourceAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'error', 'Expected AudioCraft continuation readiness to require a source audio edge.');
+  assert(continuationMissingSourceAnalysis.nodeSummaries['audio-generate'].readiness.message.includes('connected source audio'), 'Expected continuation readiness to explain the missing source audio requirement.');
+
+  const invalidSeedAnalysis = pipelineSchema.analyzePipeline(createAudiocraftContinuationPipeline(audioPath, { config: { continuationSeedSeconds: 0 } }), {
+    tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
+  });
+  assert.strictEqual(invalidSeedAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'error', 'Expected AudioCraft continuation readiness to reject invalid seed seconds.');
+  assert(invalidSeedAnalysis.nodeSummaries['audio-generate'].readiness.message.includes('seed seconds'), 'Expected invalid continuation seed readiness to explain the seed requirement.');
+
+  const invalidDurationAnalysis = pipelineSchema.analyzePipeline(createAudiocraftContinuationPipeline(audioPath, { config: { durationSeconds: 0 } }), {
+    tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
+  });
+  assert.strictEqual(invalidDurationAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'error', 'Expected AudioCraft continuation readiness to reject invalid generation duration.');
+  assert(invalidDurationAnalysis.nodeSummaries['audio-generate'].readiness.message.includes('duration'), 'Expected invalid continuation duration readiness to explain the duration requirement.');
 
   const brokenAnalysis = pipelineSchema.analyzePipeline(createAudiocraftTextToAudioPipeline('Build a gentle ambient loop.'), {
     tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, lastError: 'AudioCraft needs repair before it can launch.', status: 'error' })],
@@ -724,6 +786,207 @@ function verifyRvcReadinessStates(tempRoot, audioPath) {
   assert(wrongSourceAnalysis.nodeSummaries['audio-transform'].readiness.message.includes('does not accept Text'), 'Expected RVC wrong-source readiness to explain that audio input is required.');
 }
 
+async function verifyAudiocraftContinuationPipelineRun(tempRoot, sourceAudioPath) {
+  const toolEntries = [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })];
+  const audioCalls = [];
+  const service = createPipelineExecutionService(tempRoot, toolEntries, {
+    generateAudioFixture: async ({ artifactService, request, tool }) => {
+      audioCalls.push({ request, tool });
+      const outputPath = path.join(request.runDirectories.artifactsDir, 'audiocraft-continuation-result.wav');
+      await fsp.writeFile(outputPath, createWaveBuffer({ channelCount: 2, durationSeconds: request.durationSeconds, frequency: 510, sampleRate: 32000 }));
+      const artifact = await artifactService.buildFileArtifact(outputPath, {
+        audioGeneration: {
+          advancedSettings: {
+            cfgCoef: request.audiocraftCfgCoef,
+            temperature: request.audiocraftTemperature,
+            topK: request.audiocraftTopK,
+            topP: request.audiocraftTopP,
+            twoStepCfg: request.audiocraftTwoStepCfg,
+          },
+          appendSource: false,
+          backend: 'audiocraft',
+          backendLabel: 'AudioCraft',
+          continuationSeedSeconds: request.continuationSeedSeconds,
+          durationSeconds: request.durationSeconds,
+          generatedDurationSeconds: request.durationSeconds,
+          lineage: {
+            sourceFileName: request.sourceAudioArtifact?.fileName || '',
+            sourceFilePath: request.sourceAudioPath,
+            sourceKind: request.sourceAudioArtifact?.kind || '',
+          },
+          mode: request.audioMode,
+          model: request.model,
+          operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+          operationSubtype: request.audioMode,
+          prompt: request.prompt,
+          sourceAudio: request.sourceAudioArtifact ? {
+            displayName: request.sourceAudioArtifact.displayName,
+            fileName: request.sourceAudioArtifact.fileName,
+            filePath: request.sourceAudioArtifact.filePath,
+            fileUrl: request.sourceAudioArtifact.fileUrl,
+            formatLabel: request.sourceAudioArtifact.formatLabel,
+            kind: request.sourceAudioArtifact.kind,
+            mimeType: request.sourceAudioArtifact.mimeType,
+            sizeBytes: request.sourceAudioArtifact.sizeBytes,
+            summary: request.sourceAudioArtifact.summary,
+          } : null,
+          sourceAudioPath: request.sourceAudioPath,
+          sourceDurationSeconds: 18,
+          toolId: tool.id,
+          toolLabel: tool.name,
+        },
+        displayName: request.displayName || request.nodeLabel || 'Continuation Audio',
+        kind: pipelineSchema.PORT_KIND_AUDIO,
+        role: 'generated',
+      });
+      return {
+        destinationPath: artifact.filePath,
+        message: tool.name + ' generated a continuation locally.',
+        outputs: { audio: artifact },
+        preview: artifactService.summarizeArtifact(artifact),
+      };
+    },
+  });
+
+  const completedRun = await runPipelineToCompletion(service, createAudiocraftContinuationPipeline(sourceAudioPath));
+  assert.strictEqual(completedRun.status, 'completed', 'Expected the Audiocraft continuation pipeline to complete successfully.');
+  assert.strictEqual(audioCalls.length, 1, 'Expected the local audio adapter to run exactly once for the continuation pipeline.');
+  assert.strictEqual(audioCalls[0].request.audioMode, 'continuation', 'Expected the continuation run to request AudioCraft continuation mode.');
+  assert.strictEqual(audioCalls[0].request.sourceAudioPath, sourceAudioPath, 'Expected continuation to pass the upstream source audio file path.');
+  assert.strictEqual(audioCalls[0].request.continuationSeedSeconds, 10, 'Expected continuation to pass the configured seed seconds.');
+  assert.strictEqual(audioCalls[0].request.durationSeconds, 12, 'Expected continuation to pass the generated duration separately from the seed.');
+  assert.strictEqual(audioCalls[0].request.appendSource, false, 'Expected continuation-only mode to keep appendSource false by default.');
+  assert.strictEqual(audioCalls[0].request.model, 'facebook/musicgen-small', 'Expected continuation to preserve selected AudioCraft model/snapshot value.');
+  assert.strictEqual(audioCalls[0].request.audiocraftTemperature, 0.85, 'Expected continuation to pass AudioCraft temperature.');
+  assert.strictEqual(audioCalls[0].request.audiocraftTopK, 120, 'Expected continuation to pass AudioCraft top_k.');
+  assert.strictEqual(audioCalls[0].request.audiocraftTopP, 0.2, 'Expected continuation to pass AudioCraft top_p.');
+  assert.strictEqual(audioCalls[0].request.audiocraftCfgCoef, 2.5, 'Expected continuation to pass AudioCraft CFG coefficient.');
+  assert.strictEqual(audioCalls[0].request.audiocraftTwoStepCfg, true, 'Expected continuation to pass AudioCraft two-step CFG.');
+
+  const result = completedRun.terminalResults[0];
+  assert.strictEqual(result.audioGeneration.mode, 'continuation', 'Expected terminal metadata to expose continuation mode.');
+  assert.strictEqual(result.audioGeneration.operationSubtype, 'continuation', 'Expected terminal metadata to expose continuation subtype.');
+  assert.strictEqual(result.audioGeneration.appendSource, false, 'Expected terminal metadata to preserve continuation-only appendSource false.');
+  assert.strictEqual(result.audioGeneration.continuationSeedSeconds, 10, 'Expected terminal metadata to preserve continuation seed seconds.');
+  assert.strictEqual(result.audioGeneration.finalOutputDurationSeconds, 12, 'Expected terminal metadata to keep continuation-only final duration equal to generated duration.');
+  assert.strictEqual(result.audioGeneration.generatedDurationSeconds, 12, 'Expected terminal metadata to preserve generated continuation duration.');
+  assert.strictEqual(result.audioGeneration.advancedSettings.topK, 120, 'Expected terminal metadata to preserve AudioCraft advanced settings.');
+  assert.strictEqual(result.audioGeneration.sourceAudio.fileName, path.basename(sourceAudioPath), 'Expected terminal metadata to preserve source audio reference.');
+  assert.strictEqual(result.audioGeneration.lineage.sourceFileName, path.basename(sourceAudioPath), 'Expected terminal metadata to preserve source lineage.');
+
+  const sidecarPath = result.supportingPaths.find((entry) => entry.endsWith('.audio.json'));
+  const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
+  assert.strictEqual(sidecar.audioGeneration.mode, 'continuation', 'Expected saved sidecar to preserve continuation mode.');
+  assert.strictEqual(sidecar.audioGeneration.appendSource, false, 'Expected saved sidecar to preserve continuation-only appendSource false.');
+  assert.strictEqual(sidecar.audioGeneration.continuationSeedSeconds, 10, 'Expected saved sidecar to preserve continuation seed seconds.');
+  assert.strictEqual(sidecar.audioGeneration.finalOutputDurationSeconds, 12, 'Expected saved sidecar to keep continuation-only final duration equal to generated duration.');
+  assert.strictEqual(sidecar.audioGeneration.generatedDurationSeconds, 12, 'Expected saved sidecar to preserve generated continuation duration.');
+  assert.strictEqual(sidecar.audioGeneration.advancedSettings.cfgCoef, 2.5, 'Expected saved sidecar to preserve CFG coefficient.');
+  assert.strictEqual(sidecar.audioGeneration.sourceAudio.fileName, path.basename(sourceAudioPath), 'Expected saved sidecar to preserve source audio reference.');
+  assert.strictEqual(sidecar.audioGeneration.lineage.sourceFilePath, sourceAudioPath, 'Expected saved sidecar to preserve source lineage path.');
+}
+
+async function verifyAudiocraftAppendSourceContinuationPipelineRun(tempRoot, sourceAudioPath) {
+  const toolEntries = [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })];
+  const audioCalls = [];
+  const sourceDurationSeconds = 1;
+  const service = createPipelineExecutionService(tempRoot, toolEntries, {
+    generateAudioFixture: async ({ artifactService, request, tool }) => {
+      audioCalls.push({ request, tool });
+      const finalDurationSeconds = sourceDurationSeconds + request.durationSeconds;
+      const outputPath = path.join(request.runDirectories.artifactsDir, 'audiocraft-append-continuation-result.wav');
+      await fsp.writeFile(outputPath, createWaveBuffer({ channelCount: 2, durationSeconds: finalDurationSeconds, frequency: 510, sampleRate: 32000 }));
+      const artifact = await artifactService.buildFileArtifact(outputPath, {
+        audioGeneration: {
+          advancedSettings: {
+            cfgCoef: request.audiocraftCfgCoef,
+            temperature: request.audiocraftTemperature,
+            topK: request.audiocraftTopK,
+            topP: request.audiocraftTopP,
+            twoStepCfg: request.audiocraftTwoStepCfg,
+          },
+          appendSource: true,
+          backend: 'audiocraft',
+          backendLabel: 'AudioCraft',
+          continuationSeedSeconds: request.continuationSeedSeconds,
+          durationSeconds: finalDurationSeconds,
+          finalOutputDurationSeconds: finalDurationSeconds,
+          generatedDurationSeconds: request.durationSeconds,
+          lineage: {
+            sourceFileName: request.sourceAudioArtifact?.fileName || '',
+            sourceFilePath: request.sourceAudioPath,
+            sourceKind: request.sourceAudioArtifact?.kind || '',
+          },
+          mode: request.audioMode,
+          model: request.model,
+          operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+          operationSubtype: request.audioMode,
+          prompt: request.prompt,
+          sourceAudio: request.sourceAudioArtifact ? {
+            displayName: request.sourceAudioArtifact.displayName,
+            fileName: request.sourceAudioArtifact.fileName,
+            filePath: request.sourceAudioArtifact.filePath,
+            fileUrl: request.sourceAudioArtifact.fileUrl,
+            formatLabel: request.sourceAudioArtifact.formatLabel,
+            kind: request.sourceAudioArtifact.kind,
+            mimeType: request.sourceAudioArtifact.mimeType,
+            sizeBytes: request.sourceAudioArtifact.sizeBytes,
+            summary: request.sourceAudioArtifact.summary,
+          } : null,
+          sourceAudioPath: request.sourceAudioPath,
+          sourceDurationSeconds,
+          toolId: tool.id,
+          toolLabel: tool.name,
+        },
+        displayName: request.displayName || request.nodeLabel || 'Appended Continuation Audio',
+        kind: pipelineSchema.PORT_KIND_AUDIO,
+        role: 'generated',
+      });
+      return {
+        destinationPath: artifact.filePath,
+        message: tool.name + ' generated and appended a continuation locally.',
+        outputs: { audio: artifact },
+        preview: artifactService.summarizeArtifact(artifact),
+      };
+    },
+  });
+
+  const completedRun = await runPipelineToCompletion(service, createAudiocraftContinuationPipeline(sourceAudioPath, { config: { appendSource: true } }));
+  assert.strictEqual(completedRun.status, 'completed', 'Expected the Audiocraft append-source continuation pipeline to complete successfully.');
+  assert.strictEqual(audioCalls.length, 1, 'Expected the local audio adapter to run exactly once for append-source continuation.');
+  assert.strictEqual(audioCalls[0].request.appendSource, true, 'Expected append-source continuation to pass appendSource true.');
+  assert.strictEqual(audioCalls[0].request.durationSeconds, 12, 'Expected append-source continuation to keep generated duration separate from final duration.');
+
+  const result = completedRun.terminalResults[0];
+  assert.strictEqual(result.audioGeneration.mode, 'continuation', 'Expected append-source terminal metadata to expose continuation mode.');
+  assert.strictEqual(result.audioGeneration.appendSource, true, 'Expected terminal metadata to preserve appendSource true.');
+  assert.strictEqual(result.audioGeneration.sourceDurationSeconds, sourceDurationSeconds, 'Expected terminal metadata to preserve source duration.');
+  assert.strictEqual(result.audioGeneration.generatedDurationSeconds, 12, 'Expected terminal metadata to preserve generated continuation duration.');
+  assert.strictEqual(result.audioGeneration.finalOutputDurationSeconds, 13, 'Expected terminal metadata to preserve final appended output duration.');
+  assert.strictEqual(result.audioGeneration.durationSeconds, 13, 'Expected terminal metadata durationSeconds to describe final appended output duration.');
+
+  const sidecarPath = result.supportingPaths.find((entry) => entry.endsWith('.audio.json'));
+  const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
+  assert.strictEqual(sidecar.audioGeneration.appendSource, true, 'Expected saved append-source sidecar to preserve appendSource true.');
+  assert.strictEqual(sidecar.audioGeneration.sourceDurationSeconds, sourceDurationSeconds, 'Expected saved append-source sidecar to preserve source duration.');
+  assert.strictEqual(sidecar.audioGeneration.generatedDurationSeconds, 12, 'Expected saved append-source sidecar to preserve generated duration.');
+  assert.strictEqual(sidecar.audioGeneration.finalOutputDurationSeconds, 13, 'Expected saved append-source sidecar to preserve final output duration.');
+  assert.strictEqual(sidecar.audio.durationSeconds, 13, 'Expected saved append-source audio metadata to reflect the stitched WAV duration.');
+}
+
+async function verifyAudiocraftMissingContinuationSourceFails(tempRoot) {
+  const missingPath = path.join(tempRoot, 'missing-source.wav');
+  const toolEntries = [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })];
+  const service = createPipelineExecutionService(tempRoot, toolEntries, {
+    generateAudioFixture: async () => {
+      throw new Error('Continuation should fail before calling the local audio adapter when the source file is missing.');
+    },
+  });
+  const completedRun = await runPipelineToCompletion(service, createAudiocraftContinuationPipeline(missingPath));
+  assert.strictEqual(completedRun.status, 'failed', 'Expected missing continuation source audio to fail the pipeline.');
+  assert(completedRun.message.includes('could not be found') || completedRun.message.includes('source audio'), 'Expected missing continuation source failure to be plain English.');
+}
+
 async function verifyRvcPipelineRun(tempRoot, sourceAudioPath) {
   const voiceModel = createRvcModel({ path: path.join(tempRoot, 'weights', 'voices', 'test-voice.pth') });
   const toolEntries = [createRvcTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped', downloadedModels: [voiceModel] })];
@@ -878,7 +1141,12 @@ async function verifyAudiocraftPipelineEnvironmentContract(tempRoot) {
   assert(helperSource.includes('summarize_runtime_exception'), 'AudioCraft helper should report the actual runtime exception instead of a generic warning-shaped failure.');
   assert(helperSource.includes('write_pcm16_wav'), 'AudioCraft helper should save generated pipeline audio through Local AI Hub\'s PCM WAV fallback.');
   assert(helperSource.includes('load_audio_for_chroma'), 'AudioCraft helper should avoid TorchCodec-only loading for local WAV audio guidance when possible.');
-  assert(!helperSource.includes('audio_write(output_stem'), 'AudioCraft pipeline export should not depend on audiocraft.data.audio.audio_write because recent Torchaudio requires TorchCodec there.');
+  assert(helperSource.includes('generate_continuation'), 'AudioCraft helper should use the real AudioCraft continuation API for continuation mode.');
+  assert(helperSource.includes('trim_end_seed'), 'AudioCraft helper should trim the end of the source clip for continuation seeding.');
+  assert(helperSource.includes('normalize_source_for_append'), 'AudioCraft helper should normalize the source audio before append-source concatenation.');
+  assert(helperSource.includes('torch.cat([source_for_append, waveform]'), 'AudioCraft helper should append full source audio to the stripped continuation without duplicating the seed segment.');
+  assert(helperSource.includes('generationSettings'), 'AudioCraft helper should accept stable AudioCraft advanced generation settings.');
+  assert(!/audio_write\s*\(/.test(helperSource), 'AudioCraft pipeline export should not depend on audiocraft.data.audio.audio_write because recent Torchaudio requires TorchCodec there.');
 
   const readinessService = loadModuleWithStubs('electron/services/localAudioService.js', {
     '/electron/services/localAudioService.js': {
@@ -1009,6 +1277,9 @@ async function main() {
   await verifyAudioOutputRun(tempRoot, audioPath);
   await verifyAudiocraftTextPipelineRun(tempRoot);
   await verifyAudiocraftGuidedPipelineRun(tempRoot, audioPath);
+  await verifyAudiocraftContinuationPipelineRun(tempRoot, audioPath);
+  await verifyAudiocraftAppendSourceContinuationPipelineRun(tempRoot, audioPath);
+  await verifyAudiocraftMissingContinuationSourceFails(tempRoot);
   await verifyRvcPipelineRun(tempRoot, audioPath);
   await verifyCloudAudioPipelineRun(tempRoot);
 

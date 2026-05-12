@@ -346,10 +346,35 @@ function buildSourceAudioReference(sourceAudioArtifact) {
     filePath: String(sourceAudioArtifact.filePath || '').trim(),
     fileUrl: String(sourceAudioArtifact.fileUrl || '').trim(),
     formatLabel: String(sourceAudioArtifact.formatLabel || '').trim(),
+    id: String(sourceAudioArtifact.id || sourceAudioArtifact.artifactId || '').trim(),
     kind: String(sourceAudioArtifact.kind || '').trim(),
     mimeType: String(sourceAudioArtifact.mimeType || '').trim(),
     sizeBytes: Number(sourceAudioArtifact.sizeBytes || 0) || 0,
     summary: String(sourceAudioArtifact.summary || '').trim(),
+  };
+}
+
+function buildAudioSourceLineage(sourceAudioArtifact) {
+  if (!sourceAudioArtifact) {
+    return null;
+  }
+
+  const lineage = {
+    sourceArtifactId: String(sourceAudioArtifact.id || sourceAudioArtifact.artifactId || '').trim(),
+    sourceFileName: String(sourceAudioArtifact.fileName || sourceAudioArtifact.displayName || '').trim(),
+    sourceFilePath: String(sourceAudioArtifact.filePath || '').trim(),
+    sourceKind: String(sourceAudioArtifact.kind || '').trim(),
+  };
+  return Object.values(lineage).some(Boolean) ? lineage : null;
+}
+
+function buildAudiocraftGenerationSettings(options = {}) {
+  return {
+    cfgCoef: Number.isFinite(Number(options.audiocraftCfgCoef)) ? Number(options.audiocraftCfgCoef) : 3,
+    temperature: Number.isFinite(Number(options.audiocraftTemperature)) ? Number(options.audiocraftTemperature) : 1,
+    topK: Math.max(0, Math.floor(Number(options.audiocraftTopK ?? 250) || 0)),
+    topP: Math.max(0, Math.min(1, Number(options.audiocraftTopP || 0) || 0)),
+    twoStepCfg: Boolean(options.audiocraftTwoStepCfg),
   };
 }
 
@@ -388,9 +413,13 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
   const nodeLabel = String(options.nodeLabel || options.displayName || 'Audio step').trim() || 'Audio step';
   const outputPath = buildAudioOutputPath(runDirectories, nodeLabel, 'wav');
   const requestPath = buildJsonRequestPath(runDirectories, nodeLabel, 'audiocraft-request');
+  const generationSettings = buildAudiocraftGenerationSettings(options);
   const response = await runLocalAudioTask(tool, {
+    appendSource: Boolean(options.appendSource),
     audioMode: String(options.audioMode || 'music').trim() || 'music',
+    continuationSeedSeconds: Math.max(0.25, Number(options.continuationSeedSeconds || 12) || 12),
     durationSeconds: Math.max(1, Number(options.durationSeconds || 8) || 8),
+    generationSettings,
     model: String(options.model || '').trim(),
     nodeLabel,
     outputPath,
@@ -408,16 +437,25 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
     throw new Error(toolLabel + ' reported success, but the generated audio file could not be found.');
   }
 
+  const audioMode = String(response?.audioMode || options.audioMode || 'music').trim() || 'music';
   const audioGeneration = {
+    advancedSettings: response?.advancedSettings && typeof response.advancedSettings === 'object' ? response.advancedSettings : generationSettings,
+    appendSource: Boolean(response?.appendSource),
     backend: 'audiocraft',
     backendLabel: 'AudioCraft',
+    continuationSeedSeconds: Number(response?.continuationSeedSeconds || options.continuationSeedSeconds || 0) || 0,
     durationSeconds: Number(response?.durationSeconds || options.durationSeconds || 0) || 0,
-    mode: String(response?.audioMode || options.audioMode || 'music').trim() || 'music',
+    finalOutputDurationSeconds: Number(response?.finalOutputDurationSeconds || response?.durationSeconds || options.durationSeconds || 0) || 0,
+    generatedDurationSeconds: Number(response?.generatedDurationSeconds || response?.durationSeconds || options.durationSeconds || 0) || 0,
+    lineage: buildAudioSourceLineage(options.sourceAudioArtifact),
+    mode: audioMode,
     model: String(response?.model || options.model || '').trim(),
     operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
-    operationSubtype: String(response?.audioMode || options.audioMode || 'music').trim() || 'music',
+    operationSubtype: audioMode,
     prompt: String(response?.prompt || options.prompt || '').trim(),
     sourceAudio: buildSourceAudioReference(options.sourceAudioArtifact),
+    sourceAudioPath: String(response?.sourceAudioPath || options.sourceAudioPath || '').trim(),
+    sourceDurationSeconds: Number(response?.sourceDurationSeconds || 0) || 0,
     toolId: String(tool?.id || '').trim() || 'audiocraft-webui',
     toolLabel,
   };

@@ -397,7 +397,14 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       videoSize: '1280x720',
       audioVoice: '',
       audioMode: 'music',
+      continuationSeedSeconds: 12,
+      appendSource: false,
       durationSeconds: 8,
+      audiocraftTemperature: 1,
+      audiocraftTopK: 250,
+      audiocraftTopP: 0,
+      audiocraftCfgCoef: 3,
+      audiocraftTwoStepCfg: false,
       negativePrompt: '',
       width: 832,
       height: 832,
@@ -720,6 +727,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       workflowFormat: DEFAULT_GRAPH_WORKFLOW_BINDINGS.workflowFormat,
       model: '',
       instruction: 'Generate one image for each text item while preserving the source order.',
+      failureMode: 'fail-fast',
       imageSize: '1024x1024',
       imageQuality: 'auto',
       imageBackground: 'auto',
@@ -730,7 +738,14 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       cfgScale: 7,
       seed: -1,
       audioMode: 'music',
+      continuationSeedSeconds: 12,
+      appendSource: false,
       durationSeconds: 8,
+      audiocraftTemperature: 1,
+      audiocraftTopK: 250,
+      audiocraftTopP: 0,
+      audiocraftCfgCoef: 3,
+      audiocraftTwoStepCfg: false,
       audioVoice: '',
       transformSubtype: 'upscale',
       analysisMode: 'clip',
@@ -4128,14 +4143,38 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
     if (connectedKinds.includes(PORT_KIND_AUDIO) && audioMode === 'sound') {
       summary.readiness = {
         tone: 'error',
-        message: 'Sound mode currently accepts text prompts only in this first audio-output slice. Switch the step to Music mode if you want to guide generation with connected audio.',
+        message: 'Sound mode currently accepts text prompts only in this audio-output slice. Switch the step to Music or Continuation mode if you want to use connected audio.',
+      };
+      return false;
+    }
+
+    if (audioMode === 'continuation' && !connectedKinds.includes(PORT_KIND_AUDIO)) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Continuation mode needs a connected source audio clip. Connect an Audio File node or an earlier audio output to this Model Step.',
+      };
+      return false;
+    }
+
+    if (audioMode === 'continuation' && Number(node.config?.continuationSeedSeconds || 0) <= 0) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Continuation seed seconds must be greater than zero so AudioCraft knows how much of the source ending to reuse.',
+      };
+      return false;
+    }
+
+    if (Number(node.config?.durationSeconds || 0) <= 0) {
+      summary.readiness = {
+        tone: 'error',
+        message: 'AudioCraft generation duration must be greater than zero seconds.',
       };
       return false;
     }
 
     summary.readiness = {
       tone: 'info',
-      message: tool.name + ' will run this audio generation step through its dedicated local backend adapter. Music mode accepts text prompts and optional audio guidance, while Sound mode stays text-only in this pass.',
+      message: tool.name + ' will run this audio generation step through its dedicated local backend adapter. Music mode accepts text prompts and optional audio guidance, Sound mode is text-only, and Continuation mode extends the end of a connected audio clip.',
     };
     return true;
   }

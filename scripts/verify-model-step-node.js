@@ -30,6 +30,10 @@ function verifyPipelineBuilderSourceGuards() {
   assert(!/selectedNode\.type === 'imageGenerate'/.test(source), 'Expected removed standalone image generation inspector branches to stay gone.');
   assert(!/selectedNode\.type === 'imageAnalyze'/.test(source), 'Expected removed standalone image analysis inspector branches to stay gone.');
   assert(!/selectedNode\.type === 'whisperTranscribe'/.test(source), 'Expected removed standalone transcription inspector branches to stay gone.');
+  assert(source.includes('<option value="continuation">Continuation</option>'), 'Expected Model Step AudioCraft mode picker to expose continuation mode.');
+  assert(source.includes('llm-local-audio-seed'), 'Expected Model Step AudioCraft continuation UI to expose seed seconds.');
+  assert(source.includes('llm-local-audio-append'), 'Expected Model Step AudioCraft continuation UI to expose append-source output mode.');
+  assert(source.includes('Advanced AudioCraft settings'), 'Expected Model Step AudioCraft UI to keep advanced generation settings available but collapsed.');
   const checkpointOptionHelperUses = source.match(/buildStableDiffusionCheckpointOption/g) || [];
   assert(checkpointOptionHelperUses.length >= 3, 'Expected Model Step and collectionMap checkpoint refresh options to use the shared checkpoint identity helper.');
 }

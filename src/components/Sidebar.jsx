@@ -22,18 +22,18 @@ function Sidebar({
   storeCount,
 }) {
   return (
-    <aside className="sidebar-shell xl:sticky xl:top-5 xl:self-start">
-      <div className="space-y-6">
-        <div className="rounded-[28px] border border-white/10 bg-white/5 p-5">
+    <aside className="sidebar-shell xl:sticky xl:top-5 xl:max-h-full xl:self-stretch xl:overflow-hidden">
+      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+        <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
           <div>
             <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Local AI Hub</p>
           </div>
-          <p className="mt-4 text-sm leading-6 text-slate-300">
+          <p className="mt-3 line-clamp-2 text-xs leading-5 text-slate-300">
             Keep installs, launches, repair, snapshots, pipelines, models, and cloud connections in one Windows-native control center.
           </p>
         </div>
 
-        <div className="space-y-3">
+        <div className="space-y-2">
           <NavButton active={activeTab === 'library'} count={installedCount} label="Library" onClick={() => onChangeTab('library')} />
           <NavButton active={activeTab === 'store'} count={storeCount} label="Store" onClick={() => onChangeTab('store')} />
           <NavButton active={activeTab === 'models'} count={modelManagerCount} label="Model Manager" onClick={() => onChangeTab('models')} />
@@ -42,24 +42,24 @@ function Sidebar({
           <NavButton active={activeTab === 'settings'} count={null} label="Settings" onClick={() => onChangeTab('settings')} />
         </div>
 
-        <div className="rounded-[28px] border border-white/10 bg-white/5 p-5">
+        <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
           <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Hardware</p>
-          <p className="mt-3 text-xl font-semibold text-white">{hardware?.gpuModel || 'Detecting GPU...'}</p>
-          <div className="mt-4 grid gap-3">
-            <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-3">
+          <p className="mt-2 text-base font-semibold leading-5 text-white">{hardware?.gpuModel || 'Detecting GPU...'}</p>
+          <div className="mt-3 grid gap-2">
+            <div className="rounded-xl border border-white/10 bg-slate-950/35 px-3 py-2">
               <p className="text-xs uppercase tracking-[0.18em] text-slate-500">VRAM</p>
               <p className="mt-2 text-sm font-medium text-white">{formatMemory(hardware?.vramMb)}</p>
             </div>
-            <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-3">
+            <div className="rounded-xl border border-white/10 bg-slate-950/35 px-3 py-2">
               <p className="text-xs uppercase tracking-[0.18em] text-slate-500">System RAM</p>
               <p className="mt-2 text-sm font-medium text-white">{formatMemory(hardware?.systemRamMb)}</p>
             </div>
           </div>
-          <p className="mt-4 text-sm leading-6 text-slate-400">{hardware?.compatibilityMessage || 'Local AI Hub is building a local hardware profile.'}</p>
+          <p className="mt-3 line-clamp-2 text-xs leading-5 text-slate-400">{hardware?.compatibilityMessage || 'Local AI Hub is building a local hardware profile.'}</p>
         </div>
       </div>
 
-      <button className="ghost-button mt-auto w-full justify-center" disabled={logsBusy} onClick={onOpenLogs} type="button">
+      <button className="ghost-button mt-3 w-full shrink-0 justify-center" disabled={logsBusy} onClick={onOpenLogs} type="button">
         {logsBusy ? 'Opening logs...' : 'Open logs folder'}
       </button>
     </aside>

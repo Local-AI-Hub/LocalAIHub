@@ -41,23 +41,23 @@ select {
   }
 
   .ghost-button {
-    @apply inline-flex items-center justify-center rounded-2xl border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-white transition hover:border-cyan-300/40 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60;
+    @apply inline-flex items-center justify-center rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold text-white transition hover:border-cyan-300/40 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60;
   }
 
   .primary-button {
-    @apply inline-flex items-center justify-center rounded-2xl bg-cyan-300 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-500;
+    @apply inline-flex items-center justify-center rounded-xl bg-cyan-300 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:bg-slate-500;
   }
 
   .status-pill {
-    @apply inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.22em];
+    @apply inline-flex items-center rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em];
   }
 
   .sidebar-shell {
-    @apply panel flex flex-col gap-6 p-5;
+    @apply panel flex flex-col gap-3 p-4;
   }
 
   .sidebar-tab {
-    @apply flex w-full items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left text-sm font-semibold text-slate-200 transition hover:border-cyan-300/30 hover:bg-white/10;
+    @apply flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-left text-sm font-semibold text-slate-200 transition hover:border-cyan-300/30 hover:bg-white/10;
   }
 
   .sidebar-tab-active {
@@ -77,19 +77,18 @@ select {
   }
 
   .tool-emblem {
-    @apply flex h-16 w-16 shrink-0 items-center justify-center rounded-[22px] border border-cyan-300/20 bg-cyan-300/10 text-lg font-semibold tracking-[0.24em] text-cyan-100;
+    @apply flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl border border-cyan-300/20 bg-cyan-300/10 text-base font-semibold tracking-[0.18em] text-cyan-100;
   }
 
   .library-card {
-    @apply panel p-6;
+    @apply panel p-4;
   }
 
   .store-card {
-    @apply rounded-[32px] border border-white/10 bg-[#0d1623]/90 p-6 shadow-soft;
+    @apply rounded-[24px] border border-white/10 bg-[#0d1623]/90 p-4 shadow-soft;
   }
 
   .store-input {
     @apply w-full rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-cyan-300/40 focus:bg-slate-950/55;
   }
 }
-

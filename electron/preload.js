@@ -25,9 +25,9 @@ contextBridge.exposeInMainWorld('localAIHub', {
   getKoboldCppSetup: (payload) => invoke('koboldcpp:get-setup', payload),
   getPipeline: (pipelineId) => invoke('pipelines:get', pipelineId),
   getRepairPreview: (toolId) => invoke('tools:get-repair-preview', toolId),
-  getStatistics: () => invoke('settings:get-statistics'),
+  getStatistics: (payload) => invoke('settings:get-statistics', payload),
   getStatisticsCore: () => invoke('settings:get-statistics-core'),
-  getStatisticsStorage: () => invoke('settings:get-statistics-storage'),
+  getStatisticsStorage: (payload) => invoke('settings:get-statistics-storage', payload),
   getToolInstallPreflight: (payload) => invoke('tools:get-install-preflight', payload),
   getToolRuntimeOutput: (toolId) => invoke('tools:get-runtime-output', toolId),
   getWindowActivity: () => invoke('app:get-window-activity'),
@@ -142,4 +142,3 @@ contextBridge.exposeInMainWorld('localAIHub', {
     return () => ipcRenderer.removeListener('app:window-activity', listener);
   },
 });
-

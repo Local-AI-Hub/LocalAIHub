@@ -276,36 +276,36 @@ function LibraryCard({
   const uninstallLabel = uninstallActionLabel(tool);
 
   return (
-    <article className="library-card">
-      <div className="flex flex-wrap items-start justify-between gap-5">
-        <div className="flex min-w-0 flex-1 items-start gap-5">
+    <article className="library-card h-full">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 flex-1 items-start gap-3">
           <div className="tool-emblem">{tool.icon || tool.name.slice(0, 2).toUpperCase()}</div>
           <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-3">
-              <h3 className="text-3xl font-semibold tracking-tight text-white">{tool.name}</h3>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-xl font-semibold tracking-tight text-white">{tool.name}</h3>
               <span className={`status-pill ${statusClass(tool.status)}`}>{tool.status.charAt(0).toUpperCase() + tool.status.slice(1)}</span>
               <span className="status-pill border-white/10 bg-white/5 text-slate-300">{tool.category || 'Tool'}</span>
               {hasUpdate ? <span className="status-pill border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Update available</span> : null}
             </div>
-            <p className="mt-3 text-sm leading-6 text-slate-300">{tool.description}</p>
-            <div className="mt-5 grid gap-3 md:grid-cols-3">
-              <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
-                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Install source</p>
-                <p className="mt-2 text-sm font-medium text-white">{installSourceLabel(tool)}</p>
+            <p className="mt-2 line-clamp-2 text-sm leading-5 text-slate-300">{tool.description}</p>
+            <div className="mt-3 grid gap-2 md:grid-cols-3">
+              <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Install source</p>
+                <p className="mt-1 text-xs font-medium text-white">{installSourceLabel(tool)}</p>
               </div>
-              <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
-                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Current VRAM load</p>
-                <p className="mt-2 text-sm font-medium text-white">{runningUsage}</p>
+              <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Current VRAM load</p>
+                <p className="mt-1 text-xs font-medium text-white">{runningUsage}</p>
               </div>
-              <div className="rounded-3xl border border-white/10 bg-slate-950/35 px-4 py-4">
-                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Last seen</p>
-                <p className="mt-2 text-sm font-medium text-white">{formatTimestamp(tool.installedAt || tool.detectedAt)}</p>
+              <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2">
+                <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Last seen</p>
+                <p className="mt-1 text-xs font-medium text-white">{formatTimestamp(tool.installedAt || tool.detectedAt)}</p>
               </div>
             </div>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2">
           <PrimaryAction busyMap={busyMap} onLaunch={onLaunch} onOpenInterface={onOpenInterface} onStop={onStop} tool={tool} />
           {tool.id === 'koboldcpp' ? (
             <button className="ghost-button" onClick={onOpenKoboldSetup} type="button">
@@ -341,7 +341,7 @@ function LibraryCard({
       <ProgressNotice accent="emerald" progress={updateProgress} showSpinner />
 
       {tool.lastError ? (
-        <div className="mt-5 rounded-3xl border border-rose-400/25 bg-rose-400/10 p-4 text-sm text-rose-100">
+        <div className="mt-3 rounded-2xl border border-rose-400/25 bg-rose-400/10 p-3 text-sm text-rose-100">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <p className="text-xs uppercase tracking-[0.22em] text-rose-200/80">Launch issue</p>
@@ -358,15 +358,15 @@ function LibraryCard({
 
 
       {tool.lastRepairMessage && !tool.lastError ? (
-        <div className="mt-5 rounded-3xl border border-emerald-400/20 bg-emerald-400/10 p-4 text-sm text-emerald-100">
+        <div className="mt-3 rounded-2xl border border-emerald-400/20 bg-emerald-400/10 p-3 text-sm text-emerald-100">
           {tool.lastRepairMessage}
         </div>
       ) : null}
 
       {settingsOpen ? (
-        <div className="mt-5 grid gap-4 xl:grid-cols-[0.8fr,1.2fr]">
+        <div className="mt-3 grid gap-3 2xl:grid-cols-[0.8fr,1.2fr]">
           <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
-            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">{installLocationLabel(tool)}</p>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">{installLocationLabel(tool)}</p>
             <div className="mt-4 space-y-3 text-sm text-slate-300">
               <p className="break-all leading-6">{locationDisplayPath(tool)}</p>
               {note ? <p className="mt-3 text-xs leading-6 text-slate-400">{note}</p> : null}
@@ -404,7 +404,7 @@ function LibraryCard({
           <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Snapshots</p>
+                <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Snapshots</p>
                 <p className="mt-2 text-sm leading-6 text-slate-300">
                   Save and restore a local checkpoint before changing models, extensions, or dependencies.
                 </p>

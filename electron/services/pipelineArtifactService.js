@@ -410,6 +410,7 @@ function serializeAudioSourceReference(reference = null) {
     filePath: String(reference.filePath || '').trim(),
     fileUrl: String(reference.fileUrl || '').trim(),
     formatLabel: String(reference.formatLabel || '').trim(),
+    id: String(reference.id || reference.artifactId || '').trim(),
     kind: String(reference.kind || '').trim(),
     mimeType: String(reference.mimeType || '').trim(),
     sizeBytes: Number(reference.sizeBytes || 0) || 0,
@@ -419,6 +420,22 @@ function serializeAudioSourceReference(reference = null) {
   return Object.values(normalized).some(Boolean) ? normalized : null;
 }
 
+function serializeAudioGenerationSettings(settings = null) {
+  if (!settings || typeof settings !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    cfgCoef: Number(settings.cfgCoef || 0) || 0,
+    temperature: Number(settings.temperature || 0) || 0,
+    topK: Number.isFinite(Number(settings.topK)) ? Math.max(0, Math.floor(Number(settings.topK))) : 0,
+    topP: Number(settings.topP || 0) || 0,
+    twoStepCfg: Boolean(settings.twoStepCfg),
+  };
+
+  return Object.entries(normalized).some(([, value]) => Boolean(value)) ? normalized : null;
+}
+
 function serializeAudioGenerationForUi(generation = null) {
   if (!generation || typeof generation !== 'object') {
     return null;
@@ -426,15 +443,23 @@ function serializeAudioGenerationForUi(generation = null) {
 
   const durationSeconds = roundAudioMetric(generation.durationSeconds);
   const normalized = {
+    advancedSettings: serializeAudioGenerationSettings(generation.advancedSettings),
+    appendSource: Boolean(generation.appendSource),
     backend: String(generation.backend || '').trim(),
     backendLabel: String(generation.backendLabel || '').trim(),
+    continuationSeedSeconds: roundAudioMetric(generation.continuationSeedSeconds),
     durationSeconds,
+    finalOutputDurationSeconds: roundAudioMetric(generation.finalOutputDurationSeconds || generation.durationSeconds),
+    generatedDurationSeconds: roundAudioMetric(generation.generatedDurationSeconds),
+    lineage: generation.lineage && typeof generation.lineage === 'object' ? serializeArtifactForUi(generation.lineage) : null,
     mode: String(generation.mode || '').trim(),
     model: String(generation.model || '').trim(),
     operationId: String(generation.operationId || '').trim(),
     operationSubtype: String(generation.operationSubtype || generation.mode || '').trim(),
     prompt: String(generation.prompt || '').trim(),
     sourceAudio: serializeAudioSourceReference(generation.sourceAudio),
+    sourceAudioPath: String(generation.sourceAudioPath || '').trim(),
+    sourceDurationSeconds: roundAudioMetric(generation.sourceDurationSeconds),
     voice: String(generation.voice || '').trim(),
     toolId: String(generation.toolId || '').trim(),
     toolLabel: String(generation.toolLabel || '').trim(),
@@ -881,7 +906,8 @@ function buildCompositionSummary(artifact, limit = 180) {
 function buildCollectionSummary(artifact, limit = 180) {
   const items = Array.isArray(artifact?.items) ? artifact.items.filter(Boolean) : [];
   const itemKindLabel = formatArtifactKindLabel(artifact?.itemKind || items[0]?.artifact?.kind || PORT_KIND_FILE);
-  const countLabel = items.length + ' ' + itemKindLabel.toLowerCase() + (items.length === 1 ? ' item' : ' items');
+  const statusPrefix = artifact?.collectionStatus === 'partial' || artifact?.partial ? 'Partial collection: ' : '';
+  const countLabel = statusPrefix + items.length + ' ' + itemKindLabel.toLowerCase() + (items.length === 1 ? ' item' : ' items');
   const itemPreview = items
     .slice(0, 4)
     .map((entry, index) => {
@@ -1090,9 +1116,18 @@ function createArtifactCollection(items, options = {}) {
     throw new Error('This collection can only contain one artifact type in this pass. Connect only text, image, audio, video, or file items of the same kind.');
   }
 
+  const collectionStatus = String(options.collectionStatus || '').trim().toLowerCase() === 'partial' ? 'partial' : 'complete';
+  const sourceItemCount = Math.max(0, Number(options.sourceItemCount || normalizedItems.length) || normalizedItems.length);
+  const failedItems = Array.isArray(options.failedItems) ? serializeArtifactForUi(options.failedItems).filter(Boolean) : [];
   const collection = {
     kind: PORT_KIND_COLLECTION,
     itemKind,
+    collectionStatus,
+    partial: collectionStatus === 'partial',
+    sourceItemCount,
+    successfulItemCount: normalizedItems.length,
+    failedItemCount: failedItems.length,
+    failedItems,
     displayName: String(options.displayName || formatArtifactKindLabel(itemKind) + ' Collection').trim() || (formatArtifactKindLabel(itemKind) + ' Collection'),
     previewKind: 'collection',
     role: options.role || 'artifact',
@@ -1121,6 +1156,9 @@ function createArtifactCollection(items, options = {}) {
   }
   if (options.collectionMapping && typeof options.collectionMapping === 'object') {
     collection.collectionMapping = serializeArtifactForUi(options.collectionMapping);
+  }
+  if (options.sourceCollection && typeof options.sourceCollection === 'object') {
+    collection.sourceCollection = serializeArtifactForUi(options.sourceCollection);
   }
 
   collection.summary = summarizeArtifact(collection);
@@ -1873,6 +1911,10 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
   const savedCollection = createArtifactCollection(normalizedItems, {
     accumulation: artifact?.accumulation,
     collectionMapping: artifact?.collectionMapping,
+    collectionStatus: artifact?.collectionStatus,
+    failedItems: artifact?.failedItems,
+    sourceCollection: artifact?.sourceCollection,
+    sourceItemCount: artifact?.sourceItemCount,
     destinationPath: options.target === 'outputs' ? directoryPath : '',
     directoryPath,
     displayName: options.displayName || options.title || artifact?.displayName || 'Collection',
@@ -1890,6 +1932,12 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
     artifactRole: savedCollection.artifactRole || '',
     kind: PORT_KIND_COLLECTION,
     isFinalOutput: Boolean(savedCollection.isFinalOutput),
+    collectionStatus: savedCollection.collectionStatus || 'complete',
+    partial: Boolean(savedCollection.partial),
+    sourceItemCount: Number(savedCollection.sourceItemCount || savedCollection.itemCount || 0) || 0,
+    successfulItemCount: Number(savedCollection.successfulItemCount || savedCollection.itemCount || 0) || 0,
+    failedItemCount: Number(savedCollection.failedItemCount || 0) || 0,
+    failedItems: Array.isArray(savedCollection.failedItems) ? serializeArtifactForUi(savedCollection.failedItems) : [],
     itemCount: savedCollection.itemCount,
     itemKind: savedCollection.itemKind,
     displayName: savedCollection.displayName,
@@ -1903,6 +1951,7 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
     summary: savedCollection.summary,
     accumulation: savedCollection.accumulation ? serializeArtifactForUi(savedCollection.accumulation) : null,
     collectionMapping: savedCollection.collectionMapping ? serializeArtifactForUi(savedCollection.collectionMapping) : null,
+    sourceCollection: savedCollection.sourceCollection ? serializeArtifactForUi(savedCollection.sourceCollection) : null,
     items: savedCollection.items.map((entry) => buildCollectionManifestItem(entry, directoryPath)),
   }, { spaces: 2 });
 
@@ -2227,6 +2276,10 @@ async function describeArtifactForLlm(artifact) {
       artifact.displayName ? 'Name: ' + artifact.displayName : '',
       artifact.summary ? 'Summary: ' + artifact.summary : '',
       artifact.manifestPath ? 'Manifest: ' + artifact.manifestPath : '',
+      artifact.collectionStatus ? 'Collection status: ' + artifact.collectionStatus : '',
+      artifact.partial ? 'Partial output: yes' : '',
+      Number(artifact.sourceItemCount || 0) ? 'Source item count: ' + Number(artifact.sourceItemCount || 0) : '',
+      Number(artifact.failedItemCount || 0) ? 'Failed item count: ' + Number(artifact.failedItemCount || 0) : '',
       accumulation?.status ? 'Collection state: ' + accumulation.status : '',
       Number(accumulation?.acceptedCount || 0) ? 'Accepted count: ' + Number(accumulation.acceptedCount || 0) : '',
       Number(accumulation?.targetCount || 0) ? 'Target count: ' + Number(accumulation.targetCount || 0) : '',

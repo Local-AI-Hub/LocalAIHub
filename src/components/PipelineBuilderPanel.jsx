@@ -81,12 +81,13 @@ const CANVAS_PADDING_X = 360;
 const CANVAS_PADDING_Y = 280;
 const PIPELINE_SECTION_VISIBILITY_STORAGE_KEY = 'local-ai-hub.pipeline-builder.section-visibility.v1';
 const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
+  pipelineInfo: false,
   canvas: true,
-  inspector: true,
-  nodePalette: true,
-  pipelineWizard: true,
-  runStatus: true,
-  savedPipelines: true,
+  inspector: false,
+  nodePalette: false,
+  pipelineWizard: false,
+  runStatus: false,
+  savedPipelines: false,
 });
 const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ? getPlanningSchemaOptions() : [];
 const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
@@ -195,10 +196,11 @@ function normalizePipelineSectionVisibility(value) {
   }
 
   for (const key of Object.keys(normalized)) {
-    if (typeof value[key] === 'boolean') {
-      normalized[key] = value[key];
-    }
+    normalized[key] = false;
   }
+
+  const firstOpenKey = Object.keys(DEFAULT_PIPELINE_SECTION_VISIBILITY).find((key) => value[key] === true) || 'canvas';
+  normalized[firstOpenKey] = true;
 
   return normalized;
 }
@@ -424,7 +426,7 @@ function buildAudioFactLabels(artifact) {
     audio?.sampleRate ? `${audio.sampleRate} Hz` : '',
     buildAudioChannelFact(audio?.channelCount),
     transformationType === 'voice-conversion' ? 'Voice conversion' : transformation?.transformationType ? transformation.transformationType : '',
-    mode === 'music' ? 'Music mode' : mode === 'sound' ? 'Sound mode' : mode === 'speech' ? 'Speech mode' : '',
+    mode === 'music' ? 'Music mode' : mode === 'sound' ? 'Sound mode' : mode === 'continuation' ? 'Continuation mode' : mode === 'speech' ? 'Speech mode' : '',
     transformation?.toolLabel || transformation?.backendLabel || generation?.toolLabel || generation?.backendLabel || '',
     transformation?.targetVoice ? `Voice ${transformation.targetVoice}` : generation?.voice ? `Voice ${generation.voice}` : '',
   ].filter(Boolean);
@@ -1756,7 +1758,7 @@ function PipelineOutputsPanel({ busyPath, expanded, loading, onDelete, onOpenPat
   const outputCountLabel = `${outputCount} saved output${outputCount === 1 ? '' : 's'}`;
 
   return (
-    <div className="panel p-5">
+    <div className="panel p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline outputs</p>
@@ -2819,6 +2821,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       workflowFormat: executionMode === 'graphWorkflow' ? currentConfig.workflowFormat || graphDefaults.workflowFormat : currentConfig.workflowFormat,
       model: '',
       instruction: getCollectionMapDefaultInstruction(operationId),
+      failureMode: currentConfig.failureMode === 'partial' ? 'partial' : 'fail-fast',
       perItemValidation: currentConfig.perItemValidation && typeof currentConfig.perItemValidation === 'object'
         ? currentConfig.perItemValidation
         : { enabled: false, mode: 'llm', llmExecutionMode: 'cloud', providerId: '', model: '', ruleset: '', systemPrompt: '', maxAttempts: 2, retryInstruction: '', failMode: 'fail-fast' },
@@ -2836,7 +2839,14 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       nextConfig.seed = Number(currentConfig.seed ?? -1);
     } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
       nextConfig.audioMode = currentConfig.audioMode || 'music';
+      nextConfig.continuationSeedSeconds = Number(currentConfig.continuationSeedSeconds || 12) || 12;
+      nextConfig.appendSource = Boolean(currentConfig.appendSource);
       nextConfig.durationSeconds = Number(currentConfig.durationSeconds || 8) || 8;
+      nextConfig.audiocraftTemperature = Number(currentConfig.audiocraftTemperature || 1) || 1;
+      nextConfig.audiocraftTopK = Number(currentConfig.audiocraftTopK ?? 250) || 250;
+      nextConfig.audiocraftTopP = Number(currentConfig.audiocraftTopP || 0) || 0;
+      nextConfig.audiocraftCfgCoef = Number(currentConfig.audiocraftCfgCoef || 3) || 3;
+      nextConfig.audiocraftTwoStepCfg = Boolean(currentConfig.audiocraftTwoStepCfg);
       nextConfig.audioVoice = currentConfig.audioVoice || '';
     } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
       nextConfig.transformSubtype = currentConfig.transformSubtype || 'upscale';
@@ -3203,10 +3213,11 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   }, [canvasZoom]);
 
   function toggleSection(sectionKey) {
-    setSectionVisibility((current) => ({
-      ...current,
-      [sectionKey]: !current[sectionKey],
-    }));
+    setSectionVisibility((current) => {
+      const next = Object.fromEntries(Object.keys(DEFAULT_PIPELINE_SECTION_VISIBILITY).map((key) => [key, false]));
+      next[sectionKey] = !current[sectionKey];
+      return next;
+    });
   }
 
   function updatePipelineMetadata(field, value) {
@@ -4036,90 +4047,95 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const graphEdges = draft.edges.filter((edge) => graph.nodeMap.has(edge.source.nodeId) && graph.nodeMap.has(edge.target.nodeId));
 
   if (loading) {
-    return <section className="panel p-6 text-sm text-slate-300">Loading the Pipeline Builder...</section>;
+    return <section className="panel p-4 text-sm text-slate-300">Loading the Pipeline Builder...</section>;
   }
 
   return (
-    <section className="space-y-5">
-      <div className="panel p-6">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div>
-            <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Pipeline Builder</p>
-            <h3 className="mt-3 text-3xl font-semibold tracking-tight text-white">Build typed Local AI Hub workflows</h3>
-            <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-300">
-              Provider and tool nodes stay capability-aware across text, image, audio, video, and file artifacts while Local AI Hub launches heavy local tools one step at a time.
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-3">
-            <button className="ghost-button" onClick={createNewPipeline} type="button">New pipeline</button>
-            <button className="ghost-button" disabled={!currentPipelineSaved || deleteBusy} onClick={handleDeletePipeline} type="button">
-              {deleteBusy ? 'Deleting...' : 'Delete'}
-            </button>
-            <button className="primary-button" disabled={saveBusy} onClick={handleSavePipeline} type="button">
-              {savePipelineLabel}
-            </button>
-            {runState?.status === 'running' || runState?.status === 'paused' ? (
-              <button className="ghost-button" disabled={cancelBusy} onClick={handleCancelRun} type="button">
-                {cancelBusy ? 'Cancelling...' : 'Cancel run'}
+    <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+      <div className="min-h-0 flex-1 overflow-y-auto pb-6 pr-1">
+        <div className="space-y-3">
+          <div className="panel p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('pipelineInfo')} type="button">
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline setup</p>
+                <p className="mt-1 truncate text-lg font-semibold text-white">{draft.name || 'Untitled pipeline'}</p>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-300">
+                  <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">{currentPipelineSaved ? 'Saved pipeline' : 'New pipeline'}</span>
+                  {pipelineMetadataDirty ? <span className="rounded-full border border-amber-300/30 bg-amber-300/12 px-3 py-1 text-amber-100">Metadata changed</span> : null}
+                  <span className={`rounded-full border px-3 py-1 ${toneToClassName(analysis.compatibilitySummary?.tone || analysis.primaryIssue?.tone || 'neutral')}`}>{analysis.compatibilitySummary?.label || (analysis.executable ? 'Ready to run' : 'Needs attention')}</span>
+                  <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{analysis.executionOrder.length} queued step{analysis.executionOrder.length === 1 ? '' : 's'}</span>
+                </div>
               </button>
-            ) : (
-              <button className="primary-button" disabled={runBusy} onClick={handleRunPipeline} type="button">
-                {runBusy ? 'Starting...' : 'Run pipeline'}
-              </button>
-            )}
-          </div>
-        </div>
-
-        <div className="mt-6 grid gap-4 xl:grid-cols-[1.1fr,1fr]">
-          <div className="rounded-[28px] border border-white/10 bg-slate-950/35 p-4">
-            <div className="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">
-              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">{currentPipelineSaved ? 'Saved pipeline' : 'New pipeline'}</span>
-              {pipelineMetadataDirty ? <span className="rounded-full border border-amber-300/30 bg-amber-300/12 px-3 py-1 text-amber-100">Metadata changed</span> : null}
+              <div className="flex flex-wrap items-center gap-2">
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={createNewPipeline} type="button">New pipeline</button>
+                <button className="ghost-button px-3 py-1.5 text-xs" disabled={!currentPipelineSaved || deleteBusy} onClick={handleDeletePipeline} type="button">
+                  {deleteBusy ? 'Deleting...' : 'Delete'}
+                </button>
+                <button className="primary-button px-3 py-1.5 text-xs" disabled={saveBusy} onClick={handleSavePipeline} type="button">
+                  {savePipelineLabel}
+                </button>
+                {runState?.status === 'running' || runState?.status === 'paused' ? (
+                  <button className="ghost-button px-3 py-1.5 text-xs" disabled={cancelBusy} onClick={handleCancelRun} type="button">
+                    {cancelBusy ? 'Cancelling...' : 'Cancel run'}
+                  </button>
+                ) : (
+                  <button className="primary-button px-3 py-1.5 text-xs" disabled={runBusy} onClick={handleRunPipeline} type="button">
+                    {runBusy ? 'Starting...' : 'Run pipeline'}
+                  </button>
+                )}
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('pipelineInfo')} type="button">
+                  {sectionVisibility.pipelineInfo ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
             </div>
-            <label className="mt-4 block text-xs uppercase tracking-[0.2em] text-slate-500" htmlFor="pipeline-name">Pipeline name</label>
-            <input
-              className="store-input mt-3"
-              id="pipeline-name"
-              onChange={(event) => updatePipelineMetadata('name', event.target.value)}
-              placeholder="Untitled pipeline"
-              value={draft.name}
-            />
-            <label className="mt-4 block text-xs uppercase tracking-[0.2em] text-slate-500" htmlFor="pipeline-description">Description</label>
-            <textarea
-              className="store-input mt-3 min-h-[120px] resize-none"
-              id="pipeline-description"
-              onChange={(event) => updatePipelineMetadata('description', event.target.value)}
-              placeholder="What should this workflow do?"
-              value={draft.description}
-            />
-            <p className="mt-3 text-xs leading-5 text-slate-400">
-              {currentPipelineSaved
-                ? 'Editing the name or description updates this same saved pipeline when you click Update pipeline. You do not need to rebuild the graph first.'
-                : 'Set the name and description before the first save so this pipeline is easy to find later.'}
-            </p>
-          </div>
 
-          <div className={`rounded-[28px] border p-4 ${toneToClassName(analysis.compatibilitySummary?.tone || analysis.primaryIssue?.tone || 'neutral')}`}>
-            <p className="text-xs uppercase tracking-[0.2em] text-slate-300">Readiness and suitability</p>
-            <p className="mt-3 text-lg font-semibold text-white">{analysis.compatibilitySummary?.label || (analysis.executable ? 'Ready to run' : 'Needs attention')}</p>
-            <p className="mt-2 text-sm leading-6 text-slate-100">{analysis.primaryIssue?.message || analysis.compatibilitySummary?.message || 'This pipeline is ready to run.'}</p>
-            <div className="mt-4 flex flex-wrap items-center gap-3 text-[11px] uppercase tracking-[0.18em] text-slate-300">
-              <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{analysis.executionOrder.length} queued step{analysis.executionOrder.length === 1 ? '' : 's'}</span>
-              <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{getIssueCountText(analysis.issues.length)}</span>
-              <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">Sequential only</span>
-            </div>
-            {analysis.issues.length ? (
-              <div className="mt-4 space-y-2">
-                {analysis.issues.slice(0, 5).map((issue, index) => (
-                  <div key={`${issue.message}-${index}`} className={`rounded-2xl border px-3 py-2 text-sm ${toneToClassName(issue.tone)}`}>{issue.message}</div>
-                ))}
+            {sectionVisibility.pipelineInfo ? (
+              <div className="mt-4 grid gap-3 xl:grid-cols-[1.1fr,1fr]">
+                <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
+                  <label className="block text-xs uppercase tracking-[0.2em] text-slate-500" htmlFor="pipeline-name">Pipeline name</label>
+                  <input
+                    className="store-input mt-3"
+                    id="pipeline-name"
+                    onChange={(event) => updatePipelineMetadata('name', event.target.value)}
+                    placeholder="Untitled pipeline"
+                    value={draft.name}
+                  />
+                  <label className="mt-3 block text-xs uppercase tracking-[0.2em] text-slate-500" htmlFor="pipeline-description">Description</label>
+                  <textarea
+                    className="store-input mt-2 min-h-[76px] resize-none"
+                    id="pipeline-description"
+                    onChange={(event) => updatePipelineMetadata('description', event.target.value)}
+                    placeholder="What should this workflow do?"
+                    value={draft.description}
+                  />
+                  <p className="mt-3 text-xs leading-5 text-slate-400">
+                    {currentPipelineSaved
+                      ? 'Editing the name or description updates this same saved pipeline when you click Update pipeline.'
+                      : 'Set the name and description before the first save so this pipeline is easy to find later.'}
+                  </p>
+                </div>
+
+                <div className={`rounded-2xl border p-3 ${toneToClassName(analysis.compatibilitySummary?.tone || analysis.primaryIssue?.tone || 'neutral')}`}>
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-300">Readiness and suitability</p>
+                  <p className="mt-3 text-lg font-semibold text-white">{analysis.compatibilitySummary?.label || (analysis.executable ? 'Ready to run' : 'Needs attention')}</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-100">{analysis.primaryIssue?.message || analysis.compatibilitySummary?.message || 'This pipeline is ready to run.'}</p>
+                  <div className="mt-4 flex flex-wrap items-center gap-3 text-[11px] uppercase tracking-[0.18em] text-slate-300">
+                    <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{analysis.executionOrder.length} queued step{analysis.executionOrder.length === 1 ? '' : 's'}</span>
+                    <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">{getIssueCountText(analysis.issues.length)}</span>
+                    <span className="rounded-full border border-white/10 bg-slate-950/35 px-3 py-1">Sequential only</span>
+                  </div>
+                  {analysis.issues.length ? (
+                    <div className="mt-4 max-h-56 space-y-2 overflow-y-auto pr-1">
+                      {analysis.issues.map((issue, index) => (
+                        <div key={`${issue.message}-${index}`} className={`rounded-2xl border px-3 py-2 text-sm ${toneToClassName(issue.tone)}`}>{issue.message}</div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               </div>
             ) : null}
           </div>
-        </div>
-      </div>
-      <div className="panel p-5">
+          <div className="panel p-4">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline wizard</p>
@@ -4264,8 +4280,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
           </div>
         ) : null}
       </div>
-      <div className="space-y-5">
-          <div className="panel p-5">
+      <div className="space-y-3">
+          <div className="panel p-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Saved pipelines</p>
@@ -4291,7 +4307,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             ) : null}
           </div>
 
-          <div className="panel p-5">
+          <div className="panel p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node palette</p>
@@ -4330,7 +4346,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             ) : null}
           </div>
 
-          <div className="panel p-5">
+          <div className="panel p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node inspector</p>
@@ -4491,7 +4507,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                           ? 'Local Ollama mode currently returns text only.'
                           : selectedNode.config?.executionMode === 'localTool'
                             ? getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
-                              ? 'Local audio tool mode returns a generated audio artifact from the Audio output port. Music mode can also use an upstream audio artifact as guidance in this slice.'
+                              ? 'Local audio tool mode returns a generated audio artifact from the Audio output port. Music mode can use upstream audio as guidance, and Continuation mode extends the end of a connected source clip.'
                               : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
                                 ? 'Local audio transform tool mode returns a transformed audio artifact from the Audio output port and keeps the source-audio lineage visible after the run.'
                                 : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
@@ -4535,7 +4551,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                           ? 'Optional style or scene guidance to prepend to the incoming prompt.'
                           : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                             ? selectedNode.config?.executionMode === 'localTool'
-                              ? 'Optional guidance for the generated audio. In Music mode, use this for mood, style, or instrumentation. With upstream audio, this can steer how the result evolves.'
+                              ? 'Optional guidance for the generated audio. In Music mode, use this for mood, style, or instrumentation. In Continuation mode, use this only as optional text conditioning for the continuation.'
                               : 'Optional guidance for how the provider should speak the connected text, such as tone, pacing, or delivery style.'
                             : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
                               ? 'Optional note to save with this transformed audio result. Choose the source audio and RVC voice model through the connected input and local model field.'
@@ -4549,7 +4565,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                       {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? (
                         <p className="mt-2 text-xs leading-5 text-slate-400">
                           {selectedNode.config?.executionMode === 'localTool'
-                            ? 'Text input becomes the base generation prompt. In Music mode, you can also connect an upstream audio artifact to guide the result. Sound mode stays text-only in this first shared audio-output slice.'
+                            ? 'Text input becomes the base prompt for Music or Sound mode. Continuation mode requires an upstream audio artifact and uses the end of that clip as the generation seed.'
                             : 'Text input becomes the spoken content for this cloud audio step. Use the instruction box for optional delivery guidance, and choose a provider voice below when the model supports it.'}
                         </p>
                       ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM ? (
@@ -4574,17 +4590,34 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                             <select className="store-input mt-3" id="llm-local-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value } }))} value={selectedNode.config?.audioMode || 'music'}>
                               <option value="music">Music</option>
                               <option value="sound">Sound</option>
+                              <option value="continuation">Continuation</option>
                             </select>
                           </div>
-                          <div>
-                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-duration">Duration (seconds)</label>
-                            <input className="store-input mt-3" id="llm-local-audio-duration" max="60" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} />
+                          <div className={selectedNode.config?.audioMode === 'continuation' ? 'grid gap-3 sm:grid-cols-2' : ''}>
+                            {selectedNode.config?.audioMode === 'continuation' ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-seed">Seed from source ending (seconds)</label><input className="store-input mt-3" id="llm-local-audio-seed" max="30" min="0.25" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationSeedSeconds: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.continuationSeedSeconds || 12} /></div> : null}
+                            <div>
+                              <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-duration">{selectedNode.config?.audioMode === 'continuation' ? 'Generated continuation duration' : 'Duration'} (seconds)</label>
+                              <input className="store-input mt-3" id="llm-local-audio-duration" max="60" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} />
+                            </div>
                           </div>
+                          {selectedNode.config?.audioMode === 'continuation' ? <label className="flex items-center gap-3 rounded-[18px] border border-white/10 bg-white/5 px-4 py-3 text-sm font-medium text-slate-200" htmlFor="llm-local-audio-append"><input checked={Boolean(selectedNode.config?.appendSource)} className="h-4 w-4 accent-cyan-300" id="llm-local-audio-append" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, appendSource: event.target.checked } }))} type="checkbox" />Append source audio to continuation</label> : null}
                           <p className="text-xs leading-5 text-slate-400">
                             {selectedNode.config?.audioMode === 'sound'
                               ? 'Sound mode runs AudioGen and currently accepts text prompts only. Use it for environmental or effect-style clips rather than melody-guided output.'
-                              : 'Music mode runs MusicGen. Connect text for text-to-music, or connect an audio artifact to guide melody and structure while keeping this instruction box as optional extra guidance.'}
+                              : selectedNode.config?.audioMode === 'continuation'
+                                ? (selectedNode.config?.appendSource ? 'Continuation mode will output one WAV containing the full source audio followed by the new continuation segment.' : 'Continuation mode outputs only the new continuation segment. Enable append source when you want one longer stitched WAV.')
+                                : 'Music mode runs MusicGen. Connect text for text-to-music, or connect an audio artifact to guide melody and structure while keeping this instruction box as optional extra guidance.'}
                           </p>
+                          <details className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3">
+                            <summary className="cursor-pointer text-xs uppercase tracking-[0.18em] text-slate-400">Advanced AudioCraft settings</summary>
+                            <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-temperature">Temperature</label><input className="store-input mt-3" id="llm-local-audio-temperature" min="0.01" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTemperature: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTemperature ?? 1} /></div>
+                              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-top-k">Top K</label><input className="store-input mt-3" id="llm-local-audio-top-k" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopK: Number(event.target.value || 0) || 0 } }))} step="1" type="number" value={selectedNode.config?.audiocraftTopK ?? 250} /></div>
+                              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-top-p">Top P</label><input className="store-input mt-3" id="llm-local-audio-top-p" max="1" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopP: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTopP ?? 0} /></div>
+                              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-cfg">CFG coefficient</label><input className="store-input mt-3" id="llm-local-audio-cfg" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftCfgCoef: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.audiocraftCfgCoef ?? 3} /></div>
+                              <label className="flex items-center gap-3 pt-7 text-sm font-medium text-slate-200" htmlFor="llm-local-audio-two-step"><input checked={Boolean(selectedNode.config?.audiocraftTwoStepCfg)} className="h-4 w-4 accent-cyan-300" id="llm-local-audio-two-step" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTwoStepCfg: event.target.checked } }))} type="checkbox" />Two-step CFG</label>
+                            </div>
+                          </details>
                         </div>
                       ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM ? (
                         <div className="space-y-4">
@@ -5168,6 +5201,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                   const collectionMapTransformSubtypeOptions = getImageTransformSubtypeOptions(selectedNode.config?.toolId || 'upscayl');
                   const collectionMapInstructionValue = getCollectionMapInstructionValue(selectedNode, collectionMapOperationId);
                   const collectionMapModelOptions = modelOptionsByNodeId[selectedNode.id] || [];
+                  const collectionMapFailureMode = selectedNode.config?.failureMode === 'partial' || selectedNode.config?.partialSuccess?.enabled ? 'partial' : 'fail-fast';
                   const perItemValidation = selectedNode.config?.perItemValidation || {};
                   const perItemValidationEnabled = Boolean(perItemValidation.enabled);
                   const perItemValidationOutputKind = selectedCollectionMapMapping?.outputKind || 'image';
@@ -5238,8 +5272,16 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                     {showCollectionMapInstructionField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-instruction">{getCollectionMapInstructionLabel(collectionMapOperationId, collectionMapExecutionMode)}</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="collection-map-instruction" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder={getCollectionMapInstructionPlaceholder(collectionMapOperationId, collectionMapExecutionMode)} value={collectionMapInstructionValue} /></div> : null}
                     {showCollectionMapLocalImageGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[100px] resize-none" id="collection-map-negative" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for every mapped image." value={selectedNode.config?.negativePrompt || ''} /></div> : null}
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-failure-mode">On item failure</label>
+                      <select className="store-input mt-3" id="collection-map-failure-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, failureMode: event.target.value === 'partial' ? 'partial' : 'fail-fast', partialSuccess: { ...(currentNode.config?.partialSuccess || {}), enabled: event.target.value === 'partial' } } }))} value={collectionMapFailureMode}>
+                        <option value="fail-fast">Fail entire map, no partial output</option>
+                        <option value="partial">Output partial collection with successful items</option>
+                      </select>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">Partial output contains only successful final items and records failed item details in the collection manifest. With per-item validation, this applies after max attempts are exhausted.</p>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
                       <label className="flex items-center gap-3 text-sm font-medium text-white" htmlFor="collection-map-per-item-validation"><input checked={perItemValidationEnabled} className="h-4 w-4 accent-cyan-300" id="collection-map-per-item-validation" onChange={(event) => updatePerItemValidation({ enabled: event.target.checked })} type="checkbox" />Validate each mapped item</label>
-                      <p className="mt-2 text-xs leading-5 text-slate-400">When enabled, Local AI Hub validates one mapped {perItemValidationOutputLabel.toLowerCase()} item at a time and retries only that source item. Final collection output is still all-or-fail.</p>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">When enabled, Local AI Hub validates one mapped {perItemValidationOutputLabel.toLowerCase()} item at a time and retries only that source item. Final collection output follows the item failure setting above.</p>
                       {perItemValidationEnabled ? (
                         <div className="mt-4 space-y-3">
                           <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-mode">Validation mode</label><select className="store-input mt-3" id="collection-map-validation-mode" onChange={(event) => updatePerItemValidation({ mode: event.target.value === 'user' ? 'user' : 'llm' })} value={perItemValidation.mode === 'user' ? 'user' : 'llm'}><option disabled={!perItemValidationLlmSupported} value="llm">LLM validator</option><option value="user">User approval</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-validation-attempts">Max attempts per item</label><input className="store-input mt-3" id="collection-map-validation-attempts" max={PIPELINE_RETRY_LOOP_MAX_ATTEMPTS} min="1" onChange={(event) => updatePerItemValidation({ maxAttempts: Math.max(1, Math.min(PIPELINE_RETRY_LOOP_MAX_ATTEMPTS, Number(event.target.value || 1) || 1)) })} type="number" value={Math.max(1, Math.min(PIPELINE_RETRY_LOOP_MAX_ATTEMPTS, Number(perItemValidation.maxAttempts || 2) || 2))} /></div></div>
@@ -5254,7 +5296,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         </div>
                       ) : null}
                     </div>
-                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This node maps an ordered typed collection into another ordered typed collection. It fails the whole mapped step on the first failed item and identifies the item number and id, so hidden partial results are never marked complete.</div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">This node maps an ordered typed collection into another ordered typed collection. Partial collections are explicit, marked partial in their manifest, and never include failed item artifacts as successful final items.</div>
                   </div>
                   );
                 })() : null}
@@ -5373,7 +5415,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             ) : <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">Select a node on the canvas to edit its settings and inspect its connections.</div>) : null}
           </div>
 
-          <div className="panel p-5">
+          <div className="panel p-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Canvas</p>
@@ -5392,9 +5434,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             </div>
 
             {sectionVisibility.canvas ? (
-              <div className="mt-4 rounded-[28px] border border-white/10 bg-slate-950/30 p-2">
+              <div className="mt-3 rounded-[24px] border border-white/10 bg-slate-950/30 p-2">
                 <div
-                  className="relative h-[860px] overflow-auto rounded-[24px] border border-dashed border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(67,171,255,0.08),transparent_24%),linear-gradient(180deg,rgba(7,15,26,0.96),rgba(5,10,18,0.96))]"
+                  className="relative h-[min(66vh,760px)] min-h-[460px] overflow-auto rounded-[22px] border border-dashed border-white/10 bg-[radial-gradient(circle_at_top_left,rgba(67,171,255,0.08),transparent_24%),linear-gradient(180deg,rgba(7,15,26,0.96),rgba(5,10,18,0.96))]"
                   onMouseDown={handleCanvasMouseDown}
                   onWheel={handleCanvasWheel}
                   ref={canvasRef}
@@ -5541,7 +5583,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             ) : null}
           </div>
 
-          <div className="panel p-5">
+          <div className="panel p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Runtime status</p>
@@ -5578,7 +5620,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             onToggleExpanded={() => setPipelineOutputsExpanded((current) => !current)}
             outputs={pipelineOutputs}
           />
+        </div>
       </div>
+        </div>
     </section>
   );
 }

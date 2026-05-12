@@ -77,7 +77,7 @@ const {
   setProviderStateChangeSink,
   testProviderConnection,
 } = require('./services/providerService');
-const { getStatisticsCoreSnapshot, getStatisticsSnapshot, getStatisticsStorageSnapshot, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
+const { getStatisticsCoreSnapshot, getStatisticsSnapshot, getStatisticsStorageSnapshot, invalidateStatisticsIndexSections, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
 const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./services/toolUpdateService');
 const { transcribeWithWhisper } = require('./services/whisperService');
 const { buildMergedToolStateList } = require('./services/toolStateService');
@@ -985,6 +985,7 @@ function registerIpcHandlers() {
         onProgress: (progressPayload) => sendInstallProgress(progressPayload),
       });
       invalidateDiscoveryCache();
+      await invalidateStatisticsIndexSections(['storage'], 'tool-installed', { toolId }).catch(() => null);
       return {
         message:
           tool.installActionMessage ||
@@ -1125,6 +1126,7 @@ function registerIpcHandlers() {
         onProgress: (progressPayload) => sendUpdateProgress(progressPayload),
       });
       invalidateDiscoveryCache();
+      await invalidateStatisticsIndexSections(['storage'], 'tool-updated', { toolId }).catch(() => null);
       const nextState = await buildAppState({ forceDiscovery: true });
       await refreshInstalledToolUpdates(nextState.tools).catch(() => null);
       nextState.toolUpdates = await getToolUpdateSnapshot(nextState.tools);
@@ -1147,6 +1149,7 @@ function registerIpcHandlers() {
         removeOrphanedToolFolders: Boolean(payload?.removeOrphanedToolFolders),
       });
       invalidateDiscoveryCache();
+      await invalidateStatisticsIndexSections(['storage'], 'tool-repaired', { toolId }).catch(() => null);
       return {
         message: repairedTool.lastRepairMessage,
         state: await buildAppState({ forceDiscovery: true }),
@@ -1171,6 +1174,7 @@ function registerIpcHandlers() {
       }
       const removedTool = await uninstallTool(tool);
       invalidateDiscoveryCache();
+      await invalidateStatisticsIndexSections(['storage'], 'tool-uninstalled', { toolId: tool.id }).catch(() => null);
       return {
         message: removedTool.uninstallMessage || `${tool.name} was removed from Local AI Hub.`,
         state: await buildAppState({ forceDiscovery: true }),
@@ -1206,6 +1210,7 @@ function registerIpcHandlers() {
         migrationSourceRoot: payload?.migrationSourceRoot || null,
       });
       invalidateDiscoveryCache();
+      await invalidateStatisticsIndexSections(['storage'], 'storage-location-changed', { targetPath: normalizedTargetPath }).catch(() => null);
       return {
         message: `Large Local AI Hub data will now use ${normalizedTargetPath}. Direct Local AI Hub-managed tool folders can move there when you choose migration, but official-installer apps stay in their current Windows install location until you reinstall them.`,
         state: await buildAppState({ forceDiscovery: true }),
@@ -1227,6 +1232,7 @@ function registerIpcHandlers() {
         preferredInstallRoot: normalizedTargetPath,
       }));
       invalidateDiscoveryCache();
+      await invalidateStatisticsIndexSections(['storage'], 'preferred-install-root-changed', { targetPath: normalizedTargetPath }).catch(() => null);
       return {
         message: `New store installs will default to ${normalizedTargetPath}. Tools that use an external official installer may still ask you to confirm or change the final destination.`,
         state: await buildAppState({ forceDiscovery: true }),
@@ -1283,6 +1289,7 @@ function registerIpcHandlers() {
   ipcMain.handle('settings:run-cleanup', () =>
     withPlainEnglishErrors(async () => {
       const cleanupSummary = await runCleanup();
+      await invalidateStatisticsIndexSections(['storage'], 'storage-cleanup').catch(() => null);
       const removedCount = cleanupSummary.removedEntries?.length || 0;
       const failedCount = cleanupSummary.failedEntries?.length || 0;
       const message = failedCount
@@ -1325,7 +1332,7 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not load the main statistics right now.'),
   );
 
-  ipcMain.handle('settings:get-statistics-storage', () =>
+  ipcMain.handle('settings:get-statistics-storage', (_event, payload = {}) =>
     withPlainEnglishErrors(async () => {
       const startedAt = Date.now();
       const toolsStartedAt = Date.now();
@@ -1335,7 +1342,9 @@ function registerIpcHandlers() {
       });
       const toolStateMs = Date.now() - toolsStartedAt;
       const snapshotStartedAt = Date.now();
-      const snapshot = await getStatisticsStorageSnapshot(tools);
+      const snapshot = await getStatisticsStorageSnapshot(tools, {
+        forceRefresh: Boolean(payload?.forceRefresh || payload?.refresh || payload?.rebuildIndex),
+      });
       appendLog('statistics', 'info', 'Statistics storage IPC request completed.', {
         totalMs: Date.now() - startedAt,
         toolStateMs,
@@ -1346,7 +1355,7 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not load storage statistics right now.'),
   );
 
-  ipcMain.handle('settings:get-statistics', () =>
+  ipcMain.handle('settings:get-statistics', (_event, payload = {}) =>
     withPlainEnglishErrors(async () => {
       const startedAt = Date.now();
       const toolsStartedAt = Date.now();
@@ -1362,7 +1371,9 @@ function registerIpcHandlers() {
       }
       const vramSampleMs = Date.now() - vramStartedAt;
       const snapshotStartedAt = Date.now();
-      const snapshot = await getStatisticsSnapshot(tools);
+      const snapshot = await getStatisticsSnapshot(tools, {
+        forceRefresh: Boolean(payload?.forceRefresh || payload?.refresh || payload?.rebuildIndex),
+      });
       appendLog('statistics', 'info', 'Statistics full IPC request completed.', {
         totalMs: Date.now() - startedAt,
         toolStateMs,
@@ -1532,6 +1543,7 @@ function registerIpcHandlers() {
         }),
       });
       const localModels = await listDownloadedModels(tool);
+      await invalidateStatisticsIndexSections(['storage'], 'model-downloaded', { toolId: tool.id }).catch(() => null);
       sendAppStateUpdate({
         downloadedModelCount: await getDownloadedModelCountSnapshot(),
       });
@@ -1548,6 +1560,7 @@ function registerIpcHandlers() {
       const tool = modelToolLookup(payload.toolId, state.tools);
       const result = await deleteModel(tool, payload);
       const localModels = await listDownloadedModels(tool);
+      await invalidateStatisticsIndexSections(['storage'], 'model-deleted', { toolId: tool.id }).catch(() => null);
       sendAppStateUpdate({
         downloadedModelCount: await getDownloadedModelCountSnapshot(),
       });
@@ -1882,7 +1895,11 @@ function registerIpcHandlers() {
   );
 
   ipcMain.handle('pipelines:delete-output', (_event, payload) =>
-    withPlainEnglishErrors(async () => deletePipelineOutput(payload?.path), 'Local AI Hub could not delete that pipeline output.'),
+    withPlainEnglishErrors(async () => {
+      const result = await deletePipelineOutput(payload?.path);
+      await invalidateStatisticsIndexSections(['storage'], 'pipeline-output-deleted').catch(() => null);
+      return result;
+    }, 'Local AI Hub could not delete that pipeline output.'),
   );
 }
 
@@ -1915,8 +1932,14 @@ async function startApplication() {
 
     mainWindow?.webContents.send('tools:runtime-output', payload);
   });
+  const statisticsInvalidatedPipelineRuns = new Set();
   setPipelineEventSink((payload) => {
     mainWindow?.webContents.send('pipelines:run-update', payload);
+    const run = payload?.run || {};
+    if (run.runId && ['completed', 'failed', 'cancelled'].includes(String(run.status || '').toLowerCase()) && !statisticsInvalidatedPipelineRuns.has(run.runId)) {
+      statisticsInvalidatedPipelineRuns.add(run.runId);
+      invalidateStatisticsIndexSections(['storage'], 'pipeline-run-finished', { runId: run.runId, status: run.status }).catch(() => null);
+    }
   });
   setProviderStateChangeSink((payload) => {
     if (!Array.isArray(payload?.providers)) {
