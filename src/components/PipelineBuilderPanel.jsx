@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 import pipelineWizardShared from '../../electron/shared/pipelineWizard.cjs';
 import pipelineWizardLifecycleShared from '../../electron/shared/pipelineWizardLifecycle.cjs';
+import pipelineTemplatesShared from '../../electron/shared/pipelineTemplates.cjs';
 import toolAssetSelectionShared from '../../electron/shared/toolAssetSelection.cjs';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
@@ -40,6 +41,12 @@ const {
   runPipelineWizardLifecycle,
 } = pipelineWizardLifecycleShared;
 
+const {
+  BUILT_IN_PIPELINE_TEMPLATES,
+  TEMPLATE_STATUS,
+  getPipelineTemplateReadiness,
+  instantiatePipelineTemplate,
+} = pipelineTemplatesShared;
 
 const {
   buildStableDiffusionCheckpointOption,
@@ -90,6 +97,7 @@ const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
   inspector: false,
   nodePalette: false,
   pipelineWizard: false,
+  starterTemplates: false,
   runStatus: false,
   savedPipelines: false,
 });
@@ -97,6 +105,44 @@ const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ?
 const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
 const EMPTY_GRAPH_WORKFLOW_PRESETS = Object.freeze([]);
 
+const TEMPLATE_STATUS_LABELS = Object.freeze({
+  [TEMPLATE_STATUS.READY]: 'Ready',
+  [TEMPLATE_STATUS.CONFIGURABLE]: 'Ready to configure',
+  [TEMPLATE_STATUS.MISSING_REQUIREMENTS]: 'Needs requirements',
+  [TEMPLATE_STATUS.UNAVAILABLE]: 'Unavailable',
+});
+
+function getTemplateStatusLabel(readiness) {
+  if (readiness?.missingTools?.length) return 'Needs tool install';
+  if (readiness?.missingProviders?.length) return 'Needs provider/API key';
+  if (readiness?.missingModels?.length) return 'Needs model';
+  if (readiness?.warnings?.some((warning) => /hardware|below|vram|ram/i.test(warning))) return 'Hardware warning';
+  return TEMPLATE_STATUS_LABELS[readiness?.status] || 'Ready to configure';
+}
+
+function getTemplateStatusTone(readiness) {
+  if (readiness?.status === TEMPLATE_STATUS.READY) return 'good';
+  if (readiness?.status === TEMPLATE_STATUS.UNAVAILABLE || readiness?.missingTools?.length || readiness?.missingProviders?.length) return 'warn';
+  if (readiness?.warnings?.length) return 'warn';
+  return 'info';
+}
+
+function getTemplateActionLabel(readiness) {
+  if (readiness?.status === TEMPLATE_STATUS.UNAVAILABLE) return 'View requirements';
+  if (readiness?.status === TEMPLATE_STATUS.MISSING_REQUIREMENTS) return 'Use anyway';
+  return 'Use template';
+}
+
+function getTemplateDetailLines(readiness) {
+  return [
+    ...(readiness?.missingTools?.length ? ['Missing tools: ' + readiness.missingTools.join(', ')] : []),
+    ...(readiness?.missingProviders?.length ? ['Missing providers/API keys: ' + readiness.missingProviders.join(', ')] : []),
+    ...(readiness?.missingModels?.length ? readiness.missingModels : []),
+    ...(readiness?.missingPresets?.length ? readiness.missingPresets : []),
+    ...(readiness?.warnings || []),
+    ...(readiness?.notes || []),
+  ];
+}
 function getCollectionMapDefaultInstruction(operationId) {
   return operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION : '';
 }
@@ -2607,6 +2653,20 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     [graphWorkflowPresets, hardware, manifests, pipelineTools, providers],
   );
   const analysis = useMemo(() => analyzePipelineDraft(draft, contextMaps), [draft, contextMaps]);
+  const templateCards = useMemo(
+    () => BUILT_IN_PIPELINE_TEMPLATES.map((template) => ({
+      ...template,
+      readiness: getPipelineTemplateReadiness(template, {
+        graphWorkflowPresets,
+        hardware,
+        manifests,
+        promptStyles,
+        providers,
+        tools: pipelineTools,
+      }),
+    })),
+    [graphWorkflowPresets, hardware, manifests, pipelineTools, promptStyles, providers],
+  );
   const graph = useMemo(() => buildPipelineGraph(draft), [draft]);
   const selectedNode = useMemo(() => draft.nodes.find((node) => node.id === selectedNodeId) || null, [draft.nodes, selectedNodeId]);
   const selectedEdge = useMemo(() => draft.edges.find((edge) => edge.id === selectedEdgeId) || null, [draft.edges, selectedEdgeId]);
@@ -3579,6 +3639,47 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
   }
 
+  function createPipelineFromTemplate(templateId) {
+    const result = instantiatePipelineTemplate(templateId, {
+      graphWorkflowPresets,
+      hardware,
+      manifests,
+      promptStyles,
+      providers,
+      tools: pipelineTools,
+    });
+    if (!result?.ok) {
+      onToast(result?.message || 'Local AI Hub could not create that starter pipeline.', 'error');
+      return;
+    }
+
+    if (result.readiness?.status === TEMPLATE_STATUS.UNAVAILABLE) {
+      const details = getTemplateDetailLines(result.readiness)[0] || 'This starter template needs another saved preset or configuration first.';
+      onToast(details, 'error');
+      return;
+    }
+
+    if (dirty) {
+      const confirmed = window.confirm('Discard the unsaved pipeline changes and create this starter pipeline?');
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    replaceDraft(result.pipeline || createEmptyPipeline(), {
+      dirty: true,
+      selectedNodeId: result.pipeline?.nodes?.[0]?.id || '',
+    });
+    setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
+    setSectionVisibility((current) => ({
+      ...current,
+      canvas: true,
+      pipelineInfo: true,
+      starterTemplates: false,
+    }));
+    const details = getTemplateDetailLines(result.readiness);
+    onToast(details.length ? `${result.template?.name || 'Starter pipeline'} created. ${details[0]}` : `${result.template?.name || 'Starter pipeline'} created.`, result.readiness?.status === TEMPLATE_STATUS.MISSING_REQUIREMENTS ? 'error' : 'success');
+  }
   function addNode(type) {
     const nextNode = createPositionedNode(type, draft.nodes);
     logPipelineBuilderRendererEvent('Pipeline node added from palette.', { nodeId: nextNode.id, nodeType: type }, 'info');
@@ -4325,6 +4426,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               </button>
               <div className="flex flex-wrap items-center gap-2">
                 <button className="ghost-button px-3 py-1.5 text-xs" onClick={createNewPipeline} type="button">New pipeline</button>
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('starterTemplates')} type="button">New from template</button>
                 <button className="ghost-button px-3 py-1.5 text-xs" disabled={!currentPipelineSaved || deleteBusy} onClick={handleDeletePipeline} type="button">
                   {deleteBusy ? 'Deleting...' : 'Delete'}
                 </button>
@@ -4389,6 +4491,62 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                     </div>
                   ) : null}
                 </div>
+              </div>
+            ) : null}
+          </div>
+          <div className={getPipelineSectionPanelClass(sectionVisibility.starterTemplates)}>
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('starterTemplates')} type="button">
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Starter templates</p>
+                <p className="mt-2 text-lg font-semibold text-white">New from built-in workflows</p>
+                <p className="mt-2 text-sm leading-6 text-slate-400">Templates stay visible when dependencies are missing, but Local AI Hub labels what is needed before the workflow can run.</p>
+              </button>
+              <div className="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">
+                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">{templateCards.length} starters</span>
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('starterTemplates')} type="button">
+                  {sectionVisibility.starterTemplates ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
+            </div>
+
+            {sectionVisibility.starterTemplates ? (
+              <div className="mt-4 grid gap-3 xl:grid-cols-2">
+                {templateCards.map((template) => {
+                  const readiness = template.readiness || {};
+                  const detailLines = getTemplateDetailLines(readiness);
+                  const unavailable = readiness.status === TEMPLATE_STATUS.UNAVAILABLE;
+                  return (
+                    <div className={`rounded-2xl border p-3 ${unavailable ? 'border-white/10 bg-white/[0.025] opacity-70' : 'border-white/10 bg-slate-950/35'}`} key={template.id}>
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="text-sm font-semibold text-white">{template.name}</p>
+                            <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${toneToClassName(getTemplateStatusTone(readiness))}`}>{getTemplateStatusLabel(readiness)}</span>
+                          </div>
+                          <p className="mt-2 text-xs leading-5 text-slate-400">{template.description}</p>
+                        </div>
+                        <button className={unavailable ? 'ghost-button px-3 py-1.5 text-xs opacity-70' : 'primary-button px-3 py-1.5 text-xs'} disabled={unavailable} onClick={() => createPipelineFromTemplate(template.id)} type="button">
+                          {getTemplateActionLabel(readiness)}
+                        </button>
+                      </div>
+                      <div className="mt-3 flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-[0.16em] text-slate-400">
+                        <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">{template.category}</span>
+                        <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">{template.outputType}</span>
+                        <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">{template.complexity}</span>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {(template.requirements || []).slice(0, 4).map((requirement) => (
+                          <span className="rounded-full border border-white/10 bg-slate-950/40 px-2 py-1 text-[11px] text-slate-300" key={requirement}>{requirement}</span>
+                        ))}
+                      </div>
+                      {detailLines.length ? (
+                        <div className="mt-3 space-y-1 text-xs leading-5 text-amber-100">
+                          {detailLines.slice(0, 3).map((line) => <p key={line}>{line}</p>)}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
               </div>
             ) : null}
           </div>

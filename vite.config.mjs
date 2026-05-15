@@ -13,5 +13,16 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     chunkSizeWarningLimit: 550,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const normalizedId = id.replace(/\\/g, '/');
+          if (normalizedId.endsWith('/electron/shared/pipelineTemplates.cjs')) {
+            return 'pipeline-templates';
+          }
+          return undefined;
+        },
+      },
+    },
   },
 });

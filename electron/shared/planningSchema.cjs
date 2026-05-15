@@ -71,12 +71,39 @@ function summarizeHardware(hardware = {}) {
   return summary || 'Hardware profile unavailable';
 }
 
+function summarizeTranscriptionSource(artifact) {
+  const transcription = artifact?.transcription && typeof artifact.transcription === 'object'
+    ? artifact.transcription
+    : null;
+  if (!transcription) {
+    return null;
+  }
+
+  const segments = (Array.isArray(transcription.segments) ? transcription.segments : [])
+    .map((segment, index) => ({
+      end: Number.isFinite(Number(segment?.end)) ? Math.round(Number(segment.end) * 100) / 100 : null,
+      index,
+      start: Number.isFinite(Number(segment?.start)) ? Math.round(Number(segment.start) * 100) / 100 : null,
+      text: normalizeTextBlock(segment?.text),
+    }))
+    .filter((segment) => segment.text)
+    .slice(0, 200);
+
+  return {
+    durationSeconds: Number.isFinite(Number(transcription.durationSeconds)) ? Math.round(Number(transcription.durationSeconds) * 100) / 100 : null,
+    language: normalizeString(transcription.language),
+    model: normalizeString(transcription.model),
+    segmentCount: Number(transcription.segmentCount || segments.length) || segments.length,
+    segments,
+  };
+}
+
 function summarizeSourceArtifact(artifact) {
   if (!artifact || typeof artifact !== 'object') {
     return null;
   }
 
-  return {
+  const summary = {
     displayName: normalizeString(artifact.displayName || artifact.fileName || artifact.kind, 'Artifact'),
     fileName: normalizeString(artifact.fileName),
     filePath: normalizeString(artifact.filePath),
@@ -84,6 +111,11 @@ function summarizeSourceArtifact(artifact) {
     summary: normalizeString(artifact.summary || artifact.previewText || artifact.text),
     textExcerpt: trimPreviewText(artifact.textExcerpt || artifact.text || artifact.previewText || '', 1200),
   };
+  const transcription = summarizeTranscriptionSource(artifact);
+  if (transcription) {
+    summary.transcription = transcription;
+  }
+  return summary;
 }
 
 function normalizeDesiredOutput(schema, config = {}) {
