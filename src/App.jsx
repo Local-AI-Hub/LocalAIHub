@@ -26,6 +26,8 @@ const EMPTY_STATE = {
   downloadedModelCount: 0,
   executablePath: '',
   firstLaunch: false,
+  graphWorkflowPresets: [],
+  promptStyles: [],
   hardware: null,
   logsPath: '',
   managedDataPath: '',
@@ -52,6 +54,9 @@ const FOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 10000;
 const UNFOCUSED_RESOURCE_REFRESH_INTERVAL_MS = 30000;
 const DISK_RESOURCE_REFRESH_INTERVAL_MS = 60000;
 const STATISTICS_CACHE_MS = 60000;
+const CONTAINED_CONTENT_MAX_WIDTH_CLASS = 'max-w-[1760px]';
+const CONTAINED_SHELL_PADDING_CLASS = 'px-5 pt-5 pb-2 lg:px-6';
+const CONTAINED_SHELL_HEIGHT_CLASS = 'xl:h-[calc(100dvh-8px)] xl:max-h-[calc(100dvh-8px)] xl:min-h-0 xl:overflow-hidden';
 
 function trimConsoleOutput(value) {
   const text = String(value || '');
@@ -1286,6 +1291,14 @@ export default function App() {
     await runAction('settings:save-close-behavior', () => window.localAIHub.saveCloseBehavior(closeBehaviorDraft));
   }
 
+  async function savePromptStyle(promptStyle) {
+    return runAction('settings:save-prompt-style', () => window.localAIHub.savePromptStyle(promptStyle));
+  }
+
+  async function deletePromptStyle(promptStyleId) {
+    return runAction('settings:delete-prompt-style', () => window.localAIHub.deletePromptStyle(promptStyleId));
+  }
+
   async function saveLiveResourcePollingPreference() {
     await runAction('settings:save-live-resource-polling', () =>
       window.localAIHub.saveLiveResourcePolling(liveResourcePollingDraft),
@@ -1941,11 +1954,9 @@ export default function App() {
   }
 
   const containedTab = ['library', 'store', 'models', 'pipelines', 'statistics', 'settings'].includes(activeTab);
-  const shellGridClassName = activeTab === 'pipelines'
-    ? `mx-auto grid max-w-[1760px] gap-5 xl:grid-cols-[280px,minmax(0,1fr)] ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`
-    : `mx-auto grid max-w-[1600px] gap-5 xl:grid-cols-[280px,1fr] ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`;
+  const shellGridClassName = `mx-auto grid ${CONTAINED_CONTENT_MAX_WIDTH_CLASS} gap-5 xl:grid-cols-[280px,minmax(0,1fr)] ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`;
   const appShellClassName = containedTab
-    ? 'min-h-screen bg-shell px-5 py-5 text-white xl:h-[calc(100dvh-32px)] xl:max-h-[calc(100dvh-32px)] xl:min-h-0 xl:overflow-hidden lg:px-6'
+    ? `min-h-screen bg-shell ${CONTAINED_SHELL_PADDING_CLASS} text-white ${CONTAINED_SHELL_HEIGHT_CLASS}`
     : 'min-h-screen bg-shell px-5 py-5 text-white lg:px-6';
   const mainClassName = containedTab ? 'flex min-h-0 min-w-0 flex-col gap-5 overflow-hidden' : 'min-w-0 space-y-5';
 
@@ -2216,8 +2227,10 @@ export default function App() {
           ) : activeTab === 'pipelines' ? (
             <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-slate-300">Loading Pipelines...</div>}>
               <PipelineBuilderPanel
+                graphWorkflowPresets={appState.graphWorkflowPresets}
                 hardware={appState.hardware}
                 manifests={appState.manifests}
+                promptStyles={appState.promptStyles}
                 onToast={pushToast}
                 providers={providers}
                 tools={tools}
@@ -2235,7 +2248,7 @@ export default function App() {
               onRefresh={() => loadStatistics({ manual: true })}
             />
           ) : (
-            <section className="min-h-0 flex-1 overflow-y-auto pb-6 pr-1">
+            <section className="min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
               <div className="space-y-3">
               <SettingsPanel
                 busyMap={busyMap}
@@ -2252,11 +2265,14 @@ export default function App() {
                 onMigrateLegacyStorage={migrateLegacyStorage}
                 onPreviewCleanup={() => previewCleanup()}
                 onRunCleanup={runCleanupNow}
+                onDeletePromptStyle={deletePromptStyle}
                 onSaveCloseBehavior={saveCloseBehaviorPreference}
+                onSavePromptStyle={savePromptStyle}
                 onSaveLiveResourcePolling={saveLiveResourcePollingPreference}
                 onSavePreferredInstallRoot={savePreferredInstallRoot}
                 onSaveStorageLocation={() => saveStorageLocation()}
                 preferredInstallRootDraft={preferredInstallRootDraft}
+                promptStyles={appState.promptStyles}
                 storage={appState.storage}
                 storageDraft={storageDraft}
               />

@@ -4,6 +4,7 @@ const { pathToFileURL } = require('url');
 
 const { ensureStorage, getAppPaths } = require('./configService');
 const { DEFAULT_PLANNING_SCHEMA_ID, getPlanningSchemaDefinition } = require('../shared/planningSchema.cjs');
+const { serializePromptStyleApplication } = require('../shared/promptStyles.cjs');
 const {
   PORT_KIND_AUDIO,
   PORT_KIND_COLLECTION,
@@ -457,6 +458,7 @@ function serializeAudioGenerationForUi(generation = null) {
     operationId: String(generation.operationId || '').trim(),
     operationSubtype: String(generation.operationSubtype || generation.mode || '').trim(),
     prompt: String(generation.prompt || '').trim(),
+    promptStyle: serializePromptStyleApplication(generation.promptStyle),
     sourceAudio: serializeAudioSourceReference(generation.sourceAudio),
     sourceAudioPath: String(generation.sourceAudioPath || '').trim(),
     sourceDurationSeconds: roundAudioMetric(generation.sourceDurationSeconds),
@@ -522,6 +524,39 @@ function serializeImageSourceReference(reference = null) {
   return Object.values(normalized).some(Boolean) ? normalized : null;
 }
 
+function serializeImageGenerationForUi(generation = null) {
+  if (!generation || typeof generation !== 'object') {
+    return null;
+  }
+
+  const seed = Number(generation.seed || 0);
+  const normalized = {
+    backend: String(generation.backend || '').trim(),
+    backendLabel: String(generation.backendLabel || '').trim(),
+    cfgScale: Number(generation.cfgScale || 0) || 0,
+    height: Number(generation.height || 0) || 0,
+    model: String(generation.model || '').trim(),
+    negativePrompt: String(generation.negativePrompt || '').trim(),
+    operationId: String(generation.operationId || '').trim(),
+    prompt: String(generation.prompt || '').trim(),
+    promptStyle: serializePromptStyleApplication(generation.promptStyle),
+    quality: String(generation.quality || '').trim(),
+    seed: Number.isFinite(seed) ? seed : null,
+    size: String(generation.size || '').trim(),
+    steps: Number(generation.steps || 0) || 0,
+    toolId: String(generation.toolId || '').trim(),
+    toolLabel: String(generation.toolLabel || '').trim(),
+    width: Number(generation.width || 0) || 0,
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
 function serializeImageTransformationForUi(transformation = null) {
   if (!transformation || typeof transformation !== 'object') {
     return null;
@@ -569,6 +604,7 @@ function serializeVideoGenerationForUi(generation = null) {
     operationId: String(generation.operationId || '').trim(),
     operationSubtype: String(generation.operationSubtype || generation.mode || '').trim(),
     prompt: String(generation.prompt || '').trim(),
+    promptStyle: serializePromptStyleApplication(generation.promptStyle),
     seed: Number.isFinite(seed) ? seed : null,
     size: String(generation.size || '').trim(),
     sourceImage: serializeImageSourceReference(generation.sourceImage),
@@ -1353,6 +1389,11 @@ async function buildFileArtifact(filePath, options = {}) {
   }
 
   if (kind === PORT_KIND_IMAGE || String(mimeType || '').toLowerCase().startsWith('image/')) {
+    const imageGeneration = serializeImageGenerationForUi(options.imageGeneration);
+    if (imageGeneration) {
+      artifact.imageGeneration = imageGeneration;
+    }
+
     const imageTransformation = serializeImageTransformationForUi(options.imageTransformation);
     if (imageTransformation) {
       artifact.imageTransformation = imageTransformation;
@@ -1548,6 +1589,7 @@ async function saveBase64Artifact(runDirectories, base64Payload, options = {}) {
     audioGeneration: options.audioGeneration,
     audioTransformation: options.audioTransformation,
     displayName: options.displayName,
+    imageGeneration: options.imageGeneration,
     imageTransformation: options.imageTransformation,
     kind: options.kind,
     role: options.role || 'generated',
@@ -1570,6 +1612,7 @@ async function saveBufferArtifact(runDirectories, bufferPayload, options = {}) {
     audioGeneration: options.audioGeneration,
     audioTransformation: options.audioTransformation,
     displayName: options.displayName,
+    imageGeneration: options.imageGeneration,
     imageTransformation: options.imageTransformation,
     kind: options.kind,
     role: options.role || 'generated',
@@ -1655,8 +1698,9 @@ async function saveAudioArtifactMetadata(filePath, artifact) {
 }
 
 async function saveImageArtifactMetadata(filePath, artifact) {
+  const imageGeneration = serializeImageGenerationForUi(artifact?.imageGeneration);
   const imageTransformation = serializeImageTransformationForUi(artifact?.imageTransformation);
-  if (!imageTransformation) {
+  if (!imageGeneration && !imageTransformation) {
     return [];
   }
 
@@ -1666,6 +1710,7 @@ async function saveImageArtifactMetadata(filePath, artifact) {
     fileName: String(artifact?.fileName || '').trim(),
     formatLabel: String(artifact?.formatLabel || '').trim(),
     height: Number(artifact?.height || 0) || 0,
+    imageGeneration,
     imageTransformation,
     kind: String(artifact?.kind || PORT_KIND_IMAGE).trim() || PORT_KIND_IMAGE,
     summary: String(artifact?.summary || '').trim(),
@@ -1741,6 +1786,7 @@ async function saveArtifactIntoDirectory(directoryPath, artifact, options = {}) 
   const savedArtifact = await buildFileArtifact(filePath, {
     audio: artifact.audio,
     audioGeneration: artifact.audioGeneration,
+    imageGeneration: artifact.imageGeneration,
     audioTransformation: artifact.audioTransformation,
     compositionExport: artifact.compositionExport,
     displayName: artifact.displayName || options.baseName || path.basename(filePath),
@@ -2085,6 +2131,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
   const savedArtifact = await buildFileArtifact(filePath, {
     audio: artifact.audio,
     audioGeneration: artifact.audioGeneration,
+    imageGeneration: artifact.imageGeneration,
     audioTransformation: artifact.audioTransformation,
     compositionExport: artifact.compositionExport,
     displayName: title,

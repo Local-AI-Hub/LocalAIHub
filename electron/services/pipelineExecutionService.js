@@ -6,6 +6,7 @@ const { chatWithOllama, inspectOllamaModel, inspectOllamaModelCapabilities } = r
 const { chatWithProvider, listProviderConnections, runProviderOperation } = require('./providerService');
 const { initializeProviderRegistry } = require('./providerRegistry');
 const { getToolCatalog } = require('./toolRegistry');
+const { listGraphWorkflowPresets, listPromptStyles } = require('./configService');
 const { listDownloadedModels } = require('./modelService');
 const { buildMergedToolStateList, getResolvedToolState } = require('./toolStateService');
 const { DEFAULT_WHISPER_MODEL, transcribeWithWhisper } = require('./whisperService');
@@ -49,6 +50,7 @@ const {
   GRAPH_WORKFLOW_OPERATION_BACKEND_IDS,
   buildGraphWorkflowOperationBackendNode,
   getGraphWorkflowOperationBackendSupport,
+  resolveGraphWorkflowPresetNode,
 } = require('../shared/graphWorkflowContracts.cjs');
 const { generateAudioWithLocalAudioTool } = require('./localAudioService');
 const {
@@ -59,6 +61,11 @@ const {
 } = require('../shared/toolAssetSelection.cjs');
 const { generateImageWithLocalImageTool } = require('./localImageService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
+const {
+  applyPromptStyleToPrompt,
+  isPromptStyleCompatibleWithTarget,
+  serializePromptStyleApplication,
+} = require('../shared/promptStyles.cjs');
 const { exportCompositionArtifactToVideo } = require('./mediaCompositionService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
@@ -338,12 +345,17 @@ async function buildPipelineContext(definition = {}) {
     toolEntries = attachDownloadedToolModels(toolEntries, downloadedModelsByToolId);
   }
 
-  return buildContextMaps({
+  const promptStyles = typeof listPromptStyles === 'function' ? await listPromptStyles() : [];
+  const context = buildContextMaps({
     hardware: null,
+    graphWorkflowPresets: await listGraphWorkflowPresets(),
     providers: await listProviderConnections(),
     toolCatalog: getToolCatalog(),
     tools: toolEntries,
   });
+  context.promptStyles = promptStyles;
+  context.promptStylesById = Object.fromEntries(promptStyles.map((entry) => [entry.id, entry]));
+  return context;
 }
 
 async function analyzeWithCurrentContext(definition) {
@@ -1760,6 +1772,59 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
   };
 }
 
+function resolveNodePromptStyle(contextMaps = {}, node = {}, targetKind = '') {
+  const promptStyleId = String(node?.config?.promptStyleId || '').trim();
+  if (!promptStyleId || !targetKind) {
+    return null;
+  }
+  const style = contextMaps.promptStylesById?.[promptStyleId] || null;
+  return style && isPromptStyleCompatibleWithTarget(style, targetKind) ? style : null;
+}
+
+function applyNodePromptStyle(contextMaps = {}, node = {}, prompt = '', targetKind = '', options = {}) {
+  const originalNegativePrompt = String(options.negativePrompt || '').trim();
+  const style = resolveNodePromptStyle(contextMaps, node, targetKind);
+  if (!style) {
+    return {
+      prompt: String(prompt || '').trim(),
+      negativePrompt: originalNegativePrompt,
+      promptStyle: null,
+    };
+  }
+
+  const application = applyPromptStyleToPrompt(prompt, style, {
+    negativePrompt: originalNegativePrompt,
+    supportNegativePrompt: Boolean(options.supportNegativePrompt),
+    targetKind,
+  });
+  return {
+    prompt: application.finalPrompt,
+    negativePrompt: application.finalNegativePrompt,
+    promptStyle: serializePromptStyleApplication(application),
+  };
+}
+
+function buildImageGenerationMetadata(node, executionTarget, promptRequest, options = {}) {
+  return {
+    backend: String(options.backend || executionTarget?.id || '').trim(),
+    backendLabel: String(options.backendLabel || executionTarget?.name || '').trim(),
+    cfgScale: node.config?.cfgScale,
+    height: node.config?.height,
+    model: String(options.model || node.config?.model || '').trim(),
+    negativePrompt: promptRequest.negativePrompt,
+    operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+    prompt: promptRequest.prompt,
+    promptStyle: promptRequest.promptStyle,
+    quality: node.config?.imageQuality,
+    seed: node.config?.seed,
+    size: node.config?.imageSize,
+    steps: node.config?.steps,
+    toolId: String(executionTarget?.id || '').trim(),
+    toolLabel: String(executionTarget?.name || '').trim(),
+    width: node.config?.width,
+  };
+}
+
 function buildImageGenerationPrompt(node, inputArtifact) {
   if (!inputArtifact) {
     throw new Error('This image generation step did not receive any input.');
@@ -1786,21 +1851,26 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
   const itemIndex = Number(options.itemIndex || 0) || 0;
   const itemCount = Number(options.itemCount || 0) || 0;
   const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '');
-  const prompt = buildImageGenerationPrompt(node, textArtifact);
+  const basePrompt = buildImageGenerationPrompt(node, textArtifact);
   const executionMode = node.config?.executionMode === 'localTool'
     ? 'localTool'
     : node.config?.executionMode === 'graphWorkflow'
       ? 'graphWorkflow'
       : 'cloud';
+  const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image', {
+    negativePrompt: executionMode === 'localTool' ? node.config?.negativePrompt : '',
+    supportNegativePrompt: executionMode === 'localTool',
+  });
+  const prompt = promptRequest.prompt;
 
   if (executionMode === 'graphWorkflow') {
-    const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+    const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE, contextMaps);
     if (!support.usable) {
       throw new Error(support.message || 'Configure a compatible text-to-image graph workflow before using it for collection mapping.');
     }
 
     const tool = options.graphWorkflowTool || await getGraphWorkflowBackendToolOrThrow(contextMaps, node, 'collection image mapping');
-    const graphNode = buildGraphWorkflowOperationBackendNode(node, {
+    const graphNode = buildGraphWorkflowOperationBackendNode(resolveGraphWorkflowPresetNode(node, contextMaps).node, {
       label: node.label + ' ' + itemLabel,
     });
     reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' through the configured graph workflow.', 'Running ' + node.label + '...');
@@ -1820,6 +1890,7 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
     if (!imageArtifact || imageArtifact.kind !== PORT_KIND_IMAGE) {
       throw new Error((tool.name || 'The graph workflow tool') + ' finished the graph workflow, but it did not return an image artifact.');
     }
+    imageArtifact.imageGeneration = buildImageGenerationMetadata(node, tool, promptRequest, { backend: 'graphWorkflow', backendLabel: tool.name });
 
     return imageArtifact;
   }
@@ -1831,7 +1902,7 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
       cfgScale: node.config?.cfgScale,
       height: node.config?.height,
       model: String(node.config?.model || '').trim(),
-      negativePrompt: node.config?.negativePrompt,
+      negativePrompt: promptRequest.negativePrompt,
       prompt,
       seed: node.config?.seed,
       steps: node.config?.steps,
@@ -1843,6 +1914,7 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
       extension: '.png',
       kind: PORT_KIND_IMAGE,
       role: 'generated',
+      imageGeneration: buildImageGenerationMetadata(node, tool, promptRequest, { model: String(node.config?.model || '').trim() }),
     });
   }
 
@@ -1880,6 +1952,7 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
     extension: '.png',
     kind: PORT_KIND_IMAGE,
     role: 'generated',
+    imageGeneration: buildImageGenerationMetadata(node, provider, promptRequest, { backend: providerId, backendLabel: provider.name, model }),
   });
 }
 
@@ -2321,7 +2394,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
   if (executionMode === 'localTool') {
     if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
       const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'collection audio generation');
-      const audioRequest = await buildAudioGenerationRequest(operationNode, inputArtifact);
+      const audioRequest = await buildAudioGenerationRequest(operationNode, inputArtifact, contextMaps);
       reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for local audio generation.', 'Running ' + node.label + '...');
       const result = await generateAudioWithLocalAudioTool(tool, {
         audioMode: audioRequest.audioMode,
@@ -2331,6 +2404,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
         nodeLabel: node.label,
         operationId,
         prompt: audioRequest.prompt,
+        promptStyle: audioRequest.promptStyle,
         reportProgress,
         runDirectories: run.directories,
         sourceAudioArtifact: audioRequest.sourceAudioArtifact,
@@ -2446,7 +2520,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
-    const audioRequest = await buildCloudAudioGenerationRequest(operationNode, inputArtifact);
+    const audioRequest = await buildCloudAudioGenerationRequest(operationNode, inputArtifact, contextMaps);
     reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + ' for speech generation.', 'Running ' + node.label + '...');
     const result = await runProviderOperation(providerId, {
       instruction: audioRequest.instruction,
@@ -2474,7 +2548,9 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
         model,
         operationId,
         operationSubtype: 'speech',
-        prompt: audioRequest.spokenText,
+        prompt: audioRequest.prompt,
+        promptStyle: audioRequest.promptStyle,
+        spokenText: audioRequest.spokenText,
         voice: generatedAudio.voice || audioRequest.voice,
       },
       baseName: node.label + '-item-' + String(itemIndex + 1).padStart(3, '0') + '-' + Date.now(),
@@ -2667,7 +2743,7 @@ function formatArtifactCollectionLineageLabel(kind) {
   if (kind === PORT_KIND_FILE) return 'File Collection';
   return 'Text Collection';
 }
-async function buildVideoGenerationRequest(node, inputArtifact) {
+async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}) {
   if (!inputArtifact) {
     throw new Error('This video generation step did not receive any input.');
   }
@@ -2681,9 +2757,15 @@ async function buildVideoGenerationRequest(node, inputArtifact) {
       throw new Error('This video generation step did not receive any text prompt.');
     }
 
-    return {
+    const basePrompt = motionPrompt ? motionPrompt + '\n\nPrompt:\n' + promptText : promptText;
+    const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'video', {
       negativePrompt: String(node.config?.negativePrompt || '').trim(),
-      prompt: motionPrompt ? motionPrompt + '\n\nPrompt:\n' + promptText : promptText,
+      supportNegativePrompt: true,
+    });
+    return {
+      negativePrompt: promptRequest.negativePrompt,
+      prompt: promptRequest.prompt,
+      promptStyle: promptRequest.promptStyle,
       referenceImage: null,
       referenceImagePath: '',
       sourceImageArtifact: null,
@@ -2736,7 +2818,7 @@ function getAudiocraftGenerationSettings(node) {
   };
 }
 
-async function buildAudioGenerationRequest(node, inputArtifact) {
+async function buildAudioGenerationRequest(node, inputArtifact, contextMaps = {}) {
   if (!inputArtifact) {
     throw new Error('This audio generation step did not receive any input.');
   }
@@ -2758,12 +2840,15 @@ async function buildAudioGenerationRequest(node, inputArtifact) {
       throw new Error('AudioCraft continuation mode needs a source audio clip. Connect an Audio File node or an earlier audio output to this Model Step.');
     }
 
+    const basePrompt = instruction ? instruction + '\n\nPrompt:\n' + promptText : promptText;
+    const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'audio');
     return {
       ...generationSettings,
       audioMode,
       continuationSeedSeconds,
       durationSeconds,
-      prompt: instruction ? instruction + '\n\nPrompt:\n' + promptText : promptText,
+      prompt: promptRequest.prompt,
+      promptStyle: promptRequest.promptStyle,
       sourceAudioArtifact: null,
       sourceAudioPath: '',
     };
@@ -2860,7 +2945,7 @@ async function buildImageTransformRequest(node, inputArtifact, referenceArtifact
   };
 }
 
-async function buildCloudAudioGenerationRequest(node, inputArtifact) {
+async function buildCloudAudioGenerationRequest(node, inputArtifact, contextMaps = {}) {
   if (!inputArtifact) {
     throw new Error('This cloud audio step did not receive any input.');
   }
@@ -2876,9 +2961,12 @@ async function buildCloudAudioGenerationRequest(node, inputArtifact) {
 
   const instruction = String(node.config?.instruction || '').trim();
   const voice = String(node.config?.audioVoice || '').trim();
+  const basePrompt = instruction ? instruction + '\n\nSpeak this text exactly:\n' + spokenText : spokenText;
+  const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'audio');
   return {
     instruction,
-    prompt: instruction ? instruction + '\n\nSpeak this text exactly:\n' + spokenText : spokenText,
+    prompt: promptRequest.prompt,
+    promptStyle: promptRequest.promptStyle,
     spokenText,
     voice,
   };
@@ -3141,7 +3229,7 @@ async function getInstalledToolOrThrow(contextMaps, toolId, message) {
 }
 
 async function getGraphWorkflowBackendToolOrThrow(contextMaps, node, actionLabel) {
-  const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+  const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE, contextMaps);
   if (!support.usable) {
     throw new Error(support.message || 'Configure a compatible text-to-image graph workflow before using it for ' + actionLabel + '.');
   }
@@ -4293,7 +4381,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     if (executionMode === 'localTool') {
       if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
         const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'local audio generation');
-        const audioRequest = await buildAudioGenerationRequest(node, promptArtifact);
+        const audioRequest = await buildAudioGenerationRequest(node, promptArtifact, contextMaps);
         reportProgress?.('Sending the request to ' + tool.name + ' for local audio generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
         return generateAudioWithLocalAudioTool(tool, {
           appendSource: audioRequest.appendSource,
@@ -4310,6 +4398,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           nodeLabel: node.label,
           operationId,
           prompt: audioRequest.prompt,
+          promptStyle: audioRequest.promptStyle,
           reportProgress,
           runDirectories: run.directories,
           sourceAudioArtifact: audioRequest.sourceAudioArtifact,
@@ -4369,7 +4458,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
       if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
         const tool = await getSelectedLocalVideoToolOrThrow(contextMaps, node, 'local video generation');
-        const videoRequest = await buildVideoGenerationRequest(node, promptArtifact);
+        const videoRequest = await buildVideoGenerationRequest(node, promptArtifact, contextMaps);
         reportProgress?.('Sending the request to ' + tool.name + ' for local video generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
         return generateVideoWithLocalVideoTool(tool, {
           displayName: node.label,
@@ -4378,6 +4467,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           negativePrompt: videoRequest.negativePrompt,
           nodeLabel: node.label,
           prompt: videoRequest.prompt,
+          promptStyle: videoRequest.promptStyle,
           referenceImagePath: videoRequest.referenceImagePath,
           reportProgress,
           sourceImageArtifact: videoRequest.sourceImageArtifact,
@@ -4441,8 +4531,13 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         throw new Error('Local AI Hub currently supports audio transcription, audio generation, audio transformation, image analysis, image generation, image transformation, and video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
       }
 
-      const prompt = buildImageGenerationPrompt(node, promptArtifact);
+      const basePrompt = buildImageGenerationPrompt(node, promptArtifact);
       const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'local image generation');
+      const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image', {
+        negativePrompt: node.config?.negativePrompt,
+        supportNegativePrompt: true,
+      });
+      const prompt = promptRequest.prompt;
       const checkpointOverride = String(model || '').trim();
 
       reportProgress?.('Sending the prompt to ' + tool.name + ' for local image generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
@@ -4450,7 +4545,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         cfgScale: node.config?.cfgScale,
         height: node.config?.height,
         model: checkpointOverride,
-        negativePrompt: node.config?.negativePrompt,
+        negativePrompt: promptRequest.negativePrompt,
         prompt,
         seed: node.config?.seed,
         steps: node.config?.steps,
@@ -4462,6 +4557,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         extension: '.png',
         kind: PORT_KIND_IMAGE,
         role: 'generated',
+        imageGeneration: buildImageGenerationMetadata(node, tool, promptRequest, { model: checkpointOverride }),
       });
       return {
         destinationPath: artifact.filePath,
@@ -4484,7 +4580,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
     sourceLabel = provider.name;
     if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
-      const audioRequest = await buildCloudAudioGenerationRequest(node, promptArtifact);
+      const audioRequest = await buildCloudAudioGenerationRequest(node, promptArtifact, contextMaps);
       reportProgress?.('Sending the text to ' + provider.name + ' for speech generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
       const result = await runProviderOperation(providerId, {
         instruction: audioRequest.instruction,
@@ -4513,7 +4609,9 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           model,
           operationId,
           operationSubtype: 'speech',
-          prompt: audioRequest.spokenText,
+          prompt: audioRequest.prompt,
+          promptStyle: audioRequest.promptStyle,
+          spokenText: audioRequest.spokenText,
           voice: generatedAudio.voice || audioRequest.voice,
         },
         baseName: node.label + '-' + Date.now(),
@@ -4533,7 +4631,9 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     }
 
     if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-      const prompt = buildImageGenerationPrompt(node, promptArtifact);
+      const basePrompt = buildImageGenerationPrompt(node, promptArtifact);
+      const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image');
+      const prompt = promptRequest.prompt;
       reportProgress?.('Sending the prompt to ' + provider.name + ' for image generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
       const result = await runProviderOperation(providerId, {
         background: node.config?.imageBackground,
@@ -4555,6 +4655,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         extension: '.png',
         kind: 'image',
         role: 'generated',
+        imageGeneration: buildImageGenerationMetadata(node, provider, promptRequest, { backend: providerId, backendLabel: provider.name, model }),
       });
       return {
         destinationPath: artifact.filePath,
@@ -4567,7 +4668,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     }
 
     if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
-      const videoRequest = await buildVideoGenerationRequest(node, promptArtifact);
+      const videoRequest = await buildVideoGenerationRequest(node, promptArtifact, contextMaps);
       reportProgress?.('Sending the prompt to ' + provider.name + ' for video generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
       const result = await runProviderOperation(providerId, {
         imageReference: videoRequest.referenceImage,
@@ -4590,6 +4691,18 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         extension: String(result?.videos?.[0]?.extension || '.mp4').trim() || '.mp4',
         kind: PORT_KIND_VIDEO,
         role: 'generated',
+        videoGeneration: {
+          backend: providerId,
+          backendLabel: provider.name,
+          mode: videoRequest.referenceImage ? 'image-to-video' : 'text-to-video',
+          model,
+          negativePrompt: videoRequest.negativePrompt,
+          operationId,
+          operationSubtype: videoRequest.referenceImage ? 'image-to-video' : 'text-to-video',
+          prompt: videoRequest.prompt,
+          promptStyle: videoRequest.promptStyle,
+          size: videoRequest.size,
+        },
       });
       return {
         destinationPath: artifact.filePath,
@@ -4628,7 +4741,12 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     };
   }
   if (node.type === 'graphWorkflow') {
-    const toolId = getGraphWorkflowToolId(node);
+    const resolvedPreset = resolveGraphWorkflowPresetNode(node, contextMaps);
+    if (resolvedPreset.missingPreset) {
+      throw new Error('The selected graph workflow preset could not be found. Choose another preset or switch this node back to local workflow config.');
+    }
+    const effectiveNode = resolvedPreset.node;
+    const toolId = getGraphWorkflowToolId(effectiveNode);
     const installMessage = toolId === 'comfyui'
       ? 'Install ComfyUI before using a graph workflow step in a pipeline.'
       : 'Install the selected graph workflow tool before using this step in a pipeline.';
@@ -4638,7 +4756,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         image: getNodeInputArtifact(node.id, 'image', graph, run.resultsByNodeId, run),
         text: getNodeInputArtifact(node.id, 'text', graph, run.resultsByNodeId, run),
       },
-      node,
+      node: effectiveNode,
       reportProgress,
       runDirectories: run.directories,
       tool,

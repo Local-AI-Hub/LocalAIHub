@@ -46,6 +46,7 @@ const {
 } = toolAssetSelectionShared;
 const {
   arePortsCompatible,
+  buildGraphWorkflowConfigFromPreset,
   buildPipelineGraph,
   createEdge,
   createEmptyPipeline,
@@ -56,7 +57,10 @@ const {
   getGraphWorkflowOutputBinding,
   getGraphWorkflowOutputNodeOptions,
   getGraphWorkflowOperationBackendSupport,
+  getGraphWorkflowPresetContractSummary,
   getCollectionMapMapping,
+  isGraphWorkflowPresetCompatibleWithOperation,
+  resolveGraphWorkflowPresetNode,
   getPipelineNodePorts,
   COLLECTION_MAP_MAPPING_OPTIONS,
   getPortDefinition,
@@ -91,6 +95,7 @@ const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
 });
 const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ? getPlanningSchemaOptions() : [];
 const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
+const EMPTY_GRAPH_WORKFLOW_PRESETS = Object.freeze([]);
 
 function getCollectionMapDefaultInstruction(operationId) {
   return operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION : '';
@@ -102,6 +107,54 @@ function getCollectionMapInstructionValue(node, operationId) {
     return '';
   }
   return instruction;
+}
+
+function isPromptStyleCompatibleWithTarget(style, targetKind) {
+  const target = String(targetKind || '').trim().toLowerCase();
+  if (!target) return false;
+  const rawKinds = Array.isArray(style?.targetKinds) ? style.targetKinds : [style?.targetKind || 'any'];
+  const kinds = rawKinds.map((entry) => String(entry || '').trim().toLowerCase()).filter(Boolean);
+  return kinds.includes('any') || kinds.includes(target);
+}
+
+function getPromptStyleTargetKindForOperation(operationId) {
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) return 'image';
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return 'audio';
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return 'video';
+  if (operationId === PIPELINE_OPERATION_IDS.LLM_PROMPT) return 'text';
+  return '';
+}
+
+function getPromptStyleTargetKindForModelStep(node) {
+  const operationId = getSelectedModelStepOperationId(node);
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && node?.config?.executionMode === 'localTool' && node?.config?.audioMode === 'continuation') {
+    return '';
+  }
+  return getPromptStyleTargetKindForOperation(operationId);
+}
+
+function getPromptStyleTargetKindForCollectionMap(mapping) {
+  if (!mapping || mapping.inputKind !== 'text') return '';
+  return getPromptStyleTargetKindForOperation(mapping.operationId);
+}
+
+function PromptStyleSelector({ id, onChange, promptStyles = [], targetKind, value }) {
+  const compatibleStyles = (promptStyles || []).filter((style) => isPromptStyleCompatibleWithTarget(style, targetKind));
+  const selectedStyle = value ? (promptStyles || []).find((style) => style.id === value) : null;
+  if (!targetKind) {
+    return null;
+  }
+
+  return (
+    <div>
+      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={id}>Prompt style</label>
+      <select className="store-input mt-3" id={id} onChange={(event) => onChange(event.target.value)} value={value || ''}>
+        <option value="">None</option>
+        {selectedStyle && !compatibleStyles.some((style) => style.id === selectedStyle.id) ? <option disabled value={selectedStyle.id}>{selectedStyle.name} (not compatible)</option> : null}
+        {compatibleStyles.map((style) => <option key={style.id} value={style.id}>{style.name}</option>)}
+      </select>
+    </div>
+  );
 }
 
 function getCollectionMapModelFieldLabel(operationId) {
@@ -203,6 +256,10 @@ function normalizePipelineSectionVisibility(value) {
   normalized[firstOpenKey] = true;
 
   return normalized;
+}
+
+function getPipelineSectionPanelClass(expanded) {
+  return expanded ? 'panel p-4 xl:col-span-2 2xl:col-span-3' : 'panel p-3';
 }
 
 function getPlanningSchemaOptionById(schemaId) {
@@ -1110,6 +1167,16 @@ function formatGraphWorkflowNodeLabel(entry) {
 function formatGraphWorkflowAdapterLabel(contract) {
   return contract?.supportsExecution ? 'Runs in Local AI Hub' : 'Planned adapter';
 }
+
+function formatGraphWorkflowPresetSummary(preset) {
+  if (!preset) {
+    return '';
+  }
+
+  const summary = getGraphWorkflowPresetContractSummary(preset);
+  const toolId = String(preset.toolId || '').trim() || 'graph tool';
+  return toolId + ' | ' + summary.label;
+}
 function ArtifactPreview({ artifact, className = '', compact = false }) {
   if (!artifact) {
     return <div className={`rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-4 text-sm leading-6 text-slate-400 ${className}`}>Nothing to preview yet.</div>;
@@ -1753,12 +1820,12 @@ function PipelineOutputRow({ busy, onDelete, onOpenPath, onRevealPath, output })
   );
 }
 
-function PipelineOutputsPanel({ busyPath, expanded, loading, onDelete, onOpenPath, onRefresh, onRevealPath, onToggleExpanded, outputs }) {
+function PipelineOutputsPanel({ busyPath, className = '', expanded, loading, onDelete, onOpenPath, onRefresh, onRevealPath, onToggleExpanded, outputs }) {
   const outputCount = Array.isArray(outputs) ? outputs.length : 0;
   const outputCountLabel = `${outputCount} saved output${outputCount === 1 ? '' : 's'}`;
 
   return (
-    <div className="panel p-4">
+    <div className={`panel ${expanded ? 'p-4' : 'p-3'} ${className}`}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline outputs</p>
@@ -2463,7 +2530,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
     </>
   );
 }
-export default function PipelineBuilderPanel({ hardware, manifests, onToast, providers, tools }) {
+export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, manifests, onToast, promptStyles = [], providers, tools }) {
   const [pipelines, setPipelines] = useState([]);
   const [draft, setDraft] = useState(() => createEmptyPipeline());
   const [selectedNodeId, setSelectedNodeId] = useState('');
@@ -2479,6 +2546,10 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   const [validationComment, setValidationComment] = useState('');
   const [dirty, setDirty] = useState(false);
   const [modelOptionsByNodeId, setModelOptionsByNodeId] = useState({});
+  const [graphWorkflowPresets, setGraphWorkflowPresets] = useState(() => (Array.isArray(initialGraphWorkflowPresets) ? initialGraphWorkflowPresets : []));
+  const [graphWorkflowPresetName, setGraphWorkflowPresetName] = useState('');
+  const [graphWorkflowPresetStatus, setGraphWorkflowPresetStatus] = useState(null);
+  const [graphWorkflowPresetBusy, setGraphWorkflowPresetBusy] = useState(false);
   const [modelsBusyNodeId, setModelsBusyNodeId] = useState('');
   const [pipelineOutputs, setPipelineOutputs] = useState([]);
   const [outputsLoading, setOutputsLoading] = useState(false);
@@ -2532,8 +2603,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     [localToolModelsByToolId, ollamaModelCapabilitiesByName, tools],
   );
   const contextMaps = useMemo(
-    () => buildPipelineDisplayContext({ hardware, manifests, providers, tools: pipelineTools }),
-    [hardware, manifests, pipelineTools, providers],
+    () => buildPipelineDisplayContext({ graphWorkflowPresets, hardware, manifests, providers, tools: pipelineTools }),
+    [graphWorkflowPresets, hardware, manifests, pipelineTools, providers],
   );
   const analysis = useMemo(() => analyzePipelineDraft(draft, contextMaps), [draft, contextMaps]);
   const graph = useMemo(() => buildPipelineGraph(draft), [draft]);
@@ -2561,6 +2632,24 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
     () => wizardModelOptions.find((model) => model.id === getWizardModelId(wizardModel)) || null,
     [wizardModel, wizardModelOptions],
   );
+  useEffect(() => {
+    if (Array.isArray(initialGraphWorkflowPresets)) {
+      setGraphWorkflowPresets(initialGraphWorkflowPresets);
+    }
+  }, [initialGraphWorkflowPresets]);
+
+  useEffect(() => {
+    let cancelled = false;
+    window.localAIHub.listGraphWorkflowPresets?.().then((result) => {
+      if (!cancelled && result?.ok) {
+        setGraphWorkflowPresets(result.data?.presets || []);
+      }
+    }).catch(() => null);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const audioTools = useMemo(() => (tools || []).filter((tool) => AUDIO_WORKFLOW_TOOL_IDS.includes(tool.id) && !AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const audioTransformTools = useMemo(() => (tools || []).filter((tool) => AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const imageTools = useMemo(() => (tools || []).filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
@@ -2580,39 +2669,55 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
       return true;
     });
   }, [manifests, tools]);
+  const graphWorkflowPresetsById = useMemo(() => Object.fromEntries((graphWorkflowPresets || []).map((preset) => [preset.id, preset])), [graphWorkflowPresets]);
+  const selectedGraphWorkflowPreset = selectedNode?.type === 'graphWorkflow' && selectedNode.config?.workflowSource === 'preset'
+    ? graphWorkflowPresetsById[selectedNode.config?.graphWorkflowPresetId] || null
+    : null;
+  const selectedGraphWorkflowEffectiveNode = useMemo(
+    () => (selectedNode?.type === 'graphWorkflow' ? resolveGraphWorkflowPresetNode(selectedNode, { graphWorkflowPresetsById }).node : selectedNode),
+    [graphWorkflowPresetsById, selectedNode],
+  );
+  const collectionMapSelectedGraphWorkflowPreset = selectedNode?.type === 'collectionMap' && selectedNode.config?.workflowSource === 'preset'
+    ? graphWorkflowPresetsById[selectedNode.config?.graphWorkflowPresetId] || null
+    : null;
+  const collectionMapEffectiveNode = useMemo(
+    () => (selectedNode?.type === 'collectionMap' ? resolveGraphWorkflowPresetNode(selectedNode, { graphWorkflowPresetsById }).node : selectedNode),
+    [graphWorkflowPresetsById, selectedNode],
+  );
+  const compatibleCollectionMapGraphWorkflowPresets = useMemo(() => (graphWorkflowPresets || []).filter((preset) => isGraphWorkflowPresetCompatibleWithOperation(preset)), [graphWorkflowPresets]);
   const selectedGraphWorkflowTool = useMemo(
     () => (selectedNode?.type === 'graphWorkflow'
-      ? graphWorkflowTools.find((tool) => tool.id === (selectedNode.config?.toolId || graphWorkflowTools[0]?.id || '')) || null
+      ? graphWorkflowTools.find((tool) => tool.id === (selectedGraphWorkflowEffectiveNode?.config?.toolId || graphWorkflowTools[0]?.id || '')) || null
       : null),
     [graphWorkflowTools, selectedNode],
   );
   const selectedGraphWorkflowToolContract = useMemo(
     () => (selectedNode?.type === 'graphWorkflow'
-      ? getGraphWorkflowContract(selectedNode.config?.toolId || selectedGraphWorkflowTool?.id || graphWorkflowTools[0]?.id || '')
+      ? getGraphWorkflowContract(selectedGraphWorkflowEffectiveNode?.config?.toolId || selectedGraphWorkflowTool?.id || graphWorkflowTools[0]?.id || '')
       : null),
     [graphWorkflowTools, selectedGraphWorkflowTool, selectedNode],
   );
   const selectedGraphWorkflowDefinition = useMemo(
     () => (selectedNode?.type === 'graphWorkflow'
-      ? parseGraphWorkflowDefinitionText(selectedNode.config?.toolId || selectedGraphWorkflowTool?.id || '', selectedNode.config?.workflowText)
+      ? parseGraphWorkflowDefinitionText(selectedGraphWorkflowEffectiveNode?.config?.toolId || selectedGraphWorkflowTool?.id || '', selectedGraphWorkflowEffectiveNode?.config?.workflowText)
       : null),
     [selectedGraphWorkflowTool, selectedNode],
   );
   const graphWorkflowNodeOptions = selectedGraphWorkflowDefinition?.nodeEntries || [];
   const graphWorkflowTextBinding = useMemo(
-    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowInputBinding(selectedNode, 'text') : null),
+    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowInputBinding(selectedGraphWorkflowEffectiveNode, 'text') : null),
     [selectedNode],
   );
   const graphWorkflowImageBinding = useMemo(
-    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowInputBinding(selectedNode, 'image') : null),
+    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowInputBinding(selectedGraphWorkflowEffectiveNode, 'image') : null),
     [selectedNode],
   );
   const graphWorkflowImageOutputBinding = useMemo(
-    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowOutputBinding(selectedNode, 'image') : null),
+    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowOutputBinding(selectedGraphWorkflowEffectiveNode, 'image') : null),
     [selectedNode],
   );
   const graphWorkflowVideoOutputBinding = useMemo(
-    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowOutputBinding(selectedNode, 'video') : null),
+    () => (selectedNode?.type === 'graphWorkflow' ? getGraphWorkflowOutputBinding(selectedGraphWorkflowEffectiveNode, 'video') : null),
     [selectedNode],
   );
   const graphWorkflowTextFieldOptions = useMemo(
@@ -2645,12 +2750,12 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   );
   const collectionMapGraphWorkflowDefinition = useMemo(
     () => (selectedNode?.type === 'collectionMap'
-      ? parseGraphWorkflowDefinitionText(selectedNode.config?.graphWorkflowToolId || collectionMapGraphWorkflowTool?.id || '', selectedNode.config?.workflowText)
+      ? parseGraphWorkflowDefinitionText(collectionMapEffectiveNode?.config?.graphWorkflowToolId || collectionMapEffectiveNode?.config?.toolId || collectionMapGraphWorkflowTool?.id || '', collectionMapEffectiveNode?.config?.workflowText)
       : null),
     [collectionMapGraphWorkflowTool, selectedNode],
   );
   const collectionMapGraphWorkflowSupport = useMemo(
-    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowOperationBackendSupport(selectedNode) : null),
+    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowOperationBackendSupport(selectedNode, undefined, { graphWorkflowPresetsById }) : null),
     [selectedNode],
   );
   const selectedCollectionMapMapping = useMemo(
@@ -2667,12 +2772,12 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
   }, [audioTools, audioTransformTools, imageTools, imageTransformTools, selectedCollectionMapMapping, transcriptionTools]);
   const collectionMapGraphWorkflowNodeOptions = collectionMapGraphWorkflowDefinition?.nodeEntries || [];
   const collectionMapGraphWorkflowTextBinding = useMemo(
-    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowInputBinding(selectedNode, 'text') : null),
-    [selectedNode],
+    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowInputBinding(collectionMapEffectiveNode, 'text') : null),
+    [collectionMapEffectiveNode, selectedNode],
   );
   const collectionMapGraphWorkflowImageOutputBinding = useMemo(
-    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowOutputBinding(selectedNode, 'image') : null),
-    [selectedNode],
+    () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowOutputBinding(collectionMapEffectiveNode, 'image') : null),
+    [collectionMapEffectiveNode, selectedNode],
   );
   const collectionMapGraphWorkflowTextFieldOptions = useMemo(
     () => getGraphWorkflowFieldOptions(collectionMapGraphWorkflowDefinition, collectionMapGraphWorkflowTextBinding?.nodeId, 'text'),
@@ -2911,6 +3016,158 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
           },
         },
       },
+    }));
+  }
+
+  function buildGraphWorkflowPresetPayload(node, options = {}) {
+    const config = node?.type === 'collectionMap'
+      ? {
+          ...(node.config || {}),
+          toolId: node.config?.graphWorkflowToolId || node.config?.toolId || '',
+        }
+      : node?.config || {};
+    return {
+      description: String(options.description || '').trim(),
+      id: String(options.id || '').trim(),
+      inputBindings: config.inputBindings || {},
+      name: String(options.name || '').trim(),
+      outputBindings: config.outputBindings || {},
+      toolId: config.toolId || config.graphWorkflowToolId || '',
+      workflowFormat: config.workflowFormat || '',
+      workflowText: config.workflowText || '',
+    };
+  }
+
+  async function refreshGraphWorkflowPresets() {
+    const result = await window.localAIHub.listGraphWorkflowPresets?.();
+    if (result?.ok) {
+      setGraphWorkflowPresets(result.data?.presets || []);
+    }
+    return result?.data?.presets || [];
+  }
+
+  async function saveGraphWorkflowPresetFromNode(node) {
+    const defaultName = node?.label ? node.label + ' preset' : 'Graph workflow preset';
+    const name = String(graphWorkflowPresetName || defaultName).trim();
+    if (!name) {
+      setGraphWorkflowPresetStatus({ kind: 'error', message: 'Enter a preset name before saving.' });
+      return;
+    }
+
+    if (!window.localAIHub.saveGraphWorkflowPreset) {
+      const message = 'Local AI Hub could not reach the graph workflow preset service.';
+      setGraphWorkflowPresetStatus({ kind: 'error', message });
+      onToast(message, 'error');
+      return;
+    }
+
+    setGraphWorkflowPresetBusy(true);
+    setGraphWorkflowPresetStatus({ kind: 'info', message: 'Saving graph workflow preset...' });
+    try {
+      const result = await window.localAIHub.saveGraphWorkflowPreset(buildGraphWorkflowPresetPayload(node, { name }));
+      if (!result?.ok) {
+        const message = result?.message || 'Local AI Hub could not save that graph workflow preset.';
+        setGraphWorkflowPresetStatus({ kind: 'error', message });
+        onToast(message, 'error');
+        return;
+      }
+
+      let presets = result.data?.presets || result.data?.state?.graphWorkflowPresets || [];
+      if (!Array.isArray(presets) || !presets.length) {
+        presets = await refreshGraphWorkflowPresets();
+      } else {
+        setGraphWorkflowPresets(presets);
+      }
+      const savedPreset = presets.find((preset) => String(preset?.name || '').trim() === name) || presets[presets.length - 1] || null;
+      const message = result.data?.message || 'Graph workflow preset saved.';
+      setGraphWorkflowPresetName('');
+      setGraphWorkflowPresetStatus({ kind: 'success', message: savedPreset?.name ? message + ' ' + savedPreset.name + ' is ready to select.' : message });
+      onToast(message, 'success');
+    } catch (error) {
+      const message = error?.message || 'Local AI Hub could not save that graph workflow preset.';
+      setGraphWorkflowPresetStatus({ kind: 'error', message });
+      onToast(message, 'error');
+    } finally {
+      setGraphWorkflowPresetBusy(false);
+    }
+  }
+
+  async function deleteGraphWorkflowPreset(presetId) {
+    const preset = graphWorkflowPresetsById[presetId] || null;
+    if (!preset || !window.confirm('Delete the graph workflow preset "' + preset.name + '"? Nodes using it will show a missing-preset readiness issue.')) {
+      return;
+    }
+
+    const result = await window.localAIHub.deleteGraphWorkflowPreset(presetId);
+    if (!result?.ok) {
+      onToast(result?.message || 'Local AI Hub could not delete that graph workflow preset.', 'error');
+      return;
+    }
+
+    const presets = result.data?.presets || result.data?.state?.graphWorkflowPresets || [];
+    setGraphWorkflowPresets(presets);
+    onToast(result.data?.message || 'Graph workflow preset deleted.', 'success');
+  }
+
+  function applyGraphWorkflowPresetToNode(nodeId, presetId, mode = 'graphWorkflow') {
+    const preset = graphWorkflowPresetsById[presetId] || null;
+    updateNode(nodeId, (currentNode) => {
+      if (!preset) {
+        return {
+          ...currentNode,
+          config: {
+            ...currentNode.config,
+            graphWorkflowPresetId: '',
+            workflowSource: 'local',
+          },
+        };
+      }
+
+      const presetConfig = buildGraphWorkflowConfigFromPreset(preset);
+      return {
+        ...currentNode,
+        config: currentNode.type === 'collectionMap'
+          ? {
+              ...currentNode.config,
+              graphWorkflowPresetId: preset.id,
+              graphWorkflowToolId: preset.toolId,
+              inputBindings: presetConfig.inputBindings,
+              outputBindings: presetConfig.outputBindings,
+              workflowFormat: presetConfig.workflowFormat,
+              workflowSource: 'preset',
+              workflowText: presetConfig.workflowText,
+            }
+          : {
+              ...currentNode.config,
+              ...presetConfig,
+              workflowSource: 'preset',
+            },
+      };
+    });
+  }
+
+  function detachGraphWorkflowPreset(nodeId, preset) {
+    if (!preset) return;
+    const presetConfig = buildGraphWorkflowConfigFromPreset(preset);
+    updateNode(nodeId, (currentNode) => ({
+      ...currentNode,
+      config: currentNode.type === 'collectionMap'
+        ? {
+            ...currentNode.config,
+            graphWorkflowPresetId: '',
+            graphWorkflowToolId: preset.toolId,
+            inputBindings: presetConfig.inputBindings,
+            outputBindings: presetConfig.outputBindings,
+            workflowFormat: presetConfig.workflowFormat,
+            workflowSource: 'local',
+            workflowText: presetConfig.workflowText,
+          }
+        : {
+            ...currentNode.config,
+            ...presetConfig,
+            graphWorkflowPresetId: '',
+            workflowSource: 'local',
+          },
     }));
   }
 
@@ -4052,9 +4309,9 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
 
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
-      <div className="min-h-0 flex-1 overflow-y-auto pb-6 pr-1">
-        <div className="space-y-3">
-          <div className="panel p-4">
+      <div className="min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
+        <div className="grid gap-3 xl:grid-cols-2 2xl:grid-cols-3">
+          <div className={getPipelineSectionPanelClass(sectionVisibility.pipelineInfo)}>
             <div className="flex flex-wrap items-start justify-between gap-3">
               <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('pipelineInfo')} type="button">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline setup</p>
@@ -4135,7 +4392,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
               </div>
             ) : null}
           </div>
-          <div className="panel p-4">
+          <div className={getPipelineSectionPanelClass(sectionVisibility.pipelineWizard)}>
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline wizard</p>
@@ -4280,8 +4537,8 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
           </div>
         ) : null}
       </div>
-      <div className="space-y-3">
-          <div className="panel p-4">
+      <>
+          <div className={getPipelineSectionPanelClass(sectionVisibility.savedPipelines)}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Saved pipelines</p>
@@ -4307,7 +4564,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             ) : null}
           </div>
 
-          <div className="panel p-4">
+          <div className={getPipelineSectionPanelClass(sectionVisibility.nodePalette)}>
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node palette</p>
@@ -4346,7 +4603,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             ) : null}
           </div>
 
-          <div className="panel p-4">
+          <div className={getPipelineSectionPanelClass(sectionVisibility.inspector)}>
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node inspector</p>
@@ -4527,6 +4784,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                       </p>
                     </div>
                     <ModelTargetFields allowLocalTool connectedProviders={connectedProviders} executionModeKey="executionMode" localAudioTools={audioTools} localAudioTransformTools={audioTransformTools} localImageTools={imageTools} localImageTransformTools={imageTransformTools} localTranscriptionTools={transcriptionTools} localVideoTools={videoTools} modelOptions={modelOptionsByNodeId[selectedNode.id]} modelsBusy={modelsBusyNodeId === selectedNode.id} node={selectedNode} onRefreshModels={refreshNodeModels} onUpdateNode={updateNode} providerIdKey="providerId" />
+                    <PromptStyleSelector id="llm-prompt-style" onChange={(promptStyleId) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, promptStyleId } }))} promptStyles={promptStyles} targetKind={getPromptStyleTargetKindForModelStep(selectedNode)} value={selectedNode.config?.promptStyleId || ''} />
                     <div>
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-instruction">
                         {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
@@ -4704,20 +4962,53 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                             ...currentNode,
                             config: {
                               ...currentNode.config,
+                              graphWorkflowPresetId: '',
                               inputBindings: nextBindings.inputBindings,
                               outputBindings: nextBindings.outputBindings,
                               toolId: nextToolId,
                               workflowFormat: nextBindings.workflowFormat,
+                              workflowSource: 'local',
                               workflowText: '',
                             },
                           }));
                         }}
-                        value={selectedNode.config?.toolId || graphWorkflowTools[0]?.id || ''}
+                        value={selectedGraphWorkflowEffectiveNode?.config?.toolId || graphWorkflowTools[0]?.id || ''}
                       >
                         <option value="">Choose a graph workflow tool</option>
                         {graphWorkflowTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}
                       </select>
                       <p className="mt-2 text-xs leading-5 text-slate-400">Use this step for graph-native local tools instead of flattening them into the model-step abstraction. Each tool keeps its own workflow contract and honest limitations.</p>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-4">
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="graph-workflow-preset-select">Saved preset</label>
+                      <select className="store-input mt-3" id="graph-workflow-preset-select" onChange={(event) => applyGraphWorkflowPresetToNode(selectedNode.id, event.target.value)} value={selectedNode.config?.workflowSource === 'preset' ? selectedNode.config?.graphWorkflowPresetId || '' : ''}>
+                        <option value="">Use node-local workflow config</option>
+                        {graphWorkflowPresets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name} - {formatGraphWorkflowPresetSummary(preset)}</option>)}
+                      </select>
+                      {selectedGraphWorkflowPreset ? (
+                        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs leading-5 text-slate-300">
+                          <span className="rounded-full border border-cyan-300/25 bg-cyan-300/10 px-3 py-1 text-cyan-100">{formatGraphWorkflowPresetSummary(selectedGraphWorkflowPreset)}</span>
+                          <button className="ghost-button" onClick={() => detachGraphWorkflowPreset(selectedNode.id, selectedGraphWorkflowPreset)} type="button">Detach to local copy</button>
+                          <button className="ghost-button" onClick={() => deleteGraphWorkflowPreset(selectedGraphWorkflowPreset.id)} type="button">Delete preset</button>
+                        </div>
+                      ) : (
+                        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs leading-5 text-slate-400">
+                          <input
+                            className="store-input min-w-[220px] flex-1"
+                            id="graph-workflow-preset-name"
+                            onChange={(event) => setGraphWorkflowPresetName(event.target.value)}
+                            placeholder={(selectedNode?.label || 'Graph Workflow') + ' preset'}
+                            value={graphWorkflowPresetName}
+                          />
+                          <button className="ghost-button" disabled={graphWorkflowPresetBusy} onClick={() => saveGraphWorkflowPresetFromNode(selectedNode)} type="button">{graphWorkflowPresetBusy ? 'Saving preset...' : 'Save node config as preset'}</button>
+                          <span>{graphWorkflowPresets.length ? 'Choose a saved preset or keep this node local.' : 'No graph workflow presets saved yet.'}</span>
+                        </div>
+                      )}
+                      {graphWorkflowPresetStatus ? (
+                        <p className={'mt-3 text-xs leading-5 ' + (graphWorkflowPresetStatus.kind === 'error' ? 'text-amber-200' : graphWorkflowPresetStatus.kind === 'success' ? 'text-emerald-200' : 'text-slate-300')}>
+                          {graphWorkflowPresetStatus.message}
+                        </p>
+                      ) : null}
                     </div>
                     <div className="grid gap-4 xl:grid-cols-2">
                       <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-4 text-sm leading-6 text-slate-300">
@@ -5245,10 +5536,25 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
                         </select>
                       </div>
                     </div>
+                    <PromptStyleSelector id="collection-map-prompt-style" onChange={(promptStyleId) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, promptStyleId } }))} promptStyles={promptStyles} targetKind={getPromptStyleTargetKindForCollectionMap(selectedCollectionMapMapping)} value={selectedNode.config?.promptStyleId || ''} />
                     {collectionMapExecutionMode === 'graphWorkflow' ? (
                       <div className="space-y-4">
                         <div className="rounded-[24px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3 text-sm leading-6 text-cyan-100">Use a real graph workflow boundary here. Paste the workflow JSON, map the Text input, and choose a final Image output node; Local AI Hub will run that workflow once per collection item.</div>
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-tool">Graph workflow tool</label><select className="store-input mt-3" id="collection-map-graph-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => { const nextToolId = event.target.value; const nextBindings = getDefaultGraphWorkflowBindings(nextToolId); return { ...currentNode, config: { ...currentNode.config, graphWorkflowToolId: nextToolId, inputBindings: nextBindings.inputBindings, outputBindings: nextBindings.outputBindings, toolId: '', workflowFormat: nextBindings.workflowFormat, workflowText: '' } }; })} value={selectedNode.config?.graphWorkflowToolId || graphWorkflowTools[0]?.id || ''}><option value="">Choose a graph workflow tool</option>{graphWorkflowTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select><p className="mt-2 text-xs leading-5 text-slate-500">ComfyUI and InvokeAI stay graph-native. They are only usable here after this workflow boundary is configured.</p></div>
+                        <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-4">
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-preset">Graph workflow preset</label>
+                          <select className="store-input mt-3" id="collection-map-graph-preset" onChange={(event) => applyGraphWorkflowPresetToNode(selectedNode.id, event.target.value)} value={selectedNode.config?.workflowSource === 'preset' ? selectedNode.config?.graphWorkflowPresetId || '' : ''}>
+                            <option value="">Use configured workflow below</option>
+                            {compatibleCollectionMapGraphWorkflowPresets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name} - {formatGraphWorkflowPresetSummary(preset)}</option>)}
+                          </select>
+                          {compatibleCollectionMapGraphWorkflowPresets.length ? null : <p className="mt-2 text-xs leading-5 text-amber-200">No compatible text-to-image graph workflow presets are saved yet.</p>}
+                          {collectionMapSelectedGraphWorkflowPreset ? (
+                            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs leading-5 text-slate-300">
+                              <span className="rounded-full border border-cyan-300/25 bg-cyan-300/10 px-3 py-1 text-cyan-100">{formatGraphWorkflowPresetSummary(collectionMapSelectedGraphWorkflowPreset)}</span>
+                              <button className="ghost-button" onClick={() => detachGraphWorkflowPreset(selectedNode.id, collectionMapSelectedGraphWorkflowPreset)} type="button">Detach to configured workflow</button>
+                            </div>
+                          ) : null}
+                        </div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-tool">Graph workflow tool</label><select className="store-input mt-3" id="collection-map-graph-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => { const nextToolId = event.target.value; const nextBindings = getDefaultGraphWorkflowBindings(nextToolId); return { ...currentNode, config: { ...currentNode.config, graphWorkflowPresetId: '', workflowSource: 'local', graphWorkflowToolId: nextToolId, inputBindings: nextBindings.inputBindings, outputBindings: nextBindings.outputBindings, toolId: '', workflowFormat: nextBindings.workflowFormat, workflowText: '' } }; })} value={selectedNode.config?.graphWorkflowToolId || graphWorkflowTools[0]?.id || ''}><option value="">Choose a graph workflow tool</option>{graphWorkflowTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select><p className="mt-2 text-xs leading-5 text-slate-500">ComfyUI and InvokeAI stay graph-native. They are only usable here after this workflow boundary is configured.</p></div>
                         <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-json">Workflow definition</label><textarea className="store-input mt-3 min-h-[180px] resize-none font-mono text-xs leading-6" id="collection-map-graph-json" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, workflowText: event.target.value } }))} placeholder={collectionMapGraphWorkflowContract?.workflowFormat?.placeholder || 'Paste the workflow definition here.'} value={selectedNode.config?.workflowText || ''} />{collectionMapGraphWorkflowDefinition ? <p className={'mt-2 text-xs leading-5 ' + (collectionMapGraphWorkflowDefinition.ok ? 'text-emerald-200' : 'text-amber-200')}>{collectionMapGraphWorkflowDefinition.message}</p> : null}</div>
                         <div className="grid gap-4 xl:grid-cols-2">
                           <div className="rounded-[24px] border border-white/10 bg-slate-950/35 p-4"><p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Text Input Boundary</p><div className="mt-3 space-y-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-text-node">Workflow node</label>{collectionMapGraphWorkflowDefinition?.ok ? <select className="store-input mt-3" id="collection-map-graph-text-node" onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: '', nodeId: event.target.value })} value={collectionMapGraphWorkflowTextBinding?.nodeId || ''}><option value="">Choose the text input node</option>{collectionMapGraphWorkflowNodeOptions.map((entry) => <option key={entry.id} value={entry.id}>{formatGraphWorkflowNodeLabel(entry)}</option>)}</select> : <input className="store-input mt-3" id="collection-map-graph-text-node" onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { nodeId: event.target.value })} placeholder="For example: 6" value={collectionMapGraphWorkflowTextBinding?.nodeId || ''} />}</div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-graph-text-field">Workflow field</label>{collectionMapGraphWorkflowTextFieldOptions.length ? <select className="store-input mt-3" id="collection-map-graph-text-field" onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })} value={collectionMapGraphWorkflowTextBinding?.field || ''}><option value="">Choose a prompt field</option>{collectionMapGraphWorkflowTextFieldOptions.map((field) => <option key={field} value={field}>{field}</option>)}</select> : <input className="store-input mt-3" id="collection-map-graph-text-field" onChange={(event) => updateGraphWorkflowInputBinding(selectedNode.id, 'text', { field: event.target.value })} placeholder="For example: text" value={collectionMapGraphWorkflowTextBinding?.field || ''} />}</div></div></div>
@@ -5415,14 +5721,14 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             ) : <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">Select a node on the canvas to edit its settings and inspect its connections.</div>) : null}
           </div>
 
-          <div className="panel p-4">
+          <div className={getPipelineSectionPanelClass(sectionVisibility.canvas)}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Canvas</p>
                 <p className="mt-2 text-lg font-semibold text-white">Navigate large pipeline graphs without losing node interaction</p>
               </div>
               <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Blank space drags the viewport. The mouse wheel zooms while the cursor is over the canvas.</span>
+                {sectionVisibility.canvas ? <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Blank space drags the viewport. The mouse wheel zooms while the cursor is over the canvas.</span> : null}
                 <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1.5 text-slate-200">{Math.round(canvasZoom * 100)}%</span>
                 <button className="ghost-button px-3 py-1.5 text-xs" onClick={resetCanvasView} type="button">Reset view</button>
                 {selectedEdge ? <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => removeEdge(selectedEdge.id)} type="button">Disconnect selected link</button> : null}
@@ -5583,7 +5889,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             ) : null}
           </div>
 
-          <div className="panel p-4">
+          <div className={getPipelineSectionPanelClass(sectionVisibility.runStatus)}>
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Runtime status</p>
@@ -5610,6 +5916,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
           </div>
 
           <PipelineOutputsPanel
+            className={pipelineOutputsExpanded ? 'xl:col-span-2 2xl:col-span-3' : ''}
             busyPath={outputsBusyPath}
             expanded={pipelineOutputsExpanded}
             loading={outputsLoading}
@@ -5620,7 +5927,7 @@ export default function PipelineBuilderPanel({ hardware, manifests, onToast, pro
             onToggleExpanded={() => setPipelineOutputsExpanded((current) => !current)}
             outputs={pipelineOutputs}
           />
-        </div>
+      </>
       </div>
         </div>
     </section>

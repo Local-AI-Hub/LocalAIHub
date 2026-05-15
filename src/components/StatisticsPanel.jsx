@@ -224,7 +224,7 @@ function StatisticsPanel({ busy, data = null, error, loading, onOpenCleanup, onR
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto pb-6 pr-1">
+      <div className="min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
         <div className="space-y-3">
           {coreLoading && !hasCoreData ? <SectionLoadingMessage>Loading launch history, drive details, and VRAM history first.</SectionLoadingMessage> : null}
           {busy && hasCoreData ? <SectionLoadingMessage>Updating statistics while keeping the current snapshot visible.</SectionLoadingMessage> : null}

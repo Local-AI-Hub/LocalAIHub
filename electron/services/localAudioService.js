@@ -11,6 +11,7 @@ const { runCommand } = require('./commandService');
 const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
+const { serializePromptStyleApplication } = require('../shared/promptStyles.cjs');
 const { PIPELINE_OPERATION_IDS, PORT_KIND_AUDIO } = require('../shared/pipelineSchema.cjs');
 
 const LOCAL_AUDIO_RUNTIME_MODE_IDS = Object.freeze({
@@ -453,6 +454,7 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
     operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
     operationSubtype: audioMode,
     prompt: String(response?.prompt || options.prompt || '').trim(),
+    promptStyle: serializePromptStyleApplication(options.promptStyle),
     sourceAudio: buildSourceAudioReference(options.sourceAudioArtifact),
     sourceAudioPath: String(response?.sourceAudioPath || options.sourceAudioPath || '').trim(),
     sourceDurationSeconds: Number(response?.sourceDurationSeconds || 0) || 0,

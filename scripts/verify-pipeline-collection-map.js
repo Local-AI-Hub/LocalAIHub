@@ -125,6 +125,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
                   model: request.model || '',
                   operationId: request.operationId,
                   prompt: request.prompt || '',
+                  promptStyle: request.promptStyle,
                   toolLabel: _tool.name,
                 } : undefined,
                 audioTransformation: request.operationId === 'audioTransform' ? {
@@ -201,7 +202,9 @@ const {
   createNode,
 } = require('../electron/shared/pipelineSchema.cjs');
 const { buildPipelineWizardDraft } = require('../electron/shared/pipelineWizard.cjs');
+const { normalizeGraphWorkflowPresetRecord } = require('../electron/shared/graphWorkflowContracts.cjs');
 const { getActiveRunSnapshot, resumePipelineValidation, runPipeline } = require('../electron/services/pipelineExecutionService');
+const configService = require('../electron/services/configService');
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -356,7 +359,7 @@ async function main() {
   assert(builderPanelSource.includes("assetKind: 'upscayl-model-set'"), 'collectionMap refresh should load Upscayl model sets.');
   assert(!builderPanelSource.includes('This mapping uses the selected tool default settings here. No refreshable model list is needed.'), 'collectionMap refresh should not use the stale generic no-models message for refreshable mappings.');
 
-  const pipeline = buildCollectionMapPipeline();
+  const pipeline = buildCollectionMapPipeline({ mapConfig: { promptStyleId: 'style-anime-test' } });
   const graph = buildPipelineGraph(pipeline);
   assert.deepStrictEqual(graph.errors, [], 'collection:text -> collectionMap -> collectionOutput should be structurally valid');
   const analysis = analyzePipeline(pipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true, lastTestedAt: new Date().toISOString(), lastTestSucceeded: true }] });
@@ -383,6 +386,26 @@ async function main() {
   const noImageBoundaryPipeline = buildCollectionMapPipeline({ mapConfig: buildGraphCollectionMapConfig(COMFY_NO_IMAGE_OUTPUT_WORKFLOW, { outputBindings: { image: { mode: 'node-output', nodeId: '7' } } }) });
   const noImageBoundaryAnalysis = analyzePipeline(noImageBoundaryPipeline, { tools: mockedInstalledTools, toolCatalog: mockedInstalledTools });
   assert(noImageBoundaryAnalysis.issues.some((issue) => /Image output boundary|image-producing node/i.test(issue.message)), 'graph workflow collectionMap should reject workflows without a compatible image output boundary.');
+
+  const graphPreset = normalizeGraphWorkflowPresetRecord({
+    ...buildGraphCollectionMapConfig(),
+    id: 'collection-text-image-preset',
+    name: 'Collection text to image preset',
+    toolId: 'comfyui',
+  });
+  assert.strictEqual(graphPreset.validation.ok, true, graphPreset.validation.message);
+  const graphPresetPipeline = buildCollectionMapPipeline({ mapConfig: { executionMode: 'graphWorkflow', graphWorkflowPresetId: graphPreset.id, workflowSource: 'preset' } });
+  const graphPresetAnalysis = analyzePipeline(graphPresetPipeline, { graphWorkflowPresets: [graphPreset], tools: mockedInstalledTools, toolCatalog: mockedInstalledTools });
+  assert.strictEqual(graphPresetAnalysis.executable, true, graphPresetAnalysis.primaryIssue?.message);
+
+  const incompatibleGraphPreset = {
+    ...graphPreset,
+    id: 'collection-image-image-preset',
+    declaredContract: { inputKinds: ['image'], outputKinds: ['image'], operationFamily: 'imageToImage' },
+  };
+  const incompatiblePresetPipeline = buildCollectionMapPipeline({ mapConfig: { executionMode: 'graphWorkflow', graphWorkflowPresetId: incompatibleGraphPreset.id, workflowSource: 'preset' } });
+  const incompatiblePresetAnalysis = analyzePipeline(incompatiblePresetPipeline, { graphWorkflowPresets: [incompatibleGraphPreset], tools: mockedInstalledTools, toolCatalog: mockedInstalledTools });
+  assert(incompatiblePresetAnalysis.issues.some((issue) => /not compatible|declares image -> image/i.test(issue.message)), 'collectionMap should reject incompatible graph workflow presets.');
 
   graphWorkflowPrompts.length = 0;
   await runPipeline(graphPipeline);
@@ -422,6 +445,8 @@ async function main() {
   });
   assert(wizardDraft.pipeline.nodes.some((node) => node.type === 'collectionMap'), 'wizard should lower collection:text image generation through collectionMap');
 
+  await configService.upsertPromptStyle({ id: 'style-anime-test', name: 'Anime Test', targetKind: 'image', requiredTerms: ['anime film still', 'hand-painted background', 'soft sunlight'], negativePrompt: 'photorealistic, 3d render' });
+  providerImageGenerationPrompts.length = 0;
   await runPipeline(pipeline);
   const snapshot = await waitForRunToFinish();
   assert.strictEqual(snapshot.status, 'completed', snapshot.message);
@@ -430,6 +455,8 @@ async function main() {
   assert.strictEqual(mapState.outputs.collection.itemCount, 2);
   assert.strictEqual(mapState.outputs.collection.items[0].lineage.sourceItemIndex, 0);
   assert.strictEqual(mapState.outputs.collection.items[1].lineage.sourceItemIndex, 1);
+  assert(providerImageGenerationPrompts.every((prompt) => prompt.includes('anime film still') && prompt.includes('hand-painted background') && prompt.includes('soft sunlight')), 'collection text-to-image prompt style should apply required terms to every item prompt.');
+  assert.strictEqual(mapState.outputs.collection.items[0].artifact.imageGeneration.promptStyle.id, 'style-anime-test', 'collection text-to-image metadata should record selected prompt style.');
 
   mockedInstalledTools = [createTool('audiocraft-webui', 'AudioCraft WebUI')];
   const textToAudioPipeline = buildCollectionInputMapPipeline({
@@ -446,9 +473,11 @@ async function main() {
       audioMode: 'music',
       durationSeconds: 2,
       instruction: 'Short ambient loop.',
+      promptStyleId: 'style-cinematic-music',
     },
   });
   assert.strictEqual(analyzePipeline(textToAudioPipeline, { tools: mockedInstalledTools, toolCatalog: mockedInstalledTools }).executable, true, 'text-to-audio collectionMap should analyze as executable with AudioCraft.');
+  await configService.upsertPromptStyle({ id: 'style-cinematic-music', name: 'Cinematic Music', targetKind: 'audio', requiredTerms: ['cinematic orchestral', 'dark ambient'] });
   await runPipeline(textToAudioPipeline);
   const textToAudioSnapshot = await waitForRunToFinish();
   assert.strictEqual(textToAudioSnapshot.status, 'completed', textToAudioSnapshot.message);
@@ -459,6 +488,8 @@ async function main() {
   assert.deepStrictEqual(textToAudioCollection.items.map((entry) => entry.lineage.sourceItemIndex), [0, 1], 'text-to-audio should preserve source order lineage.');
   assert(/Short ambient loop/.test(textToAudioCollection.items[0].artifact.audioGeneration.prompt), 'text-to-audio prompt should use audio wording when configured.');
   assert(!/Generate one image/.test(textToAudioCollection.items[0].artifact.audioGeneration.prompt), 'text-to-audio metadata must not inherit stale image-generation instructions.');
+  assert(textToAudioCollection.items.every((entry) => /cinematic orchestral/.test(entry.artifact.audioGeneration.prompt) && /dark ambient/.test(entry.artifact.audioGeneration.prompt)), 'collection text-to-audio prompt style should apply required terms to every item prompt.');
+  assert.strictEqual(textToAudioCollection.items[0].artifact.audioGeneration.promptStyle.id, 'style-cinematic-music', 'collection text-to-audio metadata should record selected prompt style.');
 
   const staleInstructionTextToAudioPipeline = buildCollectionInputMapPipeline({
     itemType: 'text',

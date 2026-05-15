@@ -34,6 +34,8 @@ function verifyPipelineBuilderSourceGuards() {
   assert(source.includes('llm-local-audio-seed'), 'Expected Model Step AudioCraft continuation UI to expose seed seconds.');
   assert(source.includes('llm-local-audio-append'), 'Expected Model Step AudioCraft continuation UI to expose append-source output mode.');
   assert(source.includes('Advanced AudioCraft settings'), 'Expected Model Step AudioCraft UI to keep advanced generation settings available but collapsed.');
+  assert(source.includes('llm-prompt-style'), 'Expected Model Step inspector to expose the Prompt Style selector.');
+  assert(source.includes('collection-map-prompt-style'), 'Expected collectionMap inspector to expose the Prompt Style selector for text mappings.');
   const checkpointOptionHelperUses = source.match(/buildStableDiffusionCheckpointOption/g) || [];
   assert(checkpointOptionHelperUses.length >= 3, 'Expected Model Step and collectionMap checkpoint refresh options to use the shared checkpoint identity helper.');
 }
@@ -43,6 +45,8 @@ async function main() {
   assert(defaultConfig && typeof defaultConfig === 'object', 'Expected a default config object for Model Step.');
   assert.strictEqual(defaultConfig.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.LLM_PROMPT, 'Expected Model Step to default to the general llmPrompt operation.');
   assert.strictEqual(defaultConfig.executionMode, 'cloud', 'Expected Model Step to default to cloud execution mode.');
+  assert.strictEqual(defaultConfig.promptStyleId, '', 'Expected Model Step prompt style to default to none.');
+  assert.strictEqual(pipelineSchema.getDefaultNodeConfig('collectionMap').promptStyleId, '', 'Expected collectionMap prompt style to default to none.');
 
   const pipelineUi = await loadPipelineUiBundle();
   const paletteGroups = pipelineUi.getNodePaletteGroups();

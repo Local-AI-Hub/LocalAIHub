@@ -3,6 +3,14 @@ const fs = require('fs-extra');
 const { app } = require('electron');
 
 const { sanitizeUserMessage } = require('./redactionService');
+const {
+  normalizeGraphWorkflowPresetRecord,
+  validateGraphWorkflowPresetConfig,
+} = require('../shared/graphWorkflowContracts.cjs');
+const {
+  normalizePromptStylePreset,
+  normalizePromptStylePresets,
+} = require('../shared/promptStyles.cjs');
 
 const CONFIG_VERSION = 4;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
@@ -304,12 +312,37 @@ function createDefaultConfig() {
     ignoredToolIds: [],
     closeBehavior: 'exit',
     liveResourcePolling: false,
+    graphWorkflowPresets: [],
+    promptStyles: [],
     managedDataRoot: null,
     preferredInstallRoot: null,
     managedDataRootHistory: [],
     dismissedManagedMigrationRoots: [],
     tools: {},
   };
+}
+
+function normalizeGraphWorkflowPresets(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seenIds = new Set();
+  return value
+    .map((entry) => {
+      try {
+        return normalizeGraphWorkflowPresetRecord(entry);
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => {
+      if (!entry?.id || seenIds.has(entry.id)) {
+        return false;
+      }
+      seenIds.add(entry.id);
+      return true;
+    });
 }
 
 function normalizeConfig(config, options = {}) {
@@ -328,6 +361,8 @@ function normalizeConfig(config, options = {}) {
       ignoredToolIds: normalizeIgnoredToolIds(config?.ignoredToolIds),
       closeBehavior: normalizeCloseBehavior(config?.closeBehavior),
       liveResourcePolling: Boolean(config?.liveResourcePolling),
+      graphWorkflowPresets: normalizeGraphWorkflowPresets(config?.graphWorkflowPresets),
+      promptStyles: normalizePromptStylePresets(config?.promptStyles),
       managedDataRoot: normalizeOptionalDirectoryPath(config?.managedDataRoot),
       preferredInstallRoot: normalizeOptionalDirectoryPath(config?.preferredInstallRoot),
       managedDataRootHistory: normalizePathList([
@@ -644,6 +679,95 @@ async function updateConfig(mutator, options = {}) {
   });
 }
 
+async function listGraphWorkflowPresets() {
+  const config = await readConfig();
+  return normalizeGraphWorkflowPresets(config.graphWorkflowPresets);
+}
+
+async function upsertGraphWorkflowPreset(preset) {
+  const validation = validateGraphWorkflowPresetConfig(preset || {});
+  if (!validation.ok) {
+    throw new Error(validation.message || 'Fix the graph workflow preset contract before saving it.');
+  }
+
+  const normalizedPreset = normalizeGraphWorkflowPresetRecord(preset || {}, { touch: true });
+  return updateConfig((config) => {
+    const currentPresets = normalizeGraphWorkflowPresets(config.graphWorkflowPresets);
+    const nextPresets = [
+      ...currentPresets.filter((entry) => entry.id !== normalizedPreset.id),
+      normalizedPreset,
+    ].sort((left, right) => String(left.name || '').localeCompare(String(right.name || ''), undefined, { sensitivity: 'base' }));
+    return {
+      ...config,
+      graphWorkflowPresets: nextPresets,
+    };
+  });
+}
+
+async function deleteGraphWorkflowPreset(presetId) {
+  const normalizedPresetId = String(presetId || '').trim();
+  if (!normalizedPresetId) {
+    throw new Error('Choose a graph workflow preset before deleting it.');
+  }
+
+  return updateConfig((config) => {
+    const currentPresets = normalizeGraphWorkflowPresets(config.graphWorkflowPresets);
+    const nextPresets = currentPresets.filter((entry) => entry.id !== normalizedPresetId);
+    if (nextPresets.length === currentPresets.length) {
+      throw new Error('That graph workflow preset could not be found.');
+    }
+
+    return {
+      ...config,
+      graphWorkflowPresets: nextPresets,
+    };
+  });
+}
+
+async function listPromptStyles() {
+  const config = await readConfig();
+  return normalizePromptStylePresets(config.promptStyles);
+}
+
+async function upsertPromptStyle(promptStyle) {
+  const normalizedStyle = normalizePromptStylePreset(promptStyle || {}, { touch: true });
+  if (!String(normalizedStyle.name || '').trim()) {
+    throw new Error('Enter a prompt style name before saving it.');
+  }
+
+  return updateConfig((config) => {
+    const currentStyles = normalizePromptStylePresets(config.promptStyles);
+    const nextStyles = [
+      ...currentStyles.filter((entry) => entry.id !== normalizedStyle.id),
+      normalizedStyle,
+    ].sort((left, right) => String(left.name || '').localeCompare(String(right.name || ''), undefined, { sensitivity: 'base' }));
+    return {
+      ...config,
+      promptStyles: nextStyles,
+    };
+  });
+}
+
+async function deletePromptStyle(promptStyleId) {
+  const normalizedStyleId = String(promptStyleId || '').trim();
+  if (!normalizedStyleId) {
+    throw new Error('Choose a prompt style before deleting it.');
+  }
+
+  return updateConfig((config) => {
+    const currentStyles = normalizePromptStylePresets(config.promptStyles);
+    const nextStyles = currentStyles.filter((entry) => entry.id !== normalizedStyleId);
+    if (nextStyles.length === currentStyles.length) {
+      throw new Error('That prompt style could not be found.');
+    }
+
+    return {
+      ...config,
+      promptStyles: nextStyles,
+    };
+  });
+}
+
 async function saveHardwareDetection(hardware) {
   return updateConfig((config) => ({
     ...config,
@@ -720,10 +844,14 @@ module.exports = {
   buildManagedPathMappings,
   buildManagedSubdirectoryPaths,
   createDefaultConfig,
+  deleteGraphWorkflowPreset,
+  deletePromptStyle,
   ensureStorage,
   getAppPaths,
   getStorageRoots,
   humanizeError,
+  listGraphWorkflowPresets,
+  listPromptStyles,
   markFirstLaunchComplete,
   normalizeDirectoryPath,
   normalizeOptionalDirectoryPath,
@@ -733,6 +861,8 @@ module.exports = {
   saveHardwareDetection,
   setToolIgnored,
   updateConfig,
+  upsertGraphWorkflowPreset,
+  upsertPromptStyle,
   upsertTool,
   writeConfig,
 };

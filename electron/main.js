@@ -13,13 +13,18 @@ const {
 } = require('electron');
 
 const {
+  deleteGraphWorkflowPreset,
+  deletePromptStyle,
   ensureStorage,
   getAppPaths,
   humanizeError,
+  listGraphWorkflowPresets,
   markFirstLaunchComplete,
   readConfig,
   saveHardwareDetection,
   updateConfig,
+  upsertGraphWorkflowPreset,
+  upsertPromptStyle,
   upsertTool,
 } = require('./services/configService');
 const {
@@ -539,6 +544,8 @@ async function buildAppState(options = {}) {
     downloadedModelCount,
     executablePath: paths.executablePath,
     firstLaunch: !latestConfig.firstLaunchCompleted,
+    graphWorkflowPresets: latestConfig.graphWorkflowPresets || [],
+    promptStyles: latestConfig.promptStyles || [],
     hardware,
     logsPath: paths.logsRoot,
     managedDataPath: paths.managedRoot,
@@ -1825,6 +1832,61 @@ function registerIpcHandlers() {
       };
     }, 'Local AI Hub could not restore that snapshot.'),
   );
+  ipcMain.handle('graph-workflow-presets:list', () =>
+    withPlainEnglishErrors(async () => ({
+      presets: await listGraphWorkflowPresets(),
+    }), 'Local AI Hub could not load graph workflow presets.'),
+  );
+
+  ipcMain.handle('graph-workflow-presets:save', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const config = await upsertGraphWorkflowPreset(payload || {});
+      return {
+        message: 'Graph workflow preset saved.',
+        presets: config.graphWorkflowPresets || [],
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not save that graph workflow preset.'),
+  );
+
+  ipcMain.handle('graph-workflow-presets:delete', (_event, presetId) =>
+    withPlainEnglishErrors(async () => {
+      const config = await deleteGraphWorkflowPreset(presetId);
+      return {
+        message: 'Graph workflow preset deleted.',
+        presets: config.graphWorkflowPresets || [],
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not delete that graph workflow preset.'),
+  );
+  ipcMain.handle('prompt-styles:list', () =>
+    withPlainEnglishErrors(async () => ({
+      promptStyles: (await readConfig()).promptStyles || [],
+    }), 'Local AI Hub could not load prompt styles.'),
+  );
+
+  ipcMain.handle('prompt-styles:save', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const config = await upsertPromptStyle(payload || {});
+      return {
+        message: 'Prompt style saved.',
+        promptStyles: config.promptStyles || [],
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not save that prompt style.'),
+  );
+
+  ipcMain.handle('prompt-styles:delete', (_event, promptStyleId) =>
+    withPlainEnglishErrors(async () => {
+      const config = await deletePromptStyle(promptStyleId);
+      return {
+        message: 'Prompt style deleted.',
+        promptStyles: config.promptStyles || [],
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not delete that prompt style.'),
+  );
+
   ipcMain.handle('pipelines:list', () =>
     withPlainEnglishErrors(async () => ({
       pipelines: await listPipelines(),

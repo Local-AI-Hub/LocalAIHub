@@ -21,6 +21,7 @@ const PORT_KIND_TEXT = 'text';
 const PORT_KIND_IMAGE = 'image';
 const PORT_KIND_VIDEO = 'video';
 const DEFAULT_GRAPH_WORKFLOW_TOOL_ID = 'comfyui';
+const GRAPH_WORKFLOW_PRESET_SCHEMA_VERSION = 1;
 const INVOKEAI_RESERVED_GRAPH_FIELDS = new Set(['id', 'is_intermediate', 'type', 'use_cache']);
 
 const GRAPH_WORKFLOW_TOOL_CONTRACTS = Object.freeze({
@@ -125,6 +126,19 @@ function isRecord(value) {
 
 function normalizeToolId(value) {
   return String(value || '').trim().toLowerCase();
+}
+
+function normalizeKind(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeStringList(value = []) {
+  const entries = Array.isArray(value) ? value : [value];
+  return [...new Set(entries.map((entry) => String(entry || '').trim()).filter(Boolean))];
+}
+
+function createGraphWorkflowPresetId() {
+  return 'gwp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
 }
 
 function createGraphWorkflowId() {
@@ -737,9 +751,349 @@ function getGraphWorkflowNodeEntrySummary(definition, nodeId) {
   return (definition?.nodeEntries || []).find((entry) => String(entry?.id || '').trim() === normalizedNodeId) || null;
 }
 
-function getGraphWorkflowOperationBackendSupport(nodeOrConfig = {}, operationId = GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE) {
+function getGraphWorkflowPresetId(config = {}) {
+  return String(config?.graphWorkflowPresetId || config?.presetId || '').trim();
+}
+
+function getGraphWorkflowPresetRegistry(options = {}) {
+  if (options.graphWorkflowPresetsById && typeof options.graphWorkflowPresetsById === 'object') {
+    return options.graphWorkflowPresetsById;
+  }
+
+  if (options.presetsById && typeof options.presetsById === 'object') {
+    return options.presetsById;
+  }
+
+  const presets = Array.isArray(options.graphWorkflowPresets)
+    ? options.graphWorkflowPresets
+    : Array.isArray(options.presets)
+      ? options.presets
+      : [];
+  return Object.fromEntries(presets.map((preset) => [String(preset?.id || '').trim(), preset]).filter(([id]) => id));
+}
+
+function getGraphWorkflowPresetById(presetId, options = {}) {
+  const normalizedPresetId = String(presetId || '').trim();
+  if (!normalizedPresetId) {
+    return null;
+  }
+
+  return getGraphWorkflowPresetRegistry(options)[normalizedPresetId] || null;
+}
+
+function buildGraphWorkflowConfigFromPreset(preset) {
+  if (!preset || typeof preset !== 'object') {
+    return null;
+  }
+
+  return {
+    graphContractVersion: 1,
+    graphWorkflowPresetId: String(preset.id || '').trim(),
+    inputBindings: isRecord(preset.inputBindings) ? cloneValue(preset.inputBindings) : {},
+    outputBindings: isRecord(preset.outputBindings) ? cloneValue(preset.outputBindings) : {},
+    toolId: normalizeToolId(preset.toolId) || DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
+    workflowFormat: String(preset.workflowFormat || preset.workflowKind || '').trim(),
+    workflowSource: 'preset',
+    workflowText: typeof preset.workflowText === 'string'
+      ? preset.workflowText
+      : preset.workflowJson !== undefined
+        ? JSON.stringify(preset.workflowJson, null, 2)
+        : '',
+  };
+}
+
+function resolveGraphWorkflowPresetConfig(nodeOrConfig = {}, options = {}) {
+  const originalConfig = nodeOrConfig && typeof nodeOrConfig === 'object' && nodeOrConfig.config && typeof nodeOrConfig.config === 'object'
+    ? nodeOrConfig.config
+    : nodeOrConfig || {};
+  const presetId = getGraphWorkflowPresetId(originalConfig);
+  const wantsPreset = presetId && String(originalConfig.workflowSource || '').trim() === 'preset';
+  if (!wantsPreset) {
+    return {
+      config: cloneValue(originalConfig),
+      missingPreset: false,
+      preset: null,
+      presetId: '',
+      source: 'local',
+    };
+  }
+
+  const preset = getGraphWorkflowPresetById(presetId, options);
+  if (!preset) {
+    return {
+      config: cloneValue(originalConfig),
+      missingPreset: true,
+      preset: null,
+      presetId,
+      source: 'preset',
+    };
+  }
+
+  return {
+    config: {
+      ...cloneValue(originalConfig),
+      ...buildGraphWorkflowConfigFromPreset(preset),
+      graphWorkflowPresetId: presetId,
+      workflowSource: 'preset',
+    },
+    missingPreset: false,
+    preset,
+    presetId,
+    source: 'preset',
+  };
+}
+
+function buildGraphWorkflowNodeWithConfig(nodeOrConfig = {}, config = {}) {
+  if (nodeOrConfig && typeof nodeOrConfig === 'object' && nodeOrConfig.config && typeof nodeOrConfig.config === 'object') {
+    return {
+      ...nodeOrConfig,
+      config,
+    };
+  }
+
+  return {
+    id: 'graph-workflow-config',
+    label: 'Graph Workflow',
+    type: 'graphWorkflow',
+    config,
+  };
+}
+
+function resolveGraphWorkflowPresetNode(nodeOrConfig = {}, options = {}) {
+  const resolved = resolveGraphWorkflowPresetConfig(nodeOrConfig, options);
+  return {
+    ...resolved,
+    node: buildGraphWorkflowNodeWithConfig(nodeOrConfig, resolved.config),
+  };
+}
+
+function buildGraphWorkflowOperationFamily(inputKinds = [], outputKinds = []) {
+  const inputs = new Set((inputKinds || []).map(normalizeKind));
+  const outputs = new Set((outputKinds || []).map(normalizeKind));
+  if (inputs.has(PORT_KIND_TEXT) && outputs.has(PORT_KIND_IMAGE)) {
+    return GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE;
+  }
+  if (inputs.has(PORT_KIND_IMAGE) && outputs.has(PORT_KIND_IMAGE)) {
+    return 'imageToImage';
+  }
+  if (inputs.has(PORT_KIND_TEXT) && outputs.has(PORT_KIND_VIDEO)) {
+    return 'textToVideo';
+  }
+  return '';
+}
+
+function buildGraphWorkflowDeclaredContract(inputPorts = [], outputPorts = []) {
+  const normalizedInputPorts = (inputPorts || [])
+    .map((entry) => ({
+      kind: normalizeKind(entry.kind),
+      portId: String(entry.portId || '').trim(),
+    }))
+    .filter((entry) => entry.kind && entry.portId);
+  const normalizedOutputPorts = (outputPorts || [])
+    .map((entry) => ({
+      kind: normalizeKind(entry.kind),
+      portId: String(entry.portId || '').trim(),
+    }))
+    .filter((entry) => entry.kind && entry.portId);
+  const inputKinds = [...new Set(normalizedInputPorts.map((entry) => entry.kind))];
+  const outputKinds = [...new Set(normalizedOutputPorts.map((entry) => entry.kind))];
+  return {
+    inputKinds,
+    inputPorts: normalizedInputPorts,
+    operationFamily: buildGraphWorkflowOperationFamily(inputKinds, outputKinds),
+    outputKinds,
+    outputPorts: normalizedOutputPorts,
+  };
+}
+
+function validateGraphWorkflowPresetConfig(config = {}) {
+  const toolId = normalizeToolId(config.toolId || config.graphWorkflowToolId) || DEFAULT_GRAPH_WORKFLOW_TOOL_ID;
+  const contract = getGraphWorkflowContract(toolId);
+  const issues = [];
+  if (!contract?.supportsExecution) {
+    issues.push(contract?.executionBlockedMessage || 'This graph workflow tool is not runnable in Local AI Hub yet.');
+  }
+
+  const workflowText = String(config.workflowText || config.graphWorkflowWorkflowText || '').trim();
+  const parsedWorkflow = parseGraphWorkflowDefinitionText(toolId, workflowText);
+  if (!parsedWorkflow.ok) {
+    issues.push(parsedWorkflow.message || 'Paste a workflow definition before saving this preset.');
+  }
+
+  const node = buildGraphWorkflowNodeWithConfig({}, {
+    ...config,
+    toolId,
+    workflowText,
+  });
+  const declaredInputPorts = [];
+  const declaredOutputPorts = [];
+
+  if (parsedWorkflow.ok) {
+    for (const inputSpec of contract.inputPorts || []) {
+      const portId = String(inputSpec.portId || '').trim();
+      const binding = getGraphWorkflowInputBinding(node, portId);
+      const nodeId = String(binding?.nodeId || '').trim();
+      const field = String(binding?.field || '').trim();
+      if (!nodeId) {
+        continue;
+      }
+
+      if (!field || binding?.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_FIELD) {
+        issues.push('Map the ' + String(inputSpec.label || portId || 'input') + ' boundary to a workflow node and field before saving this preset.');
+        continue;
+      }
+
+      const workflowNode = getGraphWorkflowNodeEntry(parsedWorkflow.workflow, nodeId);
+      if (!workflowNode) {
+        issues.push('The mapped ' + String(inputSpec.label || portId || 'input') + ' boundary node could not be found in the workflow definition.');
+        continue;
+      }
+
+      if (!workflowNode.inputs || typeof workflowNode.inputs !== 'object' || !Object.prototype.hasOwnProperty.call(workflowNode.inputs, field)) {
+        issues.push('The mapped ' + String(inputSpec.label || portId || 'input') + ' boundary field could not be found in the workflow definition.');
+        continue;
+      }
+
+      declaredInputPorts.push({ kind: inputSpec.kind, portId });
+    }
+
+    for (const outputSpec of contract.outputPorts || []) {
+      const portId = String(outputSpec.portId || '').trim();
+      const binding = getGraphWorkflowOutputBinding(node, portId);
+      const outputNodeId = String(binding?.nodeId || '').trim();
+      if (!outputNodeId) {
+        continue;
+      }
+
+      if (binding?.mode !== GRAPH_WORKFLOW_BINDING_MODE_IDS.NODE_OUTPUT) {
+        issues.push('Choose a workflow node for the ' + String(outputSpec.label || portId || 'output') + ' output boundary before saving this preset.');
+        continue;
+      }
+
+      if (!getGraphWorkflowNodeEntry(parsedWorkflow.workflow, outputNodeId)) {
+        issues.push('The selected ' + String(outputSpec.label || portId || 'output') + ' boundary node could not be found in the workflow definition.');
+        continue;
+      }
+
+      const summary = getGraphWorkflowNodeEntrySummary(parsedWorkflow, outputNodeId);
+      if (outputSpec.kind === PORT_KIND_IMAGE && !summary?.imageOutputCandidate) {
+        issues.push('The selected Image output boundary is not recognized as an image-producing node. Choose a final image output node before saving this preset.');
+        continue;
+      }
+      if (outputSpec.kind === PORT_KIND_VIDEO && !summary?.videoOutputCandidate) {
+        issues.push('The selected Video output boundary is not recognized as a video-producing node. Choose a final video output node before saving this preset.');
+        continue;
+      }
+
+      declaredOutputPorts.push({ kind: outputSpec.kind, portId });
+    }
+  }
+
+  const declaredContract = buildGraphWorkflowDeclaredContract(declaredInputPorts, declaredOutputPorts);
+  if (!declaredContract.inputKinds.length) {
+    issues.push('Save at least one typed input boundary in this preset.');
+  }
+  if (!declaredContract.outputKinds.length) {
+    issues.push('Save at least one typed output boundary in this preset.');
+  }
+
+  return {
+    contract,
+    declaredContract,
+    issues: [...new Set(issues.filter(Boolean))],
+    message: issues[0] || 'This graph workflow preset has a validated typed contract.',
+    ok: issues.length === 0,
+    parsedWorkflow,
+    toolId,
+    workflowFormat: String(config.workflowFormat || contract.workflowFormat?.id || '').trim(),
+    workflowText,
+  };
+}
+
+function normalizeGraphWorkflowPresetRecord(record = {}, options = {}) {
+  const now = String(options.now || new Date().toISOString());
+  const id = String(record.id || options.id || createGraphWorkflowPresetId()).trim();
+  const validation = validateGraphWorkflowPresetConfig(record);
+  const workflowFormat = String(record.workflowFormat || validation.workflowFormat || '').trim();
+  return {
+    createdAt: String(record.createdAt || now),
+    declaredContract: validation.declaredContract,
+    description: String(record.description || '').trim(),
+    id,
+    inputBindings: isRecord(record.inputBindings) ? cloneValue(record.inputBindings) : {},
+    lastValidatedAt: validation.ok ? (options.touch ? now : String(record.lastValidatedAt || record.updatedAt || now)) : String(record.lastValidatedAt || ''),
+    name: String(record.name || '').trim() || 'Graph workflow preset',
+    outputBindings: isRecord(record.outputBindings) ? cloneValue(record.outputBindings) : {},
+    schemaVersion: GRAPH_WORKFLOW_PRESET_SCHEMA_VERSION,
+    toolId: validation.toolId,
+    updatedAt: options.touch ? now : String(record.updatedAt || now),
+    validation: {
+      issues: validation.issues,
+      message: validation.message,
+      ok: validation.ok,
+      status: validation.ok ? 'valid' : 'invalid',
+    },
+    workflowFormat,
+    workflowKind: workflowFormat,
+    workflowText: validation.workflowText,
+  };
+}
+
+function validateGraphWorkflowPresetRecord(record = {}) {
+  return validateGraphWorkflowPresetConfig(record);
+}
+
+function getGraphWorkflowPresetContractSummary(preset = {}) {
+  const contract = preset?.declaredContract || {};
+  const inputKinds = normalizeStringList(contract.inputKinds);
+  const outputKinds = normalizeStringList(contract.outputKinds);
+  const operationFamily = String(contract.operationFamily || buildGraphWorkflowOperationFamily(inputKinds, outputKinds) || '').trim();
+  return {
+    inputKinds,
+    label: (inputKinds.length ? inputKinds.join('+') : 'unknown') + ' -> ' + (outputKinds.length ? outputKinds.join('+') : 'unknown'),
+    operationFamily,
+    outputKinds,
+  };
+}
+
+function isGraphWorkflowPresetCompatibleWithOperation(preset = {}, operationId = GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE) {
+  const summary = getGraphWorkflowPresetContractSummary(preset);
   const normalizedOperationId = String(operationId || '').trim() || GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE;
-  const backendNode = buildGraphWorkflowOperationBackendNode(nodeOrConfig);
+  if (normalizedOperationId === GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE) {
+    return summary.operationFamily === GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE
+      && summary.inputKinds.includes(PORT_KIND_TEXT)
+      && summary.outputKinds.includes(PORT_KIND_IMAGE)
+      && preset?.validation?.ok !== false;
+  }
+
+  return false;
+}
+
+function getGraphWorkflowOperationBackendSupport(nodeOrConfig = {}, operationId = GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE, options = {}) {
+  const normalizedOperationId = String(operationId || '').trim() || GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE;
+  const resolvedPreset = resolveGraphWorkflowPresetNode(nodeOrConfig, options);
+  if (resolvedPreset.missingPreset) {
+    return {
+      contract: getGraphWorkflowContract(nodeOrConfig?.config?.toolId || nodeOrConfig?.toolId),
+      message: 'The selected graph workflow preset could not be found. Choose another preset or switch this node back to local workflow config.',
+      operationId: normalizedOperationId,
+      presetId: resolvedPreset.presetId,
+      toolId: normalizeToolId(nodeOrConfig?.config?.toolId || nodeOrConfig?.toolId) || DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
+      usable: false,
+    };
+  }
+  if (resolvedPreset.preset && !isGraphWorkflowPresetCompatibleWithOperation(resolvedPreset.preset, normalizedOperationId)) {
+    return {
+      contract: getGraphWorkflowContract(resolvedPreset.config?.toolId),
+      message: 'That graph workflow preset declares ' + getGraphWorkflowPresetContractSummary(resolvedPreset.preset).label + ', so it is not compatible with this mapping.',
+      operationId: normalizedOperationId,
+      preset: resolvedPreset.preset,
+      presetId: resolvedPreset.presetId,
+      toolId: normalizeToolId(resolvedPreset.config?.toolId) || DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
+      usable: false,
+    };
+  }
+  const backendNode = buildGraphWorkflowOperationBackendNode(resolvedPreset.node);
   const toolId = normalizeToolId(backendNode.config.toolId) || DEFAULT_GRAPH_WORKFLOW_TOOL_ID;
   const contract = getGraphWorkflowContract(toolId);
 
@@ -886,6 +1240,8 @@ module.exports = {
   GRAPH_WORKFLOW_BINDING_MODE_IDS,
   GRAPH_WORKFLOW_BOUNDARY_DIRECTION_IDS,
   GRAPH_WORKFLOW_OPERATION_BACKEND_IDS,
+  GRAPH_WORKFLOW_PRESET_SCHEMA_VERSION,
+  buildGraphWorkflowConfigFromPreset,
   buildGraphWorkflowOperationBackendNode,
   getDefaultGraphWorkflowBindings,
   getGraphWorkflowOperationBackendConfig,
@@ -899,7 +1255,15 @@ module.exports = {
   getGraphWorkflowNodeEntry,
   getGraphWorkflowOutputBinding,
   getGraphWorkflowOutputNodeOptions,
+  getGraphWorkflowPresetById,
+  getGraphWorkflowPresetContractSummary,
+  isGraphWorkflowPresetCompatibleWithOperation,
+  normalizeGraphWorkflowPresetRecord,
   parseGraphWorkflowDefinitionText,
+  resolveGraphWorkflowPresetConfig,
+  resolveGraphWorkflowPresetNode,
+  validateGraphWorkflowPresetConfig,
+  validateGraphWorkflowPresetRecord,
 };
 
 module.exports.default = module.exports;

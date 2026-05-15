@@ -14,15 +14,19 @@ const {
 const {
   GRAPH_WORKFLOW_BINDING_MODE_IDS,
   GRAPH_WORKFLOW_OPERATION_BACKEND_IDS,
+  buildGraphWorkflowConfigFromPreset,
   getDefaultGraphWorkflowBindings,
   getGraphWorkflowContract,
   getGraphWorkflowOperationBackendSupport,
+  getGraphWorkflowPresetContractSummary,
   getGraphWorkflowFieldOptions,
+  isGraphWorkflowPresetCompatibleWithOperation,
   getGraphWorkflowInputBinding,
   getGraphWorkflowNodeEntry,
   getGraphWorkflowOutputBinding,
   getGraphWorkflowOutputNodeOptions,
   parseGraphWorkflowDefinitionText,
+  resolveGraphWorkflowPresetNode,
 } = require('./graphWorkflowContracts.cjs');
 const {
   DEFAULT_PLANNING_SCHEMA_ID,
@@ -391,6 +395,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       model: '',
       instruction: '',
       systemPrompt: '',
+      promptStyleId: '',
       imageSize: '1024x1024',
       imageQuality: 'auto',
       imageBackground: 'auto',
@@ -732,6 +737,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       imageQuality: 'auto',
       imageBackground: 'auto',
       negativePrompt: '',
+      promptStyleId: '',
       width: 832,
       height: 832,
       steps: 24,
@@ -2340,6 +2346,11 @@ function buildContextMaps(context = {}) {
     : context.providersById && typeof context.providersById === 'object'
       ? Object.values(context.providersById)
       : [];
+  const graphWorkflowPresets = Array.isArray(context.graphWorkflowPresets)
+    ? context.graphWorkflowPresets
+    : context.graphWorkflowPresetsById && typeof context.graphWorkflowPresetsById === 'object'
+      ? Object.values(context.graphWorkflowPresetsById)
+      : [];
   const toolCatalog = Array.isArray(context.toolCatalog)
     ? context.toolCatalog
     : context.toolCatalogById && typeof context.toolCatalogById === 'object'
@@ -2349,6 +2360,8 @@ function buildContextMaps(context = {}) {
   return {
     hardware: context.hardware || null,
     toolsById: Object.fromEntries(tools.map((tool) => [tool.id, tool])),
+    graphWorkflowPresets,
+    graphWorkflowPresetsById: Object.fromEntries(graphWorkflowPresets.map((preset) => [preset.id, preset])),
     providersById: Object.fromEntries(providers.map((provider) => [provider.id, provider])),
     toolCatalogById: Object.fromEntries(toolCatalog.map((tool) => [tool.id, tool])),
   };
@@ -2585,7 +2598,7 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
     }
 
     if (executionMode === 'graphWorkflow') {
-      const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+      const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE, contextMaps);
       const tool = support.toolId ? getContextToolEntry(support.toolId, contextMaps) : null;
       return {
         capability: support.usable
@@ -2644,7 +2657,9 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
     };
   }
   if (node.type === 'graphWorkflow') {
-    const toolId = getGraphWorkflowToolId(node);
+    const resolvedPreset = resolveGraphWorkflowPresetNode(node, contextMaps);
+    const effectiveNode = resolvedPreset.node;
+    const toolId = getGraphWorkflowToolId(effectiveNode);
     const tool = getContextToolEntry(toolId, contextMaps);
     const contract = getGraphWorkflowContract(toolId);
     return {
@@ -3768,7 +3783,7 @@ function getLocalToolRequirement(node, contextMaps = {}) {
   }
 
   if (node.type === 'collectionMap' && getCollectionMapExecutionMode(node) === 'graphWorkflow') {
-    const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+    const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE, contextMaps);
     return support.toolId || String(node.config?.graphWorkflowToolId || '').trim().toLowerCase() || null;
   }
   if (node.type === 'graphWorkflow') {
@@ -4305,7 +4320,7 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
 }
 
 function analyzeCollectionMapGraphWorkflowNode(node, summary, contextMaps) {
-  const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE);
+  const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE, contextMaps);
   if (!support.usable) {
     summary.readiness = {
       tone: 'error',
@@ -4357,10 +4372,28 @@ function analyzeCollectionMapGraphWorkflowNode(node, summary, contextMaps) {
 }
 
 function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
-  const toolId = getGraphWorkflowToolId(node);
+  const resolvedPreset = resolveGraphWorkflowPresetNode(node, contextMaps);
+  if (resolvedPreset.missingPreset) {
+    summary.readiness = {
+      tone: 'error',
+      message: 'The selected graph workflow preset could not be found. Choose another preset or switch this node back to local workflow config.',
+    };
+    return false;
+  }
+
+  const effectiveNode = resolvedPreset.node;
+  const toolId = getGraphWorkflowToolId(effectiveNode);
   const toolLabel = getContextToolEntry(toolId, contextMaps)?.name || 'This graph workflow tool';
   const strategy = getToolPipelineStrategy(toolId);
   const contract = getGraphWorkflowContract(toolId);
+
+  if (resolvedPreset.preset?.validation?.ok === false) {
+    summary.readiness = {
+      tone: 'error',
+      message: resolvedPreset.preset.validation.message || 'The selected graph workflow preset is not valid anymore. Update or delete the preset.',
+    };
+    return false;
+  }
 
   if (!toolId || !GRAPH_WORKFLOW_TOOL_IDS.includes(toolId) || !strategy || !contract) {
     summary.readiness = {
@@ -4378,7 +4411,7 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
     return false;
   }
 
-  const parsedWorkflow = parseGraphWorkflowDefinitionText(toolId, node.config?.workflowText);
+  const parsedWorkflow = parseGraphWorkflowDefinitionText(toolId, effectiveNode.config?.workflowText);
   if (!parsedWorkflow.ok) {
     summary.readiness = {
       tone: 'error',
@@ -4402,7 +4435,7 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
 
   for (const inputSpec of contract.inputPorts || []) {
     const portId = String(inputSpec.portId || '').trim();
-    const binding = getGraphWorkflowInputBinding(node, portId);
+    const binding = getGraphWorkflowInputBinding(effectiveNode, portId);
     const nodeId = String(binding.nodeId || '').trim();
     const field = String(binding.field || '').trim();
     const connected = getIncomingKindsForNodePort(node, portId, graph).length > 0;
@@ -4463,7 +4496,7 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
 
   for (const outputSpec of requiredOutputSpecs) {
     const portId = String(outputSpec.portId || '').trim();
-    const outputBinding = getGraphWorkflowOutputBinding(node, portId);
+    const outputBinding = getGraphWorkflowOutputBinding(effectiveNode, portId);
     const outputNodeId = String(outputBinding.nodeId || '').trim();
     const outputLabel = outputSpec.label || (PIPELINE_PORT_KIND_LABELS[normalizePortKind(outputSpec.kind)] || 'workflow output');
     const lowerLabel = String(outputLabel).toLowerCase();
@@ -4503,7 +4536,7 @@ function analyzeGraphWorkflowNode(node, graph, summary, contextMaps) {
 
   summary.readiness = {
     tone: 'info',
-    message: installedTool.name + ' will run the imported ' + (contract.workflowFormat?.label || 'graph workflow definition') + ' and return the selected typed output back into the main pipeline.',
+    message: installedTool.name + ' will run ' + (resolvedPreset.preset ? 'the ' + getGraphWorkflowPresetContractSummary(resolvedPreset.preset).label + ' preset' : 'the imported ' + (contract.workflowFormat?.label || 'graph workflow definition')) + ' and return the selected typed output back into the main pipeline.',
   };
   return true;
 }
@@ -5386,8 +5419,8 @@ module.exports = {
   analyzePipeline,
   arePortsCompatible,
   buildContextMaps,
-  buildPipelineGraph,
-  cloneValue,
+  buildGraphWorkflowConfigFromPreset,
+  buildPipelineGraph,  cloneValue,
   compareIssueSeverity,
   createEdge,
   createEmptyPipeline,
@@ -5403,7 +5436,9 @@ module.exports = {
   getGraphWorkflowOutputBinding,
   getGraphWorkflowOutputNodeOptions,
   getGraphWorkflowOperationBackendSupport,
+  getGraphWorkflowPresetContractSummary,
   getGraphWorkflowToolId,
+  isGraphWorkflowPresetCompatibleWithOperation,
   getImageToolIdForNode,
   getCollectionMapInputKind,
   getCollectionMapMapping,
@@ -5430,6 +5465,7 @@ module.exports = {
   normalizePipelineDefinition,
   normalizePortKind,
   parseGraphWorkflowDefinitionText,
+  resolveGraphWorkflowPresetNode,
   resolveOutputKinds,
   trimPreviewText,
 };

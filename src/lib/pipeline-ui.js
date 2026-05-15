@@ -25,8 +25,9 @@ export const PIPELINE_PORT_ROW_HEIGHT = 36;
 export const PIPELINE_PORT_SECTION_OFFSET = 76;
 export const PIPELINE_NODE_MIN_HEIGHT = 168;
 
-export function buildPipelineDisplayContext({ hardware, manifests, providers, tools }) {
+export function buildPipelineDisplayContext({ graphWorkflowPresets, hardware, manifests, providers, tools }) {
   return buildContextMaps({
+    graphWorkflowPresets,
     hardware,
     providers,
     toolCatalog: manifests,

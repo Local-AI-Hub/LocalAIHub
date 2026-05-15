@@ -11,6 +11,7 @@ const { runCommand } = require('./commandService');
 const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
+const { serializePromptStyleApplication } = require('../shared/promptStyles.cjs');
 const { PIPELINE_OPERATION_IDS, PORT_KIND_VIDEO } = require('../shared/pipelineSchema.cjs');
 
 const LOCAL_VIDEO_RUNTIME_MODE_IDS = Object.freeze({
