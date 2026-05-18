@@ -62,6 +62,50 @@ const SCENE_PLAN_RESPONSE_SHAPE_EXAMPLE = Object.freeze({
   openQuestions: ['Any missing detail the source still leaves unclear.'],
 });
 
+const SCENE_PLAN_RESPONSE_JSON_SCHEMA = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  required: ['title', 'overview', 'scenes', 'openQuestions'],
+  properties: {
+    title: { type: 'string', description: 'Short title for the scene plan.' },
+    overview: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['meaningIntent', 'viewerTakeaway', 'narrativeArc', 'toneStrategy', 'continuityNotes', 'riskNotes'],
+      properties: {
+        meaningIntent: { type: 'string' },
+        viewerTakeaway: { type: 'string' },
+        narrativeArc: { type: 'string' },
+        toneStrategy: { type: 'string' },
+        continuityNotes: { type: 'array', items: { type: 'string' } },
+        riskNotes: { type: 'array', items: { type: 'string' } },
+      },
+    },
+    scenes: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sceneId', 'sourceSpanLabel', 'meaningIntent', 'viewerTakeaway', 'sceneConcept', 'treatmentApproach', 'narrationDraft', 'visualPromptDraft', 'riskNotes'],
+        properties: {
+          sceneId: { type: 'string' },
+          sourceSpanLabel: { type: 'string' },
+          meaningIntent: { type: 'string' },
+          viewerTakeaway: { type: 'string' },
+          sceneConcept: { type: 'string' },
+          treatmentApproach: { type: 'string' },
+          narrationDraft: { type: 'string' },
+          visualPromptDraft: { type: 'string' },
+          riskNotes: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+    openQuestions: { type: 'array', items: { type: 'string' } },
+  },
+});
+
+
 const LONGFORM_SCENE_PLAN_SCHEMA = Object.freeze({
   familyId: LONGFORM_MEDIA_SCHEMA_FAMILY_ID,
   familyLabel: 'Longform media',
@@ -449,6 +493,7 @@ function buildTextCollectionItems(planValue) {
 
 const LONGFORM_SCENE_PLAN_ADAPTER = Object.freeze({
   definition: LONGFORM_SCENE_PLAN_SCHEMA,
+  responseJsonSchema: SCENE_PLAN_RESPONSE_JSON_SCHEMA,
   buildPreviewDocument,
   buildReviewDocument,
   buildTextCollectionItems,

@@ -7,6 +7,8 @@ const TEST_STORAGE_ROOT = path.join(process.cwd(), 'temp', 'verify-pipeline-coll
 const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 const WAVE_FIXTURE = Buffer.from('UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=', 'base64');
 let failSecondAudioGeneration = false;
+const localAudioGenerationRequests = [];
+const localAudioStitchRequests = [];
 const providerImageGenerationPrompts = [];
 const perItemValidationRequests = [];
 const perItemValidationDecisionsByItemLabel = new Map();
@@ -111,6 +113,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
       return {
         generateAudioWithLocalAudioTool: async (_tool, request = {}) => {
           const prompt = String(request.prompt || '');
+          localAudioGenerationRequests.push({ ...request });
           if (failSecondAudioGeneration && /city street/i.test(prompt)) {
             throw new Error('mock AudioCraft failure');
           }
@@ -142,6 +145,24 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
             },
             preview: 'audio',
             message: 'Generated audio.',
+          };
+        },
+        stitchAudioWithLocalAudioTool: async (_tool, request = {}) => {
+          fs.mkdirSync(TEST_STORAGE_ROOT, { recursive: true });
+          const outputPath = path.join(TEST_STORAGE_ROOT, 'cumulative-' + Date.now() + '-' + Math.random().toString(16).slice(2) + '.wav');
+          localAudioStitchRequests.push({ ...request, outputPath });
+          fs.writeFileSync(outputPath, WAVE_FIXTURE);
+          return {
+            outputPath,
+            destinationPath: outputPath,
+            metadata: {
+              finalOutputDurationSeconds: localAudioStitchRequests.length + 1,
+              outputPath,
+              segmentAudioPath: request.segmentAudioPath || '',
+              segmentDurationSeconds: 1,
+              sourceAudioPath: request.sourceAudioPath || '',
+              sourceDurationSeconds: localAudioStitchRequests.length,
+            },
           };
         },
       };
@@ -355,6 +376,9 @@ async function main() {
 
   const builderPanelSource = fs.readFileSync(path.join(process.cwd(), 'src', 'components', 'PipelineBuilderPanel.jsx'), 'utf8');
   assert(builderPanelSource.includes('showCollectionMapAudioGenerationFields'), 'collectionMap inspector should render operation-specific audio-generation fields.');
+  assert(builderPanelSource.includes('collection-map-audiocraft-item-mode'), 'collectionMap inspector should expose AudioCraft item mode.');
+  assert(builderPanelSource.includes('sequentialContinuation'), 'collectionMap inspector should expose sequential AudioCraft continuation mode.');
+  assert(builderPanelSource.includes('collection-map-chain-seed'), 'collectionMap inspector should expose seed seconds for chained AudioCraft maps.');
   assert(builderPanelSource.includes("assetKind: 'audiocraft-snapshot'"), 'collectionMap refresh should load AudioCraft snapshots.');
   assert(builderPanelSource.includes("assetKind: 'upscayl-model-set'"), 'collectionMap refresh should load Upscayl model sets.');
   assert(!builderPanelSource.includes('This mapping uses the selected tool default settings here. No refreshable model list is needed.'), 'collectionMap refresh should not use the stale generic no-models message for refreshable mappings.');
@@ -478,6 +502,8 @@ async function main() {
   });
   assert.strictEqual(analyzePipeline(textToAudioPipeline, { tools: mockedInstalledTools, toolCatalog: mockedInstalledTools }).executable, true, 'text-to-audio collectionMap should analyze as executable with AudioCraft.');
   await configService.upsertPromptStyle({ id: 'style-cinematic-music', name: 'Cinematic Music', targetKind: 'audio', requiredTerms: ['cinematic orchestral', 'dark ambient'] });
+  localAudioGenerationRequests.length = 0;
+  localAudioStitchRequests.length = 0;
   await runPipeline(textToAudioPipeline);
   const textToAudioSnapshot = await waitForRunToFinish();
   assert.strictEqual(textToAudioSnapshot.status, 'completed', textToAudioSnapshot.message);
@@ -490,6 +516,138 @@ async function main() {
   assert(!/Generate one image/.test(textToAudioCollection.items[0].artifact.audioGeneration.prompt), 'text-to-audio metadata must not inherit stale image-generation instructions.');
   assert(textToAudioCollection.items.every((entry) => /cinematic orchestral/.test(entry.artifact.audioGeneration.prompt) && /dark ambient/.test(entry.artifact.audioGeneration.prompt)), 'collection text-to-audio prompt style should apply required terms to every item prompt.');
   assert.strictEqual(textToAudioCollection.items[0].artifact.audioGeneration.promptStyle.id, 'style-cinematic-music', 'collection text-to-audio metadata should record selected prompt style.');
+  assert.strictEqual(localAudioGenerationRequests.length, 2, 'independent text-to-audio should generate each item once.');
+  assert(localAudioGenerationRequests.every((request) => request.audioMode === 'music' && !request.sourceAudioPath), 'independent text-to-audio should not pass continuation sources.');
+  assert.strictEqual(localAudioStitchRequests.length, 0, 'independent text-to-audio should not stitch cumulative AudioCraft chain audio.');
+
+  localAudioGenerationRequests.length = 0;
+  localAudioStitchRequests.length = 0;
+  const sequentialChainPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'chain-a', text: 'ominous ambient intro, low strings' },
+      { id: 'chain-b', text: 'add distant percussion and rising tension' },
+      { id: 'chain-c', text: 'sparse fading outro' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToAudio',
+      operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'audiocraft-webui',
+      audiocraftItemMode: 'sequentialContinuation',
+      continuationSeedSeconds: 3,
+      durationSeconds: 2,
+      instruction: 'Long-form cinematic cue.',
+      promptStyleId: 'style-cinematic-music',
+    },
+  });
+  const sequentialAnalysis = analyzePipeline(sequentialChainPipeline, { tools: mockedInstalledTools, toolCatalog: mockedInstalledTools });
+  assert.strictEqual(sequentialAnalysis.executable, true, 'sequential AudioCraft collectionMap should analyze as executable only for local AudioCraft text-to-audio.');
+  await runPipeline(sequentialChainPipeline);
+  const sequentialSnapshot = await waitForRunToFinish();
+  assert.strictEqual(sequentialSnapshot.status, 'completed', sequentialSnapshot.message);
+  const sequentialCollection = sequentialSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(sequentialCollection.itemKind, 'audio');
+  assert.strictEqual(sequentialCollection.itemCount, 3, 'sequential chain should still output one segment artifact per source prompt.');
+  assert.strictEqual(sequentialCollection.collectionMapping.audioContinuationChain.enabled, true, 'manifest metadata should record enabled continuation chain mode.');
+  assert.strictEqual(sequentialCollection.collectionMapping.audioContinuationChain.outputMode, 'segments', 'sequential chain should keep collection output as generated segments.');
+  assert(sequentialCollection.collectionMapping.audioContinuationChain.finalCombinedAudioPath, 'sequential chain metadata should record the final cumulative track path.');
+  assert.deepStrictEqual(localAudioGenerationRequests.map((request) => request.audioMode), ['music', 'continuation', 'continuation'], 'sequential chain should generate the first item from scratch and later items as continuations.');
+  assert.strictEqual(localAudioGenerationRequests[1].sourceAudioPath, sequentialCollection.items[0].artifact.filePath, 'item 2 should use item 1 as the first continuation source.');
+  assert.strictEqual(localAudioGenerationRequests[2].sourceAudioPath, localAudioStitchRequests[0].outputPath, 'item 3 should use the current cumulative output as continuation source.');
+  assert.strictEqual(localAudioStitchRequests.length, 2, 'sequential chain should stitch a cumulative source after each continuation segment.');
+  assert.notStrictEqual(sequentialCollection.items[1].artifact.filePath, localAudioStitchRequests[0].outputPath, 'item 2 output should remain the generated segment, not the cumulative WAV.');
+  assert.strictEqual(sequentialCollection.items[1].metadata.audioContinuationChain.seedSeconds, 3, 'item metadata should record continuation seed seconds.');
+  assert.strictEqual(sequentialCollection.items[1].metadata.audioContinuationChain.previousArtifact.filePath, sequentialCollection.items[0].artifact.filePath, 'item metadata should reference the previous accepted segment.');
+  assert(sequentialCollection.items.every((entry) => /cinematic orchestral/.test(entry.artifact.audioGeneration.prompt)), 'prompt style should still apply to each chained AudioCraft item.');
+
+  localAudioGenerationRequests.length = 0;
+  localAudioStitchRequests.length = 0;
+  const manualSequentialChainPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'chain-retry-a', text: 'soft opening drone' },
+      { id: 'chain-retry-b', text: 'rising percussion layer' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToAudio',
+      operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'audiocraft-webui',
+      audiocraftItemMode: 'sequentialContinuation',
+      continuationSeedSeconds: 4,
+      durationSeconds: 2,
+      perItemValidation: { enabled: true, mode: 'user', maxAttempts: 2 },
+    },
+  });
+  await runPipeline(manualSequentialChainPipeline);
+  let chainManualSnapshot = await waitForRunStatus('paused');
+  resumePendingValidation(chainManualSnapshot, 'pass', 'first section works');
+  chainManualSnapshot = await waitForRunStatus('paused');
+  assert.strictEqual(chainManualSnapshot.pendingValidation.collectionMap.itemIndex, 1, 'chain validation should move to item 2 after item 1 passes.');
+  const acceptedFirstChainPath = localAudioGenerationRequests[1].sourceAudioPath;
+  resumePendingValidation(chainManualSnapshot, 'fail', 'retry the second section');
+  chainManualSnapshot = await waitForRunStatus('paused');
+  assert.strictEqual(chainManualSnapshot.pendingValidation.collectionMap.itemIndex, 1, 'chain validation retry should stay on item 2.');
+  assert.strictEqual(localAudioGenerationRequests.filter((request) => /soft opening drone/i.test(request.prompt || '')).length, 1, 'chain validation retry should not rerun prior accepted items.');
+  assert.strictEqual(localAudioGenerationRequests.filter((request) => /rising percussion layer/i.test(request.prompt || '')).length, 2, 'chain validation retry should regenerate only the failed chain item.');
+  assert.strictEqual(localAudioGenerationRequests[1].sourceAudioPath, localAudioGenerationRequests[2].sourceAudioPath, 'chain retry should reuse the same previous accepted cumulative source.');
+  assert.strictEqual(localAudioGenerationRequests[1].sourceAudioPath, acceptedFirstChainPath, 'chain retry source should be the previously accepted cumulative audio.');
+  resumePendingValidation(chainManualSnapshot, 'pass', 'retry works');
+  chainManualSnapshot = await waitForRunToFinish();
+  assert.strictEqual(chainManualSnapshot.status, 'completed', chainManualSnapshot.message);
+
+  localAudioGenerationRequests.length = 0;
+  localAudioStitchRequests.length = 0;
+  failSecondAudioGeneration = true;
+  const partialSequentialChainPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'chain-partial-a', text: 'soft rain on glass' },
+      { id: 'chain-partial-b', text: 'city street at sunrise' },
+      { id: 'chain-partial-c', text: 'distant thunder' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      failureMode: 'partial',
+      mappingId: 'textToAudio',
+      operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'audiocraft-webui',
+      audiocraftItemMode: 'sequentialContinuation',
+      durationSeconds: 2,
+    },
+  });
+  await runPipeline(partialSequentialChainPipeline);
+  let partialSequentialSnapshot = await waitForRunToFinish();
+  failSecondAudioGeneration = false;
+  assert.strictEqual(partialSequentialSnapshot.status, 'completed', partialSequentialSnapshot.message);
+  const partialSequentialCollection = partialSequentialSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(partialSequentialCollection.itemCount, 1, 'partial chain output should contain only successful accepted segments before the broken item.');
+  assert.strictEqual(partialSequentialCollection.failedItems[0].chainFailure, true, 'partial chain failure metadata should mark the chain as broken.');
+  assert.strictEqual(localAudioGenerationRequests.length, 2, 'partial chain should stop at the failed item and skip later prompts.');
+
+  localAudioGenerationRequests.length = 0;
+  failSecondAudioGeneration = true;
+  const failedSequentialChainPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'chain-fail-a', text: 'soft rain on glass' },
+      { id: 'chain-fail-b', text: 'city street at sunrise' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToAudio',
+      operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'audiocraft-webui',
+      audiocraftItemMode: 'sequentialContinuation',
+      durationSeconds: 2,
+    },
+  });
+  await runPipeline(failedSequentialChainPipeline);
+  const failedSequentialSnapshot = await waitForRunToFinish();
+  failSecondAudioGeneration = false;
+  assert.strictEqual(failedSequentialSnapshot.status, 'failed', 'chain failure without partial success should fail the map normally.');
+  assert(/item 2 of 2.*mock AudioCraft failure/i.test(failedSequentialSnapshot.message), 'failed chain should report the broken item and plain-English reason.');
 
   const staleInstructionTextToAudioPipeline = buildCollectionInputMapPipeline({
     itemType: 'text',

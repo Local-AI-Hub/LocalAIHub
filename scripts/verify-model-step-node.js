@@ -32,6 +32,8 @@ function verifyPipelineBuilderSourceGuards() {
   assert(!/selectedNode\.type === 'whisperTranscribe'/.test(source), 'Expected removed standalone transcription inspector branches to stay gone.');
   assert(source.includes('<option value="continuation">Continuation</option>'), 'Expected Model Step AudioCraft mode picker to expose continuation mode.');
   assert(source.includes('llm-local-audio-seed'), 'Expected Model Step AudioCraft continuation UI to expose seed seconds.');
+  assert(source.includes('llm-local-audio-repeat'), 'Expected Model Step AudioCraft continuation UI to expose repeat count.');
+  assert(source.includes('Each repeat uses the end of the current audio as the next seed'), 'Expected Model Step AudioCraft continuation UI to explain repeat continuation semantics.');
   assert(source.includes('llm-local-audio-append'), 'Expected Model Step AudioCraft continuation UI to expose append-source output mode.');
   assert(source.includes('Advanced AudioCraft settings'), 'Expected Model Step AudioCraft UI to keep advanced generation settings available but collapsed.');
   assert(source.includes('llm-prompt-style'), 'Expected Model Step inspector to expose the Prompt Style selector.');

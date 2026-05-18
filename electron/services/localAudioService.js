@@ -379,6 +379,12 @@ function buildAudiocraftGenerationSettings(options = {}) {
   };
 }
 
+function coerceContinuationRepeatCount(value) {
+  const numericValue = Number(value ?? 1);
+  const repeatCount = Number.isFinite(numericValue) ? Math.floor(numericValue) : 1;
+  return Math.max(1, Math.min(10, repeatCount || 1));
+}
+
 function buildVoiceModelReference(voiceModel, fallbackModel) {
   if (voiceModel && typeof voiceModel === 'object') {
     return {
@@ -418,6 +424,7 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
   const response = await runLocalAudioTask(tool, {
     appendSource: Boolean(options.appendSource),
     audioMode: String(options.audioMode || 'music').trim() || 'music',
+    continuationRepeatCount: coerceContinuationRepeatCount(options.continuationRepeatCount ?? options.repeatCount),
     continuationSeedSeconds: Math.max(0.25, Number(options.continuationSeedSeconds || 12) || 12),
     durationSeconds: Math.max(1, Number(options.durationSeconds || 8) || 8),
     generationSettings,
@@ -439,11 +446,16 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
   }
 
   const audioMode = String(response?.audioMode || options.audioMode || 'music').trim() || 'music';
+  const continuationRepeatCount = audioMode === 'continuation'
+    ? Number(response?.continuationRepeatCount || response?.repeatCount || options.continuationRepeatCount || 1) || 1
+    : 0;
   const audioGeneration = {
     advancedSettings: response?.advancedSettings && typeof response.advancedSettings === 'object' ? response.advancedSettings : generationSettings,
     appendSource: Boolean(response?.appendSource),
     backend: 'audiocraft',
     backendLabel: 'AudioCraft',
+    continuationRepeatCount,
+    continuationRepeats: audioMode === 'continuation' && Array.isArray(response?.continuationRepeats) ? response.continuationRepeats : [],
     continuationSeedSeconds: Number(response?.continuationSeedSeconds || options.continuationSeedSeconds || 0) || 0,
     durationSeconds: Number(response?.durationSeconds || options.durationSeconds || 0) || 0,
     finalOutputDurationSeconds: Number(response?.finalOutputDurationSeconds || response?.durationSeconds || options.durationSeconds || 0) || 0,
@@ -455,6 +467,8 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
     operationSubtype: audioMode,
     prompt: String(response?.prompt || options.prompt || '').trim(),
     promptStyle: serializePromptStyleApplication(options.promptStyle),
+    repeatCount: continuationRepeatCount,
+    requestedGeneratedDurationSeconds: audioMode === 'continuation' ? Number(response?.requestedGeneratedDurationSeconds || 0) || 0 : 0,
     sourceAudio: buildSourceAudioReference(options.sourceAudioArtifact),
     sourceAudioPath: String(response?.sourceAudioPath || options.sourceAudioPath || '').trim(),
     sourceDurationSeconds: Number(response?.sourceDurationSeconds || 0) || 0,
@@ -477,6 +491,50 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
       audio: artifact,
     },
     preview: summarizeArtifact(artifact),
+  };
+}
+
+async function stitchAudioWithAudiocraftTool(tool, options = {}) {
+  const toolLabel = getLocalAudioToolLabel(tool);
+  const runDirectories = options.runDirectories || null;
+  if (!runDirectories?.artifactsDir) {
+    throw new Error('Local AI Hub could not prepare a pipeline run folder for the AudioCraft continuation chain.');
+  }
+
+  const sourceAudioPath = path.resolve(String(options.sourceAudioPath || '').trim());
+  const segmentAudioPath = path.resolve(String(options.segmentAudioPath || '').trim());
+  if (!sourceAudioPath || !(await fs.pathExists(sourceAudioPath))) {
+    throw new Error('The current cumulative audio for this AudioCraft continuation chain could not be found anymore. Rerun the collection map from the beginning.');
+  }
+  if (!segmentAudioPath || !(await fs.pathExists(segmentAudioPath))) {
+    throw new Error('The generated continuation segment for this AudioCraft chain could not be found. Rerun the collection map from the beginning.');
+  }
+
+  const nodeLabel = String(options.nodeLabel || options.displayName || 'AudioCraft continuation chain').trim() || 'AudioCraft continuation chain';
+  const outputPath = buildAudioOutputPath(runDirectories, nodeLabel + '-cumulative', 'wav');
+  const requestPath = buildJsonRequestPath(runDirectories, nodeLabel, 'audiocraft-stitch-request');
+  const response = await runLocalAudioTask(tool, {
+    audioTask: 'append-audio',
+    nodeLabel,
+    outputPath,
+    requestPath,
+    segmentAudioPath,
+    sourceAudioPath,
+    toolRoot: resolveLocalAudioToolRoot(tool),
+  }, options.reportProgress, {
+    run: 'Updating the cumulative AudioCraft continuation audio for ' + nodeLabel + '...',
+    start: 'Preparing the next AudioCraft continuation-chain source.',
+  });
+
+  const finalOutputPath = path.resolve(String(response?.outputPath || outputPath).trim());
+  if (!(await fs.pathExists(finalOutputPath))) {
+    throw new Error(toolLabel + ' reported success, but the cumulative continuation-chain audio file could not be found.');
+  }
+
+  return {
+    destinationPath: finalOutputPath,
+    metadata: response,
+    outputPath: finalOutputPath,
   };
 }
 
@@ -554,6 +612,15 @@ async function generateAudioWithRvcTool(tool, options = {}) {
   };
 }
 
+async function stitchAudioWithLocalAudioTool(tool, options = {}) {
+  const toolId = String(tool?.id || '').trim().toLowerCase();
+  if (toolId === 'audiocraft-webui') {
+    return stitchAudioWithAudiocraftTool(tool, options);
+  }
+
+  throw new Error((tool?.name || 'This local audio tool') + ' cannot update an AudioCraft continuation chain. Choose AudioCraft WebUI for chained text-to-audio maps.');
+}
+
 async function generateAudioWithLocalAudioTool(tool, options = {}) {
   const toolId = String(tool?.id || '').trim().toLowerCase();
   if (toolId === 'audiocraft-webui') {
@@ -572,6 +639,7 @@ module.exports = {
   checkAudiocraftPipelineReadiness,
   generateAudioWithLocalAudioTool,
   getLocalAudioToolRuntimeMode,
+  stitchAudioWithLocalAudioTool,
   _test: {
     AUDIOCRAFT_PIPELINE_IMPORT_CHECKS,
     buildAudiocraftMissingPipelinePackagesMessage,

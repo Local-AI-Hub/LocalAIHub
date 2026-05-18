@@ -17,6 +17,7 @@ const {
   createNode,
   evaluateCompatibilityProfile,
   getNodeTypeDefinition,
+  getPlanningSchemaOptions,
   normalizePipelineDefinition,
   selectLocalImageBackend,
   trimPreviewText,
@@ -303,7 +304,7 @@ function buildPlanningPacketConfig({ intent, context, requestedConfig = {}, titl
     goal: isLikelyCopiedAuthoringRequest(requestedGoal, intent) ? buildDistilledPlanningGoal(intent) : normalizeString(requestedGoal, buildDistilledPlanningGoal(intent)),
     sourceSummary: isLikelyCopiedAuthoringRequest(requestedSummary, intent) ? buildRuntimeSourceSummary(intent) : normalizeString(requestedSummary, buildRuntimeSourceSummary(intent)),
     availableToolsText: normalizeString(requestedConfig.availableToolsText, (context.availableTools || []).map((tool) => tool.name).join('\n')),
-    readinessNotesText: normalizeString(requestedConfig.readinessNotesText, [context.hardwareSummary, 'Only the longform scene-planning schema is mature in this draft.'].filter(Boolean).join('\n')),
+    readinessNotesText: normalizeString(requestedConfig.readinessNotesText, [context.hardwareSummary, 'Longform scene planning and audio prompt planning are available planning schemas in this draft.'].filter(Boolean).join('\n')),
     desiredOutputNotes: normalizeString(requestedConfig.desiredOutputNotes, 'Create a structured scene plan and scene prompt collection. Downstream media generation settings remain editable.'),
   };
 }
@@ -439,7 +440,7 @@ function buildPipelineWizardContext({ hardware = {}, manifests = [], providers =
     connectedProviders,
     availableTools,
     toolOperationSupport,
-    maturePlanningSchemas: [{ id: DEFAULT_PLANNING_SCHEMA_ID, label: 'Scene plan', family: 'Longform media' }],
+    maturePlanningSchemas: getPlanningSchemaOptions().map((schema) => ({ id: schema.id, label: schema.label, family: schema.familyLabel })),
     nodeTypes: NODE_TYPE_LIST
       .map((definition) => definition ? {
         type: definition.type,
@@ -638,7 +639,7 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         'For complex workflows, preserve requested modality, validation, retry, planning, collection, generation, transformation, composition, and export intent in intentIr stages and gaps.',
         'Recipe ids are hints, not required templates. Local AI Hub will compile, validate, and instantiate the graph.',
         'Local AI Hub will restore explicit source/output modality plus planning, validation, retry, composition, and export obligations before graph compilation when the request clearly requires them.',
-        'Only the longform scene-planning schema is mature today.',
+        'Use only planning schemas listed in maturePlanningSchemas.',
       ]
     : [
         'You are the Local AI Hub Pipeline Wizard planner.',
@@ -654,7 +655,7 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         'Current limitation: validation/retry for collections is whole-collection validation. Do not claim per-item validation/retry inside collectionMap or internal llmPrompt workflows.',
         'Local AI Hub will repair missing explicit source/output modality and requested planning/validation/retry/composition/export structure before graph compilation, so keep intentIr compact and honest.',
         'If the request is only partly possible, draft the closest honest graph and put the missing pieces in gaps.',
-        'Only the longform scene-planning schema is mature today. Do not claim other planning schema families are mature.',
+        'Use only planning schemas listed in maturePlanningSchemas. Do not claim other planning schema families are mature.',
       ];
   return [
     {
@@ -3421,13 +3422,3 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
-
-
-
-
-
-
-
-
-
-

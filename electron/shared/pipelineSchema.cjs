@@ -402,6 +402,10 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       videoSize: '1280x720',
       audioVoice: '',
       audioMode: 'music',
+      audiocraftItemMode: 'independent',
+      audioChainFirstItemBehavior: 'scratch',
+      audioChainOutputMode: 'segments',
+      continuationRepeatCount: 1,
       continuationSeedSeconds: 12,
       appendSource: false,
       durationSeconds: 8,
@@ -479,9 +483,9 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   planScenes: Object.freeze({
     type: 'planScenes',
-    label: 'Plan Scenes',
+    label: 'Plan Text Collection',
     category: 'Planning',
-    description: 'Turns a structured Plan into an ordered text collection of scene prompt drafts for downstream output or later generation work.',
+    description: 'Turns a structured Plan into an ordered text collection using the selected planning schema adapter.',
     inputPorts: [
       {
         id: 'plan',
@@ -495,7 +499,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         id: 'collection',
         kind: PORT_KIND_TEXT,
         collectionBehavior: 'only',
-        label: 'Scene Text Collection',
+        label: 'Text Collection',
       },
     ],
     configDefaults: {},
@@ -744,6 +748,10 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       cfgScale: 7,
       seed: -1,
       audioMode: 'music',
+      audiocraftItemMode: 'independent',
+      audioChainFirstItemBehavior: 'scratch',
+      audioChainOutputMode: 'segments',
+      continuationRepeatCount: 1,
       continuationSeedSeconds: 12,
       appendSource: false,
       durationSeconds: 8,
@@ -818,6 +826,31 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     terminal: true,
     configDefaults: {
       title: 'Collection result',
+    },
+  }),
+  audioStitch: Object.freeze({
+    type: 'audioStitch',
+    label: 'Audio Stitch',
+    category: 'Flow',
+    description: 'Concatenates an ordered audio collection into one WAV artifact.',
+    inputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_AUDIO,
+        collectionBehavior: 'only',
+        label: 'Audio Collection',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'audio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Stitched Audio',
+      },
+    ],
+    configDefaults: {
+      gapSeconds: 0,
     },
   }),
   mediaComposition: Object.freeze({
@@ -1418,6 +1451,13 @@ function getCollectionMapLocalToolIds(node) {
     return AUDIO_WORKFLOW_TOOL_IDS;
   }
   return IMAGE_WORKFLOW_TOOL_IDS;
+}
+
+function isCollectionMapAudioContinuationChainEnabled(node) {
+  return getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    && getCollectionMapInputKind(node) === PORT_KIND_TEXT
+    && getCollectionMapOutputKind(node) === PORT_KIND_AUDIO
+    && String(node?.config?.audiocraftItemMode || '').trim() === 'sequentialContinuation';
 }
 
 function getCollectionMapFallbackTargetLabel(node) {
@@ -4179,6 +4219,20 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
       return false;
     }
 
+    if (audioMode === 'continuation') {
+      const rawContinuationRepeatCount = node.config?.continuationRepeatCount;
+      const continuationRepeatCount = rawContinuationRepeatCount === undefined || rawContinuationRepeatCount === null || rawContinuationRepeatCount === ''
+        ? 1
+        : Number(rawContinuationRepeatCount);
+      if (!Number.isInteger(continuationRepeatCount) || continuationRepeatCount < 1 || continuationRepeatCount > 10) {
+        summary.readiness = {
+          tone: 'error',
+          message: 'Continuation repeat count must be a whole number from 1 to 10.',
+        };
+        return false;
+      }
+    }
+
     if (Number(node.config?.durationSeconds || 0) <= 0) {
       summary.readiness = {
         tone: 'error',
@@ -4886,13 +4940,13 @@ function analyzePipeline(definition = {}, context = {}) {
         if (!planKinds.includes(normalizePortKind(PORT_KIND_PLAN))) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect a structured Plan before building scene text.',
+            message: 'Connect a structured Plan before building the text collection.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else {
           summary.readiness = {
             tone: 'info',
-            message: 'This step will turn the connected Plan into an ordered text collection of scene prompt drafts.',
+            message: 'This step will turn the connected Plan into an ordered text collection using its planning schema adapter.',
           };
         }
       }
@@ -5109,6 +5163,18 @@ function analyzePipeline(definition = {}, context = {}) {
               message: mapping.label + ' is not supported by the selected local tool in Map Collection. Choose ' + getCollectionMapFallbackTargetLabel(node) + ' or use an explicit Model Step for this item.',
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && isCollectionMapAudioContinuationChainEnabled(node) && Number(node.config?.continuationSeedSeconds || 0) <= 0) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Sequential AudioCraft continuation maps need seed seconds greater than zero.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && isCollectionMapAudioContinuationChainEnabled(node) && Number(node.config?.durationSeconds || 0) <= 0) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Sequential AudioCraft continuation maps need a segment duration greater than zero seconds.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
           } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE && (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256)) {
             summary.readiness = {
               tone: 'error',
@@ -5142,7 +5208,9 @@ function analyzePipeline(definition = {}, context = {}) {
             } else {
               summary.readiness = {
                 tone: 'info',
-                message: summary.readiness.message + ' Map Collection will emit an ordered ' + formatPortKindLabel(createCollectionPortKind(mapping.outputKind)).toLowerCase() + ' and keep item lineage.',
+                message: isCollectionMapAudioContinuationChainEnabled(node)
+                  ? 'AudioCraft WebUI will generate this text collection as a sequential continuation chain, emit ordered audio segments, and record the final cumulative track in the collection manifest.'
+                  : summary.readiness.message + ' Map Collection will emit an ordered ' + formatPortKindLabel(createCollectionPortKind(mapping.outputKind)).toLowerCase() + ' and keep item lineage.',
               };
               issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
             }
@@ -5257,6 +5325,28 @@ function analyzePipeline(definition = {}, context = {}) {
           summary.readiness = {
             tone: 'info',
             message: 'This output saves an ordered collection manifest and keeps the item order explicit in the run folder.',
+          };
+        }
+      }
+
+      if (node.type === 'audioStitch') {
+        const collectionKinds = getIncomingKindsForNodePort(node, 'collection', graph);
+        if (!collectionKinds.includes(createCollectionPortKind(PORT_KIND_AUDIO))) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect an ordered audio collection before stitching it into one WAV file.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (Number(node.config?.gapSeconds || 0) < 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Audio Stitch gap seconds cannot be negative.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step concatenates the ordered audio collection into a single WAV artifact.',
           };
         }
       }

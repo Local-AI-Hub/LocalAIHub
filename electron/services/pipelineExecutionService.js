@@ -25,8 +25,10 @@ const {
   isCompositionArtifact,
   persistArtifactCollection,
   persistCompositionArtifact,
+  saveAudioArtifactMetadata,
   saveBase64Artifact,
   saveBufferArtifact,
+  sanitizeSegment,
   serializeArtifactForUi,
   summarizeArtifact,
 } = require('./pipelineArtifactService');
@@ -35,6 +37,7 @@ const {
   buildPlanReviewDocument,
   buildPlanTextCollectionItems,
   buildPlanningPacketDocument,
+  buildPlanningSchemaStructuredOutputRequest,
   buildPlannerPrompt,
   getPlanningSchemaDefinition,
   validatePlanAgainstSchema,
@@ -52,7 +55,7 @@ const {
   getGraphWorkflowOperationBackendSupport,
   resolveGraphWorkflowPresetNode,
 } = require('../shared/graphWorkflowContracts.cjs');
-const { generateAudioWithLocalAudioTool } = require('./localAudioService');
+const { generateAudioWithLocalAudioTool, stitchAudioWithLocalAudioTool } = require('./localAudioService');
 const {
   findRvcVoiceModelMatch,
   findStableDiffusionCheckpointMatch,
@@ -1616,6 +1619,7 @@ function executePlanScenesNode(node, graph, run) {
       sourceRunCount: run.nodeStates?.[node.id]?.runCount || 1,
     },
     itemId: textItems[index]?.itemId || '',
+    metadata: textItems[index]?.metadata || null,
   })), {
     displayName: node.label,
     itemKind: PORT_KIND_TEXT,
@@ -1623,7 +1627,7 @@ function executePlanScenesNode(node, graph, run) {
   });
 
   return {
-    message: 'Plan Scenes built an ordered text collection with ' + textItems.length + ' item' + (textItems.length === 1 ? '' : 's') + '.',
+    message: (node.label || 'Plan text bridge') + ' built an ordered text collection with ' + textItems.length + ' item' + (textItems.length === 1 ? '' : 's') + '.',
     outputs: {
       collection,
     },
@@ -1690,6 +1694,7 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
     guidance: plannerGuidance,
     systemPrompt: node.config?.systemPrompt,
   });
+  const plannerResponseFormat = buildPlanningSchemaStructuredOutputRequest(schemaId);
   const messages = [];
   if (plannerPrompt.systemPrompt) {
     messages.push({
@@ -1712,10 +1717,11 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       'ollama',
       'Install Ollama before using a local Planner step in a pipeline.',
     );
-    reportProgress?.('Sending the planning packet to Ollama for structured scene planning.', 'Running ' + node.label + ' with Ollama...');
+    reportProgress?.('Sending the planning packet to Ollama for structured planning.', 'Running ' + node.label + ' with Ollama...');
     const result = await chatWithOllama(ollamaTool, {
       messages,
       model,
+      ...(plannerResponseFormat ? { format: 'json' } : {}),
     });
     reply = String(result?.message?.content || '').trim();
     providerLabel = 'Ollama';
@@ -1737,6 +1743,8 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       model,
       timeoutMessage: providerLabel + ' took too long to answer this planner request. Try again or simplify the planning packet if the delay continues.',
       timeoutMs: PLANNER_PROVIDER_TIMEOUT_MS,
+      maxOutputTokens: 4096,
+      ...(plannerResponseFormat ? { responseFormat: plannerResponseFormat } : {}),
     });
     reply = String(result?.message?.content || '').trim();
   }
@@ -1761,10 +1769,10 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
     role: 'generated',
     sourcePacket: packetValidation.value,
   });
-  const sceneCount = Number(planArtifact.sceneCount || normalizedPlan.scenes?.length || 0) || 0;
+  const planItemCount = Number(planArtifact.sceneCount || planArtifact.sectionCount || normalizedPlan.scenes?.length || normalizedPlan.sections?.length || 0) || 0;
 
   return {
-    message: providerLabel + ' returned a structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + sceneCount + ' scene' + (sceneCount === 1 ? '' : 's') + '.',
+    message: providerLabel + ' returned a structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.',
     outputs: {
       plan: planArtifact,
     },
@@ -1987,9 +1995,96 @@ function buildCollectionMapOperationNode(node, operationId) {
   };
 }
 
-function buildCollectionMapMetadata(mapping, node, executionMode) {
+function getCollectionMapAudiocraftItemMode(node) {
+  return String(node?.config?.audiocraftItemMode || '').trim() === 'sequentialContinuation'
+    ? 'sequentialContinuation'
+    : 'independent';
+}
+
+function isCollectionMapAudioContinuationChainEnabledForRun(node, mapping, executionMode) {
+  const toolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  return executionMode === 'localTool'
+    && getCollectionMapAudiocraftItemMode(node) === 'sequentialContinuation'
+    && String(mapping?.id || node?.config?.mappingId || '').trim() === 'textToAudio'
+    && String(mapping?.inputKind || '').trim() === PORT_KIND_TEXT
+    && String(mapping?.outputKind || '').trim() === PORT_KIND_AUDIO
+    && String(mapping?.operationId || getCollectionMapOperationId(node)).trim() === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    && (!toolId || toolId === 'audiocraft-webui');
+}
+
+function buildCollectionMapAudioContinuationChainState(node) {
+  const seedSeconds = Math.max(0.25, Number(node?.config?.continuationSeedSeconds || 12) || 12);
+  const segmentDurationSeconds = Math.max(1, Number(node?.config?.durationSeconds || 8) || 8);
+  return {
+    currentCumulativeAudioPath: '',
+    enabled: true,
+    finalCombinedAudioPath: '',
+    finalCombinedDurationSeconds: 0,
+    firstItemBehavior: 'scratch',
+    itemMode: 'sequentialContinuation',
+    items: [],
+    lastAcceptedArtifact: null,
+    outputMode: 'segments',
+    seedSeconds,
+    segmentDurationSeconds,
+  };
+}
+
+function buildAudioArtifactReference(artifact) {
+  if (!artifact) {
+    return null;
+  }
+
+  return {
+    displayName: String(artifact.displayName || '').trim(),
+    fileName: String(artifact.fileName || '').trim(),
+    filePath: String(artifact.filePath || '').trim(),
+    id: String(artifact.id || artifact.artifactId || '').trim(),
+    kind: String(artifact.kind || '').trim(),
+    summary: summarizeArtifact(artifact),
+  };
+}
+
+function getAudioDurationSeconds(artifact, fallback = 0) {
+  const candidates = [
+    artifact?.audio?.durationSeconds,
+    artifact?.audioGeneration?.generatedDurationSeconds,
+    artifact?.audioGeneration?.finalOutputDurationSeconds,
+    artifact?.audioGeneration?.durationSeconds,
+    fallback,
+  ];
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (Number.isFinite(value) && value > 0) {
+      return Math.round(value * 100) / 100;
+    }
+  }
+  return 0;
+}
+
+function serializeCollectionMapAudioContinuationChainState(chainState, patch = {}) {
+  if (!chainState?.enabled) {
+    return null;
+  }
+
+  return {
+    enabled: true,
+    finalCombinedAudioPath: String(chainState.finalCombinedAudioPath || '').trim(),
+    finalCombinedDurationSeconds: Number(chainState.finalCombinedDurationSeconds || 0) || 0,
+    firstItemBehavior: chainState.firstItemBehavior || 'scratch',
+    itemMode: 'sequentialContinuation',
+    items: Array.isArray(chainState.items) ? serializeArtifactForUi(chainState.items) : [],
+    outputMode: chainState.outputMode || 'segments',
+    seedSeconds: Number(chainState.seedSeconds || 0) || 0,
+    segmentDurationSeconds: Number(chainState.segmentDurationSeconds || 0) || 0,
+    ...patch,
+  };
+}
+
+function buildCollectionMapMetadata(mapping, node, executionMode, options = {}) {
   const perItemValidation = getCollectionMapPerItemValidationConfig(node);
   const failureMode = getCollectionMapFailureMode(node);
+  const audioContinuationChain = serializeCollectionMapAudioContinuationChainState(options.audioContinuationChain);
   return {
     executionMode: String(executionMode || '').trim(),
     inputKind: String(mapping?.inputKind || '').trim(),
@@ -2009,6 +2104,7 @@ function buildCollectionMapMetadata(mapping, node, executionMode) {
       maxAttempts: perItemValidation.maxAttempts,
       mode: perItemValidation.mode,
     } : { enabled: false },
+    ...(audioContinuationChain ? { audioContinuationChain } : {}),
     toolId: String(node?.config?.toolId || '').trim(),
     providerId: String(node?.config?.providerId || '').trim(),
   };
@@ -2213,10 +2309,10 @@ function buildCollectionMapFailedItemMetadata({ error, failureKind, itemCount, i
   };
 }
 
-async function persistPartialCollectionMapArtifact({ executionMode, failedItems, mappedItems, mapping, node, outputKind, run, sourceCollection, sourceItems }) {
+async function persistPartialCollectionMapArtifact({ audioContinuationChain, executionMode, failedItems, mappedItems, mapping, node, outputKind, run, sourceCollection, sourceItems }) {
   const collection = createArtifactCollection(mappedItems, {
     collectionMapping: {
-      ...buildCollectionMapMetadata(mapping, node, executionMode),
+      ...buildCollectionMapMetadata(mapping, node, executionMode, { audioContinuationChain }),
       partialReason: String(failedItems?.[0]?.reason || '').trim(),
     },
     collectionStatus: 'partial',
@@ -2370,6 +2466,115 @@ async function executeMappedCollectionItemWithPerItemValidation(node, sourceArti
   throw new Error('Map Collection could not finish validating ' + itemLabel + '.');
 }
 
+async function generateMappedAudiocraftContinuationChainArtifact(node, inputArtifact, options = {}) {
+  const contextMaps = options.contextMaps || {};
+  const run = options.run || null;
+  const reportProgress = options.reportProgress;
+  const chainState = options.audioContinuationChain || null;
+  const itemIndex = Number(options.itemIndex || 0) || 0;
+  const itemCount = Number(options.itemCount || 0) || 0;
+  if (!chainState?.enabled) {
+    throw new Error('Local AI Hub could not prepare the AudioCraft continuation chain state for this mapped item.');
+  }
+
+  const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'collection AudioCraft continuation chaining');
+  const operationNode = buildCollectionMapOperationNode({
+    ...node,
+    config: {
+      ...(node.config || {}),
+      audioMode: 'music',
+    },
+  }, PIPELINE_OPERATION_IDS.AUDIO_GENERATE);
+  const audioRequest = await buildAudioGenerationRequest(operationNode, inputArtifact, contextMaps);
+  const model = String(operationNode.config?.model || '').trim();
+  const hasPreviousCumulative = Boolean(chainState.currentCumulativeAudioPath);
+  const audioMode = hasPreviousCumulative ? 'continuation' : 'music';
+  const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '');
+  const previousArtifactReference = buildAudioArtifactReference(chainState.lastAcceptedArtifact);
+  const previousCumulativeAudioPath = String(chainState.currentCumulativeAudioPath || '').trim();
+
+  reportProgress?.(
+    hasPreviousCumulative
+      ? 'Generating ' + itemLabel + ' as an AudioCraft continuation from the current cumulative track.'
+      : 'Generating the first AudioCraft chain item from scratch.',
+    'Running ' + node.label + ' as a sequential AudioCraft chain...',
+  );
+
+  const result = await generateAudioWithLocalAudioTool(tool, {
+    appendSource: false,
+    audioMode,
+    audiocraftCfgCoef: audioRequest.audiocraftCfgCoef,
+    audiocraftTemperature: audioRequest.audiocraftTemperature,
+    audiocraftTopK: audioRequest.audiocraftTopK,
+    audiocraftTopP: audioRequest.audiocraftTopP,
+    audiocraftTwoStepCfg: audioRequest.audiocraftTwoStepCfg,
+    continuationRepeatCount: 1,
+    continuationSeedSeconds: chainState.seedSeconds,
+    displayName: node.label + ' section ' + String(itemIndex + 1),
+    durationSeconds: chainState.segmentDurationSeconds,
+    model,
+    nodeLabel: node.label + ' section ' + String(itemIndex + 1),
+    operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+    prompt: audioRequest.prompt,
+    promptStyle: audioRequest.promptStyle,
+    reportProgress,
+    runDirectories: run.directories,
+    sourceAudioArtifact: chainState.lastAcceptedArtifact,
+    sourceAudioPath: previousCumulativeAudioPath,
+  });
+  const segmentArtifact = result?.outputs?.audio || null;
+  if (!segmentArtifact?.filePath || segmentArtifact.kind !== PORT_KIND_AUDIO) {
+    throw new Error('AudioCraft finished this chain item, but it did not return a generated audio segment.');
+  }
+
+  let cumulativeAudioPath = segmentArtifact.filePath;
+  let cumulativeDurationAfterItemSeconds = getAudioDurationSeconds(segmentArtifact, chainState.segmentDurationSeconds);
+  let stitchMetadata = null;
+  if (hasPreviousCumulative) {
+    const stitched = await stitchAudioWithLocalAudioTool(tool, {
+      nodeLabel: node.label + ' section ' + String(itemIndex + 1),
+      reportProgress,
+      runDirectories: run.directories,
+      segmentAudioPath: segmentArtifact.filePath,
+      sourceAudioPath: previousCumulativeAudioPath,
+    });
+    stitchMetadata = stitched?.metadata || null;
+    cumulativeAudioPath = String(stitched?.outputPath || stitched?.destinationPath || '').trim();
+    cumulativeDurationAfterItemSeconds = Number(stitchMetadata?.finalOutputDurationSeconds || 0) || cumulativeDurationAfterItemSeconds;
+  }
+
+  const segmentDurationSeconds = getAudioDurationSeconds(segmentArtifact, result?.metadata?.generatedDurationSeconds || chainState.segmentDurationSeconds);
+  const chainMetadata = {
+    cumulativeAudioPath,
+    cumulativeDurationAfterItemSeconds,
+    enabled: true,
+    finalPrompt: audioRequest.prompt,
+    firstItemBehavior: chainState.firstItemBehavior || 'scratch',
+    itemCount,
+    itemIndex,
+    itemMode: 'sequentialContinuation',
+    outputMode: chainState.outputMode || 'segments',
+    previousArtifact: previousArtifactReference,
+    previousCumulativeAudioPath,
+    seedSeconds: hasPreviousCumulative ? Number(result?.metadata?.continuationSeedSeconds || chainState.seedSeconds || 0) || 0 : 0,
+    segmentAudioPath: segmentArtifact.filePath,
+    segmentDurationSeconds,
+    sourcePrompt: String(inputArtifact?.text || '').trim(),
+    stitch: stitchMetadata ? {
+      outputPath: String(stitchMetadata.outputPath || '').trim(),
+      segmentDurationSeconds: Number(stitchMetadata.segmentDurationSeconds || 0) || 0,
+      sourceDurationSeconds: Number(stitchMetadata.sourceDurationSeconds || 0) || 0,
+    } : null,
+  };
+
+  segmentArtifact.audioGeneration = {
+    ...(segmentArtifact.audioGeneration || {}),
+    collectionMapAudioChain: chainMetadata,
+    collectionMapItemMode: 'sequentialContinuation',
+  };
+  return segmentArtifact;
+}
+
 async function executeMappedCollectionItemArtifact(node, inputArtifact, options = {}) {
   const operationId = getCollectionMapOperationId(node);
   const outputKind = getCollectionMapOutputKind(node);
@@ -2382,6 +2587,10 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
   const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '');
   const operationNode = buildCollectionMapOperationNode(node, operationId);
   const model = String(operationNode.config?.model || '').trim();
+
+  if (options.audioContinuationChain?.enabled && executionMode === 'localTool' && operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+    return generateMappedAudiocraftContinuationChainArtifact(node, inputArtifact, options);
+  }
 
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
     return generateMappedImageArtifact(node, inputArtifact, options);
@@ -2397,8 +2606,16 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
       const audioRequest = await buildAudioGenerationRequest(operationNode, inputArtifact, contextMaps);
       reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for local audio generation.', 'Running ' + node.label + '...');
       const result = await generateAudioWithLocalAudioTool(tool, {
+        appendSource: audioRequest.appendSource,
         audioMode: audioRequest.audioMode,
+        audiocraftCfgCoef: audioRequest.audiocraftCfgCoef,
+        audiocraftTemperature: audioRequest.audiocraftTemperature,
+        audiocraftTopK: audioRequest.audiocraftTopK,
+        audiocraftTopP: audioRequest.audiocraftTopP,
+        audiocraftTwoStepCfg: audioRequest.audiocraftTwoStepCfg,
+        continuationRepeatCount: audioRequest.continuationRepeatCount,
         displayName: node.label + ' item ' + String(itemIndex + 1),
+        continuationSeedSeconds: audioRequest.continuationSeedSeconds,
         durationSeconds: audioRequest.durationSeconds,
         model,
         nodeLabel: node.label,
@@ -2626,6 +2843,9 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
   const partialOutputEnabled = isCollectionMapPartialOutputEnabled(node);
   const mappedItems = [];
   const failedItems = [];
+  const audioContinuationChain = isCollectionMapAudioContinuationChainEnabledForRun(node, mapping, executionMode)
+    ? buildCollectionMapAudioContinuationChainState(node)
+    : null;
   for (let index = 0; index < sourceItems.length; index += 1) {
     const entry = sourceItems[index];
     const sourceArtifact = entry?.artifact || null;
@@ -2645,12 +2865,29 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
         run,
         sourceEntry: entry,
         validationConfig,
+        audioContinuationChain,
       });
       const mappedArtifact = mappedResult.artifact;
       if (!mappedArtifact || mappedArtifact.kind !== outputKind) {
         throw new Error('The mapped operation finished, but it did not return a ' + outputKind + ' artifact.');
       }
       const itemId = String(entry?.itemId || '').trim();
+      const itemChainMetadata = mappedArtifact?.audioGeneration?.collectionMapAudioChain || null;
+      if (audioContinuationChain?.enabled && itemChainMetadata?.cumulativeAudioPath) {
+        audioContinuationChain.currentCumulativeAudioPath = String(itemChainMetadata.cumulativeAudioPath || '').trim();
+        audioContinuationChain.finalCombinedAudioPath = audioContinuationChain.currentCumulativeAudioPath;
+        audioContinuationChain.finalCombinedDurationSeconds = Number(itemChainMetadata.cumulativeDurationAfterItemSeconds || 0) || 0;
+        audioContinuationChain.lastAcceptedArtifact = mappedArtifact;
+        audioContinuationChain.items.push({
+          cumulativeAudioPath: audioContinuationChain.currentCumulativeAudioPath,
+          cumulativeDurationAfterItemSeconds: audioContinuationChain.finalCombinedDurationSeconds,
+          itemId,
+          itemIndex: index,
+          previousCumulativeAudioPath: String(itemChainMetadata.previousCumulativeAudioPath || '').trim(),
+          segmentAudioPath: String(itemChainMetadata.segmentAudioPath || mappedArtifact.filePath || '').trim(),
+          segmentDurationSeconds: Number(itemChainMetadata.segmentDurationSeconds || 0) || 0,
+        });
+      }
       mappedItems.push({
         artifact: mappedArtifact,
         attempts: mappedResult.attempts,
@@ -2664,6 +2901,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
           sourceItemIndex: index,
           parentLineage: entry?.lineage || null,
         },
+        ...(itemChainMetadata ? { metadata: { audioContinuationChain: itemChainMetadata } } : {}),
         validation: mappedResult.validation,
       });
     } catch (error) {
@@ -2685,6 +2923,14 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
       });
       failedItem.message = message;
       failedItem.reason = String(failedItem.reason || rawMessage).trim();
+      if (audioContinuationChain?.enabled) {
+        failedItem.chainFailure = true;
+        failedItem.audioContinuationChain = serializeCollectionMapAudioContinuationChainState(audioContinuationChain, {
+          chainBrokenAtItemIndex: index,
+          chainBrokenAtItemId: itemId,
+          status: 'failed',
+        });
+      }
       failedItems.push(failedItem);
 
       if (!partialOutputEnabled || !mappedItems.length) {
@@ -2692,6 +2938,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
       }
 
       const persistedPartialCollection = await persistPartialCollectionMapArtifact({
+        audioContinuationChain,
         executionMode,
         failedItems,
         mappedItems,
@@ -2714,7 +2961,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
   }
 
   const collection = createArtifactCollection(mappedItems, {
-    collectionMapping: buildCollectionMapMetadata(mapping, node, executionMode),
+    collectionMapping: buildCollectionMapMetadata(mapping, node, executionMode, { audioContinuationChain }),
     collectionStatus: 'complete',
     sourceItemCount: sourceItems.length,
     displayName: node.label,
@@ -2815,6 +3062,7 @@ function getAudiocraftGenerationSettings(node) {
     audiocraftTopP: Math.max(0, Math.min(1, Number(node.config?.audiocraftTopP || 0) || 0)),
     audiocraftTwoStepCfg: Boolean(node.config?.audiocraftTwoStepCfg),
     appendSource: Boolean(node.config?.appendSource),
+    continuationRepeatCount: Math.max(1, Math.min(10, Math.floor(Number(node.config?.continuationRepeatCount ?? 1) || 1))),
   };
 }
 
@@ -4001,6 +4249,134 @@ async function executeCollectionBuilderNode(node, graph, run) {
   };
 }
 
+
+function ensurePcmWaveChunk(buffer, start, size, fileLabel, chunkLabel) {
+  const end = start + size;
+  if (end > buffer.length) {
+    throw new Error(fileLabel + ' has a damaged WAV ' + chunkLabel + ' chunk. Export it again as a standard PCM WAV and try Audio Stitch again.');
+  }
+  return buffer.subarray(start, end);
+}
+
+async function readPcmWaveFile(filePath, fileLabel) {
+  const buffer = await fs.readFile(filePath);
+  if (buffer.length < 44 || buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WAVE') {
+    throw new Error(fileLabel + ' is not a readable WAV file. Audio Stitch currently expects standard PCM WAV clips.');
+  }
+  let format = null;
+  let data = null;
+  let offset = 12;
+  while (offset + 8 <= buffer.length) {
+    const chunkId = buffer.toString('ascii', offset, offset + 4);
+    const chunkSize = buffer.readUInt32LE(offset + 4);
+    const chunkStart = offset + 8;
+    const chunk = ensurePcmWaveChunk(buffer, chunkStart, chunkSize, fileLabel, chunkId.trim() || 'unknown');
+    if (chunkId === 'fmt ') {
+      if (chunk.length < 16) throw new Error(fileLabel + ' has a damaged WAV format header. Export it again as PCM WAV and try Audio Stitch again.');
+      format = { audioFormat: chunk.readUInt16LE(0), channelCount: chunk.readUInt16LE(2), sampleRate: chunk.readUInt32LE(4), byteRate: chunk.readUInt32LE(8), blockAlign: chunk.readUInt16LE(12), bitsPerSample: chunk.readUInt16LE(14) };
+    } else if (chunkId === 'data') {
+      data = chunk;
+    }
+    offset = chunkStart + chunkSize + (chunkSize % 2);
+  }
+  if (!format || !data) throw new Error(fileLabel + ' is missing WAV audio data. Export it again as PCM WAV and try Audio Stitch again.');
+  if (format.audioFormat !== 1) throw new Error(fileLabel + ' is not PCM WAV audio. Audio Stitch currently supports uncompressed PCM WAV clips.');
+  if (![8, 16, 24, 32].includes(format.bitsPerSample) || format.channelCount <= 0 || format.sampleRate <= 0 || format.blockAlign <= 0) {
+    throw new Error(fileLabel + ' uses a WAV format Audio Stitch cannot safely combine yet. Export each clip as matching PCM WAV and try again.');
+  }
+  const frameCount = Math.floor(data.length / format.blockAlign);
+  return { ...format, data, durationSeconds: frameCount / format.sampleRate, filePath };
+}
+
+function ensureMatchingWaveFormat(reference, candidate, fileLabel) {
+  const mismatches = [];
+  if (candidate.sampleRate !== reference.sampleRate) mismatches.push('sample rate');
+  if (candidate.channelCount !== reference.channelCount) mismatches.push('channel count');
+  if (candidate.bitsPerSample !== reference.bitsPerSample) mismatches.push('bit depth');
+  if (candidate.blockAlign !== reference.blockAlign) mismatches.push('block alignment');
+  if (mismatches.length) throw new Error(fileLabel + ' does not match the first clip ' + mismatches.join(', ') + '. Audio Stitch can combine matching PCM WAV clips; normalize the collection to one WAV format and try again.');
+}
+
+function createPcmSilence(format, seconds) {
+  const durationSeconds = Math.max(0, Number(seconds || 0) || 0);
+  if (durationSeconds <= 0) return Buffer.alloc(0);
+  const buffer = Buffer.alloc(Math.round(durationSeconds * format.sampleRate) * format.blockAlign);
+  if (format.bitsPerSample === 8) buffer.fill(128);
+  return buffer;
+}
+
+function writePcmWaveBuffer(format, dataChunks) {
+  const dataSize = dataChunks.reduce((total, chunk) => total + chunk.length, 0);
+  if (dataSize > 0xffffffff - 44) throw new Error('The stitched audio is too large for a standard WAV file. Split the collection into smaller groups and stitch those results.');
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(format.channelCount, 22);
+  header.writeUInt32LE(format.sampleRate, 24);
+  header.writeUInt32LE(format.sampleRate * format.blockAlign, 28);
+  header.writeUInt16LE(format.blockAlign, 32);
+  header.writeUInt16LE(format.bitsPerSample, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, ...dataChunks], 44 + dataSize);
+}
+
+async function createAudioStitchOutputPath(runDirectories, node) {
+  const baseName = sanitizeSegment(node.label || 'stitched-audio', 'stitched-audio');
+  let attempt = 0;
+  while (true) {
+    const suffix = attempt === 0 ? '' : '-' + String(attempt + 1);
+    const outputPath = path.join(runDirectories.artifactsDir, baseName + suffix + '.wav');
+    if (!(await fs.pathExists(outputPath))) return outputPath;
+    attempt += 1;
+  }
+}
+
+async function executeAudioStitchNode(node, graph, run) {
+  const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
+  if (!isArtifactCollection(sourceCollection)) throw new Error('Audio Stitch needs an ordered audio collection before it can create one WAV file.');
+  if (String(sourceCollection.itemKind || '').trim() !== PORT_KIND_AUDIO) throw new Error('Audio Stitch only accepts ordered audio collections. Connect collection:audio to this node.');
+  const orderedEntries = (Array.isArray(sourceCollection.items) ? sourceCollection.items : []).filter((entry) => entry?.artifact).sort((left, right) => (Number(left.index || 0) || 0) - (Number(right.index || 0) || 0));
+  if (!orderedEntries.length) throw new Error('Audio Stitch received an empty audio collection. Add at least one generated or selected audio clip before stitching.');
+  const gapSeconds = Math.max(0, Number(node.config?.gapSeconds || 0) || 0);
+  const dataChunks = [];
+  const sourceItems = [];
+  let referenceFormat = null;
+  let totalDurationSeconds = 0;
+  for (let index = 0; index < orderedEntries.length; index += 1) {
+    const entry = orderedEntries[index];
+    const artifact = entry.artifact || null;
+    const itemLabel = 'Audio collection item ' + String(index + 1);
+    if (String(artifact?.kind || '').trim() !== PORT_KIND_AUDIO) throw new Error(itemLabel + ' is not an audio artifact. Audio Stitch can only combine collection:audio items.');
+    const sourcePath = path.resolve(String(artifact.filePath || '').trim());
+    if (!sourcePath || !(await fs.pathExists(sourcePath))) throw new Error(itemLabel + ' points to an audio file Local AI Hub cannot find. Regenerate that item or choose the file again before stitching.');
+    const wave = await readPcmWaveFile(sourcePath, itemLabel);
+    if (!referenceFormat) referenceFormat = wave;
+    else ensureMatchingWaveFormat(referenceFormat, wave, itemLabel);
+    if (index > 0 && gapSeconds > 0) {
+      const silence = createPcmSilence(referenceFormat, gapSeconds);
+      dataChunks.push(silence);
+      totalDurationSeconds += silence.length / referenceFormat.blockAlign / referenceFormat.sampleRate;
+    }
+    dataChunks.push(wave.data);
+    totalDurationSeconds += wave.durationSeconds;
+    sourceItems.push({ artifactPath: sourcePath, bitDepth: wave.bitsPerSample, channelCount: wave.channelCount, displayName: String(artifact.displayName || artifact.fileName || itemLabel).trim(), durationSeconds: Math.round(wave.durationSeconds * 100) / 100, fileName: String(artifact.fileName || path.basename(sourcePath)).trim(), index: Number(entry.index || index) || index, itemId: String(entry.itemId || '').trim(), metadataPaths: Array.isArray(artifact.metadataPaths) ? artifact.metadataPaths : [], sampleRate: wave.sampleRate, summary: String(entry.summary || artifact.summary || '').trim() });
+  }
+  const outputPath = await createAudioStitchOutputPath(run.directories, node);
+  await fs.writeFile(outputPath, writePcmWaveBuffer(referenceFormat, dataChunks));
+  const roundedTotalDuration = Math.round(totalDurationSeconds * 100) / 100;
+  const audioStitch = { createdBy: { nodeId: String(node.id || '').trim(), nodeLabel: String(node.label || '').trim(), nodeType: String(node.type || 'audioStitch').trim() }, crossfadeSeconds: 0, gapSeconds, outputFormat: 'wav', sourceCollection: { directoryPath: String(sourceCollection.directoryPath || '').trim(), displayName: String(sourceCollection.displayName || '').trim(), itemCount: Number(sourceCollection.itemCount || orderedEntries.length) || orderedEntries.length, itemKind: String(sourceCollection.itemKind || PORT_KIND_AUDIO).trim() || PORT_KIND_AUDIO, manifestPath: String(sourceCollection.manifestPath || '').trim(), summary: String(sourceCollection.summary || '').trim() }, sourceItemCount: sourceItems.length, sourceItems, totalDurationSeconds: roundedTotalDuration };
+  const artifact = await buildFileArtifact(outputPath, { audio: { bitDepth: referenceFormat.bitsPerSample, channelCount: referenceFormat.channelCount, durationSeconds: roundedTotalDuration, sampleRate: referenceFormat.sampleRate }, audioStitch, displayName: node.label || 'Stitched audio', kind: PORT_KIND_AUDIO, role: 'generated' });
+  const metadataPaths = await saveAudioArtifactMetadata(outputPath, artifact);
+  if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
+  artifact.summary = summarizeArtifact(artifact);
+  return { destinationPath: outputPath, message: 'Audio Stitch combined ' + sourceItems.length + ' audio clip' + (sourceItems.length === 1 ? '' : 's') + ' into one WAV file.', outputs: { audio: artifact }, preview: summarizeArtifact(artifact) };
+}
+
 async function executeMediaCompositionNode(node, graph, run) {
   const visualCollection = getNodeInputArtifact(node.id, 'visuals', graph, run.resultsByNodeId, run);
   if (!isArtifactCollection(visualCollection)) {
@@ -4386,6 +4762,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         return generateAudioWithLocalAudioTool(tool, {
           appendSource: audioRequest.appendSource,
           audioMode: audioRequest.audioMode,
+          continuationRepeatCount: audioRequest.continuationRepeatCount,
           audiocraftCfgCoef: audioRequest.audiocraftCfgCoef,
           audiocraftTemperature: audioRequest.audiocraftTemperature,
           audiocraftTopK: audioRequest.audiocraftTopK,
@@ -4777,6 +5154,10 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
   if (node.type === 'collectionAccumulator') {
     return executeCollectionAccumulatorNode(node, graph, run);
+  }
+
+  if (node.type === 'audioStitch') {
+    return executeAudioStitchNode(node, graph, run);
   }
 
   if (node.type === 'mediaComposition') {

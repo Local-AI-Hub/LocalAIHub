@@ -3,6 +3,7 @@ const {
   DEFAULT_PLANNING_SCHEMA_ID,
   IMAGE_WORKFLOW_TOOL_IDS,
   PIPELINE_OPERATION_IDS,
+  PORT_KIND_AUDIO,
   PORT_KIND_IMAGE,
   PORT_KIND_TEXT,
   analyzePipeline,
@@ -15,6 +16,9 @@ const {
   isGraphWorkflowPresetCompatibleWithOperation,
   normalizePipelineDefinition,
 } = require('./pipelineSchema.cjs');
+const {
+  AUDIO_PROMPT_PLAN_SCHEMA_ID,
+} = require('./planningSchema.cjs');
 
 const {
   getProviderIdsForPipelineOperation,
@@ -150,6 +154,59 @@ function audioContinuation(template) {
   link(edges, a, 'audio', b, 'prompt'); link(edges, b, 'audio', c, 'audio');
   return finalize(template, [a, b, c], edges);
 }
+function audioIdeaToPromptCollection(template, contextMaps) {
+  const plannerTarget = chooseTarget(PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps, { localToolIds: ['ollama'], preferLocal: false });
+  if (!plannerTarget.providerId && getTool(contextMaps, 'ollama')) plannerTarget.executionMode = 'ollama';
+  const edges = [];
+  const idea = node('textInput', 0, { text: '' }, 'Audio idea');
+  const packet = node('planningPacket', 1, {
+    schemaId: AUDIO_PROMPT_PLAN_SCHEMA_ID,
+    title: 'Audio prompt planning packet',
+    goal: 'Turn the text idea into an ordered audio prompt plan for a longer or structured music, ambience, soundscape, game-loop, or cinematic audio piece.',
+    sourceSummary: '',
+    constraintsText: 'Create useful text prompts only. Preserve the requested order, mood, duration intent, continuity, and transitions. Do not execute audio generation and do not claim AudioCraft continuation chaining.',
+    stylePolicyText: 'Keep prompts concrete for downstream text-to-audio generation. Include instruments, texture, mood, energy, pacing, and sonic space when useful.',
+    availableToolsText: 'Planner model, ordered text collection output, and downstream collectionMap text-to-audio when the user chooses to connect generation later.',
+    readinessNotesText: 'Choose a planner provider/model or Ollama model before running. AudioCraft is not required for this planning-only template.',
+    desiredOutputNotes: 'Return an audioPromptPlan with ordered sections. Each section should include prompt, durationSeconds, optional negativePrompt, mood, energy, continuityNotes, and transitionNotes.',
+    riskNotesText: 'Keep unclear duration, genre, or instrumentation assumptions visible in notes instead of pretending certainty.',
+  }, 'Build audio plan packet');
+  const planner = node('planner', 2, {
+    executionMode: plannerTarget.executionMode === 'ollama' ? 'ollama' : 'cloud',
+    providerId: plannerTarget.executionMode === 'cloud' ? plannerTarget.providerId || '' : '',
+    model: plannerTarget.model || '',
+    schemaId: AUDIO_PROMPT_PLAN_SCHEMA_ID,
+    instruction: 'Create an ordered audioPromptPlan from the connected idea. Keep the result planning-only: sections should contain text prompts and metadata for downstream generation, not generated audio or stateful continuation instructions.',
+    systemPrompt: '',
+  }, 'Plan audio prompts');
+  const prompts = node('planScenes', 3, {}, 'Audio prompt collection');
+  const output = node('collectionOutput', 4, { title: 'Audio prompt collection' }, 'Text collection output');
+  link(edges, idea, 'text', packet, 'source');
+  link(edges, packet, 'packet', planner, 'packet');
+  link(edges, planner, 'plan', prompts, 'plan');
+  link(edges, prompts, 'collection', output, 'collection');
+  return finalize(template, [idea, packet, planner, prompts, output], edges, 'This template creates an ordered collection of text audio prompts. Route the collection into Map Collection text-to-audio when you want generated clips, or use the generated-song template for the full AudioCraft continuation and stitch path.');
+}
+function audioIdeaToGeneratedSong(template, contextMaps) {
+  const plannerTarget = chooseTarget(PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps, { localToolIds: ['ollama'], preferLocal: false });
+  if (!plannerTarget.providerId && getTool(contextMaps, 'ollama')) plannerTarget.executionMode = 'ollama';
+  const audioTarget = chooseTarget(PIPELINE_OPERATION_IDS.AUDIO_GENERATE, contextMaps, { fallbackExecutionMode: 'localTool', fallbackToolId: 'audiocraft-webui', localToolIds: ['audiocraft-webui'], preferLocal: true });
+  const edges = [];
+  const idea = node('textInput', 0, { text: '' }, 'Song idea');
+  const packet = node('planningPacket', 1, { schemaId: AUDIO_PROMPT_PLAN_SCHEMA_ID, title: 'Generated song planning packet', goal: 'Turn the text idea into an ordered section plan for a longer generated song, ambience, soundtrack cue, or cinematic audio piece.', sourceSummary: '', constraintsText: 'Create ordered audio prompt sections that can be generated sequentially. Preserve mood, continuity, section roles, transitions, and duration intent.', stylePolicyText: 'Keep every section prompt concrete for AudioCraft text-to-audio generation. Include instruments, texture, energy, pacing, sonic space, and transition intent when useful.', availableToolsText: 'Planner model, ordered text collection output, AudioCraft collectionMap text-to-audio with sequential continuation, Audio Stitch, and Audio Output.', readinessNotesText: 'Choose a planner provider/model or Ollama model, confirm AudioCraft WebUI is installed, and tune the generation duration before running.', desiredOutputNotes: 'Return an audioPromptPlan with ordered sections. Each section should include prompt, durationSeconds, optional negativePrompt, mood, energy, continuityNotes, and transitionNotes.', riskNotesText: 'Keep unclear duration, genre, instrumentation, or transition assumptions visible in notes instead of pretending certainty.' }, 'Build song plan packet');
+  const planner = node('planner', 2, { executionMode: plannerTarget.executionMode === 'ollama' ? 'ollama' : 'cloud', providerId: plannerTarget.executionMode === 'cloud' ? plannerTarget.providerId || '' : '', model: plannerTarget.model || '', schemaId: AUDIO_PROMPT_PLAN_SCHEMA_ID, instruction: 'Create an ordered audioPromptPlan for a generated song or structured audio piece. Each section should stand on its own as a prompt while also indicating how it continues from the previous section.', systemPrompt: '' }, 'Plan song sections');
+  const prompts = node('planScenes', 3, {}, 'Song section prompts');
+  const sections = node('collectionMap', 4, mapConfig(PIPELINE_OPERATION_IDS.AUDIO_GENERATE, 'textToAudio', audioTarget, { audioMode: 'music', audiocraftCfgCoef: 3, audiocraftItemMode: 'sequentialContinuation', audiocraftTemperature: 1, audiocraftTopK: 250, audiocraftTopP: 0, audiocraftTwoStepCfg: false, audioChainFirstItemBehavior: 'scratch', audioChainOutputMode: 'segments', continuationSeedSeconds: 12, durationSeconds: 8, failureMode: 'fail-fast', instruction: 'Generate one musical section for each planned prompt. Preserve section order and use AudioCraft sequential continuation so each accepted section follows the previous accepted audio.', promptStyleId: '' }), 'Generate song sections');
+  const stitch = node('audioStitch', 5, { gapSeconds: 0 }, 'Stitch generated song');
+  const output = node('audioOutput', 6, { title: 'Generated song' }, 'Generated song output');
+  link(edges, idea, 'text', packet, 'source');
+  link(edges, packet, 'packet', planner, 'packet');
+  link(edges, planner, 'plan', prompts, 'plan');
+  link(edges, prompts, 'collection', sections, 'collection');
+  link(edges, sections, 'collection', stitch, 'collection');
+  link(edges, stitch, 'audio', output, 'audio');
+  return finalize(template, [idea, packet, planner, prompts, sections, stitch, output], edges, 'This template generates ordered AudioCraft continuation sections, then explicitly stitches the resulting audio collection into one final WAV before Audio Output. Prompt Style is optional and left unset on the Map Collection node.');
+}
 function voiceoverSlideshowVideo(template, contextMaps) {
   const plannerTarget = chooseTarget(PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps, { localToolIds: ['ollama'], preferLocal: false });
   if (!plannerTarget.providerId && getTool(contextMaps, 'ollama')) plannerTarget.executionMode = 'ollama';
@@ -247,6 +304,8 @@ const BUILT_IN_PIPELINE_TEMPLATES = Object.freeze([
   Object.freeze({ id: 'prompt-collection-to-images', name: 'Prompt collection to image collection', description: 'Map an ordered text prompt collection into an ordered image collection.', category: 'Local image', tags: Object.freeze(['collection', 'image', 'map']), outputType: 'Image collection', complexity: 'intermediate', requirements: Object.freeze(['Collection Input text items', 'Image generation runtime']), runtimeGroups: Object.freeze([localOrCloudImageRuntime]), placeholdersRequired: true, nextSteps: Object.freeze(['Add prompt items to Collection Input.', 'Review image settings before running the map.']), createPipeline: (template, contextMaps) => promptCollectionImages(template, contextMaps) }),
   Object.freeze({ id: 'validated-prompt-collection-to-images', name: 'Prompt collection to images with user validation', description: 'Map each prompt to an image, pause for per-item user review, and keep partial successes when an item cannot be accepted.', category: 'Local image', tags: Object.freeze(['collection', 'validation', 'retry']), outputType: 'Image collection', complexity: 'advanced', requirements: Object.freeze(['Collection Input text items', 'Image generation runtime', 'User review during run']), runtimeGroups: Object.freeze([localOrCloudImageRuntime]), placeholdersRequired: true, nextSteps: Object.freeze(['Add prompt items to Collection Input.', 'Run when you are ready to review each generated item.']), createPipeline: (template, contextMaps) => promptCollectionImages(template, contextMaps, { partialSuccess: true, userValidation: true }) }),
   Object.freeze({ id: 'audio-transcription', name: 'Audio transcription', description: 'Transcribe an audio file locally with Whisper and save the transcript.', category: 'Audio', tags: Object.freeze(['audio', 'whisper']), outputType: 'Text', complexity: 'easy', requirements: Object.freeze(['Whisper installed', 'Audio file selected before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'whisper-runtime', label: 'Whisper', anyOf: Object.freeze([Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, toolIds: Object.freeze(['whisper']) })]) })]), placeholdersRequired: true, nextSteps: Object.freeze(['Choose the source audio file.', 'Change the Whisper model size if needed.']), createPipeline: audioTranscription }),
+  Object.freeze({ id: 'audio-idea-to-prompt-collection', name: 'Audio idea to audio prompt collection', description: 'Plan a longer or structured music, ambience, soundscape, game-loop, or cinematic audio idea into an ordered text prompt collection.', category: 'Audio', tags: Object.freeze(['audio', 'planning', 'collection', 'prompts']), outputType: 'Text collection', complexity: 'intermediate', requirements: Object.freeze(['Connected planning provider/model or Ollama', 'Text idea entered before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'planning-runtime', label: 'Connected planning provider or Ollama', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, toolIds: Object.freeze(['ollama']) })]) })]), modelSelectionRequired: true, placeholdersRequired: true, nextSteps: Object.freeze(['Enter the structured audio or music idea.', 'Choose a planner provider/model or Ollama model.', 'Run the planner to produce the ordered prompt collection.', 'Connect the collection to Map Collection text-to-audio when you are ready to generate clips.']), createPipeline: audioIdeaToPromptCollection }),
+  Object.freeze({ id: 'audio-idea-to-generated-song', name: 'Audio idea to generated song', description: 'Plan a structured audio idea, generate ordered AudioCraft continuation sections, stitch them into one WAV, and save the final song/audio file.', category: 'Audio', tags: Object.freeze(['audio', 'planning', 'music', 'audiocraft', 'collection', 'stitch']), outputType: 'Audio', complexity: 'advanced', requirements: Object.freeze(['Connected planning provider/model or Ollama', 'AudioCraft WebUI installed', 'Text idea entered before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'planning-runtime', label: 'Connected planning provider or Ollama', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, toolIds: Object.freeze(['ollama']) })]) }), Object.freeze({ id: 'audiocraft-runtime', label: 'AudioCraft WebUI', anyOf: Object.freeze([Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE, toolIds: Object.freeze(['audiocraft-webui']) })]) })]), modelSelectionRequired: true, placeholdersRequired: true, optionalPresets: Object.freeze(['promptStyle']), nextSteps: Object.freeze(['Enter the song or structured audio idea.', 'Choose a planner provider/model or Ollama model.', 'Confirm AudioCraft WebUI is installed and review sequential continuation settings.', 'Optionally select a Prompt Style preset on the Map Collection node.', 'Run the pipeline to generate section clips, stitch them, and save one WAV.']), createPipeline: audioIdeaToGeneratedSong }),
   Object.freeze({ id: 'text-to-music-audio', name: 'Text to music or audio', description: 'Generate a short music or sound artifact from text using AudioCraft.', category: 'Audio', tags: Object.freeze(['audio', 'music']), outputType: 'Audio', complexity: 'intermediate', requirements: Object.freeze(['AudioCraft WebUI installed', 'Prompt entered before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'audiocraft-runtime', label: 'AudioCraft WebUI', anyOf: Object.freeze([Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE, toolIds: Object.freeze(['audiocraft-webui']) })]) })]), placeholdersRequired: true, nextSteps: Object.freeze(['Enter the audio prompt.', 'Adjust duration and AudioCraft settings if needed.']), createPipeline: textToAudio }),
   Object.freeze({ id: 'audiocraft-continuation', name: 'AudioCraft continuation', description: 'Continue a source audio clip with AudioCraft while preserving its style.', category: 'Audio', tags: Object.freeze(['audio', 'continuation']), outputType: 'Audio', complexity: 'advanced', requirements: Object.freeze(['AudioCraft WebUI installed', 'Source audio selected before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'audiocraft-runtime', label: 'AudioCraft WebUI', anyOf: Object.freeze([Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE, toolIds: Object.freeze(['audiocraft-webui']) })]) })]), placeholdersRequired: true, nextSteps: Object.freeze(['Choose the source audio file.', 'Tune continuation seed seconds and duration.']), createPipeline: audioContinuation }),
   Object.freeze({ id: 'voiceover-to-slideshow-video', name: 'Voiceover to slideshow video', description: 'Turn a source voiceover into a timestamp-aware scene plan, generate ordered slideshow images, and export a video with the original audio.', category: 'Media/collection', tags: Object.freeze(['audio', 'whisper', 'planning', 'collection', 'image', 'video']), outputType: 'Video', complexity: 'advanced', requirements: Object.freeze(['Voiceover audio file selected before running', 'Whisper installed', 'Connected planning provider/model or Ollama', 'Local or cloud image generation runtime', 'Built-in media composition/export path']), runtimeGroups: Object.freeze([Object.freeze({ id: 'whisper-runtime', label: 'Whisper', anyOf: Object.freeze([Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, toolIds: Object.freeze(['whisper']) })]) }), Object.freeze({ id: 'planning-runtime', label: 'Connected planning provider or Ollama', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, toolIds: Object.freeze(['ollama']) })]) }), localOrCloudImageRuntime]), modelSelectionRequired: true, placeholdersRequired: true, optionalPresets: Object.freeze(['promptStyle']), nextSteps: Object.freeze(['Select the source voiceover audio file.', 'Configure Whisper if needed.', 'Choose a planner provider/model or Ollama model.', 'Choose the image backend, checkpoint, or cloud image model.', 'Optionally select a Prompt Style preset on the image map for visual consistency.', 'Adjust the Media Composition seconds-per-item setting if the default slide timing does not match the voiceover.']), createPipeline: voiceoverSlideshowVideo }),

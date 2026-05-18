@@ -11,17 +11,24 @@ const {
   LONGFORM_SCENE_PLAN_ADAPTER,
   LONGFORM_SCENE_PLAN_SCHEMA_ID,
 } = require('./planningSchemas/longformScenePlan.cjs');
+const {
+  AUDIO_PROMPT_PLAN_ADAPTER,
+  AUDIO_PROMPT_PLAN_SCHEMA_ID,
+  AUDIO_PROMPT_SCHEMA_FAMILY_ID,
+} = require('./planningSchemas/audioPromptPlan.cjs');
 
 const PLANNING_SCHEMA_VERSION = 1;
 const PLANNING_REVIEW_VERSION = 1;
 const DEFAULT_PLANNING_SCHEMA_ID = LONGFORM_SCENE_PLAN_SCHEMA_ID;
 
 const PLANNING_SCHEMA_FAMILY_IDS = Object.freeze({
+  AUDIO_PROMPT: AUDIO_PROMPT_SCHEMA_FAMILY_ID,
   LONGFORM_MEDIA: LONGFORM_MEDIA_SCHEMA_FAMILY_ID,
 });
 
 const PLANNING_SCHEMA_ADAPTERS = Object.freeze({
   [LONGFORM_SCENE_PLAN_SCHEMA_ID]: LONGFORM_SCENE_PLAN_ADAPTER,
+  [AUDIO_PROMPT_PLAN_SCHEMA_ID]: AUDIO_PROMPT_PLAN_ADAPTER,
 });
 
 function getPlanningSchemaAdapter(schemaId, options = {}) {
@@ -37,6 +44,32 @@ function getPlanningSchemaAdapter(schemaId, options = {}) {
 function getPlanningSchemaDefinition(schemaId) {
   const adapter = getPlanningSchemaAdapter(schemaId);
   return cloneValue(adapter?.definition || PLANNING_SCHEMA_ADAPTERS[DEFAULT_PLANNING_SCHEMA_ID].definition);
+}
+
+function getPlanningSchemaResponseJsonSchema(schemaId) {
+  const adapter = getPlanningSchemaAdapter(schemaId, { allowDefault: false });
+  if (!adapter?.responseJsonSchema) {
+    return null;
+  }
+  return cloneValue(adapter.responseJsonSchema);
+}
+
+function buildPlanningSchemaStructuredOutputRequest(schemaId) {
+  const adapter = getPlanningSchemaAdapter(schemaId, { allowDefault: false });
+  const responseJsonSchema = adapter?.responseJsonSchema ? cloneValue(adapter.responseJsonSchema) : null;
+  if (!responseJsonSchema) {
+    return null;
+  }
+
+  const schemaDefinition = adapter.definition || {};
+  const schemaName = ('local_ai_hub_' + normalizeString(schemaDefinition.id || schemaId, 'planning_schema'))
+    .replace(/[^a-zA-Z0-9_-]+/g, '_')
+    .slice(0, 80) || 'local_ai_hub_planning_schema';
+  return {
+    type: 'json_schema',
+    name: schemaName,
+    schema: responseJsonSchema,
+  };
 }
 
 function getPlanningSchemaOptions() {
@@ -307,6 +340,7 @@ function buildPlannerPrompt(schemaId, packet, options = {}) {
 const buildPlanAuditDocument = buildPlanReviewDocument;
 
 module.exports = {
+  AUDIO_PROMPT_PLAN_SCHEMA_ID,
   DEFAULT_PLANNING_SCHEMA_ID,
   PLANNING_REVIEW_VERSION,
   PLANNING_SCHEMA_FAMILY_IDS,
@@ -316,11 +350,13 @@ module.exports = {
   buildPlanReviewDocument,
   buildPlanTextCollectionItems,
   buildPlanningPacketDocument,
+  buildPlanningSchemaStructuredOutputRequest,
   buildPlannerPrompt,
   cloneValue,
   getPlanningSchemaAdapter,
   getPlanningSchemaDefinition,
   getPlanningSchemaOptions,
+  getPlanningSchemaResponseJsonSchema,
   summarizeHardware,
   summarizeSourceArtifact,
   trimPreviewText,

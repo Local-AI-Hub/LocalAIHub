@@ -77,6 +77,52 @@ assert.strictEqual(getModelStepOperationId(continuationStep), PIPELINE_OPERATION
 assert.strictEqual(continuationStep.config.audioMode, 'continuation', 'AudioCraft continuation should use continuation mode.');
 assert.strictEqual(continuationStep.config.appendSource, true, 'AudioCraft continuation should append the source by default.');
 
+const audioPlanResult = instantiatePipelineTemplate('audio-idea-to-prompt-collection', allReadyContext);
+assert(audioPlanResult.ok, 'Audio idea planning template should instantiate.');
+const audioPlanPipeline = audioPlanResult.pipeline;
+const audioPacket = audioPlanPipeline.nodes.find((node) => node.type === 'planningPacket');
+const audioPlanner = audioPlanPipeline.nodes.find((node) => node.type === 'planner');
+const audioPlanBridge = audioPlanPipeline.nodes.find((node) => node.type === 'planScenes');
+const audioCollectionOutput = audioPlanPipeline.nodes.find((node) => node.type === 'collectionOutput');
+assert(audioPacket, 'Audio planning template should include a Planning Packet.');
+assert(audioPlanner, 'Audio planning template should include a Planner.');
+assert(audioPlanBridge, 'Audio planning template should include the plan-to-text collection bridge.');
+assert(audioCollectionOutput, 'Audio planning template should include a Collection Output.');
+assert.strictEqual(audioPacket.config.schemaId, 'audioPromptPlan.v1', 'Audio planning packet should request audioPromptPlan.');
+assert.strictEqual(audioPlanner.config.schemaId, 'audioPromptPlan.v1', 'Audio planner should request audioPromptPlan.');
+assert(/AudioCraft is not required/i.test(audioPacket.config.readinessNotesText), 'Audio planning template should not require AudioCraft.');
+assert(!audioPlanPipeline.nodes.some((node) => node.type === 'llmPrompt' && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE), 'Audio planning template should not execute audio generation.');
+assert(audioPlanPipeline.edges.some((edge) => edge.source.nodeId === audioPlanner.id && edge.target.nodeId === audioPlanBridge.id), 'Audio plan should feed the text collection bridge.');
+const missingAudioCraftAudioPlan = getPipelineTemplateReadiness('audio-idea-to-prompt-collection', {
+  ...allReadyContext,
+  tools: allReadyContext.tools.filter((entry) => entry.id !== 'audiocraft-webui'),
+});
+assert.notStrictEqual(missingAudioCraftAudioPlan.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Audio prompt planning should not require AudioCraft when a planning provider is available.');
+
+const generatedSongResult = instantiatePipelineTemplate('audio-idea-to-generated-song', allReadyContext);
+assert(generatedSongResult.ok, 'Audio idea generated song template should instantiate.');
+const generatedSong = generatedSongResult.pipeline;
+const generatedSongMap = generatedSong.nodes.find((node) => node.type === 'collectionMap');
+const generatedSongStitch = generatedSong.nodes.find((node) => node.type === 'audioStitch');
+const generatedSongOutput = generatedSong.nodes.find((node) => node.type === 'audioOutput');
+assert(generatedSong.nodes.some((node) => node.type === 'planningPacket' && node.config.schemaId === 'audioPromptPlan.v1'), 'Generated song template should include an audio prompt planning packet.');
+assert(generatedSongMap, 'Generated song template should include collectionMap generation.');
+assert.strictEqual(getCollectionMapMapping(generatedSongMap)?.id, 'textToAudio', 'Generated song template should map planned text prompts to audio.');
+assert.strictEqual(generatedSongMap.config.executionMode, 'localTool', 'Generated song template should prefer local AudioCraft.');
+assert.strictEqual(generatedSongMap.config.toolId, 'audiocraft-webui', 'Generated song template should target AudioCraft WebUI.');
+assert.strictEqual(generatedSongMap.config.audiocraftItemMode, 'sequentialContinuation', 'Generated song template should enable AudioCraft sequential continuation.');
+assert.strictEqual(generatedSongMap.config.promptStyleId, '', 'Generated song template should leave Prompt Style unset.');
+assert(generatedSongStitch, 'Generated song template should include Audio Stitch.');
+assert(generatedSongOutput, 'Generated song template should include Audio Output.');
+assert(generatedSong.edges.some((edge) => edge.source.nodeId === generatedSongMap.id && edge.target.nodeId === generatedSongStitch.id), 'Generated song collection should feed Audio Stitch.');
+assert(generatedSong.edges.some((edge) => edge.source.nodeId === generatedSongStitch.id && edge.target.nodeId === generatedSongOutput.id), 'Audio Stitch should feed Audio Output.');
+const missingAudioCraftGeneratedSong = getPipelineTemplateReadiness('audio-idea-to-generated-song', {
+  ...allReadyContext,
+  tools: allReadyContext.tools.filter((entry) => entry.id !== 'audiocraft-webui'),
+});
+assert.strictEqual(missingAudioCraftGeneratedSong.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Generated song template should require AudioCraft.');
+assert(missingAudioCraftGeneratedSong.missingTools.some((entry) => /AudioCraft|audiocraft/i.test(entry)), 'Generated song readiness should explain the missing AudioCraft requirement.');
+
 const noPresetGraph = getPipelineTemplateReadiness('graph-workflow-from-preset', { tools: [tool('comfyui')], graphWorkflowPresets: [] });
 assert.strictEqual(noPresetGraph.status, TEMPLATE_STATUS.UNAVAILABLE, 'Graph preset template should be unavailable without a compatible preset.');
 assert(noPresetGraph.missingPresets.length, 'Graph preset template should explain the missing preset.');

@@ -124,7 +124,10 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
           }
 
           assert.strictEqual(payload.timeoutMs, 60000, 'Expected planner to use the extended provider timeout for structured planning.');
+          assert.strictEqual(payload.maxOutputTokens, 4096, 'Expected planner to request enough output budget for structured JSON.');
           assert(/planner request/i.test(String(payload.timeoutMessage || '')), 'Expected planner to pass a planner-specific timeout message.');
+          assert.strictEqual(payload.responseFormat?.type, 'json_schema', 'Expected planner to request provider structured JSON when the planning schema defines it.');
+          assert(payload.responseFormat?.schema?.properties?.scenes, 'Expected planner structured output request to include the longform scene JSON schema.');
           return {
             message: {
               content: buildMockPlanReply(),
