@@ -41,7 +41,7 @@ const {
   isLikelySupportOnlyStableDiffusionModel,
 } = require('./toolAssetSelection.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 12;
+const PIPELINE_SCHEMA_VERSION = 15;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
@@ -1013,15 +1013,52 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     configDefaults: {
       captionMode: 'auto',
       durationPerCaptionSeconds: 3,
+      fontSize: 28,
+      outline: 2,
+      shadow: 1,
+      bottomMargin: 32,
+      textColor: 'white',
+      outlineColor: 'black',
+      fontPreset: 'arial',
+      bold: false,
+      italic: false,
+      position: 'bottomCenter',
+      backgroundBox: false,
+      backgroundOpacity: 50,
       outputFormat: 'mp4',
-      position: 'bottom',
+    },
+  }),
+  exportSubtitles: Object.freeze({
+    type: 'exportSubtitles',
+    label: 'Export Subtitles',
+    category: 'Deterministic Media Operations',
+    description: 'Creates a reusable .srt or .vtt subtitle file from transcript segments or caption lines.',
+    inputPorts: [
+      {
+        id: 'captions',
+        kind: PORT_KIND_TEXT,
+        label: 'Captions',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'subtitles',
+        kind: PORT_KIND_FILE,
+        label: 'Subtitles',
+      },
+    ],
+    configDefaults: {
+      outputFormat: 'srt',
+      captionMode: 'auto',
+      durationPerCaptionSeconds: 3,
     },
   }),
   extractVideoFrame: Object.freeze({
     type: 'extractVideoFrame',
     label: 'Extract Video Frame',
     category: 'Deterministic Media Operations',
-    description: 'Extracts the first or last frame from a video as an image.',
+    description: 'Extracts the first, last, or timestamped frame from a video as an image.',
     inputPorts: [
       {
         id: 'video',
@@ -1039,6 +1076,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       framePosition: 'first',
+      timestampSeconds: 0,
       outputFormat: 'png',
     },
   }),
@@ -5785,6 +5823,48 @@ function analyzePipeline(definition = {}, context = {}) {
             message: 'Manual caption lines need a positive duration per caption.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if ((Number(node.config?.fontSize || 28) || 28) <= 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Caption font size must be greater than zero.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if ((Number(node.config?.outline || 0) || 0) < 0 || (Number(node.config?.shadow || 0) || 0) < 0 || (Number(node.config?.bottomMargin || 0) || 0) < 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Caption outline, shadow, and bottom margin cannot be negative.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['white', 'black', 'yellow', 'red', 'blue', 'green', 'cyan', 'magenta', 'lightGray', 'darkGray'].includes(String(node.config?.textColor || 'white').trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported caption text color.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['black', 'white', 'darkGray', 'lightGray', 'yellow', 'red', 'blue'].includes(String(node.config?.outlineColor || 'black').trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported caption outline color.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['arial', 'segoeUi', 'tahoma', 'verdana'].includes(String(node.config?.fontPreset || 'arial').trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported caption font preset.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['bottomCenter', 'bottomLeft', 'bottomRight', 'topCenter', 'topLeft', 'topRight', 'center'].includes(String(node.config?.position || 'bottomCenter').trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported caption position.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['25', '50', '75', '100'].includes(String(node.config?.backgroundOpacity ?? 50).trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported caption background opacity.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (outputFormat && outputFormat !== 'mp4') {
           summary.readiness = {
             tone: 'error',
@@ -5799,9 +5879,47 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
+      if (node.type === 'exportSubtitles') {
+        const captionKinds = getIncomingKindsForNodePort(node, 'captions', graph);
+        const captionMode = String(node.config?.captionMode || 'auto').trim();
+        const durationPerCaptionSeconds = Number(node.config?.durationPerCaptionSeconds || 0) || 0;
+        const outputFormat = String(node.config?.outputFormat || 'srt').trim().toLowerCase();
+        if (!captionKinds.includes(PORT_KIND_TEXT)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect transcript segments or text caption lines before exporting subtitles.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['auto', 'transcriptSegments', 'manualLines'].includes(captionMode)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported subtitle export caption mode.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (captionMode === 'manualLines' && durationPerCaptionSeconds <= 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Manual subtitle lines need a positive duration per caption.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (outputFormat !== 'srt' && outputFormat !== 'vtt') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Export Subtitles writes SRT or VTT files.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step creates a reusable .' + outputFormat + ' subtitle file from transcript segments or caption lines.',
+          };
+        }
+      }
+
       if (node.type === 'extractVideoFrame') {
         const videoKinds = getIncomingKindsForNodePort(node, 'video', graph);
         const framePosition = String(node.config?.framePosition || 'first').trim().toLowerCase();
+        const timestampSeconds = Number(node.config?.timestampSeconds || 0) || 0;
         const outputFormat = String(node.config?.outputFormat || 'png').trim().toLowerCase();
         if (!videoKinds.includes(PORT_KIND_VIDEO)) {
           summary.readiness = {
@@ -5809,22 +5927,30 @@ function analyzePipeline(definition = {}, context = {}) {
             message: 'Connect a video before extracting a frame.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (framePosition !== 'first' && framePosition !== 'last') {
+        } else if (framePosition !== 'first' && framePosition !== 'last' && framePosition !== 'timestamp') {
           summary.readiness = {
             tone: 'error',
-            message: 'Extract Video Frame can extract either the first frame or the last frame.',
+            message: 'Extract Video Frame can extract the first frame, last frame, or a frame at a timestamp.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (framePosition === 'timestamp' && timestampSeconds < 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Timestamp frame extraction needs a timestamp of zero seconds or later.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (outputFormat && outputFormat !== 'png') {
           summary.readiness = {
             tone: 'error',
-            message: 'Extract Video Frame writes PNG images in this pass. Leave the output format as png.',
+            message: 'Extract Video Frame writes PNG images in this pass.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else {
           summary.readiness = {
             tone: 'info',
-            message: 'This step extracts the ' + framePosition + ' frame from the connected video as a PNG image artifact.',
+            message: framePosition === 'timestamp'
+              ? 'This step extracts the frame at ' + timestampSeconds + ' seconds from the connected video as a PNG image artifact.'
+              : 'This step extracts the ' + framePosition + ' frame from the connected video as a PNG image artifact.',
           };
         }
       }

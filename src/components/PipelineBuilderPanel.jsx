@@ -863,8 +863,16 @@ function buildNodePreview(node, runState) {
 
   if (node.type === 'burnSubtitles') {
     const mode = String(node.config?.captionMode || 'auto').trim() || 'auto';
-    return mode === 'manualLines' ? 'Manual lines | ' + Math.max(0.1, Number(node.config?.durationPerCaptionSeconds || 3) || 3) + 's each' : mode + ' captions';
+    const fontSize = Math.max(1, Number(node.config?.fontSize || 28) || 28);
+    return mode === 'manualLines' ? 'Manual lines | ' + Math.max(0.1, Number(node.config?.durationPerCaptionSeconds || 3) || 3) + 's each | ' + fontSize + 'px' : mode + ' captions | ' + fontSize + 'px';
   }
+
+  if (node.type === 'exportSubtitles') {
+    const mode = String(node.config?.captionMode || 'auto').trim() || 'auto';
+    const format = String(node.config?.outputFormat || 'srt').trim().toUpperCase() || 'SRT';
+    return mode === 'manualLines' ? format + ' | Manual lines | ' + Math.max(0.1, Number(node.config?.durationPerCaptionSeconds || 3) || 3) + 's each' : format + ' | ' + mode + ' captions';
+  }
+
 
   if (node.type === 'normalizeAudioCollection') {
     const sampleRate = Math.max(1, Number(node.config?.sampleRate || 44100) || 44100);
@@ -879,8 +887,12 @@ function buildNodePreview(node, runState) {
   }
 
   if (node.type === 'extractVideoFrame') {
-    const framePosition = String(node.config?.framePosition || 'first').trim() === 'last' ? 'Last' : 'First';
-    return framePosition + ' frame | video to PNG';
+    const framePosition = String(node.config?.framePosition || 'first').trim();
+    if (framePosition === 'timestamp') {
+      const timestampSeconds = Math.max(0, Number(node.config?.timestampSeconds || 0) || 0);
+      return 'Timestamp ' + timestampSeconds + 's | video to PNG';
+    }
+    return (framePosition === 'last' ? 'Last' : 'First') + ' frame | video to PNG';
   }
 
   if (node.type === 'extractAudio') {
@@ -5974,6 +5986,68 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   </div>
                 ) : null}
 
+                {selectedNode.type === 'exportSubtitles' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Create a reusable .srt or .vtt subtitle file from transcript segments or caption lines.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="export-subtitles-format">Output format</label>
+                      <select
+                        className="store-input mt-3"
+                        id="export-subtitles-format"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, outputFormat: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.outputFormat || 'srt').trim() === 'vtt' ? 'vtt' : 'srt'}
+                      >
+                        <option value="srt">SRT</option>
+                        <option value="vtt">VTT</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="export-subtitles-mode">Caption mode</label>
+                      <select
+                        className="store-input mt-3"
+                        id="export-subtitles-mode"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, captionMode: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.captionMode || 'auto').trim() || 'auto'}
+                      >
+                        <option value="auto">Auto</option>
+                        <option value="transcriptSegments">Transcript segments</option>
+                        <option value="manualLines">Manual lines</option>
+                      </select>
+                    </div>
+                    {String(selectedNode.config?.captionMode || 'auto').trim() === 'manualLines' ? (
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="export-subtitles-duration">Duration per caption seconds</label>
+                        <input
+                          className="store-input mt-3"
+                          id="export-subtitles-duration"
+                          inputMode="decimal"
+                          onChange={(event) => {
+                            const nextValue = event.target.value;
+                            if (!isDraftSecondsValue(nextValue)) {
+                              return;
+                            }
+                            updateNode(selectedNode.id, (currentNode) => ({
+                              ...currentNode,
+                              config: { ...currentNode.config, durationPerCaptionSeconds: nextValue },
+                            }));
+                          }}
+                          pattern="[0-9]*[.]?[0-9]*"
+                          type="text"
+                          value={selectedNode.config?.durationPerCaptionSeconds ?? 3}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
                 {selectedNode.type === 'burnSubtitles' ? (
                   <div className="space-y-4">
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
@@ -6002,17 +6076,125 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         <input
                           className="store-input mt-3"
                           id="burn-subtitles-duration"
-                          min="0.1"
-                          onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
-                            ...currentNode,
-                            config: { ...currentNode.config, durationPerCaptionSeconds: Math.max(0.1, Number(event.target.value || 3) || 3) },
-                          }))}
-                          step="0.1"
-                          type="number"
-                          value={Math.max(0.1, Number(selectedNode.config?.durationPerCaptionSeconds || 3) || 3)}
+                          inputMode="decimal"
+                          onChange={(event) => {
+                            const nextValue = event.target.value;
+                            if (!isDraftSecondsValue(nextValue)) {
+                              return;
+                            }
+                            updateNode(selectedNode.id, (currentNode) => ({
+                              ...currentNode,
+                              config: { ...currentNode.config, durationPerCaptionSeconds: nextValue },
+                            }));
+                          }}
+                          pattern="[0-9]*[.]?[0-9]*"
+                          type="text"
+                          value={selectedNode.config?.durationPerCaptionSeconds ?? 3}
                         />
                       </div>
                     ) : null}
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
+                      <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Style</p>
+                      <div className="mt-4 grid grid-cols-2 gap-3">
+                        {[
+                          ['burn-subtitles-font-size', 'Font size', 'fontSize', 28],
+                          ['burn-subtitles-outline', 'Outline', 'outline', 2],
+                          ['burn-subtitles-shadow', 'Shadow', 'shadow', 1],
+                          ['burn-subtitles-bottom-margin', 'Vertical margin', 'bottomMargin', 32],
+                        ].map(([inputId, label, configKey, fallbackValue]) => (
+                          <div key={inputId}>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={inputId}>{label}</label>
+                            <input
+                              className="store-input mt-3"
+                              id={inputId}
+                              inputMode="decimal"
+                              onChange={(event) => {
+                                const nextValue = event.target.value;
+                                if (!isDraftSecondsValue(nextValue)) {
+                                  return;
+                                }
+                                updateNode(selectedNode.id, (currentNode) => ({
+                                  ...currentNode,
+                                  config: { ...currentNode.config, [configKey]: nextValue },
+                                }));
+                              }}
+                              pattern="[0-9]*[.]?[0-9]*"
+                              type="text"
+                              value={selectedNode.config?.[configKey] ?? fallbackValue}
+                            />
+                          </div>
+                        ))}
+                        {[
+                          ['burn-subtitles-text-color', 'Text color', 'textColor', 'white', [
+                            ['white', 'White'], ['black', 'Black'], ['yellow', 'Yellow'], ['red', 'Red'], ['blue', 'Blue'], ['green', 'Green'], ['cyan', 'Cyan'], ['magenta', 'Magenta'], ['lightGray', 'Light gray'], ['darkGray', 'Dark gray'],
+                          ]],
+                          ['burn-subtitles-outline-color', 'Outline color', 'outlineColor', 'black', [
+                            ['black', 'Black'], ['white', 'White'], ['darkGray', 'Dark gray'], ['lightGray', 'Light gray'], ['yellow', 'Yellow'], ['red', 'Red'], ['blue', 'Blue'],
+                          ]],
+                          ['burn-subtitles-position', 'Position', 'position', 'bottomCenter', [
+                            ['bottomCenter', 'Bottom center'], ['bottomLeft', 'Bottom left'], ['bottomRight', 'Bottom right'], ['topCenter', 'Top center'], ['topLeft', 'Top left'], ['topRight', 'Top right'], ['center', 'Center'],
+                          ]],
+                          ['burn-subtitles-font-preset', 'Font preset', 'fontPreset', 'arial', [
+                            ['arial', 'Arial'], ['segoeUi', 'Segoe UI'], ['tahoma', 'Tahoma'], ['verdana', 'Verdana'],
+                          ]],
+                        ].map(([inputId, label, configKey, fallbackValue, options]) => (
+                          <div key={inputId}>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={inputId}>{label}</label>
+                            <select
+                              className="store-input mt-3"
+                              id={inputId}
+                              onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                                ...currentNode,
+                                config: { ...currentNode.config, [configKey]: event.target.value },
+                              }))}
+                              value={String(selectedNode.config?.[configKey] || fallbackValue).trim() || fallbackValue}
+                            >
+                              {options.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                            </select>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-4 grid grid-cols-2 gap-3">
+                        {[
+                          ['burn-subtitles-bold', 'Bold', 'bold'],
+                          ['burn-subtitles-italic', 'Italic', 'italic'],
+                          ['burn-subtitles-background-box', 'Background box', 'backgroundBox'],
+                        ].map(([inputId, label, configKey]) => (
+                          <label key={inputId} className="flex items-center gap-3 rounded-2xl border border-white/10 bg-black/10 px-3 py-3 text-sm text-slate-300" htmlFor={inputId}>
+                            <input
+                              checked={selectedNode.config?.[configKey] === true}
+                              className="h-4 w-4 rounded border-white/20 bg-slate-950 text-cyan-300"
+                              id={inputId}
+                              onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                                ...currentNode,
+                                config: { ...currentNode.config, [configKey]: event.target.checked },
+                              }))}
+                              type="checkbox"
+                            />
+                            <span>{label}</span>
+                          </label>
+                        ))}
+                        {selectedNode.config?.backgroundBox === true ? (
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="burn-subtitles-background-opacity">Background opacity</label>
+                            <select
+                              className="store-input mt-3"
+                              id="burn-subtitles-background-opacity"
+                              onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                                ...currentNode,
+                                config: { ...currentNode.config, backgroundOpacity: Number(event.target.value) },
+                              }))}
+                              value={String(selectedNode.config?.backgroundOpacity ?? 50)}
+                            >
+                              <option value="25">25%</option>
+                              <option value="50">50%</option>
+                              <option value="75">75%</option>
+                              <option value="100">100%</option>
+                            </select>
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
                   </div>
                 ) : null}
 
@@ -6137,17 +6319,41 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                           ...currentNode,
                           config: {
                             ...currentNode.config,
-                            framePosition: event.target.value === 'last' ? 'last' : 'first',
+                            framePosition: event.target.value === 'last' || event.target.value === 'timestamp' ? event.target.value : 'first',
                           },
                         }))}
-                        value={selectedNode.config?.framePosition === 'last' ? 'last' : 'first'}
+                        value={['last', 'timestamp'].includes(selectedNode.config?.framePosition) ? selectedNode.config.framePosition : 'first'}
                       >
                         <option value="first">First frame</option>
                         <option value="last">Last frame</option>
+                        <option value="timestamp">Timestamp</option>
                       </select>
                     </div>
+                    {selectedNode.config?.framePosition === 'timestamp' ? (
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="extract-video-frame-timestamp">Timestamp</label>
+                        <input
+                          className="store-input mt-3"
+                          id="extract-video-frame-timestamp"
+                          inputMode="decimal"
+                          onChange={(event) => {
+                            const nextValue = event.target.value;
+                            if (!isDraftSecondsValue(nextValue)) {
+                              return;
+                            }
+                            updateNode(selectedNode.id, (currentNode) => ({
+                              ...currentNode,
+                              config: { ...currentNode.config, timestampSeconds: nextValue },
+                            }));
+                          }}
+                          pattern="[0-9]*[.]?[0-9]*"
+                          type="text"
+                          value={selectedNode.config?.timestampSeconds ?? 0}
+                        />
+                      </div>
+                    ) : null}
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Extract the first or last frame from a video as an image.
+                      {selectedNode.config?.framePosition === 'timestamp' ? 'Extract the frame at the selected timestamp.' : 'Extract the first or last frame from a video as an image.'}
                     </div>
                   </div>
                 ) : null}
@@ -6159,6 +6365,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                     </div>
                   </div>
                 ) : null}
+
                 {selectedNode.type === 'mediaComposition' ? (
                   <div className="space-y-4">
                     <div>

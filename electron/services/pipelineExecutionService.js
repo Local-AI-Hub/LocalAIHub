@@ -79,6 +79,7 @@ const {
   normalizeVideoCollectionArtifact,
   trimMediaArtifact,
   burnSubtitlesIntoVideoArtifact,
+  exportSubtitlesArtifact,
 } = require('./mediaUtilityService');
 const { runCommand } = require('./commandService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
@@ -4950,6 +4951,7 @@ async function executeExtractVideoFrameNode(node, graph, run, reportProgress) {
     framePosition: node.config?.framePosition || 'first',
     node,
     outputFormat: node.config?.outputFormat || 'png',
+    timestampSeconds: node.config?.timestampSeconds || 0,
     reportProgress,
     runDirectories: run.directories,
   });
@@ -5019,8 +5021,33 @@ async function executeBurnSubtitlesNode(node, graph, run, reportProgress) {
     captionMode: node.config?.captionMode || 'auto',
     displayName: node.label || 'Burn Subtitles / Captions',
     durationPerCaptionSeconds: node.config?.durationPerCaptionSeconds || 3,
+    fontSize: node.config?.fontSize || 28,
+    outline: node.config?.outline ?? 2,
+    shadow: node.config?.shadow ?? 1,
+    bottomMargin: node.config?.bottomMargin ?? 32,
+    textColor: node.config?.textColor || 'white',
+    outlineColor: node.config?.outlineColor || 'black',
+    fontPreset: node.config?.fontPreset || 'arial',
+    bold: node.config?.bold || false,
+    italic: node.config?.italic || false,
+    position: node.config?.position || 'bottomCenter',
+    backgroundBox: node.config?.backgroundBox || false,
+    backgroundOpacity: node.config?.backgroundOpacity ?? 50,
     node,
     outputFormat: node.config?.outputFormat || 'mp4',
+    reportProgress,
+    runDirectories: run.directories,
+  });
+}
+
+async function executeExportSubtitlesNode(node, graph, run, reportProgress) {
+  const captionArtifact = getNodeInputArtifact(node.id, 'captions', graph, run.resultsByNodeId, run);
+  return exportSubtitlesArtifact(captionArtifact, {
+    captionMode: node.config?.captionMode || 'auto',
+    displayName: node.label || 'Export Subtitles',
+    durationPerCaptionSeconds: node.config?.durationPerCaptionSeconds || 3,
+    node,
+    outputFormat: node.config?.outputFormat || 'srt',
     reportProgress,
     runDirectories: run.directories,
   });
@@ -5819,6 +5846,10 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
   if (node.type === 'burnSubtitles') {
     return executeBurnSubtitlesNode(node, graph, run, reportProgress);
+  }
+
+  if (node.type === 'exportSubtitles') {
+    return executeExportSubtitlesNode(node, graph, run, reportProgress);
   }
 
   if (node.type === 'normalizeAudioCollection') {

@@ -9,6 +9,7 @@ const {
   persistArtifactCollection,
   saveAudioArtifactMetadata,
   saveImageArtifactMetadata,
+  saveSubtitleExportArtifactMetadata,
   saveVideoArtifactMetadata,
   summarizeArtifact,
 } = require('./pipelineArtifactService');
@@ -33,10 +34,18 @@ function sanitizeSegment(value, fallback = 'media-utility') {
 
 function normalizeFramePosition(value) {
   const normalized = String(value || 'first').trim().toLowerCase();
-  if (normalized === 'first' || normalized === 'last') {
+  if (normalized === 'first' || normalized === 'last' || normalized === 'timestamp') {
     return normalized;
   }
-  throw new Error('Extract Video Frame can extract either the first frame or the last frame.');
+  throw new Error('Extract Video Frame can extract the first frame, last frame, or a frame at a timestamp.');
+}
+
+function normalizeTimestampSeconds(value) {
+  const timestampSeconds = Number(value || 0) || 0;
+  if (timestampSeconds < 0) {
+    throw new Error('Timestamp frame extraction needs a timestamp of zero seconds or later.');
+  }
+  return Math.round(timestampSeconds * 1000) / 1000;
 }
 
 function normalizeImageOutputFormat(value) {
@@ -174,12 +183,21 @@ async function nextOutputPath(runDirectories, node, suffix, extension) {
   }
 }
 
-function buildFrameCommandArgs(sourcePath, outputPath, framePosition) {
+function buildFrameCommandArgs(sourcePath, outputPath, framePosition, timestampSeconds = 0) {
   if (framePosition === 'last') {
     return {
       args: ['-y', '-i', sourcePath, '-map', '0:v:0', '-vf', 'reverse', '-frames:v', '1', '-update', '1', outputPath],
       mode: 'reverse-filter-last-frame',
       timestampSeconds: null,
+    };
+  }
+
+  if (framePosition === 'timestamp') {
+    const normalizedTimestamp = normalizeTimestampSeconds(timestampSeconds);
+    return {
+      args: ['-y', '-ss', String(normalizedTimestamp), '-i', sourcePath, '-map', '0:v:0', '-frames:v', '1', '-update', '1', outputPath],
+      mode: 'input-seek-timestamp-frame',
+      timestampSeconds: normalizedTimestamp,
     };
   }
 
@@ -195,18 +213,26 @@ async function extractVideoFrameArtifact(videoArtifact, options = {}) {
   const framePosition = normalizeFramePosition(options.framePosition);
   const outputFormat = normalizeImageOutputFormat(options.outputFormat);
   const sourcePath = await resolveSourceVideoPath(videoArtifact, operationLabel);
+  const timestampSeconds = framePosition === 'timestamp' ? normalizeTimestampSeconds(options.timestampSeconds) : null;
   const outputPath = await nextOutputPath(options.runDirectories, options.node, framePosition + '-frame', '.' + outputFormat);
 
   options.reportProgress?.(
     'Extracting video frame.',
-    'Saving the ' + framePosition + ' frame as a PNG image with the bundled ffmpeg runtime...',
+    framePosition === 'timestamp'
+      ? 'Saving the frame at ' + timestampSeconds + ' seconds as a PNG image with the bundled ffmpeg runtime...'
+      : 'Saving the ' + framePosition + ' frame as a PNG image with the bundled ffmpeg runtime...',
   );
 
   const ffmpegPath = resolveFfmpegPath();
-  const command = buildFrameCommandArgs(sourcePath, outputPath, framePosition);
+  const command = buildFrameCommandArgs(sourcePath, outputPath, framePosition, timestampSeconds);
   const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true });
-  if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
+  const outputExists = await fs.pathExists(outputPath);
+  const outputSize = outputExists ? Number((await fs.stat(outputPath)).size || 0) : 0;
+  if (Number(commandResult.code || 0) !== 0 || !outputExists || outputSize <= 0) {
     const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
+    if (framePosition === 'timestamp' && (!outputExists || outputSize <= 0)) {
+      throw new Error('No frame was found at the requested timestamp. Choose a timestamp inside the video duration and try again.');
+    }
     throw new Error('Extract Video Frame could not read a video frame from this file. ' + (failureLine || 'Try a different video file or regenerate the source clip.'));
   }
 
@@ -232,7 +258,9 @@ async function extractVideoFrameArtifact(videoArtifact, options = {}) {
 
   return {
     destinationPath: outputPath,
-    message: 'Extract Video Frame saved the ' + framePosition + ' frame as a PNG image.',
+    message: framePosition === 'timestamp'
+      ? 'Extract Video Frame saved the frame at ' + command.timestampSeconds + ' seconds as a PNG image.'
+      : 'Extract Video Frame saved the ' + framePosition + ' frame as a PNG image.',
     outputs: { image: artifact },
     preview: summarizeArtifact(artifact),
   };
@@ -777,7 +805,7 @@ async function trimMediaArtifact(mediaArtifact, options = {}) {
   };
 }
 
-function formatSrtTimestamp(seconds) {
+function formatSubtitleTimestamp(seconds, millisecondSeparator) {
   const safe = Math.max(0, Number(seconds || 0) || 0);
   const totalMs = Math.round(safe * 1000);
   const ms = totalMs % 1000;
@@ -786,7 +814,27 @@ function formatSrtTimestamp(seconds) {
   const totalMinutes = Math.floor(totalSeconds / 60);
   const min = totalMinutes % 60;
   const hour = Math.floor(totalMinutes / 60);
-  return String(hour).padStart(2, '0') + ':' + String(min).padStart(2, '0') + ':' + String(sec).padStart(2, '0') + ',' + String(ms).padStart(3, '0');
+  return String(hour).padStart(2, '0') + ':' + String(min).padStart(2, '0') + ':' + String(sec).padStart(2, '0') + millisecondSeparator + String(ms).padStart(3, '0');
+}
+
+function formatSrtTimestamp(seconds) {
+  return formatSubtitleTimestamp(seconds, ',');
+}
+
+function formatVttTimestamp(seconds) {
+  return formatSubtitleTimestamp(seconds, '.');
+}
+
+function formatAssTimestamp(seconds) {
+  const safe = Math.max(0, Number(seconds || 0) || 0);
+  const totalCentiseconds = Math.round(safe * 100);
+  const centiseconds = totalCentiseconds % 100;
+  const totalSeconds = Math.floor(totalCentiseconds / 100);
+  const sec = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const min = totalMinutes % 60;
+  const hour = Math.floor(totalMinutes / 60);
+  return String(hour) + ':' + String(min).padStart(2, '0') + ':' + String(sec).padStart(2, '0') + '.' + String(centiseconds).padStart(2, '0');
 }
 
 function sanitizeSrtText(value) {
@@ -810,6 +858,82 @@ function buildSrtContent(captions) {
   }).join('\n');
 }
 
+function buildVttContent(captions) {
+  const body = captions.map((caption) => {
+    return [
+      formatVttTimestamp(caption.startSeconds) + ' --> ' + formatVttTimestamp(caption.endSeconds),
+      sanitizeSrtText(caption.text),
+      '',
+    ].join('\n');
+  }).join('\n');
+  return 'WEBVTT\n\n' + body;
+}
+
+function sanitizeAssText(value) {
+  return sanitizeSrtText(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/\{/g, '\\{')
+    .replace(/\}/g, '\\}')
+    .replace(/\n/g, '\\N');
+}
+
+function buildAssContent(captions, style = {}) {
+  const normalized = normalizeSubtitleStyle(style);
+  const borderStyle = normalized.backgroundBox ? 3 : 1;
+  const backColour = normalized.backgroundBox ? buildAssBackgroundColor('black', String(normalized.backgroundOpacity)) : '&H00000000';
+  const styleValues = [
+    'Default',
+    SUBTITLE_FONT_PRESETS[normalized.fontPreset].ass,
+    normalized.fontSize,
+    SUBTITLE_COLOR_VALUES[normalized.textColor].ass,
+    '&H000000FF',
+    SUBTITLE_COLOR_VALUES[normalized.outlineColor].ass,
+    backColour,
+    normalized.bold ? -1 : 0,
+    normalized.italic ? -1 : 0,
+    0,
+    0,
+    100,
+    100,
+    0,
+    0,
+    borderStyle,
+    normalized.outline,
+    normalized.shadow,
+    getSubtitleAssAlignment(normalized.position),
+    10,
+    10,
+    normalized.bottomMargin,
+    1,
+  ];
+  const events = captions.map((caption) => [
+    'Dialogue: 0',
+    formatAssTimestamp(caption.startSeconds),
+    formatAssTimestamp(caption.endSeconds),
+    'Default',
+    '',
+    0,
+    0,
+    0,
+    '',
+    sanitizeAssText(caption.text),
+  ].join(',')).join('\n');
+  return [
+    '[Script Info]',
+    'ScriptType: v4.00+',
+    'WrapStyle: 0',
+    'ScaledBorderAndShadow: yes',
+    '',
+    '[V4+ Styles]',
+    'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+    'Style: ' + styleValues.join(','),
+    '',
+    '[Events]',
+    'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+    events,
+    '',
+  ].join('\n');
+}
 function extractTranscriptSegments(captionArtifact) {
   return (Array.isArray(captionArtifact?.transcription?.segments) ? captionArtifact.transcription.segments : [])
     .map((segment) => ({
@@ -832,34 +956,227 @@ function buildManualLineCaptions(text, durationPerCaptionSeconds) {
       text: line,
     }));
 }
+const SUBTITLE_COLOR_VALUES = Object.freeze({
+  black: Object.freeze({ ass: '&H00000000', label: 'Black' }),
+  blue: Object.freeze({ ass: '&H00FF0000', label: 'Blue' }),
+  cyan: Object.freeze({ ass: '&H00FFFF00', label: 'Cyan' }),
+  darkGray: Object.freeze({ ass: '&H00404040', label: 'Dark gray' }),
+  green: Object.freeze({ ass: '&H00008000', label: 'Green' }),
+  lightGray: Object.freeze({ ass: '&H00C0C0C0', label: 'Light gray' }),
+  magenta: Object.freeze({ ass: '&H00FF00FF', label: 'Magenta' }),
+  red: Object.freeze({ ass: '&H000000FF', label: 'Red' }),
+  white: Object.freeze({ ass: '&H00FFFFFF', label: 'White' }),
+  yellow: Object.freeze({ ass: '&H0000FFFF', label: 'Yellow' }),
+});
 
-async function nextSubtitlePath(runDirectories, node, suffix = 'captions') {
-  return nextOutputPath(runDirectories, node, suffix, '.srt');
+const SUBTITLE_OUTLINE_COLOR_KEYS = Object.freeze(['black', 'white', 'darkGray', 'lightGray', 'yellow', 'red', 'blue']);
+const SUBTITLE_TEXT_COLOR_KEYS = Object.freeze(['white', 'black', 'yellow', 'red', 'blue', 'green', 'cyan', 'magenta', 'lightGray', 'darkGray']);
+const SUBTITLE_FONT_PRESETS = Object.freeze({
+  arial: Object.freeze({ ass: 'Arial', label: 'Arial' }),
+  segoeUi: Object.freeze({ ass: 'Segoe UI', label: 'Segoe UI' }),
+  tahoma: Object.freeze({ ass: 'Tahoma', label: 'Tahoma' }),
+  verdana: Object.freeze({ ass: 'Verdana', label: 'Verdana' }),
+});
+const SUBTITLE_POSITION_VALUES = Object.freeze({
+  bottomCenter: Object.freeze({ label: 'Bottom center' }),
+  bottomLeft: Object.freeze({ label: 'Bottom left' }),
+  bottomRight: Object.freeze({ label: 'Bottom right' }),
+  center: Object.freeze({ label: 'Center' }),
+  topCenter: Object.freeze({ label: 'Top center' }),
+  topLeft: Object.freeze({ label: 'Top left' }),
+  topRight: Object.freeze({ label: 'Top right' }),
+});
+
+const SUBTITLE_ASS_ALIGNMENT_BY_POSITION = Object.freeze({
+  bottomLeft: 1,
+  bottomCenter: 2,
+  bottomRight: 3,
+  center: 5,
+  topLeft: 7,
+  topCenter: 8,
+  topRight: 9,
+});
+
+// FFmpeg's subtitles filter applies force_style to SRT/VTT inputs using legacy SSA alignment values.
+// Generated burn-in captions use ASS files above, where the normal ASS numpad alignment values apply.
+const SUBTITLE_FILTER_ALIGNMENT_BY_POSITION = Object.freeze({
+  bottomLeft: 1,
+  bottomCenter: 2,
+  bottomRight: 3,
+  center: 10,
+  topLeft: 5,
+  topCenter: 6,
+  topRight: 7,
+});
+const SUBTITLE_BACKGROUND_OPACITY_VALUES = Object.freeze({
+  25: Object.freeze({ alpha: 'BF', label: '25%' }),
+  50: Object.freeze({ alpha: '80', label: '50%' }),
+  75: Object.freeze({ alpha: '40', label: '75%' }),
+  100: Object.freeze({ alpha: '00', label: '100%' }),
+});
+
+function normalizeSubtitleEnum(value, allowedKeys, fallback, label) {
+  const normalized = String(value || fallback).trim();
+  if (allowedKeys.includes(normalized)) {
+    return normalized;
+  }
+  throw new Error('Burn Subtitles / Captions does not support that ' + label + ' style option. Choose one of the built-in presets.');
+}
+
+function normalizeSubtitleBoolean(value) {
+  return value === true || value === 'true' || value === 1 || value === '1';
+}
+
+function buildAssBackgroundColor(colorKey, opacityKey) {
+  const color = SUBTITLE_COLOR_VALUES[colorKey]?.ass || SUBTITLE_COLOR_VALUES.black.ass;
+  const alpha = SUBTITLE_BACKGROUND_OPACITY_VALUES[opacityKey]?.alpha || SUBTITLE_BACKGROUND_OPACITY_VALUES[50].alpha;
+  return '&H' + alpha + color.slice(4);
+}
+
+function getSubtitleAssAlignment(position) {
+  const normalized = normalizeSubtitleEnum(position, Object.keys(SUBTITLE_POSITION_VALUES), 'bottomCenter', 'position');
+  return SUBTITLE_ASS_ALIGNMENT_BY_POSITION[normalized] || 2;
+}
+
+function getSubtitleFilterAlignment(position) {
+  const normalized = normalizeSubtitleEnum(position, Object.keys(SUBTITLE_POSITION_VALUES), 'bottomCenter', 'position');
+  return SUBTITLE_FILTER_ALIGNMENT_BY_POSITION[normalized] || 2;
+}
+
+function normalizeSubtitleStyle(options = {}) {
+  const fontSize = Math.max(1, Number(options.fontSize || 28) || 28);
+  const outline = Math.max(0, Number(options.outline ?? 2) || 0);
+  const shadow = Math.max(0, Number(options.shadow ?? 1) || 0);
+  const bottomMargin = Math.max(0, Number(options.bottomMargin ?? 32) || 0);
+  const textColor = normalizeSubtitleEnum(options.textColor, SUBTITLE_TEXT_COLOR_KEYS, 'white', 'text color');
+  const outlineColor = normalizeSubtitleEnum(options.outlineColor, SUBTITLE_OUTLINE_COLOR_KEYS, 'black', 'outline color');
+  const position = normalizeSubtitleEnum(options.position, Object.keys(SUBTITLE_POSITION_VALUES), 'bottomCenter', 'position');
+  const fontPreset = normalizeSubtitleEnum(options.fontPreset, Object.keys(SUBTITLE_FONT_PRESETS), 'arial', 'font preset');
+  const backgroundBox = normalizeSubtitleBoolean(options.backgroundBox);
+  const backgroundOpacity = normalizeSubtitleEnum(String(options.backgroundOpacity ?? 50), Object.keys(SUBTITLE_BACKGROUND_OPACITY_VALUES), '50', 'background opacity');
+  return {
+    backgroundBox,
+    backgroundOpacity: Number(backgroundOpacity),
+    bottomMargin: Math.round(bottomMargin * 10) / 10,
+    bold: normalizeSubtitleBoolean(options.bold),
+    fontPreset,
+    fontSize: Math.round(fontSize * 10) / 10,
+    italic: normalizeSubtitleBoolean(options.italic),
+    outline: Math.round(outline * 10) / 10,
+    outlineColor,
+    position,
+    shadow: Math.round(shadow * 10) / 10,
+    textColor,
+  };
+}
+
+function buildSubtitleForceStyle(style = {}, options = {}) {
+  const normalized = normalizeSubtitleStyle(style);
+  const alignment = options.alignmentMode === 'filter'
+    ? getSubtitleFilterAlignment(normalized.position)
+    : getSubtitleAssAlignment(normalized.position);
+  const forceStyle = [
+    'Alignment=' + alignment,
+    'Fontname=' + SUBTITLE_FONT_PRESETS[normalized.fontPreset].ass,
+    'Fontsize=' + normalized.fontSize,
+    'PrimaryColour=' + SUBTITLE_COLOR_VALUES[normalized.textColor].ass,
+    'OutlineColour=' + SUBTITLE_COLOR_VALUES[normalized.outlineColor].ass,
+    'Bold=' + (normalized.bold ? -1 : 0),
+    'Italic=' + (normalized.italic ? -1 : 0),
+    'Outline=' + normalized.outline,
+    'Shadow=' + normalized.shadow,
+    'MarginV=' + normalized.bottomMargin,
+  ];
+  if (normalized.backgroundBox) {
+    forceStyle.push('BorderStyle=3');
+    forceStyle.push('BackColour=' + buildAssBackgroundColor('black', String(normalized.backgroundOpacity)));
+  }
+  return forceStyle.join(',');
+}
+
+function escapeSubtitleForceStyle(value) {
+  return String(value || '').replace(/'/g, "\\'");
+}
+
+async function nextSubtitlePath(runDirectories, node, suffix = 'captions', extension = '.srt') {
+  return nextOutputPath(runDirectories, node, suffix, extension);
 }
 
 function escapeSubtitleFilterPath(filePath) {
   return path.resolve(filePath).replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
 }
 
-async function prepareSubtitleSource(captionArtifact, options = {}) {
-  const operationLabel = 'Burn Subtitles / Captions';
-  const captionMode = String(options.captionMode || 'auto').trim() || 'auto';
+function normalizeSubtitleCaptionMode(value, supportedModes, operationLabel) {
+  const mode = String(value || 'auto').trim() || 'auto';
+  if (supportedModes.includes(mode)) {
+    return mode;
+  }
+  throw new Error(operationLabel + ' needs a supported caption mode.');
+}
+
+function normalizeSubtitleOutputFormat(value, operationLabel) {
+  const outputFormat = String(value || 'srt').trim().toLowerCase() || 'srt';
+  if (outputFormat === 'srt' || outputFormat === 'vtt') {
+    return outputFormat;
+  }
+  throw new Error(operationLabel + ' can export SRT or VTT subtitles.');
+}
+
+function buildSubtitleContent(captions, outputFormat) {
+  return outputFormat === 'vtt' ? buildVttContent(captions) : buildSrtContent(captions);
+}
+
+function resolveSubtitleCaptions(captionArtifact, options = {}) {
+  const operationLabel = String(options.operationLabel || 'Subtitles').trim() || 'Subtitles';
+  const captionMode = normalizeSubtitleCaptionMode(options.captionMode, ['auto', 'transcriptSegments', 'manualLines'], operationLabel);
   const durationPerCaptionSeconds = Math.max(0.1, Number(options.durationPerCaptionSeconds || 3) || 3);
   const captionKind = String(captionArtifact?.kind || '').trim();
   if (!captionArtifact) {
-    throw new Error(operationLabel + ' needs captions, a transcript, or a subtitle file before it can run.');
+    throw new Error(operationLabel + ' needs captions or a transcript before it can run.');
+  }
+  if (captionKind !== PORT_KIND_TEXT) {
+    throw new Error(operationLabel + ' needs a text or transcript artifact for generated subtitle timing.');
   }
 
-  if ((captionMode === 'auto' || captionMode === 'transcriptSegments') && captionKind === PORT_KIND_TEXT) {
+  if (captionMode === 'auto' || captionMode === 'transcriptSegments') {
     const segments = extractTranscriptSegments(captionArtifact);
     if (segments.length) {
-      const subtitlePath = await nextSubtitlePath(options.runDirectories, options.node, 'transcript-captions');
-      await fs.writeFile(subtitlePath, buildSrtContent(segments), 'utf8');
-      return { captionCount: segments.length, mode: 'transcriptSegments', subtitleFormat: 'srt', subtitlePath };
+      return {
+        captionCount: segments.length,
+        captions: segments,
+        durationPerCaptionSeconds: null,
+        mode: 'transcriptSegments',
+        timingSource: 'transcriptSegments',
+      };
     }
     if (captionMode === 'transcriptSegments') {
       throw new Error(operationLabel + ' was set to transcript segments, but the caption input does not contain timed transcript segments.');
     }
+  }
+
+  if (captionMode === 'auto' || captionMode === 'manualLines') {
+    const captions = buildManualLineCaptions(captionArtifact.text, durationPerCaptionSeconds);
+    if (!captions.length) {
+      throw new Error(operationLabel + ' needs at least one non-empty caption line.');
+    }
+    return {
+      captionCount: captions.length,
+      captions,
+      durationPerCaptionSeconds,
+      mode: 'manualLines',
+      timingSource: 'manualLines',
+    };
+  }
+
+  throw new Error(operationLabel + ' could not turn the caption input into timed subtitles. Use Whisper transcript segments or a text artifact with caption lines.');
+}
+
+async function prepareSubtitleSource(captionArtifact, options = {}) {
+  const operationLabel = 'Burn Subtitles / Captions';
+  const captionMode = String(options.captionMode || 'auto').trim() || 'auto';
+  const captionKind = String(captionArtifact?.kind || '').trim();
+  if (!captionArtifact) {
+    throw new Error(operationLabel + ' needs captions, a transcript, or a subtitle file before it can run.');
   }
 
   if ((captionMode === 'auto' || captionMode === 'subtitleFile') && captionKind === PORT_KIND_FILE) {
@@ -876,21 +1193,69 @@ async function prepareSubtitleSource(captionArtifact, options = {}) {
     }
   }
 
-  if ((captionMode === 'auto' || captionMode === 'manualLines') && captionKind === PORT_KIND_TEXT) {
-    const captions = buildManualLineCaptions(captionArtifact.text, durationPerCaptionSeconds);
-    if (!captions.length) {
-      throw new Error(operationLabel + ' needs at least one non-empty caption line.');
-    }
-    const subtitlePath = await nextSubtitlePath(options.runDirectories, options.node, 'manual-captions');
-    await fs.writeFile(subtitlePath, buildSrtContent(captions), 'utf8');
-    return { captionCount: captions.length, mode: 'manualLines', subtitleFormat: 'srt', subtitlePath };
+  const textMode = normalizeSubtitleCaptionMode(captionMode, ['auto', 'transcriptSegments', 'manualLines', 'subtitleFile'], operationLabel);
+  if (textMode === 'subtitleFile') {
+    throw new Error(operationLabel + ' needs an .srt or .vtt file for subtitle file mode.');
   }
-
-  throw new Error(operationLabel + ' could not turn the caption input into timed subtitles. Use Whisper transcript segments, a text artifact with caption lines, or an .srt/.vtt file.');
+  const resolved = resolveSubtitleCaptions(captionArtifact, {
+    captionMode: textMode,
+    durationPerCaptionSeconds: options.durationPerCaptionSeconds,
+    operationLabel,
+  });
+  const suffix = resolved.mode === 'transcriptSegments' ? 'transcript-captions' : 'manual-captions';
+  const subtitlePath = await nextSubtitlePath(options.runDirectories, options.node, suffix, '.ass');
+  await fs.writeFile(subtitlePath, buildAssContent(resolved.captions, options), 'utf8');
+  return { captionCount: resolved.captionCount, mode: resolved.mode, subtitleFormat: 'ass', subtitlePath };
 }
 
-function buildBurnSubtitlesCommandArgs(sourcePath, subtitlePath, outputPath) {
-  const filter = "subtitles='" + escapeSubtitleFilterPath(subtitlePath) + "'";
+async function exportSubtitlesArtifact(captionArtifact, options = {}) {
+  const operationLabel = 'Export Subtitles';
+  const outputFormat = normalizeSubtitleOutputFormat(options.outputFormat, operationLabel);
+  const resolved = resolveSubtitleCaptions(captionArtifact, {
+    captionMode: options.captionMode || 'auto',
+    durationPerCaptionSeconds: options.durationPerCaptionSeconds,
+    operationLabel,
+  });
+  const outputPath = await nextOutputPath(options.runDirectories, options.node, 'subtitles', '.' + outputFormat);
+  const subtitleText = buildSubtitleContent(resolved.captions, outputFormat);
+  await fs.writeFile(outputPath, subtitleText, 'utf8');
+  if (!(await fs.pathExists(outputPath))) {
+    throw new Error(operationLabel + ' could not write the subtitle file.');
+  }
+  const subtitleExport = {
+    captionCount: resolved.captionCount,
+    captionMode: resolved.mode,
+    captionSource: buildArtifactReference(captionArtifact),
+    createdBy: buildCreatedBy(options.node, 'exportSubtitles'),
+    durationPerCaptionSeconds: resolved.mode === 'manualLines' ? resolved.durationPerCaptionSeconds : null,
+    operation: 'exportSubtitles',
+    operationId: 'exportSubtitles',
+    outputFormat,
+    segmentTimingSource: resolved.timingSource,
+  };
+  const artifact = await buildFileArtifact(outputPath, {
+    displayName: String(options.displayName || options.node?.label || 'Exported subtitles').trim() || 'Exported subtitles',
+    kind: PORT_KIND_FILE,
+    role: 'generated',
+    subtitleExport,
+  });
+  artifact.subtitleExport = subtitleExport;
+  artifact.summary = summarizeArtifact(artifact);
+  const metadataPaths = await saveSubtitleExportArtifactMetadata(outputPath, artifact);
+  if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
+  return {
+    destinationPath: outputPath,
+    message: operationLabel + ' created a .' + outputFormat + ' subtitle file.',
+    outputs: { subtitles: artifact },
+    preview: summarizeArtifact(artifact),
+  };
+}
+
+function buildBurnSubtitlesCommandArgs(sourcePath, subtitlePath, outputPath, style = {}) {
+  const extension = path.extname(String(subtitlePath || '')).toLowerCase();
+  const filter = extension === '.ass'
+    ? "subtitles='" + escapeSubtitleFilterPath(subtitlePath) + "'"
+    : "subtitles='" + escapeSubtitleFilterPath(subtitlePath) + "':force_style='" + escapeSubtitleForceStyle(buildSubtitleForceStyle(style, { alignmentMode: 'filter' })) + "'";
   return {
     args: [
       '-y', '-i', sourcePath,
@@ -899,7 +1264,7 @@ function buildBurnSubtitlesCommandArgs(sourcePath, subtitlePath, outputPath) {
       '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
       '-c:a', 'aac', '-movflags', '+faststart', outputPath,
     ],
-    mode: 'burn-subtitles-filter',
+    mode: extension === '.ass' ? 'burn-ass-subtitles-filter' : 'burn-subtitles-filter',
   };
 }
 
@@ -908,10 +1273,11 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
   const outputFormat = normalizeVideoOutputFormat(options.outputFormat, operationLabel);
   const sourcePath = await resolveSourceVideoPath(videoArtifact, operationLabel);
   const subtitleSource = await prepareSubtitleSource(captionArtifact, options);
+  const subtitleStyle = normalizeSubtitleStyle(options);
   const outputPath = await nextOutputPath(options.runDirectories, options.node, 'captioned', '.' + outputFormat);
   options.reportProgress?.('Burning captions.', 'Rendering timed captions directly into the video with the bundled ffmpeg runtime...');
   const ffmpegPath = resolveFfmpegPath();
-  const command = buildBurnSubtitlesCommandArgs(sourcePath, subtitleSource.subtitlePath, outputPath);
+  const command = buildBurnSubtitlesCommandArgs(sourcePath, subtitleSource.subtitlePath, outputPath, subtitleStyle);
   const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true });
   if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
     const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
@@ -932,6 +1298,7 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
     operationId: 'burnSubtitles',
     outputFormat,
     position: 'bottom',
+    style: subtitleStyle,
     sourceVideo: buildVideoReference(videoArtifact),
   };
   const artifact = await buildFileArtifact(outputPath, {
@@ -959,6 +1326,7 @@ module.exports = {
   normalizeVideoCollectionArtifact,
   trimMediaArtifact,
   burnSubtitlesIntoVideoArtifact,
+  exportSubtitlesArtifact,
   _test: {
     buildAudioCommandArgs,
     buildAudioNormalizeCommandArgs,
@@ -966,8 +1334,16 @@ module.exports = {
     buildVideoNormalizeCommandArgs,
     buildTrimCommandArgs,
     buildBurnSubtitlesCommandArgs,
+    buildAssContent,
     buildSrtContent,
+    buildVttContent,
+    resolveSubtitleCaptions,
     prepareSubtitleSource,
     normalizeFramePosition,
+    normalizeTimestampSeconds,
+    normalizeSubtitleStyle,
+    getSubtitleAssAlignment,
+    getSubtitleFilterAlignment,
+    buildSubtitleForceStyle,
   },
 };

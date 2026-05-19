@@ -77,6 +77,62 @@ assert.strictEqual(getModelStepOperationId(continuationStep), PIPELINE_OPERATION
 assert.strictEqual(continuationStep.config.audioMode, 'continuation', 'AudioCraft continuation should use continuation mode.');
 assert.strictEqual(continuationStep.config.appendSource, true, 'AudioCraft continuation should append the source by default.');
 
+function nodeByType(pipeline, type, message) {
+  const found = pipeline.nodes.find((entry) => entry.type === type) || null;
+  assert(found, message || ('Expected node type ' + type + '.'));
+  return found;
+}
+function hasEdge(pipeline, source, sourcePort, target, targetPort) {
+  return pipeline.edges.some((edge) => edge.source?.nodeId === source.id && edge.source?.portId === sourcePort && edge.target?.nodeId === target.id && edge.target?.portId === targetPort);
+}
+
+const exportSubsResult = instantiatePipelineTemplate('export-subtitles-from-video', allReadyContext);
+assert(exportSubsResult.ok, 'Export subtitles from video template should instantiate.');
+const exportSubs = exportSubsResult.pipeline;
+const exportSubsVideo = nodeByType(exportSubs, 'videoInput', 'Export subtitles template should include Video Input.');
+const exportSubsAudio = nodeByType(exportSubs, 'extractAudio', 'Export subtitles template should include Extract Audio.');
+const exportSubsWhisper = exportSubs.nodes.find((entry) => entry.type === 'llmPrompt' && getModelStepOperationId(entry) === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE);
+assert(exportSubsWhisper, 'Export subtitles template should include a Whisper Model Step.');
+const exportSubsNode = nodeByType(exportSubs, 'exportSubtitles', 'Export subtitles template should include Export Subtitles.');
+const exportSubsOutput = nodeByType(exportSubs, 'fileOutput', 'Export subtitles template should include File Output.');
+assert(hasEdge(exportSubs, exportSubsVideo, 'video', exportSubsAudio, 'video'), 'Video Input should feed Extract Audio.');
+assert(hasEdge(exportSubs, exportSubsAudio, 'audio', exportSubsWhisper, 'prompt'), 'Extract Audio should feed Whisper.');
+assert(hasEdge(exportSubs, exportSubsWhisper, 'text', exportSubsNode, 'captions'), 'Whisper transcript should feed Export Subtitles captions.');
+assert(hasEdge(exportSubs, exportSubsNode, 'subtitles', exportSubsOutput, 'file'), 'Export Subtitles should feed File Output.');
+assert.strictEqual(exportSubsNode.config.outputFormat, 'srt', 'Export subtitles template should default Export Subtitles to SRT.');
+assert(['auto', 'transcriptSegments'].includes(exportSubsNode.config.captionMode), 'Export subtitles template should use transcript-aware subtitle timing.');
+assert(/standalone subtitle file/i.test(exportSubs.description), 'Export subtitles template notes should explain standalone subtitle output.');
+assert(/Whisper timestamped segments/i.test(exportSubs.description), 'Export subtitles template notes should explain Whisper timing.');
+const missingWhisperExportSubs = getPipelineTemplateReadiness('export-subtitles-from-video', { ...allReadyContext, tools: allReadyContext.tools.filter((entry) => entry.id !== 'whisper') });
+assert.strictEqual(missingWhisperExportSubs.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Export subtitles template should report missing Whisper.');
+assert(missingWhisperExportSubs.missingTools.some((entry) => /whisper/i.test(entry)), 'Export subtitles readiness should explain the missing Whisper requirement.');
+const configurableExportSubs = getPipelineTemplateReadiness('export-subtitles-from-video', allReadyContext);
+assert.strictEqual(configurableExportSubs.status, TEMPLATE_STATUS.CONFIGURABLE, 'Export subtitles template should remain configurable for source video and Whisper settings.');
+
+const subtitledVideoResult = instantiatePipelineTemplate('generate-subtitled-video-from-video', allReadyContext);
+assert(subtitledVideoResult.ok, 'Generate subtitled video template should instantiate.');
+const subtitledVideo = subtitledVideoResult.pipeline;
+const subtitledVideoInput = nodeByType(subtitledVideo, 'videoInput', 'Subtitled video template should include Video Input.');
+const subtitledExtractAudio = nodeByType(subtitledVideo, 'extractAudio', 'Subtitled video template should include Extract Audio.');
+const subtitledWhisper = subtitledVideo.nodes.find((entry) => entry.type === 'llmPrompt' && getModelStepOperationId(entry) === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE);
+assert(subtitledWhisper, 'Subtitled video template should include a Whisper Model Step.');
+const subtitledBurn = nodeByType(subtitledVideo, 'burnSubtitles', 'Subtitled video template should include Burn Subtitles / Captions.');
+const subtitledOutput = nodeByType(subtitledVideo, 'videoOutput', 'Subtitled video template should include Video Output.');
+assert(hasEdge(subtitledVideo, subtitledVideoInput, 'video', subtitledExtractAudio, 'video'), 'Video Input should feed Extract Audio in subtitled video template.');
+assert(hasEdge(subtitledVideo, subtitledExtractAudio, 'audio', subtitledWhisper, 'prompt'), 'Extract Audio should feed Whisper in subtitled video template.');
+assert(hasEdge(subtitledVideo, subtitledVideoInput, 'video', subtitledBurn, 'video'), 'Original Video Input should feed Burn Subtitles video input.');
+assert(hasEdge(subtitledVideo, subtitledWhisper, 'text', subtitledBurn, 'captions'), 'Whisper transcript should feed Burn Subtitles captions input.');
+assert(hasEdge(subtitledVideo, subtitledBurn, 'video', subtitledOutput, 'video'), 'Burn Subtitles should feed Video Output.');
+assert(['auto', 'transcriptSegments'].includes(subtitledBurn.config.captionMode), 'Subtitled video template should use transcript-aware burn timing.');
+assert(/burns captions directly into the video/i.test(subtitledVideo.description), 'Subtitled video template notes should explain burned captions.');
+assert(/Export subtitles from video/i.test(subtitledVideo.description), 'Subtitled video template notes should point users to reusable subtitle export.');
+assert(!subtitledVideo.nodes.some((entry) => entry.type === 'exportSubtitles'), 'Subtitled video template should not require Export Subtitles.');
+const missingWhisperSubtitledVideo = getPipelineTemplateReadiness('generate-subtitled-video-from-video', { ...allReadyContext, tools: allReadyContext.tools.filter((entry) => entry.id !== 'whisper') });
+assert.strictEqual(missingWhisperSubtitledVideo.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Subtitled video template should report missing Whisper.');
+assert(missingWhisperSubtitledVideo.missingTools.some((entry) => /whisper/i.test(entry)), 'Subtitled video readiness should explain the missing Whisper requirement.');
+const configurableSubtitledVideo = getPipelineTemplateReadiness('generate-subtitled-video-from-video', allReadyContext);
+assert.strictEqual(configurableSubtitledVideo.status, TEMPLATE_STATUS.CONFIGURABLE, 'Subtitled video template should remain configurable for source video and Whisper settings.');
+
 const audioPlanResult = instantiatePipelineTemplate('audio-idea-to-prompt-collection', allReadyContext);
 assert(audioPlanResult.ok, 'Audio idea planning template should instantiate.');
 const audioPlanPipeline = audioPlanResult.pipeline;

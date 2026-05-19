@@ -671,6 +671,20 @@ function serializeSubtitleBurnForUi(burn = null) {
   }) ? normalized : null;
 }
 
+function serializeSubtitleExportForUi(exportData = null) {
+  if (!exportData || typeof exportData !== 'object') {
+    return null;
+  }
+  const normalized = serializeArtifactForUi(exportData);
+  normalized.operation = String(normalized.operation || normalized.operationId || 'exportSubtitles').trim() || 'exportSubtitles';
+  normalized.operationId = String(normalized.operationId || normalized.operation || 'exportSubtitles').trim() || 'exportSubtitles';
+  return Object.entries(normalized).some(([, value]) => {
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === 'object') return true;
+    return Boolean(value) || value === 0;
+  }) ? normalized : null;
+}
+
 function serializeVideoStitchForUi(stitch = null) {
   if (!stitch || typeof stitch !== 'object') {
     return null;
@@ -710,7 +724,7 @@ function serializeVideoFrameExtractionForUi(extraction = null) {
     backendLabel: String(extraction.backendLabel || 'Bundled ffmpeg').trim() || 'Bundled ffmpeg',
     createdBy: extraction.createdBy && typeof extraction.createdBy === 'object' ? serializeArtifactForUi(extraction.createdBy) : null,
     ffmpegMode: String(extraction.ffmpegMode || '').trim(),
-    framePosition: String(extraction.framePosition || 'first').trim() === 'last' ? 'last' : 'first',
+    framePosition: ['last', 'timestamp'].includes(String(extraction.framePosition || 'first').trim()) ? String(extraction.framePosition || 'first').trim() : 'first',
     operationId: String(extraction.operationId || 'extractVideoFrame').trim() || 'extractVideoFrame',
     outputFormat: String(extraction.outputFormat || 'png').trim() || 'png',
     sourceVideo: extraction.sourceVideo && typeof extraction.sourceVideo === 'object' ? serializeArtifactForUi(extraction.sourceVideo) : null,
@@ -1705,6 +1719,13 @@ async function buildFileArtifact(filePath, options = {}) {
     }
   }
 
+  if (kind === PORT_KIND_FILE) {
+    const subtitleExport = serializeSubtitleExportForUi(options.subtitleExport);
+    if (subtitleExport) {
+      artifact.subtitleExport = subtitleExport;
+    }
+  }
+
   if (kind === PORT_KIND_VIDEO || String(mimeType || '').toLowerCase().startsWith('video/')) {
     const videoGeneration = serializeVideoGenerationForUi(options.videoGeneration);
     if (videoGeneration) {
@@ -2089,6 +2110,25 @@ async function saveVideoArtifactMetadata(filePath, artifact) {
   return [metadataPath];
 }
 
+async function saveSubtitleExportArtifactMetadata(filePath, artifact) {
+  const subtitleExport = serializeSubtitleExportForUi(artifact?.subtitleExport);
+  if (!subtitleExport) {
+    return [];
+  }
+
+  const metadataPath = path.join(path.dirname(filePath), path.basename(filePath, path.extname(filePath)) + '.subtitle.json');
+  await fs.writeJson(metadataPath, {
+    displayName: String(artifact?.displayName || '').trim(),
+    fileName: String(artifact?.fileName || '').trim(),
+    formatLabel: String(artifact?.formatLabel || '').trim(),
+    kind: String(artifact?.kind || PORT_KIND_FILE).trim() || PORT_KIND_FILE,
+    subtitleExport,
+    summary: String(artifact?.summary || '').trim(),
+  }, { spaces: 2 });
+
+  return [metadataPath];
+}
+
 async function saveArtifactIntoDirectory(directoryPath, artifact, options = {}) {
   const itemIndex = Number(options.itemIndex || 0) || 0;
   const baseName = `${String(itemIndex + 1).padStart(3, '0')}-${sanitizeSegment(options.baseName || artifact?.displayName || artifact?.fileName || artifact?.kind || 'item', 'item')}`;
@@ -2126,7 +2166,9 @@ async function saveArtifactIntoDirectory(directoryPath, artifact, options = {}) 
       ? await saveImageArtifactMetadata(filePath, artifact)
       : artifact.kind === PORT_KIND_VIDEO
         ? await saveVideoArtifactMetadata(filePath, artifact)
-        : [];
+        : artifact.kind === PORT_KIND_FILE
+          ? await saveSubtitleExportArtifactMetadata(filePath, artifact)
+          : [];
 
   const savedArtifact = await buildFileArtifact(filePath, {
     audio: artifact.audio,
@@ -2145,6 +2187,7 @@ async function saveArtifactIntoDirectory(directoryPath, artifact, options = {}) 
     videoNormalization: artifact.videoNormalization,
     mediaTrim: artifact.mediaTrim,
     subtitleBurn: artifact.subtitleBurn,
+    subtitleExport: artifact.subtitleExport,
     videoStitch: artifact.videoStitch,
     kind: artifact.kind,
     role: options.role || artifact.role || 'artifact',
@@ -2486,7 +2529,9 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
       ? await saveImageArtifactMetadata(filePath, artifact)
       : artifact.kind === PORT_KIND_VIDEO
         ? await saveVideoArtifactMetadata(filePath, artifact)
-        : [];
+        : artifact.kind === PORT_KIND_FILE
+          ? await saveSubtitleExportArtifactMetadata(filePath, artifact)
+          : [];
 
   const savedArtifact = await buildFileArtifact(filePath, {
     audio: artifact.audio,
@@ -2505,6 +2550,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     videoNormalization: artifact.videoNormalization,
     mediaTrim: artifact.mediaTrim,
     subtitleBurn: artifact.subtitleBurn,
+    subtitleExport: artifact.subtitleExport,
     videoStitch: artifact.videoStitch,
     kind: artifact.kind,
     role: 'output',
@@ -2542,6 +2588,7 @@ function buildTerminalResult(node, artifact) {
     videoNormalization: artifact?.videoNormalization ? serializeArtifactForUi(artifact.videoNormalization) : null,
     mediaTrim: artifact?.mediaTrim ? serializeArtifactForUi(artifact.mediaTrim) : null,
     subtitleBurn: artifact?.subtitleBurn ? serializeArtifactForUi(artifact.subtitleBurn) : null,
+    subtitleExport: artifact?.subtitleExport ? serializeArtifactForUi(artifact.subtitleExport) : null,
     videoStitch: artifact?.videoStitch ? serializeArtifactForUi(artifact.videoStitch) : null,
     filePath: artifact?.filePath || '',
     fileUrl: artifact?.fileUrl || '',
@@ -2791,6 +2838,7 @@ async function describeArtifactForLlm(artifact) {
     artifact.videoFrameExtraction?.sourceVideo?.fileName ? 'Source video: ' + artifact.videoFrameExtraction.sourceVideo.fileName : '',
     artifact.videoNormalization?.sourceVideo?.fileName ? 'Normalized video from: ' + artifact.videoNormalization.sourceVideo.fileName : '',
     artifact.subtitleBurn?.captionSource?.displayName ? 'Captions burned from: ' + artifact.subtitleBurn.captionSource.displayName : '',
+    artifact.subtitleExport?.captionSource?.displayName ? 'Subtitles exported from: ' + artifact.subtitleExport.captionSource.displayName : '',
     artifact.audioGeneration?.backendLabel ? 'Generated by: ' + artifact.audioGeneration.backendLabel : '',
     artifact.audioGeneration?.toolLabel ? 'Tool: ' + artifact.audioGeneration.toolLabel : '',
     artifact.audioGeneration?.model ? 'Model: ' + artifact.audioGeneration.model : '',
@@ -2833,6 +2881,7 @@ module.exports = {
   sanitizeSegment,
   saveAudioArtifactMetadata,
   saveImageArtifactMetadata,
+  saveSubtitleExportArtifactMetadata,
   saveVideoArtifactMetadata,
   serializeArtifactForUi,
   summarizeArtifact,
