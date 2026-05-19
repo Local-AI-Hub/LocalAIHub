@@ -41,7 +41,7 @@ const {
   isLikelySupportOnlyStableDiffusionModel,
 } = require('./toolAssetSelection.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 8;
+const PIPELINE_SCHEMA_VERSION = 12;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
@@ -156,6 +156,14 @@ const COLLECTION_MAP_MAPPING_OPTIONS = Object.freeze([
     modes: Object.freeze(['cloud', 'localTool']),
   }),
   Object.freeze({
+    id: 'textToVideo',
+    label: 'Text to video',
+    inputKind: PORT_KIND_TEXT,
+    outputKind: PORT_KIND_VIDEO,
+    operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+    modes: Object.freeze(['cloud', 'localTool']),
+  }),
+  Object.freeze({
     id: 'imageToImage',
     label: 'Image to image',
     inputKind: PORT_KIND_IMAGE,
@@ -217,7 +225,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   imageInput: Object.freeze({
     type: 'imageInput',
-    label: 'Image File',
+    label: 'Image Input',
     category: 'Inputs',
     description: 'Supplies an image file to later nodes.',
     inputPorts: [],
@@ -234,7 +242,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   audioInput: Object.freeze({
     type: 'audioInput',
-    label: 'Audio File',
+    label: 'Audio Input',
     category: 'Inputs',
     description: 'Supplies an audio file path to later nodes.',
     inputPorts: [],
@@ -251,7 +259,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   videoInput: Object.freeze({
     type: 'videoInput',
-    label: 'Video File',
+    label: 'Video Input',
     category: 'Inputs',
     description: 'Supplies a video file to later nodes.',
     inputPorts: [],
@@ -546,7 +554,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   validation: Object.freeze({
     type: 'validation',
     label: 'Validation',
-    category: 'Validation',
+    category: 'AI Steps',
     description: 'Evaluates incoming content and routes it to pass or fail.',
     inputPorts: [
       {
@@ -668,7 +676,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   collectionBuilder: Object.freeze({
     type: 'collectionBuilder',
     label: 'Collection Builder',
-    category: 'Flow',
+    category: 'Deterministic Media Operations',
     description: 'Builds an ordered collection from compatible single artifacts and can extend an existing collection.',
     inputPorts: [
       {
@@ -704,7 +712,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   collectionMap: Object.freeze({
     type: 'collectionMap',
     label: 'Map Collection',
-    category: 'Flow',
+    category: 'AI Steps',
     description: 'Applies one supported operation to every item in an ordered typed collection and emits a same-order typed collection with item lineage preserved.',
     inputPorts: [
       {
@@ -740,6 +748,12 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       imageSize: '1024x1024',
       imageQuality: 'auto',
       imageBackground: 'auto',
+      videoSize: '1280x720',
+      videoFps: 15,
+      videoQuality: 5,
+      videoItemMode: 'independent',
+      videoChainFirstItemBehavior: 'textToVideo',
+      videoInitialReferenceImagePath: '',
       negativePrompt: '',
       promptStyleId: '',
       width: 832,
@@ -831,7 +845,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   audioStitch: Object.freeze({
     type: 'audioStitch',
     label: 'Audio Stitch',
-    category: 'Flow',
+    category: 'Deterministic Media Operations',
     description: 'Concatenates an ordered audio collection into one WAV artifact.',
     inputPorts: [
       {
@@ -853,10 +867,209 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       gapSeconds: 0,
     },
   }),
+  videoStitch: Object.freeze({
+    type: 'videoStitch',
+    label: 'Video Stitch',
+    category: 'Deterministic Media Operations',
+    description: 'Concatenates an ordered video collection into one MP4 artifact.',
+    inputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_VIDEO,
+        collectionBehavior: 'only',
+        label: 'Video Collection',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Stitched Video',
+      },
+    ],
+    configDefaults: {
+      outputFormat: 'mp4',
+    },
+  }),
+  normalizeAudioCollection: Object.freeze({
+    type: 'normalizeAudioCollection',
+    label: 'Normalize Audio Collection',
+    category: 'Deterministic Media Operations',
+    description: 'Converts every audio item in a collection to matching WAV settings while preserving order.',
+    inputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_AUDIO,
+        collectionBehavior: 'only',
+        label: 'Audio Collection',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_AUDIO,
+        collectionBehavior: 'only',
+        label: 'Normalized',
+      },
+    ],
+    configDefaults: {
+      outputFormat: 'wav',
+      sampleRate: 44100,
+      channels: 'stereo',
+      pcmFormat: 'pcm_s16le',
+    },
+  }),
+  normalizeVideoCollection: Object.freeze({
+    type: 'normalizeVideoCollection',
+    label: 'Normalize Video Collection',
+    category: 'Deterministic Media Operations',
+    description: 'Converts every video item in a collection to matching MP4 settings while preserving order.',
+    inputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_VIDEO,
+        collectionBehavior: 'only',
+        label: 'Video Collection',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'collection',
+        kind: PORT_KIND_VIDEO,
+        collectionBehavior: 'only',
+        label: 'Normalized',
+      },
+    ],
+    configDefaults: {
+      outputFormat: 'mp4',
+      sizeMode: 'matchFirst',
+      width: 1280,
+      height: 720,
+      fps: 30,
+      videoCodec: 'libx264',
+      audioCodec: 'aac',
+      pixelFormat: 'yuv420p',
+    },
+  }),
+  trimMedia: Object.freeze({
+    type: 'trimMedia',
+    label: 'Trim Media',
+    category: 'Deterministic Media Operations',
+    description: 'Trims an audio or video artifact to a selected time range.',
+    inputPorts: [
+      {
+        id: 'media',
+        kind: PORT_KIND_ANY,
+        allowedKinds: [PORT_KIND_AUDIO, PORT_KIND_VIDEO],
+        label: 'Media',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'trimmed',
+        kind: PORT_KIND_PASSTHROUGH,
+        label: 'Trimmed',
+        passthroughFrom: 'media',
+      },
+    ],
+    configDefaults: {
+      mode: 'duration',
+      startSeconds: 0,
+      durationSeconds: 5,
+      endSeconds: 5,
+    },
+  }),
+  burnSubtitles: Object.freeze({
+    type: 'burnSubtitles',
+    label: 'Burn Subtitles / Captions',
+    category: 'Deterministic Media Operations',
+    description: 'Renders timed captions directly into a video.',
+    inputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
+        required: true,
+      },
+      {
+        id: 'captions',
+        kind: PORT_KIND_ANY,
+        allowedKinds: [PORT_KIND_TEXT, PORT_KIND_FILE],
+        label: 'Captions',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Captioned Video',
+      },
+    ],
+    configDefaults: {
+      captionMode: 'auto',
+      durationPerCaptionSeconds: 3,
+      outputFormat: 'mp4',
+      position: 'bottom',
+    },
+  }),
+  extractVideoFrame: Object.freeze({
+    type: 'extractVideoFrame',
+    label: 'Extract Video Frame',
+    category: 'Deterministic Media Operations',
+    description: 'Extracts the first or last frame from a video as an image.',
+    inputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        label: 'Frame Image',
+      },
+    ],
+    configDefaults: {
+      framePosition: 'first',
+      outputFormat: 'png',
+    },
+  }),
+  extractAudio: Object.freeze({
+    type: 'extractAudio',
+    label: 'Extract Audio',
+    category: 'Deterministic Media Operations',
+    description: 'Extracts the audio track from a video as a WAV artifact.',
+    inputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'audio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Extracted Audio',
+      },
+    ],
+    configDefaults: {
+      outputFormat: 'wav',
+    },
+  }),
   mediaComposition: Object.freeze({
     type: 'mediaComposition',
     label: 'Media Composition',
-    category: 'Flow',
+    category: 'Deterministic Media Operations',
     description: 'Builds a reusable media composition from an ordered image collection with optional narration and optional background music.',
     inputPorts: [
       {
@@ -891,7 +1104,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   mediaExport: Object.freeze({
     type: 'mediaExport',
     label: 'Media Export',
-    category: 'Flow',
+    category: 'Deterministic Media Operations',
     description: 'Renders a saved media composition into a video artifact through the shared export path.',
     inputPorts: [
       {
@@ -1450,6 +1663,9 @@ function getCollectionMapLocalToolIds(node) {
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
     return AUDIO_WORKFLOW_TOOL_IDS;
   }
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+    return VIDEO_WORKFLOW_TOOL_IDS;
+  }
   return IMAGE_WORKFLOW_TOOL_IDS;
 }
 
@@ -1458,6 +1674,25 @@ function isCollectionMapAudioContinuationChainEnabled(node) {
     && getCollectionMapInputKind(node) === PORT_KIND_TEXT
     && getCollectionMapOutputKind(node) === PORT_KIND_AUDIO
     && String(node?.config?.audiocraftItemMode || '').trim() === 'sequentialContinuation';
+}
+
+function getCollectionMapVideoItemMode(node) {
+  return String(node?.config?.videoItemMode || '').trim() === 'sequentialLastFrame'
+    ? 'sequentialLastFrame'
+    : 'independent';
+}
+
+function getCollectionMapVideoFirstItemBehavior(node) {
+  return String(node?.config?.videoChainFirstItemBehavior || '').trim() === 'initialReferenceImage'
+    ? 'initialReferenceImage'
+    : 'textToVideo';
+}
+
+function isCollectionMapVideoContinuationChainEnabled(node) {
+  return getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+    && getCollectionMapInputKind(node) === PORT_KIND_TEXT
+    && getCollectionMapOutputKind(node) === PORT_KIND_VIDEO
+    && getCollectionMapVideoItemMode(node) === 'sequentialLastFrame';
 }
 
 function getCollectionMapFallbackTargetLabel(node) {
@@ -1473,6 +1708,9 @@ function getCollectionMapFallbackTargetLabel(node) {
   }
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
     return 'Upscayl';
+  }
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+    return 'Wan2.1 WebUI';
   }
   return 'Automatic1111 or Forge';
 }
@@ -5145,6 +5383,12 @@ function analyzePipeline(definition = {}, context = {}) {
             message: validationIssue.message,
           };
           issues.push(buildNodeIssue(node, validationIssue.tone, validationIssue.message));
+        } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && isCollectionMapVideoContinuationChainEnabled(node) && executionMode !== 'localTool') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Sequential video continuity uses Wan2.1 image-to-video with a generated last-frame reference, so it is only available in local tool mode in this pass. Use independent clips for cloud video mapping.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (executionMode === 'graphWorkflow') {
           const ready = analyzeCollectionMapGraphWorkflowNode(node, summary, contextMaps);
           if (!ready || summary.readiness.tone === 'error') {
@@ -5175,6 +5419,24 @@ function analyzePipeline(definition = {}, context = {}) {
               message: 'Sequential AudioCraft continuation maps need a segment duration greater than zero seconds.',
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && isCollectionMapVideoContinuationChainEnabled(node) && selectedToolId && selectedToolId !== 'wan21-webui') {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Sequential video continuity is only wired to Wan2.1 WebUI in this pass because it needs real image-to-video support for the generated last-frame reference.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && isCollectionMapVideoContinuationChainEnabled(node) && getCollectionMapVideoFirstItemBehavior(node) === 'initialReferenceImage' && !String(node.config?.videoInitialReferenceImagePath || '').trim()) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Choose an initial reference image or set the first video chain item to start as text-to-video.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && String(node.config?.videoSize || '').trim() && !['832x480', '1280x720'].includes(String(node.config?.videoSize || '').trim())) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Wan2.1 collection video maps currently support 832x480 or 1280x720. Choose one of those sizes before running this map.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
           } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE && (Number(node.config?.width || 0) < 256 || Number(node.config?.height || 0) < 256)) {
             summary.readiness = {
               tone: 'error',
@@ -5202,7 +5464,9 @@ function analyzePipeline(definition = {}, context = {}) {
             } else if (summary.readiness.tone === 'warn') {
               summary.readiness = {
                 tone: 'warn',
-                message: summary.readiness.message + ' Map Collection will run this once per item and stop on the first failed item.',
+                message: summary.readiness.message + (isCollectionMapVideoContinuationChainEnabled(node)
+                  ? ' Map Collection will render accepted items as a Wan previous-last-frame chain and can output a partial video collection if that mode is enabled.'
+                  : ' Map Collection will run this once per item and stop on the first failed item.'),
               };
               issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
             } else {
@@ -5210,7 +5474,9 @@ function analyzePipeline(definition = {}, context = {}) {
                 tone: 'info',
                 message: isCollectionMapAudioContinuationChainEnabled(node)
                   ? 'AudioCraft WebUI will generate this text collection as a sequential continuation chain, emit ordered audio segments, and record the final cumulative track in the collection manifest.'
-                  : summary.readiness.message + ' Map Collection will emit an ordered ' + formatPortKindLabel(createCollectionPortKind(mapping.outputKind)).toLowerCase() + ' and keep item lineage.',
+                  : isCollectionMapVideoContinuationChainEnabled(node)
+                    ? 'Wan2.1 WebUI will render this text collection as an ordered video collection. The first item follows the configured first-item behavior, later accepted items use the previous clip last frame as the next reference image, and ffmpeg frame extraction plus chain metadata are recorded in the manifest.'
+                    : summary.readiness.message + ' Map Collection will emit an ordered ' + formatPortKindLabel(createCollectionPortKind(mapping.outputKind)).toLowerCase() + ' and keep item lineage.',
               };
               issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
             }
@@ -5347,6 +5613,241 @@ function analyzePipeline(definition = {}, context = {}) {
           summary.readiness = {
             tone: 'info',
             message: 'This step concatenates the ordered audio collection into a single WAV artifact.',
+          };
+        }
+      }
+
+      if (node.type === 'videoStitch') {
+        const collectionKinds = getIncomingKindsForNodePort(node, 'collection', graph);
+        const outputFormat = String(node.config?.outputFormat || 'mp4').trim().toLowerCase();
+        if (!collectionKinds.includes(createCollectionPortKind(PORT_KIND_VIDEO))) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect an ordered video collection before stitching it into one MP4 file.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (outputFormat && outputFormat !== 'mp4') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Video Stitch currently writes MP4 output only. Leave the output format as mp4 for this pass.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step concatenates the ordered video collection into a single MP4 artifact. Source clips must already be concat-compatible.',
+          };
+        }
+      }
+
+      if (node.type === 'normalizeAudioCollection') {
+        const collectionKinds = getIncomingKindsForNodePort(node, 'collection', graph);
+        const outputFormat = String(node.config?.outputFormat || 'wav').trim().toLowerCase();
+        const sampleRate = Number(node.config?.sampleRate || 0) || 0;
+        const channels = String(node.config?.channels || 'stereo').trim().toLowerCase();
+        if (!collectionKinds.includes(createCollectionPortKind(PORT_KIND_AUDIO))) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect an ordered audio collection before normalizing it.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (outputFormat && outputFormat !== 'wav') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Normalize Audio Collection writes WAV output in this pass. Leave the output format as wav.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (sampleRate <= 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a positive sample rate for normalized audio.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (channels !== 'mono' && channels !== 'stereo') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Normalize Audio Collection supports mono or stereo output.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step converts every audio item to matching WAV settings and preserves collection order.',
+          };
+        }
+      }
+
+      if (node.type === 'normalizeVideoCollection') {
+        const collectionKinds = getIncomingKindsForNodePort(node, 'collection', graph);
+        const outputFormat = String(node.config?.outputFormat || 'mp4').trim().toLowerCase();
+        const sizeMode = String(node.config?.sizeMode || 'matchFirst').trim() === 'custom' ? 'custom' : 'matchFirst';
+        const fps = Number(node.config?.fps || 0) || 0;
+        const width = Number(node.config?.width || 0) || 0;
+        const height = Number(node.config?.height || 0) || 0;
+        if (!collectionKinds.includes(createCollectionPortKind(PORT_KIND_VIDEO))) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect an ordered video collection before normalizing it.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (outputFormat && outputFormat !== 'mp4') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Normalize Video Collection writes MP4 output in this pass. Leave the output format as mp4.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (fps <= 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a positive FPS value for normalized video.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (sizeMode === 'custom' && (width <= 0 || height <= 0)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a positive width and height for custom video normalization.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step converts every video item to matching MP4 settings and preserves collection order.',
+          };
+        }
+      }
+
+      if (node.type === 'trimMedia') {
+        const mediaKinds = getIncomingKindsForNodePort(node, 'media', graph);
+        const mode = String(node.config?.mode || 'duration').trim() === 'end' ? 'end' : 'duration';
+        const startSeconds = Number(node.config?.startSeconds || 0) || 0;
+        const durationSeconds = Number(node.config?.durationSeconds || 0) || 0;
+        const endSeconds = Number(node.config?.endSeconds || 0) || 0;
+        const acceptsMedia = mediaKinds.includes(PORT_KIND_AUDIO) || mediaKinds.includes(PORT_KIND_VIDEO);
+        if (!acceptsMedia) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect an audio or video artifact before trimming media.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (startSeconds < 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Trim Media start seconds cannot be negative.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (mode === 'duration' && durationSeconds <= 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Trim Media needs a positive duration.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (mode === 'end' && endSeconds <= startSeconds) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Trim Media end seconds must be greater than start seconds.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step trims the connected audio or video artifact and keeps the same media kind.',
+          };
+        }
+      }
+
+      if (node.type === 'burnSubtitles') {
+        const videoKinds = getIncomingKindsForNodePort(node, 'video', graph);
+        const captionKinds = getIncomingKindsForNodePort(node, 'captions', graph);
+        const captionMode = String(node.config?.captionMode || 'auto').trim();
+        const durationPerCaptionSeconds = Number(node.config?.durationPerCaptionSeconds || 0) || 0;
+        const outputFormat = String(node.config?.outputFormat || 'mp4').trim().toLowerCase();
+        if (!videoKinds.includes(PORT_KIND_VIDEO)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a video before burning captions.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!captionKinds.includes(PORT_KIND_TEXT) && !captionKinds.includes(PORT_KIND_FILE)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a transcript, text caption lines, or an .srt/.vtt subtitle file before burning captions.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['auto', 'transcriptSegments', 'subtitleFile', 'manualLines'].includes(captionMode)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported caption timing mode.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (captionMode === 'manualLines' && durationPerCaptionSeconds <= 0) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Manual caption lines need a positive duration per caption.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (outputFormat && outputFormat !== 'mp4') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Burn Subtitles / Captions writes MP4 output in this pass. Leave the output format as mp4.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step renders timed captions directly into the connected video.',
+          };
+        }
+      }
+
+      if (node.type === 'extractVideoFrame') {
+        const videoKinds = getIncomingKindsForNodePort(node, 'video', graph);
+        const framePosition = String(node.config?.framePosition || 'first').trim().toLowerCase();
+        const outputFormat = String(node.config?.outputFormat || 'png').trim().toLowerCase();
+        if (!videoKinds.includes(PORT_KIND_VIDEO)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a video before extracting a frame.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (framePosition !== 'first' && framePosition !== 'last') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Extract Video Frame can extract either the first frame or the last frame.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (outputFormat && outputFormat !== 'png') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Extract Video Frame writes PNG images in this pass. Leave the output format as png.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step extracts the ' + framePosition + ' frame from the connected video as a PNG image artifact.',
+          };
+        }
+      }
+
+      if (node.type === 'extractAudio') {
+        const videoKinds = getIncomingKindsForNodePort(node, 'video', graph);
+        const outputFormat = String(node.config?.outputFormat || 'wav').trim().toLowerCase();
+        if (!videoKinds.includes(PORT_KIND_VIDEO)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a video before extracting its audio track.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (outputFormat && outputFormat !== 'wav') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Extract Audio writes WAV output in this pass. Leave the output format as wav.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step extracts the first audio stream from the connected video as a WAV artifact.',
           };
         }
       }

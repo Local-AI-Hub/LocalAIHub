@@ -34,7 +34,7 @@ const allReadyContext = {
     workflowFormat: 'comfyui-api',
     workflowText: '{}',
   }],
-  tools: ['ollama', 'forge', 'automatic1111', 'whisper', 'audiocraft-webui', 'upscayl', 'comfyui'].map((id) => tool(id)),
+  tools: ['ollama', 'forge', 'automatic1111', 'whisper', 'audiocraft-webui', 'upscayl', 'comfyui', 'wan21-webui'].map((id) => tool(id)),
 };
 
 assert(BUILT_IN_PIPELINE_TEMPLATES.length >= 10, 'Expected a useful starter template set.');
@@ -99,6 +99,66 @@ const missingAudioCraftAudioPlan = getPipelineTemplateReadiness('audio-idea-to-p
 });
 assert.notStrictEqual(missingAudioCraftAudioPlan.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Audio prompt planning should not require AudioCraft when a planning provider is available.');
 
+const videoPromptPlanResult = instantiatePipelineTemplate('script-to-video-prompt-collection', allReadyContext);
+assert(videoPromptPlanResult.ok, 'Script to video prompt collection template should instantiate.');
+const videoPromptPlanPipeline = videoPromptPlanResult.pipeline;
+const videoPacket = videoPromptPlanPipeline.nodes.find((node) => node.type === 'planningPacket');
+const videoPlanner = videoPromptPlanPipeline.nodes.find((node) => node.type === 'planner');
+const videoPlanBridge = videoPromptPlanPipeline.nodes.find((node) => node.type === 'planScenes');
+const videoCollectionOutput = videoPromptPlanPipeline.nodes.find((node) => node.type === 'collectionOutput');
+assert(videoPacket, 'Video prompt planning template should include a Planning Packet.');
+assert(videoPlanner, 'Video prompt planning template should include a Planner.');
+assert(videoPlanBridge, 'Video prompt planning template should include the plan-to-text collection bridge.');
+assert(videoCollectionOutput, 'Video prompt planning template should include a Collection Output.');
+assert.strictEqual(videoPacket.config.schemaId, 'videoPromptPlan.v1', 'Video prompt planning packet should request videoPromptPlan.');
+assert.strictEqual(videoPlanner.config.schemaId, 'videoPromptPlan.v1', 'Video planner should request videoPromptPlan.');
+assert(/not required/i.test(videoPacket.config.readinessNotesText) && /Wan/i.test(videoPacket.config.readinessNotesText), 'Video prompt planning template should not require Wan.');
+assert(/referenceMode/i.test(videoPacket.config.desiredOutputNotes) && /referenceFrameRole/i.test(videoPacket.config.desiredOutputNotes), 'Video prompt planning packet should request reference-frame metadata.');
+assert(!videoPromptPlanPipeline.nodes.some((node) => node.type === 'collectionMap'), 'Video prompt planning template should not add collectionMap text-to-video.');
+assert(!videoPromptPlanPipeline.nodes.some((node) => node.type === 'llmPrompt' && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE), 'Video prompt planning template should not execute video generation.');
+assert(videoPromptPlanPipeline.edges.some((edge) => edge.source.nodeId === videoPlanner.id && edge.target.nodeId === videoPlanBridge.id), 'Video plan should feed the text collection bridge.');
+const missingVideoToolVideoPlan = getPipelineTemplateReadiness('script-to-video-prompt-collection', {
+  ...allReadyContext,
+  tools: allReadyContext.tools.filter((entry) => !/wan|video/i.test(entry.id)),
+});
+assert.notStrictEqual(missingVideoToolVideoPlan.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Video prompt planning should not require a video generation tool when a planning provider is available.');
+
+const generatedVideoResult = instantiatePipelineTemplate('video-idea-to-generated-video', allReadyContext);
+assert(generatedVideoResult.ok, 'Video idea generated video template should instantiate.');
+const generatedVideo = generatedVideoResult.pipeline;
+const generatedVideoPacket = generatedVideo.nodes.find((node) => node.type === 'planningPacket');
+const generatedVideoPlanner = generatedVideo.nodes.find((node) => node.type === 'planner');
+const generatedVideoPlanBridge = generatedVideo.nodes.find((node) => node.type === 'planScenes');
+const generatedVideoMap = generatedVideo.nodes.find((node) => node.type === 'collectionMap');
+const generatedVideoStitch = generatedVideo.nodes.find((node) => node.type === 'videoStitch');
+const generatedVideoOutput = generatedVideo.nodes.find((node) => node.type === 'videoOutput');
+assert(generatedVideoPacket, 'Generated video template should include a Planning Packet.');
+assert(generatedVideoPlanner, 'Generated video template should include a Planner.');
+assert(generatedVideoPlanBridge, 'Generated video template should include the plan-to-text collection bridge.');
+assert(generatedVideoMap, 'Generated video template should include collectionMap generation.');
+assert(generatedVideoStitch, 'Generated video template should include Video Stitch.');
+assert(generatedVideoOutput, 'Generated video template should include Video Output.');
+assert.strictEqual(generatedVideoPacket.config.schemaId, 'videoPromptPlan.v1', 'Generated video planning packet should request videoPromptPlan.');
+assert.strictEqual(generatedVideoPlanner.config.schemaId, 'videoPromptPlan.v1', 'Generated video planner should request videoPromptPlan.');
+assert.strictEqual(getCollectionMapMapping(generatedVideoMap)?.id, 'textToVideo', 'Generated video template should map planned text prompts to video.');
+assert.strictEqual(generatedVideoMap.config.executionMode, 'localTool', 'Generated video template should use local video generation by default.');
+assert.strictEqual(generatedVideoMap.config.toolId, 'wan21-webui', 'Generated video template should target Wan2.1 WebUI.');
+assert.strictEqual(generatedVideoMap.config.videoItemMode, 'independent', 'Generated video template should use independent clips by default.');
+assert.strictEqual(generatedVideoMap.config.videoChainFirstItemBehavior, 'textToVideo', 'Generated video template should keep a clear first-item behavior.');
+assert.strictEqual(generatedVideoMap.config.promptStyleId, '', 'Generated video template should leave Prompt Style unset.');
+assert(generatedVideo.edges.some((edge) => edge.source.nodeId === generatedVideoMap.id && edge.target.nodeId === generatedVideoStitch.id), 'Generated video collection should feed Video Stitch.');
+assert(generatedVideo.edges.some((edge) => edge.source.nodeId === generatedVideoStitch.id && edge.target.nodeId === generatedVideoOutput.id), 'Video Stitch should feed Video Output.');
+const missingWanGeneratedVideo = getPipelineTemplateReadiness('video-idea-to-generated-video', {
+  ...allReadyContext,
+  tools: allReadyContext.tools.filter((entry) => entry.id !== 'wan21-webui'),
+});
+assert.strictEqual(missingWanGeneratedVideo.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Generated video template should require Wan for actual generation.');
+assert(missingWanGeneratedVideo.missingTools.some((entry) => /Wan|wan/i.test(entry)), 'Generated video readiness should explain the missing Wan requirement.');
+const missingWanModelsGeneratedVideo = getPipelineTemplateReadiness('video-idea-to-generated-video', {
+  ...allReadyContext,
+  tools: allReadyContext.tools.map((entry) => entry.id === 'wan21-webui' ? tool('wan21-webui', { downloadedModels: [] }) : entry),
+});
+assert(missingWanModelsGeneratedVideo.missingModels.some((entry) => /model folders/i.test(entry)), 'Generated video readiness should explain missing Wan model folders when the tool reports none.');
 const generatedSongResult = instantiatePipelineTemplate('audio-idea-to-generated-song', allReadyContext);
 assert(generatedSongResult.ok, 'Audio idea generated song template should instantiate.');
 const generatedSong = generatedSongResult.pipeline;

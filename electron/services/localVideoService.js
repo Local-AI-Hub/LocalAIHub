@@ -10,7 +10,7 @@ try {
 const { runCommand } = require('./commandService');
 const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
 const { createLogger } = require('./logService');
-const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
+const { buildFileArtifact, saveVideoArtifactMetadata, summarizeArtifact } = require('./pipelineArtifactService');
 const { serializePromptStyleApplication } = require('../shared/promptStyles.cjs');
 const { PIPELINE_OPERATION_IDS, PORT_KIND_VIDEO } = require('../shared/pipelineSchema.cjs');
 
@@ -230,15 +230,26 @@ async function generateVideoWithWanTool(tool, options = {}) {
       operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
       operationSubtype,
       prompt,
+      quality: Number(options.quality || 5),
       seed: requestedSeed,
       size: String(response?.size || requestedSize).trim() || requestedSize,
       sourceImage: buildSourceImageReference(options.sourceImageArtifact),
       steps: requestedSteps,
+      collectionMap: options.collectionMap && typeof options.collectionMap === 'object' ? options.collectionMap : null,
+      collectionMapItemMode: String(options.collectionMapItemMode || '').trim(),
+      collectionMapVideoChain: options.collectionMapVideoChain && typeof options.collectionMapVideoChain === 'object' ? options.collectionMapVideoChain : null,
       toolId: String(tool?.id || '').trim().toLowerCase(),
       toolLabel,
       usedReferenceImage: Boolean(referenceImagePath),
     },
   });
+
+  if (typeof saveVideoArtifactMetadata === 'function') {
+    const metadataPaths = await saveVideoArtifactMetadata(artifact.filePath, artifact);
+    if (metadataPaths.length) {
+      artifact.metadataPaths = metadataPaths;
+    }
+  }
 
   return {
     destinationPath: artifact.filePath,

@@ -2,10 +2,12 @@ const {
   GRAPH_WORKFLOW_TOOL_IDS,
   DEFAULT_PLANNING_SCHEMA_ID,
   IMAGE_WORKFLOW_TOOL_IDS,
+  VIDEO_WORKFLOW_TOOL_IDS,
   PIPELINE_OPERATION_IDS,
   PORT_KIND_AUDIO,
   PORT_KIND_IMAGE,
   PORT_KIND_TEXT,
+  PORT_KIND_VIDEO,
   analyzePipeline,
   buildContextMaps,
   buildGraphWorkflowConfigFromPreset,
@@ -18,6 +20,7 @@ const {
 } = require('./pipelineSchema.cjs');
 const {
   AUDIO_PROMPT_PLAN_SCHEMA_ID,
+  VIDEO_PROMPT_PLAN_SCHEMA_ID,
 } = require('./planningSchema.cjs');
 
 const {
@@ -187,7 +190,84 @@ function audioIdeaToPromptCollection(template, contextMaps) {
   link(edges, prompts, 'collection', output, 'collection');
   return finalize(template, [idea, packet, planner, prompts, output], edges, 'This template creates an ordered collection of text audio prompts. Route the collection into Map Collection text-to-audio when you want generated clips, or use the generated-song template for the full AudioCraft continuation and stitch path.');
 }
-function audioIdeaToGeneratedSong(template, contextMaps) {
+function scriptToVideoPromptCollection(template, contextMaps) {
+  const plannerTarget = chooseTarget(PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps, { localToolIds: ['ollama'], preferLocal: false });
+  if (!plannerTarget.providerId && getTool(contextMaps, 'ollama')) plannerTarget.executionMode = 'ollama';
+  const edges = [];
+  const script = node('textInput', 0, { text: '' }, 'Video script or concept');
+  const packet = node('planningPacket', 1, {
+    schemaId: VIDEO_PROMPT_PLAN_SCHEMA_ID,
+    title: 'Video prompt planning packet',
+    goal: 'Turn the text script, narration, scene description, or concept into an ordered video prompt plan for future text-to-video or image-to-video generation.',
+    sourceSummary: '',
+    constraintsText: 'Create useful video prompt text only. Preserve order, duration intent, motion, camera/action language, continuity strategy, transition notes, and reference-frame intent. Do not execute video generation, image-to-video generation, or last-frame extraction.',
+    stylePolicyText: 'Keep prompts concrete for downstream video generation. Include camera motion, subject motion, setting, visible action, pacing, atmosphere, and continuity anchors when useful.',
+    availableToolsText: 'Planner model, ordered text collection output, and future collectionMap text-to-video or image-to-video routing when available. No local video tool is required for this planning-only template.',
+    readinessNotesText: 'Choose a planner provider/model or Ollama model before running. Wan or any other video generation tool is not required for this planning-only template.',
+    desiredOutputNotes: 'Return a videoPromptPlan with ordered clips. Each clip should include prompt, durationSeconds, cameraMotion, subjectMotion, setting, action, negativePrompt, continuityNotes, transitionNotes, referenceMode, referenceFrameRole, needsInitialReferenceImage, usesPreviousClipLastFrame, and sourceText where supported.',
+    riskNotesText: 'Keep unclear duration, style, source references, or continuity assumptions visible in notes instead of pretending certainty.',
+  }, 'Build video plan packet');
+  const planner = node('planner', 2, {
+    executionMode: plannerTarget.executionMode === 'ollama' ? 'ollama' : 'cloud',
+    providerId: plannerTarget.executionMode === 'cloud' ? plannerTarget.providerId || '' : '',
+    model: plannerTarget.model || '',
+    schemaId: VIDEO_PROMPT_PLAN_SCHEMA_ID,
+    instruction: 'Create an ordered videoPromptPlan from the connected script or concept. Keep the result planning-only: clips should contain video prompt text and metadata for duration, motion, continuity, transitions, and future reference-frame chaining. Do not add collectionMap text-to-video behavior, video generation, image-to-video execution, or last-frame extraction.',
+    systemPrompt: '',
+  }, 'Plan video prompts');
+  const prompts = node('planScenes', 3, {}, 'Video prompt collection');
+  const output = node('collectionOutput', 4, { title: 'Video prompt collection' }, 'Text collection output');
+  link(edges, script, 'text', packet, 'source');
+  link(edges, packet, 'packet', planner, 'packet');
+  link(edges, planner, 'plan', prompts, 'plan');
+  link(edges, prompts, 'collection', output, 'collection');
+  return finalize(template, [script, packet, planner, prompts, output], edges, 'This template creates an ordered collection of text prompts intended for video generation. It does not generate video yet. It preserves duration, camera motion, subject motion, action, negative prompt, continuity notes, transition notes, reference-frame intent, and source lineage for future text-to-video or image-to-video collection mapping. Prompt Style presets can be applied later at generation time where supported.');
+}
+function videoIdeaToGeneratedVideo(template, contextMaps) {
+  const plannerTarget = chooseTarget(PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps, { localToolIds: ['ollama'], preferLocal: false });
+  if (!plannerTarget.providerId && getTool(contextMaps, 'ollama')) plannerTarget.executionMode = 'ollama';
+  const videoTarget = chooseTarget(PIPELINE_OPERATION_IDS.VIDEO_GENERATE, contextMaps, { fallbackExecutionMode: 'localTool', fallbackToolId: VIDEO_WORKFLOW_TOOL_IDS[0] || 'wan21-webui', localToolIds: VIDEO_WORKFLOW_TOOL_IDS, preferLocal: true });
+  const edges = [];
+  const idea = node('textInput', 0, { text: '' }, 'Video idea or script');
+  const packet = node('planningPacket', 1, {
+    schemaId: VIDEO_PROMPT_PLAN_SCHEMA_ID,
+    title: 'Generated video planning packet',
+    goal: 'Turn the text idea, concept, narration, or script into an ordered video prompt plan that can be rendered as generated clips and stitched into one final video.',
+    sourceSummary: '',
+    constraintsText: 'Create ordered video prompt sections that can be generated independently by a local video model. Preserve duration intent, camera motion, subject motion, continuity notes, transition notes, and reference-frame intent when useful.',
+    stylePolicyText: 'Keep every section prompt concrete for local text-to-video generation. Prompt Style presets can be selected later on the Map Collection node where supported.',
+    availableToolsText: 'Planner model, ordered text collection output, local Wan text-to-video collection mapping, Video Stitch, and Video Output.',
+    readinessNotesText: 'Choose a planner provider/model or Ollama model, confirm Wan2.1 WebUI is installed with usable model folders, and review local hardware readiness before running generation. Planning can run without Wan, but generated clips require the local Wan path in this pass.',
+    desiredOutputNotes: 'Return a videoPromptPlan with ordered segments. Each segment should include prompt, durationSeconds, cameraMotion, subjectMotion, action, optional negativePrompt, continuityNotes, transitionNotes, referenceMode, referenceFrameRole, and source lineage when available.',
+    riskNotesText: 'Keep unclear timing, camera, transition, model, hardware, or continuity assumptions visible in notes instead of pretending certainty.',
+  }, 'Build video plan packet');
+  const planner = node('planner', 2, { executionMode: plannerTarget.executionMode === 'ollama' ? 'ollama' : 'cloud', providerId: plannerTarget.executionMode === 'cloud' ? plannerTarget.providerId || '' : '', model: plannerTarget.model || '', schemaId: VIDEO_PROMPT_PLAN_SCHEMA_ID, instruction: 'Create an ordered videoPromptPlan for local generated video. Each segment should stand on its own as a text-to-video prompt while preserving continuity notes that a user can use for sequential previous-last-frame generation if their Wan setup supports it.', systemPrompt: '' }, 'Plan video clips');
+  const prompts = node('planScenes', 3, {}, 'Video prompt collection');
+  const clips = node('collectionMap', 4, mapConfig(PIPELINE_OPERATION_IDS.VIDEO_GENERATE, 'textToVideo', videoTarget, {
+    durationSeconds: 4,
+    failureMode: 'fail-fast',
+    fps: 15,
+    instruction: 'Generate one local video clip for each planned prompt while preserving order and prompt lineage. Independent clips are the default; switch to sequential previous-last-frame mode only on a Wan setup with image-to-video models.',
+    negativePrompt: '',
+    promptStyleId: '',
+    quality: 5,
+    seed: -1,
+    steps: 24,
+    videoChainFirstItemBehavior: 'textToVideo',
+    videoInitialReferenceImagePath: '',
+    videoItemMode: 'independent',
+    videoSize: '832x480',
+  }), 'Generate video clips');
+  const stitch = node('videoStitch', 5, { outputFormat: 'mp4' }, 'Stitch generated video');
+  const output = node('videoOutput', 6, { title: 'Generated video' }, 'Generated video output');
+  link(edges, idea, 'text', packet, 'source');
+  link(edges, packet, 'packet', planner, 'packet');
+  link(edges, planner, 'plan', prompts, 'plan');
+  link(edges, prompts, 'collection', clips, 'collection');
+  link(edges, clips, 'collection', stitch, 'collection');
+  link(edges, stitch, 'video', output, 'video');
+  return finalize(template, [idea, packet, planner, prompts, clips, stitch, output], edges, 'This template keeps Map Collection as an ordered collection operation, then explicitly converts the generated collection:video into one final MP4 through Video Stitch. It uses local Wan generation only in this pass and leaves Prompt Style and generation settings editable. Cloud reference-image chaining is intentionally not configured.');
+}function audioIdeaToGeneratedSong(template, contextMaps) {
   const plannerTarget = chooseTarget(PIPELINE_OPERATION_IDS.LLM_PROMPT, contextMaps, { localToolIds: ['ollama'], preferLocal: false });
   if (!plannerTarget.providerId && getTool(contextMaps, 'ollama')) plannerTarget.executionMode = 'ollama';
   const audioTarget = chooseTarget(PIPELINE_OPERATION_IDS.AUDIO_GENERATE, contextMaps, { fallbackExecutionMode: 'localTool', fallbackToolId: 'audiocraft-webui', localToolIds: ['audiocraft-webui'], preferLocal: true });
@@ -297,6 +377,9 @@ const localOrCloudImageRuntime = Object.freeze({ id: 'image-generation-runtime',
   Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE }),
 ]) });
 
+const localWanVideoRuntime = Object.freeze({ id: 'wan-video-runtime', label: 'Wan2.1 WebUI local video generation', anyOf: Object.freeze([
+  Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE, toolIds: VIDEO_WORKFLOW_TOOL_IDS }),
+]) });
 const BUILT_IN_PIPELINE_TEMPLATES = Object.freeze([
   Object.freeze({ id: 'text-response', name: 'Text response', description: 'Ask a local or cloud language model for a text answer and save the response.', category: 'Cloud/basic', tags: Object.freeze(['text', 'llm']), outputType: 'Text', complexity: 'easy', requirements: Object.freeze(['Connected text provider or Ollama', 'Model selected before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'text-runtime', label: 'Connected text provider or Ollama', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, toolIds: Object.freeze(['ollama']) })]) })]), modelSelectionRequired: true, placeholdersRequired: true, nextSteps: Object.freeze(['Enter the real prompt.', 'Choose a provider or Ollama model before running.']), createPipeline: textResponse }),
   Object.freeze({ id: 'image-description', name: 'Image description', description: 'Send an image to a vision-capable model or image backend and save a text description.', category: 'Cloud/basic', tags: Object.freeze(['image', 'analysis']), outputType: 'Text', complexity: 'easy', requirements: Object.freeze(['Vision provider or local image analysis backend', 'Image file selected before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'image-analysis-runtime', label: 'Vision provider or local image backend', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.IMAGE_ANALYZE }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.IMAGE_ANALYZE, toolIds: IMAGE_WORKFLOW_TOOL_IDS })]) })]), modelSelectionRequired: true, placeholdersRequired: true, nextSteps: Object.freeze(['Choose the source image.', 'Choose a vision model or local image analysis backend.']), createPipeline: imageDescription }),
@@ -304,6 +387,9 @@ const BUILT_IN_PIPELINE_TEMPLATES = Object.freeze([
   Object.freeze({ id: 'prompt-collection-to-images', name: 'Prompt collection to image collection', description: 'Map an ordered text prompt collection into an ordered image collection.', category: 'Local image', tags: Object.freeze(['collection', 'image', 'map']), outputType: 'Image collection', complexity: 'intermediate', requirements: Object.freeze(['Collection Input text items', 'Image generation runtime']), runtimeGroups: Object.freeze([localOrCloudImageRuntime]), placeholdersRequired: true, nextSteps: Object.freeze(['Add prompt items to Collection Input.', 'Review image settings before running the map.']), createPipeline: (template, contextMaps) => promptCollectionImages(template, contextMaps) }),
   Object.freeze({ id: 'validated-prompt-collection-to-images', name: 'Prompt collection to images with user validation', description: 'Map each prompt to an image, pause for per-item user review, and keep partial successes when an item cannot be accepted.', category: 'Local image', tags: Object.freeze(['collection', 'validation', 'retry']), outputType: 'Image collection', complexity: 'advanced', requirements: Object.freeze(['Collection Input text items', 'Image generation runtime', 'User review during run']), runtimeGroups: Object.freeze([localOrCloudImageRuntime]), placeholdersRequired: true, nextSteps: Object.freeze(['Add prompt items to Collection Input.', 'Run when you are ready to review each generated item.']), createPipeline: (template, contextMaps) => promptCollectionImages(template, contextMaps, { partialSuccess: true, userValidation: true }) }),
   Object.freeze({ id: 'audio-transcription', name: 'Audio transcription', description: 'Transcribe an audio file locally with Whisper and save the transcript.', category: 'Audio', tags: Object.freeze(['audio', 'whisper']), outputType: 'Text', complexity: 'easy', requirements: Object.freeze(['Whisper installed', 'Audio file selected before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'whisper-runtime', label: 'Whisper', anyOf: Object.freeze([Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, toolIds: Object.freeze(['whisper']) })]) })]), placeholdersRequired: true, nextSteps: Object.freeze(['Choose the source audio file.', 'Change the Whisper model size if needed.']), createPipeline: audioTranscription }),
+  Object.freeze({ id: 'script-to-video-prompt-collection', name: 'Script to video prompt collection', description: 'Plan a script, narration, scene description, or concept into an ordered text prompt collection for future video generation.', category: 'Media/collection', tags: Object.freeze(['video', 'planning', 'collection', 'prompts']), outputType: 'Text collection', complexity: 'intermediate', requirements: Object.freeze(['Connected planning provider/model or Ollama', 'Text script or concept entered before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'planning-runtime', label: 'Connected planning provider or Ollama', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, toolIds: Object.freeze(['ollama']) })]) })]), modelSelectionRequired: true, placeholdersRequired: true, nextSteps: Object.freeze(['Enter the video script, narration, scene description, or concept.', 'Choose a planner provider/model or Ollama model.', 'Run the planner to produce the ordered video prompt collection.', 'Use the collection with future collectionMap text-to-video or image-to-video routing when available.']), createPipeline: scriptToVideoPromptCollection }),
+  Object.freeze({ id: 'video-idea-to-generated-video', name: 'Video idea to generated video', description: 'Plan a video idea, generate ordered local Wan video clips, stitch them into one MP4, and save the final video artifact.', category: 'Media/collection', tags: Object.freeze(['video', 'planning', 'generation', 'collection', 'stitch', 'wan']), outputType: 'Video', complexity: 'advanced', requirements: Object.freeze(['Connected planning provider/model or Ollama', 'Wan2.1 WebUI installed with usable model folders', 'Hardware appropriate for local video generation', 'Text idea or script entered before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'planning-runtime', label: 'Connected planning provider or Ollama', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, toolIds: Object.freeze(['ollama']) })]) }), localWanVideoRuntime]), requiredDownloadedModelTools: Object.freeze(['wan21-webui']), modelSelectionRequired: true, placeholdersRequired: true, optionalPresets: Object.freeze(['promptStyle']), nextSteps: Object.freeze(['Enter the video idea, script, or narration.', 'Choose a planner provider/model or Ollama model.', 'Confirm Wan2.1 WebUI is installed with local model folders and review hardware readiness.', 'Review Map Collection text-to-video settings; independent clips are the default.', 'Run the pipeline to generate ordered clips, stitch them, and save one MP4.']), createPipeline: videoIdeaToGeneratedVideo }),
+
   Object.freeze({ id: 'audio-idea-to-prompt-collection', name: 'Audio idea to audio prompt collection', description: 'Plan a longer or structured music, ambience, soundscape, game-loop, or cinematic audio idea into an ordered text prompt collection.', category: 'Audio', tags: Object.freeze(['audio', 'planning', 'collection', 'prompts']), outputType: 'Text collection', complexity: 'intermediate', requirements: Object.freeze(['Connected planning provider/model or Ollama', 'Text idea entered before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'planning-runtime', label: 'Connected planning provider or Ollama', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, toolIds: Object.freeze(['ollama']) })]) })]), modelSelectionRequired: true, placeholdersRequired: true, nextSteps: Object.freeze(['Enter the structured audio or music idea.', 'Choose a planner provider/model or Ollama model.', 'Run the planner to produce the ordered prompt collection.', 'Connect the collection to Map Collection text-to-audio when you are ready to generate clips.']), createPipeline: audioIdeaToPromptCollection }),
   Object.freeze({ id: 'audio-idea-to-generated-song', name: 'Audio idea to generated song', description: 'Plan a structured audio idea, generate ordered AudioCraft continuation sections, stitch them into one WAV, and save the final song/audio file.', category: 'Audio', tags: Object.freeze(['audio', 'planning', 'music', 'audiocraft', 'collection', 'stitch']), outputType: 'Audio', complexity: 'advanced', requirements: Object.freeze(['Connected planning provider/model or Ollama', 'AudioCraft WebUI installed', 'Text idea entered before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'planning-runtime', label: 'Connected planning provider or Ollama', anyOf: Object.freeze([Object.freeze({ kind: 'providerOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT }), Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT, toolIds: Object.freeze(['ollama']) })]) }), Object.freeze({ id: 'audiocraft-runtime', label: 'AudioCraft WebUI', anyOf: Object.freeze([Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE, toolIds: Object.freeze(['audiocraft-webui']) })]) })]), modelSelectionRequired: true, placeholdersRequired: true, optionalPresets: Object.freeze(['promptStyle']), nextSteps: Object.freeze(['Enter the song or structured audio idea.', 'Choose a planner provider/model or Ollama model.', 'Confirm AudioCraft WebUI is installed and review sequential continuation settings.', 'Optionally select a Prompt Style preset on the Map Collection node.', 'Run the pipeline to generate section clips, stitch them, and save one WAV.']), createPipeline: audioIdeaToGeneratedSong }),
   Object.freeze({ id: 'text-to-music-audio', name: 'Text to music or audio', description: 'Generate a short music or sound artifact from text using AudioCraft.', category: 'Audio', tags: Object.freeze(['audio', 'music']), outputType: 'Audio', complexity: 'intermediate', requirements: Object.freeze(['AudioCraft WebUI installed', 'Prompt entered before running']), runtimeGroups: Object.freeze([Object.freeze({ id: 'audiocraft-runtime', label: 'AudioCraft WebUI', anyOf: Object.freeze([Object.freeze({ kind: 'toolOperation', operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE, toolIds: Object.freeze(['audiocraft-webui']) })]) })]), placeholdersRequired: true, nextSteps: Object.freeze(['Enter the audio prompt.', 'Adjust duration and AudioCraft settings if needed.']), createPipeline: textToAudio }),
@@ -365,6 +451,12 @@ function getPipelineTemplateReadiness(templateOrId, context = {}) {
   for (const group of runtimeGroups) if (!group.ready) for (const result of group.optionResults || []) { missingTools.push(...(result.missingTools || [])); missingProviders.push(...(result.missingProviders || [])); warnings.push(...(result.warnings || [])); }
   if ((template.requiredPresets || []).includes('graphWorkflow:text-to-image') && !(contextMaps.graphWorkflowPresets || []).some((preset) => isGraphWorkflowPresetCompatibleWithOperation(preset))) missingPresets.push('Create/save a compatible text-to-image Graph Workflow preset first.');
   if ((template.optionalPresets || []).includes('promptStyle') && !(Array.isArray(context.promptStyles) && context.promptStyles.length)) notes.push('No Prompt Style presets are saved yet. You can still create this pipeline and choose a style later.');
+  for (const toolId of template.requiredDownloadedModelTools || []) {
+    const tool = getTool(contextMaps, toolId) || getCatalogTool(contextMaps, toolId);
+    if (tool && Array.isArray(tool.downloadedModels) && tool.downloadedModels.length === 0) {
+      missingModels.push(toolLabel(contextMaps, toolId) + ' has no downloaded model folders available yet. Download or select usable local video model folders before running generation.');
+    }
+  }
   if (template.modelSelectionRequired) missingModels.push('Choose a model before running this pipeline.');
   warnings.push(...hardwareWarnings(template, contextMaps));
   const result = { missingTools: unique(missingTools), missingProviders: unique(missingProviders), missingModels: unique(missingModels), missingPresets: unique(missingPresets), notes: unique(notes), runtimeGroups, warnings: unique(warnings) };

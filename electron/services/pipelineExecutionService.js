@@ -26,6 +26,7 @@ const {
   persistArtifactCollection,
   persistCompositionArtifact,
   saveAudioArtifactMetadata,
+  saveVideoArtifactMetadata,
   saveBase64Artifact,
   saveBufferArtifact,
   sanitizeSegment,
@@ -64,12 +65,22 @@ const {
 } = require('../shared/toolAssetSelection.cjs');
 const { generateImageWithLocalImageTool } = require('./localImageService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
+const { extractVideoLastFrameArtifact } = require('./videoFrameService');
 const {
   applyPromptStyleToPrompt,
   isPromptStyleCompatibleWithTarget,
   serializePromptStyleApplication,
 } = require('../shared/promptStyles.cjs');
-const { exportCompositionArtifactToVideo } = require('./mediaCompositionService');
+const { exportCompositionArtifactToVideo, resolveFfmpegPath } = require('./mediaCompositionService');
+const {
+  extractAudioFromVideoArtifact,
+  extractVideoFrameArtifact,
+  normalizeAudioCollectionArtifact,
+  normalizeVideoCollectionArtifact,
+  trimMediaArtifact,
+  burnSubtitlesIntoVideoArtifact,
+} = require('./mediaUtilityService');
+const { runCommand } = require('./commandService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
@@ -237,6 +248,35 @@ function collectSelectedLocalAudioTransformToolIds(definition = {}) {
   return selectedToolIds.size ? [...selectedToolIds] : ['rvc'];
 }
 
+function collectSelectedLocalVideoToolIds(definition = {}) {
+  const selectedToolIds = new Set();
+  let hasLocalVideoStep = false;
+
+  for (const node of Array.isArray(definition?.nodes) ? definition.nodes : []) {
+    const isModelStepVideo = node?.type === 'llmPrompt'
+      && node?.config?.executionMode === 'localTool'
+      && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE;
+    const isCollectionVideoMap = node?.type === 'collectionMap'
+      && node?.config?.executionMode === 'localTool'
+      && getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE;
+
+    if (!isModelStepVideo && !isCollectionVideoMap) {
+      continue;
+    }
+
+    hasLocalVideoStep = true;
+    const toolId = String(node?.config?.toolId || '').trim().toLowerCase();
+    if (toolId) {
+      selectedToolIds.add(toolId);
+    }
+  }
+
+  if (!hasLocalVideoStep) {
+    return [];
+  }
+
+  return selectedToolIds.size ? [...selectedToolIds] : ['wan21-webui'];
+}
 function filterLocalImageCheckpointModels(models = []) {
   return (Array.isArray(models) ? models : []).filter((model) => {
     const modelType = String(model?.modelType || '').trim().toLowerCase();
@@ -336,12 +376,16 @@ async function buildPipelineContext(definition = {}) {
 
   const selectedLocalImageToolIds = collectSelectedLocalImageToolIds(definition);
   const selectedLocalAudioTransformToolIds = collectSelectedLocalAudioTransformToolIds(definition);
-  if (selectedLocalImageToolIds.length || selectedLocalAudioTransformToolIds.length) {
+  const selectedLocalVideoToolIds = collectSelectedLocalVideoToolIds(definition);
+  if (selectedLocalImageToolIds.length || selectedLocalAudioTransformToolIds.length || selectedLocalVideoToolIds.length) {
     const downloadedModelsByToolId = {};
     for (const toolId of selectedLocalImageToolIds) {
       downloadedModelsByToolId[toolId] = filterLocalImageCheckpointModels(await listDownloadedModels(toolId).catch(() => []));
     }
     for (const toolId of selectedLocalAudioTransformToolIds) {
+      downloadedModelsByToolId[toolId] = await listDownloadedModels(toolId).catch(() => []);
+    }
+    for (const toolId of selectedLocalVideoToolIds) {
       downloadedModelsByToolId[toolId] = await listDownloadedModels(toolId).catch(() => []);
     }
 
@@ -1769,7 +1813,7 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
     role: 'generated',
     sourcePacket: packetValidation.value,
   });
-  const planItemCount = Number(planArtifact.sceneCount || planArtifact.sectionCount || normalizedPlan.scenes?.length || normalizedPlan.sections?.length || 0) || 0;
+  const planItemCount = Number(planArtifact.sceneCount || planArtifact.sectionCount || planArtifact.clipCount || normalizedPlan.scenes?.length || normalizedPlan.sections?.length || normalizedPlan.clips?.length || 0) || 0;
 
   return {
     message: providerLabel + ' returned a structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.',
@@ -2081,10 +2125,154 @@ function serializeCollectionMapAudioContinuationChainState(chainState, patch = {
   };
 }
 
+function getCollectionMapVideoItemModeForRun(node) {
+  return String(node?.config?.videoItemMode || '').trim() === 'sequentialLastFrame'
+    ? 'sequentialLastFrame'
+    : 'independent';
+}
+
+function getCollectionMapVideoFirstItemBehaviorForRun(node) {
+  return String(node?.config?.videoChainFirstItemBehavior || '').trim() === 'initialReferenceImage'
+    ? 'initialReferenceImage'
+    : 'textToVideo';
+}
+
+function isCollectionMapVideoContinuationChainEnabledForRun(node, mapping, executionMode) {
+  const toolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  return executionMode === 'localTool'
+    && getCollectionMapVideoItemModeForRun(node) === 'sequentialLastFrame'
+    && String(mapping?.id || node?.config?.mappingId || '').trim() === 'textToVideo'
+    && String(mapping?.inputKind || '').trim() === PORT_KIND_TEXT
+    && String(mapping?.outputKind || '').trim() === PORT_KIND_VIDEO
+    && String(mapping?.operationId || getCollectionMapOperationId(node)).trim() === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+    && (!toolId || toolId === 'wan21-webui');
+}
+
+function buildCollectionMapVideoContinuationChainState(node) {
+  const firstItemBehavior = getCollectionMapVideoFirstItemBehaviorForRun(node);
+  return {
+    enabled: true,
+    finalLastFramePath: '',
+    firstItemBehavior,
+    fps: Math.max(1, Number(node?.config?.videoFps || 15) || 15),
+    initialReferenceImagePath: String(node?.config?.videoInitialReferenceImagePath || '').trim(),
+    itemMode: 'sequentialLastFrame',
+    items: [],
+    lastAcceptedArtifact: null,
+    previousLastFrameArtifact: null,
+    size: String(node?.config?.videoSize || '1280x720').trim() || '1280x720',
+  };
+}
+
+function buildVideoArtifactReference(artifact) {
+  if (!artifact) {
+    return null;
+  }
+
+  return {
+    displayName: String(artifact.displayName || '').trim(),
+    fileName: String(artifact.fileName || '').trim(),
+    filePath: String(artifact.filePath || '').trim(),
+    id: String(artifact.id || artifact.artifactId || '').trim(),
+    kind: String(artifact.kind || '').trim(),
+    operationSubtype: String(artifact.videoGeneration?.operationSubtype || artifact.videoGeneration?.mode || '').trim(),
+    summary: summarizeArtifact(artifact),
+  };
+}
+
+function buildImageArtifactReference(artifact) {
+  if (!artifact) {
+    return null;
+  }
+
+  return {
+    displayName: String(artifact.displayName || '').trim(),
+    fileName: String(artifact.fileName || '').trim(),
+    filePath: String(artifact.filePath || '').trim(),
+    height: Number(artifact.height || 0) || 0,
+    id: String(artifact.id || artifact.artifactId || '').trim(),
+    kind: String(artifact.kind || '').trim(),
+    summary: summarizeArtifact(artifact),
+    width: Number(artifact.width || 0) || 0,
+  };
+}
+
+function serializeCollectionMapVideoContinuationChainState(chainState, patch = {}) {
+  if (!chainState?.enabled) {
+    return null;
+  }
+
+  return {
+    enabled: true,
+    finalLastFramePath: String(chainState.finalLastFramePath || '').trim(),
+    firstItemBehavior: chainState.firstItemBehavior || 'textToVideo',
+    fps: Number(chainState.fps || 0) || 0,
+    initialReferenceImagePath: String(chainState.initialReferenceImagePath || '').trim(),
+    itemMode: 'sequentialLastFrame',
+    items: Array.isArray(chainState.items) ? serializeArtifactForUi(chainState.items) : [],
+    size: String(chainState.size || '').trim(),
+    ...patch,
+  };
+}
+
+function buildCollectionMapVideoItemMetadata({ chainState, executionMode, inputArtifact, itemCount, itemId, itemIndex, mapping, node, referenceImageArtifact, referenceRole, videoRequest }) {
+  const base = {
+    executionMode: String(executionMode || '').trim(),
+    finalPrompt: String(videoRequest?.prompt || '').trim(),
+    inputKind: String(mapping?.inputKind || '').trim(),
+    itemCount,
+    itemIndex,
+    mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+    nodeId: String(node?.id || '').trim(),
+    nodeLabel: String(node?.label || '').trim(),
+    operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+    originalPrompt: String(inputArtifact?.text || '').trim(),
+    outputKind: String(mapping?.outputKind || '').trim(),
+    promptStyle: videoRequest?.promptStyle || null,
+    sourceItemId: String(itemId || '').trim(),
+  };
+
+  if (!chainState?.enabled) {
+    return {
+      collectionMap: base,
+      collectionMapItemMode: 'independent',
+      collectionMapVideoChain: null,
+    };
+  }
+
+  const referenceImage = buildImageArtifactReference(referenceImageArtifact);
+  return {
+    collectionMap: base,
+    collectionMapItemMode: 'sequentialLastFrame',
+    collectionMapVideoChain: {
+      enabled: true,
+      firstItemBehavior: chainState.firstItemBehavior || 'textToVideo',
+      itemMode: 'sequentialLastFrame',
+      previousClip: buildVideoArtifactReference(chainState.lastAcceptedArtifact),
+      previousLastFrame: referenceRole === 'previousLastFrame' ? referenceImage : null,
+      referenceImage,
+      referenceRole: String(referenceRole || '').trim() || 'none',
+    },
+  };
+}
+
+async function persistVideoGenerationMetadataSidecar(artifact) {
+  if (!artifact?.filePath || artifact.kind !== PORT_KIND_VIDEO || typeof saveVideoArtifactMetadata !== 'function') {
+    return artifact;
+  }
+
+  const metadataPaths = await saveVideoArtifactMetadata(artifact.filePath, artifact);
+  if (metadataPaths.length) {
+    artifact.metadataPaths = [...new Set([...(Array.isArray(artifact.metadataPaths) ? artifact.metadataPaths : []), ...metadataPaths])];
+  }
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
+}
 function buildCollectionMapMetadata(mapping, node, executionMode, options = {}) {
   const perItemValidation = getCollectionMapPerItemValidationConfig(node);
   const failureMode = getCollectionMapFailureMode(node);
   const audioContinuationChain = serializeCollectionMapAudioContinuationChainState(options.audioContinuationChain);
+  const videoContinuationChain = serializeCollectionMapVideoContinuationChainState(options.videoContinuationChain);
   return {
     executionMode: String(executionMode || '').trim(),
     inputKind: String(mapping?.inputKind || '').trim(),
@@ -2105,6 +2293,7 @@ function buildCollectionMapMetadata(mapping, node, executionMode, options = {}) 
       mode: perItemValidation.mode,
     } : { enabled: false },
     ...(audioContinuationChain ? { audioContinuationChain } : {}),
+    ...(videoContinuationChain ? { videoContinuationChain } : {}),
     toolId: String(node?.config?.toolId || '').trim(),
     providerId: String(node?.config?.providerId || '').trim(),
   };
@@ -2309,10 +2498,10 @@ function buildCollectionMapFailedItemMetadata({ error, failureKind, itemCount, i
   };
 }
 
-async function persistPartialCollectionMapArtifact({ audioContinuationChain, executionMode, failedItems, mappedItems, mapping, node, outputKind, run, sourceCollection, sourceItems }) {
+async function persistPartialCollectionMapArtifact({ audioContinuationChain, executionMode, failedItems, mappedItems, mapping, node, outputKind, run, sourceCollection, sourceItems, videoContinuationChain }) {
   const collection = createArtifactCollection(mappedItems, {
     collectionMapping: {
-      ...buildCollectionMapMetadata(mapping, node, executionMode, { audioContinuationChain }),
+      ...buildCollectionMapMetadata(mapping, node, executionMode, { audioContinuationChain, videoContinuationChain }),
       partialReason: String(failedItems?.[0]?.reason || '').trim(),
     },
     collectionStatus: 'partial',
@@ -2575,6 +2764,157 @@ async function generateMappedAudiocraftContinuationChainArtifact(node, inputArti
   return segmentArtifact;
 }
 
+async function buildInitialVideoChainReferenceArtifact(node, chainState) {
+  const referencePath = path.resolve(String(chainState?.initialReferenceImagePath || '').trim());
+  if (!referencePath || !(await fs.pathExists(referencePath))) {
+    throw new Error('The initial reference image for this video chain could not be found. Choose the image again or start the first item as text-to-video.');
+  }
+
+  return buildFileArtifact(referencePath, {
+    displayName: String(node?.label || 'Video chain') + ' initial reference image',
+    kind: PORT_KIND_IMAGE,
+    role: 'reference',
+  });
+}
+
+async function resolveCollectionMapVideoReferenceArtifact(node, options = {}) {
+  const chainState = options.videoContinuationChain || null;
+  const itemIndex = Number(options.itemIndex || 0) || 0;
+  if (!chainState?.enabled) {
+    return { artifact: null, role: 'none' };
+  }
+
+  if (itemIndex === 0) {
+    if (chainState.firstItemBehavior === 'initialReferenceImage') {
+      const artifact = await buildInitialVideoChainReferenceArtifact(node, chainState);
+      return { artifact, role: 'initialReferenceImage' };
+    }
+
+    return { artifact: null, role: 'firstTextToVideo' };
+  }
+
+  if (!chainState.previousLastFrameArtifact?.filePath) {
+    throw new Error('Local AI Hub could not continue the video chain because the previous accepted clip did not produce a last-frame reference image.');
+  }
+
+  return {
+    artifact: chainState.previousLastFrameArtifact,
+    role: 'previousLastFrame',
+  };
+}
+
+async function generateMappedVideoArtifact(node, inputArtifact, options = {}) {
+  const contextMaps = options.contextMaps || {};
+  const run = options.run || null;
+  const reportProgress = options.reportProgress;
+  const itemIndex = Number(options.itemIndex || 0) || 0;
+  const itemCount = Number(options.itemCount || 0) || 0;
+  const itemId = String(options.sourceEntry?.itemId || '').trim();
+  const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '');
+  const mapping = options.mapping || getCollectionMapMapping(node);
+  const operationNode = buildCollectionMapOperationNode(node, PIPELINE_OPERATION_IDS.VIDEO_GENERATE);
+  const executionMode = getCollectionMapExecutionModeForRun(operationNode);
+  const reference = await resolveCollectionMapVideoReferenceArtifact(operationNode, options);
+  const videoRequest = await buildVideoGenerationRequest(operationNode, inputArtifact, contextMaps, {
+    referenceImageArtifact: reference.artifact,
+  });
+  const videoMapMetadata = buildCollectionMapVideoItemMetadata({
+    chainState: options.videoContinuationChain || null,
+    executionMode,
+    inputArtifact,
+    itemCount,
+    itemId,
+    itemIndex,
+    mapping,
+    node,
+    referenceImageArtifact: reference.artifact,
+    referenceRole: reference.role,
+    videoRequest,
+  });
+  const model = String(operationNode.config?.model || '').trim();
+  const fps = Math.max(1, Number(operationNode.config?.videoFps || 15) || 15);
+  const quality = Math.max(1, Number(operationNode.config?.videoQuality || 5) || 5);
+
+  if (executionMode === 'localTool') {
+    const tool = await getSelectedLocalVideoToolOrThrow(contextMaps, operationNode, 'collection video generation');
+    reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for local video generation.', 'Running ' + node.label + '...');
+    const result = await generateVideoWithLocalVideoTool(tool, {
+      collectionMap: videoMapMetadata.collectionMap,
+      collectionMapItemMode: videoMapMetadata.collectionMapItemMode,
+      collectionMapVideoChain: videoMapMetadata.collectionMapVideoChain,
+      displayName: node.label + ' item ' + String(itemIndex + 1),
+      fps,
+      model,
+      negativePrompt: videoRequest.negativePrompt,
+      nodeLabel: node.label + ' item ' + String(itemIndex + 1),
+      prompt: videoRequest.prompt,
+      promptStyle: videoRequest.promptStyle,
+      quality,
+      referenceImagePath: videoRequest.referenceImagePath,
+      reportProgress,
+      runDirectories: run.directories,
+      seed: operationNode.config?.seed,
+      size: videoRequest.size,
+      sourceImageArtifact: videoRequest.sourceImageArtifact,
+      steps: operationNode.config?.steps,
+    });
+    return result?.outputs?.video || null;
+  }
+
+  const providerId = String(operationNode.config?.providerId || '').trim();
+  if (!providerId) {
+    throw new Error('Choose a connected cloud provider before running this video collection map.');
+  }
+  if (doesProviderOperationRequireExplicitModel(providerId, PIPELINE_OPERATION_IDS.VIDEO_GENERATE) && !model) {
+    throw new Error('Choose or enter a video model before running this collection map.');
+  }
+  const provider = contextMaps.providersById[providerId] || null;
+  if (!provider?.isConnected) {
+    throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
+  }
+
+  reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + ' for video generation.', 'Running ' + node.label + '...');
+  const result = await runProviderOperation(providerId, {
+    imageReference: videoRequest.referenceImage,
+    model,
+    onProgress: (message) => reportProgress?.(message, 'Running ' + node.label + '...'),
+    operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+    prompt: videoRequest.prompt,
+    providerId,
+    seconds: Math.max(1, Number(operationNode.config?.durationSeconds || 8) || 8),
+    size: videoRequest.size,
+  });
+  const generatedVideo = result?.videos?.[0] || null;
+  if (!generatedVideo?.buffer) {
+    throw new Error(provider.name + ' finished the request, but it did not return a video file for this item.');
+  }
+
+  const artifact = await saveBufferArtifact(run.directories, generatedVideo.buffer, {
+    baseName: node.label + '-item-' + String(itemIndex + 1).padStart(3, '0') + '-' + Date.now(),
+    displayName: node.label + ' item ' + String(itemIndex + 1),
+    extension: String(generatedVideo.extension || '.mp4').trim() || '.mp4',
+    kind: PORT_KIND_VIDEO,
+    role: 'generated',
+    videoGeneration: {
+      backend: providerId,
+      backendLabel: provider.name,
+      collectionMap: videoMapMetadata.collectionMap,
+      collectionMapItemMode: videoMapMetadata.collectionMapItemMode,
+      collectionMapVideoChain: videoMapMetadata.collectionMapVideoChain,
+      mode: videoRequest.referenceImage ? 'image-to-video' : 'text-to-video',
+      model,
+      negativePrompt: videoRequest.negativePrompt,
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      operationSubtype: videoRequest.referenceImage ? 'image-to-video' : 'text-to-video',
+      prompt: videoRequest.prompt,
+      promptStyle: videoRequest.promptStyle,
+      size: videoRequest.size,
+      sourceImage: videoRequest.sourceImageArtifact,
+      usedReferenceImage: Boolean(videoRequest.referenceImage),
+    },
+  });
+  return persistVideoGenerationMetadataSidecar(artifact);
+}
 async function executeMappedCollectionItemArtifact(node, inputArtifact, options = {}) {
   const operationId = getCollectionMapOperationId(node);
   const outputKind = getCollectionMapOutputKind(node);
@@ -2594,6 +2934,10 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
 
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
     return generateMappedImageArtifact(node, inputArtifact, options);
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+    return generateMappedVideoArtifact(node, inputArtifact, options);
   }
 
   if (executionMode === 'graphWorkflow') {
@@ -2846,6 +3190,9 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
   const audioContinuationChain = isCollectionMapAudioContinuationChainEnabledForRun(node, mapping, executionMode)
     ? buildCollectionMapAudioContinuationChainState(node)
     : null;
+  const videoContinuationChain = isCollectionMapVideoContinuationChainEnabledForRun(node, mapping, executionMode)
+    ? buildCollectionMapVideoContinuationChainState(node)
+    : null;
   for (let index = 0; index < sourceItems.length; index += 1) {
     const entry = sourceItems[index];
     const sourceArtifact = entry?.artifact || null;
@@ -2866,6 +3213,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
         sourceEntry: entry,
         validationConfig,
         audioContinuationChain,
+        videoContinuationChain,
       });
       const mappedArtifact = mappedResult.artifact;
       if (!mappedArtifact || mappedArtifact.kind !== outputKind) {
@@ -2888,6 +3236,42 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
           segmentDurationSeconds: Number(itemChainMetadata.segmentDurationSeconds || 0) || 0,
         });
       }
+      let videoChainItemMetadata = mappedArtifact?.videoGeneration?.collectionMapVideoChain || null;
+      if (videoContinuationChain?.enabled) {
+        let lastFrameArtifact = null;
+        if (index < sourceItems.length - 1) {
+          lastFrameArtifact = await extractVideoLastFrameArtifact(mappedArtifact, {
+            displayName: node.label + ' item ' + String(index + 1) + ' last frame',
+            itemIndex: index,
+            nodeLabel: node.label,
+            runDirectories: run.directories,
+          });
+          videoContinuationChain.previousLastFrameArtifact = lastFrameArtifact;
+          videoContinuationChain.finalLastFramePath = String(lastFrameArtifact.filePath || '').trim();
+        }
+        videoContinuationChain.lastAcceptedArtifact = mappedArtifact;
+        videoChainItemMetadata = {
+          ...(videoChainItemMetadata || {}),
+          lastFrameReference: buildImageArtifactReference(lastFrameArtifact),
+          lastFrameReferencePrepared: Boolean(lastFrameArtifact),
+        };
+        mappedArtifact.videoGeneration = {
+          ...(mappedArtifact.videoGeneration || {}),
+          collectionMapVideoChain: videoChainItemMetadata,
+        };
+        videoContinuationChain.items.push({
+          clip: buildVideoArtifactReference(mappedArtifact),
+          itemId,
+          itemIndex: index,
+          lastFrameReference: buildImageArtifactReference(lastFrameArtifact),
+          previousClip: videoChainItemMetadata.previousClip || null,
+          previousLastFrame: videoChainItemMetadata.previousLastFrame || null,
+          referenceRole: String(videoChainItemMetadata.referenceRole || '').trim(),
+        });
+        await persistVideoGenerationMetadataSidecar(mappedArtifact);
+      } else if (mappedArtifact?.kind === PORT_KIND_VIDEO) {
+        await persistVideoGenerationMetadataSidecar(mappedArtifact);
+      }
       mappedItems.push({
         artifact: mappedArtifact,
         attempts: mappedResult.attempts,
@@ -2901,7 +3285,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
           sourceItemIndex: index,
           parentLineage: entry?.lineage || null,
         },
-        ...(itemChainMetadata ? { metadata: { audioContinuationChain: itemChainMetadata } } : {}),
+        ...(itemChainMetadata || videoChainItemMetadata ? { metadata: { ...(itemChainMetadata ? { audioContinuationChain: itemChainMetadata } : {}), ...(videoChainItemMetadata ? { videoContinuationChain: videoChainItemMetadata } : {}) } } : {}),
         validation: mappedResult.validation,
       });
     } catch (error) {
@@ -2931,6 +3315,14 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
           status: 'failed',
         });
       }
+      if (videoContinuationChain?.enabled) {
+        failedItem.chainFailure = true;
+        failedItem.videoContinuationChain = serializeCollectionMapVideoContinuationChainState(videoContinuationChain, {
+          brokenAtItemId: itemId,
+          brokenAtItemIndex: index,
+          status: 'failed',
+        });
+      }
       failedItems.push(failedItem);
 
       if (!partialOutputEnabled || !mappedItems.length) {
@@ -2948,6 +3340,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
         run,
         sourceCollection,
         sourceItems,
+        videoContinuationChain,
       });
       return {
         message: node.label + ' stopped on ' + itemLabel + ' and output a partial ' + outputKind + ' collection with ' + persistedPartialCollection.itemCount + ' successful item' + (persistedPartialCollection.itemCount === 1 ? '' : 's') + '. Failed item details are recorded in the collection manifest.',
@@ -2961,7 +3354,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
   }
 
   const collection = createArtifactCollection(mappedItems, {
-    collectionMapping: buildCollectionMapMetadata(mapping, node, executionMode, { audioContinuationChain }),
+    collectionMapping: buildCollectionMapMetadata(mapping, node, executionMode, { audioContinuationChain, videoContinuationChain }),
     collectionStatus: 'complete',
     sourceItemCount: sourceItems.length,
     displayName: node.label,
@@ -2990,13 +3383,49 @@ function formatArtifactCollectionLineageLabel(kind) {
   if (kind === PORT_KIND_FILE) return 'File Collection';
   return 'Text Collection';
 }
-async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}) {
+async function buildVideoReferenceImageRequest(referenceArtifact, size) {
+  if (!referenceArtifact) {
+    return {
+      referenceImage: null,
+      referenceImagePath: '',
+      sourceImageArtifact: null,
+    };
+  }
+
+  if (referenceArtifact.kind !== PORT_KIND_IMAGE || !referenceArtifact.filePath) {
+    throw new Error('The video reference for this item is not a usable image artifact.');
+  }
+
+  const filePath = path.resolve(String(referenceArtifact.filePath || '').trim());
+  if (!filePath || !(await fs.pathExists(filePath))) {
+    throw new Error('The reference image for this video step could not be found anymore. Choose it again and rerun the pipeline.');
+  }
+
+  const [expectedWidth, expectedHeight] = String(size || '').split('x').map((value) => Number(value || 0));
+  if (expectedWidth > 0 && expectedHeight > 0 && referenceArtifact.width && referenceArtifact.height) {
+    if (Number(referenceArtifact.width) !== expectedWidth || Number(referenceArtifact.height) !== expectedHeight) {
+      throw new Error('This video step is set to ' + size + ', but the reference image is ' + referenceArtifact.width + 'x' + referenceArtifact.height + '. Choose a matching video size or supply a matching image.');
+    }
+  }
+
+  return {
+    referenceImage: {
+      buffer: await fs.readFile(filePath),
+      fileName: String(referenceArtifact.fileName || path.basename(filePath)).trim() || path.basename(filePath),
+      mimeType: String(referenceArtifact.mimeType || 'image/png').trim() || 'image/png',
+    },
+    referenceImagePath: filePath,
+    sourceImageArtifact: referenceArtifact,
+  };
+}
+async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}, options = {}) {
   if (!inputArtifact) {
     throw new Error('This video generation step did not receive any input.');
   }
 
   const size = String(node.config?.videoSize || '1280x720').trim() || '1280x720';
   const motionPrompt = String(node.config?.instruction || '').trim();
+  const referenceImageArtifact = options.referenceImageArtifact || null;
 
   if (inputArtifact.kind === PORT_KIND_TEXT) {
     const promptText = String(inputArtifact.text || '').trim();
@@ -3009,13 +3438,14 @@ async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}
       negativePrompt: String(node.config?.negativePrompt || '').trim(),
       supportNegativePrompt: true,
     });
+    const referenceRequest = await buildVideoReferenceImageRequest(referenceImageArtifact, size);
     return {
       negativePrompt: promptRequest.negativePrompt,
       prompt: promptRequest.prompt,
       promptStyle: promptRequest.promptStyle,
-      referenceImage: null,
-      referenceImagePath: '',
-      sourceImageArtifact: null,
+      referenceImage: referenceRequest.referenceImage,
+      referenceImagePath: referenceRequest.referenceImagePath,
+      sourceImageArtifact: referenceRequest.sourceImageArtifact,
       size,
     };
   }
@@ -4336,6 +4766,142 @@ async function createAudioStitchOutputPath(runDirectories, node) {
   }
 }
 
+function firstNonEmptyLine(value) {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) || '';
+}
+
+function formatFfmpegConcatPath(value) {
+  return String(value || '').replace(/\\/g, '/').replace(/'/g, "'\\''");
+}
+
+async function createVideoStitchOutputPath(runDirectories, node) {
+  const baseName = sanitizeSegment(node.label || 'stitched-video', 'stitched-video');
+  let attempt = 0;
+  while (true) {
+    const suffix = attempt === 0 ? '' : '-' + String(attempt + 1);
+    const outputPath = path.join(runDirectories.artifactsDir, baseName + suffix + '.mp4');
+    if (!(await fs.pathExists(outputPath))) return outputPath;
+    attempt += 1;
+  }
+}
+
+function getVideoMetric(artifact, key) {
+  if (!artifact || typeof artifact !== 'object') return null;
+  const generation = artifact.videoGeneration && typeof artifact.videoGeneration === 'object' ? artifact.videoGeneration : null;
+  const direct = artifact.video && typeof artifact.video === 'object' ? artifact.video : null;
+  const value = generation?.[key] ?? direct?.[key] ?? artifact[key];
+  if (key === 'fps' || key === 'durationSeconds') {
+    const numeric = Number(value || 0) || 0;
+    return numeric > 0 ? numeric : null;
+  }
+  return String(value || '').trim() || null;
+}
+
+function buildVideoStitchSourceReference(entry, artifact, sourcePath, index) {
+  const generation = artifact.videoGeneration && typeof artifact.videoGeneration === 'object' ? artifact.videoGeneration : null;
+  return {
+    artifactPath: sourcePath,
+    displayName: String(artifact.displayName || artifact.fileName || 'Video collection item ' + String(index + 1)).trim(),
+    durationSeconds: getVideoMetric(artifact, 'durationSeconds'),
+    fileName: String(artifact.fileName || path.basename(sourcePath)).trim(),
+    fps: getVideoMetric(artifact, 'fps'),
+    index: Number(entry.index || index) || index,
+    itemId: String(entry.itemId || '').trim(),
+    metadataPaths: Array.isArray(artifact.metadataPaths) ? artifact.metadataPaths : [],
+    operationSubtype: String(generation?.operationSubtype || generation?.mode || '').trim(),
+    prompt: String(generation?.prompt || '').trim(),
+    promptStyle: generation?.promptStyle || null,
+    size: getVideoMetric(artifact, 'size'),
+    summary: String(entry.summary || artifact.summary || '').trim(),
+    toolId: String(generation?.toolId || '').trim(),
+    toolLabel: String(generation?.toolLabel || generation?.backendLabel || '').trim(),
+    videoChain: generation?.collectionMapVideoChain || null,
+  };
+}
+
+function ensureCompatibleVideoClip(reference, candidate, itemLabel) {
+  const mismatches = [];
+  const refExtension = String(path.extname(reference.artifactPath || '') || '').toLowerCase();
+  const candidateExtension = String(path.extname(candidate.artifactPath || '') || '').toLowerCase();
+  if (candidateExtension !== '.mp4') mismatches.push('MP4 container');
+  if (refExtension && candidateExtension && candidateExtension !== refExtension) mismatches.push('container extension');
+  if (reference.size && candidate.size && reference.size !== candidate.size) mismatches.push('frame size');
+  if (reference.fps && candidate.fps && Number(reference.fps) !== Number(candidate.fps)) mismatches.push('fps');
+  if (mismatches.length) {
+    throw new Error(itemLabel + ' is not concat-compatible with the first clip (' + mismatches.join(', ') + '). Video Stitch currently stream-copies matching MP4 clips only; regenerate or normalize the collection before stitching.');
+  }
+}
+
+async function writeVideoConcatManifest(directoryPath, sourceItems) {
+  const manifestPath = path.join(directoryPath, 'video-stitch.ffconcat');
+  const lines = ['ffconcat version 1.0'];
+  for (const item of sourceItems) {
+    lines.push("file '" + formatFfmpegConcatPath(item.artifactPath) + "'");
+  }
+  await fs.writeFile(manifestPath, lines.join('\n') + '\n', 'utf8');
+  return manifestPath;
+}
+
+async function executeVideoStitchNode(node, graph, run) {
+  const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
+  if (!isArtifactCollection(sourceCollection)) throw new Error('Video Stitch needs an ordered video collection before it can create one MP4 file.');
+  if (String(sourceCollection.itemKind || '').trim() !== PORT_KIND_VIDEO) throw new Error('Video Stitch only accepts ordered video collections. Connect collection:video to this node.');
+  const orderedEntries = (Array.isArray(sourceCollection.items) ? sourceCollection.items : []).filter((entry) => entry?.artifact).sort((left, right) => (Number(left.index || 0) || 0) - (Number(right.index || 0) || 0));
+  if (!orderedEntries.length) throw new Error('Video Stitch received an empty video collection. Generate or select at least one video clip before stitching.');
+  const sourceItems = [];
+  let referenceItem = null;
+  let totalDurationSeconds = 0;
+  for (let index = 0; index < orderedEntries.length; index += 1) {
+    const entry = orderedEntries[index];
+    const artifact = entry.artifact || null;
+    const itemLabel = 'Video collection item ' + String(index + 1);
+    if (String(artifact?.kind || '').trim() !== PORT_KIND_VIDEO) throw new Error(itemLabel + ' is not a video artifact. Video Stitch can only combine collection:video items.');
+    const rawPath = String(artifact.filePath || '').trim();
+    if (!rawPath) throw new Error(itemLabel + ' is missing a video file path. Regenerate that item or choose the file again before stitching.');
+    const sourcePath = path.resolve(rawPath);
+    if (!(await fs.pathExists(sourcePath))) throw new Error(itemLabel + ' points to a video file Local AI Hub cannot find. Regenerate that item or choose the file again before stitching.');
+    if (String(path.extname(sourcePath) || '').toLowerCase() !== '.mp4') {
+      throw new Error(itemLabel + ' is not an MP4 file. Video Stitch currently uses ffmpeg concat stream-copy for matching MP4 clips only.');
+    }
+    const sourceRef = buildVideoStitchSourceReference(entry, artifact, sourcePath, index);
+    if (!referenceItem) referenceItem = sourceRef;
+    else ensureCompatibleVideoClip(referenceItem, sourceRef, itemLabel);
+    const durationSeconds = Number(sourceRef.durationSeconds || 0) || 0;
+    if (durationSeconds > 0) totalDurationSeconds += durationSeconds;
+    sourceItems.push(sourceRef);
+  }
+
+  const outputPath = await createVideoStitchOutputPath(run.directories, node);
+  const manifestPath = await writeVideoConcatManifest(run.directories.artifactsDir, sourceItems);
+  const ffmpegPath = resolveFfmpegPath();
+  const commandResult = await runCommand(ffmpegPath, ['-y', '-f', 'concat', '-safe', '0', '-i', manifestPath, '-c', 'copy', '-movflags', '+faststart', outputPath], { allowFailure: true });
+  if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
+    const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
+    throw new Error('Video Stitch could not concatenate these clips with ffmpeg stream-copy concat. In this pass, clips need matching MP4 container, codec, resolution, and fps. ' + (failureLine || 'Normalize the clips and try again.'));
+  }
+
+  const roundedTotalDuration = totalDurationSeconds > 0 ? Math.round(totalDurationSeconds * 100) / 100 : null;
+  const videoStitch = {
+    concatManifestPath: manifestPath,
+    concatMode: 'ffmpeg-concat-demuxer',
+    createdBy: { nodeId: String(node.id || '').trim(), nodeLabel: String(node.label || '').trim(), nodeType: String(node.type || 'videoStitch').trim() },
+    ffmpegMode: 'stream-copy',
+    operationId: 'videoStitch',
+    outputFormat: 'mp4',
+    sourceCollection: { directoryPath: String(sourceCollection.directoryPath || '').trim(), displayName: String(sourceCollection.displayName || '').trim(), itemCount: Number(sourceCollection.itemCount || orderedEntries.length) || orderedEntries.length, itemKind: String(sourceCollection.itemKind || PORT_KIND_VIDEO).trim() || PORT_KIND_VIDEO, manifestPath: String(sourceCollection.manifestPath || '').trim(), summary: String(sourceCollection.summary || '').trim() },
+    sourceItemCount: sourceItems.length,
+    sourceItems,
+    totalDurationSeconds: roundedTotalDuration,
+  };
+  const artifact = await buildFileArtifact(outputPath, { displayName: node.label || 'Stitched video', kind: PORT_KIND_VIDEO, role: 'generated', videoStitch });
+  const metadataPaths = await saveVideoArtifactMetadata(outputPath, artifact);
+  if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
+  artifact.summary = summarizeArtifact(artifact);
+  return { destinationPath: outputPath, message: 'Video Stitch combined ' + sourceItems.length + ' video clip' + (sourceItems.length === 1 ? '' : 's') + ' into one MP4 file.', outputs: { video: artifact }, preview: summarizeArtifact(artifact) };
+}
 async function executeAudioStitchNode(node, graph, run) {
   const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
   if (!isArtifactCollection(sourceCollection)) throw new Error('Audio Stitch needs an ordered audio collection before it can create one WAV file.');
@@ -4375,6 +4941,89 @@ async function executeAudioStitchNode(node, graph, run) {
   if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
   artifact.summary = summarizeArtifact(artifact);
   return { destinationPath: outputPath, message: 'Audio Stitch combined ' + sourceItems.length + ' audio clip' + (sourceItems.length === 1 ? '' : 's') + ' into one WAV file.', outputs: { audio: artifact }, preview: summarizeArtifact(artifact) };
+}
+
+async function executeExtractVideoFrameNode(node, graph, run, reportProgress) {
+  const sourceVideo = getNodeInputArtifact(node.id, 'video', graph, run.resultsByNodeId, run);
+  return extractVideoFrameArtifact(sourceVideo, {
+    displayName: node.label || 'Extracted video frame',
+    framePosition: node.config?.framePosition || 'first',
+    node,
+    outputFormat: node.config?.outputFormat || 'png',
+    reportProgress,
+    runDirectories: run.directories,
+  });
+}
+
+async function executeExtractAudioNode(node, graph, run, reportProgress) {
+  const sourceVideo = getNodeInputArtifact(node.id, 'video', graph, run.resultsByNodeId, run);
+  return extractAudioFromVideoArtifact(sourceVideo, {
+    displayName: node.label || 'Extracted audio',
+    node,
+    outputFormat: node.config?.outputFormat || 'wav',
+    reportProgress,
+    runDirectories: run.directories,
+  });
+}
+
+async function executeNormalizeAudioCollectionNode(node, graph, run, reportProgress) {
+  const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
+  return normalizeAudioCollectionArtifact(sourceCollection, {
+    channels: node.config?.channels || 'stereo',
+    displayName: node.label || 'Normalize Audio Collection',
+    node,
+    outputFormat: node.config?.outputFormat || 'wav',
+    pcmFormat: node.config?.pcmFormat || 'pcm_s16le',
+    reportProgress,
+    runDirectories: run.directories,
+    sampleRate: node.config?.sampleRate || 44100,
+  });
+}
+
+async function executeNormalizeVideoCollectionNode(node, graph, run, reportProgress) {
+  const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
+  return normalizeVideoCollectionArtifact(sourceCollection, {
+    audioCodec: node.config?.audioCodec || 'aac',
+    displayName: node.label || 'Normalize Video Collection',
+    fps: node.config?.fps || 30,
+    height: node.config?.height || 720,
+    node,
+    outputFormat: node.config?.outputFormat || 'mp4',
+    pixelFormat: node.config?.pixelFormat || 'yuv420p',
+    reportProgress,
+    runDirectories: run.directories,
+    sizeMode: node.config?.sizeMode || 'matchFirst',
+    videoCodec: node.config?.videoCodec || 'libx264',
+    width: node.config?.width || 1280,
+  });
+}
+
+async function executeTrimMediaNode(node, graph, run, reportProgress) {
+  const mediaArtifact = getNodeInputArtifact(node.id, 'media', graph, run.resultsByNodeId, run);
+  return trimMediaArtifact(mediaArtifact, {
+    displayName: node.label || 'Trim Media',
+    durationSeconds: node.config?.durationSeconds || 5,
+    endSeconds: node.config?.endSeconds || 5,
+    mode: node.config?.mode || 'duration',
+    node,
+    reportProgress,
+    runDirectories: run.directories,
+    startSeconds: node.config?.startSeconds || 0,
+  });
+}
+
+async function executeBurnSubtitlesNode(node, graph, run, reportProgress) {
+  const videoArtifact = getNodeInputArtifact(node.id, 'video', graph, run.resultsByNodeId, run);
+  const captionArtifact = getNodeInputArtifact(node.id, 'captions', graph, run.resultsByNodeId, run);
+  return burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, {
+    captionMode: node.config?.captionMode || 'auto',
+    displayName: node.label || 'Burn Subtitles / Captions',
+    durationPerCaptionSeconds: node.config?.durationPerCaptionSeconds || 3,
+    node,
+    outputFormat: node.config?.outputFormat || 'mp4',
+    reportProgress,
+    runDirectories: run.directories,
+  });
 }
 
 async function executeMediaCompositionNode(node, graph, run) {
@@ -5158,6 +5807,34 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
   if (node.type === 'audioStitch') {
     return executeAudioStitchNode(node, graph, run);
+  }
+
+  if (node.type === 'videoStitch') {
+    return executeVideoStitchNode(node, graph, run);
+  }
+
+  if (node.type === 'trimMedia') {
+    return executeTrimMediaNode(node, graph, run, reportProgress);
+  }
+
+  if (node.type === 'burnSubtitles') {
+    return executeBurnSubtitlesNode(node, graph, run, reportProgress);
+  }
+
+  if (node.type === 'normalizeAudioCollection') {
+    return executeNormalizeAudioCollectionNode(node, graph, run, reportProgress);
+  }
+
+  if (node.type === 'normalizeVideoCollection') {
+    return executeNormalizeVideoCollectionNode(node, graph, run, reportProgress);
+  }
+
+  if (node.type === 'extractVideoFrame') {
+    return executeExtractVideoFrameNode(node, graph, run, reportProgress);
+  }
+
+  if (node.type === 'extractAudio') {
+    return executeExtractAudioNode(node, graph, run, reportProgress);
   }
 
   if (node.type === 'mediaComposition') {

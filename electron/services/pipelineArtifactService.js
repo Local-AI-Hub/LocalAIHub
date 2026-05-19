@@ -535,6 +535,196 @@ function serializeAudioStitchForUi(stitch = null) {
   }) ? normalized : null;
 }
 
+function serializeAudioExtractionForUi(extraction = null) {
+  if (!extraction || typeof extraction !== 'object') {
+    return null;
+  }
+
+  const audio = serializeAudioDetailsForUi(extraction.audio);
+  const normalized = {
+    audio,
+    backend: String(extraction.backend || 'ffmpeg').trim() || 'ffmpeg',
+    backendLabel: String(extraction.backendLabel || 'Bundled ffmpeg').trim() || 'Bundled ffmpeg',
+    channelCount: Number(extraction.channelCount || audio?.channelCount || 0) || 0,
+    createdBy: extraction.createdBy && typeof extraction.createdBy === 'object' ? serializeArtifactForUi(extraction.createdBy) : null,
+    durationSeconds: roundAudioMetric(extraction.durationSeconds || audio?.durationSeconds),
+    ffmpegMode: String(extraction.ffmpegMode || '').trim(),
+    operationId: String(extraction.operationId || 'extractAudio').trim() || 'extractAudio',
+    outputFormat: String(extraction.outputFormat || 'wav').trim() || 'wav',
+    sampleRate: Number(extraction.sampleRate || audio?.sampleRate || 0) || 0,
+    sourceVideo: extraction.sourceVideo && typeof extraction.sourceVideo === 'object' ? serializeArtifactForUi(extraction.sourceVideo) : null,
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
+function serializeAudioNormalizationForUi(normalization = null) {
+  if (!normalization || typeof normalization !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    backend: String(normalization.backend || 'ffmpeg').trim() || 'ffmpeg',
+    backendLabel: String(normalization.backendLabel || 'Bundled ffmpeg').trim() || 'Bundled ffmpeg',
+    channelCount: Number(normalization.channelCount || 0) || 0,
+    channels: String(normalization.channels || '').trim(),
+    codec: String(normalization.codec || normalization.pcmFormat || 'pcm_s16le').trim() || 'pcm_s16le',
+    createdBy: normalization.createdBy && typeof normalization.createdBy === 'object' ? serializeArtifactForUi(normalization.createdBy) : null,
+    durationSeconds: roundAudioMetric(normalization.durationSeconds),
+    ffmpegMode: String(normalization.ffmpegMode || '').trim(),
+    operation: String(normalization.operation || 'normalizeAudioCollection').trim() || 'normalizeAudioCollection',
+    operationId: String(normalization.operationId || 'normalizeAudioCollection').trim() || 'normalizeAudioCollection',
+    outputFormat: String(normalization.outputFormat || 'wav').trim() || 'wav',
+    sampleRate: Number(normalization.sampleRate || 0) || 0,
+    sourceAudio: normalization.sourceAudio && typeof normalization.sourceAudio === 'object' ? serializeArtifactForUi(normalization.sourceAudio) : null,
+    sourceCollection: normalization.sourceCollection && typeof normalization.sourceCollection === 'object' ? serializeArtifactForUi(normalization.sourceCollection) : null,
+    sourceItem: normalization.sourceItem && typeof normalization.sourceItem === 'object' ? serializeArtifactForUi(normalization.sourceItem) : null,
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
+function serializeVideoNormalizationForUi(normalization = null) {
+  if (!normalization || typeof normalization !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    audioCodec: String(normalization.audioCodec || '').trim(),
+    audioHandling: String(normalization.audioHandling || '').trim(),
+    backend: String(normalization.backend || 'ffmpeg').trim() || 'ffmpeg',
+    backendLabel: String(normalization.backendLabel || 'Bundled ffmpeg').trim() || 'Bundled ffmpeg',
+    container: String(normalization.container || normalization.outputFormat || 'mp4').trim() || 'mp4',
+    createdBy: normalization.createdBy && typeof normalization.createdBy === 'object' ? serializeArtifactForUi(normalization.createdBy) : null,
+    ffmpegMode: String(normalization.ffmpegMode || '').trim(),
+    fps: Number(normalization.fps || 0) || 0,
+    height: Number(normalization.height || 0) || 0,
+    operation: String(normalization.operation || 'normalizeVideoCollection').trim() || 'normalizeVideoCollection',
+    operationId: String(normalization.operationId || 'normalizeVideoCollection').trim() || 'normalizeVideoCollection',
+    outputFormat: String(normalization.outputFormat || 'mp4').trim() || 'mp4',
+    pixelFormat: String(normalization.pixelFormat || 'yuv420p').trim() || 'yuv420p',
+    sourceCollection: normalization.sourceCollection && typeof normalization.sourceCollection === 'object' ? serializeArtifactForUi(normalization.sourceCollection) : null,
+    sourceItem: normalization.sourceItem && typeof normalization.sourceItem === 'object' ? serializeArtifactForUi(normalization.sourceItem) : null,
+    sourceVideo: normalization.sourceVideo && typeof normalization.sourceVideo === 'object' ? serializeArtifactForUi(normalization.sourceVideo) : null,
+    videoCodec: String(normalization.videoCodec || 'libx264').trim() || 'libx264',
+    width: Number(normalization.width || 0) || 0,
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
+function serializeCollectionNormalizationForUi(normalization = null) {
+  if (!normalization || typeof normalization !== 'object') {
+    return null;
+  }
+  const normalized = serializeArtifactForUi(normalization);
+  normalized.operation = String(normalized.operation || normalized.operationId || '').trim();
+  normalized.operationId = String(normalized.operationId || normalized.operation || '').trim();
+  normalized.itemCount = Number(normalized.itemCount || 0) || 0;
+  return Object.entries(normalized).some(([, value]) => {
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === 'object') return true;
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
+function serializeMediaTrimForUi(trim = null) {
+  if (!trim || typeof trim !== 'object') {
+    return null;
+  }
+  const normalized = serializeArtifactForUi(trim);
+  normalized.operation = String(normalized.operation || normalized.operationId || 'trimMedia').trim() || 'trimMedia';
+  normalized.operationId = String(normalized.operationId || normalized.operation || 'trimMedia').trim() || 'trimMedia';
+  return Object.entries(normalized).some(([, value]) => {
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === 'object') return true;
+    return Boolean(value) || value === 0;
+  }) ? normalized : null;
+}
+
+function serializeSubtitleBurnForUi(burn = null) {
+  if (!burn || typeof burn !== 'object') {
+    return null;
+  }
+  const normalized = serializeArtifactForUi(burn);
+  normalized.operation = String(normalized.operation || normalized.operationId || 'burnSubtitles').trim() || 'burnSubtitles';
+  normalized.operationId = String(normalized.operationId || normalized.operation || 'burnSubtitles').trim() || 'burnSubtitles';
+  return Object.entries(normalized).some(([, value]) => {
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === 'object') return true;
+    return Boolean(value) || value === 0;
+  }) ? normalized : null;
+}
+
+function serializeVideoStitchForUi(stitch = null) {
+  if (!stitch || typeof stitch !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    concatManifestPath: String(stitch.concatManifestPath || '').trim(),
+    concatMode: String(stitch.concatMode || '').trim(),
+    createdBy: stitch.createdBy && typeof stitch.createdBy === 'object' ? serializeArtifactForUi(stitch.createdBy) : null,
+    ffmpegMode: String(stitch.ffmpegMode || '').trim(),
+    operationId: String(stitch.operationId || '').trim(),
+    outputFormat: String(stitch.outputFormat || 'mp4').trim() || 'mp4',
+    sourceCollection: stitch.sourceCollection && typeof stitch.sourceCollection === 'object' ? serializeArtifactForUi(stitch.sourceCollection) : null,
+    sourceItemCount: Number(stitch.sourceItemCount || 0) || 0,
+    sourceItems: Array.isArray(stitch.sourceItems) ? serializeArtifactForUi(stitch.sourceItems) : [],
+    totalDurationSeconds: roundAudioMetric(stitch.totalDurationSeconds),
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (Array.isArray(value)) {
+      return value.length > 0;
+    }
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+function serializeVideoFrameExtractionForUi(extraction = null) {
+  if (!extraction || typeof extraction !== 'object') {
+    return null;
+  }
+
+  const timestamp = Number(extraction.timestampSeconds);
+  const normalized = {
+    backend: String(extraction.backend || 'ffmpeg').trim() || 'ffmpeg',
+    backendLabel: String(extraction.backendLabel || 'Bundled ffmpeg').trim() || 'Bundled ffmpeg',
+    createdBy: extraction.createdBy && typeof extraction.createdBy === 'object' ? serializeArtifactForUi(extraction.createdBy) : null,
+    ffmpegMode: String(extraction.ffmpegMode || '').trim(),
+    framePosition: String(extraction.framePosition || 'first').trim() === 'last' ? 'last' : 'first',
+    operationId: String(extraction.operationId || 'extractVideoFrame').trim() || 'extractVideoFrame',
+    outputFormat: String(extraction.outputFormat || 'png').trim() || 'png',
+    sourceVideo: extraction.sourceVideo && typeof extraction.sourceVideo === 'object' ? serializeArtifactForUi(extraction.sourceVideo) : null,
+    timestampSeconds: Number.isFinite(timestamp) ? Math.round(timestamp * 1000) / 1000 : null,
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
 function serializeImageSourceReference(reference = null) {
   if (!reference || typeof reference !== 'object') {
     return null;
@@ -636,6 +826,10 @@ function serializeVideoGenerationForUi(generation = null) {
     operationSubtype: String(generation.operationSubtype || generation.mode || '').trim(),
     prompt: String(generation.prompt || '').trim(),
     promptStyle: serializePromptStyleApplication(generation.promptStyle),
+    quality: Number(generation.quality || 0) || null,
+    collectionMap: generation.collectionMap && typeof generation.collectionMap === 'object' ? serializeArtifactForUi(generation.collectionMap) : null,
+    collectionMapItemMode: String(generation.collectionMapItemMode || '').trim(),
+    collectionMapVideoChain: generation.collectionMapVideoChain && typeof generation.collectionMapVideoChain === 'object' ? serializeArtifactForUi(generation.collectionMapVideoChain) : null,
     seed: Number.isFinite(seed) ? seed : null,
     size: String(generation.size || '').trim(),
     sourceImage: serializeImageSourceReference(generation.sourceImage),
@@ -862,14 +1056,16 @@ function buildPlanSummary(artifact, limit = 180) {
   const schema = getPlanningSchemaDefinition(plan.schemaId || DEFAULT_PLANNING_SCHEMA_ID);
   const scenes = Array.isArray(plan.scenes) ? plan.scenes : [];
   const sections = Array.isArray(plan.sections) ? plan.sections : [];
+  const clips = Array.isArray(plan.clips) ? plan.clips : [];
   const overview = plan.overview && typeof plan.overview === 'object' ? plan.overview : {};
   const parts = [
     schema?.label || 'Plan',
     scenes.length ? scenes.length + ' scene' + (scenes.length === 1 ? '' : 's') : '',
     sections.length ? sections.length + ' section' + (sections.length === 1 ? '' : 's') : '',
+    clips.length ? clips.length + ' clip' + (clips.length === 1 ? '' : 's') : '',
     overview.viewerTakeaway || '',
     plan.overallStyle || '',
-    scenes[0]?.sceneConcept || sections[0]?.prompt || '',
+    scenes[0]?.sceneConcept || sections[0]?.prompt || clips[0]?.prompt || '',
   ].filter(Boolean);
   return trimPreviewText(parts.join(' | '), limit);
 }
@@ -1034,6 +1230,8 @@ function summarizeArtifact(artifact, limit = 180) {
     const generation = artifact.audioGeneration && typeof artifact.audioGeneration === 'object' ? artifact.audioGeneration : null;
     const transformation = artifact.audioTransformation && typeof artifact.audioTransformation === 'object' ? artifact.audioTransformation : null;
     const stitch = artifact.audioStitch && typeof artifact.audioStitch === 'object' ? artifact.audioStitch : null;
+    const extraction = artifact.audioExtraction && typeof artifact.audioExtraction === 'object' ? artifact.audioExtraction : null;
+    const normalization = artifact.audioNormalization && typeof artifact.audioNormalization === 'object' ? artifact.audioNormalization : null;
     const details = [
       artifact.fileName || artifact.displayName || '',
       artifact.formatLabel || '',
@@ -1048,6 +1246,10 @@ function summarizeArtifact(artifact, limit = 180) {
       generation?.toolLabel || generation?.backendLabel || '',
       generation?.voice ? `Voice ${generation.voice}` : '',
       generation?.sourceAudio?.fileName ? `Guided by ${generation.sourceAudio.fileName}` : '',
+      extraction?.sourceVideo?.fileName ? `Extracted from ${extraction.sourceVideo.fileName}` : '',
+      extraction?.ffmpegMode ? String(extraction.ffmpegMode).replace(/-/g, ' ') : '',
+      normalization?.operationId ? 'normalized collection item' : '',
+      normalization?.sampleRate ? `${normalization.sampleRate} Hz normalized` : '',
       stitch?.sourceItemCount ? `Stitched from ${stitch.sourceItemCount} clips` : '',
     ].filter(Boolean);
     return trimPreviewText(details.join(' | '), limit);
@@ -1055,10 +1257,13 @@ function summarizeArtifact(artifact, limit = 180) {
 
   if (artifact.kind === PORT_KIND_IMAGE) {
     const transformation = artifact.imageTransformation && typeof artifact.imageTransformation === 'object' ? artifact.imageTransformation : null;
+    const frameExtraction = artifact.videoFrameExtraction && typeof artifact.videoFrameExtraction === 'object' ? artifact.videoFrameExtraction : null;
     const details = [
       artifact.fileName || artifact.displayName || '',
       artifact.formatLabel || '',
       artifact.width && artifact.height ? `${artifact.width}x${artifact.height}` : '',
+      frameExtraction?.framePosition ? `${frameExtraction.framePosition} video frame` : '',
+      frameExtraction?.sourceVideo?.fileName ? `Source ${frameExtraction.sourceVideo.fileName}` : '',
       (transformation?.transformSubtype || transformation?.transformationType) ? String(transformation.transformSubtype || transformation.transformationType).replace(/-/g, ' ') : '',
       transformation?.toolLabel || transformation?.backendLabel || '',
       transformation?.scale ? `${transformation.scale}x scale` : '',
@@ -1086,6 +1291,30 @@ function summarizeArtifact(artifact, limit = 180) {
     return trimPreviewText(details.join(' | '), limit);
   }
 
+  if (artifact.kind === PORT_KIND_VIDEO && artifact.videoNormalization && typeof artifact.videoNormalization === 'object') {
+    const normalization = artifact.videoNormalization;
+    const details = [
+      artifact.fileName || artifact.displayName || '',
+      artifact.formatLabel || '',
+      normalization.width && normalization.height ? String(normalization.width) + 'x' + String(normalization.height) : '',
+      normalization.fps ? String(normalization.fps) + ' fps' : '',
+      normalization.videoCodec || 'normalized video',
+    ].filter(Boolean);
+    return trimPreviewText(details.join(' | '), limit);
+  }
+
+  if (artifact.kind === PORT_KIND_VIDEO && artifact.videoStitch && typeof artifact.videoStitch === 'object') {
+    const stitch = artifact.videoStitch;
+    const details = [
+      artifact.fileName || artifact.displayName || '',
+      artifact.formatLabel || '',
+      formatDurationSummary(stitch.totalDurationSeconds),
+      stitch.sourceItemCount ? stitch.sourceItemCount + ' stitched clip' + (stitch.sourceItemCount === 1 ? '' : 's') : '',
+      stitch.concatMode ? String(stitch.concatMode).replace(/-/g, ' ') : 'video stitch',
+      stitch.ffmpegMode ? String(stitch.ffmpegMode).replace(/-/g, ' ') : '',
+    ].filter(Boolean);
+    return trimPreviewText(details.join(' | '), limit);
+  }
   if (artifact.kind === PORT_KIND_VIDEO && artifact.videoGeneration && typeof artifact.videoGeneration === 'object') {
     const generation = artifact.videoGeneration;
     const details = [
@@ -1234,6 +1463,10 @@ function createArtifactCollection(items, options = {}) {
   }
   if (options.sourceCollection && typeof options.sourceCollection === 'object') {
     collection.sourceCollection = serializeArtifactForUi(options.sourceCollection);
+  }
+  const collectionNormalization = serializeCollectionNormalizationForUi(options.collectionNormalization);
+  if (collectionNormalization) {
+    collection.collectionNormalization = collectionNormalization;
   }
 
   collection.summary = summarizeArtifact(collection);
@@ -1436,6 +1669,23 @@ async function buildFileArtifact(filePath, options = {}) {
         };
       }
     }
+
+    const audioExtraction = serializeAudioExtractionForUi(options.audioExtraction);
+    if (audioExtraction) {
+      artifact.audioExtraction = audioExtraction;
+      if (audioExtraction.audio && !artifact.audio) {
+        artifact.audio = audioExtraction.audio;
+      }
+    }
+
+    const audioNormalization = serializeAudioNormalizationForUi(options.audioNormalization);
+    if (audioNormalization) {
+      artifact.audioNormalization = audioNormalization;
+    }
+    const mediaTrim = serializeMediaTrimForUi(options.mediaTrim);
+    if (mediaTrim) {
+      artifact.mediaTrim = mediaTrim;
+    }
   }
 
   if (kind === PORT_KIND_IMAGE || String(mimeType || '').toLowerCase().startsWith('image/')) {
@@ -1448,12 +1698,37 @@ async function buildFileArtifact(filePath, options = {}) {
     if (imageTransformation) {
       artifact.imageTransformation = imageTransformation;
     }
+
+    const videoFrameExtraction = serializeVideoFrameExtractionForUi(options.videoFrameExtraction);
+    if (videoFrameExtraction) {
+      artifact.videoFrameExtraction = videoFrameExtraction;
+    }
   }
 
   if (kind === PORT_KIND_VIDEO || String(mimeType || '').toLowerCase().startsWith('video/')) {
     const videoGeneration = serializeVideoGenerationForUi(options.videoGeneration);
     if (videoGeneration) {
       artifact.videoGeneration = videoGeneration;
+    }
+    const videoStitch = serializeVideoStitchForUi(options.videoStitch);
+    if (videoStitch) {
+      artifact.videoStitch = videoStitch;
+    }
+    const videoNormalization = serializeVideoNormalizationForUi(options.videoNormalization);
+    if (videoNormalization) {
+      artifact.videoNormalization = videoNormalization;
+      if (videoNormalization.width) artifact.width = videoNormalization.width;
+      if (videoNormalization.height) artifact.height = videoNormalization.height;
+      if (videoNormalization.fps) artifact.fps = videoNormalization.fps;
+      if (videoNormalization.width && videoNormalization.height) artifact.size = String(videoNormalization.width) + 'x' + String(videoNormalization.height);
+    }
+    const mediaTrim = serializeMediaTrimForUi(options.mediaTrim);
+    if (mediaTrim) {
+      artifact.mediaTrim = mediaTrim;
+    }
+    const subtitleBurn = serializeSubtitleBurnForUi(options.subtitleBurn);
+    if (subtitleBurn) {
+      artifact.subtitleBurn = subtitleBurn;
     }
   }
 
@@ -1516,6 +1791,7 @@ function createPlanArtifact(plan, options = {}) {
     role: options.role || 'artifact',
     sceneCount: Array.isArray(plan?.scenes) ? plan.scenes.length : 0,
     sectionCount: Array.isArray(plan?.sections) ? plan.sections.length : 0,
+    clipCount: Array.isArray(plan?.clips) ? plan.clips.length : 0,
     schemaId: String(plan?.schemaId || schema?.id || DEFAULT_PLANNING_SCHEMA_ID).trim() || DEFAULT_PLANNING_SCHEMA_ID,
     schemaLabel: String(schema?.label || 'Plan').trim() || 'Plan',
   };
@@ -1730,7 +2006,10 @@ async function saveAudioArtifactMetadata(filePath, artifact) {
   const audioGeneration = serializeAudioGenerationForUi(artifact?.audioGeneration);
   const audioTransformation = serializeAudioTransformationForUi(artifact?.audioTransformation);
   const audioStitch = serializeAudioStitchForUi(artifact?.audioStitch);
-  if (!audio && !audioGeneration && !audioTransformation && !audioStitch) {
+  const audioExtraction = serializeAudioExtractionForUi(artifact?.audioExtraction);
+  const audioNormalization = serializeAudioNormalizationForUi(artifact?.audioNormalization);
+  const mediaTrim = serializeMediaTrimForUi(artifact?.mediaTrim);
+  if (!audio && !audioGeneration && !audioTransformation && !audioStitch && !audioExtraction && !audioNormalization && !mediaTrim) {
     return [];
   }
 
@@ -1740,6 +2019,9 @@ async function saveAudioArtifactMetadata(filePath, artifact) {
     audioGeneration,
     audioTransformation,
     audioStitch,
+    audioExtraction,
+    audioNormalization,
+    mediaTrim,
     displayName: String(artifact?.displayName || '').trim(),
     fileName: String(artifact?.fileName || '').trim(),
     formatLabel: String(artifact?.formatLabel || '').trim(),
@@ -1753,7 +2035,8 @@ async function saveAudioArtifactMetadata(filePath, artifact) {
 async function saveImageArtifactMetadata(filePath, artifact) {
   const imageGeneration = serializeImageGenerationForUi(artifact?.imageGeneration);
   const imageTransformation = serializeImageTransformationForUi(artifact?.imageTransformation);
-  if (!imageGeneration && !imageTransformation) {
+  const videoFrameExtraction = serializeVideoFrameExtractionForUi(artifact?.videoFrameExtraction);
+  if (!imageGeneration && !imageTransformation && !videoFrameExtraction) {
     return [];
   }
 
@@ -1765,6 +2048,7 @@ async function saveImageArtifactMetadata(filePath, artifact) {
     height: Number(artifact?.height || 0) || 0,
     imageGeneration,
     imageTransformation,
+    videoFrameExtraction,
     kind: String(artifact?.kind || PORT_KIND_IMAGE).trim() || PORT_KIND_IMAGE,
     summary: String(artifact?.summary || '').trim(),
     width: Number(artifact?.width || 0) || 0,
@@ -1778,11 +2062,15 @@ async function saveVideoArtifactMetadata(filePath, artifact) {
     ? serializeArtifactForUi(artifact.compositionExport)
     : null;
   const videoGeneration = serializeVideoGenerationForUi(artifact?.videoGeneration);
-  if (!compositionExport && !videoGeneration) {
+  const videoStitch = serializeVideoStitchForUi(artifact?.videoStitch);
+  const videoNormalization = serializeVideoNormalizationForUi(artifact?.videoNormalization);
+  const mediaTrim = serializeMediaTrimForUi(artifact?.mediaTrim);
+  const subtitleBurn = serializeSubtitleBurnForUi(artifact?.subtitleBurn);
+  if (!compositionExport && !videoGeneration && !videoStitch && !videoNormalization && !mediaTrim && !subtitleBurn) {
     return [];
   }
 
-  const suffix = videoGeneration ? '.video.json' : '.composition-export.json';
+  const suffix = (videoGeneration || videoStitch || videoNormalization || mediaTrim || subtitleBurn) ? '.video.json' : '.composition-export.json';
   const metadataPath = path.join(path.dirname(filePath), path.basename(filePath, path.extname(filePath)) + suffix);
   await fs.writeJson(metadataPath, {
     compositionExport,
@@ -1792,6 +2080,10 @@ async function saveVideoArtifactMetadata(filePath, artifact) {
     kind: String(artifact?.kind || PORT_KIND_VIDEO).trim() || PORT_KIND_VIDEO,
     summary: String(artifact?.summary || '').trim(),
     videoGeneration,
+    videoStitch,
+    videoNormalization,
+    mediaTrim,
+    subtitleBurn,
   }, { spaces: 2 });
 
   return [metadataPath];
@@ -1840,12 +2132,20 @@ async function saveArtifactIntoDirectory(directoryPath, artifact, options = {}) 
     audio: artifact.audio,
     audioGeneration: artifact.audioGeneration,
     imageGeneration: artifact.imageGeneration,
+    audioExtraction: artifact.audioExtraction,
+    audioNormalization: artifact.audioNormalization,
+    mediaTrim: artifact.mediaTrim,
     audioTransformation: artifact.audioTransformation,
     audioStitch: artifact.audioStitch,
     compositionExport: artifact.compositionExport,
     displayName: artifact.displayName || options.baseName || path.basename(filePath),
     imageTransformation: artifact.imageTransformation,
+    videoFrameExtraction: artifact.videoFrameExtraction,
     videoGeneration: artifact.videoGeneration,
+    videoNormalization: artifact.videoNormalization,
+    mediaTrim: artifact.mediaTrim,
+    subtitleBurn: artifact.subtitleBurn,
+    videoStitch: artifact.videoStitch,
     kind: artifact.kind,
     role: options.role || artifact.role || 'artifact',
   });
@@ -2015,6 +2315,7 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
   const savedCollection = createArtifactCollection(normalizedItems, {
     accumulation: artifact?.accumulation,
     collectionMapping: artifact?.collectionMapping,
+    collectionNormalization: artifact?.collectionNormalization,
     collectionStatus: artifact?.collectionStatus,
     failedItems: artifact?.failedItems,
     sourceCollection: artifact?.sourceCollection,
@@ -2055,6 +2356,7 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
     summary: savedCollection.summary,
     accumulation: savedCollection.accumulation ? serializeArtifactForUi(savedCollection.accumulation) : null,
     collectionMapping: savedCollection.collectionMapping ? serializeArtifactForUi(savedCollection.collectionMapping) : null,
+    collectionNormalization: savedCollection.collectionNormalization ? serializeArtifactForUi(savedCollection.collectionNormalization) : null,
     sourceCollection: savedCollection.sourceCollection ? serializeArtifactForUi(savedCollection.sourceCollection) : null,
     items: savedCollection.items.map((entry) => buildCollectionManifestItem(entry, directoryPath)),
   }, { spaces: 2 });
@@ -2190,12 +2492,20 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     audio: artifact.audio,
     audioGeneration: artifact.audioGeneration,
     imageGeneration: artifact.imageGeneration,
+    audioExtraction: artifact.audioExtraction,
+    audioNormalization: artifact.audioNormalization,
+    mediaTrim: artifact.mediaTrim,
     audioTransformation: artifact.audioTransformation,
     audioStitch: artifact.audioStitch,
     compositionExport: artifact.compositionExport,
     displayName: title,
     imageTransformation: artifact.imageTransformation,
+    videoFrameExtraction: artifact.videoFrameExtraction,
     videoGeneration: artifact.videoGeneration,
+    videoNormalization: artifact.videoNormalization,
+    mediaTrim: artifact.mediaTrim,
+    subtitleBurn: artifact.subtitleBurn,
+    videoStitch: artifact.videoStitch,
     kind: artifact.kind,
     role: 'output',
   });
@@ -2219,17 +2529,26 @@ function buildTerminalResult(node, artifact) {
     artifact: serializeArtifactForUi(artifact),
     audio: artifact?.audio ? serializeArtifactForUi(artifact.audio) : null,
     audioGeneration: artifact?.audioGeneration ? serializeArtifactForUi(artifact.audioGeneration) : null,
+    audioExtraction: artifact?.audioExtraction ? serializeArtifactForUi(artifact.audioExtraction) : null,
+    audioNormalization: artifact?.audioNormalization ? serializeArtifactForUi(artifact.audioNormalization) : null,
+    mediaTrim: artifact?.mediaTrim ? serializeArtifactForUi(artifact.mediaTrim) : null,
     audioTransformation: artifact?.audioTransformation ? serializeArtifactForUi(artifact.audioTransformation) : null,
     audioStitch: artifact?.audioStitch ? serializeArtifactForUi(artifact.audioStitch) : null,
     destinationPath: artifact?.destinationPath || artifact?.directoryPath || artifact?.filePath || '',
     directoryPath: artifact?.directoryPath || '',
     imageTransformation: artifact?.imageTransformation ? serializeArtifactForUi(artifact.imageTransformation) : null,
+    videoFrameExtraction: artifact?.videoFrameExtraction ? serializeArtifactForUi(artifact.videoFrameExtraction) : null,
     videoGeneration: artifact?.videoGeneration ? serializeArtifactForUi(artifact.videoGeneration) : null,
+    videoNormalization: artifact?.videoNormalization ? serializeArtifactForUi(artifact.videoNormalization) : null,
+    mediaTrim: artifact?.mediaTrim ? serializeArtifactForUi(artifact.mediaTrim) : null,
+    subtitleBurn: artifact?.subtitleBurn ? serializeArtifactForUi(artifact.subtitleBurn) : null,
+    videoStitch: artifact?.videoStitch ? serializeArtifactForUi(artifact.videoStitch) : null,
     filePath: artifact?.filePath || '',
     fileUrl: artifact?.fileUrl || '',
     itemCount: Number(artifact?.itemCount || 0) || 0,
     itemKind: String(artifact?.itemKind || '').trim(),
     collectionMapping: artifact?.collectionMapping ? serializeArtifactForUi(artifact.collectionMapping) : null,
+    collectionNormalization: artifact?.collectionNormalization ? serializeArtifactForUi(artifact.collectionNormalization) : null,
     kind: artifact?.kind || PORT_KIND_FILE,
     manifestPath: artifact?.manifestPath || '',
     nodeId: node.id,
@@ -2457,6 +2776,9 @@ async function describeArtifactForLlm(artifact) {
     artifact.audioTransformation?.targetVoice ? 'Target voice: ' + artifact.audioTransformation.targetVoice : '',
     artifact.audioTransformation?.instruction ? 'Transform note: ' + artifact.audioTransformation.instruction : '',
     artifact.audioTransformation?.sourceAudio?.fileName ? 'Source audio: ' + artifact.audioTransformation.sourceAudio.fileName : '',
+    artifact.audioExtraction?.sourceVideo?.fileName ? 'Extracted audio from: ' + artifact.audioExtraction.sourceVideo.fileName : '',
+    artifact.audioNormalization?.sourceAudio?.fileName ? 'Normalized audio from: ' + artifact.audioNormalization.sourceAudio.fileName : '',
+    artifact.mediaTrim?.sourceArtifact?.fileName ? 'Trimmed from: ' + artifact.mediaTrim.sourceArtifact.fileName : '',
     artifact.imageTransformation?.backendLabel ? 'Image transformed by: ' + artifact.imageTransformation.backendLabel : '',
     artifact.imageTransformation?.toolLabel ? 'Image transform tool: ' + artifact.imageTransformation.toolLabel : '',
     artifact.imageTransformation?.model ? 'Image transform model: ' + artifact.imageTransformation.model : '',
@@ -2465,6 +2787,10 @@ async function describeArtifactForLlm(artifact) {
     artifact.imageTransformation?.instruction ? 'Image transform note: ' + artifact.imageTransformation.instruction : '',
     artifact.imageTransformation?.sourceImage?.fileName ? 'Target image: ' + artifact.imageTransformation.sourceImage.fileName : '',
     artifact.imageTransformation?.referenceImage?.fileName ? 'Reference image: ' + artifact.imageTransformation.referenceImage.fileName : '',
+    artifact.videoFrameExtraction?.framePosition ? 'Extracted frame: ' + artifact.videoFrameExtraction.framePosition : '',
+    artifact.videoFrameExtraction?.sourceVideo?.fileName ? 'Source video: ' + artifact.videoFrameExtraction.sourceVideo.fileName : '',
+    artifact.videoNormalization?.sourceVideo?.fileName ? 'Normalized video from: ' + artifact.videoNormalization.sourceVideo.fileName : '',
+    artifact.subtitleBurn?.captionSource?.displayName ? 'Captions burned from: ' + artifact.subtitleBurn.captionSource.displayName : '',
     artifact.audioGeneration?.backendLabel ? 'Generated by: ' + artifact.audioGeneration.backendLabel : '',
     artifact.audioGeneration?.toolLabel ? 'Tool: ' + artifact.audioGeneration.toolLabel : '',
     artifact.audioGeneration?.model ? 'Model: ' + artifact.audioGeneration.model : '',
@@ -2506,6 +2832,8 @@ module.exports = {
   saveBufferArtifact,
   sanitizeSegment,
   saveAudioArtifactMetadata,
+  saveImageArtifactMetadata,
+  saveVideoArtifactMetadata,
   serializeArtifactForUi,
   summarizeArtifact,
 };

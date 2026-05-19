@@ -7,7 +7,11 @@ const TEST_STORAGE_ROOT = path.join(process.cwd(), 'temp', 'verify-pipeline-coll
 const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 const WAVE_FIXTURE = Buffer.from('UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=', 'base64');
 let failSecondAudioGeneration = false;
+let failSecondVideoGeneration = false;
 const localAudioGenerationRequests = [];
+const localVideoGenerationRequests = [];
+const videoLastFrameExtractionRequests = [];
+const videoStitchCommandRequests = [];
 const localAudioStitchRequests = [];
 const providerImageGenerationPrompts = [];
 const perItemValidationRequests = [];
@@ -82,7 +86,18 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
 
   if (normalizedParent.endsWith('/electron/services/pipelineExecutionService.js')) {
     if (request === './providerRegistry') return { initializeProviderRegistry: async () => {} };
-    if (request === './providerService') {
+    if (request === './modelService') return { listDownloadedModels: async (toolId) => mockedInstalledTools.find((tool) => tool.id === toolId)?.downloadedModels || [] };
+    if (request === './commandService') {
+      return {
+        runCommand: async (command, args = []) => {
+          const outputPath = String(args[args.length - 1] || '');
+          videoStitchCommandRequests.push({ args: [...args], command, outputPath });
+          fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+          fs.writeFileSync(outputPath, Buffer.from('stitched-video-output'));
+          return { code: 0, stderr: '', stdout: 'mock ffmpeg stitched video' };
+        },
+      };
+    }    if (request === './providerService') {
       return {
         chatWithProvider: async (_providerId, payload = {}) => ({ message: { content: buildMockValidationReply(payload) } }),
         listProviderConnections: async () => ([{
@@ -94,6 +109,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
         }]),
         runProviderOperation: async (_providerId, payload = {}) => {
           if (payload.operationId === 'audioGenerate') return { audios: [{ buffer: WAVE_FIXTURE, extension: '.wav', sampleRate: 16000, channelCount: 1, bitDepth: 16 }] };
+          if (payload.operationId === 'videoGenerate') return { videos: [{ buffer: Buffer.from('video-output'), extension: '.mp4' }] };
           if (payload.operationId === 'imageAnalyze') return { message: { content: 'cloud image description' } };
           providerImageGenerationPrompts.push(String(payload.prompt || ''));
           return { images: [{ base64Data: ONE_PIXEL_PNG }] };
@@ -167,7 +183,76 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
         },
       };
     }
-    if (request === './localImageService') {
+        if (request === './localVideoService') {
+      return {
+        generateVideoWithLocalVideoTool: async (_tool, request = {}) => {
+          const prompt = String(request.prompt || '');
+          localVideoGenerationRequests.push({ ...request });
+          if (failSecondVideoGeneration && /city street/i.test(prompt)) {
+            throw new Error('mock Wan failure');
+          }
+          fs.mkdirSync(TEST_STORAGE_ROOT, { recursive: true });
+          const outputPath = path.join(TEST_STORAGE_ROOT, 'video-' + Date.now() + '-' + Math.random().toString(16).slice(2) + '.mp4');
+          fs.writeFileSync(outputPath, Buffer.from('video-output'));
+          return {
+            outputs: {
+              video: {
+                filePath: outputPath,
+                fileName: path.basename(outputPath),
+                kind: 'video',
+                role: 'generated',
+                videoGeneration: {
+                  collectionMap: request.collectionMap || null,
+                  collectionMapItemMode: request.collectionMapItemMode || '',
+                  collectionMapVideoChain: request.collectionMapVideoChain || null,
+                  fps: request.fps,
+                  model: request.model || '',
+                  negativePrompt: request.negativePrompt || '',
+                  operationId: request.operationId || 'videoGenerate',
+                  operationSubtype: request.referenceImagePath ? 'image-to-video' : 'text-to-video',
+                  prompt: request.prompt || '',
+                  promptStyle: request.promptStyle || null,
+                  quality: request.quality,
+                  seed: request.seed,
+                  size: request.size || '832x480',
+                  sourceImage: request.sourceImageArtifact || null,
+                  steps: request.steps,
+                  toolLabel: _tool.name,
+                  usedReferenceImage: Boolean(request.referenceImagePath),
+                },
+              },
+            },
+            preview: 'video',
+            message: 'Generated video.',
+          };
+        },
+        getLocalVideoToolRuntimeMode: () => 'direct-command',
+        LOCAL_VIDEO_RUNTIME_MODE_IDS: { DIRECT_COMMAND: 'direct-command' },
+      };
+    }
+    if (request === './videoFrameService') {
+      return {
+        extractVideoLastFrameArtifact: async (videoArtifact, options = {}) => {
+          const size = String(videoArtifact?.videoGeneration?.size || '832x480');
+          const parts = size.split('x').map((value) => Number(value || 0));
+          fs.mkdirSync(TEST_STORAGE_ROOT, { recursive: true });
+          const outputPath = path.join(TEST_STORAGE_ROOT, 'last-frame-' + Date.now() + '-' + Math.random().toString(16).slice(2) + '.png');
+          fs.writeFileSync(outputPath, Buffer.from(ONE_PIXEL_PNG, 'base64'));
+          const artifact = {
+            filePath: outputPath,
+            fileName: path.basename(outputPath),
+            kind: 'image',
+            mimeType: 'image/png',
+            role: 'generated',
+            width: parts[0] || 832,
+            height: parts[1] || 480,
+          };
+          videoLastFrameExtractionRequests.push({ videoArtifact, options, artifact });
+          return artifact;
+        },
+      };
+    }
+if (request === './localImageService') {
       return {
         generateImageWithLocalImageTool: async (_tool, request = {}) => {
           fs.mkdirSync(TEST_STORAGE_ROOT, { recursive: true });
@@ -333,6 +418,77 @@ function buildCollectionInputMapPipeline({ itemType, items, mapConfig, outputId 
   });
 }
 
+function buildVideoStitchInputPipeline(items, config = {}) {
+  const input = createNode('collectionInput', { id: 'video-collection-input', label: 'Video collection', config: { itemType: 'video', items } });
+  const stitch = createNode('videoStitch', { id: 'stitch-videos', label: 'Video Stitch', config: { outputFormat: 'mp4', ...config } });
+  const output = createNode('videoOutput', { id: 'stitched-video-output', label: 'Video Output', config: { title: 'Stitched video' } });
+  return createEmptyPipeline({
+    id: 'video-stitch-input-verify',
+    name: 'Video stitch input verification',
+    nodes: [input, stitch, output],
+    edges: [
+      createEdge(input.id, 'collection', stitch.id, 'collection'),
+      createEdge(stitch.id, 'video', output.id, 'video'),
+    ],
+  });
+}
+
+function buildEmptyMappedVideoStitchPipeline() {
+  const input = createNode('collectionInput', { id: 'video-prompt-input', label: 'Video prompts', config: { itemType: 'text', items: [{ id: 'empty-video-a', text: 'city street at sunrise' }] } });
+  const map = createNode('collectionMap', {
+    id: 'map-video-prompts',
+    label: 'Generate video clips',
+    config: {
+      executionMode: 'localTool',
+      failureMode: 'partial',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      videoItemMode: 'independent',
+      videoSize: '832x480',
+    },
+  });
+  const stitch = createNode('videoStitch', { id: 'stitch-videos', label: 'Video Stitch', config: { outputFormat: 'mp4' } });
+  const output = createNode('videoOutput', { id: 'stitched-video-output', label: 'Video Output', config: { title: 'Stitched video' } });
+  return createEmptyPipeline({
+    id: 'empty-mapped-video-stitch-verify',
+    name: 'Empty mapped video stitch verification',
+    nodes: [input, map, stitch, output],
+    edges: [
+      createEdge(input.id, 'collection', map.id, 'collection'),
+      createEdge(map.id, 'collection', stitch.id, 'collection'),
+      createEdge(stitch.id, 'video', output.id, 'video'),
+    ],
+  });
+}
+function buildTextToVideoStitchPipeline() {
+  const input = createNode('collectionInput', { id: 'video-prompt-input', label: 'Video prompts', config: { itemType: 'text', items: [{ id: 'clip-a', text: 'quiet mountain cabin' }, { id: 'clip-b', text: 'city street at sunrise' }] } });
+  const map = createNode('collectionMap', {
+    id: 'map-video-prompts',
+    label: 'Generate video clips',
+    config: {
+      executionMode: 'localTool',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      videoItemMode: 'independent',
+      videoSize: '832x480',
+      videoFps: 15,
+    },
+  });
+  const stitch = createNode('videoStitch', { id: 'stitch-videos', label: 'Video Stitch', config: { outputFormat: 'mp4' } });
+  const output = createNode('videoOutput', { id: 'stitched-video-output', label: 'Video Output', config: { title: 'Stitched video' } });
+  return createEmptyPipeline({
+    id: 'text-video-stitch-verify',
+    name: 'Text to video stitch verification',
+    nodes: [input, map, stitch, output],
+    edges: [
+      createEdge(input.id, 'collection', map.id, 'collection'),
+      createEdge(map.id, 'collection', stitch.id, 'collection'),
+      createEdge(stitch.id, 'video', output.id, 'video'),
+    ],
+  });
+}
 function createComfyTool(patch = {}) {
   return {
     id: 'comfyui',
@@ -346,6 +502,18 @@ function createComfyTool(patch = {}) {
   };
 }
 
+function createWanTool(patch = {}) {
+  return createTool('wan21-webui', 'Wan2.1 WebUI', {
+    compatibility: {
+      minimumRamMb: 32768,
+      minimumVramMb: 12288,
+      recommendedRamMb: 65536,
+      recommendedVramMb: 16384,
+    },
+    downloadedModels: [{ id: 'Wan2.1-T2V-1.3B', name: 'Wan2.1-T2V-1.3B', modelType: 'model-folder', relativePath: 'Wan2.1-T2V-1.3B' }],
+    ...patch,
+  });
+}
 function buildGraphCollectionMapConfig(workflow = COMFY_TEXT_TO_IMAGE_WORKFLOW, patch = {}) {
   return {
     executionMode: 'graphWorkflow',
@@ -373,15 +541,32 @@ function buildGraphCollectionMapConfig(workflow = COMFY_TEXT_TO_IMAGE_WORKFLOW, 
 async function main() {
   fs.rmSync(TEST_STORAGE_ROOT, { recursive: true, force: true });
   assert(PIPELINE_NODE_TYPES.collectionMap, 'collectionMap node type should be registered');
+  assert(PIPELINE_NODE_TYPES.videoStitch, 'videoStitch node type should be registered');
+  assert.strictEqual(PIPELINE_NODE_TYPES.videoStitch.category, 'Deterministic Media Operations', 'Video Stitch should live under the Deterministic Media Operations palette category.');
+  assert.strictEqual(PIPELINE_NODE_TYPES.audioStitch.category, 'Deterministic Media Operations', 'Audio Stitch should live under the Deterministic Media Operations palette category.');
+  assert.strictEqual(PIPELINE_NODE_TYPES.videoStitch.inputPorts[0].kind, 'video', 'Video Stitch should accept collection:video input items.');
+  assert.strictEqual(PIPELINE_NODE_TYPES.videoStitch.inputPorts[0].collectionBehavior, 'only', 'Video Stitch input should be a collection-only port.');
+  assert.strictEqual(PIPELINE_NODE_TYPES.videoStitch.outputPorts[0].kind, 'video', 'Video Stitch should output one video artifact.');
 
   const builderPanelSource = fs.readFileSync(path.join(process.cwd(), 'src', 'components', 'PipelineBuilderPanel.jsx'), 'utf8');
   assert(builderPanelSource.includes('showCollectionMapAudioGenerationFields'), 'collectionMap inspector should render operation-specific audio-generation fields.');
   assert(builderPanelSource.includes('collection-map-audiocraft-item-mode'), 'collectionMap inspector should expose AudioCraft item mode.');
   assert(builderPanelSource.includes('sequentialContinuation'), 'collectionMap inspector should expose sequential AudioCraft continuation mode.');
   assert(builderPanelSource.includes('collection-map-chain-seed'), 'collectionMap inspector should expose seed seconds for chained AudioCraft maps.');
+  assert(builderPanelSource.includes('showCollectionMapVideoGenerationFields'), 'collectionMap inspector should render operation-specific video-generation fields.');
+  assert(builderPanelSource.includes('collection-map-video-item-mode'), 'collectionMap inspector should expose Wan video item mode.');
+  assert(builderPanelSource.includes('sequentialLastFrame'), 'collectionMap inspector should expose sequential previous-last-frame video chaining.');
+  assert(builderPanelSource.includes('collection-map-video-first-behavior'), 'collectionMap inspector should expose first-item behavior for video chains.');
+  assert(builderPanelSource.includes('collection-map-video-initial-reference'), 'collectionMap inspector should expose an optional initial reference image.');
+  const videoFlagIndex = builderPanelSource.indexOf('const showCollectionMapVideoGenerationFields =');
+  const cloudVideoFlagIndex = builderPanelSource.indexOf('const showCollectionMapCloudVideoGenerationFields =');
+  assert(videoFlagIndex >= 0 && cloudVideoFlagIndex > videoFlagIndex, 'collectionMap inspector must initialize video-generation flags before derived cloud-video flags to avoid renderer TDZ crashes.');
   assert(builderPanelSource.includes("assetKind: 'audiocraft-snapshot'"), 'collectionMap refresh should load AudioCraft snapshots.');
   assert(builderPanelSource.includes("assetKind: 'upscayl-model-set'"), 'collectionMap refresh should load Upscayl model sets.');
+  assert(builderPanelSource.includes("assetKind: 'wan-model-folder'"), 'collectionMap refresh should load Wan model folders for video generation.');
   assert(!builderPanelSource.includes('This mapping uses the selected tool default settings here. No refreshable model list is needed.'), 'collectionMap refresh should not use the stale generic no-models message for refreshable mappings.');
+  assert(builderPanelSource.includes("selectedNode.type === 'videoStitch'"), 'Pipeline Builder inspector should render Video Stitch safely.');
+  assert(builderPanelSource.includes('Concatenate ordered video clips into one final video'), 'Video Stitch inspector should explain the ordered clip concat behavior.');
 
   const pipeline = buildCollectionMapPipeline({ mapConfig: { promptStyleId: 'style-anime-test' } });
   const graph = buildPipelineGraph(pipeline);
@@ -389,9 +574,10 @@ async function main() {
   const analysis = analyzePipeline(pipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true, lastTestedAt: new Date().toISOString(), lastTestSucceeded: true }] });
   assert.strictEqual(analysis.executable, true, 'collection map pipeline should analyze as executable with a connected provider');
 
-  const unsupportedPipeline = buildCollectionMapPipeline({ operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE });
-  const unsupportedAnalysis = analyzePipeline(unsupportedPipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true }] });
-  assert(unsupportedAnalysis.issues.some((issue) => /Map Collection does not support that input\/output operation pair/.test(issue.message)) || buildPipelineGraph(unsupportedPipeline).errors.length, 'unsupported collection mappings should surface an honest issue');
+  const cloudVideoPipeline = buildCollectionMapPipeline({ operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE, mapConfig: { model: 'mock-video-model', videoSize: '1280x720' } });
+  assert.deepStrictEqual(buildPipelineGraph(cloudVideoPipeline).errors, [], 'collection:text -> collection:video should be structurally valid.');
+  const cloudVideoAnalysis = analyzePipeline(cloudVideoPipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true, lastTestedAt: new Date().toISOString(), lastTestSucceeded: true }] });
+  assert.strictEqual(cloudVideoAnalysis.executable, true, cloudVideoAnalysis.primaryIssue?.message || 'cloud text-to-video collection map should analyze as executable with a connected provider.');
 
 
   mockedInstalledTools = [createComfyTool()];
@@ -667,6 +853,278 @@ async function main() {
   assert.strictEqual(staleTextToAudioSnapshot.status, 'completed', staleTextToAudioSnapshot.message);
   const staleAudioPrompt = staleTextToAudioSnapshot.nodeStates['map-collection'].outputs.collection.items[0].artifact.audioGeneration.prompt;
   assert.strictEqual(staleAudioPrompt, 'hard rock', 'stale text-to-image default instruction should be ignored for text-to-audio metadata.');
+  const strongVideoHardware = { gpuModel: 'NVIDIA RTX 4090', systemRamMb: 65536, vramMb: 24576 };
+  await configService.upsertPromptStyle({ id: 'style-cinematic-video', name: 'Cinematic Video', targetKind: 'video', requiredTerms: ['cinematic lighting', 'smooth camera motion'], negativePrompt: 'jitter' });
+  mockedInstalledTools = [createWanTool()];
+  const textToVideoPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'video-a', text: 'quiet mountain cabin' },
+      { id: 'video-b', text: 'city street at sunrise' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      videoItemMode: 'independent',
+      videoSize: '832x480',
+      videoFps: 12,
+      videoQuality: 5,
+      durationSeconds: 2,
+      instruction: 'Slow cinematic drift.',
+      negativePrompt: 'low quality',
+      promptStyleId: 'style-cinematic-video',
+      seed: 7,
+      steps: 10,
+    },
+  });
+  const textToVideoAnalysis = analyzePipeline(textToVideoPipeline, { tools: mockedInstalledTools, toolCatalog: mockedInstalledTools, hardware: strongVideoHardware });
+  assert.strictEqual(textToVideoAnalysis.executable, true, textToVideoAnalysis.primaryIssue?.message || 'Wan text-to-video collectionMap should analyze as executable with models and suitable hardware.');
+  localVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
+  await runPipeline(textToVideoPipeline);
+  const textToVideoSnapshot = await waitForRunToFinish();
+  assert.strictEqual(textToVideoSnapshot.status, 'completed', textToVideoSnapshot.message);
+  const textToVideoCollection = textToVideoSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(textToVideoCollection.itemKind, 'video');
+  assert.strictEqual(textToVideoCollection.collectionMapping.mappingId, 'textToVideo', 'text-to-video collection should preserve mapping metadata.');
+  assert.strictEqual(textToVideoCollection.collectionMapping.operationId, PIPELINE_OPERATION_IDS.VIDEO_GENERATE, 'text-to-video collection should preserve operation metadata.');
+  assert.deepStrictEqual(textToVideoCollection.items.map((entry) => entry.lineage.sourceItemIndex), [0, 1], 'text-to-video should preserve source order lineage.');
+  assert.strictEqual(localVideoGenerationRequests.length, 2, 'independent text-to-video should generate each item once.');
+  assert(localVideoGenerationRequests.every((request) => !request.referenceImagePath), 'independent text-to-video should not pass reference images.');
+  assert(localVideoGenerationRequests.every((request) => /Slow cinematic drift/.test(request.prompt || '') && /cinematic lighting/.test(request.prompt || '') && /smooth camera motion/.test(request.prompt || '')), 'video prompts should include motion guidance and prompt-style terms.');
+  assert.strictEqual(videoLastFrameExtractionRequests.length, 0, 'independent text-to-video should not extract last-frame references.');
+  const firstVideoArtifact = textToVideoCollection.items[0].artifact;
+  assert.strictEqual(firstVideoArtifact.videoGeneration.collectionMap.originalPrompt, 'quiet mountain cabin', 'video metadata should preserve the original item prompt.');
+  assert(/cinematic lighting/.test(firstVideoArtifact.videoGeneration.collectionMap.finalPrompt), 'video metadata should preserve the final styled prompt.');
+  assert.strictEqual(firstVideoArtifact.videoGeneration.collectionMapItemMode, 'independent', 'video artifact metadata should record independent collectionMap mode.');
+  assert.strictEqual(firstVideoArtifact.videoGeneration.promptStyle.id, 'style-cinematic-video', 'video artifact metadata should record selected prompt style.');
+  const firstVideoSidecar = (firstVideoArtifact.metadataPaths || []).find((entry) => /\.video\.json$/i.test(entry));
+  assert(firstVideoSidecar && fs.existsSync(firstVideoSidecar), 'video artifact sidecar should be written for generated collectionMap clips.');
+  const firstVideoSidecarJson = JSON.parse(fs.readFileSync(firstVideoSidecar, 'utf8'));
+  assert.strictEqual(firstVideoSidecarJson.videoGeneration.collectionMap.mappingId, 'textToVideo', 'video sidecar should preserve collectionMap metadata.');
+
+  const missingWanAnalysis = analyzePipeline(textToVideoPipeline, { tools: [], toolCatalog: [], hardware: strongVideoHardware });
+  assert.strictEqual(missingWanAnalysis.executable, false, 'local text-to-video collectionMap should not be executable without Wan installed.');
+  assert(missingWanAnalysis.issues.some((issue) => /Wan2\.1 WebUI|Install Wan/i.test(issue.message)), 'missing Wan readiness should be plain English.');
+  const missingWanModelsAnalysis = analyzePipeline(textToVideoPipeline, { tools: [createWanTool({ downloadedModels: [] })], toolCatalog: [createWanTool({ downloadedModels: [] })], hardware: strongVideoHardware });
+  assert(missingWanModelsAnalysis.issues.some((issue) => /Wan model assets|model folders|models\\Wan-AI/i.test(issue.message)), 'missing Wan model folders should be reported honestly.');
+  const lowHardwareVideoAnalysis = analyzePipeline(textToVideoPipeline, { tools: [createWanTool()], toolCatalog: [createWanTool()], hardware: { gpuModel: 'NVIDIA GTX 1060', systemRamMb: 16384, vramMb: 6144 } });
+  assert(lowHardwareVideoAnalysis.issues.some((issue) => /below|higher-VRAM|hardware targets/i.test(issue.message)), 'below-target Wan hardware should surface a conservative readiness warning.');
+  const cloudVideoChainPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [{ id: 'cloud-chain-a', text: 'opening shot' }],
+    mapConfig: {
+      executionMode: 'cloud',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      providerId: 'openai',
+      model: 'mock-video-model',
+      videoItemMode: 'sequentialLastFrame',
+    },
+  });
+  const cloudVideoChainAnalysis = analyzePipeline(cloudVideoChainPipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true }] });
+  assert(cloudVideoChainAnalysis.issues.some((issue) => /only available in local tool mode|Use independent clips/i.test(issue.message)), 'cloud sequential video chains should be rejected with a clear readiness issue.');
+  const missingInitialReferenceAnalysis = analyzePipeline(buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [{ id: 'missing-ref-a', text: 'opening shot' }],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      videoItemMode: 'sequentialLastFrame',
+      videoChainFirstItemBehavior: 'initialReferenceImage',
+      videoSize: '832x480',
+    },
+  }), { tools: [createWanTool()], toolCatalog: [createWanTool()], hardware: strongVideoHardware });
+  assert(missingInitialReferenceAnalysis.issues.some((issue) => /initial reference image/i.test(issue.message)), 'initial-reference first-item mode should require a chosen image.');
+
+  localVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
+  const sequentialVideoPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'video-chain-a', text: 'misty forest establishing shot' },
+      { id: 'video-chain-b', text: 'camera reaches a quiet cabin' },
+      { id: 'video-chain-c', text: 'warm window light at dusk' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      videoItemMode: 'sequentialLastFrame',
+      videoChainFirstItemBehavior: 'textToVideo',
+      videoSize: '832x480',
+      videoFps: 12,
+      durationSeconds: 2,
+      instruction: 'Maintain gentle forward motion.',
+      promptStyleId: 'style-cinematic-video',
+      steps: 10,
+    },
+  });
+  assert.strictEqual(analyzePipeline(sequentialVideoPipeline, { tools: mockedInstalledTools, toolCatalog: mockedInstalledTools, hardware: strongVideoHardware }).executable, true, 'Wan previous-last-frame chain should analyze as executable when prerequisites are present.');
+  await runPipeline(sequentialVideoPipeline);
+  const sequentialVideoSnapshot = await waitForRunToFinish();
+  assert.strictEqual(sequentialVideoSnapshot.status, 'completed', sequentialVideoSnapshot.message);
+  const sequentialVideoCollection = sequentialVideoSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(sequentialVideoCollection.itemKind, 'video');
+  assert.strictEqual(sequentialVideoCollection.itemCount, 3, 'sequential video chain should still output one clip artifact per source prompt.');
+  assert.strictEqual(sequentialVideoCollection.collectionMapping.videoContinuationChain.enabled, true, 'manifest metadata should record enabled video chain mode.');
+  assert.strictEqual(sequentialVideoCollection.collectionMapping.videoContinuationChain.itemMode, 'sequentialLastFrame', 'manifest metadata should record previous-last-frame mode.');
+  assert.strictEqual(localVideoGenerationRequests[0].referenceImagePath || '', '', 'first chained item should start as text-to-video when configured that way.');
+  assert.strictEqual(localVideoGenerationRequests[1].referenceImagePath, videoLastFrameExtractionRequests[0].artifact.filePath, 'item 2 should use item 1 last frame as the reference image.');
+  assert.strictEqual(localVideoGenerationRequests[2].referenceImagePath, videoLastFrameExtractionRequests[1].artifact.filePath, 'item 3 should use item 2 last frame as the reference image.');
+  assert.strictEqual(videoLastFrameExtractionRequests.length, 2, 'video chain should extract a last-frame reference after each non-final accepted clip.');
+  assert.strictEqual(sequentialVideoCollection.items[0].metadata.videoContinuationChain.referenceRole, 'firstTextToVideo', 'item metadata should record first text-to-video behavior.');
+  assert.strictEqual(sequentialVideoCollection.items[1].metadata.videoContinuationChain.referenceRole, 'previousLastFrame', 'item metadata should record previous-last-frame reference use.');
+  assert.strictEqual(sequentialVideoCollection.items[1].metadata.videoContinuationChain.previousClip.filePath, sequentialVideoCollection.items[0].artifact.filePath, 'item metadata should reference the previous accepted clip.');
+  assert(sequentialVideoCollection.items.every((entry) => /cinematic lighting/.test(entry.artifact.videoGeneration.prompt)), 'prompt style should still apply to each chained video item.');
+
+  localVideoGenerationRequests.length = 0;
+  videoStitchCommandRequests.length = 0;
+  const textToVideoStitchPipeline = buildTextToVideoStitchPipeline();
+  assert.strictEqual(analyzePipeline(textToVideoStitchPipeline, { tools: mockedInstalledTools, toolCatalog: mockedInstalledTools, hardware: strongVideoHardware }).executable, true, 'collection:video -> Video Stitch should analyze as executable when Wan prerequisites are present.');
+  await runPipeline(textToVideoStitchPipeline);
+  const textToVideoStitchSnapshot = await waitForRunToFinish();
+  assert.strictEqual(textToVideoStitchSnapshot.status, 'completed', textToVideoStitchSnapshot.message);
+  assert.strictEqual(videoStitchCommandRequests.length, 1, 'Video Stitch should invoke ffmpeg concat once.');
+  assert(videoStitchCommandRequests[0].args.includes('-f') && videoStitchCommandRequests[0].args.includes('concat'), 'Video Stitch should use ffmpeg concat demuxer mode.');
+  const stitchedVideo = textToVideoStitchSnapshot.nodeStates['stitch-videos'].outputs.video;
+  assert.strictEqual(stitchedVideo.kind, 'video', 'Video Stitch should output one video artifact.');
+  assert.strictEqual(stitchedVideo.videoStitch.operationId, 'videoStitch', 'stitched video metadata should record the operation.');
+  assert.strictEqual(stitchedVideo.videoStitch.sourceItemCount, 2, 'stitched video metadata should record source item count.');
+  assert.deepStrictEqual(stitchedVideo.videoStitch.sourceItems.map((entry) => entry.itemId), ['clip-a', 'clip-b'], 'Video Stitch metadata should preserve collection order.');
+  assert(stitchedVideo.videoStitch.sourceItems[0].prompt.includes('quiet mountain cabin'), 'Video Stitch metadata should preserve per-clip prompts.');
+  const stitchedSidecarPath = stitchedVideo.metadataPaths.find((entry) => entry.endsWith('.video.json'));
+  assert(stitchedSidecarPath, 'Video Stitch should save a .video.json metadata sidecar.');
+  const stitchedSidecar = JSON.parse(fs.readFileSync(stitchedSidecarPath, 'utf8'));
+  assert.strictEqual(stitchedSidecar.videoStitch.sourceCollection.itemKind, 'video', 'Video Stitch sidecar should record source collection kind.');
+  assert.deepStrictEqual(stitchedSidecar.videoStitch.sourceItems.map((entry) => entry.itemId), ['clip-a', 'clip-b'], 'Video Stitch sidecar should preserve ordered item refs.');
+
+  const executionServiceSource = fs.readFileSync(path.join(process.cwd(), 'electron', 'services', 'pipelineExecutionService.js'), 'utf8');
+  const emptyVideoMessageIndex = executionServiceSource.indexOf('Video Stitch received an empty video collection');
+  const videoFfmpegIndex = executionServiceSource.indexOf('runCommand(ffmpegPath');
+  assert(emptyVideoMessageIndex >= 0, 'Video Stitch runtime should have a clear empty-collection failure message.');
+  assert(videoFfmpegIndex > emptyVideoMessageIndex, 'Video Stitch should reject empty collections before invoking ffmpeg.');
+
+  const missingClipPath = path.join(TEST_STORAGE_ROOT, 'missing-video-clip.mp4');
+  await runPipeline(buildVideoStitchInputPipeline([{ id: 'missing-video', filePath: missingClipPath }]));
+  const missingVideoStitchSnapshot = await waitForRunToFinish();
+  assert.strictEqual(missingVideoStitchSnapshot.status, 'failed', 'Video Stitch should fail clearly when a clip file is missing.');
+  assert(/cannot find|missing/i.test(missingVideoStitchSnapshot.message), 'missing Video Stitch failure should explain the missing file: ' + missingVideoStitchSnapshot.message);
+  const initialReferencePath = writeFixtureFile('initial-video-reference.png', Buffer.from(ONE_PIXEL_PNG, 'base64'));
+  localVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
+  const initialReferenceVideoPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'video-ref-a', text: 'start on the provided still' },
+      { id: 'video-ref-b', text: 'continue into a slow pan' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      videoItemMode: 'sequentialLastFrame',
+      videoChainFirstItemBehavior: 'initialReferenceImage',
+      videoInitialReferenceImagePath: initialReferencePath,
+      videoSize: '832x480',
+      instruction: 'Animate the still with subtle parallax.',
+      steps: 10,
+    },
+  });
+  await runPipeline(initialReferenceVideoPipeline);
+  const initialReferenceVideoSnapshot = await waitForRunToFinish();
+  assert.strictEqual(initialReferenceVideoSnapshot.status, 'completed', initialReferenceVideoSnapshot.message);
+  const initialReferenceVideoCollection = initialReferenceVideoSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(localVideoGenerationRequests[0].referenceImagePath, initialReferencePath, 'initial-reference first item should use the chosen image.');
+  assert.strictEqual(initialReferenceVideoCollection.items[0].metadata.videoContinuationChain.referenceRole, 'initialReferenceImage', 'item metadata should record initial-reference first-item behavior.');
+  assert.strictEqual(initialReferenceVideoCollection.items[0].artifact.videoGeneration.usedReferenceImage, true, 'first item generated from an initial reference should use the image-to-video path.');
+
+  localVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
+  const manualVideoChainPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'video-retry-a', text: 'soft opening shot' },
+      { id: 'video-retry-b', text: 'rising camera move' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      videoItemMode: 'sequentialLastFrame',
+      videoChainFirstItemBehavior: 'textToVideo',
+      videoSize: '832x480',
+      perItemValidation: { enabled: true, mode: 'user', maxAttempts: 2 },
+    },
+  });
+  await runPipeline(manualVideoChainPipeline);
+  let manualVideoSnapshot = await waitForRunStatus('paused');
+  assert.strictEqual(manualVideoSnapshot.pendingValidation.collectionMap.itemIndex, 0, 'manual video validation should first pause on item 1.');
+  resumePendingValidation(manualVideoSnapshot, 'pass', 'first clip works');
+  manualVideoSnapshot = await waitForRunStatus('paused');
+  assert.strictEqual(manualVideoSnapshot.pendingValidation.collectionMap.itemIndex, 1, 'manual video validation should advance to item 2 after item 1 passes.');
+  const firstAcceptedVideoReference = localVideoGenerationRequests[1].referenceImagePath;
+  resumePendingValidation(manualVideoSnapshot, 'fail', 'retry second clip');
+  manualVideoSnapshot = await waitForRunStatus('paused');
+  assert.strictEqual(manualVideoSnapshot.pendingValidation.collectionMap.itemIndex, 1, 'manual video validation retry should stay on item 2.');
+  assert.strictEqual(localVideoGenerationRequests.filter((request) => /soft opening shot/i.test(request.prompt || '')).length, 1, 'manual video retry should not rerun accepted item 1.');
+  assert.strictEqual(localVideoGenerationRequests.filter((request) => /rising camera move/i.test(request.prompt || '')).length, 2, 'manual video retry should regenerate only the failed item.');
+  assert.strictEqual(localVideoGenerationRequests[2].referenceImagePath, firstAcceptedVideoReference, 'manual video retry should reuse the previous accepted last-frame reference.');
+  resumePendingValidation(manualVideoSnapshot, 'pass', 'retry works');
+  manualVideoSnapshot = await waitForRunToFinish();
+  assert.strictEqual(manualVideoSnapshot.status, 'completed', manualVideoSnapshot.message);
+
+  localVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
+  failSecondVideoGeneration = true;
+  const partialSequentialVideoPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'video-partial-a', text: 'soft rain on glass' },
+      { id: 'video-partial-b', text: 'city street at sunrise' },
+      { id: 'video-partial-c', text: 'distant thunder' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      failureMode: 'partial',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      videoItemMode: 'sequentialLastFrame',
+      videoChainFirstItemBehavior: 'textToVideo',
+      videoSize: '832x480',
+    },
+  });
+  await runPipeline(partialSequentialVideoPipeline);
+  const partialSequentialVideoSnapshot = await waitForRunToFinish();
+  failSecondVideoGeneration = false;
+  assert.strictEqual(partialSequentialVideoSnapshot.status, 'completed', partialSequentialVideoSnapshot.message);
+  const partialSequentialVideoCollection = partialSequentialVideoSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(partialSequentialVideoCollection.collectionStatus, 'partial', 'partial video chain output should be marked partial.');
+  assert.strictEqual(partialSequentialVideoCollection.itemCount, 1, 'partial video chain should keep only accepted clips before the broken item.');
+  assert.strictEqual(partialSequentialVideoCollection.failedItems[0].chainFailure, true, 'partial video chain failure metadata should mark the chain as broken.');
+  assert.strictEqual(partialSequentialVideoCollection.failedItems[0].videoContinuationChain.brokenAtItemIndex, 1, 'partial video chain metadata should record the broken item index.');
+  assert.strictEqual(localVideoGenerationRequests.length, 2, 'partial video chain should stop at the failed item and skip later prompts.');
+
+  const videoPerItemValidationAnalysis = analyzePipeline(buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [{ id: 'video-validation-prompt', text: 'rain' }],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      toolId: 'wan21-webui',
+      perItemValidation: { enabled: true, mode: 'llm', llmExecutionMode: 'cloud', providerId: 'openai', model: 'gpt-4o', ruleset: 'validate video', maxAttempts: 2 },
+    },
+  }), { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true }], tools: [createWanTool()], toolCatalog: [createWanTool()], hardware: strongVideoHardware });
+  assert(videoPerItemValidationAnalysis.issues.some((issue) => /cannot validate mapped video items inside Map Collection yet/i.test(issue.message)), 'LLM validation should honestly reject mapped video outputs until a real video validator exists.');
 
   const sourceImageA = writeFixtureFile('source-a.png', Buffer.from(ONE_PIXEL_PNG, 'base64'));
   const sourceImageB = writeFixtureFile('source-b.png', Buffer.from(ONE_PIXEL_PNG, 'base64'));

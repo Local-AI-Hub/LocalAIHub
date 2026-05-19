@@ -636,7 +636,7 @@ async function verifyAudioOutputRun(tempRoot, audioPath) {
 async function verifyAudioStitchRun(tempRoot) {
   const stitchDefinitionNode = pipelineSchema.getNodeTypeDefinition('audioStitch');
   assert(stitchDefinitionNode, 'Audio Stitch node should exist in the pipeline schema.');
-  assert.strictEqual(stitchDefinitionNode.category, 'Flow', 'Audio Stitch should live in the existing Flow palette section.');
+  assert.strictEqual(stitchDefinitionNode.category, 'Deterministic Media Operations', 'Audio Stitch should live in the Deterministic Media Operations palette section.');
   assert.strictEqual(stitchDefinitionNode.inputPorts[0].kind, pipelineSchema.PORT_KIND_AUDIO, 'Audio Stitch should accept audio items.');
   assert.strictEqual(stitchDefinitionNode.inputPorts[0].collectionBehavior, 'only', 'Audio Stitch should require collection:audio input.');
   assert.strictEqual(stitchDefinitionNode.outputPorts[0].kind, pipelineSchema.PORT_KIND_AUDIO, 'Audio Stitch should output a single audio artifact.');

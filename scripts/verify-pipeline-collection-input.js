@@ -56,6 +56,9 @@ const {
   createEdge,
   createEmptyPipeline,
   createNode,
+  arePortsCompatible,
+  getPortDefinition,
+  resolveOutputKinds,
 } = require('../electron/shared/pipelineSchema.cjs');
 const { getActiveRunSnapshot, runPipeline } = require('../electron/services/pipelineExecutionService');
 const collectionInputState = require('../src/lib/pipeline-collection-input-state.cjs');
@@ -254,6 +257,37 @@ async function verifyFileBackedCollectionInput(itemType, filePath) {
   assert.deepStrictEqual((inputState?.outputs?.collection?.items || []).map((entry) => path.basename(entry.artifact.filePath)), [path.basename(filePath), path.basename(filePath)]);
 }
 
+function verifyNormalizeCollectionInputCompatibility() {
+  for (const entry of [
+    { itemType: 'audio', normalizeType: 'normalizeAudioCollection' },
+    { itemType: 'video', normalizeType: 'normalizeVideoCollection' },
+  ]) {
+    const input = createNode('collectionInput', {
+      id: 'collection-input-' + entry.itemType + '-normalize',
+      label: 'Manual ' + entry.itemType + ' collection',
+      config: { itemType: entry.itemType, items: [{ id: entry.itemType + '-item', filePath: entry.itemType + '.bin' }] },
+    });
+    const normalize = createNode(entry.normalizeType, { id: entry.normalizeType });
+    const output = createNode('collectionOutput', { id: entry.normalizeType + '-output', config: { title: entry.normalizeType + ' output' } });
+    const pipeline = createEmptyPipeline({
+      id: 'verify-' + entry.normalizeType + '-compatibility',
+      name: 'Verify ' + entry.normalizeType + ' compatibility',
+      nodes: [input, normalize, output],
+      edges: [
+        createEdge(input.id, 'collection', normalize.id, 'collection'),
+        createEdge(normalize.id, 'collection', output.id, 'collection'),
+      ],
+    });
+    const graph = buildPipelineGraph(pipeline);
+    assert.deepStrictEqual(graph.errors, [], 'Collection Input(' + entry.itemType + ') should connect to ' + entry.normalizeType + '.');
+    const sourcePort = getPortDefinition(input, 'output', 'collection');
+    const targetPort = getPortDefinition(normalize, 'input', 'collection');
+    assert.deepStrictEqual(resolveOutputKinds(input, sourcePort, graph), ['collection:' + entry.itemType], 'Collection Input(' + entry.itemType + ') should resolve to collection:' + entry.itemType + '.');
+    assert.strictEqual(arePortsCompatible(sourcePort, targetPort, { sourceNode: input, targetNode: normalize, graph }), true, 'Collection Input(' + entry.itemType + ') should be schema-compatible with ' + entry.normalizeType + '.');
+    assert.strictEqual(getPortDefinition(normalize, 'output', 'collection').collectionBehavior, 'only', entry.normalizeType + ' should still output a collection.');
+  }
+}
+
 function verifyRejectedDrafts() {
   const emptyPipeline = buildCollectionInputOutputPipeline('text', [], 'empty');
   const emptyAnalysis = analyzePipeline(emptyPipeline, providerContext());
@@ -286,8 +320,11 @@ async function verifyExistingCollectionBuilderStillWorks() {
 
 async function main() {
   assert(PIPELINE_NODE_TYPES.collectionInput, 'Collection Input node type should be registered.');
+  assert.strictEqual(PIPELINE_NODE_TYPES.collectionBuilder.type, 'collectionBuilder', 'Collection Builder node type id should remain stable.');
+  assert.strictEqual(PIPELINE_NODE_TYPES.collectionBuilder.category, 'Deterministic Media Operations', 'Collection Builder should live under Deterministic Media Operations.');
   const files = prepareFiles();
   verifyRejectedDrafts();
+  verifyNormalizeCollectionInputCompatibility();
   verifyCollectionInputRendererStateHelpers(files);
   await verifyTextCollectionInput();
   await verifyFileBackedCollectionInput('image', files.image);

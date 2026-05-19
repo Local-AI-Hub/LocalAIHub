@@ -56,6 +56,11 @@ async function main() {
   assert(aiStepsGroup, 'Expected an AI Steps palette group.');
   assert(aiStepsGroup.entries.some((entry) => entry.type === 'llmPrompt'), 'Expected Model Step in the AI Steps palette.');
   assert(aiStepsGroup.entries.some((entry) => entry.type === 'graphWorkflow'), 'Expected Graph Workflow in the AI Steps palette.');
+  assert(aiStepsGroup.entries.some((entry) => entry.type === 'collectionMap'), 'Expected Map Collection in the AI Steps palette.');
+  assert(aiStepsGroup.entries.some((entry) => entry.type === 'validation'), 'Expected Validation in the AI Steps palette.');
+  assert.strictEqual(pipelineSchema.getNodeTypeDefinition('validation').type, 'validation', 'Validation node type id should remain stable.');
+  assert.strictEqual(pipelineSchema.getNodeTypeDefinition('validation').category, 'AI Steps', 'Validation should live under AI Steps.');
+  assert(!paletteGroups.some((group) => group.label === 'Validation'), 'Expected no standalone Validation palette group after moving Validation into AI Steps.');
   assert(!paletteGroups.some((group) => group.entries.some((entry) => ['imageGenerate', 'imageAnalyze', 'whisperTranscribe'].includes(entry.type))), 'Expected removed standalone AI nodes to stay out of the palette.');
 
   const node = pipelineUi.createPositionedNode('llmPrompt', []);

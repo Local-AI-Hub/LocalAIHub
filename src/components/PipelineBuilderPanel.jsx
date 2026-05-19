@@ -105,6 +105,10 @@ const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ?
 const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
 const EMPTY_GRAPH_WORKFLOW_PRESETS = Object.freeze([]);
 
+function isDraftSecondsValue(value) {
+  return /^\d*(?:\.\d*)?$/.test(String(value || ''));
+}
+
 const TEMPLATE_STATUS_LABELS = Object.freeze({
   [TEMPLATE_STATUS.READY]: 'Ready',
   [TEMPLATE_STATUS.CONFIGURABLE]: 'Ready to configure',
@@ -209,6 +213,7 @@ function getCollectionMapModelFieldLabel(operationId) {
   if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return 'Transcription model';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return 'Model set override';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Analysis mode';
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return 'Wan model folder';
   return 'Checkpoint';
 }
 
@@ -218,6 +223,7 @@ function getCollectionMapModelPlaceholder(operationId) {
   if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return 'base';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return 'Optional Upscayl paired model set';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'clip or deepdanbooru';
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return 'Blank for auto-detect, or pick a Wan2.1 model folder';
   return 'Enter or pick a checkpoint file name';
 }
 
@@ -227,6 +233,7 @@ function getCollectionMapRefreshLabel(operationId) {
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return 'Refresh model sets';
   if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return 'Refresh models';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Refresh modes';
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return 'Refresh Wan models';
   return 'Refresh models';
 }
 
@@ -235,6 +242,7 @@ function getCollectionMapInstructionLabel(operationId, executionMode) {
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return executionMode === 'localTool' ? 'Prompt shaping / audio guidance' : 'Speech guidance / delivery hint';
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Transformation note';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Analysis instruction';
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return 'Motion guidance / prompt prefix';
   return 'Shared instruction';
 }
 
@@ -243,6 +251,7 @@ function getCollectionMapInstructionPlaceholder(operationId, executionMode) {
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return executionMode === 'localTool' ? 'Optional genre, mood, instrumentation, or sound-design guidance prepended to each text item.' : 'Optional delivery guidance for each speech request.';
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Optional note stored with each transformed audio item.';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Optional analysis request for each image.';
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return 'Optional motion guidance prepended to each text prompt. Required when a clip uses a reference image.';
   return 'Optional instruction applied to each mapped item.';
 }
 
@@ -626,11 +635,13 @@ function buildPlanFactLabels(artifact) {
   const plan = artifact?.plan && typeof artifact.plan === 'object' ? artifact.plan : {};
   const sceneCount = Array.isArray(plan.scenes) ? plan.scenes.length : Number(artifact?.sceneCount || 0) || 0;
   const sectionCount = Array.isArray(plan.sections) ? plan.sections.length : Number(artifact?.sectionCount || 0) || 0;
+  const clipCount = Array.isArray(plan.clips) ? plan.clips.length : Number(artifact?.clipCount || 0) || 0;
   const openQuestionCount = Array.isArray(plan.openQuestions) ? plan.openQuestions.length : 0;
   return [
     artifact?.schemaLabel || getPlanningSchemaOptionById(plan.schemaId)?.label || 'Plan',
     sceneCount ? sceneCount + ' scene' + (sceneCount === 1 ? '' : 's') : '',
     sectionCount ? sectionCount + ' section' + (sectionCount === 1 ? '' : 's') : '',
+    clipCount ? clipCount + ' clip' + (clipCount === 1 ? '' : 's') : '',
     openQuestionCount ? openQuestionCount + ' open question' + (openQuestionCount === 1 ? '' : 's') : '',
   ].filter(Boolean);
 }
@@ -837,6 +848,44 @@ function buildNodePreview(node, runState) {
     return gapSeconds > 0 ? gapSeconds + 's gaps | collection audio to WAV' : 'No gaps | collection audio to WAV';
   }
 
+
+  if (node.type === 'videoStitch') {
+    return 'Concatenate ordered video clips into MP4';
+  }
+
+  if (node.type === 'trimMedia') {
+    const mode = String(node.config?.mode || 'duration').trim() === 'end' ? 'end' : 'duration';
+    const startSeconds = Math.max(0, Number(node.config?.startSeconds || 0) || 0);
+    const durationSeconds = Math.max(0, Number(node.config?.durationSeconds || 0) || 0);
+    const endSeconds = Math.max(0, Number(node.config?.endSeconds || 0) || 0);
+    return mode === 'end' ? 'Start ' + startSeconds + 's | end ' + endSeconds + 's' : 'Start ' + startSeconds + 's | duration ' + durationSeconds + 's';
+  }
+
+  if (node.type === 'burnSubtitles') {
+    const mode = String(node.config?.captionMode || 'auto').trim() || 'auto';
+    return mode === 'manualLines' ? 'Manual lines | ' + Math.max(0.1, Number(node.config?.durationPerCaptionSeconds || 3) || 3) + 's each' : mode + ' captions';
+  }
+
+  if (node.type === 'normalizeAudioCollection') {
+    const sampleRate = Math.max(1, Number(node.config?.sampleRate || 44100) || 44100);
+    const channels = String(node.config?.channels || 'stereo').trim() === 'mono' ? 'mono' : 'stereo';
+    return sampleRate + ' Hz | ' + channels + ' WAV collection';
+  }
+
+  if (node.type === 'normalizeVideoCollection') {
+    const fps = Math.max(1, Number(node.config?.fps || 30) || 30);
+    const sizeMode = String(node.config?.sizeMode || 'matchFirst').trim() === 'custom' ? 'custom size' : 'match first size';
+    return 'MP4 | ' + fps + ' fps | ' + sizeMode;
+  }
+
+  if (node.type === 'extractVideoFrame') {
+    const framePosition = String(node.config?.framePosition || 'first').trim() === 'last' ? 'Last' : 'First';
+    return framePosition + ' frame | video to PNG';
+  }
+
+  if (node.type === 'extractAudio') {
+    return 'Video soundtrack to WAV';
+  }
 
   if (node.type === 'mediaComposition') {
     return `${Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4)}s per image | optional narration + music`;
@@ -2835,8 +2884,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return audioTransformTools;
     if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return transcriptionTools;
     if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return imageTransformTools.filter((tool) => tool.id === 'upscayl');
+    if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return videoTools;
     return imageTools;
-  }, [audioTools, audioTransformTools, imageTools, imageTransformTools, selectedCollectionMapMapping, transcriptionTools]);
+  }, [audioTools, audioTransformTools, imageTools, imageTransformTools, selectedCollectionMapMapping, transcriptionTools, videoTools]);
   const collectionMapGraphWorkflowNodeOptions = collectionMapGraphWorkflowDefinition?.nodeEntries || [];
   const collectionMapGraphWorkflowTextBinding = useMemo(
     () => (selectedNode?.type === 'collectionMap' ? getGraphWorkflowInputBinding(collectionMapEffectiveNode, 'text') : null),
@@ -2973,6 +3023,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return transcriptionTools[0]?.id || 'whisper';
     if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return imageTransformTools.find((tool) => tool.id === 'upscayl')?.id || 'upscayl';
     if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE || operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) return imageTools[0]?.id || '';
+    if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return videoTools[0]?.id || 'wan21-webui';
     return '';
   }
 
@@ -3024,6 +3075,18 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       nextConfig.audiocraftCfgCoef = Number(currentConfig.audiocraftCfgCoef || 3) || 3;
       nextConfig.audiocraftTwoStepCfg = Boolean(currentConfig.audiocraftTwoStepCfg);
       nextConfig.audioVoice = currentConfig.audioVoice || '';
+    } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+      nextConfig.videoSize = currentConfig.videoSize || '1280x720';
+      nextConfig.videoFps = Number(currentConfig.videoFps || 15) || 15;
+      nextConfig.videoQuality = Number(currentConfig.videoQuality || 5) || 5;
+      nextConfig.videoItemMode = currentConfig.videoItemMode === 'sequentialLastFrame' ? 'sequentialLastFrame' : 'independent';
+      nextConfig.videoChainFirstItemBehavior = currentConfig.videoChainFirstItemBehavior === 'initialReferenceImage' ? 'initialReferenceImage' : 'textToVideo';
+      nextConfig.videoInitialReferenceImagePath = currentConfig.videoInitialReferenceImagePath || '';
+      nextConfig.negativePrompt = currentConfig.negativePrompt || '';
+      nextConfig.steps = Number(currentConfig.steps || 24) || 24;
+      nextConfig.seed = Number(currentConfig.seed ?? -1);
+      nextConfig.durationSeconds = Number(currentConfig.durationSeconds || 8) || 8;
+
     } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
       nextConfig.transformSubtype = currentConfig.transformSubtype || 'upscale';
       nextConfig.scale = Number(currentConfig.scale || 4) || 4;
@@ -3917,7 +3980,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
           ? { assetKind: 'rvc-voice-model', defaultToolId: audioTransformTools[0]?.id || 'rvc', emptyMessage: 'No RVC voice models were found.', errorMessage: 'Local AI Hub could not load local RVC voice models for that collection map.', installMessage: 'Install RVC before refreshing voice models for this collection map.', successMessage: 'RVC voice models refreshed.' }
           : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
             ? { assetKind: 'upscayl-model-set', defaultToolId: imageTransformTools.find((tool) => tool.id === 'upscayl')?.id || imageTransformTools[0]?.id || 'upscayl', emptyMessage: 'No downloaded Upscayl model sets were found.', errorMessage: 'Local AI Hub could not load downloaded Upscayl model sets for that collection map.', installMessage: 'Install Upscayl before configuring image-to-image collection mapping.', successMessage: 'Upscayl model sets refreshed.' }
-            : { assetKind: 'stable-diffusion-checkpoint', defaultToolId: imageTools[0]?.id || '', emptyMessage: 'No backend-visible checkpoints were found.', errorMessage: 'Local AI Hub could not refresh live checkpoints for that image tool.', installMessage: 'Install Automatic1111 or Forge before refreshing local image checkpoints for this collection map.', successMessage: 'Checkpoints refreshed from the live backend.' };
+            : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+              ? { assetKind: 'wan-model-folder', defaultToolId: videoTools[0]?.id || 'wan21-webui', emptyMessage: 'No downloaded Wan model folders were found.', errorMessage: 'Local AI Hub could not load downloaded Wan model folders for that collection map.', installMessage: 'Install Wan2.1 WebUI before configuring text-to-video collection mapping.', successMessage: 'Wan model folders refreshed.' }
+              : { assetKind: 'stable-diffusion-checkpoint', defaultToolId: imageTools[0]?.id || '', emptyMessage: 'No backend-visible checkpoints were found.', errorMessage: 'Local AI Hub could not refresh live checkpoints for that image tool.', installMessage: 'Install Automatic1111 or Forge before refreshing local image checkpoints for this collection map.', successMessage: 'Checkpoints refreshed from the live backend.' };
       const toolId = String(node.config?.toolId || assetConfig.defaultToolId || '').trim();
       if (!toolId) {
         onToast(assetConfig.installMessage, 'error');
@@ -3941,7 +4006,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
         models = assetModels.map((model) => ({ ...model, id: String(model.path || model.packageRootPath || model.relativePath || model.name || model.id || '').trim(), label: model.sourceCatalogRepositoryId || model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath || model.path].filter(Boolean).join(' | '), toolId })).filter((model) => model.id);
       } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) {
         models = assetModels.map((model) => ({ ...model, id: String(model.relativePath || model.fileName || model.name || model.id || '').trim(), label: model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '), toolId })).filter((model) => model.id && model.backendVisible !== false);
-      } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) {
+      } else if (operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM || operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
         models = assetModels.map((model) => ({ ...model, id: String(model.name || model.fileName || model.relativePath || model.id || '').trim(), label: model.name || model.fileName || model.relativePath || model.id, detail: [model.modelType, model.relativePath].filter(Boolean).join(' | '), toolId })).filter((model) => model.id);
       } else {
         models = assetModels.filter((model) => {
@@ -4276,6 +4341,25 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     }));
   }
 
+  async function chooseCollectionMapInitialReferenceImage(nodeId) {
+    const result = await window.localAIHub.pickPipelineFile({ kind: 'image' });
+    if (!result?.ok) {
+      onToast(result?.message || 'Local AI Hub could not open that image picker.', 'error');
+      return;
+    }
+
+    if (result.data?.canceled || !result.data?.filePath) {
+      return;
+    }
+
+    updateNode(nodeId, (currentNode) => ({
+      ...currentNode,
+      config: {
+        ...currentNode.config,
+        videoInitialReferenceImagePath: result.data.filePath,
+      },
+    }));
+  }
   function updateCollectionInputType(nodeId, nextItemType) {
     const normalizedItemType = normalizeCollectionInputItemType(nextItemType);
     updateNode(nodeId, (currentNode) => {
@@ -5485,7 +5569,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
 
                 {selectedNode.type === 'planScenes' ? (
                   <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                    This node turns a structured Plan into an ordered text collection using that plan's schema adapter. Scene plans produce scene prompt drafts; audio prompt plans produce ordered audio prompts with section metadata.
+                    This node turns a structured Plan into an ordered text collection using that plan's schema adapter. Scene plans produce scene prompt drafts; audio prompt plans produce ordered audio prompts with section metadata; video prompt plans produce ordered video prompts with duration, motion, continuity, and reference-frame metadata.
                   </div>
                 ) : null}
 
@@ -5649,20 +5733,25 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   const collectionMapOperationId = selectedCollectionMapMapping?.operationId || PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
                   const collectionMapExecutionMode = selectedNode.config?.executionMode === 'graphWorkflow' ? 'graphWorkflow' : selectedNode.config?.executionMode === 'localTool' ? 'localTool' : 'cloud';
                   const showCollectionMapImageGenerationFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE;
+                  const showCollectionMapAudioGenerationFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE;
+                  const showCollectionMapVideoGenerationFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE;
                   const showCollectionMapLocalImageGenerationFields = showCollectionMapImageGenerationFields && collectionMapExecutionMode === 'localTool';
                   const showCollectionMapCloudImageGenerationFields = showCollectionMapImageGenerationFields && collectionMapExecutionMode === 'cloud';
-                  const showCollectionMapAudioGenerationFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE;
+                  const showCollectionMapCloudVideoGenerationFields = showCollectionMapVideoGenerationFields && collectionMapExecutionMode === 'cloud';
                   const selectedCollectionMapToolId = String(selectedNode.config?.toolId || '').trim().toLowerCase();
                   const showCollectionMapAudiocraftItemMode = showCollectionMapAudioGenerationFields && collectionMapExecutionMode === 'localTool' && (!selectedCollectionMapToolId || selectedCollectionMapToolId === 'audiocraft-webui');
                   const collectionMapAudiocraftItemMode = selectedNode.config?.audiocraftItemMode === 'sequentialContinuation' ? 'sequentialContinuation' : 'independent';
                   const showCollectionMapAudiocraftChainFields = showCollectionMapAudiocraftItemMode && collectionMapAudiocraftItemMode === 'sequentialContinuation';
+                  const showCollectionMapWanVideoItemMode = showCollectionMapVideoGenerationFields && collectionMapExecutionMode === 'localTool' && (!selectedCollectionMapToolId || selectedCollectionMapToolId === 'wan21-webui');
+                  const collectionMapVideoItemMode = selectedNode.config?.videoItemMode === 'sequentialLastFrame' ? 'sequentialLastFrame' : 'independent';
+                  const showCollectionMapVideoChainFields = showCollectionMapWanVideoItemMode && collectionMapVideoItemMode === 'sequentialLastFrame';
                   const showCollectionMapImageTransformFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM;
                   const showCollectionMapTranscriptionFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE;
                   const showCollectionMapAudioTransformFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM;
                   const showCollectionMapImageAnalysisFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE;
                   const showCollectionMapLocalModelField = collectionMapExecutionMode === 'localTool';
                   const showCollectionMapCloudModelField = collectionMapExecutionMode === 'cloud';
-                  const showCollectionMapInstructionField = showCollectionMapImageGenerationFields || showCollectionMapAudioGenerationFields || showCollectionMapAudioTransformFields || (showCollectionMapImageAnalysisFields && collectionMapExecutionMode === 'cloud');
+                  const showCollectionMapInstructionField = showCollectionMapImageGenerationFields || showCollectionMapAudioGenerationFields || showCollectionMapVideoGenerationFields || showCollectionMapAudioTransformFields || (showCollectionMapImageAnalysisFields && collectionMapExecutionMode === 'cloud');
                   const collectionMapTransformSubtypeOptions = getImageTransformSubtypeOptions(selectedNode.config?.toolId || 'upscayl');
                   const collectionMapInstructionValue = getCollectionMapInstructionValue(selectedNode, collectionMapOperationId);
                   const collectionMapModelOptions = modelOptionsByNodeId[selectedNode.id] || [];
@@ -5740,17 +5829,19 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       <div className="space-y-4">
                         <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-tool">Local backend</label><select className="store-input mt-3" id="collection-map-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: '', toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto / required local backend</option>{collectionMapLocalTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
                         {showCollectionMapLocalModelField ? (
-                          <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model-local">{getCollectionMapModelFieldLabel(collectionMapOperationId)}</label><input className="store-input mt-3" id="collection-map-model-local" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value, analysisMode: showCollectionMapImageAnalysisFields ? event.target.value || 'clip' : currentNode.config?.analysisMode } }))} placeholder={getCollectionMapModelPlaceholder(collectionMapOperationId)} value={selectedNode.config?.model || (showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || 'clip' : '')} /><div className="mt-3 flex flex-wrap items-center gap-3"><button className="ghost-button" disabled={modelsBusyNodeId === selectedNode.id} onClick={() => refreshNodeModels(selectedNode)} type="button">{modelsBusyNodeId === selectedNode.id ? 'Refreshing...' : getCollectionMapRefreshLabel(collectionMapOperationId)}</button><span className="text-xs text-slate-500">{showCollectionMapAudioGenerationFields ? 'Loads downloaded AudioCraft snapshots from the selected tool.' : showCollectionMapAudioTransformFields ? 'Loads local RVC voice models from the selected tool.' : showCollectionMapImageTransformFields ? 'Loads downloaded Upscayl model sets from the selected tool.' : showCollectionMapTranscriptionFields ? 'Shows local Whisper model size options.' : showCollectionMapImageAnalysisFields ? 'Shows WebUI interrogation modes.' : 'Loads local checkpoints from the selected image backend.'}</span></div>{collectionMapModelOptions.length ? <div className="mt-3 grid gap-2">{collectionMapModelOptions.slice(0, 8).map((model) => (<button className={'rounded-2xl border px-3 py-3 text-left transition ' + (String((showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || selectedNode.config?.model : selectedNode.config?.model) || '').trim().toLowerCase() === String(model.id || '').trim().toLowerCase() ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/20 hover:bg-white/10')} key={model.id} onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: showCollectionMapImageAnalysisFields ? model.id : currentNode.config?.analysisMode, model: model.id } }))} type="button"><p className="text-sm font-medium text-white">{model.label || model.id}</p>{buildModelOptionDetail(model) ? <p className="mt-1 text-xs leading-5 text-slate-400">{buildModelOptionDetail(model)}</p> : null}</button>))}</div> : null}</div>
+                          <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model-local">{getCollectionMapModelFieldLabel(collectionMapOperationId)}</label><input className="store-input mt-3" id="collection-map-model-local" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value, analysisMode: showCollectionMapImageAnalysisFields ? event.target.value || 'clip' : currentNode.config?.analysisMode } }))} placeholder={getCollectionMapModelPlaceholder(collectionMapOperationId)} value={selectedNode.config?.model || (showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || 'clip' : '')} /><div className="mt-3 flex flex-wrap items-center gap-3"><button className="ghost-button" disabled={modelsBusyNodeId === selectedNode.id} onClick={() => refreshNodeModels(selectedNode)} type="button">{modelsBusyNodeId === selectedNode.id ? 'Refreshing...' : getCollectionMapRefreshLabel(collectionMapOperationId)}</button><span className="text-xs text-slate-500">{showCollectionMapAudioGenerationFields ? 'Loads downloaded AudioCraft snapshots from the selected tool.' : showCollectionMapAudioTransformFields ? 'Loads local RVC voice models from the selected tool.' : showCollectionMapImageTransformFields ? 'Loads downloaded Upscayl model sets from the selected tool.' : showCollectionMapTranscriptionFields ? 'Shows local Whisper model size options.' : showCollectionMapImageAnalysisFields ? 'Shows WebUI interrogation modes.' : showCollectionMapVideoGenerationFields ? 'Loads local Wan model folders from the selected video backend.' : 'Loads local checkpoints from the selected image backend.'}</span></div>{collectionMapModelOptions.length ? <div className="mt-3 grid gap-2">{collectionMapModelOptions.slice(0, 8).map((model) => (<button className={'rounded-2xl border px-3 py-3 text-left transition ' + (String((showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || selectedNode.config?.model : selectedNode.config?.model) || '').trim().toLowerCase() === String(model.id || '').trim().toLowerCase() ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/20 hover:bg-white/10')} key={model.id} onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: showCollectionMapImageAnalysisFields ? model.id : currentNode.config?.analysisMode, model: model.id } }))} type="button"><p className="text-sm font-medium text-white">{model.label || model.id}</p>{buildModelOptionDetail(model) ? <p className="mt-1 text-xs leading-5 text-slate-400">{buildModelOptionDetail(model)}</p> : null}</button>))}</div> : null}</div>
                         ) : null}
                         {showCollectionMapAudiocraftItemMode ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audiocraft-item-mode">AudioCraft item mode</label><select className="store-input mt-3" id="collection-map-audiocraft-item-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftItemMode: event.target.value === 'sequentialContinuation' ? 'sequentialContinuation' : 'independent' } }))} value={collectionMapAudiocraftItemMode}><option value="independent">Independent clips</option><option value="sequentialContinuation">Sequential continuation chain</option></select></div>{showCollectionMapAudiocraftChainFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-first">First item behavior</label><select className="store-input mt-3" id="collection-map-chain-first" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioChainFirstItemBehavior: 'scratch' } }))} value="scratch"><option value="scratch">Generate from scratch</option></select></div> : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div>}</div>{showCollectionMapAudiocraftChainFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-seed">Seed seconds</label><input className="store-input mt-3" id="collection-map-chain-seed" min="0.25" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationSeedSeconds: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.continuationSeedSeconds || 12} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Segment duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-output">Output mode</label><select className="store-input mt-3" id="collection-map-chain-output" onChange={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioChainOutputMode: 'segments' } }))} value="segments"><option value="segments">Segments collection</option></select></div></div> : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div>}<details className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3"><summary className="cursor-pointer text-xs uppercase tracking-[0.18em] text-slate-400">Advanced AudioCraft settings</summary><div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-temperature">Temperature</label><input className="store-input mt-3" id="collection-map-audio-temperature" min="0.01" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTemperature: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTemperature ?? 1} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-top-k">Top K</label><input className="store-input mt-3" id="collection-map-audio-top-k" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopK: Number(event.target.value || 0) || 0 } }))} step="1" type="number" value={selectedNode.config?.audiocraftTopK ?? 250} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-top-p">Top P</label><input className="store-input mt-3" id="collection-map-audio-top-p" max="1" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopP: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTopP ?? 0} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-cfg">CFG coefficient</label><input className="store-input mt-3" id="collection-map-audio-cfg" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftCfgCoef: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.audiocraftCfgCoef ?? 3} /></div><label className="flex items-center gap-3 pt-7 text-sm font-medium text-slate-200" htmlFor="collection-map-audio-two-step"><input checked={Boolean(selectedNode.config?.audiocraftTwoStepCfg)} className="h-4 w-4 accent-cyan-300" id="collection-map-audio-two-step" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTwoStepCfg: event.target.checked } }))} type="checkbox" />Two-step CFG</label></div></details></div> : showCollectionMapAudioGenerationFields ? <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div></div> : null}
+                        {showCollectionMapWanVideoItemMode ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-item-mode">Video item mode</label><select className="store-input mt-3" id="collection-map-video-item-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoItemMode: event.target.value === 'sequentialLastFrame' ? 'sequentialLastFrame' : 'independent' } }))} value={collectionMapVideoItemMode}><option value="independent">Independent text-to-video clips</option><option value="sequentialLastFrame">Sequential previous-last-frame chain</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-size">Video size</label><select className="store-input mt-3" id="collection-map-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="832x480">832 x 480</option><option value="1280x720">1280 x 720</option></select></div></div>{showCollectionMapVideoChainFields ? <div className="rounded-[18px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-cyan-100/80" htmlFor="collection-map-video-first-behavior">First item</label><select className="store-input mt-3" id="collection-map-video-first-behavior" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoChainFirstItemBehavior: event.target.value === 'initialReferenceImage' ? 'initialReferenceImage' : 'textToVideo' } }))} value={selectedNode.config?.videoChainFirstItemBehavior === 'initialReferenceImage' ? 'initialReferenceImage' : 'textToVideo'}><option value="textToVideo">Start from text-to-video</option><option value="initialReferenceImage">Start from initial reference image</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-cyan-100/80" htmlFor="collection-map-video-initial-reference">Initial reference image</label><div className="mt-3 flex gap-2"><input className="store-input" id="collection-map-video-initial-reference" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoInitialReferenceImagePath: event.target.value } }))} placeholder="Optional image path" value={selectedNode.config?.videoInitialReferenceImagePath || ''} /><button className="ghost-button" onClick={() => chooseCollectionMapInitialReferenceImage(selectedNode.id)} type="button">Choose</button></div></div></div><p className="mt-3 text-xs leading-5 text-cyan-100/80">Later accepted clips use the previous generated clip last frame as the next reference image. The current text item still becomes the prompt for each clip.</p></div> : null}</div> : null}
+                        {showCollectionMapVideoGenerationFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-fps">FPS</label><input className="store-input mt-3" id="collection-map-video-fps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoFps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.videoFps || 15} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-steps">Steps</label><input className="store-input mt-3" id="collection-map-video-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-seed">Seed</label><input className="store-input mt-3" id="collection-map-video-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div> : null}
                         {showCollectionMapImageTransformFields ? <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-transform-subtype">Transform</label><select className="store-input mt-3" id="collection-map-transform-subtype" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, transformSubtype: event.target.value } }))} value={selectedNode.config?.transformSubtype || 'upscale'}>{collectionMapTransformSubtypeOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-scale">Scale</label><input className="store-input mt-3" id="collection-map-scale" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, scale: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.scale || 4} /></div></div> : null}
                         {showCollectionMapLocalImageGenerationFields ? <><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-width">Width</label><input className="store-input mt-3" id="collection-map-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-height">Height</label><input className="store-input mt-3" id="collection-map-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div><div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-steps">Steps</label><input className="store-input mt-3" id="collection-map-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cfg">CFG scale</label><input className="store-input mt-3" id="collection-map-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-seed">Seed</label><input className="store-input mt-3" id="collection-map-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div></> : null}
                       </div>
                     ) : (
-                      <div className="space-y-4"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-provider">Provider</label><select className="store-input mt-3" id="collection-map-provider" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, providerId: event.target.value, model: '' } }))} value={selectedNode.config?.providerId || ''}><option value="">Choose provider</option>{connectedProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></div>{showCollectionMapCloudModelField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model">Model</label><input className="store-input mt-3" id="collection-map-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder={showCollectionMapAudioGenerationFields ? 'Provider audio model' : showCollectionMapImageAnalysisFields ? 'Provider vision model' : 'Provider image model'} value={selectedNode.config?.model || ''} /></div> : null}{showCollectionMapCloudImageGenerationFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-size">Image size</label><select className="store-input mt-3" id="collection-map-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-quality">Quality</label><select className="store-input mt-3" id="collection-map-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-background">Background</label><select className="store-input mt-3" id="collection-map-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div></div> : null}{showCollectionMapAudioGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-voice">Voice</label><input className="store-input mt-3" id="collection-map-voice" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioVoice: event.target.value } }))} placeholder="Provider voice" value={selectedNode.config?.audioVoice || ''} /></div> : null}</div>
+                      <div className="space-y-4"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-provider">Provider</label><select className="store-input mt-3" id="collection-map-provider" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, providerId: event.target.value, model: '' } }))} value={selectedNode.config?.providerId || ''}><option value="">Choose provider</option>{connectedProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></div>{showCollectionMapCloudModelField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model">Model</label><input className="store-input mt-3" id="collection-map-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder={showCollectionMapAudioGenerationFields ? 'Provider audio model' : showCollectionMapVideoGenerationFields ? 'Provider video model' : showCollectionMapImageAnalysisFields ? 'Provider vision model' : 'Provider image model'} value={selectedNode.config?.model || ''} /></div> : null}{showCollectionMapCloudImageGenerationFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-size">Image size</label><select className="store-input mt-3" id="collection-map-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-quality">Quality</label><select className="store-input mt-3" id="collection-map-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-background">Background</label><select className="store-input mt-3" id="collection-map-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div></div> : null}{showCollectionMapCloudVideoGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cloud-video-size">Video size</label><select className="store-input mt-3" id="collection-map-cloud-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="832x480">832 x 480</option><option value="1280x720">1280 x 720</option></select></div> : null}{showCollectionMapAudioGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-voice">Voice</label><input className="store-input mt-3" id="collection-map-voice" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioVoice: event.target.value } }))} placeholder="Provider voice" value={selectedNode.config?.audioVoice || ''} /></div> : null}</div>
                     )}
                     {showCollectionMapInstructionField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-instruction">{getCollectionMapInstructionLabel(collectionMapOperationId, collectionMapExecutionMode)}</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="collection-map-instruction" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder={getCollectionMapInstructionPlaceholder(collectionMapOperationId, collectionMapExecutionMode)} value={collectionMapInstructionValue} /></div> : null}
-                    {showCollectionMapLocalImageGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[100px] resize-none" id="collection-map-negative" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for every mapped image." value={selectedNode.config?.negativePrompt || ''} /></div> : null}
+                    {(showCollectionMapLocalImageGenerationFields || showCollectionMapVideoGenerationFields) ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[100px] resize-none" id="collection-map-negative" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder={showCollectionMapVideoGenerationFields ? 'Optional negative prompt for every mapped video.' : 'Optional negative prompt for every mapped image.'} value={selectedNode.config?.negativePrompt || ''} /></div> : null}
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-failure-mode">On item failure</label>
                       <select className="store-input mt-3" id="collection-map-failure-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, failureMode: event.target.value === 'partial' ? 'partial' : 'fail-fast', partialSuccess: { ...(currentNode.config?.partialSuccess || {}), enabled: event.target.value === 'partial' } } }))} value={collectionMapFailureMode}>
@@ -5806,6 +5897,268 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   </div>
                 ) : null}
 
+                {selectedNode.type === 'videoStitch' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Concatenate ordered video clips into one final video. This pass writes MP4 output with ffmpeg concat stream-copy, so source clips must already be concat-compatible MP4 files with matching codec, resolution, and fps.
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'trimMedia' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Trim an audio or video artifact to a selected time range.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="trim-media-mode">Range mode</label>
+                      <select
+                        className="store-input mt-3"
+                        id="trim-media-mode"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, mode: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.mode || 'duration').trim() === 'end' ? 'end' : 'duration'}
+                      >
+                        <option value="duration">Start + duration</option>
+                        <option value="end">Start + end</option>
+                      </select>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="trim-media-start">Start time</label>
+                        <input
+                          className="store-input mt-3"
+                          id="trim-media-start"
+                          inputMode="decimal"
+                          onChange={(event) => {
+                            const nextValue = event.target.value;
+                            if (!isDraftSecondsValue(nextValue)) {
+                              return;
+                            }
+                            updateNode(selectedNode.id, (currentNode) => ({
+                              ...currentNode,
+                              config: { ...currentNode.config, startSeconds: nextValue },
+                            }));
+                          }}
+                          pattern="[0-9]*[.]?[0-9]*"
+                          type="text"
+                          value={selectedNode.config?.startSeconds ?? 0}
+                        />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="trim-media-endpoint">{String(selectedNode.config?.mode || 'duration').trim() === 'end' ? 'End time' : 'Duration seconds'}</label>
+                        <input
+                          className="store-input mt-3"
+                          id="trim-media-endpoint"
+                          inputMode="decimal"
+                          onChange={(event) => {
+                            const nextValue = event.target.value;
+                            if (!isDraftSecondsValue(nextValue)) {
+                              return;
+                            }
+                            updateNode(selectedNode.id, (currentNode) => ({
+                              ...currentNode,
+                              config: String(currentNode.config?.mode || 'duration').trim() === 'end'
+                                ? { ...currentNode.config, endSeconds: nextValue }
+                                : { ...currentNode.config, durationSeconds: nextValue },
+                            }));
+                          }}
+                          pattern="[0-9]*[.]?[0-9]*"
+                          type="text"
+                          value={String(selectedNode.config?.mode || 'duration').trim() === 'end' ? (selectedNode.config?.endSeconds ?? 5) : (selectedNode.config?.durationSeconds ?? 5)}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'burnSubtitles' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Render timed captions directly into a video. Use Whisper/transcript segments or subtitle files for timed captions. Manual text lines use a fixed duration per line.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="burn-subtitles-mode">Caption timing</label>
+                      <select
+                        className="store-input mt-3"
+                        id="burn-subtitles-mode"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, captionMode: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.captionMode || 'auto').trim() || 'auto'}
+                      >
+                        <option value="auto">Auto</option>
+                        <option value="transcriptSegments">Transcript segments</option>
+                        <option value="subtitleFile">Subtitle file</option>
+                        <option value="manualLines">Manual text lines</option>
+                      </select>
+                    </div>
+                    {String(selectedNode.config?.captionMode || 'auto').trim() === 'manualLines' ? (
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="burn-subtitles-duration">Duration per caption</label>
+                        <input
+                          className="store-input mt-3"
+                          id="burn-subtitles-duration"
+                          min="0.1"
+                          onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                            ...currentNode,
+                            config: { ...currentNode.config, durationPerCaptionSeconds: Math.max(0.1, Number(event.target.value || 3) || 3) },
+                          }))}
+                          step="0.1"
+                          type="number"
+                          value={Math.max(0.1, Number(selectedNode.config?.durationPerCaptionSeconds || 3) || 3)}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'normalizeAudioCollection' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Convert every audio item in the collection to matching WAV settings while preserving collection order.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-audio-sample-rate">Sample rate</label>
+                      <input
+                        className="store-input mt-3"
+                        id="normalize-audio-sample-rate"
+                        min="8000"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, sampleRate: Math.max(1, Number(event.target.value || 44100) || 44100) },
+                        }))}
+                        step="1000"
+                        type="number"
+                        value={Math.max(1, Number(selectedNode.config?.sampleRate || 44100) || 44100)}
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-audio-channels">Channels</label>
+                      <select
+                        className="store-input mt-3"
+                        id="normalize-audio-channels"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, channels: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.channels || 'stereo').trim() === 'mono' ? 'mono' : 'stereo'}
+                      >
+                        <option value="stereo">Stereo</option>
+                        <option value="mono">Mono</option>
+                      </select>
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'normalizeVideoCollection' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Convert every video item in the collection to matching MP4 settings while preserving collection order.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-video-size-mode">Target size</label>
+                      <select
+                        className="store-input mt-3"
+                        id="normalize-video-size-mode"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, sizeMode: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.sizeMode || 'matchFirst').trim() === 'custom' ? 'custom' : 'matchFirst'}
+                      >
+                        <option value="matchFirst">Match first clip</option>
+                        <option value="custom">Custom size</option>
+                      </select>
+                    </div>
+                    {String(selectedNode.config?.sizeMode || 'matchFirst').trim() === 'custom' ? (
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-video-width">Width</label>
+                          <input
+                            className="store-input mt-3"
+                            id="normalize-video-width"
+                            min="2"
+                            onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                              ...currentNode,
+                              config: { ...currentNode.config, width: Math.max(2, Number(event.target.value || 1280) || 1280) },
+                            }))}
+                            step="2"
+                            type="number"
+                            value={Math.max(2, Number(selectedNode.config?.width || 1280) || 1280)}
+                          />
+                        </div>
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-video-height">Height</label>
+                          <input
+                            className="store-input mt-3"
+                            id="normalize-video-height"
+                            min="2"
+                            onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                              ...currentNode,
+                              config: { ...currentNode.config, height: Math.max(2, Number(event.target.value || 720) || 720) },
+                            }))}
+                            step="2"
+                            type="number"
+                            value={Math.max(2, Number(selectedNode.config?.height || 720) || 720)}
+                          />
+                        </div>
+                      </div>
+                    ) : null}
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-video-fps">FPS</label>
+                      <input
+                        className="store-input mt-3"
+                        id="normalize-video-fps"
+                        min="1"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, fps: Math.max(1, Number(event.target.value || 30) || 30) },
+                        }))}
+                        step="1"
+                        type="number"
+                        value={Math.max(1, Number(selectedNode.config?.fps || 30) || 30)}
+                      />
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'extractVideoFrame' ? (
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="extract-video-frame-position">Mode</label>
+                      <select
+                        className="store-input mt-3"
+                        id="extract-video-frame-position"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            framePosition: event.target.value === 'last' ? 'last' : 'first',
+                          },
+                        }))}
+                        value={selectedNode.config?.framePosition === 'last' ? 'last' : 'first'}
+                      >
+                        <option value="first">First frame</option>
+                        <option value="last">Last frame</option>
+                      </select>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Extract the first or last frame from a video as an image.
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedNode.type === 'extractAudio' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Extract the audio track from a video as a WAV file.
+                    </div>
+                  </div>
+                ) : null}
                 {selectedNode.type === 'mediaComposition' ? (
                   <div className="space-y-4">
                     <div>
@@ -6024,10 +6377,10 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                 const allowsMultipleInputConnections = Boolean(inputPort?.allowMultipleConnections);
                                 return (
                                   <div className="grid h-9 grid-cols-2 items-center gap-4" key={`${node.id}-row-${index}`}>
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex min-w-0 items-center gap-2">
                                       {inputPort ? (
                                         <button
-                                          className={`flex items-center gap-2 rounded-full border px-2 py-1 text-left text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection && isPendingConnectionCompatible(node, inputPort) ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
+                                          className={`flex max-w-full items-center gap-2 rounded-full border px-2 py-1 text-left text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection && isPendingConnectionCompatible(node, inputPort) ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
                                           onClick={(event) => {
                                             event.stopPropagation();
                                             if (!pendingConnection) {
@@ -6040,15 +6393,15 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                           type="button"
                                         >
                                           <span className="h-2.5 w-2.5 rounded-full bg-white/70" />
-                                          <span className="truncate">{inputPort.label}</span>
+                                          <span className="min-w-0 truncate">{inputPort.label}</span>
                                           {allowsMultipleInputConnections ? <span className="rounded-full border border-white/10 bg-slate-950/50 px-2 py-0.5 text-[10px] text-slate-200">{inputConnectionCount}</span> : null}
                                         </button>
                                       ) : null}
                                     </div>
-                                    <div className="flex items-center justify-end gap-2">
+                                    <div className="flex min-w-0 items-center justify-end gap-2">
                                       {outputPort ? (
                                         <button
-                                          className={`flex items-center gap-2 rounded-full border px-2 py-1 text-right text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection?.sourceNodeId === node.id && pendingConnection?.sourcePortId === outputPort.id ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
+                                          className={`flex max-w-full items-center gap-2 rounded-full border px-2 py-1 text-right text-[11px] uppercase tracking-[0.16em] transition ${pendingConnection?.sourceNodeId === node.id && pendingConnection?.sourcePortId === outputPort.id ? 'border-cyan-300/35 bg-cyan-300/10 text-cyan-100' : 'border-white/10 bg-white/5 text-slate-400 hover:border-cyan-300/25 hover:bg-white/10'}`}
                                           onClick={(event) => {
                                             event.stopPropagation();
                                             setSelectedEdgeId('');
@@ -6061,7 +6414,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                           }}
                                           type="button"
                                         >
-                                          <span className="truncate">{outputPort.label}</span>
+                                          <span className="min-w-0 truncate">{outputPort.label}</span>
                                           <span className="h-2.5 w-2.5 rounded-full bg-cyan-300" />
                                         </button>
                                       ) : null}

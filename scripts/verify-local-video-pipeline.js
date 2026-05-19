@@ -597,6 +597,52 @@ async function verifyVideoGenerationArtifactMetadata() {
   assert(!runOutputs.some((entry) => entry.outputPath.endsWith('.video.json')), 'Expected the Outputs manager to hide video metadata sidecars.');
 }
 
+async function verifyVideoStitchArtifactMetadata() {
+  const tempDir = path.resolve(__dirname, '..', 'temp', 'video-stitch-metadata-test');
+  await fsp.mkdir(tempDir, { recursive: true });
+  const videoPath = path.join(tempDir, 'stitched-output.mp4');
+  await fsp.writeFile(videoPath, Buffer.from('stitched-video-output'));
+
+  const { buildFileArtifact, copyArtifactToOutput } = loadModuleWithStubs('electron/services/pipelineArtifactService.js', {
+    '/electron/services/pipelineArtifactService.js': {
+      './configService': {
+        ensureStorage: async () => {},
+        getAppPaths: () => ({ runtimesRoot: tempDir }),
+      },
+    },
+  });
+
+  const artifact = await buildFileArtifact(videoPath, {
+    displayName: 'Stitched Video',
+    kind: 'video',
+    role: 'generated',
+    videoStitch: {
+      concatMode: 'ffmpeg-concat-demuxer',
+      ffmpegMode: 'stream-copy',
+      operationId: 'videoStitch',
+      outputFormat: 'mp4',
+      sourceCollection: { itemKind: 'video', itemCount: 2, manifestPath: path.join(tempDir, 'manifest.json') },
+      sourceItemCount: 2,
+      sourceItems: [
+        { itemId: 'clip-a', artifactPath: path.join(tempDir, 'a.mp4'), prompt: 'first clip' },
+        { itemId: 'clip-b', artifactPath: path.join(tempDir, 'b.mp4'), prompt: 'second clip' },
+      ],
+    },
+  });
+
+  assert.strictEqual(artifact.kind, 'video', 'Expected stitched videos to stay video-typed.');
+  assert.strictEqual(artifact.videoStitch.operationId, 'videoStitch', 'Expected stitched video artifacts to preserve operation metadata.');
+  assert(artifact.summary.includes('stitched clip'), 'Expected stitched video summary to describe source clips.');
+
+  const outputDir = path.join(tempDir, 'pipeline-runs', 'run-video-stitch-output', 'outputs');
+  await fsp.mkdir(outputDir, { recursive: true });
+  const saved = await copyArtifactToOutput(artifact, { outputsDir: outputDir }, { title: 'Final Stitched Video' });
+  const sidecarPath = saved.metadataPaths.find((entry) => entry.endsWith('.video.json'));
+  assert(sidecarPath, 'Expected stitched video outputs to save a video metadata sidecar.');
+  const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
+  assert.strictEqual(sidecar.videoStitch.operationId, 'videoStitch', 'Expected stitched video sidecar to preserve operation id.');
+  assert.deepStrictEqual(sidecar.videoStitch.sourceItems.map((entry) => entry.itemId), ['clip-a', 'clip-b'], 'Expected stitched video sidecar to preserve ordered item refs.');
+}
 function verifyWanReadinessStates() {
   const textAnalysis = analyzeWanPipeline(createTextToVideoPipeline());
   const textSummary = textAnalysis.nodeSummaries['video-step'];
@@ -678,6 +724,7 @@ async function main() {
   await verifyAnimatedArtifactSemantics();
   await verifyLocalVideoService();
   await verifyVideoGenerationArtifactMetadata();
+  await verifyVideoStitchArtifactMetadata();
   verifyWanReadinessStates();
   await verifyComfyUiVideoExecution();
   await verifyComfyUiAnimatedVideoExecution();

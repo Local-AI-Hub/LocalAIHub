@@ -25,6 +25,15 @@ export const PIPELINE_PORT_ROW_HEIGHT = 36;
 export const PIPELINE_PORT_SECTION_OFFSET = 76;
 export const PIPELINE_NODE_MIN_HEIGHT = 168;
 
+const NODE_PALETTE_CATEGORY_ORDER = [
+  'Inputs',
+  'Planning',
+  'AI Steps',
+  'Flow',
+  'Deterministic Media Operations',
+  'Outputs',
+];
+
 export function buildPipelineDisplayContext({ graphWorkflowPresets, hardware, manifests, providers, tools }) {
   return buildContextMaps({
     graphWorkflowPresets,
@@ -53,10 +62,18 @@ export function getNodePaletteGroups() {
     groups[nodeType.category].push(nodeType);
   }
 
-  return Object.entries(groups).map(([label, entries]) => ({
-    entries,
-    label,
-  }));
+  return Object.entries(groups)
+    .map(([label, entries]) => ({
+      entries,
+      label,
+    }))
+    .sort((left, right) => {
+      const leftIndex = NODE_PALETTE_CATEGORY_ORDER.indexOf(left.label);
+      const rightIndex = NODE_PALETTE_CATEGORY_ORDER.indexOf(right.label);
+      const safeLeftIndex = leftIndex === -1 ? Number.MAX_SAFE_INTEGER : leftIndex;
+      const safeRightIndex = rightIndex === -1 ? Number.MAX_SAFE_INTEGER : rightIndex;
+      return safeLeftIndex === safeRightIndex ? left.label.localeCompare(right.label) : safeLeftIndex - safeRightIndex;
+    });
 }
 
 export function createPositionedNode(type, existingNodes = []) {
