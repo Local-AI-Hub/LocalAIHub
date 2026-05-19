@@ -1,5 +1,6 @@
 import { memo } from 'react';
 import { formatTimestamp, progressWidth, statusClass } from '../lib/formatters';
+import HoverRevealText from './HoverRevealText';
 
 function embeddedActionLabel(tool) {
   if (tool?.interfaceMode === 'embedded-whisper') {
@@ -156,7 +157,7 @@ function installNote(tool) {
 function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
   if (tool.status === 'running' || tool.status === 'starting') {
     return (
-      <button className="ghost-button" disabled={busyMap[`stop:${tool.id}`]} onClick={() => onStop(tool.id)} type="button">
+      <button className="ghost-button compact-card-button" disabled={busyMap[`stop:${tool.id}`]} onClick={() => onStop(tool.id)} type="button">
         {busyMap[`stop:${tool.id}`] ? 'Stopping...' : 'Stop'}
       </button>
     );
@@ -164,14 +165,14 @@ function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
 
   if (tool.interfaceMode === 'embedded-terminal') {
     return (
-      <button className="primary-button" onClick={() => onOpenInterface(tool.id)} type="button">
+      <button className="primary-button compact-card-button" onClick={() => onOpenInterface(tool.id)} type="button">
         Open console
       </button>
     );
   }
 
   return (
-    <button className="primary-button" disabled={busyMap[`launch:${tool.id}`]} onClick={() => onLaunch(tool.id)} type="button">
+    <button className="primary-button compact-card-button" disabled={busyMap[`launch:${tool.id}`]} onClick={() => onLaunch(tool.id)} type="button">
       {busyMap[`launch:${tool.id}`] ? 'Launching...' : 'Launch'}
     </button>
   );
@@ -190,20 +191,20 @@ function ProgressNotice({ progress, showSpinner = false, accent = 'cyan' }) {
   const barClass = accent === 'emerald' ? 'bg-emerald-300' : 'bg-cyan-300';
 
   return (
-    <div className={`mt-5 rounded-3xl border p-4 text-sm ${toneClass}`}>
+    <div className={`mt-2 rounded-2xl border p-2 text-xs ${toneClass}`}>
       <div className="flex items-start justify-between gap-4">
-        <div className="flex min-w-0 items-start gap-3">
+        <div className="flex min-w-0 items-start gap-2">
           {showSpinner ? (
             <span className={`mt-0.5 h-4 w-4 shrink-0 rounded-full border-2 ${accent === 'emerald' ? 'border-emerald-100/25 border-t-emerald-100' : 'border-cyan-100/25 border-t-cyan-100'} animate-spin`} />
           ) : null}
           <div className="min-w-0">
             <p>{progress.message}</p>
-            {progress.detail ? <p className="mt-2 text-xs leading-5 opacity-80">{progress.detail}</p> : null}
+            {progress.detail ? <p className="mt-1 line-clamp-1 text-xs leading-5 opacity-80" title={progress.detail}>{progress.detail}</p> : null}
           </div>
         </div>
         <span className="shrink-0">{hasPercent ? `${progress.percent}%` : 'Working...'}</span>
       </div>
-      <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-950/35">
+      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-950/35">
         {hasPercent ? (
           <div className={`h-full rounded-full transition-all ${barClass}`} style={{ width: progressWidth(progress.percent) }} />
         ) : (
@@ -274,59 +275,61 @@ function LibraryCard({
   const hasUpdate = Boolean(updateInfo?.updateAvailable);
   const note = installNote(tool);
   const uninstallLabel = uninstallActionLabel(tool);
+  const installSource = installSourceLabel(tool);
+  const lastSeen = formatTimestamp(tool.installedAt || tool.detectedAt);
 
   return (
-    <article className="library-card h-full">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+    <article className={`library-card h-full ${settingsOpen ? 'library-card-expanded' : ''}`.trim()}>
+      <div className="flex min-h-0 flex-wrap items-start justify-between gap-2 overflow-hidden">
         <div className="flex min-w-0 flex-1 items-start gap-3">
           <div className="tool-emblem">{tool.icon || tool.name.slice(0, 2).toUpperCase()}</div>
           <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <h3 className="text-xl font-semibold tracking-tight text-white">{tool.name}</h3>
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <h3 className="min-w-0 max-w-full truncate text-lg font-semibold tracking-tight text-white" title={tool.name}>{tool.name}</h3>
               <span className={`status-pill ${statusClass(tool.status)}`}>{tool.status.charAt(0).toUpperCase() + tool.status.slice(1)}</span>
-              <span className="status-pill border-white/10 bg-white/5 text-slate-300">{tool.category || 'Tool'}</span>
+              <span className="status-pill max-w-[10rem] truncate border-white/10 bg-white/5 text-slate-300" title={tool.category || 'Tool'}>{tool.category || 'Tool'}</span>
               {hasUpdate ? <span className="status-pill border-cyan-300/25 bg-cyan-300/10 text-cyan-100">Update available</span> : null}
             </div>
-            <p className="mt-2 line-clamp-2 text-sm leading-5 text-slate-300">{tool.description}</p>
-            <div className="mt-3 grid gap-2 md:grid-cols-3">
-              <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2">
+            <HoverRevealText className="line-clamp-2 text-sm leading-5 text-slate-300" revealClassName="hover-reveal-card-popover" rootClassName="mt-2 block min-w-0" text={tool.description} />
+            <div className="mt-2 grid gap-2 md:grid-cols-3">
+              <div className="card-meta-box">
                 <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Install source</p>
-                <p className="mt-1 text-xs font-medium text-white">{installSourceLabel(tool)}</p>
+                <p className="card-meta-value" title={installSource}>{installSource}</p>
               </div>
-              <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2">
+              <div className="card-meta-box">
                 <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Current VRAM load</p>
-                <p className="mt-1 text-xs font-medium text-white">{runningUsage}</p>
+                <p className="card-meta-value" title={runningUsage}>{runningUsage}</p>
               </div>
-              <div className="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2">
+              <div className="card-meta-box">
                 <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Last seen</p>
-                <p className="mt-1 text-xs font-medium text-white">{formatTimestamp(tool.installedAt || tool.detectedAt)}</p>
+                <p className="card-meta-value" title={lastSeen}>{lastSeen}</p>
               </div>
             </div>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
           <PrimaryAction busyMap={busyMap} onLaunch={onLaunch} onOpenInterface={onOpenInterface} onStop={onStop} tool={tool} />
           {tool.id === 'koboldcpp' ? (
-            <button className="ghost-button" onClick={onOpenKoboldSetup} type="button">
+            <button className="ghost-button compact-card-button" onClick={onOpenKoboldSetup} type="button">
               {tool.launchSelectionStatus?.actionLabel || 'Change model'}
             </button>
           ) : null}
           {String(tool.interfaceMode || '').startsWith('embedded-') && tool.interfaceMode !== 'embedded-terminal' ? (
-            <button className="ghost-button" onClick={() => onOpenInterface(tool.id)} type="button">
+            <button className="ghost-button compact-card-button" onClick={() => onOpenInterface(tool.id)} type="button">
               {embeddedActionLabel(tool)}
             </button>
           ) : null}
           {hasUpdate ? (
-            <button className="ghost-button" disabled={busyMap[`update:${tool.id}`]} onClick={() => onUpdate(tool.id)} type="button">
+            <button className="ghost-button compact-card-button" disabled={busyMap[`update:${tool.id}`]} onClick={() => onUpdate(tool.id)} type="button">
               {busyMap[`update:${tool.id}`] ? 'Updating...' : 'Update'}
             </button>
           ) : null}
-          <button className="ghost-button" onClick={() => onToggleSettings(tool.id)} type="button">
+          <button className="ghost-button compact-card-button" onClick={() => onToggleSettings(tool.id)} type="button">
             {settingsOpen ? 'Hide settings' : 'Settings'}
           </button>
           <button
-            className="ghost-button"
+            className="ghost-button compact-card-button"
             disabled={busyMap[`uninstall:${tool.id}`]}
             onClick={() => onUninstall(tool)}
             type="button"
@@ -341,14 +344,14 @@ function LibraryCard({
       <ProgressNotice accent="emerald" progress={updateProgress} showSpinner />
 
       {tool.lastError ? (
-        <div className="mt-3 rounded-2xl border border-rose-400/25 bg-rose-400/10 p-3 text-sm text-rose-100">
+        <div className="mt-2 rounded-2xl border border-rose-400/25 bg-rose-400/10 p-2 text-xs text-rose-100">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div>
               <p className="text-xs uppercase tracking-[0.22em] text-rose-200/80">Launch issue</p>
-              <p className="mt-2 leading-6">{tool.lastError}</p>
+              <p className="mt-1 line-clamp-2 leading-5" title={tool.lastError}>{tool.lastError}</p>
             </div>
             {canRepair ? (
-              <button className="ghost-button" disabled={busyMap[`repair:${tool.id}`]} onClick={() => onRepair(tool.id)} type="button">
+              <button className="ghost-button compact-card-button" disabled={busyMap[`repair:${tool.id}`]} onClick={() => onRepair(tool.id)} type="button">
                 {busyMap[`repair:${tool.id}`] ? 'Repairing...' : 'Repair'}
               </button>
             ) : null}
@@ -358,13 +361,13 @@ function LibraryCard({
 
 
       {tool.lastRepairMessage && !tool.lastError ? (
-        <div className="mt-3 rounded-2xl border border-emerald-400/20 bg-emerald-400/10 p-3 text-sm text-emerald-100">
+        <div className="mt-2 line-clamp-2 rounded-2xl border border-emerald-400/20 bg-emerald-400/10 p-2 text-xs leading-5 text-emerald-100" title={tool.lastRepairMessage}>
           {tool.lastRepairMessage}
         </div>
       ) : null}
 
       {settingsOpen ? (
-        <div className="mt-3 grid gap-3 2xl:grid-cols-[0.8fr,1.2fr]">
+        <div className="mt-2 grid gap-2 2xl:grid-cols-[0.8fr,1.2fr]">
           <div className="rounded-3xl border border-white/10 bg-slate-950/35 p-4">
             <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">{installLocationLabel(tool)}</p>
             <div className="mt-4 space-y-3 text-sm text-slate-300">
@@ -410,7 +413,7 @@ function LibraryCard({
                 </p>
               </div>
               {canSnapshot ? (
-                <button className="ghost-button" disabled={busyMap[`snapshot:${tool.id}`]} onClick={() => onSaveSnapshot(tool.id)} type="button">
+                <button className="ghost-button compact-card-button" disabled={busyMap[`snapshot:${tool.id}`]} onClick={() => onSaveSnapshot(tool.id)} type="button">
                   {busyMap[`snapshot:${tool.id}`] ? 'Saving...' : 'Save snapshot'}
                 </button>
               ) : null}
@@ -422,7 +425,7 @@ function LibraryCard({
                   <div key={snapshot.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-3 text-sm">
                     <span className="text-slate-300">{snapshot.fileName}</span>
                     <button
-                      className="ghost-button"
+                      className="ghost-button compact-card-button"
                       disabled={busyMap[`restore:${tool.id}`]}
                       onClick={() => onRestoreSnapshot(tool.id, snapshot.fileName)}
                       type="button"

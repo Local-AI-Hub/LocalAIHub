@@ -4,6 +4,7 @@ import pipelineWizardShared from '../../electron/shared/pipelineWizard.cjs';
 import pipelineWizardLifecycleShared from '../../electron/shared/pipelineWizardLifecycle.cjs';
 import pipelineTemplatesShared from '../../electron/shared/pipelineTemplates.cjs';
 import toolAssetSelectionShared from '../../electron/shared/toolAssetSelection.cjs';
+import HoverRevealText from './HoverRevealText';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
   GRAPH_WORKFLOW_TOOL_IDS,
@@ -6600,7 +6601,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                           type="button"
                                         >
                                           <span className="h-2.5 w-2.5 rounded-full bg-white/70" />
-                                          <span className="min-w-0 truncate">{inputPort.label}</span>
+                                          <HoverRevealText className="min-w-0 truncate" revealClassName="hover-reveal-port-popover hover-reveal-port-popover-input" rootClassName="hover-reveal-port-text" text={inputPort.label} />
                                           {allowsMultipleInputConnections ? <span className="rounded-full border border-white/10 bg-slate-950/50 px-2 py-0.5 text-[10px] text-slate-200">{inputConnectionCount}</span> : null}
                                         </button>
                                       ) : null}
@@ -6621,7 +6622,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                           }}
                                           type="button"
                                         >
-                                          <span className="min-w-0 truncate">{outputPort.label}</span>
+                                          <HoverRevealText className="min-w-0 truncate" revealClassName="hover-reveal-port-popover hover-reveal-port-popover-output" rootClassName="hover-reveal-port-text" text={outputPort.label} />
                                           <span className="h-2.5 w-2.5 rounded-full bg-cyan-300" />
                                         </button>
                                       ) : null}

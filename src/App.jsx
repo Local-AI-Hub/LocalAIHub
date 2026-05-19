@@ -13,6 +13,7 @@ import SettingsPanel from './components/SettingsPanel';
 import Sidebar from './components/Sidebar';
 import StatisticsPanel from './components/StatisticsPanel';
 import StoreCard from './components/StoreCard';
+import PaginationControls, { clampPaginationPage, getPaginatedItems } from './components/PaginationControls';
 import ToolUpdatesPanel from './components/ToolUpdatesPanel';
 import WhisperPanel from './components/WhisperPanel';
 import { formatBytes, formatUsage } from './lib/formatters';
@@ -57,6 +58,8 @@ const STATISTICS_CACHE_MS = 60000;
 const CONTAINED_CONTENT_MAX_WIDTH_CLASS = 'max-w-[1760px]';
 const CONTAINED_SHELL_PADDING_CLASS = 'px-5 pt-5 pb-2 lg:px-6';
 const CONTAINED_SHELL_HEIGHT_CLASS = 'xl:h-[calc(100dvh-8px)] xl:max-h-[calc(100dvh-8px)] xl:min-h-0 xl:overflow-hidden';
+const LIBRARY_PAGE_SIZE = 6;
+const STORE_PAGE_SIZE = 6;
 
 function trimConsoleOutput(value) {
   const text = String(value || '');
@@ -138,6 +141,8 @@ export default function App() {
   const [activePipelineRun, setActivePipelineRun] = useState(null);
   const [storeSearch, setStoreSearch] = useState('');
   const [storeCategory, setStoreCategory] = useState('All categories');
+  const [libraryPage, setLibraryPage] = useState(1);
+  const [storePage, setStorePage] = useState(1);
   const [settingsToolId, setSettingsToolId] = useState(null);
   const [cleanupPreview, setCleanupPreview] = useState(null);
   const [storageDraft, setStorageDraft] = useState('');
@@ -317,7 +322,20 @@ export default function App() {
   const currentResources = liveResources || appState.resources;
   const pipelineRunStatus = ['running', 'paused'].includes(activePipelineRun?.status) ? (activePipelineRun.status === 'paused' ? 'Paused' : 'Running') : '';
   const modelManagerCount = Number(appState.downloadedModelCount || 0);
-  const libraryCount = tools.length + connectedProviders.length;
+  const libraryItems = useMemo(
+    () => [
+      ...connectedProviders.map((provider) => ({ id: `provider:${provider.id}`, provider, type: 'provider' })),
+      ...tools.map((tool) => ({ id: `tool:${tool.id}`, tool, type: 'tool' })),
+    ],
+    [connectedProviders, tools],
+  );
+  const libraryCount = libraryItems.length;
+  const libraryTotalPages = Math.max(1, Math.ceil(libraryItems.length / LIBRARY_PAGE_SIZE));
+  const currentLibraryPage = clampPaginationPage(libraryPage, libraryTotalPages);
+  const pagedLibraryItems = useMemo(
+    () => getPaginatedItems(libraryItems, currentLibraryPage, LIBRARY_PAGE_SIZE),
+    [currentLibraryPage, libraryItems],
+  );
 
   const storeCategories = useMemo(() => {
     const values = [...new Set((appState.manifests || []).map((manifest) => manifest.category).filter(Boolean))];
@@ -342,6 +360,12 @@ export default function App() {
       return true;
     });
   }, [availableStoreTools, storeCategory, storeSearch]);
+  const storeTotalPages = Math.max(1, Math.ceil(storeTools.length / STORE_PAGE_SIZE));
+  const currentStorePage = clampPaginationPage(storePage, storeTotalPages);
+  const pagedStoreTools = useMemo(
+    () => getPaginatedItems(storeTools, currentStorePage, STORE_PAGE_SIZE),
+    [currentStorePage, storeTools],
+  );
 
   const managedLifecycleToolCount = useMemo(() => tools.filter((tool) => tool.lifecycleMode === 'managed').length, [tools]);
   const runningCount = useMemo(() => tools.filter((tool) => tool.status === 'running').length, [tools]);
@@ -360,6 +384,18 @@ export default function App() {
   }, [appState.storage?.legacyMigration]);
   const savedPreferredInstallRoot = appState.storage?.preferredInstallRoot || appState.storage?.managedRoot || '';
   const effectiveStoreInstallRoot = String(storeInstallRootDraft || savedPreferredInstallRoot || '').trim();
+
+  useEffect(() => {
+    setLibraryPage((page) => clampPaginationPage(page, libraryTotalPages));
+  }, [libraryTotalPages]);
+
+  useEffect(() => {
+    setStorePage(1);
+  }, [storeCategory, storeSearch]);
+
+  useEffect(() => {
+    setStorePage((page) => clampPaginationPage(page, storeTotalPages));
+  }, [storeTotalPages]);
 
   function dismissToast(id) {
     setToasts((current) => current.filter((toast) => toast.id !== id));
@@ -2059,71 +2095,87 @@ export default function App() {
               ) : null}
               </div>
 
-              <div className="min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
-                <div className="grid gap-3 xl:grid-cols-2">
-                {connectedProviders.map((provider) => (
-                  <ProviderCard
-                    key={provider.id}
-                    busyMap={busyMap}
-                    onOpenChat={openCloudProviderChat}
-                    onOpenSettings={() => setActiveTab('settings')}
-                    provider={provider}
-                  />
-                ))}
-
-                {tools.map((tool) => (
-                  <LibraryCard
-                    key={tool.id}
-                    busyMap={busyMap}
-                    launchProgress={launchProgressMap[tool.id]}
-                    migrationBusy={busyMap['settings:migrate-legacy']}
-                    migrationEligible={migratableToolIds.has(tool.id)}
-                    onLaunch={launchLibraryTool}
-                    onOpenKoboldSetup={() =>
-                      openKoboldSetup({
-                        autoLaunch: false,
-                        notice: 'Choose the GGUF file Local AI Hub should use for future KoboldCpp launches.',
-                      })
-                    }
-                    onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
-                    onMigrateManagedData={migrateLegacyStorage}
-                    onOpenInterface={openEmbeddedToolUi}
-                    onRepair={() => repairLibraryTool(tool)}
-                    onRestoreSnapshot={(toolId, snapshotFileName) =>
-                      runAction(`restore:${toolId}`, () => window.localAIHub.restoreSnapshot({ toolId, snapshotFileName }))
-                    }
-                    onSaveSnapshot={(toolId) => runAction(`snapshot:${toolId}`, () => window.localAIHub.saveSnapshot(toolId))}
-                    onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
-                    onToggleSettings={toggleLibraryToolSettings}
-                    onUninstall={uninstallLibraryTool}
-                    onUpdate={updateLibraryTool}
-                    progress={progressMap[tool.id]}
-                    runningUsageLabel={runningUsageLabel}
-                    settingsOpen={settingsToolId === tool.id}
-                    tool={tool}
-                    updateInfo={toolUpdateMap[tool.id]}
-                    updateProgress={updateProgressMap[tool.id]}
-                  />
-                ))}
-              </div>
-              {!libraryCount ? (
-                <div className="panel p-10 text-center">
-                  <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Library</p>
-                  <h3 className="mt-3 text-3xl font-semibold text-white">Your shelf is empty.</h3>
-                  <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-slate-300">
-                    Switch to Store to install a supported local AI tool, or open Settings to connect a supported cloud provider.
-                  </p>
-                  <div className="mt-6 flex flex-wrap justify-center gap-3">
-                    <button className="primary-button" onClick={() => setActiveTab('store')} type="button">
-                      Open Store
-                    </button>
-                    <button className="ghost-button" onClick={() => setActiveTab('settings')} type="button">
-                      Open Settings
-                    </button>
+              <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2 pr-1 xl:overflow-hidden">
+                {libraryCount ? (
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{libraryCount} library items</p>
+                    <PaginationControls
+                      currentPage={currentLibraryPage}
+                      label="Library"
+                      onPageChange={setLibraryPage}
+                      pageSize={LIBRARY_PAGE_SIZE}
+                      totalCount={libraryItems.length}
+                    />
                   </div>
-                </div>
-              ) : null}
+                ) : null}
+                <div className="grid min-h-0 gap-3 xl:flex-1 xl:grid-cols-2 xl:grid-rows-3">
+                  {pagedLibraryItems.map((entry) => {
+                    if (entry.type === 'provider') {
+                      return (
+                        <ProviderCard
+                          key={entry.id}
+                          busyMap={busyMap}
+                          onOpenChat={openCloudProviderChat}
+                          onOpenSettings={() => setActiveTab('settings')}
+                          provider={entry.provider}
+                        />
+                      );
+                    }
 
+                    const tool = entry.tool;
+                    return (
+                      <LibraryCard
+                        key={entry.id}
+                        busyMap={busyMap}
+                        launchProgress={launchProgressMap[tool.id]}
+                        migrationBusy={busyMap['settings:migrate-legacy']}
+                        migrationEligible={migratableToolIds.has(tool.id)}
+                        onLaunch={launchLibraryTool}
+                        onOpenKoboldSetup={() =>
+                          openKoboldSetup({
+                            autoLaunch: false,
+                            notice: 'Choose the GGUF file Local AI Hub should use for future KoboldCpp launches.',
+                          })
+                        }
+                        onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
+                        onMigrateManagedData={migrateLegacyStorage}
+                        onOpenInterface={openEmbeddedToolUi}
+                        onRepair={() => repairLibraryTool(tool)}
+                        onRestoreSnapshot={(toolId, snapshotFileName) =>
+                          runAction(`restore:${toolId}`, () => window.localAIHub.restoreSnapshot({ toolId, snapshotFileName }))
+                        }
+                        onSaveSnapshot={(toolId) => runAction(`snapshot:${toolId}`, () => window.localAIHub.saveSnapshot(toolId))}
+                        onStop={(toolId) => runAction(`stop:${toolId}`, () => window.localAIHub.stopTool(toolId))}
+                        onToggleSettings={toggleLibraryToolSettings}
+                        onUninstall={uninstallLibraryTool}
+                        onUpdate={updateLibraryTool}
+                        progress={progressMap[tool.id]}
+                        runningUsageLabel={runningUsageLabel}
+                        settingsOpen={settingsToolId === tool.id}
+                        tool={tool}
+                        updateInfo={toolUpdateMap[tool.id]}
+                        updateProgress={updateProgressMap[tool.id]}
+                      />
+                    );
+                  })}
+                </div>
+                {!libraryCount ? (
+                  <div className="panel p-10 text-center">
+                    <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Library</p>
+                    <h3 className="mt-3 text-3xl font-semibold text-white">Your shelf is empty.</h3>
+                    <p className="mx-auto mt-3 max-w-2xl text-sm leading-7 text-slate-300">
+                      Switch to Store to install a supported local AI tool, or open Settings to connect a supported cloud provider.
+                    </p>
+                    <div className="mt-6 flex flex-wrap justify-center gap-3">
+                      <button className="primary-button" onClick={() => setActiveTab('store')} type="button">
+                        Open Store
+                      </button>
+                      <button className="ghost-button" onClick={() => setActiveTab('settings')} type="button">
+                        Open Settings
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
               </div>
 
               {koboldSetupOpen && koboldTool ? (
@@ -2201,25 +2253,35 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="mt-3 min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
-                <div className="grid gap-3 xl:grid-cols-2 2xl:grid-cols-3">
-                {storeTools.length ? (
-                  storeTools.map((manifest) => (
-                    <StoreCard
-                      key={manifest.id}
-                      busy={busyMap[`install:${manifest.id}`]}
-                      compatibility={evaluateCompatibility(manifest, appState.hardware)}
-                      manifest={manifest}
-                      onInstall={installStoreTool}
-                      progress={progressMap[manifest.id]}
-                    />
-                  ))
-                ) : (
-                  <div className="rounded-[28px] border border-dashed border-white/15 bg-white/5 p-10 text-center text-slate-400 2xl:col-span-2">
-                    No Store results match that filter. Clear the search or category filter to see the full catalog.
-                  </div>
-                )}
-              </div>
+              <div className="mt-3 flex min-h-0 flex-1 flex-col overflow-y-auto pb-2 pr-1 xl:overflow-hidden">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{storeTools.length} Store results</p>
+                  <PaginationControls
+                    currentPage={currentStorePage}
+                    label="Store"
+                    onPageChange={setStorePage}
+                    pageSize={STORE_PAGE_SIZE}
+                    totalCount={storeTools.length}
+                  />
+                </div>
+                <div className="grid min-h-0 gap-3 xl:flex-1 xl:grid-cols-2 xl:grid-rows-3 2xl:grid-cols-3 2xl:grid-rows-2">
+                  {storeTools.length ? (
+                    pagedStoreTools.map((manifest) => (
+                      <StoreCard
+                        key={manifest.id}
+                        busy={busyMap[`install:${manifest.id}`]}
+                        compatibility={evaluateCompatibility(manifest, appState.hardware)}
+                        manifest={manifest}
+                        onInstall={installStoreTool}
+                        progress={progressMap[manifest.id]}
+                      />
+                    ))
+                  ) : (
+                    <div className="rounded-[28px] border border-dashed border-white/15 bg-white/5 p-10 text-center text-slate-400 2xl:col-span-2">
+                      No Store results match that filter. Clear the search or category filter to see the full catalog.
+                    </div>
+                  )}
+                </div>
               </div>
             </section>
           ) : activeTab === 'models' ? (

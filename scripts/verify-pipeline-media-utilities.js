@@ -276,6 +276,8 @@ function verifySchemaAndUiContracts() {
   assert(panelSource.includes('flex min-w-0 items-center justify-end gap-2'), 'Output port column should contain long labels inside its grid cell.');
   assert(panelSource.includes('flex max-w-full items-center gap-2 rounded-full border'), 'Port buttons should not overflow across the opposite port hit area.');
   assert(panelSource.includes('className="min-w-0 truncate"'), 'Port labels should truncate inside their button hit area.');
+  assert(panelSource.includes('hover-reveal-port-popover-input'), 'Input port labels should reveal their full text on hover without changing port layout.');
+  assert(panelSource.includes('hover-reveal-port-popover-output'), 'Output port labels should reveal their full text on hover without changing port layout.');
 }
 
 function verifySafeFfmpegArgs() {

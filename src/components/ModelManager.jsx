@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
 import { logRendererActionDiagnostic } from '../lib/focus-guard';
+import PaginationControls, { clampPaginationPage, getPaginatedItems } from './PaginationControls';
 const DEFAULT_SOURCE_OPTIONS = [{ id: 'huggingface', label: 'Hugging Face' }];
 const MODEL_TYPE_OPTIONS = [
   { id: 'all', label: 'All types' },
@@ -37,6 +38,7 @@ const EMPTY_PAGINATION = {
   nextCursor: null,
   nextPage: null,
 };
+const REMOTE_CATALOG_PAGE_SIZE = 6;
 function getModelManagerConfig(tool) {
   const config = tool?.modelManager;
   if (!config || config.enabled === false) {
@@ -341,6 +343,7 @@ export default function ModelManager({ tools, onToast }) {
   const [civitaiApiKeyDraft, setCivitaiApiKeyDraft] = useState('');
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
   const [pagination, setPagination] = useState(EMPTY_PAGINATION);
+  const [remoteCatalogPage, setRemoteCatalogPage] = useState(1);
   const [modelType, setModelType] = useState(getToolDefaults(modelTools[0]).modelType);
   const [sort, setSort] = useState('most-downloaded');
   const [taskType, setTaskType] = useState(getToolDefaults(modelTools[0]).taskType);
@@ -354,6 +357,12 @@ export default function ModelManager({ tools, onToast }) {
   const taskOptionsVisible = taskFilteringEnabled && taskOptions.length > 1;
   const effectiveTaskType = taskFilteringEnabled ? (taskOptions.length ? taskType : getToolDefaults(selectedTool).taskType) : 'all';
   const filterOptionsVisible = selectedSource !== 'ollama' && modelTypeOptions.length > 1;
+  const remoteCatalogTotalPages = Math.max(1, Math.ceil(remoteItems.length / REMOTE_CATALOG_PAGE_SIZE));
+  const currentRemoteCatalogPage = clampPaginationPage(remoteCatalogPage, remoteCatalogTotalPages);
+  const pagedRemoteItems = useMemo(
+    () => getPaginatedItems(remoteItems, currentRemoteCatalogPage, REMOTE_CATALOG_PAGE_SIZE),
+    [currentRemoteCatalogPage, remoteItems],
+  );
   function applyToolDefaults(toolId) {
     const tool = modelTools.find((entry) => entry.id === toolId) || null;
     const defaults = getToolDefaults(tool);
@@ -362,6 +371,7 @@ export default function ModelManager({ tools, onToast }) {
     setModelType(defaults.modelType);
     setTaskType(defaults.taskType);
     setSearch('');
+    setRemoteCatalogPage(1);
     browseRequestIdRef.current += 1;
     setRemoteItems([]);
     setCatalogState({ error: null, query: '', source: defaults.source });
@@ -406,6 +416,7 @@ export default function ModelManager({ tools, onToast }) {
       setRemoteItems([]);
       setLocalModels([]);
       setPagination(EMPTY_PAGINATION);
+      setRemoteCatalogPage(1);
       setCatalogState({ error: null, query: '', source });
       return;
     }
@@ -415,6 +426,7 @@ export default function ModelManager({ tools, onToast }) {
       setBrowseLoading(true);
       setRemoteItems([]);
       setPagination(EMPTY_PAGINATION);
+      setRemoteCatalogPage(1);
       setCatalogState({ error: null, query, source });
     }
     const requestId = browseRequestIdRef.current + 1;
@@ -441,6 +453,7 @@ export default function ModelManager({ tools, onToast }) {
         if (!append) {
           setRemoteItems([]);
           setPagination(EMPTY_PAGINATION);
+          setRemoteCatalogPage(1);
           setCatalogState({ error: message, query, source });
         }
         return;
@@ -467,6 +480,7 @@ export default function ModelManager({ tools, onToast }) {
       if (!append) {
         setRemoteItems([]);
         setPagination(EMPTY_PAGINATION);
+        setRemoteCatalogPage(1);
         setCatalogState({ error: message, query, source });
       }
     } finally {
@@ -507,6 +521,14 @@ export default function ModelManager({ tools, onToast }) {
     return () => unsubscribe();
   }, []);
   useEffect(() => {
+    setRemoteCatalogPage(1);
+  }, [modelType, search, selectedSource, selectedToolId, sort, taskType]);
+
+  useEffect(() => {
+    setRemoteCatalogPage((page) => clampPaginationPage(page, remoteCatalogTotalPages));
+  }, [remoteCatalogTotalPages]);
+
+  useEffect(() => {
     const nextToolId = modelTools[0]?.id || '';
     const hasSelectedTool = modelTools.some((tool) => tool.id === selectedToolId);
     if (!hasSelectedTool && nextToolId) {
@@ -519,6 +541,7 @@ export default function ModelManager({ tools, onToast }) {
       setRemoteItems([]);
       setLocalModels([]);
       setPagination(EMPTY_PAGINATION);
+      setRemoteCatalogPage(1);
       setCatalogState({ error: null, query: '', source });
       return;
     }
@@ -792,11 +815,20 @@ export default function ModelManager({ tools, onToast }) {
               <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Remote catalog</p>
               <h4 className="mt-1 text-lg font-semibold text-white">Available catalog results</h4>
             </div>
-            <p className="text-sm text-slate-400">{remoteItems.length} loaded</p>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <p className="text-sm text-slate-400">{remoteItems.length} loaded</p>
+              <PaginationControls
+                currentPage={currentRemoteCatalogPage}
+                label="remote catalog"
+                onPageChange={setRemoteCatalogPage}
+                pageSize={REMOTE_CATALOG_PAGE_SIZE}
+                totalCount={remoteItems.length}
+              />
+            </div>
           </div>
           <div className="mt-3 grid min-h-0 flex-1 gap-3 overflow-y-auto pb-4 pr-1 2xl:grid-cols-2">
             {remoteItems.length ? (
-              remoteItems.map((item) => {
+              pagedRemoteItems.map((item) => {
                 const localMatch = matchingLocalModel(item, localModels);
                 return (
                   <ModelCard
