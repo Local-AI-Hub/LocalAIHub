@@ -39,6 +39,28 @@ const GUIDED_INSTALLER_LAUNCH_SETTLE_MS = 1500;
 const OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS = 45000;
 const OFFICIAL_UNINSTALL_SETTLE_POLL_MS = 1000;
 const VERSION_PATTERN = /v?(\d+(?:\.\d+){1,3})/i;
+const activeToolInstallOperations = new Map();
+
+async function withToolInstallOperationLock(toolId, operationLabel, action) {
+  const normalizedToolId = String(toolId || '').trim().toLowerCase();
+  if (!normalizedToolId) {
+    return action();
+  }
+
+  const activeLabel = activeToolInstallOperations.get(normalizedToolId);
+  if (activeLabel) {
+    throw new Error(`Local AI Hub is already ${activeLabel} this tool. Wait for that operation to finish before starting another install or repair.`);
+  }
+
+  activeToolInstallOperations.set(normalizedToolId, operationLabel || 'working on');
+  try {
+    return await action();
+  } finally {
+    if (activeToolInstallOperations.get(normalizedToolId) === (operationLabel || 'working on')) {
+      activeToolInstallOperations.delete(normalizedToolId);
+    }
+  }
+}
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) {
@@ -182,6 +204,26 @@ function assertInstallPreflightApproved(preflight, confirmed) {
   }
 }
 
+function isLockedPathRepairError(error) {
+  const errorCode = String(error?.code || '').trim().toUpperCase();
+  const message = String(error?.message || error || '').toLowerCase();
+  return (
+    ['EBUSY', 'ENOTEMPTY', 'EPERM'].includes(errorCode) ||
+    message.includes('still being used by windows') ||
+    message.includes('resource busy or locked') ||
+    message.includes('operation not permitted') ||
+    message.includes('ebusy') ||
+    message.includes('eperm')
+  );
+}
+
+function buildRepairFailureMessage(error, manifest) {
+  if (isLockedPathRepairError(error)) {
+    return `${manifest.name} is still running or Windows is holding files open. Close ${manifest.name}, wait a few seconds, then run Repair again.`;
+  }
+
+  return humanizeError(error, `Local AI Hub could not repair ${manifest.name}.`);
+}
 function buildRepairCleanupNotes(cleanupSummary) {
   const notes = [];
 
@@ -1297,6 +1339,18 @@ async function installPythonDependencies(toolState, manifest, onProgress, logger
 
       installTarget = await buildFilteredRequirementsPath(toolState, requirementsPath, instruction, logger, index);
       args = [...args, '-r', installTarget];
+    } else if (instruction.kind === 'requirements-entry') {
+      const requirementsPath = assertPathInside(
+        toolState.appDir,
+        path.resolve(toolState.appDir, resolveInstructionText(instruction.value, templateContext)),
+        'Local AI Hub refused to install dependencies from outside the tool folder.',
+      );
+      if (!(await fs.pathExists(requirementsPath))) {
+        throw new Error(`Local AI Hub could not find ${manifest.name}'s requirements file for ${instruction.packageName || 'the requested package'}.`);
+      }
+
+      installTarget = assertSafePipInstallTarget(await findRequirementEntry(requirementsPath, instruction.packageName));
+      args = [...args, installTarget];
     } else if (instruction.kind === 'path') {
       installTarget = assertPathInside(
         toolState.appDir,
@@ -1510,6 +1564,296 @@ function buildAudiocraftPipelineInstallFailureMessage(probe) {
   return 'Local AI Hub installed AudioCraft WebUI, but it could not load the Python packages needed for pipeline audio generation. Run Repair or reinstall AudioCraft WebUI, then try again.';
 }
 
+function getRuntimeAssetLabel(asset = {}) {
+  return String(asset.label || asset.relativePath || asset.url || 'runtime asset').trim() || 'runtime asset';
+}
+
+function getRuntimeAssetMinBytes(asset = {}) {
+  return Math.max(1, Number(asset.minBytes || 1024) || 1024);
+}
+
+function getToolRuntimeAssets(manifest = {}) {
+  const assets = Array.isArray(manifest?.installInstructions?.runtimeAssets)
+    ? manifest.installInstructions.runtimeAssets
+    : [];
+  return assets
+    .filter((asset) => asset && typeof asset === 'object')
+    .map((asset) => ({
+      label: getRuntimeAssetLabel(asset),
+      minBytes: getRuntimeAssetMinBytes(asset),
+      relativePath: String(asset.relativePath || '').trim().replace(/[\\/]+/g, path.sep),
+      url: String(asset.url || '').trim(),
+    }))
+    .filter((asset) => asset.relativePath && asset.url);
+}
+
+function resolveRuntimeAssetPath(root, relativePath, safetyMessage) {
+  return assertPathInside(
+    root,
+    path.resolve(root, relativePath),
+    safetyMessage,
+  );
+}
+
+async function validateRuntimeAssetFile(filePath, asset) {
+  const stats = await fs.stat(filePath).catch(() => null);
+  if (!stats?.isFile() || stats.size < asset.minBytes) {
+    throw new Error(`${asset.label} is missing or incomplete.`);
+  }
+  return stats;
+}
+
+async function downloadRuntimeAsset(asset, destination, onProgress, logger, toolId) {
+  const safeUrl = assertSecureRemoteUrl(asset.url, `${asset.label} URL`);
+  await advanceStep(logger, onProgress, {
+    toolId,
+    percent: 88,
+    stage: 'runtime-assets',
+    message: `Downloading ${asset.label}.`,
+  }, { url: safeUrl });
+
+  const response = await fetchWithTimeout(safeUrl, logger);
+  if (!response.ok) {
+    throw new Error(`Local AI Hub could not download ${asset.label}. The source returned HTTP ${response.status}.`);
+  }
+
+  if (!response.body) {
+    throw new Error(`Local AI Hub reached the download source, but it did not send ${asset.label}.`);
+  }
+
+  await fs.ensureDir(path.dirname(destination));
+  const tempDestination = `${destination}.download`;
+  await fs.remove(tempDestination).catch(() => null);
+  const fileHandle = await open(tempDestination, 'w');
+  const reader = response.body.getReader();
+  let downloaded = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      const chunk = Buffer.from(value);
+      downloaded += chunk.length;
+      await fileHandle.write(chunk);
+    }
+  } finally {
+    await fileHandle.close();
+  }
+
+  await fs.move(tempDestination, destination, { overwrite: true });
+  await logger.info('Downloaded runtime asset.', {
+    downloadedBytes: downloaded,
+    label: asset.label,
+    path: destination,
+    toolId,
+  });
+}
+
+async function ensureToolRuntimeAssets(toolState, manifest, logger, onProgress = null) {
+  const assets = getToolRuntimeAssets(manifest);
+  if (!assets.length) {
+    return [];
+  }
+
+  const safeToolState = ensureManagedToolStatePaths(toolState);
+  const cacheRoot = assertPathInside(
+    safeToolState.installDir,
+    path.join(safeToolState.installDir, '.localaihub', 'runtime-assets'),
+    'Local AI Hub refused to cache a runtime asset outside the managed tool folder.',
+  );
+  const restored = [];
+
+  for (const asset of assets) {
+    const destination = resolveRuntimeAssetPath(
+      safeToolState.appDir,
+      asset.relativePath,
+      'Local AI Hub refused to install a runtime asset outside the tool folder.',
+    );
+    const cachePath = resolveRuntimeAssetPath(
+      cacheRoot,
+      asset.relativePath,
+      'Local AI Hub refused to cache a runtime asset outside the runtime asset cache.',
+    );
+
+    try {
+      await validateRuntimeAssetFile(destination, asset);
+      continue;
+    } catch {
+      // Missing or partial app asset can be restored from cache or downloaded below.
+    }
+
+    let cacheReady = false;
+    try {
+      await validateRuntimeAssetFile(cachePath, asset);
+      cacheReady = true;
+    } catch {
+      await fs.remove(cachePath).catch(() => null);
+    }
+
+    if (!cacheReady) {
+      await downloadRuntimeAsset(asset, cachePath, onProgress, logger, safeToolState.id);
+      await validateRuntimeAssetFile(cachePath, asset);
+    }
+
+    await fs.ensureDir(path.dirname(destination));
+    await fs.copy(cachePath, destination, { overwrite: true });
+    await validateRuntimeAssetFile(destination, asset);
+    restored.push({ label: asset.label, path: destination });
+  }
+
+  if (restored.length) {
+    await logger.info('Runtime assets restored for managed tool.', {
+      restored,
+      toolId: safeToolState.id,
+    });
+  }
+
+  return restored;
+}
+
+function buildFaceFusionDependencyVerificationScript() {
+  return [
+    'import importlib, json, sys',
+    'checks = [["cv2", "OpenCV (cv2)"], ["numpy", "NumPy"], ["onnxruntime", "ONNX Runtime"]]',
+    'missing = []',
+    'versions = {}',
+    'for module_name, label in checks:',
+    '    try:',
+    '        module = importlib.import_module(module_name)',
+    '        versions[module_name] = str(getattr(module, "__version__", ""))',
+    '    except ModuleNotFoundError as exc:',
+    '        missing.append(str(getattr(exc, "name", "") or module_name))',
+    '    except Exception as exc:',
+    '        missing.append(module_name + ":" + exc.__class__.__name__)',
+    'payload = {"ready": not missing, "missing": sorted(set(missing)), "versions": versions}',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
+
+function buildFaceFusionDependencyFailureMessage(probe = null) {
+  const missing = Array.isArray(probe?.missing) ? probe.missing.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+  if (missing.some((entry) => entry.toLowerCase() === 'cv2')) {
+    return 'FaceFusion finished installing, but OpenCV (cv2) is still missing from its Python environment. Run Repair again while online, or reinstall FaceFusion.';
+  }
+
+  if (missing.length) {
+    return 'FaceFusion finished installing, but its Python environment is still missing: ' + missing.join(', ') + '. Run Repair again while online, or reinstall FaceFusion.';
+  }
+
+  return 'FaceFusion finished installing, but Local AI Hub could not verify its Python dependencies. Run Repair again while online, or reinstall FaceFusion.';
+}
+
+async function verifyFaceFusionManagedRuntimeReadiness(toolState, manifest, logger) {
+  if (manifest?.id !== 'facefusion') {
+    return;
+  }
+
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  if (!(await fs.pathExists(pythonPath))) {
+    throw new Error('FaceFusion finished installing, but its Python environment is missing.');
+  }
+
+  const result = await runCommand(pythonPath, ['-c', buildFaceFusionDependencyVerificationScript()], {
+    allowFailure: true,
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+  });
+  const probe = parseRvcDependencyProbe(result.stdout);
+  if (Number(result.code || 0) === 0 && probe?.ready !== false) {
+    await logger.info('FaceFusion Python dependencies verified.', {
+      versions: probe?.versions || {},
+    });
+    return;
+  }
+
+  throw new Error(buildFaceFusionDependencyFailureMessage(probe));
+}
+function buildRvcDependencyVerificationScript() {
+  return [
+    'import importlib, json, sys',
+    'payload = {"ready": False, "gradio": "", "gradio_client": "", "has_media_data": False, "error": ""}',
+    'try:',
+    '    gradio_client = importlib.import_module("gradio_client")',
+    '    payload["gradio_client"] = str(getattr(gradio_client, "__version__", ""))',
+    '    payload["has_media_data"] = hasattr(gradio_client, "media_data")',
+    '    gradio = importlib.import_module("gradio")',
+    '    payload["gradio"] = str(getattr(gradio, "__version__", ""))',
+    '    payload["ready"] = bool(payload["has_media_data"])',
+    'except Exception as exc:',
+    '    payload["error"] = exc.__class__.__name__ + ": " + str(exc)',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
+
+function parseRvcDependencyProbe(stdout) {
+  const lastLine = String(stdout || '')
+    .trim()
+    .split(/\r?\n/)
+    .reverse()
+    .find(Boolean);
+  if (!lastLine) {
+    return null;
+  }
+  try {
+    return JSON.parse(lastLine);
+  } catch {
+    return null;
+  }
+}
+
+function buildRvcDependencyFailureMessage(probe = null) {
+  const clientVersion = String(probe?.gradio_client || '').trim();
+  const gradioVersion = String(probe?.gradio || '').trim();
+  const detail = clientVersion || gradioVersion
+    ? ` Detected gradio${gradioVersion ? ' ' + gradioVersion : ''} and gradio_client${clientVersion ? ' ' + clientVersion : ''}.`
+    : '';
+  return 'RVC finished installing, but its Gradio dependency set is incompatible. Run Repair to rebuild RVC with the pinned gradio_client version required by this RVC WebUI.' + detail;
+}
+
+async function verifyRvcManagedRuntimeReadiness(toolState, manifest, logger) {
+  if (manifest?.id !== 'rvc') {
+    return;
+  }
+
+  const assets = getToolRuntimeAssets(manifest);
+  for (const asset of assets) {
+    const destination = resolveRuntimeAssetPath(
+      toolState.appDir,
+      asset.relativePath,
+      'Local AI Hub refused to validate a runtime asset outside the tool folder.',
+    );
+    try {
+      await validateRuntimeAssetFile(destination, asset);
+    } catch {
+      throw new Error(`RVC finished installing, but ${asset.label} is still missing or incomplete at ${asset.relativePath}. Run Repair again while online, or reinstall RVC.`);
+    }
+  }
+
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  if (!(await fs.pathExists(pythonPath))) {
+    throw new Error('RVC finished installing, but its Python environment is missing.');
+  }
+
+  const result = await runCommand(pythonPath, ['-c', buildRvcDependencyVerificationScript()], {
+    allowFailure: true,
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+  });
+  const probe = parseRvcDependencyProbe(result.stdout);
+  if (Number(result.code || 0) === 0 && probe?.ready !== false && probe?.has_media_data !== false) {
+    await logger.info('RVC runtime assets and Gradio dependency compatibility verified.', {
+      gradio: probe?.gradio || '',
+      gradioClient: probe?.gradio_client || '',
+    });
+    return;
+  }
+
+  throw new Error(buildRvcDependencyFailureMessage(probe));
+}
 async function buildManagedLauncherValidationFailureMessage(toolState, manifest, launchProfile) {
   if (!launchProfile) {
     return `${manifest.name} finished installing, but its Store manifest did not produce a launch profile Local AI Hub can use.`;
@@ -1589,12 +1933,16 @@ async function verifyManagedToolInstall(toolState, manifest, logger) {
       throw new Error(`${manifest.name} finished installing, but its Python environment is missing.`);
     }
 
+    await ensureToolRuntimeAssets(safeToolState, manifest, logger);
+
     await runCommand(pythonPath, ['-m', 'pip', 'check'], {
       cwd: safeToolState.appDir,
       env: buildManagedProcessEnv(safeToolState, {}, { requireVirtualEnv: true }),
       errorMessage: `Local AI Hub installed ${manifest.name}, but its Python environment still has dependency conflicts.`,
     });
     await verifyAudiocraftManagedPipelineReadiness(safeToolState, manifest, logger);
+    await verifyRvcManagedRuntimeReadiness(safeToolState, manifest, logger);
+    await verifyFaceFusionManagedRuntimeReadiness(safeToolState, manifest, logger);
   }
 
   return {
@@ -1842,11 +2190,22 @@ function resolvePackagingBootstrapPackages(manifest) {
 }
 
 function buildDependencyInstallFailure(manifest, error, fallbackMessage) {
-  const combinedOutput = `${error?.stderr || ''}
-${error?.stdout || ''}`.toLowerCase();
+  const rawOutput = `${error?.stderr || ''}
+${error?.stdout || ''}`;
+  const combinedOutput = rawOutput.toLowerCase();
   let message = fallbackMessage;
+  const pipErrorLine = rawOutput
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse()
+    .find((line) => /^ERROR:/i.test(line) || /No matching distribution found|Could not find a version that satisfies|No such file or directory/i.test(line)) || '';
 
-  if (combinedOutput.includes('please use pip<24.1') || (combinedOutput.includes('omegaconf') && combinedOutput.includes('invalid metadata'))) {
+  if (manifest?.id === 'facefusion' && combinedOutput.includes('onnxruntime') && (combinedOutput.includes('no matching distribution') || combinedOutput.includes('could not find a version that satisfies'))) {
+    message = `${manifest.name} could not install ONNX Runtime from FaceFusion's requirements. pip reported: ${pipErrorLine || 'no compatible onnxruntime wheel was found for this Python runtime.'}`;
+  } else if (manifest?.id === 'facefusion' && pipErrorLine) {
+    message = `${manifest.name} could not install its Python dependencies. pip reported: ${pipErrorLine}`;
+  } else if (combinedOutput.includes('please use pip<24.1') || (combinedOutput.includes('omegaconf') && combinedOutput.includes('invalid metadata'))) {
     message = `${manifest.name} still relies on older Python package metadata, so this install needs pip 24.0 or older.`;
   } else if (combinedOutput.includes('flash_attn') && (combinedOutput.includes('cuda_home environment variable is not set') || combinedOutput.includes('nvcc was not found'))) {
     message = `${manifest.name} could not build flash_attn because this PC does not currently expose the NVIDIA CUDA Toolkit through nvcc or CUDA_HOME. flash_attn is acceleration-specific for Wan2.1 and should be optional when the manifest marks it optional.`;
@@ -1869,6 +2228,27 @@ ${error?.stdout || ''}`.toLowerCase();
   return wrapped;
 }
 
+async function findRequirementEntry(requirementsPath, packageName) {
+  const normalizedPackageName = String(packageName || '').trim().toLowerCase();
+  if (!normalizedPackageName) {
+    throw new Error('Local AI Hub could not identify the required Python package name.');
+  }
+
+  const raw = await fs.readFile(requirementsPath, 'utf8');
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+
+    const entryName = trimmed.split(/[<>=!~;\s\[]/, 1)[0].trim().toLowerCase();
+    if (entryName === normalizedPackageName) {
+      return trimmed;
+    }
+  }
+
+  throw new Error(`Local AI Hub could not find ${packageName} in ${path.basename(requirementsPath)}.`);
+}
 async function buildFilteredRequirementsPath(toolState, requirementsPath, instruction, logger, index) {
   const excludePatterns = Array.isArray(instruction?.excludePatterns)
     ? instruction.excludePatterns.map((value) => String(value || '').trim()).filter(Boolean)
@@ -2823,6 +3203,10 @@ async function installPipPackageTool(manifest, options, logger) {
 }
 
 async function installTool(toolId, options = {}) {
+  return withToolInstallOperationLock(toolId, 'installing or repairing', () => installToolUnlocked(toolId, options));
+}
+
+async function installToolUnlocked(toolId, options = {}) {
   await initializeToolRegistry();
   const manifest = getToolManifest(toolId);
   if (!manifest) {
@@ -3043,6 +3427,10 @@ async function inspectToolRepair(toolState) {
 }
 
 async function repairToolInstallation(toolState, options = {}) {
+  return withToolInstallOperationLock(toolState?.id, 'installing or repairing', () => repairToolInstallationUnlocked(toolState, options));
+}
+
+async function repairToolInstallationUnlocked(toolState, options = {}) {
   const manifest = getToolManifest(toolState.id);
   if (!manifest) {
     throw new Error('Local AI Hub could not find the tool definition for repair.');
@@ -3282,7 +3670,7 @@ async function repairToolInstallation(toolState, options = {}) {
         previousRuntimeVersion !== pythonResolution.runtime.versionString ||
         previousRuntimeSource !== pythonResolution.runtime.source;
       if (toolState.venvDir) {
-        await fs.remove(toolState.venvDir).catch(() => null);
+        await removePathWithRetries(toolState.venvDir, logger, 'repair-python-environment');
       }
 
       await advanceStep(logger, options.onProgress, {
@@ -3368,7 +3756,7 @@ async function repairToolInstallation(toolState, options = {}) {
 
     return trackedManagedTool;
   } catch (error) {
-    const readableMessage = humanizeError(error, `Local AI Hub could not repair ${manifest.name}.`);
+    const readableMessage = buildRepairFailureMessage(error, manifest);
     await upsertTool({
       id: toolState.id,
       lastError: readableMessage,
@@ -3379,9 +3767,10 @@ async function repairToolInstallation(toolState, options = {}) {
       error,
       readableMessage,
     });
-    throw error;
+    throw new Error(readableMessage);
   }
 }
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

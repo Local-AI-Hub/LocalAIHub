@@ -255,27 +255,22 @@
     "description": "A guided image generation stack with queueing, boards, and a polished web UI.",
     "icon": "IV",
     "category": "Image generation",
-    "downloadUrl": "https://github.com/invoke-ai/InvokeAI/archive/refs/heads/main.zip",
+    "downloadUrl": "https://pypi.org/project/invokeai/",
     "installInstructions": {
-      "kind": "zip",
+      "kind": "pip-package",
       "runtime": "python",
-      "archiveName": "InvokeAI-main.zip",
+      "archiveName": "invokeai",
       "installSummary": "Downloads InvokeAI, installs its Python package locally, and keeps the runtime inside Local AI Hub.",
       "venvFolder": ".venv",
       "configTargets": [
         "invokeai.yaml",
         ".invokeai"
       ],
-      "pythonRequirementDetection": [
-        {
-          "kind": "pyproject",
-          "file": "pyproject.toml"
-        }
-      ],
+      "pythonRequirementDetection": [],
       "pipInstalls": [
         {
-          "kind": "path",
-          "value": "."
+          "kind": "package",
+          "value": "invokeai"
         }
       ],
       "externalPythonCandidates": [
@@ -294,12 +289,13 @@
         "recommendedVramMb": 8192,
         "minimumRamMb": 16384,
         "recommendedRamMb": 32768
-      }
+      },
+      "pythonRequirement": ">=3.11,<3.13"
     },
-    "launchCommand": "python -m invokeai.app.run_app --host 127.0.0.1 --port {port}",
-    "externalLaunchCommand": "invokeai-web.exe --host 127.0.0.1 --port {port}",
+    "launchCommand": "..\\.venv\\Scripts\\invokeai-web.exe --root .. --config invokeai.yaml",
+    "externalLaunchCommand": "invokeai-web.exe --root {installDir} --config invokeai.yaml",
     "defaultPort": 9090,
-    "healthCheckPath": "/",
+    "healthCheckPath": "/api/v1/app/version",
     "detectionPaths": [
       "PATH:invokeai-web.exe",
       "PATH:invokeai.exe",
@@ -307,7 +303,50 @@
       "%USERPROFILE%\\InvokeAI\\pyproject.toml",
       "%LOCALAPPDATA%\\InvokeAI\\pyproject.toml",
       "%APPDATA%\\InvokeAI\\pyproject.toml"
-    ]
+    ],
+    "startupTimeoutMs": 240000,
+    "modelManager": {
+      "enabled": true,
+      "sources": [
+        {
+          "id": "huggingface",
+          "label": "Hugging Face"
+        },
+        {
+          "id": "civitai",
+          "label": "CivitAI"
+        }
+      ],
+      "allowedModelTypes": [
+        "all",
+        "checkpoint",
+        "inpainting",
+        "lora",
+        "controlnet",
+        "vae",
+        "embedding"
+      ],
+      "allowedTaskTypes": [
+        "image-generation",
+        "image-to-image"
+      ],
+      "defaults": {
+        "source": "huggingface",
+        "modelType": "checkpoint",
+        "taskType": "image-generation"
+      },
+      "targetLayout": {
+        "basePath": "install-dir",
+        "directories": {
+          "Checkpoint": "models",
+          "Inpainting": "models",
+          "LoRA": "models",
+          "ControlNet": "models",
+          "VAE": "models",
+          "Embedding": "models"
+        }
+      }
+    }
   },
   {
     "id": "forge",
@@ -677,6 +716,20 @@
       "pythonRequirement": ">=3.12,<3.13",
       "pipInstalls": [
         {
+          "kind": "requirements",
+          "value": "requirements.txt",
+          "excludePatterns": [
+            "^onnxruntime\\b"
+          ],
+          "message": "Installing the FaceFusion Python dependencies declared by this version."
+        },
+        {
+          "kind": "requirements-entry",
+          "value": "requirements.txt",
+          "packageName": "onnxruntime",
+          "message": "Installing the ONNX Runtime package declared by this FaceFusion version."
+        },
+        {
           "kind": "python-script",
           "value": "install.py",
           "args": [
@@ -705,6 +758,9 @@
     "externalLaunchCommand": "python facefusion.py run",
     "defaultPort": 7860,
     "healthCheckPath": "/",
+    "launchEnvironment": {
+      "includeBundledFfmpeg": true
+    },
     "detectionPaths": [
       "%USERPROFILE%\\facefusion\\facefusion.py",
       "%USERPROFILE%\\Documents\\facefusion\\facefusion.py",
@@ -929,6 +985,11 @@
         {
           "kind": "requirements",
           "value": "requirements.txt"
+        },
+        {
+          "kind": "package",
+          "value": "gradio_client==1.3.0",
+          "message": "Pinning gradio_client to the RVC-compatible API expected by Gradio 3.34."
         }
       ],
       "externalPythonCandidates": [
@@ -946,13 +1007,27 @@
         "minimumRamMb": 16384,
         "recommendedRamMb": 32768
       },
+      "runtimeAssets": [
+        {
+          "label": "RVC Hubert feature model",
+          "relativePath": "assets/hubert/hubert_base.pt",
+          "url": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt",
+          "minBytes": 1048576
+        },
+        {
+          "label": "RVC RMVPE pitch model",
+          "relativePath": "assets/rmvpe/rmvpe.pt",
+          "url": "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt",
+          "minBytes": 1048576
+        }
+      ],
       "packagingBootstrapPackages": [
         "pip<24.1",
         "setuptools",
         "wheel"
       ]
     },
-    "launchCommand": "python infer-web.py --listen --port {port}",
+    "launchCommand": "python infer-web.py --port {port} --noautoopen",
     "externalLaunchCommand": "go-web.bat",
     "defaultPort": 7865,
     "healthCheckPath": "/",

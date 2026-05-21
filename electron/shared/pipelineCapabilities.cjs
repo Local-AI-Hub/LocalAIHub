@@ -44,12 +44,12 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
   upscayl: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
     label: 'Operation-driven local tool',
-    notes: 'Upscayl fits the first local image-to-image transformation slice as a dedicated enhancement and upscaling adapter that keeps transformed-image lineage tied to the connected source image.',
+    notes: 'Upscayl uses the main image input and returns an enhanced or upscaled image artifact with lineage tied to the connected source image.',
   }),
   facefusion: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
     label: 'Operation-driven local tool',
-    notes: 'FaceFusion fits the first local image-to-image transformation slice as an image-only transformation adapter that keeps the target image and source face reference explicit inside the shared artifact flow.',
+    notes: 'FaceFusion uses the main image input as the target image and the Reference Image input as the source face, then returns the transformed image artifact.',
   }),
   'wan21-webui': Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
@@ -149,7 +149,7 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
     operations: Object.freeze({
       [PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_IMAGE]),
-        notes: 'Runs FaceFusion through a dedicated local adapter for image-only face transformation in this pass. Connect the target image on the main input and a source face image on the Reference Image input.',
+        notes: 'Runs FaceFusion through a dedicated local adapter. Connect the target image on the main input and a source face image on the Reference Image input.',
         outputKinds: Object.freeze([MODALITY_IMAGE]),
         requiresReferenceImage: true,
         transformSubtypes: Object.freeze(['face-swap']),

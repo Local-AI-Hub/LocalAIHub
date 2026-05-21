@@ -33,6 +33,8 @@ const REMOTE_PAGE_SIZE = 24;
 const OLLAMA_PAGE_SIZE = 40;
 const TOOL_ASSET_REFRESH_POLL_INTERVAL_MS = 1500;
 const TOOL_ASSET_REFRESH_STARTUP_GRACE_MS = 15000;
+const INVOKEAI_MODEL_IMPORT_TIMEOUT_MS = 20 * 60 * 1000;
+const INVOKEAI_MODEL_IMPORT_POLL_INTERVAL_MS = 2000;
 const OLLAMA_LIBRARY_URL = 'https://ollama.com/library';
 const TABBY_MODEL_REGISTRY_URLS = ['https://models.tabbyml.com', 'https://tabby.tabbyml.com/docs/models/'];
 const HUGGING_FACE_SEARCH_URL = 'https://huggingface.co/api/models';
@@ -44,6 +46,7 @@ const AUDIOCRAFT_PACKAGE_MODEL_IDS = ['facebook/musicgen-small', 'facebook/music
 const WAN_PACKAGE_MODEL_IDS = ['Wan-AI/Wan2.1-T2V-1.3B', 'Wan-AI/Wan2.1-T2V-14B', 'Wan-AI/Wan2.1-I2V-14B-480P', 'Wan-AI/Wan2.1-I2V-14B-720P'];
 const PACKAGE_SUPPORT_FILE_PATTERN = /(?:^|\/)(?:config\.json|tokenizer\.model)$/i;
 const RVC_REMOTE_ARTIFACT_FILE_PATTERN = /\.(pth|pt|index)$/i;
+const RVC_INDEX_FILE_PATTERN = /\.index$/i;
 const IMAGE_FILE_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
 const README_FILE_PATTERN = /(?:^|\/)README\.md$/i;
 const HUGGING_FACE_FILE_SIZE_CACHE = new Map();
@@ -476,6 +479,9 @@ function resolveModelManagerBasePath(tool, targetLayout) {
   if (basePath === 'app-dir') {
     return tool?.appDir || tool?.installDir || '';
   }
+  if (basePath === 'install-dir') {
+    return tool?.installDir || tool?.appDir || '';
+  }
   if (basePath === 'ollama-models-root') {
     return getOllamaModelsRoot(tool);
   }
@@ -798,6 +804,7 @@ function serializeDownloadPlan(plan, targetDirectory = null) {
     blockingReason: plan.blockingReason || null,
     compatibleArtifacts: plan.compatibleArtifacts || [],
     downloadFiles: plan.downloadFiles || [],
+    installStrategy: plan.installStrategy || null,
     modelType: plan.modelType || null,
     optionalArtifacts: plan.optionalArtifacts || [],
     packageIdentity: plan.packageIdentity || null,
@@ -910,7 +917,11 @@ function getPackageMetadataPath(packageRootPath, packageName = '') {
   return safePackageName ? path.join(packageRootPath, safePackageName + PACKAGE_METADATA_SUFFIX) : path.join(packageRootPath, PACKAGE_METADATA_FILE);
 }
 function isPackageDownloadPayload(payload = {}) {
-  return payload?.downloadPlan?.planType === 'package' || Array.isArray(payload?.downloadPlan?.downloadFiles);
+  const plan = payload?.downloadPlan || {};
+  if (plan.planType === 'package') {
+    return true;
+  }
+  return Array.isArray(plan.downloadFiles) && plan.downloadFiles.length > 0;
 }
 function normalizeIdentityPart(value) {
   return normalizeLookupKey(value).replace(/\|/g, '%7c');
@@ -1137,6 +1148,97 @@ async function walkDirectoryFiles(directory) {
   }
   return files;
 }
+function normalizeRvcCompanionToken(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+}
+
+function compactRvcCompanionToken(value) {
+  return normalizeRvcCompanionToken(value).replace(/\s+/g, '');
+}
+
+function getRvcModelStem(model = {}) {
+  const fileName = String(model.fileName || path.basename(model.path || model.relativePath || '') || '').trim();
+  const extension = path.extname(fileName);
+  return extension ? fileName.slice(0, -extension.length) : fileName;
+}
+
+function getRvcCompanionPathTokens(indexEntry = {}) {
+  const relativePath = String(indexEntry.relativePath || indexEntry.path || '').replace(/\\+/g, '/');
+  const segments = relativePath.split('/').filter(Boolean);
+  const fileName = path.basename(relativePath);
+  const withoutIndex = fileName.replace(/\.index$/i, '');
+  return [...segments.slice(0, -1), withoutIndex]
+    .map((entry) => ({ compact: compactRvcCompanionToken(entry), normalized: normalizeRvcCompanionToken(entry) }))
+    .filter((entry) => entry.compact);
+}
+
+function rvcIndexMatchesModel(indexEntry, model, modelCount, indexCount) {
+  const primaryCompact = compactRvcCompanionToken(getRvcModelStem(model));
+  if (primaryCompact.length >= 3 && !['model', 'pytorchmodel', 'weight', 'weights'].includes(primaryCompact)) {
+    if (getRvcCompanionPathTokens(indexEntry).some((token) => token.compact.includes(primaryCompact) || primaryCompact.includes(token.compact))) {
+      return true;
+    }
+  }
+  return modelCount === 1 && indexCount === 1;
+}
+
+async function listRvcIndexCompanionFiles(tool) {
+  const rawAppRoot = String(tool?.appDir || tool?.installDir || '').trim();
+  if (!rawAppRoot) {
+    return [];
+  }
+  const appRoot = path.resolve(rawAppRoot);
+  const logsRoot = path.join(appRoot, 'logs');
+  if (!(await fs.pathExists(logsRoot))) {
+    return [];
+  }
+  const files = await walkDirectoryFiles(logsRoot);
+  const companions = [];
+  for (const fullPath of files) {
+    if (!RVC_INDEX_FILE_PATTERN.test(path.basename(fullPath))) {
+      continue;
+    }
+    const stats = await fs.stat(fullPath).catch(() => null);
+    const relativePath = path.relative(appRoot, fullPath);
+    companions.push({
+      fileName: path.basename(fullPath),
+      logsRelativePath: path.relative(logsRoot, fullPath),
+      path: fullPath,
+      relativePath,
+      sizeBytes: Number(stats?.size || 0) || 0,
+    });
+  }
+  return companions.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+}
+
+async function attachRvcIndexCompanionMetadata(tool, models = []) {
+  const voiceModels = getRvcVoiceModels(models);
+  if (!voiceModels.length) {
+    return [];
+  }
+  const indexFiles = await listRvcIndexCompanionFiles(tool);
+  if (!indexFiles.length) {
+    return voiceModels;
+  }
+  return voiceModels.map((model) => {
+    const matches = indexFiles.filter((indexEntry) => rvcIndexMatchesModel(indexEntry, model, voiceModels.length, indexFiles.length));
+    if (matches.length !== 1) {
+      return {
+        ...model,
+        indexCandidateCount: matches.length || indexFiles.length,
+      };
+    }
+    const companion = matches[0];
+    return {
+      ...model,
+      indexCandidateCount: 1,
+      indexFileName: companion.fileName,
+      indexPath: companion.path,
+      indexRelativePath: companion.relativePath,
+      indexSizeBytes: companion.sizeBytes,
+    };
+  });
+}
 function buildOllamaModelNameFromManifestPath(relativePath) {
   const parts = String(relativePath || '')
     .split(/[\\/]+/)
@@ -1223,13 +1325,16 @@ async function listLocalOllamaModels(tool) {
 }
 async function listDownloadedModels(tool) {
   if (tool?.id === 'rvc') {
-    return listLocalFileModels(tool);
+    return attachRvcIndexCompanionMetadata(tool, await listLocalFileModels(tool));
   }
   if (!supportsModelManager(tool)) {
     return [];
   }
   if (tool.id === 'ollama') {
     return listLocalOllamaModels(tool);
+  }
+  if (tool.id === 'invokeai') {
+    return listInvokeAiModels(tool);
   }
   return listLocalFileModels(tool);
 }
@@ -1315,6 +1420,204 @@ async function stopStableDiffusionBackendAfterAssetRefresh(tool) {
   } catch (error) {
     throw new Error((tool?.name || 'This image backend') + ' refreshed checkpoints, but Local AI Hub could not stop the backend it started for refresh: ' + humanizeError(error, 'Stop failed.'));
   }
+}
+function isInvokeAiTool(tool) {
+  return String(tool?.id || '').trim().toLowerCase() === 'invokeai';
+}
+function getInvokeAiRoot(tool) {
+  return path.resolve(String(tool?.installDir || tool?.appDir || '').trim());
+}
+function getInvokeAiModelsRoot(tool) {
+  const root = getInvokeAiRoot(tool);
+  return root ? path.join(root, 'models') : '';
+}
+function getInvokeAiApiUrl(tool, apiPath) {
+  const launchUrl = assertLoopbackUrl(tool?.launchUrl, 'InvokeAI API URL');
+  return new URL(apiPath, launchUrl.replace(/\/$/, '') + '/').toString();
+}
+async function fetchInvokeAiJson(tool, apiPath, options = {}) {
+  const response = await fetch(getInvokeAiApiUrl(tool, apiPath), options);
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = String(payload?.detail || payload?.error || payload?.message || '').trim();
+    throw new Error(detail ? 'InvokeAI answered with an error: ' + detail : 'InvokeAI answered with status ' + response.status + '.');
+  }
+  return payload;
+}
+function normalizeInvokeAiModelType(record = {}) {
+  const type = String(record.type || record.model_type || '').trim().toLowerCase();
+  const format = String(record.format || '').trim().toLowerCase();
+  const combined = [record.name, record.path, record.base, record.description].filter(Boolean).join(' ').toLowerCase();
+  if (type === 'main' && format === 'checkpoint' && /inpaint/.test(combined)) {
+    return 'Inpainting';
+  }
+  if (type === 'main') {
+    return 'Checkpoint';
+  }
+  if (type === 'lora' || type === 'control_lora') {
+    return 'LoRA';
+  }
+  if (type === 'controlnet') {
+    return 'ControlNet';
+  }
+  if (type === 'vae') {
+    return 'VAE';
+  }
+  if (type === 'embedding' || type === 'textual_inversion' || type === 'textualinversion') {
+    return 'Embedding';
+  }
+  return normalizeModelType(type || record.name || record.path || 'Checkpoint');
+}
+function resolveInvokeAiModelPath(tool, record = {}) {
+  const rawPath = String(record.path || '').trim();
+  if (!rawPath) {
+    return '';
+  }
+  if (path.isAbsolute(rawPath)) {
+    return path.resolve(rawPath);
+  }
+  return path.join(getInvokeAiModelsRoot(tool), ...splitRelativePathSegments(rawPath));
+}
+async function buildInvokeAiLocalModel(tool, record = {}) {
+  const modelPath = resolveInvokeAiModelPath(tool, record);
+  const stats = modelPath ? await fs.stat(modelPath).catch(() => null) : null;
+  const metadata = modelPath ? await readModelMetadata(modelPath).catch(() => null) : null;
+  const modelType = normalizeInvokeAiModelType(record);
+  const fileName = path.basename(modelPath || record.path || record.name || 'model');
+  return {
+    id: tool.id + ':' + modelType + ':invokeai:' + normalizePathForId(record.key || record.path || record.name || fileName),
+    downloaded: true,
+    downloadIdentity: metadata?.downloadIdentity || null,
+    fileName,
+    invokeAiModelKey: record.key || null,
+    metadata: metadata || null,
+    modelType,
+    name: String(record.name || path.parse(fileName).name || fileName).trim(),
+    path: modelPath || String(record.path || '').trim(),
+    relativePath: String(record.path || '').trim(),
+    sizeBytes: Number(record.file_size || stats?.size || 0) || 0,
+    source: 'invokeai',
+    sourceArtifactPath: metadata?.sourceArtifactPath || null,
+    sourceCatalogRepositoryId: metadata?.catalogRepositoryId || null,
+    sourceCatalogModelId: metadata?.catalogModelId || null,
+    sourceName: metadata?.source || record.source_type || record.source || 'invokeai',
+    toolId: tool.id,
+  };
+}
+async function listInvokeAiModels(tool) {
+  if (!(await isToolReady(tool).catch(() => false))) {
+    return listLocalFileModels(tool);
+  }
+  try {
+    const payload = await fetchInvokeAiJson(tool, '/api/v2/models/');
+    const records = Array.isArray(payload?.models) ? payload.models : [];
+    const models = await Promise.all(records.map((record) => buildInvokeAiLocalModel(tool, record)));
+    return models.sort((left, right) => left.name.localeCompare(right.name));
+  } catch {
+    return listLocalFileModels(tool);
+  }
+}
+async function prepareInvokeAiModelImportSession(tool) {
+  const freshTool = await resolveFreshToolForAssetRefresh(tool);
+  const wasActive = await isToolActive(freshTool).catch(() => false);
+  const wasReady = wasActive ? await isToolReady(freshTool).catch(() => false) : false;
+  if (!wasReady) {
+    await launchToolFromUserAction(freshTool, {
+      allowPendingStartup: true,
+      launchContext: 'invokeai-model-import',
+      skipOpenInterface: true,
+    });
+  }
+  const timeoutMs = Math.max(
+    Number(freshTool?.startupTimeoutMs || 0) || 0,
+    Number(freshTool?.launchProfile?.startupTimeoutMs || 0) || 0,
+    120000,
+  ) + TOOL_ASSET_REFRESH_STARTUP_GRACE_MS;
+  const readyTool = await waitForToolReadyForAssetRefresh(freshTool, timeoutMs);
+  return {
+    readyTool,
+    startedForImport: !wasActive,
+  };
+}
+async function finishInvokeAiModelImportSession(session) {
+  if (!session?.startedForImport || !session.readyTool) {
+    return;
+  }
+  await stopTool(session.readyTool).catch(() => null);
+}
+function getInvokeAiImportStatus(job = {}) {
+  return String(job.status || '').trim().toLowerCase();
+}
+function buildInvokeAiInstallErrorMessage(job = {}, fallback = '') {
+  const detail = String(job.error || job.error_reason || fallback || '').trim();
+  return detail ? 'InvokeAI could not import and register this model. ' + detail : 'InvokeAI could not import and register this model.';
+}
+async function waitForInvokeAiInstallJob(tool, job, options = {}) {
+  const jobId = Number(job?.id);
+  if (!Number.isFinite(jobId)) {
+    throw new Error('InvokeAI accepted the import request, but did not return a model install job ID.');
+  }
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= INVOKEAI_MODEL_IMPORT_TIMEOUT_MS) {
+    const latest = await fetchInvokeAiJson(tool, '/api/v2/models/install/' + encodeURIComponent(String(jobId)));
+    const status = getInvokeAiImportStatus(latest);
+    if (status === 'completed') {
+      return latest;
+    }
+    if (status === 'error' || status === 'cancelled') {
+      throw new Error(buildInvokeAiInstallErrorMessage(latest));
+    }
+    emitProgress(options.onProgress, {
+      downloadId: options.downloadId,
+      message: 'Waiting for InvokeAI to register the model.',
+      percent: 95,
+      receivedBytes: options.receivedBytes || 0,
+      totalBytes: options.totalBytes || 0,
+    });
+    await sleep(INVOKEAI_MODEL_IMPORT_POLL_INTERVAL_MS);
+  }
+  throw new Error('InvokeAI is still importing this model. Open InvokeAI to check the model install job, then refresh Downloaded Models.');
+}
+function getInvokeAiImportStagePath(tool, payload = {}) {
+  const fileName = sanitizePathSegment(payload.fileName || path.basename(payload.sourceArtifactPath || payload.name || 'model.safetensors')) || 'model.safetensors';
+  return path.join(getAppPaths().tempRoot, 'invokeai-model-imports', sanitizePathSegment(tool?.id || 'invokeai') || 'invokeai', Date.now() + '-' + Math.random().toString(16).slice(2), fileName);
+}
+function buildInvokeAiModelInstallRequest(tool, sourcePath, config = {}) {
+  const installUrl = new URL(getInvokeAiApiUrl(tool, '/api/v2/models/install'));
+  installUrl.searchParams.set('source', sourcePath);
+  installUrl.searchParams.set('inplace', 'false');
+  return {
+    body: JSON.stringify(config && typeof config === 'object' ? config : {}),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    url: installUrl.toString(),
+  };
+}
+function buildInvokeAiModelImportConfig(payload = {}) {
+  const modelType = normalizeModelType(payload?.downloadPlan?.modelType || payload?.modelType || '');
+  const typeMap = {
+    ControlNet: 'controlnet',
+    Embedding: 'embedding',
+    LoRA: 'lora',
+    VAE: 'vae',
+  };
+  return typeMap[modelType] ? { type: typeMap[modelType] } : {};
+}
+async function writeInvokeAiImportMetadata(tool, payload, job) {
+  const configOut = job?.config_out || job?.configOut || null;
+  const modelPath = resolveInvokeAiModelPath(tool, configOut || {});
+  if (!modelPath || !(await fs.pathExists(modelPath).catch(() => false))) {
+    return null;
+  }
+  return writeModelMetadata(modelPath, buildDownloadMetadata(tool, payload, {
+    destinationPath: modelPath,
+    fileName: path.basename(modelPath),
+    installRelativePath: String(configOut?.path || path.relative(getInvokeAiModelsRoot(tool), modelPath) || path.basename(modelPath)),
+    targetDirectory: path.dirname(modelPath),
+  })).catch(() => null);
+}
+function isInvokeAiApiImportPayload(tool, payload = {}) {
+  return isInvokeAiTool(tool) && payload?.downloadPlan?.installStrategy === 'invokeai-api-import';
 }
 function getDirectorySummary(models = [], fallback = '') {
   const firstPath = String(models[0]?.path || '').trim();
@@ -1407,9 +1710,22 @@ async function listToolAssets(tool, options = {}) {
     };
   }
 
+  if (tool?.id === 'invokeai') {
+    const models = await listDownloadedModels(tool);
+    const registeredCount = models.filter((model) => model.invokeAiModelKey).length;
+    return {
+      assetKind: 'invokeai-main-model',
+      live: registeredCount > 0,
+      message: registeredCount
+        ? 'Found ' + registeredCount + ' registered InvokeAI model' + (registeredCount === 1 ? '' : 's') + ' through InvokeAI\'s model API.'
+        : 'No registered InvokeAI main models were found. Launch InvokeAI and refresh after importing models if this list looks stale.',
+      models,
+      toolId: tool?.id || '',
+    };
+  }
+
   if (tool?.id === 'rvc') {
-    const localModels = await listLocalFileModels(tool).catch(() => []);
-    const models = getRvcVoiceModels(localModels);
+    const models = await listDownloadedModels(tool).catch(() => []);
     const weightsFolder = getDirectorySummary(models, tool?.appDir || tool?.installDir ? path.join(tool.appDir || tool.installDir, 'weights') : 'the RVC weights folder');
     return {
       assetKind: 'rvc-voice-model',
@@ -1432,7 +1748,7 @@ async function listToolAssets(tool, options = {}) {
 }
 async function countDownloadedModels(tool) {
   if (tool?.id === 'rvc') {
-    return (await listLocalFileModels(tool)).length;
+    return (await listDownloadedModels(tool)).length;
   }
   if (!supportsModelManager(tool)) {
     return 0;
@@ -3740,6 +4056,101 @@ async function downloadPackageModel(tool, payload, options = {}) {
     await fs.remove(tempRoot).catch(() => null);
   }
 }
+async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
+  assertRunnableDownloadPlan(payload);
+  if (!isInvokeAiApiImportPayload(tool, payload)) {
+    throw new Error('Local AI Hub only installs InvokeAI models through InvokeAI\'s own import API. This catalog item is not an InvokeAI import plan.');
+  }
+  if (isPackageDownloadPayload(payload)) {
+    throw new Error('InvokeAI package or folder imports are not enabled in Local AI Hub yet. Choose a single .safetensors, .ckpt, .pt, or .pth file for a supported InvokeAI model type.');
+  }
+  const downloadUrl = assertSecureRemoteUrl(payload.downloadUrl, 'InvokeAI model download URL');
+  const logger = createLogger('models', {
+    toolId: tool.id,
+    mode: 'invokeai-api-import',
+    source: payload.source,
+    modelId: payload.id,
+  });
+  await ensureDiskHasCapacity(tool, payload);
+  const settings = await readModelSettingsInternal();
+  const headers = payload.source === 'civitai' ? buildCivitaiHeaders(settings) : { 'User-Agent': APP_USER_AGENT };
+  const stagePath = getInvokeAiImportStagePath(tool, payload);
+  const stageRoot = path.dirname(stagePath);
+  let session = null;
+  try {
+    await logger.info('Downloading InvokeAI model to a temporary import file.', {
+      downloadUrl,
+      stagePath,
+      sourceArtifactPath: payload.sourceArtifactPath,
+    });
+    emitProgress(options.onProgress, {
+      downloadId: payload.id,
+      message: 'Downloading ' + (payload.name || payload.fileName || 'model') + ' for InvokeAI import.',
+      percent: 2,
+      receivedBytes: 0,
+      totalBytes: payload.sizeBytes || 0,
+    });
+    const result = await streamDownloadToFile(downloadUrl, stagePath, {
+      downloadId: payload.id,
+      expectedBytes: payload.sizeBytes,
+      headers,
+      errorMessage: (payload.name || payload.fileName || 'That model') + ' could not be downloaded for InvokeAI right now.',
+      onProgress: options.onProgress,
+      progressMessage: 'Downloading ' + (payload.name || payload.fileName || 'model') + ' for InvokeAI import.',
+    });
+    emitProgress(options.onProgress, {
+      downloadId: payload.id,
+      message: 'Starting InvokeAI so it can register the model.',
+      percent: 85,
+      receivedBytes: result.downloadedBytes,
+      totalBytes: result.totalBytes || payload.sizeBytes || 0,
+    });
+    session = await prepareInvokeAiModelImportSession(tool);
+    const request = buildInvokeAiModelInstallRequest(session.readyTool, stagePath, buildInvokeAiModelImportConfig(payload));
+    const response = await fetch(request.url, {
+      body: request.body,
+      headers: request.headers,
+      method: request.method,
+    });
+    const job = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(buildInvokeAiInstallErrorMessage(job, 'InvokeAI answered with status ' + response.status + '.'));
+    }
+    emitProgress(options.onProgress, {
+      downloadId: payload.id,
+      message: 'InvokeAI is importing and registering the model.',
+      percent: 90,
+      receivedBytes: result.downloadedBytes,
+      totalBytes: result.totalBytes || payload.sizeBytes || 0,
+    });
+    const completedJob = await waitForInvokeAiInstallJob(session.readyTool, job, {
+      downloadId: payload.id,
+      onProgress: options.onProgress,
+      receivedBytes: result.downloadedBytes,
+      totalBytes: result.totalBytes || payload.sizeBytes || 0,
+    });
+    await writeInvokeAiImportMetadata(session.readyTool, payload, completedJob);
+    emitProgress(options.onProgress, {
+      downloadId: payload.id,
+      message: (payload.name || payload.fileName || 'The model') + ' is registered in InvokeAI.',
+      percent: 100,
+      receivedBytes: result.downloadedBytes,
+      totalBytes: result.totalBytes || payload.sizeBytes || 0,
+    });
+    return {
+      alreadyPresent: false,
+      destinationPath: resolveInvokeAiModelPath(session.readyTool, completedJob?.config_out || {}) || null,
+      fileName: payload.fileName || payload.name || 'model',
+      message: (payload.name || payload.fileName || 'The model') + ' was imported into InvokeAI and registered in InvokeAI\'s model database.' + (session.startedForImport ? ' Local AI Hub started InvokeAI for this import and stopped it afterward.' : ''),
+    };
+  } catch (error) {
+    await logger.warn('InvokeAI model import failed.', { error, stagePath });
+    throw new Error(humanizeError(error, (payload.name || payload.fileName || 'That model') + ' could not be imported into InvokeAI.'));
+  } finally {
+    await finishInvokeAiModelImportSession(session);
+    await fs.remove(stageRoot).catch(() => null);
+  }
+}
 async function downloadRemoteModel(tool, payload, options = {}) {
   if (isPackageDownloadPayload(payload)) {
     return downloadPackageModel(tool, payload, options);
@@ -3954,6 +4365,9 @@ async function downloadModel(tool, payload, options = {}) {
   if (tool.id === 'ollama') {
     return pullOllamaModel(tool, payload, options);
   }
+  if (tool.id === 'invokeai') {
+    return downloadInvokeAiImportedModel(tool, payload, options);
+  }
   return downloadRemoteModel(tool, payload, options);
 }
 async function resolveOllamaCommand(tool) {
@@ -4002,7 +4416,39 @@ async function deletePackageModel(tool, payload = {}) {
     message: (metadata.packageName || payload.name || 'That model package') + ' was deleted from ' + (tool.name || 'this tool') + '.',
   };
 }
+async function deleteInvokeAiModel(tool, payload = {}) {
+  const modelKey = String(payload.invokeAiModelKey || payload.key || '').trim();
+  if (!modelKey) {
+    throw new Error('Local AI Hub can only remove InvokeAI models through InvokeAI\'s model registry. Launch InvokeAI, refresh Downloaded Models, then try again.');
+  }
+  let session = null;
+  try {
+    session = await prepareInvokeAiModelImportSession(tool);
+    const response = await fetch(getInvokeAiApiUrl(session.readyTool, '/api/v2/models/i/' + encodeURIComponent(modelKey)), {
+      method: 'DELETE',
+    });
+    if (!response.ok && response.status !== 204) {
+      const payloadBody = await response.json().catch(() => null);
+      const detail = String(payloadBody?.detail || payloadBody?.error || payloadBody?.message || '').trim();
+      throw new Error(detail || 'InvokeAI answered with status ' + response.status + '.');
+    }
+    const modelPath = String(payload.path || '').trim();
+    if (modelPath) {
+      await fs.remove(getModelMetadataPath(modelPath)).catch(() => null);
+    }
+    return {
+      message: (payload.name || payload.fileName || 'That model') + ' was removed through InvokeAI\'s model registry.',
+    };
+  } catch (error) {
+    throw new Error(humanizeError(error, (payload.name || payload.fileName || 'That InvokeAI model') + ' could not be removed.'));
+  } finally {
+    await finishInvokeAiModelImportSession(session);
+  }
+}
 async function deleteModel(tool, payload) {
+  if (tool.id === 'invokeai') {
+    return deleteInvokeAiModel(tool, payload);
+  }
   if (tool.id === 'ollama') {
     const modelName = String(payload.name || payload.fileName || '').trim();
     if (!modelName) {
@@ -4072,6 +4518,12 @@ module.exports = {
     matchesSearchQuery,
     resolveHuggingFaceDownloadFile,
     searchHuggingFaceModels,
+    buildInvokeAiInstallErrorMessage,
+    buildInvokeAiModelImportConfig,
+    buildInvokeAiModelInstallRequest,
+    isInvokeAiApiImportPayload,
+    normalizeInvokeAiModelType,
+    resolveInvokeAiModelPath,
     resolveModelDestination,
     resolveRvcCompanionDestination,
     writeModelMetadata,

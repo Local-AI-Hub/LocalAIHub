@@ -606,7 +606,9 @@ export default function ModelManager({ tools, onToast }) {
     const deleteMessage =
       selectedToolId === 'ollama'
         ? `Delete ${displayName} from ${toolName}? Local AI Hub will run ollama rm and remove the local model.`
-        : `Delete ${displayName} from ${toolName}? This removes the downloaded model file from your PC.`;
+        : selectedToolId === 'invokeai'
+          ? `Delete ${displayName} from ${toolName}? Local AI Hub will ask InvokeAI to unregister it and remove files that InvokeAI owns.`
+          : `Delete ${displayName} from ${toolName}? This removes the downloaded model file from your PC.`;
     if (!window.confirm(deleteMessage)) {
       return;
     }

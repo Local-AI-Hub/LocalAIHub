@@ -528,6 +528,17 @@ async function main() {
   });
   assertRecommended(rvcPtPlan, 'weights/Bob.pt', 'RVC .pt voice model');
 
+  const rvcModelOnlyPlan = createModelDownloadPlan({
+    tool: rvc,
+    source: 'huggingface',
+    selectedType: 'rvc-voice',
+    artifacts: [artifact('model.pth', 80_000_000, { modelType: 'RVC Voice Model' })],
+  });
+  assertRecommended(rvcModelOnlyPlan, 'model.pth', 'RVC model.pth without index');
+  assert.deepStrictEqual(rvcModelOnlyPlan.requiredArtifacts, ['model.pth'], 'RVC model.pth should be the required primary artifact.');
+  assert.strictEqual(rvcModelOnlyPlan.optionalArtifacts.length, 0, 'RVC model.pth should remain downloadable without an index companion.');
+  assert.strictEqual(rvcModelOnlyPlan.warning, null, 'RVC model.pth without an index should not claim an optional companion will download.');
+
   const rvcIndexOnlyPlan = createModelDownloadPlan({
     tool: rvc,
     source: 'huggingface',
@@ -570,8 +581,11 @@ async function main() {
 
   await fs.remove(rvcRoot);
   await fs.ensureDir(path.join(rvcRoot, 'weights'));
+  await fs.ensureDir(path.join(rvcRoot, 'logs', 'Alice'));
   const localRvcModelPath = path.join(rvcRoot, 'weights', 'Alice.pth');
+  const localRvcIndexPath = path.join(rvcRoot, 'logs', 'Alice', 'added_IVF.index');
   await fs.writeFile(localRvcModelPath, Buffer.from('rvc-test-weight'));
+  await fs.writeFile(localRvcIndexPath, Buffer.from('rvc-test-index'));
   await fs.writeJson(localRvcModelPath + '.localaihub.json', {
     schemaVersion: 1,
     downloadIdentity: 'huggingface|rvc|repo:voice/alice-rvc|artifact:alice.pth',
@@ -585,7 +599,23 @@ async function main() {
   });
   try {
     const rvcAssets = await listToolAssets(rvc, { assetKind: 'rvc-voice-model' });
-    assert(rvcAssets.models.some((model) => model.fileName === 'Alice.pth' && model.metadata?.downloadIdentity), 'RVC local discovery should see downloaded voice model metadata.');
+    const aliceModel = rvcAssets.models.find((model) => model.fileName === 'Alice.pth');
+    assert(aliceModel?.metadata?.downloadIdentity, 'RVC local discovery should see downloaded voice model metadata.');
+    assert.strictEqual(path.normalize(aliceModel.indexPath), localRvcIndexPath, 'RVC local discovery should attach a matching optional .index companion.');
+    assert.strictEqual(path.normalize(aliceModel.indexRelativePath), path.join('logs', 'Alice', 'added_IVF.index'), 'RVC index metadata should stay relative to the RVC app root.');
+  } finally {
+    await fs.remove(rvcRoot);
+  }
+
+  await fs.remove(rvcRoot);
+  await fs.ensureDir(path.join(rvcRoot, 'weights', 'repo-folder'));
+  const nestedRvcModelPath = path.join(rvcRoot, 'weights', 'repo-folder', 'model.pth');
+  await fs.writeFile(nestedRvcModelPath, Buffer.from('nested-rvc-test-weight'));
+  try {
+    const rvcAssets = await listToolAssets(rvc, { assetKind: 'rvc-voice-model' });
+    const nestedModel = rvcAssets.models.find((model) => path.normalize(model.relativePath) === path.join('repo-folder', 'model.pth'));
+    assert(nestedModel, 'RVC local discovery should find voice models in repository-specific weights subfolders.');
+    assert.strictEqual(nestedModel.indexPath || '', '', 'RVC local discovery should allow .pth-only voice models without an index companion.');
   } finally {
     await fs.remove(rvcRoot);
   }
@@ -622,6 +652,45 @@ async function main() {
     assert.strictEqual(companionMetadata.sourceArtifactPath, 'logs/Alice/added_IVF.index', 'RVC companion sidecar should preserve source artifact path.');
   } finally {
     global.fetch = originalDownloadFetch;
+    await fs.remove(rvcRoot);
+  }
+
+  await fs.remove(rvcRoot);
+  const originalRvcModelDownloadFetch = global.fetch;
+  global.fetch = async (url) => {
+    const urlText = String(url);
+    if (urlText.endsWith('/weights/Alice.pth')) {
+      return new Response(Buffer.from('voice-weight'), { status: 200, headers: { 'content-length': '12' } });
+    }
+    if (urlText.endsWith('/logs/Alice/added_IVF.index')) {
+      return new Response(Buffer.from('voice-index'), { status: 200, headers: { 'content-length': '11' } });
+    }
+    throw new Error('Unexpected RVC model download URL: ' + urlText);
+  };
+  try {
+    const serializedRvcPlan = { ...rvcPlan, downloadFiles: [] };
+    await modelService.downloadModel(rvc, {
+      catalogEntityType: 'repository',
+      catalogRepositoryId: 'voice-maker/alice-rvc-voice-model',
+      downloadPlan: serializedRvcPlan,
+      downloadUrl: 'https://huggingface.co/voice-maker/alice-rvc-voice-model/resolve/main/weights/Alice.pth',
+      fileName: 'Alice.pth',
+      installRelativePath: 'Alice.pth',
+      modelType: 'RVC Voice Model',
+      name: 'Alice',
+      source: 'huggingface',
+      sourceArtifactPath: 'weights/Alice.pth',
+      toolId: 'rvc',
+      lowDiskConfirmed: true,
+    });
+    assert(await fs.pathExists(path.join(rvcRoot, 'weights', 'Alice.pth')), 'Serialized RVC repository cards should download the required .pth as a single model file.');
+    assert(await fs.pathExists(path.join(rvcRoot, 'logs', 'Alice', 'added_IVF.index')), 'Serialized RVC repository cards should still download a matched optional .index companion.');
+    const downloadedRvcAssets = await listToolAssets(rvc, { assetKind: 'rvc-voice-model' });
+    const downloadedAlice = downloadedRvcAssets.models.find((model) => model.fileName === 'Alice.pth');
+    assert(downloadedAlice, 'Model Manager RVC download target path should be discoverable by Model Step voice-model refresh.');
+    assert.strictEqual(path.normalize(downloadedAlice.indexRelativePath), path.join('logs', 'Alice', 'added_IVF.index'), 'Downloaded RVC voice models should retain matched optional index metadata for runtime.');
+  } finally {
+    global.fetch = originalRvcModelDownloadFetch;
     await fs.remove(rvcRoot);
   }
 

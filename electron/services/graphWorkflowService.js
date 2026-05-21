@@ -18,6 +18,7 @@ const COMFYUI_TIMEOUT_MS = 5 * 60 * 1000;
 const INVOKEAI_POLL_INTERVAL_MS = 1500;
 const INVOKEAI_TIMEOUT_MS = 10 * 60 * 1000;
 const INVOKEAI_DEFAULT_QUEUE_ID = 'default';
+const INVOKEAI_API_PREFIX = '/api/v1';
 const COMFYUI_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 const COMFYUI_VIDEO_EXTENSIONS = new Set(['.mp4', '.webm', '.mov', '.mkv']);
 const COMFYUI_ANIMATED_IMAGE_EXTENSIONS = new Set(['.gif', '.webp']);
@@ -35,20 +36,49 @@ function buildToolUrl(tool, endpoint) {
   return new URL(endpoint, `${getToolBaseUrl(tool)}/`).toString();
 }
 
-function extractRemoteErrorMessage(tool, rawText, fallbackStatus, parsedData = null) {
-  const directMessage = parsedData && typeof parsedData === 'object'
-    ? String(parsedData.error || parsedData.detail || parsedData.message || '').trim()
+function formatRemoteErrorDetail(detail) {
+  if (Array.isArray(detail)) {
+    return detail
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') {
+          return String(entry || '').trim();
+        }
+
+        const location = Array.isArray(entry.loc) ? entry.loc.join('.') : String(entry.loc || '').trim();
+        const message = String(entry.msg || entry.message || entry.error || '').trim();
+        return [location, message].filter(Boolean).join(': ');
+      })
+      .filter(Boolean)
+      .join('; ');
+  }
+
+  if (detail && typeof detail === 'object') {
+    return String(detail.message || detail.error || JSON.stringify(detail)).trim();
+  }
+
+  return String(detail || '').trim();
+}
+
+function extractRemoteErrorMessage(tool, rawText, fallbackStatus, parsedData = null, requestDetails = {}) {
+  const method = String(requestDetails.method || '').trim().toUpperCase();
+  const endpoint = String(requestDetails.endpoint || '').trim();
+  const statusText = String(requestDetails.statusText || '').trim();
+  const statusLabel = String(fallbackStatus || '').trim() + (statusText ? ' ' + statusText : '');
+  const detail = parsedData && typeof parsedData === 'object'
+    ? formatRemoteErrorDetail(parsedData.error || parsedData.detail || parsedData.message || '')
     : '';
-  if (directMessage) {
-    return directMessage;
-  }
-
   const trimmedText = String(rawText || '').trim();
-  if (trimmedText) {
-    return trimmedText;
+  const message = detail || trimmedText;
+
+  if (Number(fallbackStatus) === 405 && method && endpoint) {
+    return `${getToolLabel(tool)} rejected ${method} ${endpoint} because that API route does not allow this method.${message ? ' ' + message : ''}`;
   }
 
-  return `${getToolLabel(tool)} returned ${fallbackStatus}.`;
+  if (message) {
+    return message;
+  }
+
+  return `${getToolLabel(tool)} returned ${statusLabel || 'an API error'}.`;
 }
 
 function buildUnavailableToolError(tool) {
@@ -82,7 +112,8 @@ async function requestGraphWorkflowJson(tool, endpoint, options = {}, actionLabe
   }
 
   try {
-    const response = await fetch(buildToolUrl(tool, endpoint), {
+    const requestUrl = buildToolUrl(tool, endpoint);
+    const response = await fetch(requestUrl, {
       method,
       headers,
       body,
@@ -105,7 +136,11 @@ async function requestGraphWorkflowJson(tool, endpoint, options = {}, actionLabe
     }
 
     if (!response.ok) {
-      const message = extractRemoteErrorMessage(tool, rawText, response.status, parsedData);
+      const message = extractRemoteErrorMessage(tool, rawText, response.status, parsedData, {
+        endpoint,
+        method,
+        statusText: response.statusText,
+      });
       throw buildHandledGraphWorkflowError(message);
     }
 
@@ -114,7 +149,9 @@ async function requestGraphWorkflowJson(tool, endpoint, options = {}, actionLabe
     if (error?.localAiHubHandled) {
       await logger.warn('Graph workflow request returned a non-success response.', {
         actionLabel,
+        endpoint,
         message: error.message,
+        method,
       });
       throw error;
     }
@@ -135,16 +172,27 @@ async function requestGraphWorkflowBuffer(tool, endpoint, options = {}, actionLa
   });
 
   try {
+    const method = String(options.method || 'GET').trim().toUpperCase() || 'GET';
     const response = await fetch(buildToolUrl(tool, endpoint), {
       headers: {
         ...(options.headers || {}),
       },
-      method: String(options.method || 'GET').trim().toUpperCase() || 'GET',
+      method,
     });
 
     if (!response.ok) {
       const rawText = await response.text();
-      throw buildHandledGraphWorkflowError(extractRemoteErrorMessage(tool, rawText, response.status, null));
+      let parsedData = null;
+      try {
+        parsedData = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        parsedData = null;
+      }
+      throw buildHandledGraphWorkflowError(extractRemoteErrorMessage(tool, rawText, response.status, parsedData, {
+        endpoint,
+        method,
+        statusText: response.statusText,
+      }));
     }
 
     return Buffer.from(await response.arrayBuffer());
@@ -152,7 +200,9 @@ async function requestGraphWorkflowBuffer(tool, endpoint, options = {}, actionLa
     if (error?.localAiHubHandled) {
       await logger.warn('Graph workflow buffer request returned a non-success response.', {
         actionLabel,
+        endpoint,
         message: error.message,
+        method: String(options.method || 'GET').trim().toUpperCase() || 'GET',
       });
       throw error;
     }
@@ -436,6 +486,175 @@ function buildOutputFileExtension(fileName) {
   return extension || '.png';
 }
 
+function isPlainObject(value) {
+  return Boolean(value) && !Array.isArray(value) && typeof value === 'object';
+}
+
+function hasCompleteInvokeAiModelIdentifier(value) {
+  return isPlainObject(value)
+    && ['key', 'hash', 'name', 'base', 'type'].every((field) => String(value[field] || '').trim());
+}
+
+function isInvokeAiModelIdentifierCandidate(value) {
+  if (!isPlainObject(value) || hasCompleteInvokeAiModelIdentifier(value)) {
+    return false;
+  }
+
+  const key = String(value.key || '').trim();
+  const name = String(value.name || '').trim();
+  const base = String(value.base || '').trim();
+  const type = String(value.type || '').trim();
+  return Boolean(key || (name && base && type));
+}
+
+function normalizeModelMatchValue(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function getInvokeAiModelMatchScore(record = {}, reference = {}) {
+  let score = 0;
+  const referenceKey = normalizeModelMatchValue(reference.key);
+  const referenceName = normalizeModelMatchValue(reference.name);
+  const recordKey = normalizeModelMatchValue(record.key);
+  const recordName = normalizeModelMatchValue(record.name);
+  const recordPath = normalizeModelMatchValue(record.path).replace(/\\/g, '/');
+  const recordFileName = normalizeModelMatchValue(path.basename(String(record.path || record.name || '')));
+
+  if (reference.type && normalizeModelMatchValue(record.type) !== normalizeModelMatchValue(reference.type)) {
+    return -1;
+  }
+  if (reference.base && normalizeModelMatchValue(record.base) !== normalizeModelMatchValue(reference.base)) {
+    return -1;
+  }
+  if (referenceKey && recordKey === referenceKey) {
+    score += 100;
+  }
+  if (referenceName && recordName === referenceName) {
+    score += 80;
+  }
+  if (referenceKey && (recordName === referenceKey || recordFileName === referenceKey || recordPath.endsWith('/' + referenceKey.replace(/\\/g, '/')))) {
+    score += 60;
+  }
+  if (referenceName && (recordKey === referenceName || recordFileName === referenceName)) {
+    score += 50;
+  }
+  if (reference.type && normalizeModelMatchValue(record.type) === normalizeModelMatchValue(reference.type)) {
+    score += 10;
+  }
+  if (reference.base && normalizeModelMatchValue(record.base) === normalizeModelMatchValue(reference.base)) {
+    score += 10;
+  }
+
+  return score;
+}
+
+function buildInvokeAiModelIdentifier(record = {}, reference = {}) {
+  return {
+    key: String(record.key || reference.key || '').trim(),
+    hash: String(record.hash || reference.hash || '').trim(),
+    name: String(record.name || reference.name || '').trim(),
+    base: String(record.base || reference.base || '').trim(),
+    type: String(record.type || reference.type || '').trim(),
+    ...(record.submodel_type || reference.submodel_type ? { submodel_type: record.submodel_type || reference.submodel_type } : {}),
+  };
+}
+
+async function fetchInvokeAiModelRecordByKey(tool, key) {
+  const normalizedKey = String(key || '').trim();
+  if (!normalizedKey) {
+    return null;
+  }
+
+  return requestGraphWorkflowJson(tool, `/api/v2/models/i/${encodeURIComponent(normalizedKey)}`, {
+    method: 'GET',
+  }, 'look up the InvokeAI model used by this graph workflow').catch(() => null);
+}
+
+async function listInvokeAiModelRecordsForReference(tool, reference = {}) {
+  const params = new URLSearchParams();
+  const modelType = String(reference.type || '').trim();
+  if (modelType) {
+    params.set('model_type', modelType);
+  }
+
+  const payload = await requestGraphWorkflowJson(tool, `/api/v2/models/${params.toString() ? '?' + params.toString() : ''}`, {
+    method: 'GET',
+  }, 'look up registered InvokeAI models for this graph workflow');
+  return Array.isArray(payload?.models) ? payload.models : Array.isArray(payload) ? payload : [];
+}
+
+async function resolveInvokeAiModelIdentifier(tool, reference = {}, contextLabel = 'graph node') {
+  if (hasCompleteInvokeAiModelIdentifier(reference)) {
+    return reference;
+  }
+
+  const directRecord = await fetchInvokeAiModelRecordByKey(tool, reference.key);
+  if (directRecord?.hash) {
+    return buildInvokeAiModelIdentifier(directRecord, reference);
+  }
+
+  const records = await listInvokeAiModelRecordsForReference(tool, reference);
+  const scoredMatches = records
+    .map((record) => ({ record, score: getInvokeAiModelMatchScore(record, reference) }))
+    .filter((entry) => entry.score >= 0 && entry.record?.hash)
+    .sort((left, right) => right.score - left.score);
+  const bestScore = scoredMatches[0]?.score ?? -1;
+  const bestMatches = scoredMatches.filter((entry) => entry.score === bestScore);
+  const strongMatch = bestScore > 0 && bestMatches.length === 1 ? bestMatches[0].record : null;
+  const compatibleRecords = records.filter((record) => (
+    (!reference.type || normalizeModelMatchValue(record.type) === normalizeModelMatchValue(reference.type))
+    && (!reference.base || normalizeModelMatchValue(record.base) === normalizeModelMatchValue(reference.base))
+    && record?.hash
+  ));
+  const fallbackRecord = strongMatch || (compatibleRecords.length === 1 ? compatibleRecords[0] : null);
+
+  if (fallbackRecord) {
+    return buildInvokeAiModelIdentifier(fallbackRecord, reference);
+  }
+
+  const label = String(reference.name || reference.key || reference.type || 'that model').trim();
+  throw new Error('InvokeAI needs exact registered model metadata before it can run this graph workflow. Local AI Hub could not match ' + label + ' for ' + contextLabel + '. Open InvokeAI or Model Manager, confirm the model is registered, then paste a graph exported from InvokeAI or include the model key, hash, name, base, and type in the graph JSON.');
+}
+
+async function hydrateInvokeAiGraphValue(tool, value, contextLabel, cache) {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      value[index] = await hydrateInvokeAiGraphValue(tool, value[index], contextLabel + '[' + index + ']', cache);
+    }
+    return value;
+  }
+
+  if (!isPlainObject(value)) {
+    return value;
+  }
+
+  if (isInvokeAiModelIdentifierCandidate(value)) {
+    const cacheKey = JSON.stringify({
+      base: value.base || '',
+      key: value.key || '',
+      name: value.name || '',
+      type: value.type || '',
+    });
+    if (!cache.has(cacheKey)) {
+      cache.set(cacheKey, await resolveInvokeAiModelIdentifier(tool, value, contextLabel));
+    }
+    return { ...value, ...cache.get(cacheKey) };
+  }
+
+  for (const [fieldName, fieldValue] of Object.entries(value)) {
+    value[fieldName] = await hydrateInvokeAiGraphValue(tool, fieldValue, contextLabel + '.' + fieldName, cache);
+  }
+  return value;
+}
+
+async function hydrateInvokeAiGraphModelIdentifiers(tool, executionGraph) {
+  const graphNodes = executionGraph?.nodes && typeof executionGraph.nodes === 'object' ? executionGraph.nodes : {};
+  const cache = new Map();
+  for (const [nodeId, graphNode] of Object.entries(graphNodes)) {
+    await hydrateInvokeAiGraphValue(tool, graphNode, 'node ' + nodeId, cache);
+  }
+  return executionGraph;
+}
 function buildInvokeAiBatchField(nodeId, field, value, label) {
   const normalizedNodeId = String(nodeId || '').trim();
   if (!normalizedNodeId) {
@@ -465,7 +684,7 @@ async function uploadInvokeAiImage(tool, artifact) {
   const formData = new FormData();
   formData.append('file', new Blob([await fs.readFile(filePath)], { type: mimeType }), fileName);
 
-  const uploaded = await requestGraphWorkflowJson(tool, '/v1/images/upload?image_category=user&is_intermediate=false', {
+  const uploaded = await requestGraphWorkflowJson(tool, `${INVOKEAI_API_PREFIX}/images/upload?image_category=user&is_intermediate=false`, {
     body: formData,
     contentType: null,
     method: 'POST',
@@ -484,7 +703,7 @@ async function uploadInvokeAiImage(tool, artifact) {
 }
 
 async function enqueueInvokeAiBatch(tool, batch) {
-  const payload = await requestGraphWorkflowJson(tool, `/v1/queue/${encodeURIComponent(INVOKEAI_DEFAULT_QUEUE_ID)}/enqueue_batch`, {
+  const payload = await requestGraphWorkflowJson(tool, `${INVOKEAI_API_PREFIX}/queue/${encodeURIComponent(INVOKEAI_DEFAULT_QUEUE_ID)}/enqueue_batch`, {
     body: {
       batch,
       prepend: false,
@@ -558,14 +777,14 @@ function buildInvokeAiProgressMessage(queueItem, batchStatus) {
 }
 
 async function getInvokeAiQueueItem(tool, queueId, itemId) {
-  const payload = await requestGraphWorkflowJson(tool, `/v1/queue/${encodeURIComponent(queueId)}/i/${encodeURIComponent(String(itemId))}`, {
+  const payload = await requestGraphWorkflowJson(tool, `${INVOKEAI_API_PREFIX}/queue/${encodeURIComponent(queueId)}/i/${encodeURIComponent(String(itemId))}`, {
     method: 'GET',
   }, 'check the InvokeAI queue item');
   return normalizeInvokeAiQueueItem(payload);
 }
 
 async function getInvokeAiBatchStatus(tool, queueId, batchId) {
-  return requestGraphWorkflowJson(tool, `/v1/queue/${encodeURIComponent(queueId)}/b/${encodeURIComponent(batchId)}/status`, {
+  return requestGraphWorkflowJson(tool, `${INVOKEAI_API_PREFIX}/queue/${encodeURIComponent(queueId)}/b/${encodeURIComponent(batchId)}/status`, {
     method: 'GET',
   }, 'check the InvokeAI batch status');
 }
@@ -690,7 +909,7 @@ function getInvokeAiOutputImageName(queueItem, outputNodeId) {
 }
 
 async function downloadInvokeAiImage(tool, imageName) {
-  return requestGraphWorkflowBuffer(tool, `/v1/images/i/${encodeURIComponent(imageName)}/full`, {
+  return requestGraphWorkflowBuffer(tool, `${INVOKEAI_API_PREFIX}/images/i/${encodeURIComponent(imageName)}/full`, {
     method: 'GET',
   }, 'download the InvokeAI graph workflow image output');
 }
@@ -808,8 +1027,14 @@ async function executeInvokeAiGraphWorkflow({ inputArtifacts = {}, node, reportP
   const imageBinding = getGraphWorkflowInputBinding(node, 'image');
   const outputBinding = getGraphWorkflowOutputBinding(node, 'image');
   const outputNodeId = String(outputBinding?.nodeId || '').trim();
+  if (!outputNodeId) {
+    throw new Error('Choose the InvokeAI workflow node that should provide the Image output before running this graph workflow step.');
+  }
+  if (!getGraphWorkflowNodeEntry(parsedDefinition.workflow, outputNodeId)) {
+    throw new Error('The selected InvokeAI image output node ' + outputNodeId + ' is missing from the pasted graph workflow definition.');
+  }
 
-  getGraphWorkflowNodeEntry(parsedDefinition.workflow, outputNodeId);
+  await hydrateInvokeAiGraphModelIdentifiers(tool, executionGraph);
 
   const batchData = [];
   if (textArtifact) {
@@ -866,6 +1091,13 @@ async function executeInvokeAiGraphWorkflow({ inputArtifacts = {}, node, reportP
     baseName: `${nodeLabel}-${Date.now()}`,
     displayName: nodeLabel,
     extension: buildOutputFileExtension(imageName),
+    imageGeneration: {
+      backend: 'invokeai-graph-workflow',
+      backendLabel: getToolLabel(tool),
+      operationId: 'graphWorkflow',
+      toolId: String(tool?.id || 'invokeai').trim() || 'invokeai',
+      toolLabel: getToolLabel(tool),
+    },
     kind: PORT_KIND_IMAGE,
     role: 'generated',
   });

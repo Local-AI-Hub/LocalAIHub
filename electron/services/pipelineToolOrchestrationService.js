@@ -157,6 +157,14 @@ function createPipelineToolOrchestrator(contextMaps = {}) {
         return null;
       }
 
+
+      if (
+        getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
+        && getLocalAudioToolRuntimeMode(requiredToolId) === LOCAL_AUDIO_RUNTIME_MODE_IDS.DIRECT_COMMAND
+      ) {
+        return null;
+      }
+
       if (
         getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
         && getLocalImageToolRuntimeMode(requiredToolId) === LOCAL_IMAGE_RUNTIME_MODE_IDS.DIRECT_COMMAND

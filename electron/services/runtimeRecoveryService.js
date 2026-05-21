@@ -121,6 +121,35 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
     };
   }
 
+  const unsupportedLaunchArgs = stderr.match(/(?:^|\n)[^\n]*error:\s*unrecognized arguments?:\s*([^\r\n]+)/i);
+  if (unsupportedLaunchArgs?.[1]) {
+    const args = unsupportedLaunchArgs[1].trim();
+    return {
+      recognized: true,
+      id: 'unsupported-launch-arguments',
+      action: 'none',
+      summary: `${toolState.name} was launched with unsupported command-line argument${args.split(/\s+/).length === 1 ? '' : 's'}: ${args}. Local AI Hub needs updated launch settings for this tool before it can start cleanly.`,
+      repairingMessage: null,
+    };
+  }
+  if (toolState?.id === 'invokeai' && /No UI found at .*invokeai[\\/]frontend[\\/]web[\\/]dist, skipping UI mount/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'invokeai-missing-web-ui-assets',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} started its API, but the packaged InvokeAI web UI assets are missing from its Python environment. Run Repair to rebuild InvokeAI, then launch it again.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment so InvokeAI's web UI assets are installed correctly.`,
+    };
+  }
+  if (toolState?.id === 'rvc' && /ImportError:\s*cannot import name ['"]media_data['"] from ['"]gradio_client['"]/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'rvc-gradio-client-media-data',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} has an incompatible Gradio client package in its Python environment. RVC's bundled Gradio 3.34 expects gradio_client.media_data, but the installed gradio_client package does not provide it. Run Repair to rebuild RVC with the pinned compatible dependency set.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with the RVC-compatible Gradio client dependency.`,
+    };
+  }
   if (toolState?.id === 'openwebui' && /UnicodeEncodeError:/i.test(stderr) && /charmap codec can't encode/i.test(stderr) && /open_webui\\main\.py/i.test(stderr)) {
     return {
       recognized: true,
@@ -339,6 +368,35 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       action: 'repair-python-environment',
       summary: `${toolState.name} could not bootstrap its CLIP dependency. The upstream launch step fell back to building CLIP, and that build failed before pkg_resources was available.`,
       repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with the trusted CLIP bootstrap path.`,
+    };
+  }
+
+  if (toolState?.id === 'facefusion' && /(?:\[FACEFUSION\.CORE\]\s*)?ffmpeg is not installed/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'facefusion-missing-ffmpeg-runtime',
+      action: 'none',
+      summary: `${toolState.name} could not find FFmpeg in its launch environment. Local AI Hub should expose its bundled FFmpeg runtime to FaceFusion; reinstall Local AI Hub if this message appears after updating, then launch FaceFusion again.`,
+      repairingMessage: null,
+    };
+  }
+  if (toolState?.id === 'facefusion' && /ModuleNotFoundError:\s+No module named ['"]cv2['"]/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'facefusion-missing-opencv',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} is missing OpenCV (cv2), which this FaceFusion version declares as opencv-python in requirements.txt. Run Repair to rebuild FaceFusion with the required OpenCV package.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with FaceFusion's OpenCV dependency.`,
+    };
+  }
+
+  if (toolState?.id === 'facefusion' && /ModuleNotFoundError:\s+No module named ['"]onnxruntime['"]/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'facefusion-missing-onnxruntime',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} is missing ONNX Runtime (onnxruntime), which this FaceFusion version declares in requirements.txt. Run Repair to rebuild FaceFusion with the required ONNX Runtime package.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with FaceFusion's ONNX Runtime dependency.`,
     };
   }
 
@@ -718,3 +776,5 @@ module.exports = {
   diagnoseLaunchFailure,
   selectPyTorchRepairCandidates,
 };
+
+

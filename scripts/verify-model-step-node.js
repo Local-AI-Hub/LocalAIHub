@@ -6,6 +6,7 @@ const { pathToFileURL } = require('url');
 const esbuild = require('esbuild');
 
 const pipelineSchema = require('../electron/shared/pipelineSchema.cjs');
+const { diagnoseLaunchFailure } = require('../electron/services/runtimeRecoveryService');
 
 async function loadPipelineUiBundle() {
   const outfile = path.join(os.tmpdir(), 'local-ai-hub-pipeline-ui.verify.cjs');
@@ -38,6 +39,10 @@ function verifyPipelineBuilderSourceGuards() {
   assert(source.includes('Advanced AudioCraft settings'), 'Expected Model Step AudioCraft UI to keep advanced generation settings available but collapsed.');
   assert(source.includes('llm-prompt-style'), 'Expected Model Step inspector to expose the Prompt Style selector.');
   assert(source.includes('collection-map-prompt-style'), 'Expected collectionMap inspector to expose the Prompt Style selector for text mappings.');
+  assert(!source.includes('first shared image-transform slice'), 'Expected stale Upscayl first-slice phrasing to stay out of the Model Step inspector.');
+  assert(!source.includes('image-only pass'), 'Expected stale FaceFusion image-only pass phrasing to stay out of the Model Step inspector.');
+  assert(source.includes('Uses the main image input and returns an enhanced or upscaled image.'), 'Expected stable Upscayl image-transform wording.');
+  assert(source.includes('Uses the main image input as the target image and the Reference Image input as the source face, then returns the transformed image.'), 'Expected stable FaceFusion image-transform wording.');
   const checkpointOptionHelperUses = source.match(/buildStableDiffusionCheckpointOption/g) || [];
   assert(checkpointOptionHelperUses.length >= 3, 'Expected Model Step and collectionMap checkpoint refresh options to use the shared checkpoint identity helper.');
 }
@@ -49,6 +54,25 @@ async function main() {
   assert.strictEqual(defaultConfig.executionMode, 'cloud', 'Expected Model Step to default to cloud execution mode.');
   assert.strictEqual(defaultConfig.promptStyleId, '', 'Expected Model Step prompt style to default to none.');
   assert.strictEqual(pipelineSchema.getDefaultNodeConfig('collectionMap').promptStyleId, '', 'Expected collectionMap prompt style to default to none.');
+
+  const manifestTools = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../electron/config/tools-manifest.json'), 'utf8'));
+  const rvcManifest = manifestTools.find((tool) => tool.id === 'rvc');
+  assert(rvcManifest, 'Expected the tools manifest to include RVC.');
+  assert(!/\s--listen(?:\s|$)/.test(rvcManifest.launchCommand), 'Expected RVC launch command to avoid unsupported --listen.');
+  assert(/--port\s+\{port\}/.test(rvcManifest.launchCommand), 'Expected RVC launch command to preserve its configured port argument.');
+  assert(/--noautoopen(?:\s|$)/.test(rvcManifest.launchCommand), 'Expected RVC launch command to avoid opening a second browser window itself.');
+  const unsupportedArgDiagnosis = diagnoseLaunchFailure({ id: 'rvc', name: 'RVC' }, 'infer-web.py: error: unrecognized arguments: --listen');
+  assert.strictEqual(unsupportedArgDiagnosis.recognized, true, 'Expected unsupported launch arguments to be classified clearly.');
+  assert.strictEqual(unsupportedArgDiagnosis.id, 'unsupported-launch-arguments', 'Expected unsupported launch argument diagnosis id.');
+  assert(unsupportedArgDiagnosis.summary.includes('--listen'), 'Expected unsupported launch argument diagnosis to name the rejected flag.');
+  const faceFusionCv2Diagnosis = diagnoseLaunchFailure({ id: 'facefusion', name: 'FaceFusion' }, "ModuleNotFoundError: No module named 'cv2'");
+  assert.strictEqual(faceFusionCv2Diagnosis.id, 'facefusion-missing-opencv', 'Expected missing FaceFusion cv2 errors to be classified specifically.');
+  assert.strictEqual(faceFusionCv2Diagnosis.action, 'repair-python-environment', 'Expected missing FaceFusion cv2 errors to route to managed repair.');
+  assert(/OpenCV|opencv-python/i.test(faceFusionCv2Diagnosis.summary), 'Expected FaceFusion cv2 diagnosis to name OpenCV plainly.');
+  const faceFusionOnnxDiagnosis = diagnoseLaunchFailure({ id: 'facefusion', name: 'FaceFusion' }, "ModuleNotFoundError: No module named 'onnxruntime'");
+  assert.strictEqual(faceFusionOnnxDiagnosis.id, 'facefusion-missing-onnxruntime', 'Expected missing FaceFusion onnxruntime errors to be classified specifically.');
+  assert.strictEqual(faceFusionOnnxDiagnosis.action, 'repair-python-environment', 'Expected missing FaceFusion onnxruntime errors to route to managed repair.');
+  assert(/ONNX Runtime|onnxruntime/i.test(faceFusionOnnxDiagnosis.summary), 'Expected FaceFusion onnxruntime diagnosis to name ONNX Runtime plainly.');
 
   const pipelineUi = await loadPipelineUiBundle();
   const paletteGroups = pipelineUi.getNodePaletteGroups();

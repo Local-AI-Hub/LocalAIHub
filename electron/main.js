@@ -1938,7 +1938,7 @@ function registerIpcHandlers() {
 
   ipcMain.handle('pipelines:cancel-run', (_event, runId) =>
     withPlainEnglishErrors(async () => ({
-      message: 'Local AI Hub will stop the active pipeline after the current step finishes and shut down any tool it started for the run.',
+      message: 'Local AI Hub is stopping the active pipeline and will shut down any tool it started for the run.',
       run: cancelPipelineRun(runId),
     }), 'Local AI Hub could not cancel that pipeline run.'),
   );

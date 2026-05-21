@@ -7,6 +7,7 @@ const { PythonShell } = require('python-shell');
 const { getAppPaths, humanizeError, upsertTool } = require('./configService');
 const { killProcessTree, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
+const { resolveFfmpegPath } = require('./mediaCompositionService');
 const { buildOllamaAllocationFailureMessage, isOllamaAllocationFailureMessage } = require('./ollamaFailureService');
 const { attemptAutomaticLaunchRecovery, diagnoseLaunchFailure, selectPyTorchRepairCandidates } = require('./runtimeRecoveryService');
 const { assessDiskSpace, detectStorageSnapshot, findDiskForPath, getNvidiaRuntimeDetails, detectHardwareSnapshot } = require('./hardwareService');
@@ -59,6 +60,9 @@ const MANAGED_LAUNCH_ENV_KEYS = Object.freeze([
   'LOCALAIHUB_CACHE_ROOT',
   'LOCALAIHUB_TEMP_ROOT',
   'LOCALAIHUB_TOOL_ROOT',
+  'LOCALAIHUB_FFMPEG_DIR',
+  'FFMPEG_BINARY',
+  'IMAGEIO_FFMPEG_EXE',
 ]);
 const MANAGED_STABLE_DIFFUSION_CLIP_PACKAGE = '--no-build-isolation git+https://github.com/openai/CLIP.git@d50d76daa670286dd6cacf3bcd80b5e4823fc8e1#egg=clip';
 const MANAGED_STABLE_DIFFUSION_REPO_URL = 'https://github.com/w-e-w/stablediffusion.git';
@@ -952,6 +956,55 @@ function summarizeLaunchRuntimeEnv(runtimeEnv = {}) {
   );
 }
 
+function shouldExposeBundledFfmpeg(toolState, policy) {
+  return getPolicyBoolean(
+    policy,
+    'includeBundledFfmpeg',
+    String(toolState?.id || '').trim().toLowerCase() === 'facefusion',
+  );
+}
+
+function prependDirectoryToEnvPath(env, directoryPath) {
+  const normalizedDirectory = String(directoryPath || '').trim();
+  if (!normalizedDirectory) {
+    return env;
+  }
+
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') || 'PATH';
+  const existingPath = String(env[pathKey] || '');
+  const existingEntries = existingPath.split(path.delimiter).map((entry) => entry.trim()).filter(Boolean);
+  const normalizedTarget = path.resolve(normalizedDirectory).toLowerCase();
+  const alreadyPresent = existingEntries.some((entry) => path.resolve(entry).toLowerCase() === normalizedTarget);
+  env[pathKey] = alreadyPresent
+    ? existingPath
+    : [normalizedDirectory, ...existingEntries].join(path.delimiter);
+  return env;
+}
+
+async function applyBundledFfmpegLaunchEnv(toolState, policy, env) {
+  if (!shouldExposeBundledFfmpeg(toolState, policy)) {
+    return env;
+  }
+
+  let ffmpegPath = '';
+  try {
+    ffmpegPath = resolveFfmpegPath();
+  } catch (error) {
+    throw new Error('Local AI Hub could not find its bundled FFmpeg runtime for FaceFusion. Reinstall Local AI Hub, then try launching FaceFusion again.');
+  }
+
+  if (!(await fs.pathExists(ffmpegPath))) {
+    throw new Error('Local AI Hub found a FaceFusion FFmpeg setting, but the bundled ffmpeg.exe is missing. Reinstall Local AI Hub, then try launching FaceFusion again.');
+  }
+
+  const ffmpegDir = path.dirname(ffmpegPath);
+  env.LOCALAIHUB_FFMPEG_DIR = ffmpegDir;
+  env.FFMPEG_BINARY = ffmpegPath;
+  env.IMAGEIO_FFMPEG_EXE = ffmpegPath;
+  prependDirectoryToEnvPath(env, ffmpegDir);
+  return env;
+}
+
 async function buildLaunchRuntimeEnv(toolState, extraEnv = {}, options = {}) {
   const managedRoot = getManagedToolRoot(toolState);
   if (!managedRoot) {
@@ -984,14 +1037,16 @@ async function buildLaunchRuntimeEnv(toolState, extraEnv = {}, options = {}) {
     await fs.ensureDir(openWebUiDataDir);
   }
 
-  return removeUnsetEnvironmentKeys({
+  const runtimeEnv = {
     ...process.env,
     ...managedEnv,
     ...(openWebUiDataDir ? { DATA_DIR: openWebUiDataDir } : {}),
     ...openWebUiPythonEnv,
     ...extraEnv,
     ...(policy.extraEnv && typeof policy.extraEnv === 'object' && !Array.isArray(policy.extraEnv) ? policy.extraEnv : {}),
-  }, policy.unsetEnv || policy.removeEnv || []);
+  };
+  await applyBundledFfmpegLaunchEnv(toolState, policy, runtimeEnv);
+  return removeUnsetEnvironmentKeys(runtimeEnv, policy.unsetEnv || policy.removeEnv || []);
 }
 
 function getOsTempDirectory() {
@@ -1643,11 +1698,25 @@ function buildExitCodeContextMessage(toolState, runtimeState) {
   return `${stageMessage}. ${reasonMessage} Open the logs folder for the full launch details.`;
 }
 
+function buildCleanExitBeforeReadyMessage(toolState, runtimeState) {
+  const exitCode = Number(runtimeState?.process?.exitCode);
+  if (exitCode !== 0 || !toolUsesLocalUrl(toolState)) {
+    return '';
+  }
+
+  if (toolState?.id === 'invokeai') {
+    return 'InvokeAI exited without starting its web server. This usually means Local AI Hub used an old InvokeAI launch entrypoint that imports the server module instead of running invokeai-web. Run Repair or update Local AI Hub, then launch InvokeAI again.';
+  }
+
+  const target = toolState?.healthUrl || toolState?.launchUrl || `http://127.0.0.1:${toolState?.defaultPort || ''}`;
+  return `${toolState.name} exited before it became available on ${target}. Open the logs folder for the full launch details.`;
+}
+
 function buildConcreteLaunchFailureMessage(toolState, runtimeState, fallbackMessage) {
   const combinedOutput = getCombinedRuntimeOutput(runtimeState);
   const failureText = collectMeaningfulFailureText(toolState, combinedOutput);
   if (!failureText) {
-    return buildExitCodeContextMessage(toolState, runtimeState) || fallbackMessage;
+    return buildCleanExitBeforeReadyMessage(toolState, runtimeState) || buildExitCodeContextMessage(toolState, runtimeState) || fallbackMessage;
   }
 
   const diagnosis = diagnoseLaunchFailure(toolState, failureText);
@@ -1663,6 +1732,20 @@ function buildConcreteLaunchFailureMessage(toolState, runtimeState, fallbackMess
   }
 
   return diagnosis?.summary || humanizeError(failureText, fallbackMessage);
+}
+
+function buildPostReadyLaunchFailureMessage(toolState, runtimeState) {
+  if (toolState?.id !== 'invokeai' || !runtimeState) {
+    return '';
+  }
+
+  const combinedOutput = getCombinedRuntimeOutput(runtimeState);
+  if (!combinedOutput.trim()) {
+    return '';
+  }
+
+  const diagnosis = diagnoseLaunchFailure(toolState, combinedOutput);
+  return diagnosis?.id === 'invokeai-missing-web-ui-assets' ? diagnosis.summary : '';
 }
 
 async function probeUrl(url) {
@@ -2303,6 +2386,25 @@ async function monitorPendingLaunch(toolState, runtimeState = null, options = {}
         return;
       }
 
+      const postReadyFailureMessage = buildPostReadyLaunchFailureMessage(toolState, runtimeState);
+      if (postReadyFailureMessage) {
+        await logger.warn('Tool answered its API but failed a post-ready launch check.', {
+          target,
+          message: postReadyFailureMessage,
+          stdout: runtimeState?.stdoutLogBuffer || runtimeState?.stdoutBuffer || '',
+          stderr: runtimeState?.stderrLogBuffer || runtimeState?.stderrBuffer || '',
+        });
+        if (runtimeState?.process?.pid && runtimeState.process.exitCode === null) {
+          await stopRuntimeProcess(toolState.id, runtimeState);
+        }
+        await persistToolRuntimeState(toolState, 'error', {
+          lastError: postReadyFailureMessage,
+          lastRepairMessage: null,
+        });
+        emitUnexpectedStop(toolState, postReadyFailureMessage);
+        return;
+      }
+
       if (runtimeState) {
         runtimeState.launchConfirmed = true;
         clearLaunchProgress(runtimeState);
@@ -2389,6 +2491,18 @@ async function waitForLaunchConfirmation(toolState, runtimeState, logger, option
 
       await stopRuntimeProcess(toolState.id, runtimeState);
       throw new Error(launchFailureMessage);
+    }
+
+    const postReadyFailureMessage = buildPostReadyLaunchFailureMessage(toolState, runtimeState);
+    if (postReadyFailureMessage) {
+      await logger.warn('Tool answered its API but failed a post-ready launch check.', {
+        target,
+        message: postReadyFailureMessage,
+        stdout: runtimeState?.stdoutLogBuffer || runtimeState?.stdoutBuffer || '',
+        stderr: runtimeState?.stderrLogBuffer || runtimeState?.stderrBuffer || '',
+      });
+      await stopRuntimeProcess(toolState.id, runtimeState);
+      throw new Error(postReadyFailureMessage);
     }
 
     await logger.info('Tool answered on its expected local URL.', {
@@ -3219,7 +3333,12 @@ module.exports = {
   stopTool,
   summarizeLaunchRuntimeEnv,
   __testing: {
+    buildCleanExitBeforeReadyMessage,
+    buildConcreteLaunchFailureMessage,
+    buildPostReadyLaunchFailureMessage,
     getAiderOllamaTimeoutRetryClassification,
     stopRuntimeProcessTree,
   },
 };
+
+

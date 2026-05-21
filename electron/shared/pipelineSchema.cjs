@@ -4582,8 +4582,8 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
     summary.readiness = {
       tone: 'info',
       message: tool.id === 'facefusion'
-        ? tool.name + ' will run a ' + subtypeLabel + ' transform on the connected target image using the Reference Image input as the source face. This first pass stays image-only and keeps both source images attached to the saved result lineage.'
-        : tool.name + ' will run a ' + subtypeLabel + ' transform through its dedicated local backend adapter. This first pass keeps the main source image attached to the transformed result lineage and leaves advanced Upscayl tuning on the full tool surface.',
+        ? tool.name + ' will run a ' + subtypeLabel + ' transform on the connected target image using the Reference Image input as the source face. The saved result keeps both source images attached to its lineage.'
+        : tool.name + ' will run a ' + subtypeLabel + ' transform through its dedicated local backend adapter and return an enhanced or upscaled image artifact.',
     };
     return true;
   }

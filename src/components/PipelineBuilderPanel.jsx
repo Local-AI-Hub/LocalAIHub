@@ -4474,7 +4474,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     if (result.data?.run) {
       applyRunSnapshot(result.data.run);
     }
-    onToast(result.data?.message || 'Local AI Hub will stop the active pipeline after the current step finishes and shut down any tool it started for the run.', 'success');
+    onToast(result.data?.message || 'Local AI Hub is stopping the active pipeline and will shut down any tool it started for the run.', 'success');
   }
 
   async function handleValidationDecision(decision) {
@@ -5034,7 +5034,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                               : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
                                 ? 'Local audio transform tool mode returns a transformed audio artifact from the Audio output port and keeps the source-audio lineage visible after the run.'
                                 : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
-                                  ? 'Local image transform mode returns a transformed image artifact from the Image output port. FaceFusion also expects a connected Reference Image in this first image-only pass.'
+                                  ? 'Local image transform mode returns a transformed image artifact from the Image output port. FaceFusion also expects a connected Reference Image as the source face.'
                                   : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
                                     ? 'Local video tool mode returns a video artifact from the Video output port. Use the Graph Workflow step for ComfyUI video workflows.'
                                     : 'Local image tool mode returns an image artifact from the Image output port.'
@@ -5080,7 +5080,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                             : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
                               ? 'Optional note to save with this transformed audio result. Choose the source audio and RVC voice model through the connected input and local model field.'
                               : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
-                                ? 'Optional note to save with this transformed image result. The main image input becomes the target image, and FaceFusion also uses the Reference Image input in this first pass.'
+                                ? 'Optional note to save with this transformed image result. The main image input becomes the target image, and FaceFusion also uses the Reference Image input as the source face.'
                                 : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
                                   ? 'For text-to-video, this is optional extra guidance. For image-to-video, use this box for the motion prompt.'
                                   : 'Optional guidance to apply to the incoming text.'}
@@ -5098,7 +5098,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         </p>
                       ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM ? (
                         <p className="mt-2 text-xs leading-5 text-slate-400">
-                          Connect the target image to the main input for every local image transform step. FaceFusion also needs a source-face image on the Reference Image input, while Upscayl uses only the main image input in this pass.
+                          Connect the target image to the main input for every local image transform step. FaceFusion also needs a source-face image on the Reference Image input, while Upscayl uses only the main image input.
                         </p>
                       ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
                         <p className="mt-2 text-xs leading-5 text-slate-400">
@@ -5161,11 +5161,11 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                           <div className="grid gap-3 sm:grid-cols-2">
                             <div className="rounded-[20px] border border-white/10 bg-slate-950/35 px-4 py-3 text-sm leading-6 text-slate-300">
                               <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Upscayl</p>
-                              <p className="mt-2">Uses the main image input only and currently applies the tool-managed upscale path for this first shared image-transform slice.</p>
+                              <p className="mt-2">Uses the main image input and returns an enhanced or upscaled image.</p>
                             </div>
                             <div className="rounded-[20px] border border-white/10 bg-slate-950/35 px-4 py-3 text-sm leading-6 text-slate-300">
                               <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">FaceFusion</p>
-                              <p className="mt-2">Uses the main image input as the target image and the Reference Image input as the source-face image in this image-only pass.</p>
+                              <p className="mt-2">Uses the main image input as the target image and the Reference Image input as the source face, then returns the transformed image.</p>
                             </div>
                           </div>
                           <p className="text-xs leading-5 text-slate-400">

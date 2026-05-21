@@ -35,15 +35,51 @@ function formatVersion(version) {
   return String(version || 'unknown');
 }
 
+function terminateChildProcess(child) {
+  if (!child?.pid) {
+    return;
+  }
+
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    // The process may already be gone.
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      const killer = spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], {
+        windowsHide: true,
+      });
+      killer.on('error', () => {});
+    } catch {
+      // Best effort cleanup only.
+    }
+  }
+}
+
 function runCommand(command, args = [], options = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let timeoutTimer = null;
+    let abortHandler = null;
+    const cleanup = () => {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+      if (abortHandler && options.signal?.removeEventListener) {
+        options.signal.removeEventListener('abort', abortHandler);
+      }
+      abortHandler = null;
+    };
     const finalizeResolve = (value) => {
       if (settled) {
         return;
       }
 
       settled = true;
+      cleanup();
       resolve(value);
     };
     const finalizeReject = (error) => {
@@ -52,6 +88,7 @@ function runCommand(command, args = [], options = {}) {
       }
 
       settled = true;
+      cleanup();
       reject(error);
     };
 
@@ -81,6 +118,43 @@ function runCommand(command, args = [], options = {}) {
 
       finalizeReject(error);
       return;
+    }
+
+    const finishInterrupted = (message, codeValue) => {
+      terminateChildProcess(child);
+      if (options.allowFailure) {
+        finalizeResolve({
+          code: codeValue,
+          stdout,
+          stderr: stderr || message,
+        });
+        return;
+      }
+
+      const failure = new Error(message);
+      failure.code = codeValue;
+      failure.stdout = stdout;
+      failure.stderr = stderr || message;
+      finalizeReject(failure);
+    };
+
+    const timeoutMs = Number(options.timeoutMs || 0);
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => {
+        finishInterrupted(options.timeoutMessage || `${command} took too long and was stopped.`, 'ETIMEDOUT');
+      }, timeoutMs);
+    }
+
+    if (options.signal?.aborted) {
+      finishInterrupted(options.abortMessage || `${command} was cancelled.`, 'ABORT_ERR');
+      return;
+    }
+
+    if (options.signal?.addEventListener) {
+      abortHandler = () => {
+        finishInterrupted(options.abortMessage || `${command} was cancelled.`, 'ABORT_ERR');
+      };
+      options.signal.addEventListener('abort', abortHandler, { once: true });
     }
 
     child.stdout?.on('data', (chunk) => {

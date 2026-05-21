@@ -17,6 +17,8 @@ const LOCAL_IMAGE_RUNTIME_MODE_IDS = Object.freeze({
   DIRECT_COMMAND: 'direct-command',
 });
 
+const UPSCAYL_COMMAND_TIMEOUT_MS = 10 * 60 * 1000;
+
 const LOCAL_IMAGE_TOOL_ADAPTERS = Object.freeze({
   facefusion: Object.freeze({
     helperScript: 'run_facefusion_pipeline_task.py',
@@ -46,6 +48,65 @@ function firstNonEmptyLine(value) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean) || '';
+}
+
+function parseLastJsonLine(value) {
+  const line = String(value || '')
+    .trim()
+    .split(/\r?\n/)
+    .reverse()
+    .find((entry) => entry.trim().startsWith('{'));
+  if (!line) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(line);
+  } catch {
+    return null;
+  }
+}
+
+function isFaceFusionProgressOnlyLine(value) {
+  return /\[FACEFUSION\.CORE\]\s+processing step \d+ of \d+/i.test(String(value || '').trim());
+}
+function buildUsefulCommandMessage(commandResult, fallbackMessage) {
+  const combined = [commandResult?.stderr, commandResult?.stdout]
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean)
+    .join('\n');
+  const jsonMessage = String(parseLastJsonLine(commandResult?.stderr)?.message || parseLastJsonLine(commandResult?.stdout)?.message || '').trim();
+  const missingModule = combined.match(/ModuleNotFoundError:\s+No module named ['"]([^'"]+)['"]/i);
+  if (missingModule?.[1]) {
+    if (missingModule[1].toLowerCase() === 'cv2') {
+      return 'FaceFusion is missing OpenCV (cv2). Run Repair to reinstall the opencv-python dependency required by this FaceFusion version.';
+    }
+    if (missingModule[1].toLowerCase() === 'onnxruntime') {
+      return 'FaceFusion is missing ONNX Runtime (onnxruntime). Run Repair to reinstall the ONNX Runtime dependency declared by this FaceFusion version.';
+    }
+    return 'FaceFusion is missing the Python package "' + missingModule[1] + '". Run Repair to rebuild its managed Python environment.';
+  }
+
+  if (jsonMessage && !/^Traceback(?:\s|$)/i.test(jsonMessage) && !isFaceFusionProgressOnlyLine(jsonMessage)) {
+    return jsonMessage;
+  }
+
+  const lines = combined
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const usefulLine = [...lines].reverse().find((line) => {
+    if (/^Traceback/i.test(line) || /^File "/i.test(line) || /^\{.*"message"\s*:\s*"Traceback/i.test(line) || isFaceFusionProgressOnlyLine(line)) {
+      return false;
+    }
+    return /Error:|Exception:|No module named|failed|not found|timed out|cancelled|aborted/i.test(line);
+  });
+
+  const firstLine = firstNonEmptyLine(combined);
+  return usefulLine
+    || (!/^Traceback(?:\s|$)/i.test(jsonMessage) && !isFaceFusionProgressOnlyLine(jsonMessage) ? jsonMessage : '')
+    || (!/^Traceback/i.test(firstLine) && !/^\{.*"message"\s*:\s*"Traceback/i.test(firstLine) && !isFaceFusionProgressOnlyLine(firstLine) ? firstLine : '')
+    || fallbackMessage;
 }
 
 function getLocalImageToolRuntimeMode(toolId) {
@@ -105,6 +166,11 @@ function buildImageOutputPath(runDirectories, nodeLabel, suffix = 'png') {
   return path.join(runDirectories.artifactsDir, `${sanitizeLabelSegment(nodeLabel, 'image-step')}-${Date.now()}.${suffix}`);
 }
 
+function getImageFileExtension(filePath, fallback = 'png') {
+  const extension = path.extname(String(filePath || '').trim()).replace(/^\./, '').toLowerCase();
+  return /^[a-z0-9]{2,5}$/.test(extension) ? extension : fallback;
+}
+
 function parseCommandJson(stdout, toolLabel) {
   const lastLine = String(stdout || '')
     .trim()
@@ -119,7 +185,8 @@ function parseCommandJson(stdout, toolLabel) {
   try {
     return JSON.parse(lastLine);
   } catch {
-    throw new Error(toolLabel + ' finished, but Local AI Hub could not read its result.');
+    const diagnostic = buildUsefulCommandMessage({ stdout }, '');
+    throw new Error(diagnostic || toolLabel + ' finished, but Local AI Hub could not read its result.');
   }
 }
 
@@ -181,7 +248,7 @@ async function runLocalImageTask(tool, payload, reportProgress, progressMessages
   });
 
   if (Number(commandResult.code || 0) !== 0) {
-    const message = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout) || toolLabel + ' could not finish the local image request.';
+    const message = buildUsefulCommandMessage(commandResult, toolLabel + ' could not finish the local image request.');
     await logger.warn('Local image helper failed.', {
       message,
       stderr: String(commandResult.stderr || '').trim(),
@@ -219,10 +286,17 @@ async function walkForFileNames(rootPath, fileNames = [], maxDepth = 3, currentD
   return '';
 }
 
+function isUpscaylTransformExecutable(candidatePath) {
+  const executableName = path.basename(String(candidatePath || '').trim()).toLowerCase();
+  return [
+    'upscayl-bin.exe',
+    'realesrgan-ncnn-vulkan.exe',
+    'realcugan-ncnn-vulkan.exe',
+  ].includes(executableName);
+}
+
 async function resolveUpscaylBinary(tool, toolRoot) {
-  const explicitCandidates = [
-    tool?.launchProfile?.executable,
-    tool?.executablePath,
+  const bundledCandidates = [
     path.join(toolRoot, 'resources', 'bin', 'upscayl-bin.exe'),
     path.join(toolRoot, 'resources', 'upscayl-bin.exe'),
     path.join(toolRoot, 'upscayl-bin.exe'),
@@ -231,11 +305,15 @@ async function resolveUpscaylBinary(tool, toolRoot) {
     path.join(toolRoot, 'realesrgan-ncnn-vulkan.exe'),
     path.join(toolRoot, 'resources', 'bin', 'realcugan-ncnn-vulkan.exe'),
     path.join(toolRoot, 'realcugan-ncnn-vulkan.exe'),
+  ];
+  const explicitCliCandidates = [
+    tool?.launchProfile?.executable,
+    tool?.executablePath,
   ]
     .map((value) => String(value || '').trim())
-    .filter(Boolean);
+    .filter((value) => value && isUpscaylTransformExecutable(value));
 
-  for (const candidate of explicitCandidates) {
+  for (const candidate of [...bundledCandidates, ...explicitCliCandidates]) {
     if (await fs.pathExists(candidate)) {
       return candidate;
     }
@@ -329,30 +407,48 @@ async function resolveUpscaylOutputFile(preferredOutputPath, outputDirectory, so
   return newestEntry?.entry || '';
 }
 
-async function runUpscaylCommand(executablePath, args, cwd, toolLabel, logger, tool = null) {
+async function runUpscaylCommand(executablePath, args, cwd, toolLabel, logger, tool = null, options = {}) {
   const runtimeEnv = await buildLaunchRuntimeEnv(tool, {
     UPX_NO_LOGO: '1',
   }, { launchProfile: tool?.launchProfile || null });
-  await logger.info?.('Upscayl launch environment prepared.', {
+  const timeoutMs = Number(options.timeoutMs || 0) > 0 ? Number(options.timeoutMs) : UPSCAYL_COMMAND_TIMEOUT_MS;
+  await logger.info?.('Starting Upscayl transform command.', {
+    args,
+    cwd,
+    executablePath,
     launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
+    timeoutMs,
   });
   const commandResult = await runCommand(executablePath, args, {
+    abortMessage: toolLabel + ' was cancelled while Local AI Hub was running this image transformation step.',
     allowFailure: true,
     cwd,
     env: runtimeEnv,
     replaceEnv: true,
+    signal: options.signal || null,
+    timeoutMessage: toolLabel + ' took too long to finish this image transformation step, so Local AI Hub stopped it. Try a smaller image, a lighter model, or launch Upscayl directly to test the runtime.',
+    timeoutMs,
   });
 
   if (Number(commandResult.code || 0) === 0) {
+    await logger.info?.('Upscayl transform command finished.', {
+      code: Number(commandResult.code || 0),
+    });
     return commandResult;
   }
 
+  const diagnostic = buildUsefulCommandMessage(commandResult, toolLabel + ' could not finish the local image enhancement request.');
   await logger.warn('Upscayl command attempt failed.', {
     args,
     code: Number(commandResult.code || 0),
+    message: diagnostic,
     stderr: String(commandResult.stderr || '').trim(),
     stdout: String(commandResult.stdout || '').trim(),
   });
+
+  if (/timed out|cancelled|aborted/i.test(diagnostic)) {
+    throw new Error(diagnostic);
+  }
 
   return null;
 }
@@ -371,6 +467,13 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
   }
 
   const toolRoot = resolveLocalImageToolRoot(tool);
+  const logger = createLogger('pipeline-local-image', {
+    toolId: tool?.id || 'upscayl',
+  });
+  await logger.info?.('Resolving Upscayl CLI transform runtime.', {
+    desktopExecutable: String(tool?.launchProfile?.executable || tool?.executablePath || '').trim(),
+    toolRoot,
+  });
   const executablePath = await resolveUpscaylBinary(tool, toolRoot);
   if (!executablePath) {
     throw new Error('Upscayl is installed, but Local AI Hub could not find its bundled upscaling runtime yet. Run Repair or reinstall Upscayl, then try again.');
@@ -386,8 +489,14 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
   const outputDirectory = path.join(runDirectories.artifactsDir, `${sanitizeLabelSegment(nodeLabel, 'image-transform')}-${Date.now()}-upscayl`);
   await fs.ensureDir(outputDirectory);
   const preferredOutputPath = path.join(outputDirectory, `${sanitizeLabelSegment(nodeLabel, 'image-transform')}.png`);
-  const logger = createLogger('pipeline-local-image', {
-    toolId: tool?.id || 'upscayl',
+  await logger.info?.('Prepared Upscayl transform request.', {
+    executablePath,
+    modelName,
+    modelsDirectory,
+    outputDirectory,
+    preferredOutputPath,
+    sourceImagePath,
+    transformSubtype,
   });
 
   const reportProgress = options.reportProgress;
@@ -417,7 +526,10 @@ async function generateImageWithUpscaylTool(tool, options = {}) {
 
   let commandResult = null;
   for (const args of argSets) {
-    commandResult = await runUpscaylCommand(executablePath, args, toolRoot, toolLabel, logger, tool);
+    commandResult = await runUpscaylCommand(executablePath, args, toolRoot, toolLabel, logger, tool, {
+      signal: options.cancelSignal || null,
+      timeoutMs: options.timeoutMs || UPSCAYL_COMMAND_TIMEOUT_MS,
+    });
     const outputPath = await resolveUpscaylOutputFile(preferredOutputPath, outputDirectory, sourceImagePath);
     if (commandResult && outputPath) {
       const artifact = await buildFileArtifact(outputPath, {
@@ -481,7 +593,7 @@ async function generateImageWithFaceFusionTool(tool, options = {}) {
   }
 
   const nodeLabel = String(options.nodeLabel || options.displayName || 'Image transform').trim() || 'Image transform';
-  const outputPath = buildImageOutputPath(runDirectories, nodeLabel, 'png');
+  const outputPath = buildImageOutputPath(runDirectories, nodeLabel, getImageFileExtension(targetImagePath, 'png'));
   const requestPath = buildJsonRequestPath(runDirectories, nodeLabel, 'facefusion-request');
   const response = await runLocalImageTask(tool, {
     instruction: String(options.instruction || '').trim(),

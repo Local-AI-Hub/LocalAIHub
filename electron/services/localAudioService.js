@@ -43,6 +43,63 @@ function getHelperScriptPath(toolId) {
     : path.join(__dirname, '..', 'helpers', helperScript);
 }
 
+async function resolveBundledFfmpegPath() {
+  const candidates = [];
+  if (app?.isPackaged && process.resourcesPath) {
+    candidates.push(path.join(process.resourcesPath, 'bin', 'ffmpeg.exe'));
+  }
+
+  try {
+    const ffmpegStaticPath = require('ffmpeg-static');
+    if (ffmpegStaticPath) {
+      candidates.push(String(ffmpegStaticPath));
+    }
+  } catch {
+    // The packaged app copies ffmpeg.exe into extra resources instead of relying on node_modules.
+  }
+
+  candidates.push(path.join(__dirname, '..', '..', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'));
+  candidates.push(path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'));
+
+  for (const candidate of uniqueNonEmptyStrings(candidates)) {
+    if (await fs.pathExists(candidate)) {
+      return path.resolve(candidate);
+    }
+  }
+
+  return '';
+}
+
+function prependExecutableDirectoryToPath(env, executablePath) {
+  const resolvedExecutablePath = String(executablePath || '').trim();
+  if (!resolvedExecutablePath) {
+    return env;
+  }
+
+  const executableDirectory = path.dirname(resolvedExecutablePath);
+  const pathKey = Object.keys(env || {}).find((key) => key.toLowerCase() === 'path') || 'PATH';
+  const existingPath = String(env?.[pathKey] || process.env[pathKey] || '');
+  const existingSegments = existingPath.split(path.delimiter).filter(Boolean);
+  const alreadyPresent = existingSegments.some((segment) => path.resolve(segment).toLowerCase() === path.resolve(executableDirectory).toLowerCase());
+  return {
+    ...env,
+    FFMPEG_BINARY: resolvedExecutablePath,
+    [pathKey]: alreadyPresent ? existingPath : executableDirectory + (existingPath ? path.delimiter + existingPath : ''),
+  };
+}
+
+async function prepareLocalAudioRuntimeEnv(tool, toolId) {
+  let runtimeEnv = await buildLaunchRuntimeEnv(tool, {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+  }, { launchProfile: tool?.launchProfile || null });
+
+  if (String(toolId || '').trim().toLowerCase() === 'rvc') {
+    runtimeEnv = prependExecutableDirectoryToPath(runtimeEnv, await resolveBundledFfmpegPath());
+  }
+
+  return runtimeEnv;
+}
 function firstNonEmptyLine(value) {
   return String(value || '')
     .split(/\r?\n/)
@@ -68,6 +125,26 @@ function resolveLocalAudioToolRoot(tool) {
   return path.resolve(rawToolRoot);
 }
 
+const RVC_REQUIRED_RUNTIME_ASSETS = Object.freeze([
+  Object.freeze({ label: 'Hubert feature model', relativePath: path.join('assets', 'hubert', 'hubert_base.pt'), minBytes: 1024 }),
+  Object.freeze({ label: 'RMVPE pitch model', relativePath: path.join('assets', 'rmvpe', 'rmvpe.pt'), minBytes: 1024 }),
+]);
+
+async function assertRvcRuntimeAssetsReady(tool) {
+  const toolRoot = resolveLocalAudioToolRoot(tool);
+  const missing = [];
+  for (const asset of RVC_REQUIRED_RUNTIME_ASSETS) {
+    const assetPath = path.join(toolRoot, asset.relativePath);
+    const stats = await fs.stat(assetPath).catch(() => null);
+    if (!stats?.isFile() || stats.size < asset.minBytes) {
+      missing.push(asset.relativePath.replace(/\\/g, '/'));
+    }
+  }
+
+  if (missing.length) {
+    throw new Error('RVC is missing required runtime asset' + (missing.length === 1 ? '' : 's') + ': ' + missing.join(', ') + '. Run Repair or reinstall RVC while online, then try this voice conversion again.');
+  }
+}
 async function resolveLocalAudioPythonPath(tool) {
   const candidates = [
     tool?.launchProfile?.pythonPath,
@@ -108,21 +185,26 @@ function buildAudioOutputPath(runDirectories, nodeLabel, suffix = 'wav') {
 }
 
 function parseCommandJson(stdout, toolLabel) {
-  const lastLine = String(stdout || '')
+  const lines = String(stdout || '')
     .trim()
     .split(/\r?\n/)
-    .reverse()
-    .find(Boolean);
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse();
 
-  if (!lastLine) {
+  if (!lines.length) {
     throw new Error(toolLabel + ' finished, but it did not return a readable result.');
   }
 
-  try {
-    return JSON.parse(lastLine);
-  } catch {
-    throw new Error(toolLabel + ' finished, but Local AI Hub could not read its result.');
+  for (const line of lines) {
+    try {
+      return JSON.parse(line);
+    } catch {
+      // Keep looking in case the helper printed warnings around its JSON result.
+    }
   }
+
+  throw new Error(toolLabel + ' finished, but Local AI Hub could not read its result.');
 }
 
 function parseCommandMessage(value) {
@@ -309,10 +391,7 @@ async function runLocalAudioTask(tool, payload, reportProgress, progressMessages
     progressMessages.run || ('Running ' + (payload.nodeLabel || 'this step') + ' with ' + toolLabel + '...'),
   );
 
-  const runtimeEnv = await buildLaunchRuntimeEnv(tool, {
-    PYTHONIOENCODING: 'utf-8',
-    PYTHONUTF8: '1',
-  }, { launchProfile: tool?.launchProfile || null });
+  const runtimeEnv = await prepareLocalAudioRuntimeEnv(tool, toolId);
   await logger.info?.('Local audio helper launch environment prepared.', {
     launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
   });
@@ -389,6 +468,9 @@ function buildVoiceModelReference(voiceModel, fallbackModel) {
   if (voiceModel && typeof voiceModel === 'object') {
     return {
       fileName: String(voiceModel.fileName || '').trim(),
+      indexFileName: String(voiceModel.indexFileName || '').trim(),
+      indexPath: String(voiceModel.indexPath || '').trim(),
+      indexRelativePath: String(voiceModel.indexRelativePath || '').trim(),
       model: String(voiceModel.relativePath || voiceModel.fileName || voiceModel.name || voiceModel.id || fallbackModel || '').trim(),
       name: String(voiceModel.name || voiceModel.fileName || voiceModel.id || fallbackModel || '').trim(),
       path: String(voiceModel.path || '').trim(),
@@ -550,6 +632,8 @@ async function generateAudioWithRvcTool(tool, options = {}) {
     throw new Error('The source audio for this RVC step could not be found anymore. Choose it again and rerun the pipeline.');
   }
 
+  await assertRvcRuntimeAssetsReady(tool);
+
   const voiceModel = buildVoiceModelReference(options.voiceModel, options.model);
   if (!voiceModel?.model) {
     throw new Error('Choose an RVC voice model before running this audio transformation step.');
@@ -566,6 +650,8 @@ async function generateAudioWithRvcTool(tool, options = {}) {
     requestPath,
     sourceAudioPath,
     toolRoot: resolveLocalAudioToolRoot(tool),
+    voiceModelIndexPath: voiceModel.indexPath,
+    voiceModelIndexRelativePath: voiceModel.indexRelativePath,
     voiceModelName: voiceModel.name,
     voiceModelPath: voiceModel.path,
     voiceModelRelativePath: voiceModel.relativePath,
@@ -642,11 +728,16 @@ module.exports = {
   stitchAudioWithLocalAudioTool,
   _test: {
     AUDIOCRAFT_PIPELINE_IMPORT_CHECKS,
+    RVC_REQUIRED_RUNTIME_ASSETS,
     buildAudiocraftMissingPipelinePackagesMessage,
     buildAudiocraftPipelineLoadFailureMessage,
     buildAudiocraftPipelineProbeScript,
+    parseCommandJson,
     parseCommandMessage,
     parseProbeJson,
+    prepareLocalAudioRuntimeEnv,
+    prependExecutableDirectoryToPath,
+    resolveBundledFfmpegPath,
     resolveCommandFailureMessage,
   },
 };

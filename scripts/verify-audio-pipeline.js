@@ -121,10 +121,12 @@ function createPipelineExecutionService(tempRoot, toolEntries, options = {}) {
         getToolCatalog: () => toolEntries,
       },
       './modelService': {
-        listDownloadedModels: async (toolOrId) => {
-        const normalizedToolId = typeof toolOrId === 'string' ? toolOrId : toolOrId?.id;
-        return toolsById[String(normalizedToolId || '').trim().toLowerCase()]?.downloadedModels || [];
-      },
+        listDownloadedModels: async (tool) => {
+          if (!tool || typeof tool === 'string') {
+            return [];
+          }
+          return toolsById[String(tool.id || '').trim().toLowerCase()]?.downloadedModels || [];
+        },
       },
       './toolStateService': {
         buildMergedToolStateList: async () => toolEntries,
@@ -844,6 +846,54 @@ function verifyRvcReadinessStates(tempRoot, audioPath) {
   assert(wrongSourceAnalysis.nodeSummaries['audio-transform'].readiness.message.includes('does not accept Text'), 'Expected RVC wrong-source readiness to explain that audio input is required.');
 }
 
+async function verifyDirectCommandAudioTransformSkipsToolLaunch(tempRoot, sourceAudioPath) {
+  let launchCalls = 0;
+  const contextMaps = {
+    toolsById: {
+      rvc: createRvcTool({
+        appDir: tempRoot,
+        healthUrl: 'http://127.0.0.1:7865/',
+        installDir: tempRoot,
+        launchUrl: 'http://127.0.0.1:7865',
+        status: 'stopped',
+      }),
+    },
+  };
+  const { createPipelineToolOrchestrator } = loadModuleWithStubs('electron/services/pipelineToolOrchestrationService.js', {
+    '/electron/services/pipelineToolOrchestrationService.js': {
+      './localAudioService': {
+        getLocalAudioToolRuntimeMode: (toolId) => String(toolId || '').trim().toLowerCase() === 'rvc' ? 'direct-command' : '',
+        LOCAL_AUDIO_RUNTIME_MODE_IDS: { DIRECT_COMMAND: 'direct-command' },
+      },
+      './localImageService': {
+        getLocalImageToolRuntimeMode: () => '',
+        LOCAL_IMAGE_RUNTIME_MODE_IDS: { DIRECT_COMMAND: 'direct-command' },
+      },
+      './localVideoService': {
+        getLocalVideoToolRuntimeMode: () => '',
+        LOCAL_VIDEO_RUNTIME_MODE_IDS: { DIRECT_COMMAND: 'direct-command' },
+      },
+      './processService': {
+        isToolActive: async () => false,
+        isToolReady: async () => false,
+        launchToolFromUserAction: async () => {
+          launchCalls += 1;
+          throw new Error('RVC direct-command audio transforms should not launch the WebUI server.');
+        },
+        stopTool: async () => {},
+      },
+      './toolStateService': {
+        getResolvedToolState: async (toolId) => contextMaps.toolsById[String(toolId || '').trim().toLowerCase()] || null,
+      },
+    },
+  });
+
+  const node = createRvcVoiceConversionPipeline(sourceAudioPath).nodes.find((entry) => entry.id === 'audio-transform');
+  const orchestrator = createPipelineToolOrchestrator(contextMaps);
+  const session = await orchestrator.ensureToolForNode(node, () => {});
+  assert.strictEqual(session, null, 'Expected RVC audio transforms to use the direct helper instead of starting the WebUI server.');
+  assert.strictEqual(launchCalls, 0, 'Expected RVC audio transform orchestration not to call the tool launcher.');
+}
 async function verifyAudiocraftContinuationPipelineRun(tempRoot, sourceAudioPath) {
   const toolEntries = [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })];
   const audioCalls = [];
@@ -1101,7 +1151,13 @@ async function verifyAudiocraftMissingContinuationSourceFails(tempRoot) {
 }
 
 async function verifyRvcPipelineRun(tempRoot, sourceAudioPath) {
-  const voiceModel = createRvcModel({ path: path.join(tempRoot, 'weights', 'voices', 'test-voice.pth') });
+  const indexPath = path.join(tempRoot, 'logs', 'voices', 'test-voice.index');
+  const voiceModel = createRvcModel({
+    indexFileName: 'test-voice.index',
+    indexPath,
+    indexRelativePath: 'logs/voices/test-voice.index',
+    path: path.join(tempRoot, 'weights', 'voices', 'test-voice.pth'),
+  });
   const toolEntries = [createRvcTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped', downloadedModels: [voiceModel] })];
   const audioCalls = [];
   const service = createPipelineExecutionService(tempRoot, toolEntries, {
@@ -1154,6 +1210,8 @@ async function verifyRvcPipelineRun(tempRoot, sourceAudioPath) {
   assert.strictEqual(audioCalls[0].request.sourceAudioPath, sourceAudioPath, 'Expected the RVC run to retain the upstream audio file path.');
   assert.strictEqual(audioCalls[0].request.model, 'voices/test-voice.pth', 'Expected the RVC run to retain the selected voice model id.');
   assert.strictEqual(audioCalls[0].request.voiceModel.relativePath, 'voices/test-voice.pth', 'Expected the RVC run to pass the resolved voice model metadata to the adapter.');
+  assert.strictEqual(audioCalls[0].request.voiceModel.path, voiceModel.path, 'Expected the RVC run to resolve the selected voice model to an existing .pth path.');
+  assert.strictEqual(audioCalls[0].request.voiceModel.indexPath, indexPath, 'Expected the RVC run to retain optional index companion metadata.');
 
   const result = completedRun.terminalResults[0];
   assert.strictEqual(result.kind, 'audio', 'Expected the RVC pipeline to end with an audio artifact.');
@@ -1173,6 +1231,132 @@ async function verifyRvcPipelineRun(tempRoot, sourceAudioPath) {
   assert.strictEqual(sidecar.audioTransformation.sourceAudio.fileName, path.basename(sourceAudioPath), 'Expected the saved transformed audio sidecar to preserve the source audio lineage.');
 }
 
+async function verifyRvcLocalAudioHelperContract(tempRoot, sourceAudioPath) {
+  const helperSource = await fsp.readFile(path.resolve(__dirname, '..', 'electron', 'helpers', 'run_rvc_pipeline_task.py'), 'utf8');
+  assert(helperSource.includes('build_incomplete_audio_message'), 'RVC helper should turn incomplete conversion output into a backend-specific diagnostic.');
+  assert(helperSource.includes('FFmpeg was not available to the RVC helper'), 'RVC helper should recognize missing FFmpeg decode failures.');
+  assert(helperSource.includes('Expected output path'), 'RVC helper should include the expected output path when output audio is missing.');
+  assert(helperSource.includes('Hubert feature model'), 'RVC helper should give a plain-English repair message when the required Hubert model asset is missing.');
+  assert(helperSource.includes('RMVPE pitch model'), 'RVC helper should give a plain-English repair message when the required RMVPE model asset is missing.');
+  assert(helperSource.includes("os.environ['rmvpe_root'] = rmvpe_root"), 'RVC helper should expose the managed RMVPE asset root expected by the backend.');
+  assert(helperSource.includes('install_rvc_torch_load_compatibility'), 'RVC helper should install a scoped PyTorch checkpoint compatibility shim.');
+  assert(helperSource.includes("retry_kwargs['weights_only'] = False"), 'RVC helper should retry trusted RVC checkpoints with explicit weights_only=False.');
+  assert(helperSource.includes('managed RVC weights and assets folders'), 'RVC helper should explain that pickle-style checkpoint loading is limited to managed RVC paths.');
+  assert(helperSource.includes('RVC .pth checkpoints can run pickle code'), 'RVC helper should keep the checkpoint loading security warning visible in diagnostics.');
+  const artifactService = createPipelineArtifactService(tempRoot);
+  const toolRoot = path.join(tempRoot, 'rvc-local-audio-contract');
+  await fsp.mkdir(path.join(toolRoot, 'weights', 'voices'), { recursive: true });
+  await fsp.mkdir(path.join(toolRoot, 'logs', 'voices'), { recursive: true });
+  await fsp.mkdir(path.join(toolRoot, 'assets', 'hubert'), { recursive: true });
+  await fsp.mkdir(path.join(toolRoot, 'assets', 'rmvpe'), { recursive: true });
+  const voiceModelPath = path.join(toolRoot, 'weights', 'voices', 'test-voice.pth');
+  const indexPath = path.join(toolRoot, 'logs', 'voices', 'test-voice.index');
+  await fsp.writeFile(voiceModelPath, Buffer.from('fake-rvc-weight'));
+  await fsp.writeFile(indexPath, Buffer.from('fake-rvc-index'));
+  await fsp.writeFile(path.join(toolRoot, 'assets', 'hubert', 'hubert_base.pt'), Buffer.alloc(2048, 1));
+  await fsp.writeFile(path.join(toolRoot, 'assets', 'rmvpe', 'rmvpe.pt'), Buffer.alloc(2048, 2));
+
+  const runDirectories = {
+    artifactsDir: path.join(tempRoot, 'rvc-local-audio-contract-run', 'artifacts'),
+    outputsDir: path.join(tempRoot, 'rvc-local-audio-contract-run', 'outputs'),
+    runDir: path.join(tempRoot, 'rvc-local-audio-contract-run'),
+  };
+  await fsp.mkdir(runDirectories.artifactsDir, { recursive: true });
+  await fsp.mkdir(runDirectories.outputsDir, { recursive: true });
+
+  let commandMode = 'success';
+  const commandCalls = [];
+  const service = loadModuleWithStubs('electron/services/localAudioService.js', {
+    '/electron/services/localAudioService.js': {
+      './commandService': {
+        runCommand: async (command, args, options = {}) => {
+          commandCalls.push({ args, command, options });
+          const request = JSON.parse(await fsp.readFile(args[1], 'utf8'));
+          assert.strictEqual(request.voiceModelIndexPath, indexPath, 'RVC helper request should preserve the optional .index path.');
+          assert.strictEqual(request.voiceModelRelativePath, 'voices/test-voice.pth', 'RVC helper request should preserve the selected .pth relative path.');
+          assert(String(options.env?.FFMPEG_BINARY || '').toLowerCase().endsWith('ffmpeg.exe'), 'RVC helper launch env should expose bundled FFmpeg.');
+          const ffmpegDirectory = path.dirname(options.env.FFMPEG_BINARY).toLowerCase();
+          const pathValue = String(options.env.PATH || options.env.Path || '');
+          assert(pathValue.toLowerCase().split(path.delimiter).includes(ffmpegDirectory), 'RVC helper launch PATH should include the bundled FFmpeg directory.');
+
+          if (commandMode === 'failure') {
+            return {
+              code: 1,
+              stderr: 'Traceback details from RVC\n',
+              stdout: JSON.stringify({ message: 'RVC could not load the source audio because FFmpeg was not available to the RVC helper. Expected output path: ' + request.outputPath }) + '\n',
+            };
+          }
+
+          await fsp.writeFile(request.outputPath, createWaveBuffer({ channelCount: 1, durationSeconds: 2, frequency: 330, sampleRate: 32000 }));
+          return {
+            code: 0,
+            stderr: '',
+            stdout: JSON.stringify({
+              durationSeconds: 2,
+              indexPath,
+              message: 'RVC transformed the source audio locally.',
+              model: 'voices/test-voice.pth',
+              outputPath: request.outputPath,
+              sampleRate: 32000,
+              targetVoice: 'test-voice',
+              transformationType: 'voice-conversion',
+            }) + '\n',
+          };
+        },
+      },
+      './logService': {
+        createLogger: () => ({ info: async () => {}, warn: async () => {} }),
+      },
+      './pipelineArtifactService': artifactService,
+      './processService': {
+        buildLaunchRuntimeEnv: async () => ({ PATH: 'C:\\base-path', PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }),
+        summarizeLaunchRuntimeEnv: () => ({ pythonUtf8: true }),
+      },
+    },
+  });
+
+  const tool = createRvcTool({
+    appDir: toolRoot,
+    installDir: toolRoot,
+    launchProfile: { kind: 'python-script', pythonPath: 'python' },
+    pythonBootstrapPath: 'python',
+    status: 'stopped',
+  });
+  const voiceModel = createRvcModel({
+    indexFileName: 'test-voice.index',
+    indexPath,
+    indexRelativePath: 'logs/voices/test-voice.index',
+    path: voiceModelPath,
+    relativePath: 'voices/test-voice.pth',
+    weightsRoot: path.join(toolRoot, 'weights'),
+  });
+
+  const result = await service.generateAudioWithLocalAudioTool(tool, {
+    displayName: 'RVC Contract Output',
+    instruction: 'Keep the source timing.',
+    runDirectories,
+    sourceAudioArtifact: { fileName: path.basename(sourceAudioPath), filePath: sourceAudioPath, kind: pipelineSchema.PORT_KIND_AUDIO },
+    sourceAudioPath,
+    voiceModel,
+  });
+  assert.strictEqual(result.outputs.audio.kind, pipelineSchema.PORT_KIND_AUDIO, 'RVC helper success should return a normal audio artifact.');
+  assert.strictEqual(result.outputs.audio.audioTransformation.model, 'voices/test-voice.pth', 'RVC artifact metadata should preserve the selected model.');
+  assert.strictEqual(result.outputs.audio.audioTransformation.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM, 'RVC artifact metadata should preserve the audio transform operation.');
+  assert(result.outputs.audio.filePath && fs.existsSync(result.outputs.audio.filePath), 'RVC output capture should point to a real transformed audio file.');
+  assert.strictEqual(commandCalls.length, 1, 'RVC helper should run once for the successful contract check.');
+
+  commandMode = 'failure';
+  await assert.rejects(
+    () => service.generateAudioWithLocalAudioTool(tool, {
+      displayName: 'RVC Contract Failure',
+      runDirectories,
+      sourceAudioPath,
+      voiceModel,
+    }),
+    /FFmpeg was not available/,
+    'RVC helper failures should preserve backend diagnostics instead of reporting incomplete transformed audio.',
+  );
+}
 function verifyCloudAudioReadinessStates() {
   const missingProviderAnalysis = pipelineSchema.analyzePipeline(createCloudAudioPipeline('Say hello from Local AI Hub.'), { providers: [] });
   assert.strictEqual(missingProviderAnalysis.nodeSummaries['audio-generate'].readiness.tone, 'error', 'Expected cloud audio readiness to fail when the provider is missing.');
@@ -1300,6 +1484,8 @@ async function verifyAudiocraftPipelineEnvironmentContract(tempRoot) {
   const parsedProbe = readinessService._test.parseProbeJson('noise\n{"ready":false,"missing":["audiocraft"],"failures":[]}\n');
   assert.deepStrictEqual(parsedProbe.missing, ['audiocraft'], 'AudioCraft readiness should parse the final JSON line from the import probe.');
 
+  const parsedHelperResult = readinessService._test.parseCommandJson('RVC warning before result\n{"outputPath":"D:/tmp/out.wav","message":"ok"}\nRVC warning after result\n', 'RVC');
+  assert.strictEqual(parsedHelperResult.outputPath, 'D:/tmp/out.wav', 'Local audio helper result parsing should tolerate warnings around structured JSON.');
   const warningOnlyFailure = readinessService._test.resolveCommandFailureMessage({
     code: 1,
     stderr: 'WARNING[XFORMERS]: xFormers can\'t load C++/CUDA extensions.\nSet XFORMERS_MORE_DETAILS=1 for more details\n',
@@ -1398,6 +1584,7 @@ async function main() {
   verifyAudiocraftContinuationHelperSource();
   await verifyAudiocraftPipelineEnvironmentContract(tempRoot);
   verifyRvcReadinessStates(tempRoot, audioPath);
+  await verifyDirectCommandAudioTransformSkipsToolLaunch(tempRoot, audioPath);
   verifyCloudAudioReadinessStates();
   await verifyWhisperPipelineRun(tempRoot, audioPath);
   await verifyAudioOutputRun(tempRoot, audioPath);
@@ -1408,6 +1595,7 @@ async function main() {
   await verifyAudiocraftAppendSourceContinuationPipelineRun(tempRoot, audioPath);
   await verifyAudiocraftMissingContinuationSourceFails(tempRoot);
   await verifyRvcPipelineRun(tempRoot, audioPath);
+  await verifyRvcLocalAudioHelperContract(tempRoot, audioPath);
   await verifyCloudAudioPipelineRun(tempRoot);
 
   console.log('Audio pipeline verification passed.');

@@ -18,6 +18,9 @@ const DIFFUSERS_COMPONENT_SEGMENTS = new Set([
 const DIFFUSERS_GENERIC_COMPONENT_FILE_PATTERN = /^(?:diffusion_pytorch_model|model|pytorch_model)(?:[._-][a-z0-9]+)*\.(?:safetensors|bin|pt|pth)$/i;
 const SUPPORT_SEGMENTS = new Set(['assets', 'asset', 'examples', 'example', 'images', 'image', 'media', 'previews', 'preview', 'samples', 'sample']);
 const WEBUI_TOOL_IDS = new Set(['automatic1111', 'forge']);
+const INVOKEAI_TOOL_IDS = new Set(['invokeai']);
+const INVOKEAI_API_IMPORT_MODEL_TYPES = new Set(['Checkpoint', 'Inpainting', 'LoRA', 'ControlNet', 'VAE', 'Embedding']);
+const INVOKEAI_API_IMPORT_EXTENSIONS = new Set(['.safetensors', '.ckpt', '.pt', '.pth']);
 const GGUF_TOOL_IDS = new Set(['lmstudio', 'koboldcpp']);
 const RVC_MODEL_FILE_PATTERN = /\.(?:pth|pt)$/i;
 const RVC_INDEX_FILE_PATTERN = /\.index$/i;
@@ -248,6 +251,7 @@ function targetFamily(tool) {
   if (tool && GGUF_TOOL_IDS.has(tool.id)) return 'gguf';
   if (tool && WEBUI_TOOL_IDS.has(tool.id)) return 'sd-webui';
   if (tool && tool.id === 'comfyui') return 'comfyui';
+  if (tool && INVOKEAI_TOOL_IDS.has(tool.id)) return 'invokeai';
   if (tool && tool.id === 'rvc') return 'rvc';
   return 'generic-file';
 }
@@ -444,12 +448,26 @@ function classifyArtifact(tool, artifact, selectedType) {
     if (!selectedTypeMatches(inferred.modelType, selectedType)) return Object.assign({}, inferred, { runnable: false, reason: inferred.modelType + ' artifacts do not match the selected ' + normalizeModelType(selectedType) + ' filter.' });
     return Object.assign({}, inferred, { runnable: true });
   }
-  if (family === 'sd-webui' || family === 'comfyui') {
-    if (extension === '.gguf' && family === 'sd-webui') {
-      return { artifactKind: 'target-mismatch', artifactLabel: 'GGUF LLM file', modelType: 'GGUF', runnable: false, reason: 'GGUF files are for LLM targets such as KoboldCpp or LM Studio. Forge and Automatic1111 need image checkpoint files such as .safetensors or .ckpt.' };
+  if (family === 'sd-webui' || family === 'comfyui' || family === 'invokeai') {
+    if (extension === '.gguf' && (family === 'sd-webui' || family === 'invokeai')) {
+      const targetLabel = family === 'invokeai' ? 'InvokeAI' : 'Forge and Automatic1111';
+      return { artifactKind: 'target-mismatch', artifactLabel: 'GGUF LLM file', modelType: 'GGUF', runnable: false, reason: 'GGUF files are for LLM targets such as KoboldCpp or LM Studio. ' + targetLabel + ' need image checkpoint files such as .safetensors or .ckpt.' };
     }
     const inferred = inferImageArtifact(artifact);
     if (inferred.rejected) return Object.assign({}, inferred, { runnable: false });
+    if (family === 'invokeai') {
+      const normalizedPath = artifactPath(artifact).toLowerCase();
+      const looksLikeDiffusersFolderMember = DIFFUSERS_GENERIC_COMPONENT_FILE_PATTERN.test(fileName) && /(?:^|\/)controlnet(?:\/|$)/i.test(normalizedPath);
+      if (looksLikeDiffusersFolderMember) {
+        return Object.assign({}, inferred, { runnable: false, reason: 'InvokeAI diffusers folder imports are not enabled in Local AI Hub yet. Choose a single-file ControlNet, LoRA, VAE, embedding, checkpoint, or inpainting artifact.' });
+      }
+      if (!INVOKEAI_API_IMPORT_MODEL_TYPES.has(inferred.modelType)) {
+        return Object.assign({}, inferred, { runnable: false, reason: 'InvokeAI Model Manager support currently covers checkpoints, inpainting checkpoints, LoRAs, ControlNet files, VAEs, and textual inversion embeddings through InvokeAI\'s import API. This artifact type is not enabled for InvokeAI yet.' });
+      }
+      if (!INVOKEAI_API_IMPORT_EXTENSIONS.has(extension)) {
+        return Object.assign({}, inferred, { runnable: false, reason: 'InvokeAI imports from Local AI Hub are limited to single model files ending in .safetensors, .ckpt, .pt, or .pth for now.' });
+      }
+    }
     if (!selectedTypeMatches(inferred.modelType, selectedType)) return Object.assign({}, inferred, { runnable: false, reason: inferred.modelType + ' artifacts do not match the selected ' + normalizeModelType(selectedType) + ' filter.' });
     let score = 40 + Math.min(sizeBytes / (1024 * 1024 * 1024), 20);
     if (inferred.modelType === 'Checkpoint') {
@@ -461,9 +479,10 @@ function classifyArtifact(tool, artifact, selectedType) {
       if (normalizedPath.includes('non_ema') || normalizedPath.includes('non-ema')) score -= 20;
     }
     if (inferred.modelType === 'Inpainting') score += normalizeModelTypeFilter(selectedType) === 'inpainting' ? 75 : 25;
+    if (family === 'invokeai') score += 20;
     if (normalizeModelTypeFilter(selectedType) !== 'all' && selectedTypeMatches(inferred.modelType, selectedType)) score += 35;
     if (artifact && artifact.primary) score += 20;
-    return Object.assign({}, inferred, { runnable: true, score });
+    return Object.assign({}, inferred, { installStrategy: family === 'invokeai' ? 'invokeai-api-import' : null, runnable: true, score });
   }
   const modelType = normalizeModelType((artifact && (artifact.modelType || artifact.type)) || fileName);
   const runnable = selectedTypeMatches(modelType, selectedType);
@@ -495,23 +514,31 @@ function annotateArtifact(tool, artifact, selectedType, groups) {
 }
 
 function summarizePlan(tool, selectedType, annotated) {
+  const family = targetFamily(tool);
   const compatible = annotated.filter((artifact) => artifact.runnable).sort((left, right) => Number(right.score || 0) - Number(left.score || 0) || artifactPath(left).localeCompare(artifactPath(right)));
   const rejected = annotated.filter((artifact) => !artifact.runnable);
   const recommended = compatible[0] || null;
   const rvcCompanionPlan = getRvcOptionalCompanions(rejected, recommended, compatible);
   const optionalArtifacts = rvcCompanionPlan.companions;
   const blockingReason = recommended ? null : ((rejected.find((artifact) => artifact.blockingReason) || {}).blockingReason || 'Local AI Hub could not find a runnable artifact for ' + ((tool && tool.name) || 'this target') + '.');
-  const warning = optionalArtifacts.length
+  const baseWarning = optionalArtifacts.length
     ? 'A matching RVC index file will be downloaded as an optional companion for retrieval-index quality.'
     : rvcCompanionPlan.ambiguous
       ? 'RVC index files are present, but Local AI Hub could not match one confidently to the selected voice weight. Add the .index file manually if you need retrieval-index quality.'
       : recommended && recommended.modelType === 'Inpainting' && normalizeModelTypeFilter(selectedType) !== 'inpainting'
         ? 'This looks like an inpainting checkpoint. Base checkpoints are preferred unless you choose the Inpainting filter.'
         : null;
+  const invokeAiImport = family === 'invokeai' && Boolean(recommended);
+  const warning = invokeAiImport
+    ? ['Local AI Hub will download this file to a temporary location, then ask InvokeAI to import and register it through InvokeAI\'s model API.', baseWarning].filter(Boolean).join(' ')
+    : baseWarning;
   return {
     artifactLabel: recommended ? recommended.artifactLabel : null,
     compatibleArtifacts: compatible.map((artifact) => ({ artifactKind: artifact.artifactKind, fileName: artifactName(artifact), modelType: artifact.modelType, path: artifactPath(artifact), requiredArtifacts: artifact.requiredArtifacts || [] })),
+    installStrategy: invokeAiImport ? 'invokeai-api-import' : null,
+    modelType: recommended ? recommended.modelType : null,
     optionalArtifacts,
+    planType: invokeAiImport ? 'api-import' : null,
     recommendedArtifact: recommended,
     recommendedArtifactPath: recommended ? artifactPath(recommended) : null,
     rejectedArtifacts: rejected.slice(0, 8).map((artifact) => ({ fileName: artifactName(artifact), modelType: artifact.modelType, path: artifactPath(artifact), reason: artifact.blockingReason || 'This artifact is not compatible with the selected target.' })),

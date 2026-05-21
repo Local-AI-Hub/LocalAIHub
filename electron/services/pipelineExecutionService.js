@@ -123,6 +123,7 @@ class PipelineCancelledError extends Error {
 
 let pipelineEventSink = null;
 let activeRun = null;
+let activeRunAbortController = null;
 let pendingValidationControl = null;
 
 const PLANNER_PROVIDER_TIMEOUT_MS = 60000;
@@ -302,6 +303,22 @@ function attachDownloadedToolModels(tools = [], downloadedModelsByToolId = {}) {
   });
 }
 
+function findToolEntryById(tools = [], toolId = '') {
+  const normalizedToolId = String(toolId || '').trim().toLowerCase();
+  if (!normalizedToolId) {
+    return null;
+  }
+  return (tools || []).find((tool) => String(tool?.id || '').trim().toLowerCase() === normalizedToolId) || null;
+}
+
+async function listDownloadedModelsForToolId(tools = [], toolId = '') {
+  const tool = findToolEntryById(tools, toolId);
+  if (!tool) {
+    return [];
+  }
+  return listDownloadedModels(tool).catch(() => []);
+}
+
 function getDownloadedToolModelEntry(tool, model) {
   const normalizedModel = String(model || '').trim().toLowerCase();
   if (!normalizedModel) {
@@ -381,13 +398,13 @@ async function buildPipelineContext(definition = {}) {
   if (selectedLocalImageToolIds.length || selectedLocalAudioTransformToolIds.length || selectedLocalVideoToolIds.length) {
     const downloadedModelsByToolId = {};
     for (const toolId of selectedLocalImageToolIds) {
-      downloadedModelsByToolId[toolId] = filterLocalImageCheckpointModels(await listDownloadedModels(toolId).catch(() => []));
+      downloadedModelsByToolId[toolId] = filterLocalImageCheckpointModels(await listDownloadedModelsForToolId(toolEntries, toolId));
     }
     for (const toolId of selectedLocalAudioTransformToolIds) {
-      downloadedModelsByToolId[toolId] = await listDownloadedModels(toolId).catch(() => []);
+      downloadedModelsByToolId[toolId] = await listDownloadedModelsForToolId(toolEntries, toolId);
     }
     for (const toolId of selectedLocalVideoToolIds) {
-      downloadedModelsByToolId[toolId] = await listDownloadedModels(toolId).catch(() => []);
+      downloadedModelsByToolId[toolId] = await listDownloadedModelsForToolId(toolEntries, toolId);
     }
 
     toolEntries = attachDownloadedToolModels(toolEntries, downloadedModelsByToolId);
@@ -3057,6 +3074,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
         operationId,
         referenceImageArtifact: null,
         referenceImagePath: '',
+        cancelSignal: activeRunAbortController?.signal || null,
         reportProgress,
         runDirectories: run.directories,
         sourceImageArtifact: imageRequest.sourceImageArtifact,
@@ -5572,6 +5590,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           operationId,
           referenceImageArtifact: imageRequest.referenceImageArtifact,
           referenceImagePath: imageRequest.referenceImagePath,
+          cancelSignal: activeRunAbortController?.signal || null,
           reportProgress,
           runDirectories: run.directories,
           sourceImageArtifact: imageRequest.sourceImageArtifact,
@@ -5948,6 +5967,7 @@ async function executeActiveRun(graph, context) {
         activeRun.message = 'Pipeline run cancelled.';
         activeRun.finishedAt = new Date().toISOString();
         activeRun.currentNodeId = null;
+        activeRunAbortController = null;
         emitPipelineEvent();
         return;
       }
@@ -6046,6 +6066,7 @@ async function executeActiveRun(graph, context) {
     activeRun.status = 'completed';
     activeRun.message = `${activeRun.pipelineName} finished successfully.`;
     activeRun.finishedAt = new Date().toISOString();
+    activeRunAbortController = null;
     emitPipelineEvent();
   } catch (error) {
     if (!activeRun) {
@@ -6072,6 +6093,7 @@ async function executeActiveRun(graph, context) {
     activeRun.message = isCancelled ? 'Pipeline run cancelled.' : finalError.message || 'Pipeline run failed.';
     activeRun.finishedAt = new Date().toISOString();
     activeRun.currentNodeId = null;
+    activeRunAbortController = null;
     emitPipelineEvent();
   }
 }
@@ -6088,6 +6110,7 @@ async function runPipeline(definition) {
 
   const graph = buildPipelineGraph(analysis.pipeline);
   activeRun = createRunRecord(analysis, graph, null);
+  activeRunAbortController = new AbortController();
   activeRun.directories = await ensureRunDirectories(activeRun.runId);
   emitPipelineEvent();
   executeActiveRun(graph, context).catch(() => null);
@@ -6104,7 +6127,8 @@ function cancelPipelineRun(runId) {
   }
 
   activeRun.cancelRequested = true;
-  activeRun.message = 'Local AI Hub will stop this pipeline after the current step finishes and shut down any tool it started for the run.';
+  activeRunAbortController?.abort();
+  activeRun.message = 'Local AI Hub is stopping this pipeline and will shut down any tool it started for the run.';
   if (activeRun.status === 'paused' && pendingValidationControl?.resolve) {
     const resolve = pendingValidationControl.resolve;
     pendingValidationControl = null;
