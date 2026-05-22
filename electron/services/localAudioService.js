@@ -29,6 +29,11 @@ const LOCAL_AUDIO_TOOL_ADAPTERS = Object.freeze({
     label: 'RVC',
     runtimeMode: LOCAL_AUDIO_RUNTIME_MODE_IDS.DIRECT_COMMAND,
   }),
+  'chatterbox-tts': Object.freeze({
+    helperScript: 'run_chatterbox_tts_task.py',
+    label: 'Chatterbox-Turbo',
+    runtimeMode: LOCAL_AUDIO_RUNTIME_MODE_IDS.DIRECT_COMMAND,
+  }),
 });
 
 function getHelperScriptPath(toolId) {
@@ -262,6 +267,55 @@ function buildAudiocraftPipelineLoadFailureMessage() {
   return 'AudioCraft is installed, but Local AI Hub could not load the Python packages needed for pipeline audio generation. Run Repair or reinstall AudioCraft WebUI, then try again.';
 }
 
+const CHATTERBOX_PIPELINE_IMPORT_CHECKS = Object.freeze([
+  Object.freeze({ label: 'torch', moduleName: 'torch' }),
+  Object.freeze({ label: 'torchaudio', moduleName: 'torchaudio' }),
+  Object.freeze({ label: 'pkg_resources', moduleName: 'pkg_resources' }),
+  Object.freeze({ label: 'ChatterboxTurboTTS', moduleName: 'chatterbox.tts_turbo' }),
+]);
+
+function buildChatterboxMissingPipelinePackagesMessage(missingPackages = []) {
+  const uniqueMissing = uniqueNonEmptyStrings(missingPackages);
+  const detail = uniqueMissing.length ? ': ' + uniqueMissing.join(', ') : '';
+  return 'Chatterbox-Turbo is installed, but its Python environment is missing the packages needed for reference voice TTS' + detail + '. Run Repair or reinstall Chatterbox-Turbo TTS, then try again.';
+}
+
+function buildChatterboxPipelineLoadFailureMessage() {
+  return 'Chatterbox-Turbo is installed, but Local AI Hub could not load the Python packages needed for reference voice TTS. Run Repair or reinstall Chatterbox-Turbo TTS, then try again.';
+}
+
+function buildChatterboxCudaFailureMessage(probe = null) {
+  const torchVersion = String(probe?.torchVersion || '').trim();
+  const suffix = torchVersion ? ' Current torch version: ' + torchVersion + '.' : '';
+  return 'Chatterbox-Turbo needs a CUDA-enabled PyTorch install for normal Local AI Hub generation. Run Repair so Local AI Hub can install torch 2.6.0 with CUDA 12.4, then try again.' + suffix;
+}
+
+function buildChatterboxPipelineProbeScript() {
+  const checksJson = JSON.stringify(CHATTERBOX_PIPELINE_IMPORT_CHECKS.map((entry) => [entry.moduleName, entry.label]));
+  return [
+    'import importlib, json, sys',
+    'checks = ' + checksJson,
+    'missing = []',
+    'failures = []',
+    'torch_module = None',
+    'for module_name, label in checks:',
+    '    try:',
+    '        module = importlib.import_module(module_name)',
+    '        if module_name == "torch":',
+    '            torch_module = module',
+    '    except ModuleNotFoundError as exc:',
+    '        missing.append(str(getattr(exc, "name", "") or label))',
+    '    except Exception as exc:',
+    '        failures.append({"module": module_name, "label": label, "errorType": exc.__class__.__name__})',
+    'cuda_available = bool(torch_module and torch_module.cuda.is_available())',
+    'gpu_name = torch_module.cuda.get_device_name(0) if cuda_available else ""',
+    'torch_version = str(getattr(torch_module, "__version__", "")) if torch_module else ""',
+    'torch_cuda = str(getattr(getattr(torch_module, "version", None), "cuda", "")) if torch_module else ""',
+    'payload = {"ready": not missing and not failures and cuda_available, "missing": sorted(set(missing)), "failures": failures, "cudaAvailable": cuda_available, "gpuName": gpu_name, "torchVersion": torch_version, "torchCudaVersion": torch_cuda}',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
 function buildAudiocraftPipelineProbeScript() {
   const checksJson = JSON.stringify(AUDIOCRAFT_PIPELINE_IMPORT_CHECKS.map((entry) => [entry.moduleName, entry.label]));
   return [
@@ -366,7 +420,82 @@ async function assertAudiocraftPipelineReady(tool) {
   return readiness;
 }
 
-async function runLocalAudioTask(tool, payload, reportProgress, progressMessages = {}) {
+async function checkChatterboxPipelineReadiness(tool) {
+  const toolLabel = getLocalAudioToolLabel(tool);
+  let toolRoot = '';
+  try {
+    toolRoot = resolveLocalAudioToolRoot(tool);
+  } catch (error) {
+    return {
+      message: error?.message || toolLabel + ' is not installed yet.',
+      ready: false,
+      reason: 'not-installed',
+    };
+  }
+
+  let pythonPath = '';
+  try {
+    pythonPath = await resolveLocalAudioPythonPath(tool);
+  } catch (error) {
+    return {
+      message: error?.message || 'Local AI Hub could not find the Python runtime for ' + toolLabel + '.',
+      ready: false,
+      reason: 'python-missing',
+    };
+  }
+
+  const runtimeEnv = await prepareLocalAudioRuntimeEnv(tool, 'chatterbox-tts');
+  const commandResult = await runCommand(pythonPath, ['-c', buildChatterboxPipelineProbeScript()], {
+    allowFailure: true,
+    cwd: toolRoot,
+    env: runtimeEnv,
+    replaceEnv: true,
+  });
+  const probe = parseProbeJson(commandResult.stdout);
+  if (Number(commandResult.code || 0) === 0 && probe?.ready !== false) {
+    return {
+      message: 'Chatterbox-Turbo reference voice TTS packages and CUDA are ready.',
+      ready: true,
+      reason: 'ready',
+      runtime: probe,
+    };
+  }
+
+  const missing = uniqueNonEmptyStrings(probe?.missing || []);
+  if (missing.length) {
+    return {
+      message: buildChatterboxMissingPipelinePackagesMessage(missing),
+      missingPackages: missing,
+      ready: false,
+      reason: 'missing-packages',
+    };
+  }
+
+  if (probe && probe.cudaAvailable === false) {
+    return {
+      message: buildChatterboxCudaFailureMessage(probe),
+      ready: false,
+      reason: 'cuda-unavailable',
+      runtime: probe,
+    };
+  }
+
+  return {
+    message: buildChatterboxPipelineLoadFailureMessage(),
+    ready: false,
+    reason: 'package-load-failed',
+    runtime: probe,
+  };
+}
+
+async function assertChatterboxPipelineReady(tool) {
+  const readiness = await checkChatterboxPipelineReadiness(tool);
+  if (!readiness.ready) {
+    throw new Error(readiness.message);
+  }
+  return readiness;
+}
+async function runLocalAudioTask(tool, payload, reportProgress, progressMessages = {}, commandOptions = {}) {
   const toolId = String(tool?.id || '').trim().toLowerCase();
   const toolLabel = getLocalAudioToolLabel(tool);
   const helperScript = getHelperScriptPath(toolId);
@@ -397,9 +526,13 @@ async function runLocalAudioTask(tool, payload, reportProgress, progressMessages
   });
   const commandResult = await runCommand(pythonPath, [helperScript, requestPath], {
     allowFailure: true,
+    abortMessage: commandOptions.abortMessage || (toolLabel + ' audio generation was cancelled.'),
     cwd: toolRoot,
     env: runtimeEnv,
     replaceEnv: true,
+    signal: commandOptions.signal || null,
+    timeoutMessage: commandOptions.timeoutMessage || (toolLabel + ' audio generation took too long and was stopped.'),
+    timeoutMs: Number(commandOptions.timeoutMs || 0) || undefined,
   });
 
   if (Number(commandResult.code || 0) !== 0) {
@@ -698,6 +831,108 @@ async function generateAudioWithRvcTool(tool, options = {}) {
   };
 }
 
+async function generateAudioWithChatterboxTool(tool, options = {}) {
+  const toolLabel = getLocalAudioToolLabel(tool);
+  const runDirectories = options.runDirectories || null;
+  if (!runDirectories?.artifactsDir) {
+    throw new Error('Local AI Hub could not prepare a pipeline run folder for the Chatterbox-Turbo audio output.');
+  }
+
+  const text = String(options.prompt || '').trim();
+  if (!text) {
+    throw new Error('Reference Voice TTS needs connected text to speak.');
+  }
+
+  const referenceAudioPath = path.resolve(String(options.referenceAudioPath || options.sourceAudioPath || '').trim());
+  if (!referenceAudioPath || !(await fs.pathExists(referenceAudioPath))) {
+    throw new Error('Reference Voice TTS needs a connected reference voice audio clip. Connect an Audio Input node to the Reference Audio port.');
+  }
+
+  await assertChatterboxPipelineReady(tool);
+
+  const nodeLabel = String(options.nodeLabel || options.displayName || 'Reference voice TTS').trim() || 'Reference voice TTS';
+  const outputPath = buildAudioOutputPath(runDirectories, nodeLabel, 'wav');
+  const requestPath = buildJsonRequestPath(runDirectories, nodeLabel, 'chatterbox-request');
+  const response = await runLocalAudioTask(tool, {
+    allowCpu: Boolean(options.allowCpuFallback),
+    devicePreference: String(options.chatterboxDevicePreference || options.devicePreference || 'cuda').trim() || 'cuda',
+    maxTextLength: Math.max(80, Math.floor(Number(options.maxTextLength || 400) || 400)),
+    nodeLabel,
+    outputPath,
+    referenceAudioPath,
+    requestPath,
+    text,
+    toolRoot: resolveLocalAudioToolRoot(tool),
+  }, options.reportProgress, {
+    run: 'Running ' + nodeLabel + ' with ' + toolLabel + '...',
+    start: 'Starting Chatterbox-Turbo for this reference voice TTS step.',
+  }, {
+    abortMessage: 'Chatterbox-Turbo reference voice TTS was cancelled.',
+    signal: options.cancelSignal || null,
+    timeoutMessage: 'Chatterbox-Turbo reference voice TTS took too long and was stopped.',
+    timeoutMs: Math.max(60000, Number(options.generationTimeoutMs || options.timeoutMs || 900000) || 900000),
+  });
+
+  const finalOutputPath = path.resolve(String(response?.outputPath || outputPath).trim());
+  if (!(await fs.pathExists(finalOutputPath))) {
+    throw new Error(toolLabel + ' reported success, but the generated voice audio file could not be found.');
+  }
+
+  const referenceAudioArtifact = options.referenceAudioArtifact || options.sourceAudioArtifact || null;
+  const audioGeneration = {
+    backend: 'chatterbox-tts',
+    backendLabel: 'Chatterbox-Turbo',
+    consentWarning: 'Only clone voices you have permission to use.',
+    consentWarningAcknowledged: Boolean(options.referenceVoiceConsentAcknowledged),
+    consentWarningDisplayed: true,
+    device: String(response?.device || options.chatterboxDevicePreference || 'cuda').trim(),
+    durationSeconds: Number(response?.durationSeconds || 0) || 0,
+    generatedDurationSeconds: Number(response?.durationSeconds || 0) || 0,
+    gpuName: String(response?.gpuName || '').trim(),
+    lineage: buildAudioSourceLineage(referenceAudioArtifact),
+    mode: 'referenceVoiceTts',
+    model: String(response?.model || response?.modelId || options.model || 'ResembleAI/chatterbox-turbo').trim(),
+    operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+    operationSubtype: 'referenceVoiceTts',
+    packageVersion: String(response?.packageVersion || '').trim(),
+    peakAllocatedMb: Number(response?.peakAllocatedMb || 0) || 0,
+    peakReservedMb: Number(response?.peakReservedMb || 0) || 0,
+    prompt: text.length > 240 ? text.slice(0, 240) + '...' : text,
+    promptStyle: serializePromptStyleApplication(options.promptStyle),
+    referenceAudio: buildSourceAudioReference(referenceAudioArtifact),
+    referenceAudioPath: String(referenceAudioPath || '').trim(),
+    referenceDurationSeconds: Number(response?.referenceDurationSeconds || 0) || 0,
+    sampleRate: Number(response?.sampleRate || 0) || 0,
+    sourceAudio: buildSourceAudioReference(referenceAudioArtifact),
+    sourceAudioPath: String(referenceAudioPath || '').trim(),
+    textLength: Number(response?.textLength || text.length) || text.length,
+    toolId: String(tool?.id || '').trim() || 'chatterbox-tts',
+    toolLabel,
+    torchVersion: String(response?.torchVersion || '').trim(),
+  };
+
+  const artifact = await buildFileArtifact(finalOutputPath, {
+    audio: {
+      channelCount: Number(response?.channels || 0) || 0,
+      durationSeconds: Number(response?.durationSeconds || 0) || 0,
+      sampleRate: Number(response?.sampleRate || 0) || 0,
+    },
+    audioGeneration,
+    displayName: String(options.displayName || nodeLabel || 'Reference voice audio').trim() || 'Reference voice audio',
+    kind: PORT_KIND_AUDIO,
+    role: 'generated',
+  });
+
+  return {
+    destinationPath: artifact.filePath,
+    message: String(response?.message || toolLabel + ' generated reference voice speech locally and saved it to ' + artifact.filePath + '.').trim(),
+    metadata: response,
+    outputs: {
+      audio: artifact,
+    },
+    preview: summarizeArtifact(artifact),
+  };
+}
 async function stitchAudioWithLocalAudioTool(tool, options = {}) {
   const toolId = String(tool?.id || '').trim().toLowerCase();
   if (toolId === 'audiocraft-webui') {
@@ -717,21 +952,31 @@ async function generateAudioWithLocalAudioTool(tool, options = {}) {
     return generateAudioWithRvcTool(tool, options);
   }
 
+  if (toolId === 'chatterbox-tts') {
+    return generateAudioWithChatterboxTool(tool, options);
+  }
+
   throw new Error((tool?.name || 'This local audio tool') + ' does not have a runnable local audio adapter in Local AI Hub yet.');
 }
 
 module.exports = {
   LOCAL_AUDIO_RUNTIME_MODE_IDS,
   checkAudiocraftPipelineReadiness,
+  checkChatterboxPipelineReadiness,
   generateAudioWithLocalAudioTool,
   getLocalAudioToolRuntimeMode,
   stitchAudioWithLocalAudioTool,
   _test: {
     AUDIOCRAFT_PIPELINE_IMPORT_CHECKS,
+    CHATTERBOX_PIPELINE_IMPORT_CHECKS,
     RVC_REQUIRED_RUNTIME_ASSETS,
     buildAudiocraftMissingPipelinePackagesMessage,
     buildAudiocraftPipelineLoadFailureMessage,
     buildAudiocraftPipelineProbeScript,
+    buildChatterboxCudaFailureMessage,
+    buildChatterboxMissingPipelinePackagesMessage,
+    buildChatterboxPipelineLoadFailureMessage,
+    buildChatterboxPipelineProbeScript,
     parseCommandJson,
     parseCommandMessage,
     parseProbeJson,

@@ -118,6 +118,37 @@ async function main() {
   assert(rvcRuntimeAssets.some((asset) => asset.relativePath === 'assets/rmvpe/rmvpe.pt' && /huggingface\.co\/lj1995\/VoiceConversionWebUI\/resolve\/main\/rmvpe\.pt/.test(asset.url)), 'RVC install/repair should know how to restore assets/rmvpe/rmvpe.pt.');
   const rvcPipInstalls = rvcManifest.installInstructions?.pipInstalls || [];
   assert(rvcPipInstalls.some((entry) => entry.kind === 'package' && entry.value === 'gradio_client==1.3.0'), 'RVC install/repair should pin gradio_client to the RVC-compatible media_data API.');
+  const chatterboxManifest = manifestTools.find((tool) => tool.id === 'chatterbox-tts');
+  assert(chatterboxManifest, 'Chatterbox-Turbo TTS should be present in the tool manifest.');
+  assert.strictEqual(chatterboxManifest.interfaceMode, 'external-browser', 'Chatterbox-Turbo should expose a real managed WebUI launch surface.');
+  assert.strictEqual(chatterboxManifest.launchCommand, 'python .localaihub_launch_chatterbox_server.py --port {port}', 'Chatterbox WebUI launch should use the Local AI Hub localhost shim.');
+  assert.strictEqual(chatterboxManifest.defaultPort, 8004, 'Chatterbox WebUI should use the documented managed server port.');
+  assert.strictEqual(chatterboxManifest.healthCheckPath, '/api/ui/initial-data', 'Chatterbox WebUI readiness should probe a UI data endpoint.');
+  assert(/devnen\/Chatterbox-TTS-Server/.test(chatterboxManifest.downloadUrl), 'Chatterbox WebUI source should come from the audited Chatterbox-TTS-Server project.');
+  assert.strictEqual(chatterboxManifest.installInstructions?.pythonRequirement, '>=3.11,<3.12', 'Chatterbox-Turbo should require the smoke-tested Python 3.11 line.');
+  const chatterboxPipInstalls = chatterboxManifest.installInstructions?.pipInstalls || [];
+  assert(chatterboxPipInstalls.some((entry) => entry.value === 'torch==2.6.0+cu124' && (entry.pipArgs || []).includes('https://download.pytorch.org/whl/cu124')), 'Chatterbox install should install CUDA torch 2.6.0 from the cu124 PyTorch index.');
+  assert(chatterboxPipInstalls.some((entry) => entry.value === 'torchaudio==2.6.0+cu124' && (entry.pipArgs || []).includes('https://download.pytorch.org/whl/cu124')), 'Chatterbox install should install CUDA torchaudio 2.6.0 from the cu124 PyTorch index.');
+  assert(chatterboxPipInstalls.some((entry) => entry.value === 'chatterbox-tts==0.1.7'), 'Chatterbox install should pin the smoke-tested chatterbox-tts package.');
+  assert(chatterboxPipInstalls.some((entry) => entry.value === 'setuptools<81'), 'Chatterbox install should pin setuptools below 81 so pkg_resources remains available.');
+  assert(chatterboxPipInstalls.some((entry) => entry.value === 'fastapi>=0.100.0,<0.116.0'), 'Chatterbox WebUI install should include FastAPI.');
+  assert(chatterboxPipInstalls.some((entry) => entry.value === 'uvicorn[standard]>=0.27.0'), 'Chatterbox WebUI install should include uvicorn.');
+  assert(chatterboxPipInstalls.some((entry) => entry.value === 'praat-parselmouth>=0.4.0'), 'Chatterbox WebUI install should include voice analysis dependencies.');
+  assert.strictEqual(chatterboxManifest.launchEnvironment?.setHuggingFaceCacheEnv, true, 'Chatterbox launch should route Hugging Face cache to managed storage.');
+  assert.strictEqual(chatterboxManifest.launchEnvironment?.setTorchCacheEnv, true, 'Chatterbox launch should route Torch cache to managed storage.');
+  assert.strictEqual(chatterboxManifest.launchEnvironment?.setTempEnv, true, 'Chatterbox launch should route TEMP/TMP to managed storage.');
+  assert.strictEqual(chatterboxManifest.launchEnvironment?.includeBundledFfmpeg, true, 'Chatterbox WebUI launch should expose bundled FFmpeg for pydub.');
+  const processServiceSource = fs.readFileSync(path.join(process.cwd(), 'electron/services/processService.js'), 'utf8');
+  assert(processServiceSource.includes('getPipelineOnlyLaunchMessage'), 'Process launch should have a plain-English message for pipeline-only tools.');
+  assert(processServiceSource.includes("interfaceMode || '').trim().toLowerCase() === 'pipeline-only'"), 'Process launch should reject pipeline-only tools before marking them running.');
+  const libraryCardSource = fs.readFileSync(path.join(process.cwd(), 'src/components/LibraryCard.jsx'), 'utf8');
+  assert(libraryCardSource.includes('pipelineOnlyMessage'), 'Library cards should explain pipeline-only tools instead of silently launching them.');
+  assert(libraryCardSource.includes('Pipeline Builder'), 'Library cards should keep a generic pipeline-only fallback for tools that need it.');
+  assert(libraryCardSource.includes('Only clone voices you have permission to use.'), 'Library cards should surface the Chatterbox voice permission warning.');
+  const installerGridSource = fs.readFileSync(path.join(process.cwd(), 'src/components/InstallerGrid.jsx'), 'utf8');
+  assert(installerGridSource.includes('pipelineOnlyMessage'), 'Installed Store cards should explain pipeline-only tools instead of offering a silent launch.');
+  assert(installerGridSource.includes('Pipeline Builder'), 'Installed Store cards should keep a generic pipeline-only fallback for tools that need it.');
+  assert(installerGridSource.includes('Only clone voices you have permission to use.'), 'Installed Store cards should surface the Chatterbox voice permission warning.');
   const faceFusionManifest = manifestTools.find((tool) => tool.id === 'facefusion');
   assert(faceFusionManifest, 'FaceFusion should remain present in the tool manifest.');
   const faceFusionPipInstalls = faceFusionManifest.installInstructions?.pipInstalls || [];
@@ -156,12 +187,24 @@ async function main() {
   assert(installerSource.includes('repair-python-environment'), 'Managed repair should remove the old Python environment with retrying cleanup before rebuilding it.');
   assert(installerSource.includes('still running or Windows is holding files open'), 'Managed repair should tell users when a tool is still running or files are locked.');
   assert(installerSource.includes('gradio_client') && installerSource.includes('has_media_data'), 'RVC install verification should check the gradio_client media_data compatibility surface.');
+  assert(installerSource.includes('verifyChatterboxManagedPipelineReadiness'), 'Managed install/repair should verify Chatterbox imports and CUDA readiness.');
+  assert(installerSource.includes('buildChatterboxPipelineVerificationScript'), 'Managed install/repair should include a Chatterbox import probe.');
+  assert(installerSource.includes('["pkg_resources", "pkg_resources"]'), 'Chatterbox install verification should check pkg_resources.');
+  assert(installerSource.includes('cudaAvailable'), 'Chatterbox install verification should check CUDA availability.');
+  assert(installerSource.includes('CHATTERBOX_SERVER_LAUNCH_SHIM'), 'Managed install/repair should write the Chatterbox WebUI localhost launch shim.');
+  assert(installerSource.includes('serverTurboAvailable'), 'Managed install/repair should verify the Chatterbox-TTS-Server Turbo surface when server files are present.');
 
   const runtimeRecoverySource = fs.readFileSync(path.join(process.cwd(), 'electron/services/runtimeRecoveryService.js'), 'utf8');
   assert(runtimeRecoverySource.includes('rvc-gradio-client-media-data'), 'Runtime recovery should classify the RVC gradio_client media_data ImportError.');
   assert(runtimeRecoverySource.includes('facefusion-missing-opencv'), 'Runtime recovery should classify FaceFusion missing cv2/OpenCV errors.');
   assert(runtimeRecoverySource.includes('facefusion-missing-onnxruntime'), 'Runtime recovery should classify FaceFusion missing ONNX Runtime errors.');
   assert(runtimeRecoverySource.includes('facefusion-missing-ffmpeg-runtime'), 'Runtime recovery should classify FaceFusion missing FFmpeg launch-runtime errors.');
+  assert(runtimeRecoverySource.includes('chatterbox-setuptools-pkg-resources'), 'Runtime recovery should classify Chatterbox setuptools/pkg_resources failures.');
+  assert(runtimeRecoverySource.includes('chatterbox-insufficient-vram'), 'Runtime recovery should classify Chatterbox CUDA OOM failures.');
+  assert(runtimeRecoverySource.includes('chatterbox-cuda-unavailable'), 'Runtime recovery should classify Chatterbox CUDA availability failures.');
+  assert(runtimeRecoverySource.includes('chatterbox-port-in-use'), 'Runtime recovery should classify Chatterbox WebUI port conflicts.');
+  assert(runtimeRecoverySource.includes('chatterbox-config-invalid'), 'Runtime recovery should classify Chatterbox WebUI config failures.');
+  assert(runtimeRecoverySource.includes('chatterbox-model-download-failed'), 'Runtime recovery should classify Chatterbox model/cache download failures.');
   const { diagnoseLaunchFailure } = require('../electron/services/runtimeRecoveryService');
   const rvcDependencyDiagnosis = diagnoseLaunchFailure(
     { id: 'rvc', name: 'RVC (Retrieval Voice Cloning)' },
@@ -178,6 +221,37 @@ async function main() {
   );
   assert.strictEqual(faceFusionOnnxDiagnosis.id, 'facefusion-missing-onnxruntime', 'Runtime recovery should identify the FaceFusion missing onnxruntime import failure.');
   assert.strictEqual(faceFusionOnnxDiagnosis.action, 'repair-python-environment', 'Runtime recovery should route missing FaceFusion onnxruntime to managed repair.');
+
+  const chatterboxSetuptoolsDiagnosis = diagnoseLaunchFailure(
+    { id: 'chatterbox-tts', name: 'Chatterbox-Turbo TTS' },
+    'ModuleNotFoundError: No module named pkg_resources while loading PerthImplicitWatermarker',
+    {},
+  );
+  assert.strictEqual(chatterboxSetuptoolsDiagnosis.id, 'chatterbox-setuptools-pkg-resources', 'Runtime recovery should identify Chatterbox pkg_resources failures.');
+  assert.strictEqual(chatterboxSetuptoolsDiagnosis.action, 'repair-python-environment', 'Runtime recovery should route Chatterbox pkg_resources failures to managed repair.');
+
+  const chatterboxOomDiagnosis = diagnoseLaunchFailure(
+    { id: 'chatterbox-tts', name: 'Chatterbox-Turbo TTS' },
+    'CUDA error: out of memory',
+    {},
+  );
+  assert.strictEqual(chatterboxOomDiagnosis.id, 'chatterbox-insufficient-vram', 'Runtime recovery should identify Chatterbox CUDA OOM failures.');
+  assert.strictEqual(chatterboxOomDiagnosis.action, 'none', 'Runtime recovery should not retry aggressively after Chatterbox CUDA OOM.');
+
+  const chatterboxPortDiagnosis = diagnoseLaunchFailure(
+    { id: 'chatterbox-tts', name: 'Chatterbox-Turbo TTS' },
+    'OSError: [WinError 10048] Only one usage of each socket address is normally permitted',
+    {},
+  );
+  assert.strictEqual(chatterboxPortDiagnosis.id, 'chatterbox-port-in-use', 'Runtime recovery should identify Chatterbox WebUI port conflicts.');
+  assert.strictEqual(chatterboxPortDiagnosis.action, 'none', 'Runtime recovery should not repair Python for Chatterbox port conflicts.');
+
+  const chatterboxConfigDiagnosis = diagnoseLaunchFailure(
+    { id: 'chatterbox-tts', name: 'Chatterbox-Turbo TTS' },
+    'yaml.parser.ParserError: while parsing config.yaml',
+    {},
+  );
+  assert.strictEqual(chatterboxConfigDiagnosis.id, 'chatterbox-config-invalid', 'Runtime recovery should identify Chatterbox WebUI config failures.');
 
   const faceFusionFfmpegDiagnosis = diagnoseLaunchFailure(
     { id: 'facefusion', name: 'FaceFusion' },

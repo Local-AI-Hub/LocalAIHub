@@ -32,6 +32,10 @@ function verifyPipelineBuilderSourceGuards() {
   assert(!/selectedNode\.type === 'imageAnalyze'/.test(source), 'Expected removed standalone image analysis inspector branches to stay gone.');
   assert(!/selectedNode\.type === 'whisperTranscribe'/.test(source), 'Expected removed standalone transcription inspector branches to stay gone.');
   assert(source.includes('<option value="continuation">Continuation</option>'), 'Expected Model Step AudioCraft mode picker to expose continuation mode.');
+  assert(source.includes('<option value="referenceVoiceTts">Reference Voice TTS</option>'), 'Expected Model Step audio mode picker to expose Reference Voice TTS.');
+  assert(source.includes('Only clone voices you have permission to use.'), 'Expected Model Step Reference Voice TTS UI to show the consent warning.');
+  assert(source.includes('Connect text to Input and the voice sample to Reference Audio.'), 'Expected Reference Voice TTS UI to name both required inputs.');
+  assert(source.includes("tool.id !== 'chatterbox-tts'"), 'Expected Map Collection local audio tool picker to exclude Chatterbox because it requires a separate Reference Audio input.');
   assert(source.includes('llm-local-audio-seed'), 'Expected Model Step AudioCraft continuation UI to expose seed seconds.');
   assert(source.includes('llm-local-audio-repeat'), 'Expected Model Step AudioCraft continuation UI to expose repeat count.');
   assert(source.includes('Each repeat uses the end of the current audio as the next seed'), 'Expected Model Step AudioCraft continuation UI to explain repeat continuation semantics.');
@@ -91,6 +95,44 @@ async function main() {
   assert(node && node.type === 'llmPrompt', 'Expected createPositionedNode to build a Model Step node from the palette shape.');
   assert.strictEqual(node.label, 'Model Step', 'Expected fresh Model Step nodes to use the Model Step label.');
   assert.deepStrictEqual(node.position, { x: 120, y: 120 }, 'Expected the palette-created first Model Step node to use the default positioned layout.');
+
+  const referenceVoiceNode = {
+    ...node,
+    id: 'reference-voice-node',
+    config: {
+      ...node.config,
+      executionMode: 'localTool',
+      operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'chatterbox-tts',
+      audioMode: 'referenceVoiceTts',
+    },
+  };
+  const referenceVoiceInputPorts = pipelineSchema.getPipelineNodePorts(referenceVoiceNode, 'input');
+  assert(referenceVoiceInputPorts.some((port) => port.id === 'prompt'), 'Expected Reference Voice TTS Model Step to keep the text prompt input.');
+  const referenceAudioPort = referenceVoiceInputPorts.find((port) => port.id === 'referenceAudio');
+  assert(referenceAudioPort, 'Expected Reference Voice TTS Model Step to expose the dynamic Reference Audio input.');
+  assert(pipelineSchema.getPortAllowedKinds(referenceAudioPort, { direction: 'input', node: referenceVoiceNode }).includes(pipelineSchema.PORT_KIND_AUDIO), 'Expected Reference Audio port to accept audio artifacts.');
+  const referenceVoiceOutputPorts = pipelineSchema.getPipelineNodePorts(referenceVoiceNode, 'output');
+  assert(referenceVoiceOutputPorts.some((port) => port.id === 'audio'), 'Expected Reference Voice TTS Model Step to output audio.');
+
+  const textToReferenceVoicePipeline = {
+    nodes: [
+      { id: 'text-input', type: 'textInput', label: 'Speech Text', config: { text: 'This is a short Local AI Hub voice test.' } },
+      { id: 'reference-audio', type: 'audioInput', label: 'Reference Voice', config: { filePath: 'D:/reference.wav' } },
+      referenceVoiceNode,
+      { id: 'audio-output', type: 'audioOutput', label: 'Audio Output', config: {} },
+    ],
+    edges: [
+      { id: 'text-edge', source: { nodeId: 'text-input', portId: 'text' }, target: { nodeId: 'reference-voice-node', portId: 'prompt' } },
+      { id: 'reference-edge', source: { nodeId: 'reference-audio', portId: 'audio' }, target: { nodeId: 'reference-voice-node', portId: 'referenceAudio' } },
+      { id: 'audio-edge', source: { nodeId: 'reference-voice-node', portId: 'audio' }, target: { nodeId: 'audio-output', portId: 'audio' } },
+    ],
+  };
+  const referenceVoiceAnalysis = pipelineSchema.analyzePipeline(textToReferenceVoicePipeline, {
+    tools: [{ id: 'chatterbox-tts', name: 'Chatterbox-Turbo TTS', status: 'stopped', installDir: 'D:/tools/chatterbox-tts', appDir: 'D:/tools/chatterbox-tts' }],
+  });
+  assert(['info', 'warn'].includes(referenceVoiceAnalysis.nodeSummaries['reference-voice-node'].readiness.tone), 'Expected Reference Voice TTS Model Step to be analyzable when text and reference audio are connected.');
+  assert(referenceVoiceAnalysis.nodeSummaries['reference-voice-node'].readiness.message.includes('Only clone voices you have permission to use.'), 'Expected Reference Voice TTS analysis to include the consent warning.');
 
   const inputPorts = pipelineSchema.getPipelineNodePorts(node, 'input');
   const outputPorts = pipelineSchema.getPipelineNodePorts(node, 'output');

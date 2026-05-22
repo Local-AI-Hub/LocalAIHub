@@ -238,6 +238,37 @@ function createAudiocraftTextToAudioPipeline(promptText) {
   };
 }
 
+function createChatterboxReferenceVoicePipeline(promptText, referenceAudioPath, options = {}) {
+  const includeTextEdge = options.includeTextEdge !== false;
+  const includeReferenceAudioEdge = options.includeReferenceAudioEdge !== false;
+  const nodes = [
+    { id: 'text-input', type: 'textInput', label: 'Speech Text', config: { text: promptText } },
+    { id: 'reference-audio', type: 'audioInput', label: 'Reference Voice', config: { filePath: referenceAudioPath } },
+    {
+      id: 'reference-voice-tts',
+      type: 'llmPrompt',
+      label: 'Reference Voice TTS',
+      config: {
+        executionMode: 'localTool',
+        operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+        toolId: 'chatterbox-tts',
+        audioMode: 'referenceVoiceTts',
+      },
+    },
+    { id: 'audio-output', type: 'audioOutput', label: 'Generated Voice Output', config: { title: 'Reference voice result' } },
+  ];
+  const edges = [
+    { id: 'edge-output', source: { nodeId: 'reference-voice-tts', portId: 'audio' }, target: { nodeId: 'audio-output', portId: 'audio' } },
+  ];
+  if (includeTextEdge) {
+    edges.push({ id: 'edge-text', source: { nodeId: 'text-input', portId: 'text' }, target: { nodeId: 'reference-voice-tts', portId: 'prompt' } });
+  }
+  if (includeReferenceAudioEdge) {
+    edges.push({ id: 'edge-reference-audio', source: { nodeId: 'reference-audio', portId: 'audio' }, target: { nodeId: 'reference-voice-tts', portId: 'referenceAudio' } });
+  }
+  return { id: 'chatterbox-reference-voice-pipeline', name: 'Chatterbox Reference Voice Pipeline', nodes, edges };
+}
+
 function createAudiocraftAudioGuidancePipeline(audioPath, audioMode = 'music') {
   return {
     id: 'audiocraft-audio-guidance-pipeline',
@@ -418,6 +449,21 @@ function createAudiocraftTool(overrides = {}) {
     launchSupported: overrides.launchSupported !== false,
     lastError: overrides.lastError || '',
     name: 'AudioCraft WebUI',
+    pythonBootstrapPath: overrides.pythonBootstrapPath || 'python',
+    status: overrides.status || 'stopped',
+    ...overrides,
+  };
+}
+
+function createChatterboxTool(overrides = {}) {
+  return {
+    id: 'chatterbox-tts',
+    appDir: overrides.appDir || overrides.installDir || '',
+    installDir: overrides.installDir || '',
+    launchProfile: overrides.launchProfile || { kind: 'python-script', pythonPath: 'python' },
+    launchSupported: overrides.launchSupported !== false,
+    lastError: overrides.lastError || '',
+    name: 'Chatterbox-Turbo TTS',
     pythonBootstrapPath: overrides.pythonBootstrapPath || 'python',
     status: overrides.status || 'stopped',
     ...overrides,
@@ -791,6 +837,130 @@ async function verifyAudiocraftGuidedPipelineRun(tempRoot, sourceAudioPath) {
   const sidecarPath = result.supportingPaths.find((entry) => entry.endsWith('.audio.json'));
   const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
   assert.strictEqual(sidecar.audioGeneration.sourceAudio.fileName, path.basename(sourceAudioPath), 'Expected the saved audio sidecar to preserve the routed source audio reference.');
+}
+
+function verifyChatterboxReadinessStates(tempRoot, audioPath) {
+  const readyDefinition = createChatterboxReferenceVoicePipeline('This is a short Local AI Hub voice test.', audioPath);
+  const missingToolAnalysis = pipelineSchema.analyzePipeline(readyDefinition, { tools: [] });
+  assert.strictEqual(missingToolAnalysis.nodeSummaries['reference-voice-tts'].readiness.tone, 'error', 'Expected missing Chatterbox readiness to fail.');
+  assert(missingToolAnalysis.nodeSummaries['reference-voice-tts'].readiness.message.includes('Install Chatterbox-Turbo'), 'Expected missing Chatterbox readiness to explain that Chatterbox-Turbo must be installed.');
+
+  const missingTextAnalysis = pipelineSchema.analyzePipeline(createChatterboxReferenceVoicePipeline('This text is intentionally disconnected.', audioPath, { includeTextEdge: false }), {
+    tools: [createChatterboxTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
+  });
+  assert.strictEqual(missingTextAnalysis.nodeSummaries['reference-voice-tts'].readiness.tone, 'error', 'Expected Reference Voice TTS readiness to fail without connected text.');
+  assert(missingTextAnalysis.nodeSummaries['reference-voice-tts'].readiness.message.includes('connected text'), 'Expected missing text readiness to name the required text input.');
+
+  const missingReferenceAnalysis = pipelineSchema.analyzePipeline(createChatterboxReferenceVoicePipeline('This is a short Local AI Hub voice test.', audioPath, { includeReferenceAudioEdge: false }), {
+    tools: [createChatterboxTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
+  });
+  assert.strictEqual(missingReferenceAnalysis.nodeSummaries['reference-voice-tts'].readiness.tone, 'error', 'Expected Reference Voice TTS readiness to fail without reference audio.');
+  assert(missingReferenceAnalysis.nodeSummaries['reference-voice-tts'].readiness.message.includes('Reference Audio'), 'Expected missing reference audio readiness to name the Reference Audio input.');
+
+  const readyAnalysis = pipelineSchema.analyzePipeline(readyDefinition, {
+    tools: [createChatterboxTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
+  });
+  const readySummary = readyAnalysis.nodeSummaries['reference-voice-tts'];
+  assert(['info', 'warn'].includes(readySummary.readiness.tone), 'Expected installed Chatterbox readiness to be runnable or startable.');
+  assert(readySummary.readiness.message.includes('Only clone voices you have permission to use.'), 'Expected Reference Voice TTS readiness to include the consent warning.');
+  assert.strictEqual(readySummary.capabilitySummary.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE, 'Expected Reference Voice TTS capability to resolve to audio generation.');
+  assert.strictEqual(readySummary.capabilitySummary.targetId, 'chatterbox-tts', 'Expected Reference Voice TTS to resolve to Chatterbox-Turbo.');
+  assert(readySummary.capabilitySummary.outputKinds.includes('audio'), 'Expected Reference Voice TTS to produce audio output.');
+
+  const ports = pipelineSchema.getPipelineNodePorts(readyDefinition.nodes.find((node) => node.id === 'reference-voice-tts'), 'input');
+  const referencePort = ports.find((port) => port.id === 'referenceAudio');
+  assert(referencePort, 'Expected Reference Voice TTS Model Step to expose the dynamic Reference Audio input.');
+  assert(pipelineSchema.getPortAllowedKinds(referencePort, { direction: 'input', node: readyDefinition.nodes.find((node) => node.id === 'reference-voice-tts') }).includes(pipelineSchema.PORT_KIND_AUDIO), 'Expected the Reference Audio input to accept audio artifacts.');
+
+  const wrongToolAnalysis = pipelineSchema.analyzePipeline({
+    ...readyDefinition,
+    nodes: readyDefinition.nodes.map((node) => node.id === 'reference-voice-tts' ? { ...node, config: { ...node.config, toolId: 'audiocraft-webui' } } : node),
+  }, {
+    tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
+  });
+  assert.strictEqual(wrongToolAnalysis.nodeSummaries['reference-voice-tts'].readiness.tone, 'error', 'Expected Reference Voice TTS readiness to reject AudioCraft.');
+  assert(wrongToolAnalysis.nodeSummaries['reference-voice-tts'].readiness.message.includes('Chatterbox-Turbo'), 'Expected wrong-tool readiness to point users back to Chatterbox-Turbo.');
+}
+
+async function verifyChatterboxReferenceVoicePipelineRun(tempRoot, referenceAudioPath) {
+  const toolEntries = [createChatterboxTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })];
+  const audioCalls = [];
+  const service = createPipelineExecutionService(tempRoot, toolEntries, {
+    generateAudioFixture: async ({ artifactService, request, tool }) => {
+      audioCalls.push({ request, tool });
+      assert.strictEqual(tool.id, 'chatterbox-tts', 'Expected Reference Voice TTS to call the Chatterbox local audio tool.');
+      assert.strictEqual(request.audioMode, 'referenceVoiceTts', 'Expected Reference Voice TTS request mode.');
+      assert.strictEqual(request.prompt, 'This is a short Local AI Hub voice test.', 'Expected Chatterbox to speak the exact connected text without a cloud TTS wrapper.');
+      assert.strictEqual(request.referenceAudioPath, referenceAudioPath, 'Expected Chatterbox request to receive the Reference Audio file path.');
+      assert.strictEqual(request.referenceAudioArtifact.fileName, path.basename(referenceAudioPath), 'Expected Chatterbox request to receive reference audio artifact metadata.');
+      assert(request.cancelSignal, 'Expected Reference Voice TTS execution to pass the active pipeline cancel signal.');
+      const outputPath = path.join(request.runDirectories.artifactsDir, 'chatterbox-reference-voice-result.wav');
+      await fsp.writeFile(outputPath, createWaveBuffer({ channelCount: 1, durationSeconds: 2, frequency: 380, sampleRate: 24000 }));
+      const artifact = await artifactService.buildFileArtifact(outputPath, {
+        audio: { channelCount: 1, durationSeconds: 2, sampleRate: 24000 },
+        audioGeneration: {
+          backend: 'chatterbox-tts',
+          backendLabel: 'Chatterbox-Turbo',
+          consentWarning: 'Only clone voices you have permission to use.',
+          consentWarningAcknowledged: false,
+          consentWarningDisplayed: true,
+          device: 'cuda',
+          durationSeconds: 2,
+          gpuName: 'NVIDIA GeForce GTX 1060 6GB',
+          mode: 'referenceVoiceTts',
+          model: 'ResembleAI/chatterbox-turbo',
+          operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+          operationSubtype: 'referenceVoiceTts',
+          packageVersion: '0.1.7',
+          prompt: request.prompt,
+          referenceAudio: {
+            displayName: request.referenceAudioArtifact.displayName,
+            fileName: request.referenceAudioArtifact.fileName,
+            filePath: request.referenceAudioArtifact.filePath,
+            kind: request.referenceAudioArtifact.kind,
+            mimeType: request.referenceAudioArtifact.mimeType,
+            sizeBytes: request.referenceAudioArtifact.sizeBytes,
+          },
+          referenceAudioPath: request.referenceAudioPath,
+          referenceDurationSeconds: 6,
+          sampleRate: 24000,
+          textLength: request.prompt.length,
+          toolId: tool.id,
+          toolLabel: tool.name,
+          torchVersion: '2.6.0+cu124',
+        },
+        displayName: request.displayName || request.nodeLabel || 'Reference voice audio',
+        kind: pipelineSchema.PORT_KIND_AUDIO,
+        role: 'generated',
+      });
+      return {
+        destinationPath: artifact.filePath,
+        message: tool.name + ' generated reference voice speech locally.',
+        outputs: { audio: artifact },
+        preview: artifactService.summarizeArtifact(artifact),
+      };
+    },
+  });
+
+  const completedRun = await runPipelineToCompletion(service, createChatterboxReferenceVoicePipeline('This is a short Local AI Hub voice test.', referenceAudioPath));
+  assert.strictEqual(completedRun.status, 'completed', 'Expected the Chatterbox reference voice pipeline to complete successfully.');
+  assert.strictEqual(audioCalls.length, 1, 'Expected the Chatterbox local audio adapter to run exactly once.');
+  const result = completedRun.terminalResults[0];
+  assert.strictEqual(result.kind, 'audio', 'Expected Reference Voice TTS to end with an audio artifact.');
+  assert.strictEqual(result.audio.sampleRate, 24000, 'Expected Reference Voice TTS audio metadata to preserve 24 kHz output.');
+  assert.strictEqual(result.audio.channelCount, 1, 'Expected Reference Voice TTS audio metadata to preserve mono output.');
+  assert.strictEqual(result.audioGeneration.backend, 'chatterbox-tts', 'Expected terminal metadata to preserve Chatterbox backend id.');
+  assert.strictEqual(result.audioGeneration.operationSubtype, 'referenceVoiceTts', 'Expected terminal metadata to preserve Reference Voice TTS subtype.');
+  assert.strictEqual(result.audioGeneration.referenceAudio.fileName, path.basename(referenceAudioPath), 'Expected terminal metadata to preserve reference audio lineage.');
+  assert.strictEqual(result.audioGeneration.consentWarning, 'Only clone voices you have permission to use.', 'Expected terminal metadata to preserve the consent warning.');
+  assert.strictEqual(result.audioGeneration.device, 'cuda', 'Expected terminal metadata to preserve CUDA device.');
+  assert(result.supportingPaths.some((entry) => entry.endsWith('.audio.json')), 'Expected Reference Voice TTS output to save an audio metadata sidecar.');
+  const sidecarPath = result.supportingPaths.find((entry) => entry.endsWith('.audio.json'));
+  const sidecar = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'));
+  assert.strictEqual(sidecar.audioGeneration.mode, 'referenceVoiceTts', 'Expected saved Chatterbox sidecar to preserve the mode.');
+  assert.strictEqual(sidecar.audioGeneration.backendLabel, 'Chatterbox-Turbo', 'Expected saved Chatterbox sidecar to preserve the backend label.');
+  assert.strictEqual(sidecar.audioGeneration.referenceAudio.fileName, path.basename(referenceAudioPath), 'Expected saved Chatterbox sidecar to preserve reference audio metadata.');
+  assert.strictEqual(sidecar.audioGeneration.torchVersion, '2.6.0+cu124', 'Expected saved Chatterbox sidecar to preserve torch version metadata.');
 }
 
 function verifyRvcReadinessStates(tempRoot, audioPath) {
@@ -1494,6 +1664,200 @@ async function verifyAudiocraftPipelineEnvironmentContract(tempRoot) {
   assert.strictEqual(warningOnlyFailure, 'The selected AudioCraft snapshot folder could not be found anymore.', 'AudioCraft helper failures should prefer structured helper errors over warning-only stderr.');
 }
 
+async function verifyChatterboxPipelineEnvironmentContract(tempRoot) {
+  const manifestPath = path.resolve(__dirname, '..', 'electron', 'config', 'tools-manifest.json');
+  const manifestTools = JSON.parse(await fsp.readFile(manifestPath, 'utf8'));
+  const chatterboxManifest = manifestTools.find((tool) => tool.id === 'chatterbox-tts');
+  assert(chatterboxManifest, 'Chatterbox-Turbo TTS should be present in the tool manifest.');
+  assert.strictEqual(chatterboxManifest.interfaceMode, 'external-browser', 'Chatterbox-Turbo should expose a managed WebUI while keeping the direct pipeline helper path.');
+  assert.strictEqual(chatterboxManifest.launchCommand, 'python .localaihub_launch_chatterbox_server.py --port {port}', 'Chatterbox WebUI launch should use the Local AI Hub localhost shim.');
+  assert.strictEqual(chatterboxManifest.healthCheckPath, '/api/ui/initial-data', 'Chatterbox WebUI readiness should probe a UI endpoint.');
+  assert.strictEqual(chatterboxManifest.installInstructions?.pythonRequirement, '>=3.11,<3.12', 'Chatterbox-Turbo install should prefer Python 3.11.');
+  const pipInstalls = chatterboxManifest.installInstructions?.pipInstalls || [];
+  assert(pipInstalls.some((entry) => entry.value === 'torch==2.6.0+cu124' && (entry.pipArgs || []).includes('https://download.pytorch.org/whl/cu124')), 'Chatterbox install should install CUDA torch 2.6.0 before Chatterbox.');
+  assert(pipInstalls.some((entry) => entry.value === 'torchaudio==2.6.0+cu124' && (entry.pipArgs || []).includes('https://download.pytorch.org/whl/cu124')), 'Chatterbox install should install CUDA torchaudio 2.6.0 before Chatterbox.');
+  assert(pipInstalls.some((entry) => entry.value === 'chatterbox-tts==0.1.7'), 'Chatterbox install should pin the smoke-tested chatterbox-tts version.');
+  assert(pipInstalls.some((entry) => entry.value === 'setuptools<81'), 'Chatterbox install should pin setuptools below 81 for pkg_resources compatibility.');
+  assert(pipInstalls.some((entry) => entry.value === 'fastapi>=0.100.0,<0.116.0'), 'Chatterbox WebUI install should include FastAPI.');
+  assert(pipInstalls.some((entry) => entry.value === 'uvicorn[standard]>=0.27.0'), 'Chatterbox WebUI install should include uvicorn.');
+  assert.strictEqual(chatterboxManifest.launchEnvironment?.setHuggingFaceCacheEnv, true, 'Chatterbox launch env should route Hugging Face cache through managed storage.');
+  assert.strictEqual(chatterboxManifest.launchEnvironment?.setTorchCacheEnv, true, 'Chatterbox launch env should route Torch cache through managed storage.');
+  assert.strictEqual(chatterboxManifest.launchEnvironment?.setTempEnv, true, 'Chatterbox launch env should route TEMP/TMP through managed storage.');
+
+  const installerSource = await fsp.readFile(path.resolve(__dirname, '..', 'electron', 'services', 'installerService.js'), 'utf8');
+  assert(installerSource.includes('verifyChatterboxManagedPipelineReadiness'), 'Chatterbox install/repair finalization should verify imports before reporting readiness.');
+  assert(installerSource.includes('buildChatterboxPipelineVerificationScript'), 'Chatterbox install/repair should include a focused Python import probe.');
+  assert(installerSource.includes('["pkg_resources", "pkg_resources"]'), 'Chatterbox install verification should check pkg_resources.');
+  assert(installerSource.includes('cudaAvailable'), 'Chatterbox install verification should check CUDA availability.');
+
+  const helperSource = await fsp.readFile(path.resolve(__dirname, '..', 'electron', 'helpers', 'run_chatterbox_tts_task.py'), 'utf8');
+  assert(helperSource.includes('MIN_REFERENCE_SECONDS = 5.0'), 'Chatterbox helper should enforce the smoke-tested minimum reference duration.');
+  assert(helperSource.includes('encoding="utf-8-sig"'), 'Chatterbox helper should tolerate BOM-marked JSON request files from Windows tooling.');
+  assert(helperSource.includes('ChatterboxTurboTTS.from_pretrained'), 'Chatterbox helper should load the Turbo model through the documented API.');
+  assert(helperSource.includes('audio_prompt_path=str(reference_audio_path)'), 'Chatterbox helper should pass the reference audio path into generation.');
+  assert(helperSource.includes('pkg_resources'), 'Chatterbox helper should classify the known setuptools/pkg_resources issue.');
+  assert(helperSource.includes('torch.cuda.is_available()'), 'Chatterbox helper should require CUDA unless CPU fallback is explicitly enabled.');
+  assert(helperSource.includes('cuda-oom'), 'Chatterbox helper should classify CUDA OOM separately.');
+  assert(helperSource.includes('model-download-failed'), 'Chatterbox helper should classify Hugging Face/cache failures separately.');
+
+  const localAudioSource = await fsp.readFile(path.resolve(__dirname, '..', 'electron', 'services', 'localAudioService.js'), 'utf8');
+  assert(localAudioSource.includes('run_chatterbox_tts_task.py'), 'localAudioService should register the Chatterbox helper.');
+  assert(localAudioSource.includes('checkChatterboxPipelineReadiness'), 'localAudioService should expose Chatterbox readiness checks.');
+  assert(localAudioSource.includes('timeoutMs: Math.max(60000'), 'Chatterbox runtime should pass a bounded timeout to the helper.');
+  assert(localAudioSource.includes('signal: options.cancelSignal'), 'Chatterbox runtime should pass the pipeline cancel signal to the helper.');
+
+  const readinessService = loadModuleWithStubs('electron/services/localAudioService.js', {
+    '/electron/services/localAudioService.js': {
+      './commandService': {
+        runCommand: async () => ({
+          code: 3,
+          stderr: '',
+          stdout: '{"ready":false,"missing":["chatterbox.tts_turbo","pkg_resources"],"failures":[],"cudaAvailable":false,"torchVersion":"2.6.0+cpu"}\n',
+        }),
+      },
+      './logService': {
+        createLogger: () => ({ info: async () => {}, warn: async () => {} }),
+      },
+      './pipelineArtifactService': {
+        buildFileArtifact: async () => { throw new Error('Not used in Chatterbox readiness verification.'); },
+        summarizeArtifact: () => ({}),
+      },
+      './processService': {
+        buildLaunchRuntimeEnv: async () => ({ HF_HOME: path.join(tempRoot, 'hf-home'), PYTHONUTF8: '1', TORCH_HOME: path.join(tempRoot, 'torch-home') }),
+        summarizeLaunchRuntimeEnv: () => ({ hfHome: true, torchHome: true }),
+      },
+    },
+  });
+  const readiness = await readinessService.checkChatterboxPipelineReadiness(createChatterboxTool({
+    appDir: tempRoot,
+    installDir: tempRoot,
+    launchProfile: { kind: 'python-script', pythonPath: 'python' },
+    pythonBootstrapPath: 'python',
+  }));
+  assert.strictEqual(readiness.ready, false, 'Chatterbox readiness should fail when pipeline imports are missing.');
+  assert.strictEqual(readiness.reason, 'missing-packages', 'Chatterbox readiness should distinguish missing pipeline packages before CUDA repair advice.');
+  assert(readiness.message.includes('chatterbox.tts_turbo') && readiness.message.includes('pkg_resources'), 'Chatterbox missing-package readiness should name the missing imports.');
+  assert(readinessService._test.CHATTERBOX_PIPELINE_IMPORT_CHECKS.some((entry) => entry.moduleName === 'pkg_resources'), 'Chatterbox readiness should verify pkg_resources for the setuptools<81 issue.');
+  const cudaMessage = readinessService._test.buildChatterboxCudaFailureMessage({ torchVersion: '2.6.0+cpu' });
+  assert(cudaMessage.includes('CUDA-enabled PyTorch') && cudaMessage.includes('2.6.0+cpu'), 'Chatterbox CUDA failure helper should give a specific repair message.');
+
+  const recoverySource = await fsp.readFile(path.resolve(__dirname, '..', 'electron', 'services', 'runtimeRecoveryService.js'), 'utf8');
+  assert(recoverySource.includes('chatterbox-setuptools-pkg-resources'), 'Runtime recovery should classify Chatterbox pkg_resources failures.');
+  assert(recoverySource.includes('chatterbox-insufficient-vram'), 'Runtime recovery should classify Chatterbox CUDA OOM failures.');
+  assert(recoverySource.includes('chatterbox-cuda-unavailable'), 'Runtime recovery should classify Chatterbox CUDA availability failures.');
+}
+
+async function verifyChatterboxLocalAudioHelperContract(tempRoot, referenceAudioPath) {
+  const artifactService = createPipelineArtifactService(tempRoot);
+  const toolRoot = path.join(tempRoot, 'chatterbox-local-audio-contract');
+  await fsp.mkdir(toolRoot, { recursive: true });
+  const runDirectories = {
+    artifactsDir: path.join(tempRoot, 'chatterbox-local-audio-contract-run', 'artifacts'),
+    outputsDir: path.join(tempRoot, 'chatterbox-local-audio-contract-run', 'outputs'),
+    runDir: path.join(tempRoot, 'chatterbox-local-audio-contract-run'),
+  };
+  await fsp.mkdir(runDirectories.artifactsDir, { recursive: true });
+  await fsp.mkdir(runDirectories.outputsDir, { recursive: true });
+
+  let commandMode = 'success';
+  const commandCalls = [];
+  const cancelController = new AbortController();
+  const service = loadModuleWithStubs('electron/services/localAudioService.js', {
+    '/electron/services/localAudioService.js': {
+      './commandService': {
+        runCommand: async (command, args, options = {}) => {
+          commandCalls.push({ args, command, options });
+          if (args[0] === '-c') {
+            return { code: 0, stderr: '', stdout: '{"ready":true,"missing":[],"failures":[],"cudaAvailable":true,"gpuName":"NVIDIA GeForce GTX 1060 6GB","torchVersion":"2.6.0+cu124"}\n' };
+          }
+          const request = JSON.parse(await fsp.readFile(args[1], 'utf8'));
+          assert.strictEqual(request.text, 'This is a short Local AI Hub voice test.', 'Chatterbox helper request should preserve exact text.');
+          assert.strictEqual(request.referenceAudioPath, referenceAudioPath, 'Chatterbox helper request should preserve the reference audio path.');
+          assert.strictEqual(request.devicePreference, 'cuda', 'Chatterbox helper request should prefer CUDA by default.');
+          assert.strictEqual(request.allowCpu, false, 'Chatterbox helper request should not silently allow CPU fallback.');
+          assert(request.maxTextLength <= 400, 'Chatterbox helper request should keep first-pass text bounded.');
+          assert(options.signal === cancelController.signal, 'Chatterbox helper command should receive the active cancel signal.');
+          assert(Number(options.timeoutMs || 0) >= 60000, 'Chatterbox helper command should receive a timeout guard.');
+          assert(options.env?.HF_HOME && options.env?.TORCH_HOME, 'Chatterbox helper env should inherit managed HF/Torch cache paths.');
+          if (commandMode === 'oom') {
+            return {
+              code: 1,
+              stderr: 'CUDA error: out of memory',
+              stdout: JSON.stringify({ message: 'Chatterbox-Turbo ran out of GPU memory. Try shorter text or a shorter reference clip.', errorType: 'cuda-oom' }) + '\n',
+            };
+          }
+          await fsp.writeFile(request.outputPath, createWaveBuffer({ channelCount: 1, durationSeconds: 2, frequency: 390, sampleRate: 24000 }));
+          return {
+            code: 0,
+            stderr: '',
+            stdout: JSON.stringify({
+              backend: 'chatterbox-tts',
+              backendLabel: 'Chatterbox-Turbo',
+              channels: 1,
+              device: 'cuda',
+              durationSeconds: 2,
+              gpuName: 'NVIDIA GeForce GTX 1060 6GB',
+              message: 'Chatterbox-Turbo generated reference voice speech locally.',
+              model: 'ResembleAI/chatterbox-turbo',
+              outputPath: request.outputPath,
+              packageVersion: '0.1.7',
+              peakAllocatedMb: 3099,
+              peakReservedMb: 3188,
+              referenceDurationSeconds: 6,
+              sampleRate: 24000,
+              textLength: request.text.length,
+              torchVersion: '2.6.0+cu124',
+            }) + '\n',
+          };
+        },
+      },
+      './logService': {
+        createLogger: () => ({ info: async () => {}, warn: async () => {} }),
+      },
+      './pipelineArtifactService': artifactService,
+      './processService': {
+        buildLaunchRuntimeEnv: async () => ({ HF_HOME: path.join(tempRoot, 'hf-home'), PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', TORCH_HOME: path.join(tempRoot, 'torch-home') }),
+        summarizeLaunchRuntimeEnv: () => ({ hfHome: true, torchHome: true }),
+      },
+    },
+  });
+
+  const tool = createChatterboxTool({
+    appDir: toolRoot,
+    installDir: toolRoot,
+    launchProfile: { kind: 'python-script', pythonPath: 'python' },
+    pythonBootstrapPath: 'python',
+    status: 'stopped',
+  });
+  const result = await service.generateAudioWithLocalAudioTool(tool, {
+    cancelSignal: cancelController.signal,
+    displayName: 'Chatterbox Contract Output',
+    prompt: 'This is a short Local AI Hub voice test.',
+    referenceAudioArtifact: { fileName: path.basename(referenceAudioPath), filePath: referenceAudioPath, kind: pipelineSchema.PORT_KIND_AUDIO, mimeType: 'audio/wav', sizeBytes: fs.statSync(referenceAudioPath).size },
+    referenceAudioPath,
+    runDirectories,
+  });
+  assert.strictEqual(result.outputs.audio.kind, pipelineSchema.PORT_KIND_AUDIO, 'Chatterbox helper success should return a normal audio artifact.');
+  assert.strictEqual(result.outputs.audio.audioGeneration.operationSubtype, 'referenceVoiceTts', 'Chatterbox artifact metadata should preserve the operation subtype.');
+  assert.strictEqual(result.outputs.audio.audioGeneration.referenceAudio.fileName, path.basename(referenceAudioPath), 'Chatterbox artifact metadata should preserve reference audio lineage.');
+  assert.strictEqual(result.outputs.audio.audioGeneration.sampleRate, 24000, 'Chatterbox artifact metadata should preserve the output sample rate.');
+  assert.strictEqual(result.outputs.audio.audioGeneration.peakAllocatedMb, 3099, 'Chatterbox artifact metadata should preserve CUDA peak allocation diagnostics.');
+  assert.strictEqual(commandCalls.length, 2, 'Chatterbox contract should run one readiness probe and one helper command.');
+
+  commandMode = 'oom';
+  await assert.rejects(
+    () => service.generateAudioWithLocalAudioTool(tool, {
+      cancelSignal: cancelController.signal,
+      displayName: 'Chatterbox Contract Failure',
+      prompt: 'This is a short Local AI Hub voice test.',
+      referenceAudioPath,
+      runDirectories,
+    }),
+    /out of GPU memory/,
+    'Chatterbox helper failures should preserve CUDA OOM diagnostics.',
+  );
+}
+
 async function verifyCloudAudioPipelineRun(tempRoot) {
   const cases = [
     { provider: createGoogleProvider(), providerId: 'google', model: 'models/gemini-2.5-flash-preview-tts', voice: 'Kore' },
@@ -1581,8 +1945,10 @@ async function main() {
 
   verifyWhisperReadinessStates(audioPath);
   verifyAudiocraftReadinessStates(tempRoot, audioPath);
+  verifyChatterboxReadinessStates(tempRoot, audioPath);
   verifyAudiocraftContinuationHelperSource();
   await verifyAudiocraftPipelineEnvironmentContract(tempRoot);
+  await verifyChatterboxPipelineEnvironmentContract(tempRoot);
   verifyRvcReadinessStates(tempRoot, audioPath);
   await verifyDirectCommandAudioTransformSkipsToolLaunch(tempRoot, audioPath);
   verifyCloudAudioReadinessStates();
@@ -1594,8 +1960,10 @@ async function main() {
   await verifyAudiocraftContinuationPipelineRun(tempRoot, audioPath);
   await verifyAudiocraftAppendSourceContinuationPipelineRun(tempRoot, audioPath);
   await verifyAudiocraftMissingContinuationSourceFails(tempRoot);
+  await verifyChatterboxReferenceVoicePipelineRun(tempRoot, audioPath);
   await verifyRvcPipelineRun(tempRoot, audioPath);
   await verifyRvcLocalAudioHelperContract(tempRoot, audioPath);
+  await verifyChatterboxLocalAudioHelperContract(tempRoot, audioPath);
   await verifyCloudAudioPipelineRun(tempRoot);
 
   console.log('Audio pipeline verification passed.');

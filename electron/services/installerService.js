@@ -1518,6 +1518,159 @@ function resolveLaunchProfileTargetPath(launchProfile) {
   return baseDir ? path.resolve(baseDir, launchProfile.target) : null;
 }
 
+const CHATTERBOX_SERVER_LAUNCH_SHIM = '.localaihub_launch_chatterbox_server.py';
+
+function buildChatterboxServerLaunchShimScript() {
+  return String.raw`from __future__ import annotations
+
+import argparse
+import os
+import runpy
+import sys
+import webbrowser
+from pathlib import Path
+
+
+def deep_update(target, patch):
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            deep_update(target[key], value)
+        else:
+            target[key] = value
+    return target
+
+
+def load_yaml(path):
+    try:
+        import yaml
+        if path.exists():
+            data = yaml.safe_load(path.read_text(encoding="utf-8-sig")) or {}
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def save_yaml(path, data):
+    import yaml
+    path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=False), encoding="utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8004)
+    args, remaining = parser.parse_known_args()
+    root = Path.cwd()
+    server_py = root / "server.py"
+    if not server_py.exists():
+        raise SystemExit("Chatterbox-TTS-Server server.py is missing. Run Repair to restore the WebUI files.")
+
+    for folder in ("voices", "reference_audio", "outputs", "model_cache", "logs"):
+        (root / folder).mkdir(parents=True, exist_ok=True)
+
+    config_path = root / "config.yaml"
+    config = load_yaml(config_path)
+    patch = {
+        "server": {
+            "host": "127.0.0.1",
+            "port": int(args.port),
+            "use_ngrok": False,
+            "use_auth": False,
+            "log_file_path": "logs/tts_server.log",
+        },
+        "model": {
+            "repo_id": "chatterbox-turbo",
+        },
+        "tts_engine": {
+            "device": "cuda",
+            "predefined_voices_path": "voices",
+            "reference_audio_path": "reference_audio",
+        },
+        "paths": {
+            "model_cache": "model_cache",
+            "output": "outputs",
+        },
+        "audio_output": {
+            "format": "wav",
+            "sample_rate": 24000,
+            "save_to_disk": False,
+        },
+    }
+    deep_update(config, patch)
+    save_yaml(config_path, config)
+
+    webbrowser.open = lambda *args, **kwargs: True
+    os.environ.setdefault("TTS_BF16", "off")
+    os.environ["LOCALAIHUB_CHATTERBOX_SERVER"] = "1"
+    sys.argv = [str(server_py)] + remaining
+    runpy.run_path(str(server_py), run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()
+`;
+}
+
+async function ensureChatterboxServerLaunchShim(toolState, manifest, logger) {
+  if (manifest?.id !== 'chatterbox-tts') {
+    return;
+  }
+
+  const appDir = toolState?.appDir || toolState?.installDir;
+  if (!appDir) {
+    return;
+  }
+
+  const serverPath = path.join(appDir, 'server.py');
+  if (!(await fs.pathExists(serverPath))) {
+    return;
+  }
+
+  const shimPath = path.join(appDir, CHATTERBOX_SERVER_LAUNCH_SHIM);
+  await fs.outputFile(shimPath, buildChatterboxServerLaunchShimScript(), 'utf8');
+  await logger.info('Prepared Chatterbox-TTS-Server localhost launch shim.', {
+    path: shimPath,
+    toolId: toolState.id,
+  });
+}
+
+function buildChatterboxPipelineVerificationScript() {
+  return [
+    'import importlib, json, os, sys',
+    'checks = [["torch", "torch"], ["torchaudio", "torchaudio"], ["pkg_resources", "pkg_resources"], ["chatterbox.tts_turbo", "ChatterboxTurboTTS"]]',
+    'server_checks = [["fastapi", "fastapi"], ["uvicorn", "uvicorn"], ["yaml", "PyYAML"], ["jinja2", "Jinja2"], ["aiofiles", "aiofiles"], ["inflect", "inflect"], ["unidecode", "unidecode"], ["audiotsm", "audiotsm"], ["parselmouth", "praat-parselmouth"]]',
+    'if os.path.exists("server.py"):',
+    '    checks.extend(server_checks)',
+    'missing = []',
+    'failures = []',
+    'torch_module = None',
+    'server_turbo_available = None',
+    'for module_name, label in checks:',
+    '    try:',
+    '        module = importlib.import_module(module_name)',
+    '        if module_name == "torch":',
+    '            torch_module = module',
+    '    except ModuleNotFoundError as exc:',
+    '        missing.append(str(getattr(exc, "name", "") or label))',
+    '    except Exception as exc:',
+    '        failures.append({"module": module_name, "label": label, "errorType": exc.__class__.__name__})',
+    'if os.path.exists("server.py") and not missing:',
+    '    try:',
+    '        engine = importlib.import_module("engine")',
+    '        server_turbo_available = bool(getattr(engine, "TURBO_AVAILABLE", False)) and "chatterbox-turbo" in getattr(engine, "MODEL_SELECTOR_MAP", {})',
+    '        if not server_turbo_available:',
+    '            failures.append({"module": "engine", "label": "Chatterbox-TTS-Server Turbo", "errorType": "TurboUnavailable"})',
+    '    except Exception as exc:',
+    '        failures.append({"module": "engine", "label": "Chatterbox-TTS-Server", "errorType": exc.__class__.__name__})',
+    'cuda_available = bool(torch_module and torch_module.cuda.is_available())',
+    'torch_version = str(getattr(torch_module, "__version__", "")) if torch_module else ""',
+    'torch_cuda = str(getattr(getattr(torch_module, "version", None), "cuda", "")) if torch_module else ""',
+    'gpu_name = torch_module.cuda.get_device_name(0) if cuda_available else ""',
+    'payload = {"ready": not missing and not failures and cuda_available, "missing": sorted(set(missing)), "failures": failures, "cudaAvailable": cuda_available, "torchVersion": torch_version, "torchCudaVersion": torch_cuda, "gpuName": gpu_name, "serverTurboAvailable": server_turbo_available}',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
 function buildAudiocraftPipelineVerificationScript() {
   return [
     'import importlib, json, sys',
@@ -1553,6 +1706,22 @@ function parseAudiocraftPipelineVerification(stdout) {
   }
 }
 
+function buildChatterboxPipelineInstallFailureMessage(probe) {
+  const missing = [...new Set((probe?.missing || [])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean))];
+  if (missing.length) {
+    return 'Local AI Hub installed Chatterbox-Turbo TTS, but its Python environment is missing the packages needed for reference voice TTS: ' + missing.join(', ') + '. Run Repair or reinstall Chatterbox-Turbo TTS, then try again.';
+  }
+
+  if (probe && probe.cudaAvailable === false) {
+    const torchVersion = String(probe?.torchVersion || '').trim();
+    const suffix = torchVersion ? ' Current torch version: ' + torchVersion + '.' : '';
+    return 'Local AI Hub installed Chatterbox-Turbo TTS, but PyTorch is not CUDA-enabled or CUDA is unavailable. Run Repair so Local AI Hub can install torch 2.6.0 with CUDA 12.4, then try again.' + suffix;
+  }
+
+  return 'Local AI Hub installed Chatterbox-Turbo TTS, but it could not load the Python packages needed for reference voice TTS. Run Repair or reinstall Chatterbox-Turbo TTS, then try again.';
+}
 function buildAudiocraftPipelineInstallFailureMessage(probe) {
   const missing = [...new Set((probe?.missing || [])
     .map((value) => String(value || '').trim())
@@ -1771,6 +1940,146 @@ async function verifyFaceFusionManagedRuntimeReadiness(toolState, manifest, logg
 
   throw new Error(buildFaceFusionDependencyFailureMessage(probe));
 }
+function buildTripoSrDependencyVerificationScript() {
+  return [
+    'import importlib, json, sys',
+    'checks = [["gradio", "Gradio"], ["rembg", "Rembg"], ["onnxruntime", "ONNX Runtime"], ["torch", "PyTorch"], ["torchmcubes", "torchmcubes"], ["transformers", "Transformers"], ["PIL", "Pillow"], ["xatlas", "xatlas"], ["moderngl", "ModernGL"], ["fastapi", "FastAPI"], ["starlette", "Starlette"], ["uvicorn", "Uvicorn"], ["pydantic", "Pydantic"]]',
+    'expected_versions = {"fastapi": "0.104.1", "starlette": "0.27.0", "uvicorn": "0.24.0.post1", "pydantic": "2.5.3"}',
+    'missing = []',
+    'mismatched = []',
+    'versions = {}',
+    'for module_name, label in checks:',
+    '    try:',
+    '        module = importlib.import_module(module_name)',
+    '        versions[module_name] = str(getattr(module, "__version__", ""))',
+    '        expected = expected_versions.get(module_name)',
+    '        if expected and versions[module_name] != expected:',
+    '            mismatched.append(module_name + "==" + versions[module_name] + " (expected " + expected + ")")',
+    '    except ModuleNotFoundError as exc:',
+    '        missing.append(str(getattr(exc, "name", "") or module_name))',
+    '    except Exception as exc:',
+    '        missing.append(module_name + ":" + exc.__class__.__name__)',
+    'payload = {"ready": not missing and not mismatched, "missing": sorted(set(missing)), "mismatched": sorted(set(mismatched)), "versions": versions}',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
+
+function buildTripoSrDependencyFailureMessage(probe = null) {
+  const missing = Array.isArray(probe?.missing) ? probe.missing.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+  const mismatched = Array.isArray(probe?.mismatched) ? probe.mismatched.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+  if (missing.some((entry) => entry.toLowerCase() === 'onnxruntime')) {
+    return 'TripoSR / Trellis finished installing, but ONNX Runtime is still missing from its Python environment. Run Repair again while online, or reinstall TripoSR / Trellis.';
+  }
+
+  if (mismatched.length) {
+    return 'TripoSR / Trellis finished installing, but its Gradio web server dependency versions are not compatible: ' + mismatched.join(', ') + '. Run Repair again while online, or reinstall TripoSR / Trellis.';
+  }
+
+  if (missing.length) {
+    return 'TripoSR / Trellis finished installing, but its Python environment is still missing: ' + missing.join(', ') + '. Run Repair again while online, or reinstall TripoSR / Trellis.';
+  }
+
+  return 'TripoSR / Trellis finished installing, but Local AI Hub could not verify its Python dependencies. Run Repair again while online, or reinstall TripoSR / Trellis.';
+}
+
+async function verifyTripoSrManagedRuntimeReadiness(toolState, manifest, logger) {
+  if (manifest?.id !== 'triposr') {
+    return;
+  }
+
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  if (!(await fs.pathExists(pythonPath))) {
+    throw new Error('TripoSR / Trellis finished installing, but its Python environment is missing.');
+  }
+
+  const result = await runCommand(pythonPath, ['-c', buildTripoSrDependencyVerificationScript()], {
+    allowFailure: true,
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+  });
+  const probe = parseRvcDependencyProbe(result.stdout);
+  if (Number(result.code || 0) === 0 && probe?.ready !== false) {
+    await logger.info('TripoSR / Trellis Python dependencies verified.', {
+      versions: probe?.versions || {},
+    });
+    return;
+  }
+
+  throw new Error(buildTripoSrDependencyFailureMessage(probe));
+}
+
+function buildWanDependencyVerificationScript() {
+  return [
+    'import importlib, json, sys',
+    'checks = [["torch", "PyTorch"], ["gradio", "Gradio"], ["diffsynth", "DiffSynth"], ["transformers", "Transformers"], ["PIL", "Pillow"], ["numpy", "NumPy"]]',
+    'missing = []',
+    'versions = {}',
+    'cuda_available = False',
+    'cuda_version = ""',
+    'device_name = ""',
+    'for module_name, label in checks:',
+    '    try:',
+    '        module = importlib.import_module(module_name)',
+    '        versions[module_name] = str(getattr(module, "__version__", ""))',
+    '    except ModuleNotFoundError as exc:',
+    '        missing.append(str(getattr(exc, "name", "") or module_name))',
+    '    except Exception as exc:',
+    '        missing.append(module_name + ":" + exc.__class__.__name__)',
+    'try:',
+    '    torch = importlib.import_module("torch")',
+    '    cuda_available = bool(torch.cuda.is_available())',
+    '    cuda_version = str(getattr(torch.version, "cuda", "") or "")',
+    '    if cuda_available:',
+    '        device_name = str(torch.cuda.get_device_name(0))',
+    'except Exception as exc:',
+    '    missing.append("torch-cuda:" + exc.__class__.__name__)',
+    'payload = {"ready": not missing and cuda_available, "missing": sorted(set(missing)), "versions": versions, "cuda_available": cuda_available, "cuda_version": cuda_version, "device_name": device_name}',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
+
+function buildWanDependencyFailureMessage(probe = null) {
+  const missing = Array.isArray(probe?.missing) ? probe.missing.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+  if (missing.length) {
+    return 'Wan2.1 finished installing, but its Python environment is still missing or cannot import: ' + missing.join(', ') + '. Run Repair again while online, or reinstall Wan2.1.';
+  }
+
+  if (probe?.cuda_available === false) {
+    return 'Wan2.1 finished installing, but its PyTorch runtime cannot use NVIDIA CUDA on this PC. Install a CUDA-capable NVIDIA driver, then run Repair again.';
+  }
+
+  return 'Wan2.1 finished installing, but Local AI Hub could not verify its Python and CUDA runtime. Run Repair again while online, or reinstall Wan2.1.';
+}
+
+async function verifyWanManagedRuntimeReadiness(toolState, manifest, logger) {
+  if (manifest?.id !== 'wan21-webui') {
+    return;
+  }
+
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  if (!(await fs.pathExists(pythonPath))) {
+    throw new Error('Wan2.1 finished installing, but its Python environment is missing.');
+  }
+
+  const result = await runCommand(pythonPath, ['-c', buildWanDependencyVerificationScript()], {
+    allowFailure: true,
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+  });
+  const probe = parseRvcDependencyProbe(result.stdout);
+  if (Number(result.code || 0) === 0 && probe?.ready !== false) {
+    await logger.info('Wan2.1 Python and CUDA runtime verified.', {
+      versions: probe?.versions || {},
+      cudaVersion: probe?.cuda_version || '',
+      deviceName: probe?.device_name || '',
+    });
+    return;
+  }
+
+  throw new Error(buildWanDependencyFailureMessage(probe));
+}
 function buildRvcDependencyVerificationScript() {
   return [
     'import importlib, json, sys',
@@ -1893,6 +2202,34 @@ async function buildManagedLauncherValidationFailureMessage(toolState, manifest,
 
   return `${manifest.name} finished installing, but Local AI Hub still could not find a usable launcher in the managed tool folder.`;
 }
+async function verifyChatterboxManagedPipelineReadiness(toolState, manifest, logger) {
+  if (manifest?.id !== 'chatterbox-tts') {
+    return;
+  }
+
+  await ensureChatterboxServerLaunchShim(toolState, manifest, logger);
+
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  if (!(await fs.pathExists(pythonPath))) {
+    throw new Error('Chatterbox-Turbo TTS finished installing, but its Python environment is missing.');
+  }
+
+  const result = await runCommand(pythonPath, ['-c', buildChatterboxPipelineVerificationScript()], {
+    allowFailure: true,
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+  });
+  const probe = parseAudiocraftPipelineVerification(result.stdout);
+  if (Number(result.code || 0) === 0 && probe?.ready !== false) {
+    await logger.info('Chatterbox-Turbo reference voice TTS Python packages and CUDA verified.', {
+      gpuName: probe?.gpuName || '',
+      torchVersion: probe?.torchVersion || '',
+    });
+    return;
+  }
+
+  throw new Error(buildChatterboxPipelineInstallFailureMessage(probe));
+}
 async function verifyAudiocraftManagedPipelineReadiness(toolState, manifest, logger) {
   if (manifest?.id !== 'audiocraft-webui') {
     return;
@@ -1918,6 +2255,7 @@ async function verifyAudiocraftManagedPipelineReadiness(toolState, manifest, log
 }
 async function verifyManagedToolInstall(toolState, manifest, logger) {
   const safeToolState = ensureManagedToolStatePaths(toolState);
+  await ensureChatterboxServerLaunchShim(safeToolState, manifest, logger);
   const launchProfile = buildManagedLaunchProfile(safeToolState, manifest);
 
   if (!(await toolIsAvailable({
@@ -1941,8 +2279,11 @@ async function verifyManagedToolInstall(toolState, manifest, logger) {
       errorMessage: `Local AI Hub installed ${manifest.name}, but its Python environment still has dependency conflicts.`,
     });
     await verifyAudiocraftManagedPipelineReadiness(safeToolState, manifest, logger);
+    await verifyChatterboxManagedPipelineReadiness(safeToolState, manifest, logger);
     await verifyRvcManagedRuntimeReadiness(safeToolState, manifest, logger);
     await verifyFaceFusionManagedRuntimeReadiness(safeToolState, manifest, logger);
+    await verifyTripoSrManagedRuntimeReadiness(safeToolState, manifest, logger);
+    await verifyWanManagedRuntimeReadiness(safeToolState, manifest, logger);
   }
 
   return {

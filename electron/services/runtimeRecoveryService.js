@@ -150,6 +150,65 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with the RVC-compatible Gradio client dependency.`,
     };
   }
+  if (toolState?.id === 'chatterbox-tts' && /(?:pkg_resources|PerthImplicitWatermarker|watermarking dependency)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'chatterbox-setuptools-pkg-resources',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} needs pkg_resources for its watermarking dependency. Run Repair to pin setuptools below 81 in the Chatterbox-Turbo environment.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with the Chatterbox-compatible setuptools pin.`,
+    };
+  }
+
+  if (toolState?.id === 'chatterbox-tts' && /(?:CUDA out of memory|out of memory|CUBLAS_STATUS_ALLOC_FAILED|CUDA error: out of memory)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'chatterbox-insufficient-vram',
+      action: 'none',
+      summary: `${toolState.name} ran out of GPU memory during reference voice TTS. Use shorter text, close other GPU tools, or run on a GPU with more VRAM.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'chatterbox-tts' && /(?:CUDA was not available|torch not compiled with cuda enabled|cpu-only PyTorch|not CUDA-enabled)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'chatterbox-cuda-unavailable',
+      action: 'repair-pytorch-cuda',
+      summary: `${toolState.name} needs a CUDA-enabled PyTorch install for normal reference voice TTS generation.`,
+      repairingMessage: `Local AI Hub is reinstalling CUDA-enabled PyTorch for ${gpuModel}.`,
+    };
+  }
+
+  if (toolState?.id === 'chatterbox-tts' && /(?:address already in use|only one usage of each socket address|Errno 10048|port .* already in use)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'chatterbox-port-in-use',
+      action: 'none',
+      summary: `${toolState.name} could not start because its local WebUI port is already in use. Stop the other process using that port, or change the managed Chatterbox port before launching again.`,
+      repairingMessage: null,
+    };
+  }
+
+  if (toolState?.id === 'chatterbox-tts' && /(?:config\.yaml|yaml\.scanner|yaml\.parser|ScannerError|ParserError)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'chatterbox-config-invalid',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} could not read its WebUI config.yaml. Run Repair so Local AI Hub can restore the localhost Chatterbox server configuration.`,
+      repairingMessage: `Local AI Hub is restoring ${toolState.name} and its managed WebUI configuration.`,
+    };
+  }
+
+  if (toolState?.id === 'chatterbox-tts' && /(?:hugging ?face|hf_hub|snapshot_download|Repository Not Found|rate limit|connection(?: aborted| reset| refused)|ReadTimeout|ConnectTimeout)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'chatterbox-model-download-failed',
+      action: 'none',
+      summary: `${toolState.name} could not download or read its Chatterbox model files from the managed Hugging Face cache. Check the network connection and cache location, then try Launch or Repair again.`,
+      repairingMessage: null,
+    };
+  }
   if (toolState?.id === 'openwebui' && /UnicodeEncodeError:/i.test(stderr) && /charmap codec can't encode/i.test(stderr) && /open_webui\\main\.py/i.test(stderr)) {
     return {
       recognized: true,
@@ -400,6 +459,71 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
     };
   }
 
+  if (toolState?.id === 'triposr' && /ModuleNotFoundError:\s+No module named ['"]onnxruntime['"]/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'triposr-missing-onnxruntime',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} is missing ONNX Runtime (onnxruntime), which TripoSR uses for background removal before the Gradio UI can start. Run Repair to rebuild TripoSR / Trellis with the required ONNX Runtime package.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with ONNX Runtime.`,
+    };
+  }
+
+  if (toolState?.id === 'triposr' && (/(?:FieldInfo' object has no attribute 'in_'|TypeError:\s+unhashable type:\s+['"]dict['"])/i.test(stderr))) {
+    return {
+      recognized: true,
+      id: 'triposr-gradio-web-stack-mismatch',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} has incompatible Gradio web server dependencies. Run Repair to reinstall the verified FastAPI, Starlette, Uvicorn, and Pydantic versions required by this TripoSR UI.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Gradio web server dependency stack.`,
+    };
+  }
+
+  if (toolState?.id === 'wan21-webui' && /ModuleNotFoundError:\s+No module named ['"]diffsynth['"]/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'wan-missing-diffsynth',
+      action: 'repair-python-environment',
+      summary: `${toolState.name} is missing DiffSynth, which Local AI Hub uses for Wan video generation. Run Repair to rebuild Wan's Python environment.`,
+      repairingMessage: `Local AI Hub is rebuilding ${toolState.name}'s Python environment with DiffSynth.`,
+    };
+  }
+
+  if (toolState?.id === 'wan21-webui' && /DASH_API_KEY is not set/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'wan-dashscope-api-key',
+      action: 'none',
+      summary: `${toolState.name} was started with DashScope prompt extension, but DASH_API_KEY is not configured. Use the managed local pipeline path or configure a DashScope key before using the upstream Wan Gradio launcher.`,
+    };
+  }
+
+  if (toolState?.id === 'wan21-webui' && /(?:QwenPromptExpander|Qwen2\.5|AutoModelForCausalLM\.from_pretrained|local_qwen)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'wan-prompt-expander-unavailable',
+      action: 'none',
+      summary: `${toolState.name}'s upstream Gradio launcher could not initialize its prompt-extension model before the web UI was ready. Download the required prompt-extension model for that launcher, or use Local AI Hub's managed Wan pipeline path instead.`,
+    };
+  }
+
+  if (toolState?.id === 'wan21-webui' && /(?:models[\\/]Wan-AI|Wan2\.1-(?:T2V|I2V)|ckpt_dir|checkpoint|diffusion_pytorch_model|model(?: folder| files?) .*missing|No such file or directory)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'wan-missing-model-assets',
+      action: 'none',
+      summary: `${toolState.name} is installed, but its Wan model files are missing. Download Wan-AI/Wan2.1-T2V-1.3B with Model Manager so it lands in models\\Wan-AI\\Wan2.1-T2V-1.3B under the Wan tool folder.`,
+    };
+  }
+
+  if (toolState?.id === 'wan21-webui' && /(?:CUDA out of memory|out of memory|not enough (?:GPU )?memory|CUBLAS_STATUS_ALLOC_FAILED|CUDA error: out of memory)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'wan-insufficient-vram',
+      action: 'none',
+      summary: `${toolState.name} ran out of GPU memory. Wan local video generation usually needs a higher-VRAM NVIDIA GPU; reduce the requested video size if possible, or run Wan on a machine with at least 12 GB VRAM.`,
+    };
+  }
   const missingModule = stderr.match(/ModuleNotFoundError:\s+No module named ['"]([^'"]+)['"]/i);
   if (missingModule && missingModule[1] && missingModule[1].toLowerCase() !== 'torch') {
     return {
@@ -776,5 +900,3 @@ module.exports = {
   diagnoseLaunchFailure,
   selectPyTorchRepairCandidates,
 };
-
-

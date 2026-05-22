@@ -2,6 +2,22 @@ import { memo } from 'react';
 import { formatTimestamp, progressWidth, statusClass } from '../lib/formatters';
 import HoverRevealText from './HoverRevealText';
 
+function isPipelineOnlyTool(tool) {
+  return String(tool?.interfaceMode || '').trim().toLowerCase() === 'pipeline-only';
+}
+
+function pipelineOnlyMessage(tool) {
+  if (tool?.id === 'chatterbox-tts') {
+    return 'Chatterbox-Turbo is used through Pipeline Builder. Create a Reference Voice TTS pipeline to generate audio.';
+  }
+
+  return `${tool?.name || 'This tool'} is used through Pipeline Builder.`;
+}
+
+function voiceCloneConsentMessage(tool) {
+  return tool?.id === 'chatterbox-tts' ? 'Only clone voices you have permission to use.' : null;
+}
+
 function embeddedActionLabel(tool) {
   if (tool?.interfaceMode === 'embedded-whisper') {
     return 'Open transcription';
@@ -155,6 +171,14 @@ function installNote(tool) {
   return notes.length ? notes.join(' ') : null;
 }
 function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
+  if (isPipelineOnlyTool(tool)) {
+    return (
+      <button className="ghost-button compact-card-button" disabled type="button" title={pipelineOnlyMessage(tool)}>
+        Pipeline Builder
+      </button>
+    );
+  }
+
   if (tool.status === 'running' || tool.status === 'starting') {
     return (
       <button className="ghost-button compact-card-button" disabled={busyMap[`stop:${tool.id}`]} onClick={() => onStop(tool.id)} type="button">
@@ -274,6 +298,7 @@ function LibraryCard({
   const canSnapshot = lifecycleMode(tool) === 'managed';
   const hasUpdate = Boolean(updateInfo?.updateAvailable);
   const note = installNote(tool);
+  const consentNote = voiceCloneConsentMessage(tool);
   const uninstallLabel = uninstallActionLabel(tool);
   const installSource = installSourceLabel(tool);
   const lastSeen = formatTimestamp(tool.installedAt || tool.detectedAt);
@@ -342,6 +367,18 @@ function LibraryCard({
       <ProgressNotice progress={launchProgress} showSpinner />
       <ProgressNotice progress={progress} />
       <ProgressNotice accent="emerald" progress={updateProgress} showSpinner />
+
+      {isPipelineOnlyTool(tool) ? (
+        <div className="mt-2 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-2 text-xs leading-5 text-cyan-50">
+          {pipelineOnlyMessage(tool)}
+        </div>
+      ) : null}
+
+      {consentNote ? (
+        <div className="mt-2 rounded-2xl border border-amber-300/20 bg-amber-300/10 p-2 text-xs leading-5 text-amber-50">
+          {consentNote}
+        </div>
+      ) : null}
 
       {tool.lastError ? (
         <div className="mt-2 rounded-2xl border border-rose-400/25 bg-rose-400/10 p-2 text-xs text-rose-100">

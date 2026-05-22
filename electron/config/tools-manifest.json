@@ -1192,7 +1192,7 @@
         "recommendedRamMb": 65536
       }
     },
-    "launchCommand": "python gradio/t2v_1.3B_singleGPU.py",
+    "launchCommand": "python gradio/t2v_1.3B_singleGPU.py --ckpt_dir models/Wan-AI/Wan2.1-T2V-1.3B",
     "defaultPort": 7860,
     "healthCheckPath": "/",
     "detectionPaths": [
@@ -1242,6 +1242,192 @@
         }
       }
     }
+  },
+  {
+    "id": "chatterbox-tts",
+    "name": "Chatterbox-Turbo TTS",
+    "description": "Local reference voice TTS using Chatterbox-Turbo, with a managed WebUI for Library launch and a direct helper for Pipeline Builder.",
+    "icon": "CB",
+    "category": "Audio / Speech",
+    "interfaceMode": "external-browser",
+    "downloadUrl": "https://github.com/devnen/Chatterbox-TTS-Server/archive/450de1581a56fffabb3abd5a44840457b3bb70b8.zip",
+    "installInstructions": {
+      "kind": "zip",
+      "runtime": "python",
+      "installSummary": "Downloads the Chatterbox-TTS-Server WebUI source and creates a managed Python 3.11 environment for Chatterbox-Turbo. Pipeline Builder still uses the direct helper path; model weights download to the managed Hugging Face cache on first use.",
+      "venvFolder": ".venv",
+      "pythonRequirement": ">=3.11,<3.12",
+      "configTargets": [
+        "config.yaml",
+        "voices",
+        "reference_audio",
+        "outputs",
+        "model_cache",
+        "cache"
+      ],
+      "pipInstalls": [
+        {
+          "kind": "package",
+          "value": "torch==2.6.0+cu124",
+          "pipArgs": [
+            "--index-url",
+            "https://download.pytorch.org/whl/cu124"
+          ],
+          "message": "Installing CUDA PyTorch 2.6.0 for Chatterbox-Turbo."
+        },
+        {
+          "kind": "package",
+          "value": "torchaudio==2.6.0+cu124",
+          "pipArgs": [
+            "--index-url",
+            "https://download.pytorch.org/whl/cu124"
+          ],
+          "message": "Installing CUDA torchaudio 2.6.0 for Chatterbox-Turbo."
+        },
+        {
+          "kind": "package",
+          "value": "torchvision==0.21.0+cu124",
+          "pipArgs": [
+            "--index-url",
+            "https://download.pytorch.org/whl/cu124"
+          ],
+          "message": "Installing CUDA torchvision for the Chatterbox WebUI server."
+        },
+        {
+          "kind": "package",
+          "value": "chatterbox-tts==0.1.7",
+          "message": "Installing Chatterbox-Turbo TTS."
+        },
+        {
+          "kind": "package",
+          "value": "fastapi>=0.100.0,<0.116.0",
+          "message": "Installing the Chatterbox WebUI FastAPI server dependency."
+        },
+        {
+          "kind": "package",
+          "value": "uvicorn[standard]>=0.27.0",
+          "message": "Installing the Chatterbox WebUI ASGI server dependency."
+        },
+        {
+          "kind": "package",
+          "value": "PyYAML>=6.0",
+          "message": "Installing Chatterbox WebUI configuration support."
+        },
+        {
+          "kind": "package",
+          "value": "python-multipart>=0.0.5",
+          "message": "Installing Chatterbox WebUI upload support."
+        },
+        {
+          "kind": "package",
+          "value": "requests>=2.28.0",
+          "message": "Installing Chatterbox WebUI HTTP support."
+        },
+        {
+          "kind": "package",
+          "value": "Jinja2>=3.1.2,<3.2.0",
+          "message": "Installing Chatterbox WebUI template support."
+        },
+        {
+          "kind": "package",
+          "value": "watchdog>=3.0.0",
+          "message": "Installing Chatterbox WebUI file watching support."
+        },
+        {
+          "kind": "package",
+          "value": "aiofiles>=23.0.0",
+          "message": "Installing Chatterbox WebUI static file support."
+        },
+        {
+          "kind": "package",
+          "value": "unidecode>=1.3.0",
+          "message": "Installing Chatterbox WebUI text normalization support."
+        },
+        {
+          "kind": "package",
+          "value": "inflect>=7.0.0",
+          "message": "Installing Chatterbox WebUI text normalization support."
+        },
+        {
+          "kind": "package",
+          "value": "pydub>=0.25.0",
+          "message": "Installing Chatterbox WebUI audio conversion support."
+        },
+        {
+          "kind": "package",
+          "value": "audiotsm>=0.1.2",
+          "message": "Installing Chatterbox WebUI audio timing support."
+        },
+        {
+          "kind": "package",
+          "value": "praat-parselmouth>=0.4.0",
+          "message": "Installing Chatterbox WebUI voice analysis support."
+        },
+        {
+          "kind": "package",
+          "value": "hf_transfer>=0.1.4",
+          "message": "Installing Hugging Face download acceleration support."
+        },
+        {
+          "kind": "package",
+          "value": "setuptools<81",
+          "message": "Pinning setuptools so Chatterbox watermarking dependencies keep pkg_resources available."
+        }
+      ],
+      "externalPythonCandidates": [
+        ".venv\\Scripts\\python.exe",
+        "venv\\Scripts\\python.exe"
+      ],
+      "compatibility": {
+        "minVramMb": 6144,
+        "recommendedVramMb": 8192,
+        "minRamMb": 16384,
+        "recommendedRamMb": 32768
+      },
+      "packagingBootstrapPackages": [
+        "pip",
+        "setuptools<81",
+        "wheel"
+      ],
+      "archiveName": "Chatterbox-TTS-Server-450de1581a56fffabb3abd5a44840457b3bb70b8.zip"
+    },
+    "launchCommand": "python .localaihub_launch_chatterbox_server.py --port {port}",
+    "detectionPaths": [
+      "%LOCALAPPDATA%\\LocalAIHub\\tools\\chatterbox-tts\\app\\server.py",
+      "%LOCALAPPDATA%\\LocalAIHub\\tools\\chatterbox-tts\\app\\.localaihub_launch_chatterbox_server.py",
+      "%LOCALAPPDATA%\\LocalAIHub\\tools\\chatterbox-tts\\.venv\\Scripts\\python.exe",
+      "%APPDATA%\\LocalAIHub\\tools\\chatterbox-tts\\app\\server.py",
+      "%APPDATA%\\LocalAIHub\\tools\\chatterbox-tts\\app\\.localaihub_launch_chatterbox_server.py",
+      "%APPDATA%\\LocalAIHub\\tools\\chatterbox-tts\\.venv\\Scripts\\python.exe"
+    ],
+    "launchEnvironment": {
+      "managedTempCache": true,
+      "setHuggingFaceCacheEnv": true,
+      "setPythonCacheEnv": true,
+      "setTempEnv": true,
+      "setTorchCacheEnv": true,
+      "includeBundledFfmpeg": true
+    },
+    "discovery": {
+      "folderNames": [
+        "chatterbox-tts",
+        "Chatterbox-Turbo",
+        "Chatterbox TTS",
+        "Chatterbox-TTS-Server"
+      ],
+      "markerPaths": [
+        "server.py",
+        ".localaihub_launch_chatterbox_server.py",
+        ".venv\\Scripts\\python.exe"
+      ],
+      "pathExecutables": [],
+      "pythonModules": [
+        "chatterbox.tts_turbo"
+      ]
+    },
+    "defaultPort": 8004,
+    "healthCheckPath": "/api/ui/initial-data",
+    "startupTimeoutMs": 600000
   },
   {
     "id": "audiocraft-webui",
@@ -1485,6 +1671,31 @@
         },
         {
           "kind": "package",
+          "value": "fastapi==0.104.1",
+          "message": "Pinning the TripoSR / Trellis Gradio web server stack."
+        },
+        {
+          "kind": "package",
+          "value": "starlette==0.27.0",
+          "message": "Pinning the TripoSR / Trellis Gradio web server stack."
+        },
+        {
+          "kind": "package",
+          "value": "uvicorn==0.24.0.post1",
+          "message": "Pinning the TripoSR / Trellis Gradio web server stack."
+        },
+        {
+          "kind": "package",
+          "value": "pydantic==2.5.3",
+          "message": "Pinning the TripoSR / Trellis Gradio web server stack."
+        },
+        {
+          "kind": "package",
+          "value": "onnxruntime>=1.16,<2",
+          "message": "Installing ONNX Runtime for TripoSR / Trellis background removal."
+        },
+        {
+          "kind": "package",
           "value": "git+https://github.com/tatsy/torchmcubes.git",
           "pipArgs": [
             "--no-build-isolation"
@@ -1518,7 +1729,7 @@
         "ninja"
       ]
     },
-    "launchCommand": "python gradio_app.py --server-name 127.0.0.1 --server-port {port}",
+    "launchCommand": "python gradio_app.py --port {port}",
     "defaultPort": 7860,
     "healthCheckPath": "/",
     "detectionPaths": [

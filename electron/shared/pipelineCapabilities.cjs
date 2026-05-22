@@ -61,6 +61,11 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
     label: 'Operation-driven local tool',
     notes: 'AudioCraft WebUI fits the sequential model-step pipeline for generated audio, and Local AI Hub runs it through a dedicated direct Python adapter so prompt-to-audio artifacts stay typed and reusable inside the pipeline.',
   }),
+  'chatterbox-tts': Object.freeze({
+    id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
+    label: 'Operation-driven local tool',
+    notes: 'Chatterbox-Turbo fits the sequential model-step pipeline for reference voice TTS, and Local AI Hub runs it through a dedicated direct Python adapter instead of launching a WebUI.',
+  }),
   rvc: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
     label: 'Operation-driven local tool',
@@ -175,6 +180,19 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
         notes: 'Runs AudioCraft through a dedicated direct Python adapter. Text input produces generated audio. Audio input can guide Music mode or seed real continuation mode from the end of the connected clip.',
         operationSubtypes: Object.freeze(['music', 'sound', 'continuation']),
         outputKinds: Object.freeze([MODALITY_AUDIO]),
+      }),
+    }),
+    targetType: 'tool',
+  }),
+  'chatterbox-tts': Object.freeze({
+    operations: Object.freeze({
+      [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT]),
+        notes: 'Runs Chatterbox-Turbo through a dedicated direct Python adapter. Text input supplies the words to speak, and the Reference Audio input supplies the short voice sample used for zero-shot reference voice TTS.',
+        operationSubtypes: Object.freeze(['referenceVoiceTts']),
+        outputKinds: Object.freeze([MODALITY_AUDIO]),
+        referenceInputKinds: Object.freeze([MODALITY_AUDIO]),
+        requiresReferenceAudio: true,
       }),
     }),
     targetType: 'tool',

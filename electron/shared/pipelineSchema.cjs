@@ -357,7 +357,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'llmPrompt',
     label: 'Model Step',
     category: 'AI Steps',
-    description: 'Sends compatible text or media to a model and returns the selected typed output. Local image transformation can also use an optional Reference Image input for source-image lineage.',
+    description: 'Sends compatible text or media to a model and returns the selected typed output. Local image transformation can use an optional Reference Image input, and reference voice TTS can use a Reference Audio input.',
     inputPorts: [
       {
         id: 'prompt',
@@ -371,6 +371,12 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         kind: PORT_KIND_ANY,
         dynamicOnly: true,
         label: 'Reference Image',
+      },
+      {
+        id: 'referenceAudio',
+        kind: PORT_KIND_ANY,
+        dynamicOnly: true,
+        label: 'Reference Audio',
       },
     ],
     outputPorts: [
@@ -1456,6 +1462,20 @@ function resolveDynamicInputKinds(node, port) {
     return [];
   }
 
+  if (node.type === 'llmPrompt' && port.id === 'referenceAudio') {
+    const executionMode = getModelStepExecutionMode(node);
+    const operationId = getModelStepOperationId(node);
+    if (executionMode === 'localTool' && operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+      const audioMode = String(node?.config?.audioMode || '').trim().toLowerCase();
+      const toolId = getModelStepLocalToolId(node, {});
+      const operation = getToolPipelineOperation(toolId, PIPELINE_OPERATION_IDS.AUDIO_GENERATE);
+      if (audioMode === 'referencevoicetts' || operation?.requiresReferenceAudio) {
+        return [PORT_KIND_AUDIO];
+      }
+    }
+
+    return [];
+  }
   if (node.type === 'collectionMap' && port.id === 'collection') {
     return isSupportedCollectionMapOperation(node) ? [getCollectionMapInputKind(node)] : [];
   }
@@ -1699,7 +1719,7 @@ function getCollectionMapLocalToolIds(node) {
     return ['rvc'];
   }
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
-    return AUDIO_WORKFLOW_TOOL_IDS;
+    return AUDIO_WORKFLOW_TOOL_IDS.filter((toolId) => toolId !== 'chatterbox-tts');
   }
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
     return VIDEO_WORKFLOW_TOOL_IDS;
@@ -1827,6 +1847,10 @@ function getModelStepLocalToolId(node, contextMaps = {}) {
   const operationId = getModelStepOperationId(node);
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE || operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
     return selectLocalImageBackend(contextMaps, node, { operationId }).toolId || '';
+  }
+
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && String(node?.config?.audioMode || '').trim().toLowerCase() === 'referencevoicetts') {
+    return pickAvailableToolId(['chatterbox-tts'], contextMaps) || 'chatterbox-tts';
   }
 
   return pickAvailableToolId(getOperationDrivenToolIdsForModelStepOperation(operationId), contextMaps);
@@ -4371,12 +4395,16 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
   const selectedToolId = String(node.config?.toolId || '').trim();
   const supportedToolIds = getOperationDrivenToolIdsForModelStepOperation(operationId);
   const effectiveToolId = getModelStepLocalToolId(node, contextMaps);
+  const audioModeForMessages = operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    ? String(node.config?.audioMode || '').trim().toLowerCase()
+    : '';
+  const isReferenceVoiceTtsMode = audioModeForMessages === 'referencevoicetts';
   const installMessage = operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
     ? 'Install Whisper before using local audio transcription in a model step.'
     : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
       ? 'Install Wan2.1 WebUI before using local video generation in a model step.'
       : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
-        ? 'Install AudioCraft WebUI before using local audio generation in a model step.'
+        ? (isReferenceVoiceTtsMode ? 'Install Chatterbox-Turbo TTS before using Reference Voice TTS in a model step.' : 'Install AudioCraft WebUI before using local audio generation in a model step.')
         : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
           ? 'Install RVC before using local audio transformation in a model step.'
           : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
@@ -4389,7 +4417,7 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
     : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
       ? 'Choose Wan2.1 WebUI for this local video model step. ComfyUI video workflows use the dedicated Graph Workflow step instead of this model-step mode.'
       : operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
-        ? 'Choose AudioCraft WebUI for this local audio generation step. Use Audio transform when you want RVC voice conversion, so this operation stays focused on generated-audio output.'
+        ? (isReferenceVoiceTtsMode ? 'Choose Chatterbox-Turbo TTS for Reference Voice TTS. This mode needs connected text plus a reference voice audio clip.' : 'Choose AudioCraft WebUI for this local audio generation step. Use Audio transform when you want RVC voice conversion, so this operation stays focused on generated-audio output.')
         : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
           ? 'Choose RVC for this local audio transformation step. Generated-audio tools stay on the dedicated audio-generation path.'
           : operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM
@@ -4470,7 +4498,47 @@ function analyzeModelStepLocalToolNode(node, summary, contextMaps, connectedKind
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
-    const audioMode = String(node.config?.audioMode || 'music').trim().toLowerCase();
+    const requestedAudioMode = String(node.config?.audioMode || 'music').trim().toLowerCase();
+    const audioMode = requestedAudioMode === 'referencevoicetts' ? 'referenceVoiceTts' : requestedAudioMode;
+    const referenceAudioConnected = referenceKinds.includes(PORT_KIND_AUDIO);
+    if (audioMode === 'referenceVoiceTts') {
+      if (tool.id !== 'chatterbox-tts') {
+        summary.readiness = {
+          tone: 'error',
+          message: 'Reference Voice TTS uses Chatterbox-Turbo. Choose Chatterbox-Turbo TTS as the local audio tool for this mode.',
+        };
+        return false;
+      }
+      if (!connectedKinds.includes(PORT_KIND_TEXT)) {
+        summary.readiness = {
+          tone: 'error',
+          message: 'Reference Voice TTS needs connected text to speak. Connect a Text Input node to the main Model Step input.',
+        };
+        return false;
+      }
+      if (!referenceAudioConnected) {
+        summary.readiness = {
+          tone: 'error',
+          message: 'Reference Voice TTS needs a connected reference voice audio clip. Connect an Audio Input node to the Reference Audio input.',
+        };
+        return false;
+      }
+
+      summary.readiness = {
+        tone: 'info',
+        message: tool.name + ' will generate new speech from the text using the connected reference voice audio. Only clone voices you have permission to use.',
+      };
+      return true;
+    }
+
+    if (tool.id === 'chatterbox-tts') {
+      summary.readiness = {
+        tone: 'error',
+        message: 'Chatterbox-Turbo only supports Reference Voice TTS in this pass. Switch Audio mode to Reference Voice TTS or choose AudioCraft WebUI.',
+      };
+      return false;
+    }
+
     if (connectedKinds.includes(PORT_KIND_AUDIO) && audioMode === 'sound') {
       summary.readiness = {
         tone: 'error',
@@ -4935,7 +5003,10 @@ function analyzePipeline(definition = {}, context = {}) {
         const executionMode = getModelStepExecutionMode(node);
         const operationId = getModelStepOperationId(node);
         const connectedKinds = getIncomingKindsForNodePort(node, 'prompt', graph);
-        const referenceKinds = getIncomingKindsForNodePort(node, 'referenceImage', graph);
+        const referenceKinds = [
+          ...getIncomingKindsForNodePort(node, 'referenceImage', graph),
+          ...getIncomingKindsForNodePort(node, 'referenceAudio', graph),
+        ];
         if (summary.capabilitySummary?.supported === false) {
           summary.readiness = {
             tone: 'error',

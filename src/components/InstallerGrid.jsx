@@ -20,6 +20,22 @@ function locationLabel(toolState) {
   return toolState.source === 'managed' ? 'Managed location' : 'Detected location';
 }
 
+function isPipelineOnlyTool(tool, toolState) {
+  return String(toolState?.interfaceMode || tool?.interfaceMode || '').trim().toLowerCase() === 'pipeline-only';
+}
+
+function pipelineOnlyMessage(tool) {
+  if (tool?.id === 'chatterbox-tts') {
+    return 'Chatterbox-Turbo is used through Pipeline Builder. Create a Reference Voice TTS pipeline to generate audio.';
+  }
+
+  return `${tool?.name || 'This tool'} is used through Pipeline Builder.`;
+}
+
+function voiceCloneConsentMessage(tool) {
+  return tool?.id === 'chatterbox-tts' ? 'Only clone voices you have permission to use.' : null;
+}
+
 function externalInstallNote(toolState) {
   if (!(toolState?.source === 'managed' && toolState?.externalInstallDetected)) {
     return null;
@@ -59,6 +75,15 @@ function resolveAction(toolState, busyMap, handlers, tool) {
     };
   }
 
+  if (isPipelineOnlyTool(tool, toolState)) {
+    return {
+      label: 'Pipeline Builder',
+      disabled: true,
+      onClick: () => {},
+      variant: 'ghost-button',
+    };
+  }
+
   return {
     label: busyMap[`launch:${tool.id}`] ? 'Launching...' : 'Launch',
     disabled: Boolean(busyMap[`launch:${tool.id}`]),
@@ -95,6 +120,7 @@ export default function InstallerGrid({
         {manifests.map((tool) => {
           const toolState = toolMap[tool.id];
           const progress = progressMap[tool.id];
+          const consentNote = voiceCloneConsentMessage(tool);
           const action = resolveAction(
             toolState,
             busyMap,
@@ -137,6 +163,14 @@ export default function InstallerGrid({
                 </p>
                 {externalInstallNote(toolState) ? (
                   <p className="mt-2 text-xs leading-6 text-slate-400">{externalInstallNote(toolState)}</p>
+                ) : null}
+
+                {toolState && isPipelineOnlyTool(tool, toolState) ? (
+                  <p className="mt-2 text-xs leading-6 text-cyan-100">{pipelineOnlyMessage(tool)}</p>
+                ) : null}
+
+                {consentNote ? (
+                  <p className="mt-2 text-xs leading-6 text-amber-100">{consentNote}</p>
                 ) : null}
                 {toolState?.source === 'external' ? (
                   <p className="mt-2 text-xs leading-6 text-slate-400">

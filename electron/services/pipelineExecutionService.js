@@ -3515,17 +3515,57 @@ function getAudiocraftGenerationSettings(node) {
   };
 }
 
-async function buildAudioGenerationRequest(node, inputArtifact, contextMaps = {}) {
+async function buildAudioGenerationRequest(node, inputArtifact, contextMaps = {}, options = {}) {
   if (!inputArtifact) {
     throw new Error('This audio generation step did not receive any input.');
   }
 
   const requestedAudioMode = String(node.config?.audioMode || 'music').trim().toLowerCase();
-  const audioMode = requestedAudioMode === 'sound' ? 'sound' : requestedAudioMode === 'continuation' ? 'continuation' : 'music';
+  const audioMode = requestedAudioMode === 'referencevoicetts'
+    ? 'referenceVoiceTts'
+    : requestedAudioMode === 'sound'
+      ? 'sound'
+      : requestedAudioMode === 'continuation'
+        ? 'continuation'
+        : 'music';
   const durationSeconds = Math.max(1, Number(node.config?.durationSeconds || 8) || 8);
   const continuationSeedSeconds = Math.max(0.25, Number(node.config?.continuationSeedSeconds || 12) || 12);
   const instruction = String(node.config?.instruction || '').trim();
   const generationSettings = getAudiocraftGenerationSettings(node);
+
+  if (audioMode === 'referenceVoiceTts') {
+    if (inputArtifact.kind !== PORT_KIND_TEXT) {
+      throw new Error('Reference Voice TTS needs connected text to speak. Connect a Text Input node to the main Model Step input.');
+    }
+
+    const promptText = String(inputArtifact.text || '').trim();
+    if (!promptText) {
+      throw new Error('Reference Voice TTS needs connected text to speak.');
+    }
+
+    const referenceAudioArtifact = options.referenceAudioArtifact || null;
+    if (!referenceAudioArtifact || referenceAudioArtifact.kind !== PORT_KIND_AUDIO || !referenceAudioArtifact.filePath) {
+      throw new Error('Reference Voice TTS needs a connected reference voice audio clip. Connect an Audio Input node to the Reference Audio input.');
+    }
+
+    const referenceAudioPath = path.resolve(String(referenceAudioArtifact.filePath || '').trim());
+    if (!referenceAudioPath || !(await fs.pathExists(referenceAudioPath))) {
+      throw new Error('The reference voice audio clip could not be found anymore. Choose it again and rerun the pipeline.');
+    }
+
+    return {
+      ...generationSettings,
+      audioMode,
+      continuationSeedSeconds,
+      durationSeconds,
+      prompt: promptText,
+      promptStyle: null,
+      referenceAudioArtifact,
+      referenceAudioPath,
+      sourceAudioArtifact: referenceAudioArtifact,
+      sourceAudioPath: referenceAudioPath,
+    };
+  }
 
   if (inputArtifact.kind === PORT_KIND_TEXT) {
     const promptText = String(inputArtifact.text || '').trim();
@@ -5451,7 +5491,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     if (executionMode === 'localTool') {
       if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
         const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'local audio generation');
-        const audioRequest = await buildAudioGenerationRequest(node, promptArtifact, contextMaps);
+        const referenceAudioArtifact = getNodeInputArtifact(node.id, 'referenceAudio', graph, run.resultsByNodeId, run);
+        const audioRequest = await buildAudioGenerationRequest(node, promptArtifact, contextMaps, { referenceAudioArtifact });
         reportProgress?.('Sending the request to ' + tool.name + ' for local audio generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
         return generateAudioWithLocalAudioTool(tool, {
           appendSource: audioRequest.appendSource,
@@ -5470,6 +5511,9 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           operationId,
           prompt: audioRequest.prompt,
           promptStyle: audioRequest.promptStyle,
+          referenceAudioArtifact: audioRequest.referenceAudioArtifact,
+          referenceAudioPath: audioRequest.referenceAudioPath,
+          cancelSignal: activeRunAbortController?.signal || null,
           reportProgress,
           runDirectories: run.directories,
           sourceAudioArtifact: audioRequest.sourceAudioArtifact,

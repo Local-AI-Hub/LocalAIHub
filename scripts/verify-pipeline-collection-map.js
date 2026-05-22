@@ -86,7 +86,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
 
   if (normalizedParent.endsWith('/electron/services/pipelineExecutionService.js')) {
     if (request === './providerRegistry') return { initializeProviderRegistry: async () => {} };
-    if (request === './modelService') return { listDownloadedModels: async (toolId) => mockedInstalledTools.find((tool) => tool.id === toolId)?.downloadedModels || [] };
+    if (request === './modelService') return { listDownloadedModels: async (toolOrId) => { const toolId = typeof toolOrId === 'string' ? toolOrId : toolOrId?.id; return mockedInstalledTools.find((tool) => tool.id === toolId)?.downloadedModels || []; } };
     if (request === './commandService') {
       return {
         runCommand: async (command, args = []) => {

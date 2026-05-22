@@ -32,6 +32,7 @@ const GIB = 1024 * 1024 * 1024;
 const MIB = 1024 * 1024;
 const HEAVY_LOCAL_AI_TOOL_IDS = new Set([
   'audiocraft-webui',
+  'chatterbox-tts',
   'automatic1111',
   'comfyui',
   'facefusion',
@@ -41,6 +42,12 @@ const HEAVY_LOCAL_AI_TOOL_IDS = new Set([
   'triposr',
   'wan21-webui',
 ]);
+const WAN_LIBRARY_TOOL_ID = 'wan21-webui';
+const WAN_LIBRARY_MODEL_FOLDER = 'Wan2.1-T2V-1.3B';
+const WAN_LIBRARY_MODEL_RELATIVE_PATH = path.join('models', 'Wan-AI', WAN_LIBRARY_MODEL_FOLDER);
+const WAN_LIBRARY_MIN_VRAM_MB = 8192;
+const WAN_GENERATION_TARGET_VRAM_MB = 12288;
+const WAN_RECOMMENDED_RAM_MB = 32768;
 const MANAGED_LAUNCH_ENV_KEYS = Object.freeze([
   'TEMP',
   'TMP',
@@ -170,6 +177,15 @@ function emitUnexpectedStop(toolState, message) {
 
 function setRuntimeEventSink(listener) {
   runtimeEventSink = typeof listener === 'function' ? listener : null;
+}
+
+function getPipelineOnlyLaunchMessage(toolState) {
+  if (String(toolState?.id || '').trim().toLowerCase() === 'chatterbox-tts') {
+    return 'Chatterbox-Turbo is used through Pipeline Builder. Create a Reference Voice TTS pipeline to generate audio.';
+  }
+
+  const toolName = String(toolState?.name || 'This tool').trim() || 'This tool';
+  return `${toolName} is used through Pipeline Builder. Create a compatible pipeline to use it.`;
 }
 
 function snapshotRuntimeSessionState(sessionState) {
@@ -823,6 +839,91 @@ function formatBytes(bytes) {
   }
 
   return `${size >= 10 || unitIndex === 0 ? Math.round(size) : Math.round(size * 10) / 10} ${units[unitIndex]}`;
+}
+
+function formatMegabytesAsGb(megabytes) {
+  const value = Number(megabytes || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '';
+  }
+
+  return `${Math.round((value / 1024) * 10) / 10} GB`;
+}
+
+function getWanLibraryToolRoot(toolState) {
+  const candidate = toolState?.appDir || toolState?.installDir || '';
+  return candidate ? path.resolve(candidate) : '';
+}
+
+async function inspectWanLibraryLaunchReadiness(toolState, options = {}) {
+  if (String(toolState?.id || '').trim().toLowerCase() !== WAN_LIBRARY_TOOL_ID) {
+    return { ok: true, issues: [], message: '' };
+  }
+
+  const issues = [];
+  const toolRoot = getWanLibraryToolRoot(toolState);
+  const expectedModelDir = toolRoot ? path.join(toolRoot, WAN_LIBRARY_MODEL_RELATIVE_PATH) : '';
+  if (!toolRoot || !(await fs.pathExists(toolRoot))) {
+    issues.push('The managed Wan app folder is missing. Run Repair to restore Wan app files.');
+  } else if (!(await fs.pathExists(expectedModelDir))) {
+    issues.push(`Missing ${WAN_LIBRARY_MODEL_RELATIVE_PATH}. Download Wan-AI/${WAN_LIBRARY_MODEL_FOLDER} with Model Manager so it lands under the Wan tool folder.`);
+  }
+
+  let hardware = options.hardware || null;
+  if (!hardware && options.detectHardware !== false) {
+    hardware = await detectHardwareSnapshot().catch(() => null);
+  }
+
+  const gpuModel = hardware?.gpuModel || 'the detected GPU';
+  const vramMb = Number(hardware?.vramMb || 0);
+  const ramMb = Number(hardware?.systemRamMb || 0);
+  if (vramMb > 0 && vramMb < WAN_LIBRARY_MIN_VRAM_MB) {
+    issues.push(`Detected ${gpuModel} with ${formatMegabytesAsGb(vramMb)} VRAM. Wan's smallest upstream Library UI expects about ${formatMegabytesAsGb(WAN_LIBRARY_MIN_VRAM_MB)} or more before it can finish loading, and Local AI Hub's local generation path is aimed at ${formatMegabytesAsGb(WAN_GENERATION_TARGET_VRAM_MB)} or more.`);
+  }
+
+  const ramNote = ramMb > 0 && ramMb < WAN_RECOMMENDED_RAM_MB
+    ? ` System RAM is ${formatMegabytesAsGb(ramMb)}; ${formatMegabytesAsGb(WAN_RECOMMENDED_RAM_MB)} or more is recommended for Wan.`
+    : '';
+
+  if (issues.length === 0) {
+    return { ok: true, issues: [], message: '' };
+  }
+
+  return {
+    ok: false,
+    issues,
+    expectedModelDir,
+    message: `Wan2.1 WebUI is installed, but Local AI Hub cannot start its Library UI yet. ${issues.join(' ')} The upstream Wan Gradio script loads its prompt-extension runtime and T2V model before binding its local URL, so Local AI Hub is stopping here instead of waiting on a generic startup timeout.${ramNote}`,
+  };
+}
+
+async function assertWanLibraryLaunchReadiness(toolState) {
+  const readiness = await inspectWanLibraryLaunchReadiness(toolState);
+  if (!readiness.ok) {
+    throw new Error(readiness.message);
+  }
+}
+
+function ensureWanManagedLaunchProfile(toolState, launchProfile) {
+  if (String(toolState?.id || '').trim().toLowerCase() !== WAN_LIBRARY_TOOL_ID || launchProfile?.kind !== 'python-script') {
+    return launchProfile;
+  }
+
+  const target = String(launchProfile.target || '').replace(/\\/g, '/');
+  if (!target.endsWith('gradio/t2v_1.3B_singleGPU.py')) {
+    return launchProfile;
+  }
+
+  const args = Array.isArray(launchProfile.args) ? launchProfile.args : [];
+  const hasCheckpointDir = args.some((arg) => String(arg || '').trim() === '--ckpt_dir');
+  if (hasCheckpointDir) {
+    return launchProfile;
+  }
+
+  return {
+    ...launchProfile,
+    args: [...args, '--ckpt_dir', WAN_LIBRARY_MODEL_RELATIVE_PATH],
+  };
 }
 
 function getLaunchEnvironmentPolicy(toolState) {
@@ -3107,6 +3208,10 @@ async function launchToolInternal(toolState, options = {}) {
     };
   }
 
+  if (String(toolState?.interfaceMode || '').trim().toLowerCase() === 'pipeline-only') {
+    throw new Error(getPipelineOnlyLaunchMessage(toolState));
+  }
+
   let launchProfile = resolveLaunchProfile(toolState, mergeLaunchProfiles(toolState.launchProfile, options.launchProfileOverride));
   if (!launchProfile) {
     throw new Error(`${toolState.name} does not have a launch profile yet.`);
@@ -3114,6 +3219,7 @@ async function launchToolInternal(toolState, options = {}) {
 
   launchProfile = await prepareManagedStableDiffusionLaunchProfile(toolState, launchProfile);
   launchProfile = ensureStableDiffusionApiLaunchProfile(toolState, launchProfile);
+  launchProfile = ensureWanManagedLaunchProfile(toolState, launchProfile);
   launchStoragePreflight = await preflightManagedToolLaunchStorage(toolState, { launchProfile });
   const runtimeOptions = {
     ...options,
@@ -3141,6 +3247,8 @@ async function launchToolInternal(toolState, options = {}) {
   let runtimeState = null;
 
   try {
+    await assertWanLibraryLaunchReadiness(toolState);
+
     if (launchProfile.kind === 'python-script' || launchProfile.kind === 'python-module') {
       runtimeState = await launchPythonProfile(toolState, launchProfile, runtimeOptions);
     } else if (launchProfile.kind === 'binary') {
@@ -3336,9 +3444,10 @@ module.exports = {
     buildCleanExitBeforeReadyMessage,
     buildConcreteLaunchFailureMessage,
     buildPostReadyLaunchFailureMessage,
+    ensureWanManagedLaunchProfile,
     getAiderOllamaTimeoutRetryClassification,
+    getPipelineOnlyLaunchMessage,
+    inspectWanLibraryLaunchReadiness,
     stopRuntimeProcessTree,
   },
 };
-
-
