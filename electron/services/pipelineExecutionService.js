@@ -76,6 +76,7 @@ const {
   extractAudioFromVideoArtifact,
   extractVideoFrameArtifact,
   normalizeAudioCollectionArtifact,
+  normalizeImageArtifact,
   normalizeVideoCollectionArtifact,
   trimMediaArtifact,
   burnSubtitlesIntoVideoArtifact,
@@ -105,9 +106,11 @@ const {
   getCollectionMapOperationId,
   getCollectionMapOutputKind,
   getLocalImageBackendOperationId,
+  getModelStepExecutionMode,
   getModelStepLocalToolId,
   getModelStepOperationId,
   normalizeImageTransformSubtype,
+  normalizePipelineRunSettings,
   getNodeTypeDefinition,
   getPortDefinition,
   trimPreviewText,
@@ -127,6 +130,113 @@ let activeRunAbortController = null;
 let pendingValidationControl = null;
 
 const PLANNER_PROVIDER_TIMEOUT_MS = 60000;
+const HEAVY_LOCAL_PIPELINE_OPERATION_IDS = new Set([
+  PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+  PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM,
+  PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+  PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM,
+  PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+]);
+
+function getRunCooldownSettings(run) {
+  return normalizePipelineRunSettings(run?.runSettings);
+}
+
+function getActiveRunHeavyStepCooldownSeconds() {
+  const settings = getRunCooldownSettings(activeRun);
+  return settings.enableHeavyStepCooldown ? settings.heavyStepCooldownSeconds : 0;
+}
+
+function isHeavyLocalPipelineNode(node) {
+  if (!node) {
+    return false;
+  }
+
+  if (node.type === 'llmPrompt') {
+    return getModelStepExecutionMode(node) === 'localTool'
+      && HEAVY_LOCAL_PIPELINE_OPERATION_IDS.has(getModelStepOperationId(node));
+  }
+
+  if (node.type === 'collectionMap') {
+    const executionMode = getCollectionMapExecutionModeForRun(node);
+    return (executionMode === 'localTool' || executionMode === 'graphWorkflow')
+      && HEAVY_LOCAL_PIPELINE_OPERATION_IDS.has(getCollectionMapOperationId(node));
+  }
+
+  if (node.type === 'graphWorkflow') {
+    const toolId = String(getGraphWorkflowToolId(node) || '').trim().toLowerCase();
+    return toolId === 'comfyui' || toolId === 'invokeai';
+  }
+
+  return false;
+}
+
+function formatCooldownMessage(targetLabel, remainingSeconds) {
+  return 'Cooling down before the next heavy local step... ' + remainingSeconds + 's';
+}
+
+async function waitForHeavyStepCooldown(run, nodeId, targetLabel = 'the next heavy local step') {
+  const settings = getRunCooldownSettings(run);
+  const seconds = settings.enableHeavyStepCooldown ? settings.heavyStepCooldownSeconds : 0;
+  if (!run || seconds <= 0) {
+    return;
+  }
+
+  const signal = activeRunAbortController?.signal || null;
+  run.cooldownWaitCount = Number(run.cooldownWaitCount || 0) + 1;
+  run.cooldown = {
+    nodeId: String(nodeId || '').trim(),
+    seconds,
+    startedAt: new Date().toISOString(),
+    targetLabel: String(targetLabel || 'the next heavy local step').trim(),
+  };
+
+  for (let remaining = seconds; remaining > 0; remaining -= 1) {
+    if (run.cancelRequested || signal?.aborted) {
+      run.cooldown = null;
+      throw new PipelineCancelledError('Pipeline run cancelled during cooldown.');
+    }
+
+    const message = formatCooldownMessage(targetLabel, remaining);
+    if (nodeId) {
+      updateRunningNodeProgress(run, nodeId, message, message);
+    } else {
+      updateRunMessage(run, message);
+    }
+
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        if (signal) {
+          signal.removeEventListener('abort', onAbort);
+        }
+      };
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        reject(new PipelineCancelledError('Pipeline run cancelled during cooldown.'));
+      };
+      const timer = setTimeout(finish, 1000);
+      if (signal) {
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    }).catch((error) => {
+      run.cooldown = null;
+      throw error;
+    });
+  }
+
+  run.cooldown = null;
+  emitPipelineEvent();
+}
 
 function setPipelineEventSink(listener) {
   pipelineEventSink = typeof listener === 'function' ? listener : null;
@@ -521,6 +631,9 @@ function createRunRecord(analysis, graph, runDirectories) {
     message: 'Local AI Hub is running the pipeline step by step and will launch local tools only when needed.',
     nodeStates: createInitialNodeStates(graph),
     pendingValidation: null,
+    runSettings: normalizePipelineRunSettings(analysis.pipeline?.runSettings),
+    cooldown: null,
+    cooldownWaitCount: 0,
     pipelineId: analysis.pipeline.id,
     pipelineName: analysis.pipeline.name,
     reachableNodeIds: [...analysis.reachableNodeIds],
@@ -3212,7 +3325,12 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
   const videoContinuationChain = isCollectionMapVideoContinuationChainEnabledForRun(node, mapping, executionMode)
     ? buildCollectionMapVideoContinuationChainState(node)
     : null;
+  const useItemCooldown = isHeavyLocalPipelineNode(node);
   for (let index = 0; index < sourceItems.length; index += 1) {
+    if (useItemCooldown && index > 0) {
+      await waitForHeavyStepCooldown(run, node.id, node.label + ' item ' + String(index + 1));
+    }
+
     const entry = sourceItems[index];
     const sourceArtifact = entry?.artifact || null;
     try {
@@ -5020,7 +5138,7 @@ async function executeExtractAudioNode(node, graph, run, reportProgress) {
   return extractAudioFromVideoArtifact(sourceVideo, {
     displayName: node.label || 'Extracted audio',
     node,
-    outputFormat: node.config?.outputFormat || 'wav',
+    outputFormat: node.config?.outputFormat || 'auto',
     reportProgress,
     runDirectories: run.directories,
   });
@@ -5030,13 +5148,14 @@ async function executeNormalizeAudioCollectionNode(node, graph, run, reportProgr
   const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
   return normalizeAudioCollectionArtifact(sourceCollection, {
     channels: node.config?.channels || 'stereo',
-    displayName: node.label || 'Normalize Audio Collection',
+    displayName: node.label || 'Normalize Audio',
     node,
     outputFormat: node.config?.outputFormat || 'wav',
     pcmFormat: node.config?.pcmFormat || 'pcm_s16le',
     reportProgress,
     runDirectories: run.directories,
     sampleRate: node.config?.sampleRate || 44100,
+    cancelSignal: activeRunAbortController?.signal || null,
   });
 }
 
@@ -5044,17 +5163,30 @@ async function executeNormalizeVideoCollectionNode(node, graph, run, reportProgr
   const sourceCollection = getNodeInputArtifact(node.id, 'collection', graph, run.resultsByNodeId, run);
   return normalizeVideoCollectionArtifact(sourceCollection, {
     audioCodec: node.config?.audioCodec || 'aac',
-    displayName: node.label || 'Normalize Video Collection',
+    displayName: node.label || 'Normalize Video',
     fps: node.config?.fps || 30,
     height: node.config?.height || 720,
     node,
-    outputFormat: node.config?.outputFormat || 'mp4',
+    outputFormat: node.config?.outputFormat || 'auto',
     pixelFormat: node.config?.pixelFormat || 'yuv420p',
     reportProgress,
     runDirectories: run.directories,
     sizeMode: node.config?.sizeMode || 'matchFirst',
+    cancelSignal: activeRunAbortController?.signal || null,
     videoCodec: node.config?.videoCodec || 'libx264',
     width: node.config?.width || 1280,
+  });
+}
+
+async function executeNormalizeImageNode(node, graph, run, reportProgress) {
+  const sourceImage = getNodeInputArtifact(node.id, 'image', graph, run.resultsByNodeId, run);
+  return normalizeImageArtifact(sourceImage, {
+    cancelSignal: activeRunAbortController?.signal || null,
+    displayName: node.label || 'Normalize Image',
+    node,
+    outputFormat: node.config?.outputFormat || 'png',
+    reportProgress,
+    runDirectories: run.directories,
   });
 }
 
@@ -5498,6 +5630,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           appendSource: audioRequest.appendSource,
           audioMode: audioRequest.audioMode,
           continuationRepeatCount: audioRequest.continuationRepeatCount,
+          heavyStepCooldownSeconds: getActiveRunHeavyStepCooldownSeconds(),
           audiocraftCfgCoef: audioRequest.audiocraftCfgCoef,
           audiocraftTemperature: audioRequest.audiocraftTemperature,
           audiocraftTopK: audioRequest.audiocraftTopK,
@@ -5923,6 +6056,10 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     return executeNormalizeVideoCollectionNode(node, graph, run, reportProgress);
   }
 
+  if (node.type === 'normalizeImage') {
+    return executeNormalizeImageNode(node, graph, run, reportProgress);
+  }
+
   if (node.type === 'extractVideoFrame') {
     return executeExtractVideoFrameNode(node, graph, run, reportProgress);
   }
@@ -5993,6 +6130,7 @@ async function executeActiveRun(graph, context) {
 
   try {
     let index = 0;
+    let completedHeavyLocalStep = false;
     while (index < graph.executionOrder.length) {
       const nodeId = graph.executionOrder[index];
       if (!activeRun) {
@@ -6024,6 +6162,7 @@ async function executeActiveRun(graph, context) {
       applyNodeLoopState(nodeState, nodeLoopState);
 
       const missingInputs = getMissingRequiredInputs(node, graph, activeRun.resultsByNodeId, activeRun);
+      const nodeIsHeavyLocal = isHeavyLocalPipelineNode(node);
       if (missingInputs.length) {
         nodeState.status = 'skipped';
         nodeState.finishedAt = new Date().toISOString();
@@ -6031,6 +6170,10 @@ async function executeActiveRun(graph, context) {
         emitPipelineEvent();
         index += 1;
         continue;
+      }
+
+      if (nodeIsHeavyLocal && completedHeavyLocalStep) {
+        await waitForHeavyStepCooldown(activeRun, node.id, node.label);
       }
 
       nodeState.status = 'running';
@@ -6076,6 +6219,9 @@ async function executeActiveRun(graph, context) {
       }
 
       activeRun.currentNodeId = null;
+      if (nodeIsHeavyLocal) {
+        completedHeavyLocalStep = true;
+      }
       activeRun.message = result.loopControl?.action === 'retry'
         ? (result.message || `${node.label} requested another attempt.`)
         : `${node.label} finished.`;

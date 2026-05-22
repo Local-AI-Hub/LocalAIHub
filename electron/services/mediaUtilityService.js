@@ -48,28 +48,34 @@ function normalizeTimestampSeconds(value) {
   return Math.round(timestampSeconds * 1000) / 1000;
 }
 
-function normalizeImageOutputFormat(value) {
-  const normalized = String(value || 'png').trim().toLowerCase();
-  if (!normalized || normalized === 'png') {
-    return 'png';
+const AUDIO_OUTPUT_FORMATS = Object.freeze(['wav', 'mp3', 'flac', 'ogg', 'm4a']);
+const VIDEO_OUTPUT_FORMATS = Object.freeze(['mp4', 'webm', 'mov', 'mkv']);
+const IMAGE_OUTPUT_FORMATS = Object.freeze(['png', 'jpg', 'jpeg', 'webp', 'bmp']);
+
+function normalizeMediaOutputFormat(value, defaultFormat, supportedFormats, operationLabel, mediaLabel) {
+  const normalized = String(value || 'auto').trim().toLowerCase();
+  if (!normalized || normalized === 'auto' || normalized === 'normalized') {
+    return defaultFormat;
   }
-  throw new Error('Extract Video Frame writes PNG images in this pass. Leave the output format as png.');
+  if (normalized === 'jpeg' && supportedFormats.includes('jpg')) {
+    return 'jpg';
+  }
+  if (supportedFormats.includes(normalized)) {
+    return normalized;
+  }
+  throw new Error(operationLabel + ' supports these ' + mediaLabel + ' output formats: auto, ' + supportedFormats.join(', ') + '.');
+}
+
+function normalizeImageOutputFormat(value, operationLabel = 'Extract Video Frame') {
+  return normalizeMediaOutputFormat(value, 'png', IMAGE_OUTPUT_FORMATS, operationLabel, 'image');
 }
 
 function normalizeAudioOutputFormat(value, operationLabel = 'Extract Audio') {
-  const normalized = String(value || 'wav').trim().toLowerCase();
-  if (!normalized || normalized === 'wav') {
-    return 'wav';
-  }
-  throw new Error(operationLabel + ' writes WAV output in this pass. Leave the output format as wav.');
+  return normalizeMediaOutputFormat(value, 'wav', AUDIO_OUTPUT_FORMATS, operationLabel, 'audio');
 }
 
-function normalizeVideoOutputFormat(value, operationLabel = 'Normalize Video Collection') {
-  const normalized = String(value || 'mp4').trim().toLowerCase();
-  if (!normalized || normalized === 'mp4') {
-    return 'mp4';
-  }
-  throw new Error(operationLabel + ' writes MP4 output in this pass. Leave the output format as mp4.');
+function normalizeVideoOutputFormat(value, operationLabel = 'Normalize Video') {
+  return normalizeMediaOutputFormat(value, 'mp4', VIDEO_OUTPUT_FORMATS, operationLabel, 'video');
 }
 
 function buildCreatedBy(node, fallbackType) {
@@ -150,15 +156,43 @@ async function resolveSourceAudioPath(audioArtifact, operationLabel) {
 
   const rawPath = String(audioArtifact?.filePath || '').trim();
   if (!rawPath) {
-    throw new Error(operationLabel + ' needs an audio file path, but a collection item does not have one.');
+    throw new Error(operationLabel + ' needs an audio file path, but the connected audio artifact does not have one.');
   }
 
   const sourcePath = path.resolve(rawPath);
   if (!(await fs.pathExists(sourcePath))) {
-    throw new Error(operationLabel + ' could not find an audio file from the connected collection. Regenerate that item or choose the file again, then rerun the pipeline.');
+    throw new Error(operationLabel + ' could not find an audio file from the connected input. Regenerate that item or choose the file again, then rerun the pipeline.');
   }
 
   return sourcePath;
+}
+
+async function resolveSourceImagePath(imageArtifact, operationLabel) {
+  if (String(imageArtifact?.kind || '').trim() !== PORT_KIND_IMAGE) {
+    throw new Error(operationLabel + ' needs an image input before it can run.');
+  }
+
+  const rawPath = String(imageArtifact?.filePath || '').trim();
+  if (!rawPath) {
+    throw new Error(operationLabel + ' needs an image file path, but the connected image artifact does not have one.');
+  }
+
+  const sourcePath = path.resolve(rawPath);
+  if (!(await fs.pathExists(sourcePath))) {
+    throw new Error(operationLabel + ' could not find an image file from the connected input. Regenerate that item or choose the file again, then rerun the pipeline.');
+  }
+
+  return sourcePath;
+}
+
+function throwIfCancelled(options = {}, operationLabel = 'Media conversion') {
+  if (options.cancelSignal?.aborted || options.signal?.aborted) {
+    throw new Error(operationLabel + ' was cancelled.');
+  }
+}
+
+function getCancelSignal(options = {}) {
+  return options.cancelSignal || options.signal || null;
 }
 
 function getArtifactsDir(runDirectories, operationLabel) {
@@ -225,7 +259,7 @@ async function extractVideoFrameArtifact(videoArtifact, options = {}) {
 
   const ffmpegPath = resolveFfmpegPath();
   const command = buildFrameCommandArgs(sourcePath, outputPath, framePosition, timestampSeconds);
-  const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true });
+  const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true, signal: getCancelSignal(options), abortMessage: operationLabel + ' was cancelled.' });
   const outputExists = await fs.pathExists(outputPath);
   const outputSize = outputExists ? Number((await fs.stat(outputPath)).size || 0) : 0;
   if (Number(commandResult.code || 0) !== 0 || !outputExists || outputSize <= 0) {
@@ -291,7 +325,7 @@ async function extractAudioFromVideoArtifact(videoArtifact, options = {}) {
 
   const ffmpegPath = resolveFfmpegPath();
   const command = buildAudioCommandArgs(sourcePath, outputPath);
-  const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true });
+  const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true, signal: getCancelSignal(options), abortMessage: operationLabel + ' was cancelled.' });
   if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
     if (isMissingAudioStreamFailure(commandResult)) {
       throw new Error('Extract Audio could not find an audio track in this video. Choose a video with audio and try again.');
@@ -330,23 +364,33 @@ async function extractAudioFromVideoArtifact(videoArtifact, options = {}) {
   };
 }
 
+function getAudioCodecForFormat(outputFormat, settings) {
+  if (outputFormat === 'mp3') return 'libmp3lame';
+  if (outputFormat === 'flac') return 'flac';
+  if (outputFormat === 'ogg') return 'libvorbis';
+  if (outputFormat === 'm4a') return 'aac';
+  return String(settings.pcmFormat || 'pcm_s16le').trim() || 'pcm_s16le';
+}
+
 function normalizeAudioSettings(options = {}) {
-  const outputFormat = normalizeAudioOutputFormat(options.outputFormat, 'Normalize Audio Collection');
+  const outputFormat = normalizeAudioOutputFormat(options.outputFormat, 'Normalize Audio');
   const sampleRate = Math.max(1, Math.round(Number(options.sampleRate || 44100) || 44100));
   const channels = String(options.channels || 'stereo').trim().toLowerCase() === 'mono' ? 'mono' : 'stereo';
-  return {
+  const settings = {
     channelCount: channels === 'mono' ? 1 : 2,
     channels,
     outputFormat,
     pcmFormat: String(options.pcmFormat || 'pcm_s16le').trim() || 'pcm_s16le',
     sampleRate,
   };
+  settings.codec = getAudioCodecForFormat(outputFormat, settings);
+  return settings;
 }
 
 function buildAudioNormalizeCommandArgs(sourcePath, outputPath, settings) {
   return {
-    args: ['-y', '-i', sourcePath, '-vn', '-ac', String(settings.channelCount), '-ar', String(settings.sampleRate), '-c:a', settings.pcmFormat, outputPath],
-    mode: 'audio-collection-to-normalized-pcm-wav',
+    args: ['-y', '-i', sourcePath, '-vn', '-ac', String(settings.channelCount), '-ar', String(settings.sampleRate), '-c:a', settings.codec, outputPath],
+    mode: 'audio-to-normalized-' + settings.outputFormat,
   };
 }
 
@@ -380,8 +424,63 @@ function buildSourceItemReference(entry, artifact, sourcePath, index) {
   };
 }
 
+async function normalizeSingleAudioArtifact(audioArtifact, options = {}) {
+  const operationLabel = 'Normalize Audio';
+  const settings = normalizeAudioSettings(options);
+  const sourcePath = await resolveSourceAudioPath(audioArtifact, operationLabel);
+  const outputPath = await nextOutputPath(options.runDirectories, options.node, 'audio', '.' + settings.outputFormat);
+
+  options.reportProgress?.(
+    'Normalizing audio.',
+    'Converting audio to ' + settings.outputFormat.toUpperCase() + ' with the bundled ffmpeg runtime...',
+  );
+
+  throwIfCancelled(options, operationLabel);
+  const ffmpegPath = resolveFfmpegPath();
+  const command = buildAudioNormalizeCommandArgs(sourcePath, outputPath, settings);
+  const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true, signal: getCancelSignal(options), abortMessage: operationLabel + ' was cancelled.' });
+  if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
+    const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
+    throw new Error(operationLabel + ' could not normalize this audio file. ' + (failureLine || 'Try a different audio file or regenerate the source item.'));
+  }
+
+  const artifact = await buildFileArtifact(outputPath, {
+    displayName: String(options.displayName || options.node?.label || 'Normalized audio').trim() || 'Normalized audio',
+    kind: PORT_KIND_AUDIO,
+    role: 'generated',
+  });
+  artifact.audioNormalization = {
+    backend: 'ffmpeg',
+    backendLabel: 'Bundled ffmpeg',
+    channelCount: settings.channelCount,
+    channels: settings.channels,
+    codec: settings.codec,
+    createdBy: buildCreatedBy(options.node, 'normalizeAudioCollection'),
+    durationSeconds: artifact.audio?.durationSeconds || null,
+    ffmpegMode: command.mode,
+    operation: 'normalizeAudioCollection',
+    operationId: 'normalizeAudioCollection',
+    outputFormat: settings.outputFormat,
+    sampleRate: settings.sampleRate,
+    sourceAudio: buildAudioReference(audioArtifact),
+  };
+  artifact.summary = summarizeArtifact(artifact);
+  const metadataPaths = await saveAudioArtifactMetadata(outputPath, artifact);
+  if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
+
+  return {
+    destinationPath: outputPath,
+    message: operationLabel + ' saved a ' + settings.outputFormat.toUpperCase() + ' audio artifact.',
+    outputs: { collection: artifact },
+    preview: summarizeArtifact(artifact),
+  };
+}
+
 async function normalizeAudioCollectionArtifact(sourceCollection, options = {}) {
-  const operationLabel = 'Normalize Audio Collection';
+  if (String(sourceCollection?.kind || '').trim() === PORT_KIND_AUDIO) {
+    return normalizeSingleAudioArtifact(sourceCollection, options);
+  }
+  const operationLabel = 'Normalize Audio';
   const settings = normalizeAudioSettings(options);
   const orderedEntries = ensureCollection(sourceCollection, PORT_KIND_AUDIO, operationLabel);
   const collectionRef = buildCollectionReference(sourceCollection);
@@ -391,10 +490,11 @@ async function normalizeAudioCollectionArtifact(sourceCollection, options = {}) 
 
   options.reportProgress?.(
     'Normalizing audio collection.',
-    'Converting ' + orderedEntries.length + ' audio item' + (orderedEntries.length === 1 ? '' : 's') + ' to matching WAV settings...',
+    'Converting ' + orderedEntries.length + ' audio item' + (orderedEntries.length === 1 ? '' : 's') + ' to matching ' + settings.outputFormat.toUpperCase() + ' settings...',
   );
 
   for (let index = 0; index < orderedEntries.length; index += 1) {
+    throwIfCancelled(options, operationLabel);
     const entry = orderedEntries[index];
     const sourceArtifact = entry.artifact;
     const sourcePath = await resolveSourceAudioPath(sourceArtifact, operationLabel);
@@ -402,7 +502,7 @@ async function normalizeAudioCollectionArtifact(sourceCollection, options = {}) 
     orderedSourceItems.push(sourceItem);
     const outputPath = await nextOutputPath(options.runDirectories, options.node, 'audio-' + String(index + 1).padStart(3, '0'), '.' + settings.outputFormat);
     const command = buildAudioNormalizeCommandArgs(sourcePath, outputPath, settings);
-    const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true });
+    const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true, signal: getCancelSignal(options), abortMessage: operationLabel + ' was cancelled.' });
     if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
       const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
       throw new Error(operationLabel + ' could not normalize audio item ' + String(index + 1) + '. ' + (failureLine || 'Try a different audio file or regenerate the source item.'));
@@ -418,7 +518,7 @@ async function normalizeAudioCollectionArtifact(sourceCollection, options = {}) 
       backendLabel: 'Bundled ffmpeg',
       channelCount: settings.channelCount,
       channels: settings.channels,
-      codec: settings.pcmFormat,
+      codec: settings.codec,
       createdBy: buildCreatedBy(options.node, 'normalizeAudioCollection'),
       durationSeconds: artifact.audio?.durationSeconds || null,
       ffmpegMode: command.mode,
@@ -465,7 +565,7 @@ async function normalizeAudioCollectionArtifact(sourceCollection, options = {}) 
       sampleRate: settings.sampleRate,
       channels: settings.channels,
       channelCount: settings.channelCount,
-      codec: settings.pcmFormat,
+      codec: settings.codec,
       sourceCollection: collectionRef,
       targetSettings: settings,
     },
@@ -532,8 +632,15 @@ async function probeVideoFile(sourcePath) {
   };
 }
 
+function getVideoDefaultsForFormat(outputFormat) {
+  if (outputFormat === 'webm') {
+    return { audioCodec: 'libopus', pixelFormat: 'yuv420p', videoCodec: 'libvpx-vp9' };
+  }
+  return { audioCodec: 'aac', pixelFormat: 'yuv420p', videoCodec: 'libx264' };
+}
+
 async function normalizeVideoSettings(sourceArtifact, sourcePath, options = {}) {
-  const outputFormat = normalizeVideoOutputFormat(options.outputFormat, 'Normalize Video Collection');
+  const outputFormat = normalizeVideoOutputFormat(options.outputFormat, 'Normalize Video');
   const sizeMode = String(options.sizeMode || 'matchFirst').trim() === 'custom' ? 'custom' : 'matchFirst';
   const probe = await probeVideoFile(sourcePath);
   const width = sizeMode === 'custom'
@@ -543,11 +650,12 @@ async function normalizeVideoSettings(sourceArtifact, sourcePath, options = {}) 
     ? roundEven(options.height, 720)
     : roundEven(getArtifactVideoMetric(sourceArtifact, 'height') || probe.height || options.height || 720, 720);
   const fps = Math.max(1, Number(options.fps || getArtifactVideoMetric(sourceArtifact, 'fps') || probe.fps || 30) || 30);
+  const formatDefaults = getVideoDefaultsForFormat(outputFormat);
   return {
-    audioCodec: String(options.audioCodec || 'aac').trim() || 'aac',
+    audioCodec: formatDefaults.audioCodec,
     outputFormat,
-    pixelFormat: String(options.pixelFormat || 'yuv420p').trim() || 'yuv420p',
-    videoCodec: String(options.videoCodec || 'libx264').trim() || 'libx264',
+    pixelFormat: formatDefaults.pixelFormat,
+    videoCodec: formatDefaults.videoCodec,
     fps: Math.round(fps * 1000) / 1000,
     height,
     sizeMode,
@@ -557,26 +665,97 @@ async function normalizeVideoSettings(sourceArtifact, sourcePath, options = {}) 
 
 function buildVideoNormalizeCommandArgs(sourcePath, outputPath, settings) {
   const filter = 'scale=' + settings.width + ':' + settings.height + ':force_original_aspect_ratio=decrease,pad=' + settings.width + ':' + settings.height + ':(ow-iw)/2:(oh-ih)/2:black,fps=' + settings.fps + ',format=' + settings.pixelFormat;
+  const args = [
+    '-y',
+    '-i', sourcePath,
+    '-map', '0:v:0',
+    '-map', '0:a:0?',
+    '-vf', filter,
+    '-c:v', settings.videoCodec,
+  ];
+  if (settings.videoCodec === 'libx264') {
+    args.push('-preset', 'veryfast', '-crf', '20');
+  } else if (settings.videoCodec === 'libvpx-vp9') {
+    args.push('-deadline', 'realtime', '-cpu-used', '4', '-b:v', '0', '-crf', '32');
+  }
+  args.push('-c:a', settings.audioCodec);
+  if (settings.outputFormat === 'mp4' || settings.outputFormat === 'mov') {
+    args.push('-movflags', '+faststart');
+  }
+  args.push(outputPath);
   return {
-    args: [
-      '-y',
-      '-i', sourcePath,
-      '-map', '0:v:0',
-      '-map', '0:a:0?',
-      '-vf', filter,
-      '-c:v', settings.videoCodec,
-      '-preset', 'veryfast',
-      '-crf', '20',
-      '-c:a', settings.audioCodec,
-      '-movflags', '+faststart',
-      outputPath,
-    ],
-    mode: 'video-collection-to-normalized-mp4',
+    args,
+    mode: 'video-to-normalized-' + settings.outputFormat,
+  };
+}
+
+async function normalizeSingleVideoArtifact(videoArtifact, options = {}) {
+  const operationLabel = 'Normalize Video';
+  const sourcePath = await resolveSourceVideoPath(videoArtifact, operationLabel);
+  const settings = await normalizeVideoSettings(videoArtifact, sourcePath, options);
+  const sourceProbe = await probeVideoFile(sourcePath);
+  const outputPath = await nextOutputPath(options.runDirectories, options.node, 'video', '.' + settings.outputFormat);
+
+  options.reportProgress?.(
+    'Normalizing video.',
+    'Converting video to ' + settings.outputFormat.toUpperCase() + ' with the bundled ffmpeg runtime...',
+  );
+
+  throwIfCancelled(options, operationLabel);
+  const ffmpegPath = resolveFfmpegPath();
+  const command = buildVideoNormalizeCommandArgs(sourcePath, outputPath, settings);
+  const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true, signal: getCancelSignal(options), abortMessage: operationLabel + ' was cancelled.' });
+  if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
+    const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
+    throw new Error(operationLabel + ' could not normalize this video file. ' + (failureLine || 'Try a different video file or regenerate the source item.'));
+  }
+
+  const videoNormalization = {
+    audioCodec: settings.audioCodec,
+    audioHandling: sourceProbe.audioPresent ? 'reencoded-' + settings.audioCodec : 'none',
+    backend: 'ffmpeg',
+    backendLabel: 'Bundled ffmpeg',
+    container: settings.outputFormat,
+    createdBy: buildCreatedBy(options.node, 'normalizeVideoCollection'),
+    ffmpegMode: command.mode,
+    fps: settings.fps,
+    height: settings.height,
+    operation: 'normalizeVideoCollection',
+    operationId: 'normalizeVideoCollection',
+    outputFormat: settings.outputFormat,
+    pixelFormat: settings.pixelFormat,
+    sourceVideo: buildVideoReference(videoArtifact),
+    videoCodec: settings.videoCodec,
+    width: settings.width,
+  };
+  const artifact = await buildFileArtifact(outputPath, {
+    displayName: String(options.displayName || options.node?.label || 'Normalized video').trim() || 'Normalized video',
+    kind: PORT_KIND_VIDEO,
+    role: 'generated',
+    videoNormalization,
+  });
+  artifact.videoNormalization = videoNormalization;
+  artifact.width = settings.width;
+  artifact.height = settings.height;
+  artifact.fps = settings.fps;
+  artifact.size = String(settings.width) + 'x' + String(settings.height);
+  artifact.summary = summarizeArtifact(artifact);
+  const metadataPaths = await saveVideoArtifactMetadata(outputPath, artifact);
+  if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
+
+  return {
+    destinationPath: outputPath,
+    message: operationLabel + ' saved a ' + settings.outputFormat.toUpperCase() + ' video artifact.',
+    outputs: { collection: artifact },
+    preview: summarizeArtifact(artifact),
   };
 }
 
 async function normalizeVideoCollectionArtifact(sourceCollection, options = {}) {
-  const operationLabel = 'Normalize Video Collection';
+  if (String(sourceCollection?.kind || '').trim() === PORT_KIND_VIDEO) {
+    return normalizeSingleVideoArtifact(sourceCollection, options);
+  }
+  const operationLabel = 'Normalize Video';
   const orderedEntries = ensureCollection(sourceCollection, PORT_KIND_VIDEO, operationLabel);
   const collectionRef = buildCollectionReference(sourceCollection);
   const firstSourcePath = await resolveSourceVideoPath(orderedEntries[0].artifact, operationLabel);
@@ -587,10 +766,11 @@ async function normalizeVideoCollectionArtifact(sourceCollection, options = {}) 
 
   options.reportProgress?.(
     'Normalizing video collection.',
-    'Converting ' + orderedEntries.length + ' video item' + (orderedEntries.length === 1 ? '' : 's') + ' to matching MP4 settings...',
+    'Converting ' + orderedEntries.length + ' video item' + (orderedEntries.length === 1 ? '' : 's') + ' to matching ' + settings.outputFormat.toUpperCase() + ' settings...',
   );
 
   for (let index = 0; index < orderedEntries.length; index += 1) {
+    throwIfCancelled(options, operationLabel);
     const entry = orderedEntries[index];
     const sourceArtifact = entry.artifact;
     const sourcePath = index === 0 ? firstSourcePath : await resolveSourceVideoPath(sourceArtifact, operationLabel);
@@ -599,7 +779,7 @@ async function normalizeVideoCollectionArtifact(sourceCollection, options = {}) 
     const sourceProbe = await probeVideoFile(sourcePath);
     const outputPath = await nextOutputPath(options.runDirectories, options.node, 'video-' + String(index + 1).padStart(3, '0'), '.' + settings.outputFormat);
     const command = buildVideoNormalizeCommandArgs(sourcePath, outputPath, settings);
-    const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true });
+    const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true, signal: getCancelSignal(options), abortMessage: operationLabel + ' was cancelled.' });
     if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
       const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
       throw new Error(operationLabel + ' could not normalize video item ' + String(index + 1) + '. ' + (failureLine || 'Try a different video file or regenerate the source item.'));
@@ -607,7 +787,7 @@ async function normalizeVideoCollectionArtifact(sourceCollection, options = {}) 
 
     const videoNormalization = {
       audioCodec: settings.audioCodec,
-      audioHandling: sourceProbe.audioPresent ? 'reencoded-aac' : 'none',
+      audioHandling: sourceProbe.audioPresent ? 'reencoded-' + settings.audioCodec : 'none',
       backend: 'ffmpeg',
       backendLabel: 'Bundled ffmpeg',
       container: settings.outputFormat,
@@ -695,6 +875,178 @@ async function normalizeVideoCollectionArtifact(sourceCollection, options = {}) 
     destinationPath: persisted.directoryPath,
     message: operationLabel + ' converted ' + normalizedItems.length + ' video item' + (normalizedItems.length === 1 ? '' : 's') + ' into a normalized video collection.',
     outputs: { collection: persisted },
+    preview: summarizeArtifact(persisted),
+  };
+}
+
+
+function buildImageNormalizeCommandArgs(sourcePath, outputPath, settings) {
+  const args = ['-y', '-i', sourcePath, '-frames:v', '1'];
+  if (settings.outputFormat === 'jpg') {
+    args.push('-vf', 'format=rgb24');
+  }
+  args.push(outputPath);
+  return {
+    args,
+    mode: 'image-to-normalized-' + settings.outputFormat,
+  };
+}
+
+function normalizeImageSettings(options = {}) {
+  const outputFormat = normalizeImageOutputFormat(options.outputFormat, 'Normalize Image');
+  return { outputFormat };
+}
+
+async function normalizeSingleImageArtifact(imageArtifact, options = {}) {
+  const operationLabel = 'Normalize Image';
+  const settings = normalizeImageSettings(options);
+  const sourcePath = await resolveSourceImagePath(imageArtifact, operationLabel);
+  const outputPath = await nextOutputPath(options.runDirectories, options.node, 'image', '.' + settings.outputFormat);
+
+  options.reportProgress?.(
+    'Normalizing image.',
+    'Converting image to ' + settings.outputFormat.toUpperCase() + ' with the bundled ffmpeg runtime...',
+  );
+
+  throwIfCancelled(options, operationLabel);
+  const ffmpegPath = resolveFfmpegPath();
+  const command = buildImageNormalizeCommandArgs(sourcePath, outputPath, settings);
+  const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true, signal: getCancelSignal(options), abortMessage: operationLabel + ' was cancelled.' });
+  if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
+    const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
+    throw new Error(operationLabel + ' could not convert this image file. ' + (failureLine || 'Try a different image file or regenerate the source item.'));
+  }
+
+  const imageNormalization = {
+    backend: 'ffmpeg',
+    backendLabel: 'Bundled ffmpeg',
+    createdBy: buildCreatedBy(options.node, 'normalizeImage'),
+    ffmpegMode: command.mode,
+    operation: 'normalizeImage',
+    operationId: 'normalizeImage',
+    outputFormat: settings.outputFormat,
+    sourceImage: buildArtifactReference(imageArtifact),
+  };
+  const artifact = await buildFileArtifact(outputPath, {
+    displayName: String(options.displayName || options.node?.label || 'Normalized image').trim() || 'Normalized image',
+    imageNormalization,
+    kind: PORT_KIND_IMAGE,
+    role: 'generated',
+  });
+  artifact.imageNormalization = imageNormalization;
+  artifact.summary = summarizeArtifact(artifact);
+  const metadataPaths = await saveImageArtifactMetadata(outputPath, artifact);
+  if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
+
+  return {
+    destinationPath: outputPath,
+    message: operationLabel + ' saved a ' + settings.outputFormat.toUpperCase() + ' image artifact.',
+    outputs: { image: artifact },
+    preview: summarizeArtifact(artifact),
+  };
+}
+
+async function normalizeImageArtifact(sourceArtifact, options = {}) {
+  const operationLabel = 'Normalize Image';
+  if (String(sourceArtifact?.kind || '').trim() === PORT_KIND_IMAGE) {
+    return normalizeSingleImageArtifact(sourceArtifact, options);
+  }
+
+  const settings = normalizeImageSettings(options);
+  const orderedEntries = ensureCollection(sourceArtifact, PORT_KIND_IMAGE, operationLabel);
+  const collectionRef = buildCollectionReference(sourceArtifact);
+  const normalizedItems = [];
+  const orderedSourceItems = [];
+
+  options.reportProgress?.(
+    'Normalizing image collection.',
+    'Converting ' + orderedEntries.length + ' image item' + (orderedEntries.length === 1 ? '' : 's') + ' to ' + settings.outputFormat.toUpperCase() + '...',
+  );
+
+  for (let index = 0; index < orderedEntries.length; index += 1) {
+    throwIfCancelled(options, operationLabel);
+    const entry = orderedEntries[index];
+    const sourceImage = entry.artifact;
+    const sourcePath = await resolveSourceImagePath(sourceImage, operationLabel);
+    const sourceItem = buildSourceItemReference(entry, sourceImage, sourcePath, index);
+    orderedSourceItems.push(sourceItem);
+    const outputPath = await nextOutputPath(options.runDirectories, options.node, 'image-' + String(index + 1).padStart(3, '0'), '.' + settings.outputFormat);
+    const command = buildImageNormalizeCommandArgs(sourcePath, outputPath, settings);
+    const commandResult = await runCommand(resolveFfmpegPath(), command.args, { allowFailure: true, signal: getCancelSignal(options), abortMessage: operationLabel + ' was cancelled.' });
+    if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
+      const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
+      throw new Error(operationLabel + ' could not convert image item ' + String(index + 1) + '. ' + (failureLine || 'Try a different image file or regenerate the source item.'));
+    }
+
+    const imageNormalization = {
+      backend: 'ffmpeg',
+      backendLabel: 'Bundled ffmpeg',
+      createdBy: buildCreatedBy(options.node, 'normalizeImage'),
+      ffmpegMode: command.mode,
+      operation: 'normalizeImage',
+      operationId: 'normalizeImage',
+      outputFormat: settings.outputFormat,
+      sourceCollection: collectionRef,
+      sourceImage: buildArtifactReference(sourceImage),
+      sourceItem,
+    };
+    const artifact = await buildFileArtifact(outputPath, {
+      displayName: String(options.displayName || options.node?.label || 'Normalized image').trim() + ' ' + String(index + 1),
+      imageNormalization,
+      kind: PORT_KIND_IMAGE,
+      role: 'generated',
+    });
+    artifact.imageNormalization = imageNormalization;
+    artifact.summary = summarizeArtifact(artifact);
+    const metadataPaths = await saveImageArtifactMetadata(outputPath, artifact);
+    if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
+
+    normalizedItems.push({
+      artifact,
+      index,
+      itemId: String(entry.itemId || 'normalized-image-' + String(index + 1)).trim(),
+      lineage: {
+        parentLineage: entry.lineage || null,
+        sourceItemId: String(entry.itemId || '').trim(),
+        sourceItemIndex: Number(entry.index || index) || index,
+        sourceNodeId: String(options.node?.id || '').trim(),
+        sourceNodeLabel: String(options.node?.label || operationLabel).trim(),
+        sourcePortId: 'image',
+        sourcePortLabel: 'Normalized Image',
+      },
+      metadata: { normalization: imageNormalization, sourceItem },
+    });
+  }
+
+  const collection = createArtifactCollection(normalizedItems, {
+    collectionNormalization: {
+      createdBy: buildCreatedBy(options.node, 'normalizeImage'),
+      itemCount: normalizedItems.length,
+      operation: 'normalizeImage',
+      operationId: 'normalizeImage',
+      orderedSourceItems,
+      outputFormat: settings.outputFormat,
+      sourceCollection: collectionRef,
+      targetSettings: settings,
+    },
+    collectionStatus: 'complete',
+    displayName: String(options.displayName || options.node?.label || 'Normalized image collection').trim() || 'Normalized image collection',
+    itemKind: PORT_KIND_IMAGE,
+    role: 'generated',
+    sourceCollection: collectionRef,
+    sourceItemCount: orderedEntries.length,
+  });
+  const persisted = await persistArtifactCollection(options.runDirectories, collection, {
+    baseName: String(options.node?.label || 'Normalize Image').trim() || 'Normalize Image',
+    displayName: collection.displayName,
+    role: 'generated',
+    target: 'artifacts',
+  });
+
+  return {
+    destinationPath: persisted.directoryPath,
+    message: operationLabel + ' converted ' + normalizedItems.length + ' image item' + (normalizedItems.length === 1 ? '' : 's') + ' into a normalized image collection.',
+    outputs: { image: persisted },
     preview: summarizeArtifact(persisted),
   };
 }
@@ -1323,6 +1675,7 @@ module.exports = {
   extractAudioFromVideoArtifact,
   extractVideoFrameArtifact,
   normalizeAudioCollectionArtifact,
+  normalizeImageArtifact,
   normalizeVideoCollectionArtifact,
   trimMediaArtifact,
   burnSubtitlesIntoVideoArtifact,

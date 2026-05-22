@@ -1,6 +1,7 @@
 import importlib
 import json
 import os
+import time
 import sys
 import traceback
 import wave
@@ -367,6 +368,7 @@ def main():
     generation_params = build_generation_params(request, duration_seconds)
     continuation_seed_seconds = coerce_number(request.get('continuationSeedSeconds'), 12.0, 0.25, 120.0)
     continuation_repeat_count = parse_continuation_repeat_count(request.get('repeatCount', request.get('continuationRepeatCount'))) if audio_mode == 'continuation' else 1
+    heavy_step_cooldown_seconds = max(0, min(300, int(float(request.get('heavyStepCooldownSeconds') or 0)))) if audio_mode == 'continuation' else 0
     append_source = audio_mode == 'continuation' and coerce_bool(request.get('appendSource'))
     generated_duration_seconds = 0
     requested_generated_duration_seconds = duration_seconds * continuation_repeat_count if audio_mode == 'continuation' else duration_seconds
@@ -406,6 +408,8 @@ def main():
             generated_frame_count = 0
 
             for repeat_index in range(1, continuation_repeat_count + 1):
+                if repeat_index > 1 and heavy_step_cooldown_seconds > 0:
+                    time.sleep(heavy_step_cooldown_seconds)
                 seed_audio, current_duration_seconds, actual_seed_seconds = trim_end_seed(current_audio, current_sample_rate, continuation_seed_seconds)
                 if repeat_index == 1:
                     source_duration_seconds = current_duration_seconds

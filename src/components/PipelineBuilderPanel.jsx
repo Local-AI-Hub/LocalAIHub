@@ -81,6 +81,9 @@ const {
   PIPELINE_OPERATION_IDS,
   PIPELINE_PORT_KIND_LABELS,
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
+  HEAVY_STEP_COOLDOWN_MAX_SECONDS,
+  DEFAULT_PIPELINE_RUN_SETTINGS,
+  normalizePipelineRunSettings,
   DEFAULT_PLANNING_SCHEMA_ID,
   getPlanningSchemaOptions,
 } = pipelineShared;
@@ -878,13 +881,19 @@ function buildNodePreview(node, runState) {
   if (node.type === 'normalizeAudioCollection') {
     const sampleRate = Math.max(1, Number(node.config?.sampleRate || 44100) || 44100);
     const channels = String(node.config?.channels || 'stereo').trim() === 'mono' ? 'mono' : 'stereo';
-    return sampleRate + ' Hz | ' + channels + ' WAV collection';
+    const format = String(node.config?.outputFormat || 'auto').trim().toUpperCase() || 'AUTO';
+    return sampleRate + ' Hz | ' + channels + ' | ' + format + ' audio';
   }
 
   if (node.type === 'normalizeVideoCollection') {
     const fps = Math.max(1, Number(node.config?.fps || 30) || 30);
     const sizeMode = String(node.config?.sizeMode || 'matchFirst').trim() === 'custom' ? 'custom size' : 'match first size';
-    return 'MP4 | ' + fps + ' fps | ' + sizeMode;
+    const format = String(node.config?.outputFormat || 'auto').trim().toUpperCase() || 'AUTO';
+    return format + ' | ' + fps + ' fps | ' + sizeMode;
+  }
+
+  if (node.type === 'normalizeImage') {
+    return String(node.config?.outputFormat || 'png').trim().toUpperCase() + ' image';
   }
 
   if (node.type === 'extractVideoFrame') {
@@ -3634,6 +3643,17 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     markDirty();
   }
 
+  function updatePipelineRunSettings(nextSettings) {
+    setDraft((current) => ({
+      ...current,
+      runSettings: normalizePipelineRunSettings({
+        ...(current.runSettings || DEFAULT_PIPELINE_RUN_SETTINGS),
+        ...(nextSettings || {}),
+      }),
+    }));
+    markDirty();
+  }
+
   function getCanvasGraphPoint(event) {
     if (!canvasRef.current) {
       return null;
@@ -4582,6 +4602,39 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       ? 'Editing the name or description updates this same saved pipeline when you click Update pipeline.'
                       : 'Set the name and description before the first save so this pipeline is easy to find later.'}
                   </p>
+                  <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-3">
+                    <label className="flex items-center gap-3 text-sm font-medium text-white" htmlFor="pipeline-heavy-step-cooldown">
+                      <input
+                        checked={Boolean((draft.runSettings || DEFAULT_PIPELINE_RUN_SETTINGS).enableHeavyStepCooldown)}
+                        className="h-4 w-4 accent-cyan-300"
+                        id="pipeline-heavy-step-cooldown"
+                        onChange={(event) => updatePipelineRunSettings({
+                          enableHeavyStepCooldown: event.target.checked,
+                          heavyStepCooldownSeconds: event.target.checked && Number((draft.runSettings || DEFAULT_PIPELINE_RUN_SETTINGS).heavyStepCooldownSeconds || 0) <= 0 ? 30 : (draft.runSettings || DEFAULT_PIPELINE_RUN_SETTINGS).heavyStepCooldownSeconds,
+                        })}
+                        type="checkbox"
+                      />
+                      Cooldown between heavy local steps
+                    </label>
+                    <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,1fr),auto] sm:items-end">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="pipeline-heavy-step-cooldown-seconds">Cooldown seconds</label>
+                        <input
+                          className="store-input mt-3"
+                          id="pipeline-heavy-step-cooldown-seconds"
+                          inputMode="numeric"
+                          max={HEAVY_STEP_COOLDOWN_MAX_SECONDS}
+                          min="0"
+                          onChange={(event) => updatePipelineRunSettings({ heavyStepCooldownSeconds: event.target.value })}
+                          step="1"
+                          type="number"
+                          value={(draft.runSettings || DEFAULT_PIPELINE_RUN_SETTINGS).heavyStepCooldownSeconds ?? 0}
+                        />
+                      </div>
+                      <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-2 text-xs text-slate-300">0-{HEAVY_STEP_COOLDOWN_MAX_SECONDS}s</span>
+                    </div>
+                    <p className="mt-3 text-xs leading-5 text-slate-400">Adds a pause between demanding local generations. Useful for lower-end PCs that overheat or become unstable during chained runs.</p>
+                  </div>
                 </div>
 
                 <div className={`rounded-2xl border p-3 ${toneToClassName(analysis.compatibilitySummary?.tone || analysis.primaryIssue?.tone || 'neutral')}`}>
@@ -5935,6 +5988,31 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   </div>
                 ) : null}
 
+                {selectedNode.type === 'normalizeImage' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Convert image files and image collections while preserving collection order.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-image-output-format">Output format</label>
+                      <select
+                        className="store-input mt-3"
+                        id="normalize-image-output-format"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, outputFormat: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.outputFormat || 'png').trim().toLowerCase()}
+                      >
+                        <option value="png">PNG</option>
+                        <option value="jpg">JPG / JPEG</option>
+                        <option value="webp">WebP</option>
+                        <option value="bmp">BMP</option>
+                      </select>
+                    </div>
+                  </div>
+                ) : null}
+
                 {selectedNode.type === 'trimMedia' ? (
                   <div className="space-y-4">
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
@@ -6219,7 +6297,26 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                 {selectedNode.type === 'normalizeAudioCollection' ? (
                   <div className="space-y-4">
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Convert every audio item in the collection to matching WAV settings while preserving collection order.
+                      Normalize or convert audio files and audio collections while preserving collection order.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-audio-output-format">Output format</label>
+                      <select
+                        className="store-input mt-3"
+                        id="normalize-audio-output-format"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, outputFormat: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.outputFormat || 'auto').trim().toLowerCase()}
+                      >
+                        <option value="auto">Auto / normalized</option>
+                        <option value="wav">WAV</option>
+                        <option value="mp3">MP3</option>
+                        <option value="flac">FLAC</option>
+                        <option value="ogg">OGG</option>
+                        <option value="m4a">M4A</option>
+                      </select>
                     </div>
                     <div>
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-audio-sample-rate">Sample rate</label>
@@ -6257,7 +6354,25 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                 {selectedNode.type === 'normalizeVideoCollection' ? (
                   <div className="space-y-4">
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Convert every video item in the collection to matching MP4 settings while preserving collection order.
+                      Normalize or convert video files and video collections while preserving collection order.
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-video-output-format">Output format</label>
+                      <select
+                        className="store-input mt-3"
+                        id="normalize-video-output-format"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: { ...currentNode.config, outputFormat: event.target.value },
+                        }))}
+                        value={String(selectedNode.config?.outputFormat || 'auto').trim().toLowerCase()}
+                      >
+                        <option value="auto">Auto / normalized</option>
+                        <option value="mp4">MP4</option>
+                        <option value="webm">WebM</option>
+                        <option value="mov">MOV</option>
+                        <option value="mkv">MKV</option>
+                      </select>
                     </div>
                     <div>
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="normalize-video-size-mode">Target size</label>

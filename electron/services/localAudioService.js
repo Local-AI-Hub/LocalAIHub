@@ -643,6 +643,7 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
     continuationSeedSeconds: Math.max(0.25, Number(options.continuationSeedSeconds || 12) || 12),
     durationSeconds: Math.max(1, Number(options.durationSeconds || 8) || 8),
     generationSettings,
+    heavyStepCooldownSeconds: Math.max(0, Math.min(300, Math.floor(Number(options.heavyStepCooldownSeconds || 0) || 0))),
     model: String(options.model || '').trim(),
     nodeLabel,
     outputPath,
@@ -653,6 +654,8 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
   }, options.reportProgress, {
     run: 'Running ' + nodeLabel + ' with ' + toolLabel + '...',
     start: 'Starting the local AudioCraft backend for this audio step.',
+  }, {
+    signal: options.cancelSignal || null,
   });
 
   const finalOutputPath = path.resolve(String(response?.outputPath || outputPath).trim());

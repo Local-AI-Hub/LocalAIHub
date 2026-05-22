@@ -30,6 +30,7 @@ try {
 const TEXT_FILE_EXTENSIONS = new Set(['.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log', '.html', '.xml', '.ini', '.rtf']);
 const ANIMATED_IMAGE_EXTENSIONS = new Set(['.gif', '.webp']);
 const MIME_TYPES = {
+  '.bmp': 'image/bmp',
   '.aac': 'audio/aac',
   '.flac': 'audio/flac',
   '.gif': 'image/gif',
@@ -258,6 +259,8 @@ function getArtifactFormatLabel(extension, mimeType, isAnimated) {
       return isAnimated ? 'Animated WebP' : 'WebP';
     case '.png':
       return 'PNG image';
+    case '.bmp':
+      return 'BMP image';
     case '.jpg':
     case '.jpeg':
       return 'JPEG image';
@@ -642,6 +645,32 @@ function serializeVideoNormalizationForUi(normalization = null) {
   }) ? normalized : null;
 }
 
+function serializeImageNormalizationForUi(normalization = null) {
+  if (!normalization || typeof normalization !== 'object') {
+    return null;
+  }
+
+  const normalized = {
+    backend: String(normalization.backend || 'ffmpeg').trim() || 'ffmpeg',
+    backendLabel: String(normalization.backendLabel || 'Bundled ffmpeg').trim() || 'Bundled ffmpeg',
+    createdBy: normalization.createdBy && typeof normalization.createdBy === 'object' ? serializeArtifactForUi(normalization.createdBy) : null,
+    ffmpegMode: String(normalization.ffmpegMode || '').trim(),
+    operation: String(normalization.operation || 'normalizeImage').trim() || 'normalizeImage',
+    operationId: String(normalization.operationId || 'normalizeImage').trim() || 'normalizeImage',
+    outputFormat: String(normalization.outputFormat || 'png').trim() || 'png',
+    sourceCollection: normalization.sourceCollection && typeof normalization.sourceCollection === 'object' ? serializeArtifactForUi(normalization.sourceCollection) : null,
+    sourceImage: normalization.sourceImage && typeof normalization.sourceImage === 'object' ? serializeArtifactForUi(normalization.sourceImage) : null,
+    sourceItem: normalization.sourceItem && typeof normalization.sourceItem === 'object' ? serializeArtifactForUi(normalization.sourceItem) : null,
+  };
+
+  return Object.entries(normalized).some(([, value]) => {
+    if (value && typeof value === 'object') {
+      return true;
+    }
+    return Boolean(value);
+  }) ? normalized : null;
+}
+
 function serializeCollectionNormalizationForUi(normalization = null) {
   if (!normalization || typeof normalization !== 'object') {
     return null;
@@ -951,7 +980,7 @@ function sanitizeSegment(value, fallback = 'item') {
 
 function inferKindFromPath(filePath) {
   const extension = path.extname(String(filePath || '')).toLowerCase();
-  if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(extension)) {
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'].includes(extension)) {
     return PORT_KIND_IMAGE;
   }
 
@@ -1286,6 +1315,7 @@ function summarizeArtifact(artifact, limit = 180) {
   if (artifact.kind === PORT_KIND_IMAGE) {
     const transformation = artifact.imageTransformation && typeof artifact.imageTransformation === 'object' ? artifact.imageTransformation : null;
     const frameExtraction = artifact.videoFrameExtraction && typeof artifact.videoFrameExtraction === 'object' ? artifact.videoFrameExtraction : null;
+    const normalization = artifact.imageNormalization && typeof artifact.imageNormalization === 'object' ? artifact.imageNormalization : null;
     const details = [
       artifact.fileName || artifact.displayName || '',
       artifact.formatLabel || '',
@@ -1731,6 +1761,11 @@ async function buildFileArtifact(filePath, options = {}) {
     if (videoFrameExtraction) {
       artifact.videoFrameExtraction = videoFrameExtraction;
     }
+
+    const imageNormalization = serializeImageNormalizationForUi(options.imageNormalization);
+    if (imageNormalization) {
+      artifact.imageNormalization = imageNormalization;
+    }
   }
 
   if (kind === PORT_KIND_FILE) {
@@ -2071,7 +2106,8 @@ async function saveImageArtifactMetadata(filePath, artifact) {
   const imageGeneration = serializeImageGenerationForUi(artifact?.imageGeneration);
   const imageTransformation = serializeImageTransformationForUi(artifact?.imageTransformation);
   const videoFrameExtraction = serializeVideoFrameExtractionForUi(artifact?.videoFrameExtraction);
-  if (!imageGeneration && !imageTransformation && !videoFrameExtraction) {
+  const imageNormalization = serializeImageNormalizationForUi(artifact?.imageNormalization);
+  if (!imageGeneration && !imageTransformation && !videoFrameExtraction && !imageNormalization) {
     return [];
   }
 
@@ -2083,6 +2119,7 @@ async function saveImageArtifactMetadata(filePath, artifact) {
     height: Number(artifact?.height || 0) || 0,
     imageGeneration,
     imageTransformation,
+    imageNormalization,
     videoFrameExtraction,
     kind: String(artifact?.kind || PORT_KIND_IMAGE).trim() || PORT_KIND_IMAGE,
     summary: String(artifact?.summary || '').trim(),

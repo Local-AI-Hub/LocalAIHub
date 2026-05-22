@@ -259,8 +259,9 @@ async function verifyFileBackedCollectionInput(itemType, filePath) {
 
 function verifyNormalizeCollectionInputCompatibility() {
   for (const entry of [
-    { itemType: 'audio', normalizeType: 'normalizeAudioCollection' },
-    { itemType: 'video', normalizeType: 'normalizeVideoCollection' },
+    { itemType: 'audio', normalizeType: 'normalizeAudioCollection', normalizePort: 'collection' },
+    { itemType: 'video', normalizeType: 'normalizeVideoCollection', normalizePort: 'collection' },
+    { itemType: 'image', normalizeType: 'normalizeImage', normalizePort: 'image' },
   ]) {
     const input = createNode('collectionInput', {
       id: 'collection-input-' + entry.itemType + '-normalize',
@@ -274,17 +275,17 @@ function verifyNormalizeCollectionInputCompatibility() {
       name: 'Verify ' + entry.normalizeType + ' compatibility',
       nodes: [input, normalize, output],
       edges: [
-        createEdge(input.id, 'collection', normalize.id, 'collection'),
-        createEdge(normalize.id, 'collection', output.id, 'collection'),
+        createEdge(input.id, 'collection', normalize.id, entry.normalizePort),
+        createEdge(normalize.id, entry.normalizePort, output.id, 'collection'),
       ],
     });
     const graph = buildPipelineGraph(pipeline);
     assert.deepStrictEqual(graph.errors, [], 'Collection Input(' + entry.itemType + ') should connect to ' + entry.normalizeType + '.');
     const sourcePort = getPortDefinition(input, 'output', 'collection');
-    const targetPort = getPortDefinition(normalize, 'input', 'collection');
+    const targetPort = getPortDefinition(normalize, 'input', entry.normalizePort);
     assert.deepStrictEqual(resolveOutputKinds(input, sourcePort, graph), ['collection:' + entry.itemType], 'Collection Input(' + entry.itemType + ') should resolve to collection:' + entry.itemType + '.');
     assert.strictEqual(arePortsCompatible(sourcePort, targetPort, { sourceNode: input, targetNode: normalize, graph }), true, 'Collection Input(' + entry.itemType + ') should be schema-compatible with ' + entry.normalizeType + '.');
-    assert.strictEqual(getPortDefinition(normalize, 'output', 'collection').collectionBehavior, 'only', entry.normalizeType + ' should still output a collection.');
+    assert.strictEqual(getPortDefinition(normalize, 'output', entry.normalizePort).collectionBehavior, 'allow', entry.normalizeType + ' should accept and output single items or collections.');
   }
 }
 

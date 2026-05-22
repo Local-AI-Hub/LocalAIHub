@@ -61,6 +61,15 @@ async function createSyntheticAudio(outputPath, { sampleRate = 16000, channels =
   ], 'synthetic audio fixture');
 }
 
+async function createSyntheticImage(outputPath, { size = '64x48', color = 'red' } = {}) {
+  await runFfmpeg([
+    '-y',
+    '-f', 'lavfi', '-i', 'color=c=' + color + ':s=' + size,
+    '-frames:v', '1',
+    outputPath,
+  ], 'synthetic image fixture');
+}
+
 async function createSyntheticVideo(outputPath, { audio = true, size = '96x64', rate = 2, duration = 0.6 } = {}) {
   const baseArgs = [
     '-y',
@@ -136,24 +145,33 @@ function verifySchemaAndUiContracts() {
   assert(normalizeAudio, 'Normalize Audio Collection node should exist.');
   assert.strictEqual(normalizeAudio.category, 'Deterministic Media Operations', 'Normalize Audio Collection should live under Deterministic Media Operations.');
   assert.strictEqual(normalizeAudio.inputPorts[0].kind, pipelineSchema.PORT_KIND_AUDIO, 'Normalize Audio Collection should accept audio items.');
-  assert.strictEqual(normalizeAudio.inputPorts[0].collectionBehavior, 'only', 'Normalize Audio Collection input should be collection:audio.');
+  assert.strictEqual(normalizeAudio.inputPorts[0].collectionBehavior, 'allow', 'Normalize Audio should accept single audio or collection:audio.');
   assert.strictEqual(normalizeAudio.outputPorts[0].kind, pipelineSchema.PORT_KIND_AUDIO, 'Normalize Audio Collection should output audio items.');
-  assert.strictEqual(normalizeAudio.outputPorts[0].collectionBehavior, 'only', 'Normalize Audio Collection output should be collection:audio.');
+  assert.strictEqual(normalizeAudio.outputPorts[0].collectionBehavior, 'allow', 'Normalize Audio should output single audio or collection:audio.');
   assert.notStrictEqual(normalizeAudio.outputPorts[0].id, 'audio', 'Normalize Audio Collection should not output a single audio artifact.');
   assert.strictEqual(normalizeAudio.outputPorts[0].label, 'Normalized', 'Normalize Audio Collection should use a short output display label.');
-  assert.strictEqual(normalizeAudio.configDefaults.outputFormat, 'wav', 'Normalize Audio Collection should default to WAV.');
+  assert.strictEqual(normalizeAudio.configDefaults.outputFormat, 'auto', 'Normalize Audio should default to auto normalized output.');
   assert.strictEqual(normalizeAudio.configDefaults.channels, 'stereo', 'Normalize Audio Collection should default to stereo.');
 
   const normalizeVideo = pipelineSchema.getNodeTypeDefinition('normalizeVideoCollection');
   assert(normalizeVideo, 'Normalize Video Collection node should exist.');
   assert.strictEqual(normalizeVideo.category, 'Deterministic Media Operations', 'Normalize Video Collection should live under Deterministic Media Operations.');
   assert.strictEqual(normalizeVideo.inputPorts[0].kind, pipelineSchema.PORT_KIND_VIDEO, 'Normalize Video Collection should accept video items.');
-  assert.strictEqual(normalizeVideo.inputPorts[0].collectionBehavior, 'only', 'Normalize Video Collection input should be collection:video.');
+  assert.strictEqual(normalizeVideo.inputPorts[0].collectionBehavior, 'allow', 'Normalize Video should accept single video or collection:video.');
   assert.strictEqual(normalizeVideo.outputPorts[0].kind, pipelineSchema.PORT_KIND_VIDEO, 'Normalize Video Collection should output video items.');
-  assert.strictEqual(normalizeVideo.outputPorts[0].collectionBehavior, 'only', 'Normalize Video Collection output should be collection:video.');
+  assert.strictEqual(normalizeVideo.outputPorts[0].collectionBehavior, 'allow', 'Normalize Video should output single video or collection:video.');
   assert.notStrictEqual(normalizeVideo.outputPorts[0].id, 'video', 'Normalize Video Collection should not output a single video artifact.');
   assert.strictEqual(normalizeVideo.outputPorts[0].label, 'Normalized', 'Normalize Video Collection should use a short output display label.');
-  assert.strictEqual(normalizeVideo.configDefaults.outputFormat, 'mp4', 'Normalize Video Collection should default to MP4.');
+  assert.strictEqual(normalizeVideo.configDefaults.outputFormat, 'auto', 'Normalize Video should default to auto normalized output.');
+
+  const normalizeImage = pipelineSchema.getNodeTypeDefinition('normalizeImage');
+  assert(normalizeImage, 'Normalize Image node should exist.');
+  assert.strictEqual(normalizeImage.category, 'Deterministic Media Operations', 'Normalize Image should live under Deterministic Media Operations.');
+  assert.strictEqual(normalizeImage.inputPorts[0].kind, pipelineSchema.PORT_KIND_IMAGE, 'Normalize Image should accept image items.');
+  assert.strictEqual(normalizeImage.inputPorts[0].collectionBehavior, 'allow', 'Normalize Image should accept single image or collection:image.');
+  assert.strictEqual(normalizeImage.outputPorts[0].kind, pipelineSchema.PORT_KIND_IMAGE, 'Normalize Image should output image items.');
+  assert.strictEqual(normalizeImage.outputPorts[0].collectionBehavior, 'allow', 'Normalize Image should output single image or collection:image.');
+  assert.strictEqual(normalizeImage.configDefaults.outputFormat, 'png', 'Normalize Image should default to PNG.');
 
   const trimDefinition = pipelineSchema.getNodeTypeDefinition('trimMedia');
   assert(trimDefinition, 'Trim Media node should exist.');
@@ -210,7 +228,7 @@ function verifySchemaAndUiContracts() {
   assert.strictEqual(pipelineSchema.getNodeTypeDefinition('videoStitch').outputPorts[0].kind, pipelineSchema.PORT_KIND_VIDEO, 'Video Stitch should still output one video artifact.');
 
   const deterministicMediaCategory = 'Deterministic Media Operations';
-  for (const type of ['collectionBuilder', 'audioStitch', 'videoStitch', 'mediaComposition', 'mediaExport', 'extractVideoFrame', 'extractAudio', 'normalizeAudioCollection', 'normalizeVideoCollection', 'trimMedia', 'burnSubtitles', 'exportSubtitles']) {
+  for (const type of ['collectionBuilder', 'audioStitch', 'videoStitch', 'mediaComposition', 'mediaExport', 'extractVideoFrame', 'extractAudio', 'normalizeAudioCollection', 'normalizeVideoCollection', 'normalizeImage', 'trimMedia', 'burnSubtitles', 'exportSubtitles']) {
     assert.strictEqual(pipelineSchema.getNodeTypeDefinition(type).category, deterministicMediaCategory, type + ' should be grouped under Deterministic Media Operations.');
   }
   assert.strictEqual(pipelineSchema.getNodeTypeDefinition('mediaComposition').category, deterministicMediaCategory, 'Media Composition should live under Deterministic Media Operations.');
@@ -265,11 +283,15 @@ function verifySchemaAndUiContracts() {
   assert(panelSource.includes('export-subtitles-mode'), 'Export Subtitles inspector should expose caption mode control.');
   assert(panelSource.includes('export-subtitles-duration'), 'Export Subtitles inspector should expose manual duration control.');
   assert(panelSource.includes("selectedNode.type === 'normalizeAudioCollection'"), 'Pipeline Builder should render Normalize Audio Collection inspector UI.');
-  assert(panelSource.includes('Convert every audio item in the collection to matching WAV settings while preserving collection order.'), 'Normalize Audio Collection inspector should show concise help text.');
+  assert(panelSource.includes('Normalize or convert audio files and audio collections while preserving collection order.'), 'Normalize Audio inspector should show concise help text.');
+  assert(panelSource.includes('normalize-audio-output-format'), 'Normalize Audio inspector should expose output format.');
   assert(panelSource.includes("selectedNode.type === 'normalizeVideoCollection'"), 'Pipeline Builder should render Normalize Video Collection inspector UI.');
-  assert(panelSource.includes('Convert every video item in the collection to matching MP4 settings while preserving collection order.'), 'Normalize Video Collection inspector should show concise help text.');
-  const normalizeAudioHelpIndex = panelSource.indexOf('Convert every audio item in the collection to matching WAV settings while preserving collection order.');
-  const normalizeVideoHelpIndex = panelSource.indexOf('Convert every video item in the collection to matching MP4 settings while preserving collection order.');
+  assert(panelSource.includes('Normalize or convert video files and video collections while preserving collection order.'), 'Normalize Video inspector should show concise help text.');
+  assert(panelSource.includes('normalize-video-output-format'), 'Normalize Video inspector should expose output format.');
+  assert(panelSource.includes("selectedNode.type === 'normalizeImage'"), 'Pipeline Builder should render Normalize Image inspector UI.');
+  assert(panelSource.includes('normalize-image-output-format'), 'Normalize Image inspector should expose output format.');
+  const normalizeAudioHelpIndex = panelSource.indexOf('Normalize or convert audio files and audio collections while preserving collection order.');
+  const normalizeVideoHelpIndex = panelSource.indexOf('Normalize or convert video files and video collections while preserving collection order.');
   assert(!/stitch/i.test(panelSource.slice(normalizeAudioHelpIndex, normalizeAudioHelpIndex + 140)), 'Normalize Audio Collection help text should not mention stitching.');
   assert(!/stitch/i.test(panelSource.slice(normalizeVideoHelpIndex, normalizeVideoHelpIndex + 140)), 'Normalize Video Collection help text should not mention stitching.');
   assert(panelSource.includes('flex min-w-0 items-center gap-2'), 'Input port column should contain long labels inside its grid cell.');
@@ -482,6 +504,18 @@ async function verifyRuntimeNormalization() {
     assert.strictEqual(sidecar.audioNormalization.sourceAudio.filePath, entry.metadata.sourceItem.artifactPath, 'Normalized audio sidecar should record source audio path.');
   }
 
+
+
+  const convertedAudio = await mediaUtilityService.normalizeAudioCollectionArtifact(audioA, {
+    node: { id: 'normalize-audio-single', label: 'Normalize Audio', type: 'normalizeAudioCollection' },
+    outputFormat: 'mp3',
+    runDirectories: { artifactsDir: TEST_STORAGE_ROOT },
+  });
+  assert.strictEqual(convertedAudio.outputs.collection.kind, pipelineSchema.PORT_KIND_AUDIO, 'Normalize Audio should support a single audio artifact.');
+  assert.strictEqual(convertedAudio.outputs.collection.extension, '.mp3', 'Explicit audio conversion should update extension.');
+  assert.strictEqual(convertedAudio.outputs.collection.mimeType, 'audio/mpeg', 'Explicit audio conversion should update MIME type.');
+  assert.strictEqual(convertedAudio.outputs.collection.audioNormalization.outputFormat, 'mp3', 'Explicit audio conversion should record output format.');
+
   await assert.rejects(
     () => mediaUtilityService.normalizeAudioCollectionArtifact({ kind: pipelineSchema.PORT_KIND_COLLECTION, itemKind: pipelineSchema.PORT_KIND_AUDIO, items: [] }, { runDirectories: { artifactsDir: TEST_STORAGE_ROOT } }),
     /empty audio collection/i,
@@ -538,6 +572,54 @@ async function verifyRuntimeNormalization() {
     assert.strictEqual(sidecar.videoNormalization.width, 96, 'Normalized video sidecar should record target width.');
     assert.strictEqual(sidecar.videoNormalization.sourceVideo.filePath, entry.metadata.sourceItem.artifactPath, 'Normalized video sidecar should record source video path.');
   }
+
+
+
+  const convertedVideo = await mediaUtilityService.normalizeVideoCollectionArtifact(videoA, {
+    fps: 2,
+    height: 64,
+    node: { id: 'normalize-video-single', label: 'Normalize Video', type: 'normalizeVideoCollection' },
+    outputFormat: 'mov',
+    runDirectories: { artifactsDir: TEST_STORAGE_ROOT },
+    sizeMode: 'custom',
+    width: 96,
+  });
+  assert.strictEqual(convertedVideo.outputs.collection.kind, pipelineSchema.PORT_KIND_VIDEO, 'Normalize Video should support a single video artifact.');
+  assert.strictEqual(convertedVideo.outputs.collection.extension, '.mov', 'Explicit video conversion should update extension.');
+  assert.strictEqual(convertedVideo.outputs.collection.mimeType, 'video/quicktime', 'Explicit video conversion should update MIME type.');
+  assert.strictEqual(convertedVideo.outputs.collection.videoNormalization.outputFormat, 'mov', 'Explicit video conversion should record output format.');
+
+  const imageAPath = path.join(TEST_STORAGE_ROOT, 'image-a.png');
+  const imageBPath = path.join(TEST_STORAGE_ROOT, 'image-b.png');
+  await createSyntheticImage(imageAPath, { color: 'red' });
+  await createSyntheticImage(imageBPath, { color: 'blue' });
+  const imageA = await buildFileArtifact(imageAPath, { displayName: 'Image A', kind: pipelineSchema.PORT_KIND_IMAGE, role: 'input' });
+  const imageB = await buildFileArtifact(imageBPath, { displayName: 'Image B', kind: pipelineSchema.PORT_KIND_IMAGE, role: 'input' });
+  const convertedImage = await mediaUtilityService.normalizeImageArtifact(imageA, {
+    node: { id: 'normalize-image-single', label: 'Normalize Image', type: 'normalizeImage' },
+    outputFormat: 'webp',
+    runDirectories: { artifactsDir: TEST_STORAGE_ROOT },
+  });
+  assert.strictEqual(convertedImage.outputs.image.kind, pipelineSchema.PORT_KIND_IMAGE, 'Normalize Image should output an image artifact.');
+  assert.strictEqual(convertedImage.outputs.image.extension, '.webp', 'Explicit image conversion should update extension.');
+  assert.strictEqual(convertedImage.outputs.image.mimeType, 'image/webp', 'Explicit image conversion should update MIME type.');
+  assert.strictEqual(convertedImage.outputs.image.imageNormalization.outputFormat, 'webp', 'Explicit image conversion should record output format.');
+  const imageSidecar = readJson(convertedImage.outputs.image.metadataPaths.find((entry) => entry.endsWith('.image.json')));
+  assert.strictEqual(imageSidecar.imageNormalization.sourceImage.filePath, imageAPath, 'Normalize Image sidecar should record source image path.');
+
+  const imageCollection = createArtifactCollection([
+    { artifact: imageA, index: 0, itemId: 'image-a' },
+    { artifact: imageB, index: 1, itemId: 'image-b' },
+  ], { displayName: 'Mixed image collection', itemKind: pipelineSchema.PORT_KIND_IMAGE, role: 'input' });
+  const normalizedImages = await mediaUtilityService.normalizeImageArtifact(imageCollection, {
+    node: { id: 'normalize-image-collection', label: 'Normalize Image', type: 'normalizeImage' },
+    outputFormat: 'jpg',
+    runDirectories: { artifactsDir: TEST_STORAGE_ROOT },
+  });
+  assert.strictEqual(normalizedImages.outputs.image.kind, pipelineSchema.PORT_KIND_COLLECTION, 'Normalize Image should output a collection for collection input.');
+  assert.strictEqual(normalizedImages.outputs.image.itemKind, pipelineSchema.PORT_KIND_IMAGE, 'Normalize Image collection output should be collection:image.');
+  assert.deepStrictEqual(normalizedImages.outputs.image.items.map((entry) => entry.itemId), ['image-a', 'image-b'], 'Normalize Image should preserve collection order.');
+  assert(normalizedImages.outputs.image.items.every((entry) => entry.artifact.extension === '.jpg'), 'Normalize Image collection conversion should update every extension.');
 
   await assert.rejects(
     () => mediaUtilityService.normalizeVideoCollectionArtifact({ kind: pipelineSchema.PORT_KIND_COLLECTION, itemKind: pipelineSchema.PORT_KIND_VIDEO, items: [] }, { runDirectories: { artifactsDir: TEST_STORAGE_ROOT } }),

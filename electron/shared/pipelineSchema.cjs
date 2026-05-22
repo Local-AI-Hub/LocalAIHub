@@ -41,8 +41,13 @@ const {
   isLikelySupportOnlyStableDiffusionModel,
 } = require('./toolAssetSelection.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 15;
+const PIPELINE_SCHEMA_VERSION = 16;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
+const HEAVY_STEP_COOLDOWN_MAX_SECONDS = 300;
+const DEFAULT_PIPELINE_RUN_SETTINGS = Object.freeze({
+  enableHeavyStepCooldown: false,
+  heavyStepCooldownSeconds: 0,
+});
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
 const PORT_KIND_TEXT = 'text';
@@ -900,15 +905,15 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   normalizeAudioCollection: Object.freeze({
     type: 'normalizeAudioCollection',
-    label: 'Normalize Audio Collection',
+    label: 'Normalize Audio',
     category: 'Deterministic Media Operations',
-    description: 'Converts every audio item in a collection to matching WAV settings while preserving order.',
+    description: 'Normalizes or converts audio artifacts and audio collections while preserving collection order.',
     inputPorts: [
       {
         id: 'collection',
         kind: PORT_KIND_AUDIO,
-        collectionBehavior: 'only',
-        label: 'Audio Collection',
+        collectionBehavior: 'allow',
+        label: 'Audio',
         required: true,
       },
     ],
@@ -916,12 +921,12 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       {
         id: 'collection',
         kind: PORT_KIND_AUDIO,
-        collectionBehavior: 'only',
+        collectionBehavior: 'allow',
         label: 'Normalized',
       },
     ],
     configDefaults: {
-      outputFormat: 'wav',
+      outputFormat: 'auto',
       sampleRate: 44100,
       channels: 'stereo',
       pcmFormat: 'pcm_s16le',
@@ -929,15 +934,15 @@ const PIPELINE_NODE_TYPES = Object.freeze({
   }),
   normalizeVideoCollection: Object.freeze({
     type: 'normalizeVideoCollection',
-    label: 'Normalize Video Collection',
+    label: 'Normalize Video',
     category: 'Deterministic Media Operations',
-    description: 'Converts every video item in a collection to matching MP4 settings while preserving order.',
+    description: 'Normalizes or converts video artifacts and video collections while preserving collection order.',
     inputPorts: [
       {
         id: 'collection',
         kind: PORT_KIND_VIDEO,
-        collectionBehavior: 'only',
-        label: 'Video Collection',
+        collectionBehavior: 'allow',
+        label: 'Video',
         required: true,
       },
     ],
@@ -945,12 +950,12 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       {
         id: 'collection',
         kind: PORT_KIND_VIDEO,
-        collectionBehavior: 'only',
+        collectionBehavior: 'allow',
         label: 'Normalized',
       },
     ],
     configDefaults: {
-      outputFormat: 'mp4',
+      outputFormat: 'auto',
       sizeMode: 'matchFirst',
       width: 1280,
       height: 720,
@@ -958,6 +963,32 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       videoCodec: 'libx264',
       audioCodec: 'aac',
       pixelFormat: 'yuv420p',
+    },
+  }),
+  normalizeImage: Object.freeze({
+    type: 'normalizeImage',
+    label: 'Normalize Image',
+    category: 'Deterministic Media Operations',
+    description: 'Converts image artifacts and image collections to a pipeline-friendly image format.',
+    inputPorts: [
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        collectionBehavior: 'allow',
+        label: 'Image',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'image',
+        kind: PORT_KIND_IMAGE,
+        collectionBehavior: 'allow',
+        label: 'Normalized',
+      },
+    ],
+    configDefaults: {
+      outputFormat: 'png',
     },
   }),
   trimMedia: Object.freeze({
@@ -1321,6 +1352,17 @@ function normalizeTimestamp(value) {
 function normalizeNumber(value, fallback) {
   const nextValue = Number(value);
   return Number.isFinite(nextValue) ? nextValue : fallback;
+}
+
+function normalizePipelineRunSettings(value = {}) {
+  const source = value && typeof value === 'object' ? value : {};
+  const enabled = source.enableHeavyStepCooldown === true;
+  const rawSeconds = Number(source.heavyStepCooldownSeconds);
+  const seconds = Number.isFinite(rawSeconds) ? Math.floor(rawSeconds) : 0;
+  return {
+    enableHeavyStepCooldown: enabled,
+    heavyStepCooldownSeconds: Math.max(0, Math.min(HEAVY_STEP_COOLDOWN_MAX_SECONDS, seconds)),
+  };
 }
 
 function normalizePortKind(kind) {
@@ -1970,6 +2012,7 @@ function createEmptyPipeline(overrides = {}) {
     description: String(overrides.description || '').trim(),
     createdAt: normalizeTimestamp(overrides.createdAt || now),
     updatedAt: normalizeTimestamp(overrides.updatedAt || now),
+    runSettings: normalizePipelineRunSettings(overrides.runSettings),
     nodes: Array.isArray(overrides.nodes) ? overrides.nodes.map((node, index) => normalizeNode(node, index)) : [],
     edges: Array.isArray(overrides.edges) ? overrides.edges.map((edge) => normalizeEdge(edge)) : [],
   };
@@ -1987,6 +2030,7 @@ function normalizePipelineDefinition(definition = {}, options = {}) {
     description: String(definition?.description || '').trim(),
     createdAt,
     updatedAt,
+    runSettings: normalizePipelineRunSettings(definition?.runSettings),
     nodes: Array.isArray(definition?.nodes) ? definition.nodes.map((node, index) => normalizeNode(node, index)) : [],
     edges: Array.isArray(definition?.edges) ? definition.edges.map((edge) => normalizeEdge(edge)) : [],
   };
@@ -5750,20 +5794,22 @@ function analyzePipeline(definition = {}, context = {}) {
       }
 
       if (node.type === 'normalizeAudioCollection') {
-        const collectionKinds = getIncomingKindsForNodePort(node, 'collection', graph);
-        const outputFormat = String(node.config?.outputFormat || 'wav').trim().toLowerCase();
+        const audioKinds = getIncomingKindsForNodePort(node, 'collection', graph);
+        const outputFormat = String(node.config?.outputFormat || 'auto').trim().toLowerCase();
         const sampleRate = Number(node.config?.sampleRate || 0) || 0;
         const channels = String(node.config?.channels || 'stereo').trim().toLowerCase();
-        if (!collectionKinds.includes(createCollectionPortKind(PORT_KIND_AUDIO))) {
+        const acceptsAudio = audioKinds.includes(PORT_KIND_AUDIO) || audioKinds.includes(createCollectionPortKind(PORT_KIND_AUDIO));
+        const supportedAudioFormats = ['auto', 'normalized', 'wav', 'mp3', 'flac', 'ogg', 'm4a'];
+        if (!acceptsAudio) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect an ordered audio collection before normalizing it.',
+            message: 'Connect an audio file or ordered audio collection before normalizing it.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (outputFormat && outputFormat !== 'wav') {
+        } else if (outputFormat && !supportedAudioFormats.includes(outputFormat)) {
           summary.readiness = {
             tone: 'error',
-            message: 'Normalize Audio Collection writes WAV output in this pass. Leave the output format as wav.',
+            message: 'Normalize Audio supports auto, wav, mp3, flac, ogg, or m4a output.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (sampleRate <= 0) {
@@ -5775,34 +5821,36 @@ function analyzePipeline(definition = {}, context = {}) {
         } else if (channels !== 'mono' && channels !== 'stereo') {
           summary.readiness = {
             tone: 'error',
-            message: 'Normalize Audio Collection supports mono or stereo output.',
+            message: 'Normalize Audio supports mono or stereo output.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else {
           summary.readiness = {
             tone: 'info',
-            message: 'This step converts every audio item to matching WAV settings and preserves collection order.',
+            message: 'This step normalizes or converts audio and preserves collection order when the input is a collection.',
           };
         }
       }
 
       if (node.type === 'normalizeVideoCollection') {
-        const collectionKinds = getIncomingKindsForNodePort(node, 'collection', graph);
-        const outputFormat = String(node.config?.outputFormat || 'mp4').trim().toLowerCase();
+        const videoKinds = getIncomingKindsForNodePort(node, 'collection', graph);
+        const outputFormat = String(node.config?.outputFormat || 'auto').trim().toLowerCase();
         const sizeMode = String(node.config?.sizeMode || 'matchFirst').trim() === 'custom' ? 'custom' : 'matchFirst';
         const fps = Number(node.config?.fps || 0) || 0;
         const width = Number(node.config?.width || 0) || 0;
         const height = Number(node.config?.height || 0) || 0;
-        if (!collectionKinds.includes(createCollectionPortKind(PORT_KIND_VIDEO))) {
+        const acceptsVideo = videoKinds.includes(PORT_KIND_VIDEO) || videoKinds.includes(createCollectionPortKind(PORT_KIND_VIDEO));
+        const supportedVideoFormats = ['auto', 'normalized', 'mp4', 'webm', 'mov', 'mkv'];
+        if (!acceptsVideo) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect an ordered video collection before normalizing it.',
+            message: 'Connect a video file or ordered video collection before normalizing it.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (outputFormat && outputFormat !== 'mp4') {
+        } else if (outputFormat && !supportedVideoFormats.includes(outputFormat)) {
           summary.readiness = {
             tone: 'error',
-            message: 'Normalize Video Collection writes MP4 output in this pass. Leave the output format as mp4.',
+            message: 'Normalize Video supports auto, mp4, webm, mov, or mkv output.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (fps <= 0) {
@@ -5820,7 +5868,32 @@ function analyzePipeline(definition = {}, context = {}) {
         } else {
           summary.readiness = {
             tone: 'info',
-            message: 'This step converts every video item to matching MP4 settings and preserves collection order.',
+            message: 'This step normalizes or converts video and preserves collection order when the input is a collection.',
+          };
+        }
+      }
+
+      if (node.type === 'normalizeImage') {
+        const imageKinds = getIncomingKindsForNodePort(node, 'image', graph);
+        const outputFormat = String(node.config?.outputFormat || 'png').trim().toLowerCase();
+        const acceptsImage = imageKinds.includes(PORT_KIND_IMAGE) || imageKinds.includes(createCollectionPortKind(PORT_KIND_IMAGE));
+        const supportedImageFormats = ['auto', 'normalized', 'png', 'jpg', 'jpeg', 'webp', 'bmp'];
+        if (!acceptsImage) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect an image file or ordered image collection before normalizing it.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (outputFormat && !supportedImageFormats.includes(outputFormat)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Normalize Image supports png, jpg, webp, or bmp output.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This step converts images and preserves collection order when the input is a collection.',
           };
         }
       }
@@ -6178,6 +6251,8 @@ module.exports = {
   PIPELINE_OPERATION_IDS,
   PIPELINE_PORT_KIND_LABELS,
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
+  HEAVY_STEP_COOLDOWN_MAX_SECONDS,
+  DEFAULT_PIPELINE_RUN_SETTINGS,
   AUDIO_WORKFLOW_TOOL_IDS,
   AUDIO_TRANSFORM_TOOL_IDS,
   COLLECTION_MAP_MAPPING_OPTIONS,
@@ -6251,6 +6326,7 @@ module.exports = {
   getSupportedPortKinds,
   normalizeImageTransformSubtype,
   normalizePipelineDefinition,
+  normalizePipelineRunSettings,
   normalizePortKind,
   parseGraphWorkflowDefinitionText,
   resolveGraphWorkflowPresetNode,
