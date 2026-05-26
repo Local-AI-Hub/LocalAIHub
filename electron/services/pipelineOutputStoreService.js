@@ -15,7 +15,7 @@ const {
 } = require('./pipelineArtifactService');
 
 const TEXT_FILE_EXTENSIONS = new Set(['.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log', '.html', '.xml', '.ini', '.rtf']);
-const METADATA_SUFFIXES = ['.audio.json', '.image.json', '.transcription.json', '.composition-export.json', '.video.json'];
+const METADATA_SUFFIXES = ['.audio.json', '.image.json', '.transcription.json', '.composition-export.json', '.video.json', '.image-analysis.json', '.subtitle.json'];
 const TEXT_MIME_TYPES = {
   '.csv': 'text/csv',
   '.html': 'text/html',
@@ -444,7 +444,79 @@ function resolvePipelineOutputRoot(targetPath, pipelineRunsRoot) {
   return '';
 }
 
-async function deletePipelineOutput(outputPath) {
+function getAdjacentMetadataSidecarPaths(filePath) {
+  const basePath = path.join(path.dirname(filePath), path.basename(filePath, path.extname(filePath)));
+  return METADATA_SUFFIXES.map((suffix) => `${basePath}${suffix}`);
+}
+
+function assertDeletablePipelineOutputPath(candidatePath, outputsRoot) {
+  const normalizedCandidate = normalizePath(candidatePath);
+  if (!isPathInside(outputsRoot, normalizedCandidate)) {
+    throw new Error('Local AI Hub refused to delete a pipeline output companion outside the known output folder.');
+  }
+
+  if (normalizedCandidate.toLowerCase() === normalizePath(outputsRoot).toLowerCase()) {
+    throw new Error('Choose a saved pipeline output instead of the whole outputs folder.');
+  }
+
+  return normalizedCandidate;
+}
+
+async function buildPipelineOutputDeletionSet(targetPath, outputsRoot) {
+  const normalizedTargetPath = assertDeletablePipelineOutputPath(targetPath, outputsRoot);
+  let stat = null;
+  try {
+    stat = await fs.stat(normalizedTargetPath);
+  } catch {
+    throw new Error('Local AI Hub could not find that pipeline output anymore.');
+  }
+
+  if (stat.isDirectory()) {
+    return [normalizedTargetPath];
+  }
+
+  if (!stat.isFile()) {
+    throw new Error('Choose a saved pipeline output file or folder to delete.');
+  }
+
+  const deletionSet = [];
+  for (const sidecarPath of getAdjacentMetadataSidecarPaths(normalizedTargetPath)) {
+    const normalizedSidecarPath = assertDeletablePipelineOutputPath(sidecarPath, outputsRoot);
+    if (normalizedSidecarPath.toLowerCase() === normalizedTargetPath.toLowerCase()) {
+      continue;
+    }
+
+    if (await fs.pathExists(normalizedSidecarPath)) {
+      deletionSet.push(normalizedSidecarPath);
+    }
+  }
+  deletionSet.push(normalizedTargetPath);
+
+  return [...new Map(deletionSet.map((entry) => [entry.toLowerCase(), entry])).values()];
+}
+
+function normalizeDeletionMode(options = {}) {
+  return options.deleteMode === 'permanent' || options.useTrash === false ? 'permanent' : 'trash';
+}
+
+async function removePipelineOutputPath(targetPath, options = {}) {
+  if (normalizeDeletionMode(options) === 'permanent') {
+    await fs.remove(targetPath);
+    return;
+  }
+
+  if (typeof options.trashItem !== 'function') {
+    throw new Error('The Recycle Bin is not available from this Local AI Hub window. Disable "Move deleted pipeline outputs to Recycle Bin" in Settings if you want to permanently delete this output instead.');
+  }
+
+  try {
+    await options.trashItem(targetPath);
+  } catch (error) {
+    throw new Error('Local AI Hub could not move that output to the Recycle Bin. Disable "Move deleted pipeline outputs to Recycle Bin" in Settings if you want to permanently delete it instead.');
+  }
+}
+
+async function deletePipelineOutput(outputPath, options = {}) {
   const targetPath = normalizePath(outputPath);
   if (!String(outputPath || '').trim()) {
     throw new Error('Choose a pipeline output to delete first.');
@@ -457,23 +529,31 @@ async function deletePipelineOutput(outputPath) {
     throw new Error('Local AI Hub can only delete files from known pipeline output folders in this pass.');
   }
 
-  if (targetPath.toLowerCase() === outputsRoot.toLowerCase()) {
-    throw new Error('Choose a saved pipeline output instead of the whole outputs folder.');
-  }
-
-  if (!(await fs.pathExists(targetPath))) {
-    throw new Error('Local AI Hub could not find that pipeline output anymore.');
+  const deletionSet = await buildPipelineOutputDeletionSet(targetPath, outputsRoot);
+  const deletionMode = normalizeDeletionMode(options);
+  for (const deletionPath of deletionSet) {
+    await removePipelineOutputPath(deletionPath, { ...options, deleteMode: deletionMode });
   }
 
   const label = path.basename(targetPath);
-  await fs.remove(targetPath);
   return {
     deletedPath: targetPath,
-    message: `${label} was removed from Local AI Hub's pipeline outputs.`,
+    deletedPaths: deletionSet,
+    deletionMode,
+    message: deletionMode === 'permanent'
+      ? `${label} was permanently deleted from Local AI Hub's pipeline outputs.`
+      : `${label} was moved to the Recycle Bin from Local AI Hub's pipeline outputs.`,
   };
 }
 
 module.exports = {
   deletePipelineOutput,
   listPipelineOutputs,
+  _test: {
+    buildPipelineOutputDeletionSet,
+    getAdjacentMetadataSidecarPaths,
+    isMetadataSidecar,
+    normalizeDeletionMode,
+    resolvePipelineOutputRoot,
+  },
 };

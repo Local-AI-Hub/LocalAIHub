@@ -40,6 +40,7 @@ const EMPTY_STATE = {
   settings: {
     closeBehavior: 'exit',
     liveResourcePolling: false,
+    moveDeletedPipelineOutputsToRecycleBin: true,
   },
   storage: null,
   toolUpdates: {
@@ -150,6 +151,7 @@ export default function App() {
   const [storeInstallRootDraft, setStoreInstallRootDraft] = useState('');
   const [closeBehaviorDraft, setCloseBehaviorDraft] = useState('exit');
   const [liveResourcePollingDraft, setLiveResourcePollingDraft] = useState(false);
+  const [pipelineOutputTrashDraft, setPipelineOutputTrashDraft] = useState(true);
   const [ollamaChatOpen, setOllamaChatOpen] = useState(false);
   const [ollamaModels, setOllamaModels] = useState([]);
   const [ollamaSelectedModel, setOllamaSelectedModel] = useState('');
@@ -1341,6 +1343,12 @@ export default function App() {
     );
   }
 
+  async function savePipelineOutputTrashPreference() {
+    await runAction('settings:save-pipeline-output-trash', () =>
+      window.localAIHub.savePipelineOutputTrash(pipelineOutputTrashDraft),
+    );
+  }
+
   async function migrateLegacyStorage() {
     const migration = appState.storage?.legacyMigration;
     if (!migration?.available) {
@@ -1905,6 +1913,10 @@ export default function App() {
   }, [appState.settings?.liveResourcePolling]);
 
   useEffect(() => {
+    setPipelineOutputTrashDraft(appState.settings?.moveDeletedPipelineOutputsToRecycleBin !== false);
+  }, [appState.settings?.moveDeletedPipelineOutputsToRecycleBin]);
+
+  useEffect(() => {
     if (activeTab !== 'settings' || cleanupPreview) {
       return;
     }
@@ -2293,6 +2305,7 @@ export default function App() {
                 hardware={appState.hardware}
                 manifests={appState.manifests}
                 promptStyles={appState.promptStyles}
+                moveDeletedPipelineOutputsToRecycleBin={appState.settings?.moveDeletedPipelineOutputsToRecycleBin !== false}
                 onToast={pushToast}
                 providers={providers}
                 tools={tools}
@@ -2317,8 +2330,10 @@ export default function App() {
                 cleanupPreview={cleanupPreview}
                 closeBehaviorDraft={closeBehaviorDraft}
                 liveResourcePollingDraft={liveResourcePollingDraft}
+                pipelineOutputTrashDraft={pipelineOutputTrashDraft}
                 onChangeCloseBehavior={setCloseBehaviorDraft}
                 onChangeLiveResourcePolling={setLiveResourcePollingDraft}
+                onChangePipelineOutputTrash={setPipelineOutputTrashDraft}
                 onChangePreferredInstallRootDraft={setPreferredInstallRootDraft}
                 onChangeStorageDraft={setStorageDraft}
                 onChoosePreferredInstallFolder={choosePreferredInstallFolder}
@@ -2331,6 +2346,7 @@ export default function App() {
                 onSaveCloseBehavior={saveCloseBehaviorPreference}
                 onSavePromptStyle={savePromptStyle}
                 onSaveLiveResourcePolling={saveLiveResourcePollingPreference}
+                onSavePipelineOutputTrash={savePipelineOutputTrashPreference}
                 onSavePreferredInstallRoot={savePreferredInstallRoot}
                 onSaveStorageLocation={() => saveStorageLocation()}
                 preferredInstallRootDraft={preferredInstallRootDraft}

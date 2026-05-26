@@ -178,6 +178,8 @@ function buildMediaCompositionPipeline(assetPaths, options = {}) {
     label: 'Compose scenes',
     config: {
       secondsPerItem: 1.5,
+      ...(options.narrationVolume !== undefined ? { narrationVolume: options.narrationVolume } : {}),
+      ...(options.backgroundMusicVolume !== undefined ? { backgroundMusicVolume: options.backgroundMusicVolume } : {}),
     },
   });
   const exportNode = createNode('mediaExport', {
@@ -308,7 +310,31 @@ async function verifyMediaCompositionWithBackgroundMusic() {
   assert(exportArtifact.compositionExport.audioTrack?.artifact?.fileName, 'Expected the export metadata to keep the primary audio track reference.');
   assert(exportArtifact.compositionExport.backgroundMusicTrack?.artifact?.fileName, 'Expected the export metadata to keep the background music track reference.');
   assert.strictEqual(exportArtifact.compositionExport.audioMix?.mode, 'mixed-with-background-music', 'Expected the export metadata to record the mixed-audio mode.');
+  assert.strictEqual(exportArtifact.compositionExport.audioMix?.narrationVolume, 1, 'Expected the export metadata to record the default narration level.');
   assert.strictEqual(exportArtifact.compositionExport.audioMix?.backgroundMusicVolume, 0.22, 'Expected the export metadata to record the default background music level.');
+}
+
+async function verifyMediaCompositionCustomMixLevels() {
+  const assetPaths = await prepareAssets();
+  const pipeline = buildMediaCompositionPipeline(assetPaths, {
+    backgroundMusicVolume: 0.18,
+    includeBackgroundMusic: true,
+    includeNarration: true,
+    narrationVolume: 0.73,
+    outputTitle: 'Storyboard export custom mix final',
+    title: 'Storyboard export custom mix',
+  });
+  const completedRun = await runAndWaitForPipeline(pipeline);
+  verifyCompletedRun(completedRun);
+
+  const compositionResult = completedRun.resultsByNodeId?.['compose-scenes']?.outputs?.composition || null;
+  assert.strictEqual(compositionResult?.composition?.audioMix?.narrationVolume, 0.73, 'Expected composition metadata to preserve selected narration level.');
+  assert.strictEqual(compositionResult?.composition?.audioMix?.backgroundMusicVolume, 0.18, 'Expected composition metadata to preserve selected background music level.');
+
+  const exportArtifact = completedRun.resultsByNodeId?.['export-scenes']?.outputs?.video || null;
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.narrationVolume, 0.73, 'Expected export metadata to preserve selected narration level.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.backgroundMusicVolume, 0.18, 'Expected export metadata to preserve selected background music level.');
+  assert(/background music at 18% and narration at 73%/.test(completedRun.nodeStates?.['export-scenes']?.message || ''), 'Expected export status message to reflect selected mix levels.');
 }
 
 async function verifyMediaCompositionWithoutBackgroundMusic() {
@@ -344,6 +370,8 @@ async function verifyMediaCompositionWithoutBackgroundMusic() {
 async function main() {
   await cleanupActiveRun();
   await verifyMediaCompositionWithBackgroundMusic();
+  await cleanupActiveRun();
+  await verifyMediaCompositionCustomMixLevels();
   await cleanupActiveRun();
   await verifyMediaCompositionWithoutBackgroundMusic();
   await cleanupActiveRun();

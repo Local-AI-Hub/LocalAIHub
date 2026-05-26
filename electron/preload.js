@@ -67,6 +67,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   runPipeline: (payload) => invoke('pipelines:run', payload),
   saveCloseBehavior: (closeBehavior) => invoke('settings:save-close-behavior', closeBehavior),
   saveLiveResourcePolling: (enabled) => invoke('settings:save-live-resource-polling', enabled),
+  savePipelineOutputTrash: (enabled) => invoke('settings:save-pipeline-output-trash', enabled),
   savePreferredInstallRoot: (targetPath) => invoke('settings:save-preferred-install-root', targetPath),
   saveModelSettings: (payload) => invoke('models:save-settings', payload),
   saveKoboldCppSetup: (payload) => invoke('koboldcpp:save-setup', payload),

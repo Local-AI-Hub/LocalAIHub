@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 import pipelineWizardShared from '../../electron/shared/pipelineWizard.cjs';
 import pipelineWizardLifecycleShared from '../../electron/shared/pipelineWizardLifecycle.cjs';
@@ -58,7 +58,9 @@ const {
   buildPipelineGraph,
   createEdge,
   createEmptyPipeline,
+  createPipelineDefinitionCopy,
   getDefaultGraphWorkflowBindings,
+  getAudioModeOptionsForLocalTool,
   getGraphWorkflowContract,
   getGraphWorkflowFieldOptions,
   getGraphWorkflowInputBinding,
@@ -83,6 +85,9 @@ const {
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
   HEAVY_STEP_COOLDOWN_MAX_SECONDS,
   DEFAULT_PIPELINE_RUN_SETTINGS,
+  DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  normalizeAudioModeForLocalTool,
   normalizePipelineRunSettings,
   DEFAULT_PLANNING_SCHEMA_ID,
   getPlanningSchemaOptions,
@@ -111,6 +116,51 @@ const EMPTY_GRAPH_WORKFLOW_PRESETS = Object.freeze([]);
 
 function isDraftSecondsValue(value) {
   return /^\d*(?:\.\d*)?$/.test(String(value || ''));
+}
+
+function normalizeVolumeGain(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(2, numeric));
+}
+
+function formatVolumePercent(value, fallback) {
+  return Math.round(normalizeVolumeGain(value, fallback) * 100);
+}
+
+function formatAudioMixSummary(audioMix) {
+  const narrationPercent = formatVolumePercent(audioMix?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME);
+  const backgroundPercent = formatVolumePercent(audioMix?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME);
+  if (audioMix?.mode === 'mixed-with-background-music') {
+    return `Background music was mixed beneath narration at ${backgroundPercent}%; narration was kept at ${narrationPercent}%.`;
+  }
+  if (audioMix?.mode === 'background-music-only') {
+    return `This export used the connected background music track at ${backgroundPercent}% because no primary narration track was attached.`;
+  }
+  if (audioMix?.mode === 'primary-audio-only') {
+    return `This export used the primary narration track at ${narrationPercent}%.`;
+  }
+  return 'This export did not include audio.';
+}
+
+function getPipelinePortCenterKey(nodeId, direction, portId) {
+  return [String(nodeId || ''), String(direction || ''), String(portId || '')].join(':');
+}
+
+function arePipelinePortCenterMapsEqual(left = {}, right = {}) {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+
+  return leftKeys.every((key) => {
+    const leftPoint = left[key];
+    const rightPoint = right[key];
+    return rightPoint && Math.abs(leftPoint.x - rightPoint.x) < 0.5 && Math.abs(leftPoint.y - rightPoint.y) < 0.5;
+  });
 }
 
 const TEMPLATE_STATUS_LABELS = Object.freeze({
@@ -181,7 +231,7 @@ function getPromptStyleTargetKindForOperation(operationId) {
 
 function getPromptStyleTargetKindForModelStep(node) {
   const operationId = getSelectedModelStepOperationId(node);
-  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && node?.config?.executionMode === 'localTool' && (node?.config?.audioMode === 'continuation' || node?.config?.audioMode === 'referenceVoiceTts')) {
+  if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && node?.config?.executionMode === 'localTool' && (getModelStepLocalAudioModeForUi(node) === 'continuation' || getModelStepLocalAudioModeForUi(node) === 'referenceVoiceTts')) {
     return '';
   }
   return getPromptStyleTargetKindForOperation(operationId);
@@ -971,6 +1021,27 @@ function getSelectedModelStepOperationId(node) {
   return getModelStepOperationId(node);
 }
 
+function getModelStepLocalAudioToolIdForUi(node) {
+  const selectedToolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  if (selectedToolId) {
+    return selectedToolId;
+  }
+
+  return String(node?.config?.audioMode || '').trim().toLowerCase() === 'referencevoicetts'
+    ? 'chatterbox-tts'
+    : 'audiocraft-webui';
+}
+
+function getModelStepLocalAudioModeForUi(node) {
+  return normalizeAudioModeForLocalTool(getModelStepLocalAudioToolIdForUi(node), node?.config?.audioMode);
+}
+
+function isModelStepChatterboxAudioMode(node) {
+  return node?.config?.executionMode === 'localTool'
+    && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    && getModelStepLocalAudioToolIdForUi(node) === 'chatterbox-tts';
+}
+
 function getModelStepOperationLabel(node) {
   const operationId = getSelectedModelStepOperationId(node);
   return operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
@@ -1553,7 +1624,7 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
         {backgroundMusicTrack?.artifact ? (
           <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-4">
             <p className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Background music track</p>
-            <p className="mt-2 text-xs leading-5 text-slate-400">Exports mix this track under narration at a fixed 22% level in this first pass. If no primary narration track is attached, it becomes the soundtrack instead.</p>
+            <p className="mt-2 text-xs leading-5 text-slate-400">Exports use the background music level saved on the Media Composition node. If no primary narration track is attached, this track becomes the soundtrack at that level.</p>
             <ArtifactFacts artifact={backgroundMusicTrack.artifact} className="mt-3" />
             <ArtifactPreview artifact={backgroundMusicTrack.artifact} className="mt-3" compact />
           </div>
@@ -1713,13 +1784,7 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
             </div>
             {artifact.compositionExport?.audioMix ? (
               <p className="mt-3 text-xs leading-5 text-slate-400">
-                {artifact.compositionExport.audioMix.mode === 'mixed-with-background-music'
-                  ? 'Background music was mixed beneath narration at a fixed 22% level for this export.'
-                  : artifact.compositionExport.audioMix.mode === 'background-music-only'
-                    ? 'This export used the connected background music track as the soundtrack because no primary narration track was attached.'
-                    : artifact.compositionExport.audioMix.mode === 'primary-audio-only'
-                      ? 'This export used only the primary audio track.'
-                      : 'This export did not include audio.'}
+                {formatAudioMixSummary(artifact.compositionExport.audioMix)}
               </p>
             ) : null}
             {artifact.compositionExport?.composition?.manifestPath ? <input className="store-input mt-3" readOnly value={artifact.compositionExport.composition.manifestPath} /> : null}
@@ -2339,6 +2404,8 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
   const isLocalVideoMode = executionMode === 'localTool' && selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE;
   const selectedLocalToolId = String(node.config?.toolId || (isLocalImageGenerationMode || isLocalImageAnalysisMode ? '' : (isLocalAudioMode && node.config?.audioMode === 'referenceVoiceTts' ? localToolOptions.find((tool) => tool.id === 'chatterbox-tts')?.id || localToolOptions[0]?.id || '' : localToolOptions[0]?.id || ''))).trim();
   const selectedLocalTool = localToolOptions.find((tool) => tool.id === selectedLocalToolId) || null;
+  const isLocalChatterboxAudioMode = isLocalAudioMode && selectedLocalToolId === 'chatterbox-tts';
+  const isLocalAudiocraftAudioMode = isLocalAudioMode && !isLocalChatterboxAudioMode;
   const imageTransformSubtypeOptions = isLocalImageTransformMode ? getImageTransformSubtypeOptions(selectedLocalToolId) : [];
   const selectedImageTransformSubtype = isLocalImageTransformMode
     ? String(node.config?.transformSubtype || getDefaultImageTransformSubtype(selectedLocalToolId)).trim()
@@ -2399,7 +2466,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                 config: {
                   ...currentNode.config,
                   [executionModeKey]: nextExecutionMode,
-                  ...(currentNode.type === 'llmPrompt' ? { operationId: nextOperationId, toolId: nextToolId } : {}),
+                  ...(currentNode.type === 'llmPrompt' ? { operationId: nextOperationId, toolId: nextToolId, ...(nextExecutionMode === 'localTool' && nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? { audioMode: normalizeAudioModeForLocalTool(nextToolId, currentNode.config?.audioMode) } : {}) } : {}),
                   [providerIdKey]: nextExecutionMode === 'cloud' ? currentNode.config?.[providerIdKey] || '' : '',
                   model: '',
                 },
@@ -2459,8 +2526,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                     ...currentNode.config,
                     model: '',
                     toolId: nextToolId,
-                    ...(isLocalAudioMode && nextToolId === 'chatterbox-tts' ? { audioMode: 'referenceVoiceTts' } : {}),
-                    ...(isLocalAudioMode && currentNode.config?.audioMode === 'referenceVoiceTts' && nextToolId !== 'chatterbox-tts' ? { audioMode: 'music' } : {}),
+                    ...(isLocalAudioMode ? { audioMode: normalizeAudioModeForLocalTool(nextToolId, currentNode.config?.audioMode) } : {}),
                     ...(isLocalImageTransformMode ? { transformSubtype: getDefaultImageTransformSubtype(nextToolId) } : {}),
                   },
                 }));
@@ -2509,7 +2575,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
           ) : null}
           <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
             {isLocalAudioMode
-              ? 'This mode runs a single AudioCraft request inside the sequential pipeline and returns a pipeline-usable audio artifact. Use Music mode for text-to-music or audio-guided generation in this slice.'
+              ? (isLocalChatterboxAudioMode ? 'This mode runs a single Chatterbox-Turbo reference voice TTS request and returns a pipeline-usable speech artifact. Connect text plus a reference voice audio clip.' : 'This mode runs a single AudioCraft request inside the sequential pipeline and returns a pipeline-usable audio artifact. Use Music mode for text-to-music or audio-guided generation in this slice.')
               : isLocalAudioTransformMode
                 ? 'This mode runs a single source-audio transformation through RVC and returns a transformed audio artifact with source lineage. Use it for offline voice conversion from one saved audio clip to another in this first pass.'
                 : isLocalImageTransformMode
@@ -2529,7 +2595,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
 
       <div>
         <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`${node.id}-model`}>
-          {isLocalTranscriptionMode ? 'Transcription model' : isLocalAudioMode ? 'AudioCraft model' : isLocalAudioTransformMode ? 'Voice model' : isLocalImageAnalysisMode ? 'Analysis mode' : isLocalImageTransformMode ? 'Model set override' : isLocalVideoMode ? 'Model folder override' : executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
+          {isLocalTranscriptionMode ? 'Transcription model' : isLocalAudioMode ? (isLocalChatterboxAudioMode ? 'Chatterbox model' : 'AudioCraft model') : isLocalAudioTransformMode ? 'Voice model' : isLocalImageAnalysisMode ? 'Analysis mode' : isLocalImageTransformMode ? 'Model set override' : isLocalVideoMode ? 'Model folder override' : executionMode === 'localTool' ? 'Checkpoint' : 'Model'}
         </label>
         <input
           className="store-input mt-3"
@@ -2543,10 +2609,10 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
               },
             }))
           }
-          placeholder={isLocalTranscriptionMode ? 'base' : isLocalAudioMode ? 'Blank for default, or pick a downloaded AudioCraft snapshot' : isLocalAudioTransformMode ? 'Enter or pick an RVC voice model file' : isLocalImageAnalysisMode ? 'clip or deepdanbooru' : isLocalImageTransformMode ? 'Optional Upscayl paired model set' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? getCloudAudioModelPlaceholder(selectedCloudProviderId) : 'Enter or pick a model'}
+          placeholder={isLocalTranscriptionMode ? 'base' : isLocalAudioMode ? (isLocalChatterboxAudioMode ? 'Managed Chatterbox-Turbo model' : 'Blank for default, or pick a downloaded AudioCraft snapshot') : isLocalAudioTransformMode ? 'Enter or pick an RVC voice model file' : isLocalImageAnalysisMode ? 'clip or deepdanbooru' : isLocalImageTransformMode ? 'Optional Upscayl paired model set' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? getCloudAudioModelPlaceholder(selectedCloudProviderId) : 'Enter or pick a model'}
           value={node.config?.model || ''}
         />
-        {isLocalAudioMode ? (
+        {isLocalAudiocraftAudioMode ? (
           <div className="mt-3 space-y-3">
             <p className="text-xs leading-5 text-slate-500">
               AudioCraft can use upstream defaults when this is blank, or a downloaded local snapshot path from Model Manager when selected.
@@ -2558,6 +2624,10 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
               <span className="text-xs text-slate-500">Loads downloaded AudioCraft snapshots from {selectedLocalTool?.name || 'the selected tool'}.</span>
             </div>
           </div>
+        ) : isLocalChatterboxAudioMode ? (
+          <p className="mt-3 text-xs leading-5 text-slate-500">
+            Chatterbox-Turbo uses its managed local model cache for Reference Voice TTS. No AudioCraft snapshot is needed for this tool.
+          </p>
         ) : isLocalAudioTransformMode ? (
           <div className="mt-3 space-y-3">
             <p className="text-xs leading-5 text-slate-500">
@@ -2656,7 +2726,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
     </>
   );
 }
-export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, manifests, onToast, promptStyles = [], providers, tools }) {
+export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, manifests, moveDeletedPipelineOutputsToRecycleBin = true, onToast, promptStyles = [], providers, tools }) {
   const [pipelines, setPipelines] = useState([]);
   const [draft, setDraft] = useState(() => createEmptyPipeline());
   const [selectedNodeId, setSelectedNodeId] = useState('');
@@ -2665,6 +2735,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const [runState, setRunState] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saveBusy, setSaveBusy] = useState(false);
+  const [copyBusy, setCopyBusy] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [runBusy, setRunBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
@@ -2695,6 +2766,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   });
   const [canvasZoom, setCanvasZoom] = useState(1);
   const [canvasPanning, setCanvasPanning] = useState(false);
+  const [measuredPortOffsets, setMeasuredPortOffsets] = useState({});
   const [wizardExecutionMode, setWizardExecutionMode] = useState('cloud');
   const [wizardProviderId, setWizardProviderId] = useState('');
   const [wizardModel, setWizardModel] = useState('');
@@ -2704,6 +2776,8 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const [wizardBusy, setWizardBusy] = useState(false);
   const [wizardSummary, setWizardSummary] = useState(null);
   const canvasRef = useRef(null);
+  const graphSurfaceRef = useRef(null);
+  const portMeasurementFrameRef = useRef(0);
   const wizardRequestIdRef = useRef(0);
   const dragRef = useRef(null);
   const notifiedRunStateRef = useRef('');
@@ -2904,7 +2978,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   );
   const collectionMapLocalTools = useMemo(() => {
     if (!selectedCollectionMapMapping) return [];
-    if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return audioTools.filter((tool) => tool.id !== 'chatterbox-tts');
+    if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return audioTools;
     if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return audioTransformTools;
     if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) return transcriptionTools;
     if (selectedCollectionMapMapping.operationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM) return imageTransformTools.filter((tool) => tool.id === 'upscayl');
@@ -3411,7 +3485,13 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     }
 
     const outputLabel = output?.outputLabel || output?.fileName || 'this pipeline output';
-    const confirmed = window.confirm(`Delete ${outputLabel} from Local AI Hub's pipeline outputs?\n\n${outputPath}\n\nThis removes it from disk.`);
+    const deleteActionLabel = moveDeletedPipelineOutputsToRecycleBin
+      ? 'Move this output to the Recycle Bin?'
+      : 'Permanently delete this output from disk?';
+    const deleteModeDetails = moveDeletedPipelineOutputsToRecycleBin
+      ? 'Related metadata sidecars will be moved with it when present.'
+      : 'Related metadata sidecars will be permanently deleted too. This cannot be easily undone.';
+    const confirmed = window.confirm(`${deleteActionLabel}\n\n${outputLabel}\n${outputPath}\n\n${deleteModeDetails}`);
     if (!confirmed) {
       return;
     }
@@ -3746,6 +3826,38 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       selectedNodeId: '',
     });
     setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
+  }
+
+  async function handleCopyPipeline() {
+    if (!draft) {
+      onToast('Open or create a pipeline before copying it.', 'error');
+      return;
+    }
+
+    const copiedPipeline = createPipelineDefinitionCopy(draft, pipelines);
+    setCopyBusy(true);
+    logRendererActionDiagnostic('pipeline-copy', 'start', { sourcePipelineId: String(draft.id || ''), targetPipelineId: String(copiedPipeline.id || '') });
+    try {
+      const result = await window.localAIHub.savePipeline(copiedPipeline);
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not copy that pipeline.', 'error');
+        return;
+      }
+
+      setPipelines(result.data?.pipelines || []);
+      replaceDraft(result.data?.pipeline || copiedPipeline, {
+        dirty: false,
+        selectedNodeId: selectedNodeId && copiedPipeline.nodes.some((node) => node.id === selectedNodeId) ? selectedNodeId : copiedPipeline.nodes[0]?.id || '',
+      });
+      setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
+      onToast(result.data?.message || `${copiedPipeline.name} was copied.`, 'success');
+    } catch (error) {
+      logRendererActionDiagnostic('pipeline-copy', 'failure', { message: String(error?.message || ''), sourcePipelineId: String(draft.id || '') }, 'warn');
+      onToast(error?.message || 'Local AI Hub could not copy that pipeline.', 'error');
+    } finally {
+      setCopyBusy(false);
+      expectNextPrintableKeyDiagnostic('pipeline-copy', { sourcePipelineId: String(draft.id || '') });
+    }
   }
 
   function createPipelineFromTemplate(templateId) {
@@ -4534,6 +4646,89 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const paletteGroups = getNodePaletteGroups();
   const graphEdges = draft.edges.filter((edge) => graph.nodeMap.has(edge.source.nodeId) && graph.nodeMap.has(edge.target.nodeId));
 
+  function measureRenderedPortCenters() {
+    const graphSurface = graphSurfaceRef.current;
+    if (!graphSurface || !sectionVisibility.canvas || !canvasZoom) {
+      setMeasuredPortOffsets((current) => (Object.keys(current).length ? {} : current));
+      return;
+    }
+
+    const surfaceBounds = graphSurface.getBoundingClientRect();
+    const nodePositionById = new Map(draft.nodes.map((node) => [node.id, node.position || { x: 0, y: 0 }]));
+    const nextOffsets = {};
+    graphSurface.querySelectorAll('[data-pipeline-port-dot="true"]').forEach((dot) => {
+      const nodeId = dot.getAttribute('data-node-id');
+      const direction = dot.getAttribute('data-port-direction');
+      const portId = dot.getAttribute('data-port-id');
+      const nodePosition = nodePositionById.get(nodeId);
+      if (!nodeId || !direction || !portId || !nodePosition) {
+        return;
+      }
+
+      const dotBounds = dot.getBoundingClientRect();
+      const centerX = (dotBounds.left + dotBounds.width / 2 - surfaceBounds.left) / canvasZoom;
+      const centerY = (dotBounds.top + dotBounds.height / 2 - surfaceBounds.top) / canvasZoom;
+      nextOffsets[getPipelinePortCenterKey(nodeId, direction, portId)] = {
+        x: centerX - Number(nodePosition.x || 0),
+        y: centerY - Number(nodePosition.y || 0),
+      };
+    });
+
+    setMeasuredPortOffsets((current) => (arePipelinePortCenterMapsEqual(current, nextOffsets) ? current : nextOffsets));
+  }
+
+  function scheduleRenderedPortCenterMeasurement() {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    if (portMeasurementFrameRef.current) {
+      window.cancelAnimationFrame(portMeasurementFrameRef.current);
+    }
+
+    portMeasurementFrameRef.current = window.requestAnimationFrame(() => {
+      portMeasurementFrameRef.current = 0;
+      measureRenderedPortCenters();
+    });
+  }
+
+  function getRenderedOrEstimatedPortCenter(node, direction, portId, portIndex) {
+    const measuredOffset = measuredPortOffsets[getPipelinePortCenterKey(node?.id, direction, portId)];
+    return measuredOffset && node?.position
+      ? { x: Number(node.position.x || 0) + measuredOffset.x, y: Number(node.position.y || 0) + measuredOffset.y }
+      : getNodePortCenter(node, direction, portIndex);
+  }
+
+  useLayoutEffect(() => {
+    measureRenderedPortCenters();
+    scheduleRenderedPortCenterMeasurement();
+    return () => {
+      if (portMeasurementFrameRef.current && typeof window !== 'undefined') {
+        window.cancelAnimationFrame(portMeasurementFrameRef.current);
+        portMeasurementFrameRef.current = 0;
+      }
+    };
+  }, [canvasZoom, draft.nodes, graphEdges.length, sectionVisibility.canvas]);
+
+  useLayoutEffect(() => {
+    const graphSurface = graphSurfaceRef.current;
+    if (!graphSurface || !sectionVisibility.canvas || typeof ResizeObserver === 'undefined') {
+      return undefined;
+    }
+
+    const observer = new ResizeObserver(() => scheduleRenderedPortCenterMeasurement());
+    observer.observe(graphSurface);
+    graphSurface.querySelectorAll('[data-pipeline-node-card="true"], [data-pipeline-port-dot="true"]').forEach((element) => observer.observe(element));
+    scheduleRenderedPortCenterMeasurement();
+
+    return () => {
+      observer.disconnect();
+      if (portMeasurementFrameRef.current && typeof window !== 'undefined') {
+        window.cancelAnimationFrame(portMeasurementFrameRef.current);
+        portMeasurementFrameRef.current = 0;
+      }
+    };
+  }, [canvasZoom, draft.nodes, graphEdges.length, runState?.revision, sectionVisibility.canvas]);
   if (loading) {
     return <section className="panel p-4 text-sm text-slate-300">Loading the Pipeline Builder...</section>;
   }
@@ -4556,6 +4751,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               </button>
               <div className="flex flex-wrap items-center gap-2">
                 <button className="ghost-button px-3 py-1.5 text-xs" onClick={createNewPipeline} type="button">New pipeline</button>
+                <button className="ghost-button px-3 py-1.5 text-xs" disabled={copyBusy || !draft} onClick={handleCopyPipeline} type="button">{copyBusy ? 'Copying...' : 'Copy pipeline'}</button>
                 <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('starterTemplates')} type="button">New from template</button>
                 <button className="ghost-button px-3 py-1.5 text-xs" disabled={!currentPipelineSaved || deleteBusy} onClick={handleDeletePipeline} type="button">
                   {deleteBusy ? 'Deleting...' : 'Delete'}
@@ -5066,6 +5262,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                 model: '',
                                 operationId: nextOperationId,
                                 toolId: nextToolId,
+                                ...(currentNode.config?.executionMode === 'localTool' && nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? { audioMode: normalizeAudioModeForLocalTool(nextToolId, currentNode.config?.audioMode) } : {}),
                               },
                             };
                           })
@@ -5112,7 +5309,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                           ? 'Prompt prefix / style guidance'
                           : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                             ? selectedNode.config?.executionMode === 'localTool'
-                              ? 'Prompt shaping / audio guidance'
+                              ? (isModelStepChatterboxAudioMode(selectedNode) ? 'Reference voice speech guidance' : 'Prompt shaping / audio guidance')
                               : 'Speech guidance / delivery hint'
                             : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
                               ? 'Transformation note'
@@ -5130,7 +5327,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                           ? 'Optional style or scene guidance to prepend to the incoming prompt.'
                           : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                             ? selectedNode.config?.executionMode === 'localTool'
-                              ? 'Optional guidance for the generated audio. In Music mode, use this for mood, style, or instrumentation. In Continuation mode, use this only as optional text conditioning for the continuation.'
+                              ? (isModelStepChatterboxAudioMode(selectedNode) ? 'Optional guidance for the spoken delivery. The connected text remains the words to speak, and the Reference Audio input supplies the voice sample.' : 'Optional guidance for the generated audio. In Music mode, use this for mood, style, or instrumentation. In Continuation mode, use this only as optional text conditioning for the continuation.')
                               : 'Optional guidance for how the provider should speak the connected text, such as tone, pacing, or delivery style.'
                             : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
                               ? 'Optional note to save with this transformed audio result. Choose the source audio and RVC voice model through the connected input and local model field.'
@@ -5144,7 +5341,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? (
                         <p className="mt-2 text-xs leading-5 text-slate-400">
                           {selectedNode.config?.executionMode === 'localTool'
-                            ? 'Text input becomes the base prompt for Music or Sound mode. Continuation mode requires an upstream audio artifact and uses the end of that clip as the generation seed.'
+                            ? (isModelStepChatterboxAudioMode(selectedNode) ? 'Text input becomes the words to speak. Reference Voice TTS also requires a reference voice audio clip on the Reference Audio input.' : 'Text input becomes the base prompt for Music or Sound mode. Continuation mode requires an upstream audio artifact and uses the end of that clip as the generation seed.')
                             : 'Text input becomes the spoken content for this cloud audio step. Use the instruction box for optional delivery guidance, and choose a provider voice below when the model supports it.'}
                         </p>
                       ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM ? (
@@ -5169,41 +5366,38 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                             <select className="store-input mt-3" id="llm-local-audio-mode" onChange={(event) => {
                               const nextAudioMode = event.target.value;
                               updateNode(selectedNode.id, (currentNode) => {
-                                const nextConfig = { ...currentNode.config, audioMode: nextAudioMode };
-                                if (nextAudioMode === 'referenceVoiceTts') {
-                                  nextConfig.toolId = localAudioTools.find((tool) => tool.id === 'chatterbox-tts')?.id || 'chatterbox-tts';
-                                } else if (currentNode.config?.toolId === 'chatterbox-tts') {
-                                  nextConfig.toolId = localAudioTools.find((tool) => tool.id === 'audiocraft-webui')?.id || currentNode.config?.toolId || '';
-                                }
+                                const toolId = getModelStepLocalAudioToolIdForUi(currentNode);
+                                const nextConfig = {
+                                  ...currentNode.config,
+                                  audioMode: normalizeAudioModeForLocalTool(toolId, nextAudioMode),
+                                  toolId,
+                                };
                                 return { ...currentNode, config: nextConfig };
                               });
-                            }} value={selectedNode.config?.audioMode || 'music'}>
-                              <option value="music">Music</option>
-                              <option value="sound">Sound</option>
-                              <option value="continuation">Continuation</option>
-                              <option value="referenceVoiceTts">Reference Voice TTS</option>
+                            }} value={getModelStepLocalAudioModeForUi(selectedNode)}>
+                              {getAudioModeOptionsForLocalTool(getModelStepLocalAudioToolIdForUi(selectedNode)).map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
                             </select>
                           </div>
-                          <div className={selectedNode.config?.audioMode === 'continuation' ? 'grid gap-3 sm:grid-cols-3' : selectedNode.config?.audioMode === 'referenceVoiceTts' ? 'hidden' : ''}>
-                            {selectedNode.config?.audioMode === 'continuation' ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-seed">Seed from source ending (seconds)</label><input className="store-input mt-3" id="llm-local-audio-seed" max="30" min="0.25" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationSeedSeconds: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.continuationSeedSeconds || 12} /></div> : null}
-                            {selectedNode.config?.audioMode === 'continuation' ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-repeat">Repeat count</label><input className="store-input mt-3" id="llm-local-audio-repeat" max="10" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationRepeatCount: Math.max(1, Math.min(10, Math.floor(Number(event.target.value || 1) || 1))) } }))} step="1" type="number" value={selectedNode.config?.continuationRepeatCount || 1} /></div> : null}
+                          <div className={getModelStepLocalAudioModeForUi(selectedNode) === 'continuation' ? 'grid gap-3 sm:grid-cols-3' : getModelStepLocalAudioModeForUi(selectedNode) === 'referenceVoiceTts' ? 'hidden' : ''}>
+                            {getModelStepLocalAudioModeForUi(selectedNode) === 'continuation' ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-seed">Seed from source ending (seconds)</label><input className="store-input mt-3" id="llm-local-audio-seed" max="30" min="0.25" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationSeedSeconds: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.continuationSeedSeconds || 12} /></div> : null}
+                            {getModelStepLocalAudioModeForUi(selectedNode) === 'continuation' ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-repeat">Repeat count</label><input className="store-input mt-3" id="llm-local-audio-repeat" max="10" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationRepeatCount: Math.max(1, Math.min(10, Math.floor(Number(event.target.value || 1) || 1))) } }))} step="1" type="number" value={selectedNode.config?.continuationRepeatCount || 1} /></div> : null}
                             <div>
-                              <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-duration">{selectedNode.config?.audioMode === 'continuation' ? 'Generated continuation duration' : 'Duration'} (seconds)</label>
+                              <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-duration">{getModelStepLocalAudioModeForUi(selectedNode) === 'continuation' ? 'Generated continuation duration' : 'Duration'} (seconds)</label>
                               <input className="store-input mt-3" id="llm-local-audio-duration" max="60" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} />
                             </div>
                           </div>
-                          {selectedNode.config?.audioMode === 'continuation' ? <label className="flex items-center gap-3 rounded-[18px] border border-white/10 bg-white/5 px-4 py-3 text-sm font-medium text-slate-200" htmlFor="llm-local-audio-append"><input checked={Boolean(selectedNode.config?.appendSource)} className="h-4 w-4 accent-cyan-300" id="llm-local-audio-append" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, appendSource: event.target.checked } }))} type="checkbox" />Append source audio to continuation</label> : null}
-                          {selectedNode.config?.audioMode === 'referenceVoiceTts' ? <div className="rounded-[18px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-50/90">Only clone voices you have permission to use.</div> : null}
+                          {getModelStepLocalAudioModeForUi(selectedNode) === 'continuation' ? <label className="flex items-center gap-3 rounded-[18px] border border-white/10 bg-white/5 px-4 py-3 text-sm font-medium text-slate-200" htmlFor="llm-local-audio-append"><input checked={Boolean(selectedNode.config?.appendSource)} className="h-4 w-4 accent-cyan-300" id="llm-local-audio-append" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, appendSource: event.target.checked } }))} type="checkbox" />Append source audio to continuation</label> : null}
+                          {getModelStepLocalAudioModeForUi(selectedNode) === 'referenceVoiceTts' ? <div className="rounded-[18px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-50/90">Only clone voices you have permission to use.</div> : null}
                           <p className="text-xs leading-5 text-slate-400">
-                            {selectedNode.config?.audioMode === 'sound'
+                            {getModelStepLocalAudioModeForUi(selectedNode) === 'sound'
                               ? 'Sound mode runs AudioGen and currently accepts text prompts only. Use it for environmental or effect-style clips rather than melody-guided output.'
-                              : selectedNode.config?.audioMode === 'continuation'
+                              : getModelStepLocalAudioModeForUi(selectedNode) === 'continuation'
                                 ? (selectedNode.config?.appendSource ? 'Continuation mode will output one WAV containing the full source audio followed by each generated continuation segment. Higher repeat counts can take much longer.' : 'Continuation mode outputs only the generated continuation segments. Each repeat uses the end of the current audio as the next seed, and higher counts can take much longer.')
-                                : selectedNode.config?.audioMode === 'referenceVoiceTts'
+                                : getModelStepLocalAudioModeForUi(selectedNode) === 'referenceVoiceTts'
                                   ? 'Generates new speech from the text using the connected reference voice audio. Connect text to Input and the voice sample to Reference Audio.'
                                   : 'Music mode runs MusicGen. Connect text for text-to-music, or connect an audio artifact to guide melody and structure while keeping this instruction box as optional extra guidance.'}
                           </p>
-                          {selectedNode.config?.audioMode !== 'referenceVoiceTts' ? <details className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3">
+                          {getModelStepLocalAudioModeForUi(selectedNode) !== 'referenceVoiceTts' ? <details className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3">
                             <summary className="cursor-pointer text-xs uppercase tracking-[0.18em] text-slate-400">Advanced AudioCraft settings</summary>
                             <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                               <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-local-audio-temperature">Temperature</label><input className="store-input mt-3" id="llm-local-audio-temperature" min="0.01" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTemperature: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTemperature ?? 1} /></div>
@@ -5822,7 +6016,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   const showCollectionMapCloudImageGenerationFields = showCollectionMapImageGenerationFields && collectionMapExecutionMode === 'cloud';
                   const showCollectionMapCloudVideoGenerationFields = showCollectionMapVideoGenerationFields && collectionMapExecutionMode === 'cloud';
                   const selectedCollectionMapToolId = String(selectedNode.config?.toolId || '').trim().toLowerCase();
-                  const showCollectionMapAudiocraftItemMode = showCollectionMapAudioGenerationFields && collectionMapExecutionMode === 'localTool' && (!selectedCollectionMapToolId || selectedCollectionMapToolId === 'audiocraft-webui');
+                  const collectionMapAudioMode = normalizeAudioModeForLocalTool(selectedCollectionMapToolId || 'audiocraft-webui', selectedNode.config?.audioMode);
+                  const showCollectionMapChatterboxReferenceVoiceFields = showCollectionMapAudioGenerationFields && collectionMapExecutionMode === 'localTool' && selectedCollectionMapToolId === 'chatterbox-tts';
+                  const showCollectionMapAudiocraftItemMode = showCollectionMapAudioGenerationFields && collectionMapExecutionMode === 'localTool' && !showCollectionMapChatterboxReferenceVoiceFields && (!selectedCollectionMapToolId || selectedCollectionMapToolId === 'audiocraft-webui');
                   const collectionMapAudiocraftItemMode = selectedNode.config?.audiocraftItemMode === 'sequentialContinuation' ? 'sequentialContinuation' : 'independent';
                   const showCollectionMapAudiocraftChainFields = showCollectionMapAudiocraftItemMode && collectionMapAudiocraftItemMode === 'sequentialContinuation';
                   const showCollectionMapWanVideoItemMode = showCollectionMapVideoGenerationFields && collectionMapExecutionMode === 'localTool' && (!selectedCollectionMapToolId || selectedCollectionMapToolId === 'wan21-webui');
@@ -5832,9 +6028,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   const showCollectionMapTranscriptionFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE;
                   const showCollectionMapAudioTransformFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM;
                   const showCollectionMapImageAnalysisFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE;
-                  const showCollectionMapLocalModelField = collectionMapExecutionMode === 'localTool';
+                  const showCollectionMapLocalModelField = collectionMapExecutionMode === 'localTool' && !showCollectionMapChatterboxReferenceVoiceFields;
                   const showCollectionMapCloudModelField = collectionMapExecutionMode === 'cloud';
-                  const showCollectionMapInstructionField = showCollectionMapImageGenerationFields || showCollectionMapAudioGenerationFields || showCollectionMapVideoGenerationFields || showCollectionMapAudioTransformFields || (showCollectionMapImageAnalysisFields && collectionMapExecutionMode === 'cloud');
+                  const showCollectionMapInstructionField = showCollectionMapImageGenerationFields || (showCollectionMapAudioGenerationFields && !showCollectionMapChatterboxReferenceVoiceFields) || showCollectionMapVideoGenerationFields || showCollectionMapAudioTransformFields || (showCollectionMapImageAnalysisFields && collectionMapExecutionMode === 'cloud');
                   const collectionMapTransformSubtypeOptions = getImageTransformSubtypeOptions(selectedNode.config?.toolId || 'upscayl');
                   const collectionMapInstructionValue = getCollectionMapInstructionValue(selectedNode, collectionMapOperationId);
                   const collectionMapModelOptions = modelOptionsByNodeId[selectedNode.id] || [];
@@ -5882,7 +6078,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         </select>
                       </div>
                     </div>
-                    <PromptStyleSelector id="collection-map-prompt-style" onChange={(promptStyleId) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, promptStyleId } }))} promptStyles={promptStyles} targetKind={getPromptStyleTargetKindForCollectionMap(selectedCollectionMapMapping)} value={selectedNode.config?.promptStyleId || ''} />
+                    {!showCollectionMapChatterboxReferenceVoiceFields ? <PromptStyleSelector id="collection-map-prompt-style" onChange={(promptStyleId) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, promptStyleId } }))} promptStyles={promptStyles} targetKind={getPromptStyleTargetKindForCollectionMap(selectedCollectionMapMapping)} value={selectedNode.config?.promptStyleId || ''} /> : null}
                     {collectionMapExecutionMode === 'graphWorkflow' ? (
                       <div className="space-y-4">
                         <div className="rounded-[24px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3 text-sm leading-6 text-cyan-100">Use a real graph workflow boundary here. Paste the workflow JSON, map the Text input, and choose a final Image output node; Local AI Hub will run that workflow once per collection item.</div>
@@ -5910,11 +6106,12 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       </div>
                     ) : collectionMapExecutionMode === 'localTool' ? (
                       <div className="space-y-4">
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-tool">Local backend</label><select className="store-input mt-3" id="collection-map-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: '', toolId: event.target.value } }))} value={selectedNode.config?.toolId || ''}><option value="">Auto / required local backend</option>{collectionMapLocalTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-tool">Local backend</label><select className="store-input mt-3" id="collection-map-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => { const nextToolId = event.target.value; const currentAudioMode = currentNode.config?.audioMode; return { ...currentNode, config: { ...currentNode.config, audioMode: nextToolId === 'chatterbox-tts' ? 'referenceVoiceTts' : currentAudioMode === 'referenceVoiceTts' ? 'music' : currentAudioMode, audiocraftItemMode: nextToolId === 'chatterbox-tts' ? 'independent' : currentNode.config?.audiocraftItemMode, model: '', toolId: nextToolId } }; })} value={selectedNode.config?.toolId || ''}><option value="">Auto / required local backend</option>{collectionMapLocalTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
+                        {showCollectionMapChatterboxReferenceVoiceFields ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chatterbox-mode">Audio mode</label><select className="store-input mt-3" disabled id="collection-map-chatterbox-mode" value="referenceVoiceTts"><option value="referenceVoiceTts">Reference Voice TTS</option></select></div><div className="rounded-[18px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-50/90">Only clone voices you have permission to use.</div></div><p className="text-xs leading-5 text-slate-400">Reference Voice TTS uses one shared Reference Audio input for the whole collection.</p></div> : null}
                         {showCollectionMapLocalModelField ? (
                           <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model-local">{getCollectionMapModelFieldLabel(collectionMapOperationId)}</label><input className="store-input mt-3" id="collection-map-model-local" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value, analysisMode: showCollectionMapImageAnalysisFields ? event.target.value || 'clip' : currentNode.config?.analysisMode } }))} placeholder={getCollectionMapModelPlaceholder(collectionMapOperationId)} value={selectedNode.config?.model || (showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || 'clip' : '')} /><div className="mt-3 flex flex-wrap items-center gap-3"><button className="ghost-button" disabled={modelsBusyNodeId === selectedNode.id} onClick={() => refreshNodeModels(selectedNode)} type="button">{modelsBusyNodeId === selectedNode.id ? 'Refreshing...' : getCollectionMapRefreshLabel(collectionMapOperationId)}</button><span className="text-xs text-slate-500">{showCollectionMapAudioGenerationFields ? 'Loads downloaded AudioCraft snapshots from the selected tool.' : showCollectionMapAudioTransformFields ? 'Loads local RVC voice models from the selected tool.' : showCollectionMapImageTransformFields ? 'Loads downloaded Upscayl model sets from the selected tool.' : showCollectionMapTranscriptionFields ? 'Shows local Whisper model size options.' : showCollectionMapImageAnalysisFields ? 'Shows WebUI interrogation modes.' : showCollectionMapVideoGenerationFields ? 'Loads local Wan model folders from the selected video backend.' : 'Loads local checkpoints from the selected image backend.'}</span></div>{collectionMapModelOptions.length ? <div className="mt-3 grid gap-2">{collectionMapModelOptions.slice(0, 8).map((model) => (<button className={'rounded-2xl border px-3 py-3 text-left transition ' + (String((showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || selectedNode.config?.model : selectedNode.config?.model) || '').trim().toLowerCase() === String(model.id || '').trim().toLowerCase() ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/20 hover:bg-white/10')} key={model.id} onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: showCollectionMapImageAnalysisFields ? model.id : currentNode.config?.analysisMode, model: model.id } }))} type="button"><p className="text-sm font-medium text-white">{model.label || model.id}</p>{buildModelOptionDetail(model) ? <p className="mt-1 text-xs leading-5 text-slate-400">{buildModelOptionDetail(model)}</p> : null}</button>))}</div> : null}</div>
                         ) : null}
-                        {showCollectionMapAudiocraftItemMode ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audiocraft-item-mode">AudioCraft item mode</label><select className="store-input mt-3" id="collection-map-audiocraft-item-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftItemMode: event.target.value === 'sequentialContinuation' ? 'sequentialContinuation' : 'independent' } }))} value={collectionMapAudiocraftItemMode}><option value="independent">Independent clips</option><option value="sequentialContinuation">Sequential continuation chain</option></select></div>{showCollectionMapAudiocraftChainFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-first">First item behavior</label><select className="store-input mt-3" id="collection-map-chain-first" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioChainFirstItemBehavior: 'scratch' } }))} value="scratch"><option value="scratch">Generate from scratch</option></select></div> : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div>}</div>{showCollectionMapAudiocraftChainFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-seed">Seed seconds</label><input className="store-input mt-3" id="collection-map-chain-seed" min="0.25" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationSeedSeconds: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.continuationSeedSeconds || 12} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Segment duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-output">Output mode</label><select className="store-input mt-3" id="collection-map-chain-output" onChange={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioChainOutputMode: 'segments' } }))} value="segments"><option value="segments">Segments collection</option></select></div></div> : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div>}<details className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3"><summary className="cursor-pointer text-xs uppercase tracking-[0.18em] text-slate-400">Advanced AudioCraft settings</summary><div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-temperature">Temperature</label><input className="store-input mt-3" id="collection-map-audio-temperature" min="0.01" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTemperature: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTemperature ?? 1} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-top-k">Top K</label><input className="store-input mt-3" id="collection-map-audio-top-k" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopK: Number(event.target.value || 0) || 0 } }))} step="1" type="number" value={selectedNode.config?.audiocraftTopK ?? 250} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-top-p">Top P</label><input className="store-input mt-3" id="collection-map-audio-top-p" max="1" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopP: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTopP ?? 0} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-cfg">CFG coefficient</label><input className="store-input mt-3" id="collection-map-audio-cfg" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftCfgCoef: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.audiocraftCfgCoef ?? 3} /></div><label className="flex items-center gap-3 pt-7 text-sm font-medium text-slate-200" htmlFor="collection-map-audio-two-step"><input checked={Boolean(selectedNode.config?.audiocraftTwoStepCfg)} className="h-4 w-4 accent-cyan-300" id="collection-map-audio-two-step" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTwoStepCfg: event.target.checked } }))} type="checkbox" />Two-step CFG</label></div></details></div> : showCollectionMapAudioGenerationFields ? <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div></div> : null}
+                        {showCollectionMapAudiocraftItemMode ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audiocraft-item-mode">AudioCraft item mode</label><select className="store-input mt-3" id="collection-map-audiocraft-item-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftItemMode: event.target.value === 'sequentialContinuation' ? 'sequentialContinuation' : 'independent' } }))} value={collectionMapAudiocraftItemMode}><option value="independent">Independent clips</option><option value="sequentialContinuation">Sequential continuation chain</option></select></div>{showCollectionMapAudiocraftChainFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-first">First item behavior</label><select className="store-input mt-3" id="collection-map-chain-first" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioChainFirstItemBehavior: 'scratch' } }))} value="scratch"><option value="scratch">Generate from scratch</option></select></div> : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div>}</div>{showCollectionMapAudiocraftChainFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-seed">Seed seconds</label><input className="store-input mt-3" id="collection-map-chain-seed" min="0.25" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationSeedSeconds: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.continuationSeedSeconds || 12} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Segment duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-output">Output mode</label><select className="store-input mt-3" id="collection-map-chain-output" onChange={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioChainOutputMode: 'segments' } }))} value="segments"><option value="segments">Segments collection</option></select></div></div> : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div>}<details className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3"><summary className="cursor-pointer text-xs uppercase tracking-[0.18em] text-slate-400">Advanced AudioCraft settings</summary><div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-temperature">Temperature</label><input className="store-input mt-3" id="collection-map-audio-temperature" min="0.01" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTemperature: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTemperature ?? 1} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-top-k">Top K</label><input className="store-input mt-3" id="collection-map-audio-top-k" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopK: Number(event.target.value || 0) || 0 } }))} step="1" type="number" value={selectedNode.config?.audiocraftTopK ?? 250} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-top-p">Top P</label><input className="store-input mt-3" id="collection-map-audio-top-p" max="1" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopP: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTopP ?? 0} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-cfg">CFG coefficient</label><input className="store-input mt-3" id="collection-map-audio-cfg" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftCfgCoef: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.audiocraftCfgCoef ?? 3} /></div><label className="flex items-center gap-3 pt-7 text-sm font-medium text-slate-200" htmlFor="collection-map-audio-two-step"><input checked={Boolean(selectedNode.config?.audiocraftTwoStepCfg)} className="h-4 w-4 accent-cyan-300" id="collection-map-audio-two-step" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTwoStepCfg: event.target.checked } }))} type="checkbox" />Two-step CFG</label></div></details></div> : showCollectionMapAudioGenerationFields && !showCollectionMapChatterboxReferenceVoiceFields ? <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div></div> : null}
                         {showCollectionMapWanVideoItemMode ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-item-mode">Video item mode</label><select className="store-input mt-3" id="collection-map-video-item-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoItemMode: event.target.value === 'sequentialLastFrame' ? 'sequentialLastFrame' : 'independent' } }))} value={collectionMapVideoItemMode}><option value="independent">Independent text-to-video clips</option><option value="sequentialLastFrame">Sequential previous-last-frame chain</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-size">Video size</label><select className="store-input mt-3" id="collection-map-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="832x480">832 x 480</option><option value="1280x720">1280 x 720</option></select></div></div>{showCollectionMapVideoChainFields ? <div className="rounded-[18px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-cyan-100/80" htmlFor="collection-map-video-first-behavior">First item</label><select className="store-input mt-3" id="collection-map-video-first-behavior" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoChainFirstItemBehavior: event.target.value === 'initialReferenceImage' ? 'initialReferenceImage' : 'textToVideo' } }))} value={selectedNode.config?.videoChainFirstItemBehavior === 'initialReferenceImage' ? 'initialReferenceImage' : 'textToVideo'}><option value="textToVideo">Start from text-to-video</option><option value="initialReferenceImage">Start from initial reference image</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-cyan-100/80" htmlFor="collection-map-video-initial-reference">Initial reference image</label><div className="mt-3 flex gap-2"><input className="store-input" id="collection-map-video-initial-reference" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoInitialReferenceImagePath: event.target.value } }))} placeholder="Optional image path" value={selectedNode.config?.videoInitialReferenceImagePath || ''} /><button className="ghost-button" onClick={() => chooseCollectionMapInitialReferenceImage(selectedNode.id)} type="button">Choose</button></div></div></div><p className="mt-3 text-xs leading-5 text-cyan-100/80">Later accepted clips use the previous generated clip last frame as the next reference image. The current text item still becomes the prompt for each clip.</p></div> : null}</div> : null}
                         {showCollectionMapVideoGenerationFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-fps">FPS</label><input className="store-input mt-3" id="collection-map-video-fps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoFps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.videoFps || 15} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-steps">Steps</label><input className="store-input mt-3" id="collection-map-video-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-seed">Seed</label><input className="store-input mt-3" id="collection-map-video-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div> : null}
                         {showCollectionMapImageTransformFields ? <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-transform-subtype">Transform</label><select className="store-input mt-3" id="collection-map-transform-subtype" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, transformSubtype: event.target.value } }))} value={selectedNode.config?.transformSubtype || 'upscale'}>{collectionMapTransformSubtypeOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-scale">Scale</label><input className="store-input mt-3" id="collection-map-scale" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, scale: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.scale || 4} /></div></div> : null}
@@ -6519,8 +6716,24 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         value={selectedNode.config?.secondsPerItem || 4}
                       />
                     </div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-narration-volume">Narration volume</label>
+                        <div className="mt-3 flex items-center gap-3">
+                          <input className="min-w-0 flex-1 accent-cyan-300" id="media-composition-narration-volume" max="200" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, narrationVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME) } }))} step="1" type="range" value={formatVolumePercent(selectedNode.config?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)} />
+                          <input className="store-input w-24" max="200" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, narrationVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME) } }))} step="1" type="number" value={formatVolumePercent(selectedNode.config?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)} />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-background-volume">Background music volume</label>
+                        <div className="mt-3 flex items-center gap-3">
+                          <input className="min-w-0 flex-1 accent-cyan-300" id="media-composition-background-volume" max="200" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, backgroundMusicVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME) } }))} step="1" type="range" value={formatVolumePercent(selectedNode.config?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)} />
+                          <input className="store-input w-24" max="200" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, backgroundMusicVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME) } }))} step="1" type="number" value={formatVolumePercent(selectedNode.config?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)} />
+                        </div>
+                      </div>
+                    </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Connect an ordered image collection to the Visual Collection input and optionally add one primary audio artifact plus one background music artifact. Connecting or disconnecting the Background Music input is the explicit include control in this first pass, and export mixes music under narration at a fixed 22% level when both are present.
+                      Connect an ordered image collection to the Visual Collection input and optionally add one primary audio artifact plus one background music artifact. Connecting or disconnecting the Background Music input is the explicit include control; export applies the selected narration and background music levels when those tracks are present.
                     </div>
                   </div>
                 ) : null}
@@ -6562,7 +6775,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       </div>
                     </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      This first export recipe renders an ordered image track to MP4 and can use one primary narration track plus one optional background music track. Background music mixes at a fixed 22% level under narration in this pass, or becomes the soundtrack when narration is absent, so the result stays explicit without pretending to be a full audio mixer.
+                      This first export recipe renders an ordered image track to MP4 and can use one primary narration track plus one optional background music track. Background music uses the level saved on the Media Composition node; narration uses its saved level too, so the result stays explicit without pretending to be a full audio mixer.
                     </div>
                   </div>
                 ) : null}
@@ -6642,15 +6855,15 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   style={{ cursor: canvasPanning ? 'grabbing' : 'grab' }}
                 >
                   <div className="relative" style={{ height: `${scaledCanvasSize.height}px`, width: `${scaledCanvasSize.width}px` }}>
-                    <div className="relative origin-top-left" style={{ height: `${canvasSize.height}px`, transform: `scale(${canvasZoom})`, transformOrigin: 'top left', width: `${canvasSize.width}px` }}>
+                    <div className="relative origin-top-left" ref={graphSurfaceRef} style={{ height: `${canvasSize.height}px`, transform: `scale(${canvasZoom})`, transformOrigin: 'top left', width: `${canvasSize.width}px` }}>
                       <svg className="absolute inset-0 h-full w-full">
                         {graphEdges.map((edge) => {
                           const sourceNode = graph.nodeMap.get(edge.source.nodeId);
                           const targetNode = graph.nodeMap.get(edge.target.nodeId);
                           const sourceIndex = getPipelineNodePorts(sourceNode, 'output').findIndex((port) => port.id === edge.source.portId);
                           const targetIndex = getPipelineNodePorts(targetNode, 'input').findIndex((port) => port.id === edge.target.portId);
-                          const sourcePoint = getNodePortCenter(sourceNode, 'output', sourceIndex);
-                          const targetPoint = getNodePortCenter(targetNode, 'input', targetIndex);
+                          const sourcePoint = getRenderedOrEstimatedPortCenter(sourceNode, 'output', edge.source.portId, sourceIndex);
+                          const targetPoint = getRenderedOrEstimatedPortCenter(targetNode, 'input', edge.target.portId, targetIndex);
                           const curveOffset = Math.max(80, (targetPoint.x - sourcePoint.x) / 2);
                           const pathValue = `M ${sourcePoint.x} ${sourcePoint.y} C ${sourcePoint.x + curveOffset} ${sourcePoint.y}, ${targetPoint.x - curveOffset} ${targetPoint.y}, ${targetPoint.x} ${targetPoint.y}`;
                           const selected = selectedEdge?.id === edge.id;
@@ -6696,6 +6909,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                           <div
                             className={`absolute rounded-[28px] border bg-[#0f1825]/96 shadow-soft ${selectedNodeId === node.id ? 'border-cyan-300/45' : 'border-white/10'}`}
                             data-canvas-interactive="true"
+                            data-pipeline-node-card="true"
                             key={node.id}
                             onClick={() => { setSelectedEdgeId(''); setSelectedNodeId(node.id); }}
                             style={{ left: `${node.position.x}px`, minHeight: `${getNodeCardHeight(node)}px`, top: `${node.position.y}px`, width: `${PIPELINE_NODE_WIDTH}px` }}
@@ -6732,7 +6946,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                           }}
                                           type="button"
                                         >
-                                          <span className="h-2.5 w-2.5 rounded-full bg-white/70" />
+                                          <span className="h-2.5 w-2.5 rounded-full bg-white/70" data-node-id={node.id} data-pipeline-port-dot="true" data-port-direction="input" data-port-id={inputPort.id} />
                                           <HoverRevealText className="min-w-0 truncate" revealClassName="hover-reveal-port-popover hover-reveal-port-popover-input" rootClassName="hover-reveal-port-text" text={inputPort.label} />
                                           {allowsMultipleInputConnections ? <span className="rounded-full border border-white/10 bg-slate-950/50 px-2 py-0.5 text-[10px] text-slate-200">{inputConnectionCount}</span> : null}
                                         </button>
@@ -6755,7 +6969,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                           type="button"
                                         >
                                           <HoverRevealText className="min-w-0 truncate" revealClassName="hover-reveal-port-popover hover-reveal-port-popover-output" rootClassName="hover-reveal-port-text" text={outputPort.label} />
-                                          <span className="h-2.5 w-2.5 rounded-full bg-cyan-300" />
+                                          <span className="h-2.5 w-2.5 rounded-full bg-cyan-300" data-node-id={node.id} data-pipeline-port-dot="true" data-port-direction="output" data-port-id={outputPort.id} />
                                         </button>
                                       ) : null}
                                     </div>

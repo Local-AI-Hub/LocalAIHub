@@ -86,6 +86,8 @@ const { runCommand } = require('./commandService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
 const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
+  DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   PIPELINE_OPERATION_IDS,
   PORT_KIND_AUDIO,
   PORT_KIND_COLLECTION,
@@ -130,6 +132,18 @@ let activeRunAbortController = null;
 let pendingValidationControl = null;
 
 const PLANNER_PROVIDER_TIMEOUT_MS = 60000;
+function normalizeMediaCompositionVolume(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(2, numeric));
+}
+
+function formatMediaCompositionVolumePercent(value, fallback) {
+  return Math.round(normalizeMediaCompositionVolume(value, fallback) * 100);
+}
+
 const HEAVY_LOCAL_PIPELINE_OPERATION_IDS = new Set([
   PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
   PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM,
@@ -2187,6 +2201,18 @@ function isCollectionMapAudioContinuationChainEnabledForRun(node, mapping, execu
     && (!toolId || toolId === 'audiocraft-webui');
 }
 
+function isCollectionMapChatterboxReferenceVoiceTtsForRun(node, mapping, executionMode) {
+  const toolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  const requestedAudioMode = String(node?.config?.audioMode || '').trim().toLowerCase();
+  const audioMode = requestedAudioMode === 'referencevoicetts' || requestedAudioMode === 'reference-voice-tts' ? 'referenceVoiceTts' : requestedAudioMode;
+  return executionMode === 'localTool'
+    && String(mapping?.id || node?.config?.mappingId || '').trim() === 'textToAudio'
+    && String(mapping?.inputKind || '').trim() === PORT_KIND_TEXT
+    && String(mapping?.outputKind || '').trim() === PORT_KIND_AUDIO
+    && String(mapping?.operationId || getCollectionMapOperationId(node)).trim() === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    && (toolId === 'chatterbox-tts' || (!toolId && audioMode === 'referenceVoiceTts'));
+}
+
 function buildCollectionMapAudioContinuationChainState(node) {
   const seedSeconds = Math.max(0.25, Number(node?.config?.continuationSeedSeconds || 12) || 12);
   const segmentDurationSeconds = Math.max(1, Number(node?.config?.durationSeconds || 8) || 8);
@@ -2218,6 +2244,57 @@ function buildAudioArtifactReference(artifact) {
     kind: String(artifact.kind || '').trim(),
     summary: summarizeArtifact(artifact),
   };
+}
+
+function buildCollectionMapAudioItemMetadata({ audioRequest, executionMode, inputArtifact, itemCount, itemId, itemIndex, mapping, node, referenceAudioArtifact, tool }) {
+  const toolId = String(tool?.id || node?.config?.toolId || '').trim().toLowerCase();
+  const isChatterbox = toolId === 'chatterbox-tts' || String(audioRequest?.audioMode || '').trim() === 'referenceVoiceTts';
+  const audioMode = isChatterbox ? 'referenceVoiceTts' : String(audioRequest?.audioMode || node?.config?.audioMode || 'music').trim() || 'music';
+  const sourceText = String(inputArtifact?.text || '').trim();
+  const collectionMap = {
+    backend: isChatterbox ? 'chatterbox-tts' : 'audiocraft',
+    backendLabel: isChatterbox ? 'Chatterbox-Turbo' : 'AudioCraft',
+    executionMode: String(executionMode || '').trim(),
+    finalPrompt: String(audioRequest?.prompt || '').trim(),
+    inputKind: String(mapping?.inputKind || '').trim(),
+    itemCount,
+    itemIndex,
+    mapping: String(mapping?.id || node?.config?.mappingId || '').trim(),
+    mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+    mode: audioMode,
+    nodeId: String(node?.id || '').trim(),
+    nodeLabel: String(node?.label || '').trim(),
+    operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+    operationSubtype: audioMode,
+    outputKind: String(mapping?.outputKind || '').trim(),
+    sourceItemId: String(itemId || '').trim(),
+    sourceItemIndex: itemIndex,
+    sourceTextPreview: trimPreviewText(sourceText, 160),
+    tool: isChatterbox ? 'Chatterbox-Turbo' : (tool?.name || 'AudioCraft'),
+    toolId,
+    toolLabel: String(tool?.name || (isChatterbox ? 'Chatterbox-Turbo' : 'AudioCraft')).trim(),
+  };
+  if (isChatterbox) {
+    collectionMap.referenceAudio = buildAudioArtifactReference(referenceAudioArtifact || audioRequest?.referenceAudioArtifact);
+    collectionMap.referenceAudioPath = String(audioRequest?.referenceAudioPath || referenceAudioArtifact?.filePath || '').trim();
+  }
+  return {
+    collectionMap,
+    collectionMapItemMode: 'independent',
+  };
+}
+
+async function persistAudioGenerationMetadataSidecar(artifact) {
+  if (!artifact?.filePath || artifact.kind !== PORT_KIND_AUDIO || typeof saveAudioArtifactMetadata !== 'function') {
+    return artifact;
+  }
+
+  const metadataPaths = await saveAudioArtifactMetadata(artifact.filePath, artifact);
+  if (metadataPaths.length) {
+    artifact.metadataPaths = [...new Set([...(Array.isArray(artifact.metadataPaths) ? artifact.metadataPaths : []), ...metadataPaths])];
+  }
+  artifact.summary = summarizeArtifact(artifact);
+  return artifact;
 }
 
 function getAudioDurationSeconds(artifact, fallback = 0) {
@@ -2404,15 +2481,42 @@ function buildCollectionMapMetadata(mapping, node, executionMode, options = {}) 
   const failureMode = getCollectionMapFailureMode(node);
   const audioContinuationChain = serializeCollectionMapAudioContinuationChainState(options.audioContinuationChain);
   const videoContinuationChain = serializeCollectionMapVideoContinuationChainState(options.videoContinuationChain);
+  const sourceCollection = options.sourceCollection && typeof options.sourceCollection === 'object' ? {
+    directoryPath: String(options.sourceCollection.directoryPath || '').trim(),
+    displayName: String(options.sourceCollection.displayName || '').trim(),
+    itemCount: Number(options.sourceCollection.itemCount || 0) || 0,
+    itemKind: String(options.sourceCollection.itemKind || mapping?.inputKind || '').trim(),
+    manifestPath: String(options.sourceCollection.manifestPath || '').trim(),
+    summary: String(options.sourceCollection.summary || '').trim(),
+  } : null;
+  const orderedOutputItemRefs = Array.isArray(options.outputItems) ? options.outputItems.map((entry, index) => ({
+    artifactId: String(entry?.artifact?.id || entry?.artifact?.artifactId || '').trim(),
+    fileName: String(entry?.artifact?.fileName || '').trim(),
+    filePath: String(entry?.artifact?.filePath || '').trim(),
+    itemId: String(entry?.itemId || '').trim(),
+    itemIndex: index,
+    kind: String(entry?.artifact?.kind || '').trim(),
+  })) : [];
+  const selectedToolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  const isChatterbox = executionMode === 'localTool'
+    && String(mapping?.operationId || getCollectionMapOperationId(node)).trim() === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    && (selectedToolId === 'chatterbox-tts' || String(node?.config?.audioMode || '').trim().toLowerCase() === 'referencevoicetts');
   return {
+    completionStatus: String(options.collectionStatus || '').trim() || '',
     executionMode: String(executionMode || '').trim(),
     inputKind: String(mapping?.inputKind || '').trim(),
+    itemCount: Number(options.itemCount || orderedOutputItemRefs.length || 0) || 0,
     label: String(mapping?.label || node?.label || 'Map Collection').trim(),
+    mapping: String(mapping?.id || node?.config?.mappingId || '').trim(),
     mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
     nodeId: String(node?.id || '').trim(),
     nodeLabel: String(node?.label || '').trim(),
+    operation: 'collectionMap',
     operationId: String(mapping?.operationId || getCollectionMapOperationId(node)).trim(),
+    orderedOutputItemRefs,
+    ordering: 'source-order',
     outputKind: String(mapping?.outputKind || getCollectionMapOutputKind(node)).trim(),
+    sourceCollection,
     failureMode,
     partialSuccess: {
       enabled: failureMode === 'partial',
@@ -2425,6 +2529,15 @@ function buildCollectionMapMetadata(mapping, node, executionMode, options = {}) 
     } : { enabled: false },
     ...(audioContinuationChain ? { audioContinuationChain } : {}),
     ...(videoContinuationChain ? { videoContinuationChain } : {}),
+    ...(isChatterbox ? {
+      backend: 'chatterbox-tts',
+      backendLabel: 'Chatterbox-Turbo',
+      mode: 'referenceVoiceTts',
+      operationSubtype: 'referenceVoiceTts',
+      referenceAudio: buildAudioArtifactReference(options.referenceAudioArtifact),
+      referenceAudioPath: String(options.referenceAudioArtifact?.filePath || '').trim(),
+      tool: 'Chatterbox-Turbo',
+    } : {}),
     toolId: String(node?.config?.toolId || '').trim(),
     providerId: String(node?.config?.providerId || '').trim(),
   };
@@ -2629,10 +2742,18 @@ function buildCollectionMapFailedItemMetadata({ error, failureKind, itemCount, i
   };
 }
 
-async function persistPartialCollectionMapArtifact({ audioContinuationChain, executionMode, failedItems, mappedItems, mapping, node, outputKind, run, sourceCollection, sourceItems, videoContinuationChain }) {
+async function persistPartialCollectionMapArtifact({ audioContinuationChain, executionMode, failedItems, mappedItems, mapping, node, outputKind, referenceAudioArtifact, run, sourceCollection, sourceItems, videoContinuationChain }) {
   const collection = createArtifactCollection(mappedItems, {
     collectionMapping: {
-      ...buildCollectionMapMetadata(mapping, node, executionMode, { audioContinuationChain, videoContinuationChain }),
+      ...buildCollectionMapMetadata(mapping, node, executionMode, {
+        audioContinuationChain,
+        collectionStatus: 'partial',
+        itemCount: sourceItems.length,
+        outputItems: mappedItems,
+        referenceAudioArtifact,
+        sourceCollection,
+        videoContinuationChain,
+      }),
       partialReason: String(failedItems?.[0]?.reason || '').trim(),
     },
     collectionStatus: 'partial',
@@ -2640,6 +2761,13 @@ async function persistPartialCollectionMapArtifact({ audioContinuationChain, exe
     failedItems,
     itemKind: outputKind,
     role: 'generated',
+    sourceCollection: {
+      directoryPath: String(sourceCollection?.directoryPath || '').trim(),
+      displayName: String(sourceCollection?.displayName || '').trim(),
+      itemCount: Number(sourceCollection?.itemCount || sourceItems.length) || sourceItems.length,
+      itemKind: String(sourceCollection?.itemKind || mapping?.inputKind || '').trim(),
+      manifestPath: String(sourceCollection?.manifestPath || '').trim(),
+    },
     sourceItemCount: sourceItems.length,
   });
   collection.sourceCollection = {
@@ -2839,6 +2967,8 @@ async function generateMappedAudiocraftContinuationChainArtifact(node, inputArti
     promptStyle: audioRequest.promptStyle,
     reportProgress,
     runDirectories: run.directories,
+    cancelSignal: activeRunAbortController?.signal || null,
+    heavyStepCooldownSeconds: getActiveRunHeavyStepCooldownSeconds(),
     sourceAudioArtifact: chainState.lastAcceptedArtifact,
     sourceAudioPath: previousCumulativeAudioPath,
   });
@@ -3078,7 +3208,8 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
   if (executionMode === 'localTool') {
     if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
       const tool = await getSelectedLocalAudioToolOrThrow(contextMaps, node, 'collection audio generation');
-      const audioRequest = await buildAudioGenerationRequest(operationNode, inputArtifact, contextMaps);
+      const referenceAudioArtifact = options.referenceAudioArtifact || null;
+      const audioRequest = await buildAudioGenerationRequest(operationNode, inputArtifact, contextMaps, { referenceAudioArtifact });
       reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for local audio generation.', 'Running ' + node.label + '...');
       const result = await generateAudioWithLocalAudioTool(tool, {
         appendSource: audioRequest.appendSource,
@@ -3089,7 +3220,9 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
         audiocraftTopP: audioRequest.audiocraftTopP,
         audiocraftTwoStepCfg: audioRequest.audiocraftTwoStepCfg,
         continuationRepeatCount: audioRequest.continuationRepeatCount,
+        cancelSignal: activeRunAbortController?.signal || null,
         displayName: node.label + ' item ' + String(itemIndex + 1),
+        heavyStepCooldownSeconds: getActiveRunHeavyStepCooldownSeconds(),
         continuationSeedSeconds: audioRequest.continuationSeedSeconds,
         durationSeconds: audioRequest.durationSeconds,
         model,
@@ -3097,12 +3230,34 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
         operationId,
         prompt: audioRequest.prompt,
         promptStyle: audioRequest.promptStyle,
+        referenceAudioArtifact: audioRequest.referenceAudioArtifact,
+        referenceAudioPath: audioRequest.referenceAudioPath,
         reportProgress,
         runDirectories: run.directories,
         sourceAudioArtifact: audioRequest.sourceAudioArtifact,
         sourceAudioPath: audioRequest.sourceAudioPath,
       });
-      return result?.outputs?.audio || null;
+      const audioArtifact = result?.outputs?.audio || null;
+      if (audioArtifact?.audioGeneration) {
+        const itemId = String(options.sourceEntry?.itemId || '').trim();
+        audioArtifact.audioGeneration = {
+          ...(audioArtifact.audioGeneration || {}),
+          ...buildCollectionMapAudioItemMetadata({
+            audioRequest,
+            executionMode,
+            inputArtifact,
+            itemCount,
+            itemId,
+            itemIndex,
+            mapping: options.mapping || getCollectionMapMapping(node),
+            node,
+            referenceAudioArtifact,
+            tool,
+          }),
+        };
+        await persistAudioGenerationMetadataSidecar(audioArtifact);
+      }
+      return audioArtifact;
     }
 
     if (operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE) {
@@ -3315,6 +3470,13 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
   const localTool = executionMode === 'localTool' && mapping.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
     ? await getSelectedImageToolOrThrow(contextMaps, node, 'collection image mapping')
     : null;
+  const usesChatterboxReferenceVoice = isCollectionMapChatterboxReferenceVoiceTtsForRun(node, mapping, executionMode);
+  const referenceAudioArtifact = usesChatterboxReferenceVoice
+    ? getNodeInputArtifact(node.id, 'referenceAudio', graph, run.resultsByNodeId, run)
+    : null;
+  if (usesChatterboxReferenceVoice && (!referenceAudioArtifact || referenceAudioArtifact.kind !== PORT_KIND_AUDIO || !referenceAudioArtifact.filePath)) {
+    throw new Error('Reference Voice TTS collection maps need one connected Reference Audio clip for the whole collection. Connect an Audio Input node to the Reference Audio input.');
+  }
   const validationConfig = assertCollectionMapPerItemValidationSupported(node, outputKind, contextMaps);
   const partialOutputEnabled = isCollectionMapPartialOutputEnabled(node);
   const mappedItems = [];
@@ -3327,6 +3489,9 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
     : null;
   const useItemCooldown = isHeavyLocalPipelineNode(node);
   for (let index = 0; index < sourceItems.length; index += 1) {
+    if (run.cancelRequested || activeRunAbortController?.signal?.aborted) {
+      throw new PipelineCancelledError('Pipeline run cancelled before mapping item ' + String(index + 1) + '.');
+    }
     if (useItemCooldown && index > 0) {
       await waitForHeavyStepCooldown(run, node.id, node.label + ' item ' + String(index + 1));
     }
@@ -3350,6 +3515,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
         sourceEntry: entry,
         validationConfig,
         audioContinuationChain,
+        referenceAudioArtifact,
         videoContinuationChain,
       });
       const mappedArtifact = mappedResult.artifact;
@@ -3474,6 +3640,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
         mapping,
         node,
         outputKind,
+        referenceAudioArtifact,
         run,
         sourceCollection,
         sourceItems,
@@ -3491,8 +3658,23 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
   }
 
   const collection = createArtifactCollection(mappedItems, {
-    collectionMapping: buildCollectionMapMetadata(mapping, node, executionMode, { audioContinuationChain, videoContinuationChain }),
+    collectionMapping: buildCollectionMapMetadata(mapping, node, executionMode, {
+      audioContinuationChain,
+      collectionStatus: 'complete',
+      itemCount: sourceItems.length,
+      outputItems: mappedItems,
+      referenceAudioArtifact,
+      sourceCollection,
+      videoContinuationChain,
+    }),
     collectionStatus: 'complete',
+    sourceCollection: {
+      directoryPath: String(sourceCollection?.directoryPath || '').trim(),
+      displayName: String(sourceCollection?.displayName || '').trim(),
+      itemCount: Number(sourceCollection?.itemCount || sourceItems.length) || sourceItems.length,
+      itemKind: String(sourceCollection?.itemKind || mapping?.inputKind || '').trim(),
+      manifestPath: String(sourceCollection?.manifestPath || '').trim(),
+    },
     sourceItemCount: sourceItems.length,
     displayName: node.label,
     itemKind: outputKind,
@@ -4126,18 +4308,28 @@ async function getSelectedLocalVideoToolOrThrow(contextMaps, node, actionLabel) 
 }
 
 async function getSelectedLocalAudioToolOrThrow(contextMaps, node, actionLabel) {
-  const operationId = getModelStepOperationId(node);
+  const operationId = node?.type === 'collectionMap' ? getCollectionMapOperationId(node) : getModelStepOperationId(node);
   const fallbackToolId = operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
     ? 'whisper'
     : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
       ? 'rvc'
       : 'audiocraft-webui';
-  const selectedToolId = String(getModelStepLocalToolId(node, contextMaps) || fallbackToolId).trim().toLowerCase() || fallbackToolId;
+  const configuredToolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  const referenceVoiceRequested = String(node?.config?.audioMode || '').trim().toLowerCase() === 'referencevoicetts';
+  const inferredToolId = node?.type === 'collectionMap'
+    ? fallbackToolId
+    : String(getModelStepLocalToolId(node, contextMaps) || fallbackToolId).trim().toLowerCase();
+  const selectedToolId = configuredToolId
+    || (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && referenceVoiceRequested ? 'chatterbox-tts' : '')
+    || inferredToolId
+    || fallbackToolId;
   const installMessage = operationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
     ? 'Install Whisper before using the ' + actionLabel + ' step.'
     : operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
       ? 'Install RVC before using the ' + actionLabel + ' step.'
-      : 'Install AudioCraft WebUI before using the ' + actionLabel + ' step.';
+      : selectedToolId === 'chatterbox-tts'
+        ? 'Install Chatterbox-Turbo TTS before using the ' + actionLabel + ' step.'
+        : 'Install AudioCraft WebUI before using the ' + actionLabel + ' step.';
   return getInstalledToolOrThrow(
     contextMaps,
     selectedToolId,
@@ -5277,6 +5469,10 @@ async function executeMediaCompositionNode(node, graph, run) {
   }
 
   const composition = createCompositionArtifact({
+    audioMix: {
+      backgroundMusicVolume: normalizeMediaCompositionVolume(node.config?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+      narrationVolume: normalizeMediaCompositionVolume(node.config?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+    },
     displayName: node.label,
     exportKind: PORT_KIND_VIDEO,
     recipeId: 'image-sequence-optional-audio-bed',
@@ -5325,7 +5521,7 @@ async function executeMediaCompositionNode(node, graph, run) {
 
   return {
     message: audioArtifact && backgroundMusicArtifact
-      ? 'Media Composition prepared the ordered images with primary narration and background music.'
+      ? `Media Composition prepared the ordered images with primary narration at ${formatMediaCompositionVolumePercent(node.config?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}% and background music at ${formatMediaCompositionVolumePercent(node.config?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}%.`
       : audioArtifact
         ? 'Media Composition prepared the ordered images with the connected primary audio track.'
         : backgroundMusicArtifact

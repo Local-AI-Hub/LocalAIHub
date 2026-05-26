@@ -557,6 +557,7 @@ async function buildAppState(options = {}) {
     settings: {
       closeBehavior: normalizeCloseBehavior(latestConfig.closeBehavior),
       liveResourcePolling: Boolean(latestConfig.liveResourcePolling),
+      moveDeletedPipelineOutputsToRecycleBin: latestConfig.moveDeletedPipelineOutputsToRecycleBin !== false,
     },
     storage,
     toolUpdates: await getToolUpdateSnapshot(tools),
@@ -1289,6 +1290,21 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not save the live usage polling setting.'),
   );
 
+  ipcMain.handle('settings:save-pipeline-output-trash', (_event, enabled) =>
+    withPlainEnglishErrors(async () => {
+      const moveDeletedPipelineOutputsToRecycleBin = enabled !== false;
+      await updateConfig((config) => ({
+        ...config,
+        moveDeletedPipelineOutputsToRecycleBin,
+      }));
+      return {
+        message: moveDeletedPipelineOutputsToRecycleBin
+          ? 'Deleted pipeline outputs will move to the Recycle Bin when Windows allows it.'
+          : 'Deleted pipeline outputs will be permanently removed from disk. This cannot be easily undone.',
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not save the pipeline output deletion setting.'),
+  );
   ipcMain.handle('settings:get-cleanup-preview', () =>
     withPlainEnglishErrors(() => inspectCleanupTargets(), 'Local AI Hub could not scan the approved cleanup folders right now.'),
   );
@@ -1958,7 +1974,12 @@ function registerIpcHandlers() {
 
   ipcMain.handle('pipelines:delete-output', (_event, payload) =>
     withPlainEnglishErrors(async () => {
-      const result = await deletePipelineOutput(payload?.path);
+      const config = await readConfig();
+      const useTrash = config.moveDeletedPipelineOutputsToRecycleBin !== false;
+      const result = await deletePipelineOutput(payload?.path, {
+        deleteMode: useTrash ? 'trash' : 'permanent',
+        trashItem: (targetPath) => shell.trashItem(targetPath),
+      });
       await invalidateStatisticsIndexSections(['storage'], 'pipeline-output-deleted').catch(() => null);
       return result;
     }, 'Local AI Hub could not delete that pipeline output.'),

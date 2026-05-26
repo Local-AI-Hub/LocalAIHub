@@ -113,8 +113,10 @@ export default function SettingsPanel({
   cleanupPreview,
   closeBehaviorDraft,
   liveResourcePollingDraft,
+  pipelineOutputTrashDraft,
   onChangeCloseBehavior,
   onChangeLiveResourcePolling,
+  onChangePipelineOutputTrash,
   onChangePreferredInstallRootDraft,
   onChangeStorageDraft,
   onChoosePreferredInstallFolder,
@@ -127,6 +129,7 @@ export default function SettingsPanel({
   onSaveCloseBehavior,
   onSavePromptStyle,
   onSaveLiveResourcePolling,
+  onSavePipelineOutputTrash,
   onSavePreferredInstallRoot,
   onSaveStorageLocation,
   preferredInstallRootDraft,
@@ -311,6 +314,28 @@ export default function SettingsPanel({
             <button className={`rounded-2xl border p-4 text-left transition ${liveResourcePollingDraft ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`} onClick={() => onChangeLiveResourcePolling(true)} type="button">
               <p className="text-base font-semibold text-white">Enable live polling</p>
               <p className="mt-2 text-sm leading-6 text-slate-300">RAM and VRAM refresh while the app stays open.</p>
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/35 p-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline output deletion</p>
+              <p className="mt-2 text-sm leading-6 text-slate-300">Recycle Bin mode is easier to undo. Permanent delete removes output files and metadata sidecars from disk.</p>
+            </div>
+            <button className="primary-button" disabled={busyMap['settings:save-pipeline-output-trash']} onClick={onSavePipelineOutputTrash} type="button">
+              {busyMap['settings:save-pipeline-output-trash'] ? 'Saving...' : 'Save output deletion'}
+            </button>
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <button className={`rounded-2xl border p-4 text-left transition ${pipelineOutputTrashDraft ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`} onClick={() => onChangePipelineOutputTrash(true)} type="button">
+              <p className="text-base font-semibold text-white">Move deleted pipeline outputs to Recycle Bin</p>
+              <p className="mt-2 text-sm leading-6 text-slate-300">Default. Local AI Hub asks Windows to move output files or folders to the Recycle Bin.</p>
+            </button>
+            <button className={`rounded-2xl border p-4 text-left transition ${!pipelineOutputTrashDraft ? 'border-rose-300/40 bg-rose-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`} onClick={() => onChangePipelineOutputTrash(false)} type="button">
+              <p className="text-base font-semibold text-white">Permanently delete from disk</p>
+              <p className="mt-2 text-sm leading-6 text-slate-300">Aggressive cleanup. Deleted pipeline outputs cannot be easily restored.</p>
             </button>
           </div>
         </div>

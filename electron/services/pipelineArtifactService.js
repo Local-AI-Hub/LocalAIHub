@@ -463,6 +463,9 @@ function serializeAudioGenerationForUi(generation = null) {
     referenceAudioPath: String(generation.referenceAudioPath || '').trim(),
     referenceDurationSeconds: roundAudioMetric(generation.referenceDurationSeconds),
     sampleRate: Number(generation.sampleRate || 0) || 0,
+    collectionMap: generation.collectionMap && typeof generation.collectionMap === 'object' ? serializeArtifactForUi(generation.collectionMap) : null,
+    collectionMapAudioChain: generation.collectionMapAudioChain && typeof generation.collectionMapAudioChain === 'object' ? serializeArtifactForUi(generation.collectionMapAudioChain) : null,
+    collectionMapItemMode: String(generation.collectionMapItemMode || '').trim(),
     textLength: Math.max(0, Math.floor(Number(generation.textLength || 0) || 0)),
     torchVersion: String(generation.torchVersion || '').trim(),
     continuationRepeatCount: Math.max(0, Math.floor(Number(generation.continuationRepeatCount || generation.repeatCount || 0) || 0)),
@@ -1610,6 +1613,7 @@ function createCompositionArtifact(spec = {}, options = {}) {
 
   const composition = {
     schemaVersion: 1,
+    audioMix: compositionSpec.audioMix && typeof compositionSpec.audioMix === 'object' ? serializeArtifactForUi(compositionSpec.audioMix) : null,
     exportKind: String(compositionSpec.exportKind || PORT_KIND_VIDEO).trim() || PORT_KIND_VIDEO,
     recipeId: String(compositionSpec.recipeId || MEDIA_COMPOSITION_RECIPE_ID).trim() || MEDIA_COMPOSITION_RECIPE_ID,
     recipeLabel: String(compositionSpec.recipeLabel || MEDIA_COMPOSITION_RECIPE_LABEL).trim() || MEDIA_COMPOSITION_RECIPE_LABEL,
@@ -2324,6 +2328,7 @@ async function persistCompositionArtifact(runDirectories, artifact, options = {}
     displayName: options.displayName || options.title || artifact?.displayName || 'Media Composition',
     exportKind: artifact?.composition?.exportKind,
     recipeId: artifact?.composition?.recipeId,
+    audioMix: artifact?.composition?.audioMix,
     recipeLabel: artifact?.composition?.recipeLabel,
     role: artifact?.role,
     tracks: serializeArtifactForUi(artifact?.composition?.tracks || []),

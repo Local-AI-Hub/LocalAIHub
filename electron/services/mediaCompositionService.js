@@ -17,9 +17,37 @@ try {
 
 const { runCommand } = require('./commandService');
 const { buildFileArtifact, isCompositionArtifact, serializeArtifactForUi, summarizeArtifact } = require('./pipelineArtifactService');
-const { PORT_KIND_VIDEO } = require('../shared/pipelineSchema.cjs');
+const {
+  DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
+  PORT_KIND_VIDEO,
+} = require('../shared/pipelineSchema.cjs');
 
-const DEFAULT_BACKGROUND_MUSIC_VOLUME = 0.22;
+function normalizeAudioVolume(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(2, numeric));
+}
+
+function formatVolumeFilterValue(value) {
+  return String(Math.round(normalizeAudioVolume(value, 1) * 1000) / 1000);
+}
+
+function formatVolumePercent(value, fallback) {
+  return Math.round(normalizeAudioVolume(value, fallback) * 100);
+}
+
+function resolveCompositionAudioMix(compositionArtifact) {
+  const mix = compositionArtifact?.composition?.audioMix && typeof compositionArtifact.composition.audioMix === 'object'
+    ? compositionArtifact.composition.audioMix
+    : {};
+  return {
+    backgroundMusicVolume: normalizeAudioVolume(mix.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    narrationVolume: normalizeAudioVolume(mix.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+  };
+}
 
 function sanitizeSegment(value, fallback = 'composition') {
   const normalized = String(value || '')
@@ -120,7 +148,7 @@ function calculateVisualDurationSeconds(visualTrack) {
   return items.reduce((total, entry) => total + Math.max(0, Number(entry?.durationSeconds || visualTrack?.itemDurationSeconds || 0) || 0), 0);
 }
 
-function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visualDurationSeconds) {
+function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visualDurationSeconds, audioMix = {}) {
   const primaryAudioArtifact = primaryAudioTrack?.artifact || null;
   const backgroundMusicArtifact = backgroundMusicTrack?.artifact || null;
   const hasPrimaryAudio = Boolean(primaryAudioArtifact?.filePath);
@@ -139,6 +167,8 @@ function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visua
   return {
     backgroundMusicArtifact,
     backgroundMusicTrack,
+    backgroundMusicVolume: normalizeAudioVolume(audioMix.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    narrationVolume: normalizeAudioVolume(audioMix.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
     hasBackgroundMusic,
     hasPrimaryAudio,
     mode,
@@ -153,7 +183,8 @@ function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visua
 function buildAudioMixMetadata(audioPlan) {
   return {
     backgroundMusicLooping: audioPlan.hasBackgroundMusic ? audioPlan.shouldLoopBackgroundMusic : false,
-    backgroundMusicVolume: audioPlan.mode === 'mixed-with-background-music' ? DEFAULT_BACKGROUND_MUSIC_VOLUME : (audioPlan.hasBackgroundMusic ? 1 : 0),
+    backgroundMusicVolume: audioPlan.backgroundMusicVolume,
+    narrationVolume: audioPlan.narrationVolume,
     mode: audioPlan.mode,
     outputDurationSeconds: audioPlan.outputDurationSeconds || null,
     stopMode: audioPlan.stopMode,
@@ -240,11 +271,13 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
   const outputPath = path.join(exportDirectoryPath, `${sanitizeSegment(title, 'composed-video')}.mp4`);
   const stopMode = String(options.stopMode || '').trim() === 'visuals' ? 'visuals' : 'shortest';
   const visualDurationSeconds = calculateVisualDurationSeconds(visualTrack);
+  const audioMix = resolveCompositionAudioMix(compositionArtifact);
   const audioPlan = buildAudioPlan(
     getPrimaryAudioTrack(compositionArtifact),
     getBackgroundMusicTrack(compositionArtifact),
     stopMode,
     visualDurationSeconds,
+    audioMix,
   );
   const exportProfile = {
     width: Math.max(16, Number(options.width || 0) || 1280),
@@ -291,11 +324,16 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
   if (audioPlan.mode === 'mixed-with-background-music') {
     args.push(
       '-filter_complex',
-      `[1:a]aresample=async=1:first_pts=0[primary];[${backgroundMusicInputIndex}:a]aresample=async=1:first_pts=0,volume=${DEFAULT_BACKGROUND_MUSIC_VOLUME}[music];[primary][music]amix=inputs=2:duration=longest:dropout_transition=2[aout]`,
+      `[1:a]aresample=async=1:first_pts=0,volume=${formatVolumeFilterValue(audioPlan.narrationVolume)}[primary];[${backgroundMusicInputIndex}:a]aresample=async=1:first_pts=0,volume=${formatVolumeFilterValue(audioPlan.backgroundMusicVolume)}[music];[primary][music]amix=inputs=2:duration=longest:dropout_transition=2[aout]`,
     );
     audioMapTarget = '[aout]';
+  } else if (audioPlan.mode === 'primary-audio-only') {
+    args.push('-filter_complex', `[1:a]aresample=async=1:first_pts=0,volume=${formatVolumeFilterValue(audioPlan.narrationVolume)}[aout]`);
+    audioMapTarget = '[aout]';
+  } else if (audioPlan.mode === 'background-music-only') {
+    args.push('-filter_complex', `[${backgroundMusicInputIndex}:a]aresample=async=1:first_pts=0,volume=${formatVolumeFilterValue(audioPlan.backgroundMusicVolume)}[aout]`);
+    audioMapTarget = '[aout]';
   }
-
   args.push(
     '-vf',
     buildVideoFilter(exportProfile.width, exportProfile.height, exportProfile.fitMode),
@@ -351,11 +389,11 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
   artifact.summary = summarizeArtifact(artifact);
 
   const message = audioPlan.mode === 'mixed-with-background-music'
-    ? `Media Export rendered a video from ${visualItems.length} images with narration mixed over background music.`
+    ? `Media Export rendered a video from ${visualItems.length} images with background music at ${formatVolumePercent(audioPlan.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}% and narration at ${formatVolumePercent(audioPlan.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}%.`
     : audioPlan.mode === 'primary-audio-only'
-      ? `Media Export rendered a video from ${visualItems.length} images with ${audioPlan.primaryAudioArtifact.fileName} as the primary audio track.`
+      ? `Media Export rendered a video from ${visualItems.length} images with ${audioPlan.primaryAudioArtifact.fileName} as the primary audio track at ${formatVolumePercent(audioPlan.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}%.`
       : audioPlan.mode === 'background-music-only'
-        ? `Media Export rendered a video from ${visualItems.length} images with ${audioPlan.backgroundMusicArtifact.fileName} as the soundtrack.`
+        ? `Media Export rendered a video from ${visualItems.length} images with ${audioPlan.backgroundMusicArtifact.fileName} as the soundtrack at ${formatVolumePercent(audioPlan.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}%.`
         : `Media Export rendered a silent video from ${visualItems.length} images.`;
 
   return {

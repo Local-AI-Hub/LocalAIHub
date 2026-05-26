@@ -48,6 +48,8 @@ const DEFAULT_PIPELINE_RUN_SETTINGS = Object.freeze({
   enableHeavyStepCooldown: false,
   heavyStepCooldownSeconds: 0,
 });
+const DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME = 1;
+const DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME = 0.22;
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
 const PORT_KIND_TEXT = 'text';
@@ -138,6 +140,14 @@ const IMAGE_TRANSFORM_SUBTYPE_OPTIONS = Object.freeze({
 });
 const VIDEO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.VIDEO_GENERATE));
 const AUDIO_WORKFLOW_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.AUDIO_GENERATE));
+const AUDIOCRAFT_AUDIO_MODE_OPTIONS = Object.freeze([
+  Object.freeze({ id: 'music', label: 'Music' }),
+  Object.freeze({ id: 'sound', label: 'Sound' }),
+  Object.freeze({ id: 'continuation', label: 'Continuation' }),
+]);
+const CHATTERBOX_AUDIO_MODE_OPTIONS = Object.freeze([
+  Object.freeze({ id: 'referenceVoiceTts', label: 'Reference Voice TTS' }),
+]);
 const AUDIO_TRANSFORM_TOOL_IDS = Object.freeze(getOperationDrivenToolIdsForPipelineOperation(PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM));
 const GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getGraphWorkflowToolIds());
 const RUNNABLE_GRAPH_WORKFLOW_TOOL_IDS = Object.freeze(getRunnableGraphWorkflowToolIds());
@@ -1174,6 +1184,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       secondsPerItem: 4,
+      narrationVolume: DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
+      backgroundMusicVolume: DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
     },
   }),
   mediaExport: Object.freeze({
@@ -1521,6 +1533,9 @@ function resolveDynamicInputKinds(node, port) {
   if (node.type === 'collectionMap' && port.id === 'collection') {
     return isSupportedCollectionMapOperation(node) ? [getCollectionMapInputKind(node)] : [];
   }
+  if (node.type === 'collectionMap' && port.id === 'referenceAudio') {
+    return getCollectionMapReferenceAudioInputKinds(node);
+  }
   if (node.type === 'validation' && port.id === 'input' && node.config?.mode === 'llm') {
     const executionMode = node?.config?.llmExecutionMode === 'ollama' ? 'ollama' : 'cloud';
     if (executionMode === 'ollama') {
@@ -1761,12 +1776,27 @@ function getCollectionMapLocalToolIds(node) {
     return ['rvc'];
   }
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
-    return AUDIO_WORKFLOW_TOOL_IDS.filter((toolId) => toolId !== 'chatterbox-tts');
+    return AUDIO_WORKFLOW_TOOL_IDS;
   }
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
     return VIDEO_WORKFLOW_TOOL_IDS;
   }
   return IMAGE_WORKFLOW_TOOL_IDS;
+}
+
+function isCollectionMapChatterboxReferenceVoiceTts(node) {
+  const executionMode = getCollectionMapExecutionMode(node);
+  const selectedToolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  const audioMode = canonicalizeAudioMode(node?.config?.audioMode);
+  return executionMode === 'localTool'
+    && getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
+    && getCollectionMapInputKind(node) === PORT_KIND_TEXT
+    && getCollectionMapOutputKind(node) === PORT_KIND_AUDIO
+    && (selectedToolId === 'chatterbox-tts' || (!selectedToolId && audioMode === 'referenceVoiceTts'));
+}
+
+function getCollectionMapReferenceAudioInputKinds(node) {
+  return isCollectionMapChatterboxReferenceVoiceTts(node) ? [PORT_KIND_AUDIO] : [];
 }
 
 function isCollectionMapAudioContinuationChainEnabled(node) {
@@ -1856,6 +1886,55 @@ function normalizeImageTransformSubtype(toolId = '', subtype = '') {
 
   return normalizedSubtype ? '' : getDefaultImageTransformSubtype(toolId);
 }
+function cloneAudioModeOptions(options = []) {
+  return (options || []).map((entry) => ({ ...entry }));
+}
+
+function canonicalizeAudioMode(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'referencevoicetts' || normalized === 'reference-voice-tts') {
+    return 'referenceVoiceTts';
+  }
+  if (normalized === 'sound') {
+    return 'sound';
+  }
+  if (normalized === 'continuation') {
+    return 'continuation';
+  }
+  return 'music';
+}
+
+function getAudioModeOptionsForLocalTool(toolId) {
+  return String(toolId || '').trim().toLowerCase() === 'chatterbox-tts'
+    ? cloneAudioModeOptions(CHATTERBOX_AUDIO_MODE_OPTIONS)
+    : cloneAudioModeOptions(AUDIOCRAFT_AUDIO_MODE_OPTIONS);
+}
+
+function normalizeAudioModeForLocalTool(toolId, audioMode) {
+  const options = getAudioModeOptionsForLocalTool(toolId);
+  const canonicalMode = canonicalizeAudioMode(audioMode);
+  return options.some((entry) => entry.id === canonicalMode) ? canonicalMode : options[0]?.id || 'music';
+}
+
+function normalizeLocalAudioGenerationConfig(config = {}) {
+  const nextConfig = { ...(config || {}) };
+  const selectedToolId = String(nextConfig.toolId || '').trim().toLowerCase();
+  if (selectedToolId === 'chatterbox-tts') {
+    nextConfig.audioMode = 'referenceVoiceTts';
+    return nextConfig;
+  }
+  if (selectedToolId === 'audiocraft-webui') {
+    nextConfig.audioMode = normalizeAudioModeForLocalTool(selectedToolId, nextConfig.audioMode);
+    return nextConfig;
+  }
+  if (canonicalizeAudioMode(nextConfig.audioMode) === 'referenceVoiceTts') {
+    nextConfig.audioMode = 'referenceVoiceTts';
+    nextConfig.toolId = 'chatterbox-tts';
+    return nextConfig;
+  }
+  nextConfig.audioMode = normalizeAudioModeForLocalTool('audiocraft-webui', nextConfig.audioMode);
+  return nextConfig;
+}
 function getOperationDrivenToolIdsForModelStepOperation(operationId) {
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
     return VIDEO_WORKFLOW_TOOL_IDS;
@@ -1936,10 +2015,26 @@ function getDefaultNodeConfig(type) {
 }
 
 function normalizeNodeConfig(type, config) {
-  return {
+  const nextConfig = {
     ...getDefaultNodeConfig(type),
     ...(config && typeof config === 'object' ? cloneValue(config) : {}),
   };
+
+  if (type === 'llmPrompt') {
+    const executionMode = nextConfig.executionMode === 'localTool' ? 'localTool' : nextConfig.executionMode === 'ollama' ? 'ollama' : 'cloud';
+    if (executionMode === 'localTool' && String(nextConfig.operationId || '').trim() === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+      return normalizeLocalAudioGenerationConfig(nextConfig);
+    }
+  }
+
+  if (type === 'collectionMap') {
+    const operationId = String(nextConfig.operationId || '').trim();
+    if (nextConfig.executionMode === 'localTool' && operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
+      return normalizeLocalAudioGenerationConfig(nextConfig);
+    }
+  }
+
+  return nextConfig;
 }
 
 function createNode(type, overrides = {}) {
@@ -2036,6 +2131,37 @@ function normalizePipelineDefinition(definition = {}, options = {}) {
   };
 }
 
+function getPipelineCopyName(sourceName, existingPipelines = []) {
+  const baseName = String(sourceName || '').trim() || 'Untitled pipeline';
+  const existingNames = new Set((Array.isArray(existingPipelines) ? existingPipelines : [])
+    .map((entry) => String(entry?.name || entry || '').trim().toLowerCase())
+    .filter(Boolean));
+  const firstCandidate = baseName + ' (copy)';
+  if (!existingNames.has(firstCandidate.toLowerCase())) {
+    return firstCandidate;
+  }
+
+  let suffix = 2;
+  while (existingNames.has((baseName + ' (copy ' + suffix + ')').toLowerCase())) {
+    suffix += 1;
+  }
+  return baseName + ' (copy ' + suffix + ')';
+}
+
+function createPipelineDefinitionCopy(definition = {}, existingPipelines = []) {
+  const source = normalizePipelineDefinition(definition, {
+    keepCreatedAt: true,
+    keepUpdatedAt: true,
+  });
+  return createEmptyPipeline({
+    description: source.description,
+    edges: cloneValue(source.edges),
+    name: getPipelineCopyName(source.name, existingPipelines),
+    nodes: cloneValue(source.nodes),
+    runSettings: cloneValue(source.runSettings),
+  });
+}
+
 function isPipelineNodeLike(value) {
   return Boolean(value && typeof value === 'object' && typeof value.type === 'string');
 }
@@ -2077,7 +2203,7 @@ function getPipelineNodePorts(nodeOrType, direction) {
 
   if (node?.type === 'collectionMap') {
     const itemType = direction === 'input' ? getCollectionMapInputKind(node) : getCollectionMapOutputKind(node);
-    return [
+    const ports = [
       {
         id: 'collection',
         kind: itemType,
@@ -2086,6 +2212,15 @@ function getPipelineNodePorts(nodeOrType, direction) {
         required: direction === 'input',
       },
     ];
+    if (direction === 'input' && isCollectionMapChatterboxReferenceVoiceTts(node)) {
+      ports.push({
+        id: 'referenceAudio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Reference Audio',
+        required: true,
+      });
+    }
+    return ports;
   }
   const portList = direction === 'input' ? definition?.inputPorts : definition?.outputPorts;
   return portList || [];
@@ -5603,15 +5738,22 @@ function analyzePipeline(definition = {}, context = {}) {
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
           } else {
+            const effectiveLocalToolId = selectedToolId
+              || (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && canonicalizeAudioMode(node.config?.audioMode) === 'referenceVoiceTts'
+                ? 'chatterbox-tts'
+                : pickAvailableToolId(supportedToolIds, contextMaps) || '');
             const localNode = {
               ...node,
               type: 'llmPrompt',
               config: {
                 ...node.config,
-                toolId: selectedToolId || pickAvailableToolId(supportedToolIds, contextMaps) || '',
+                toolId: effectiveLocalToolId,
               },
             };
-            const ready = analyzeModelStepLocalToolNode(localNode, summary, contextMaps, [mapping.inputKind], []);
+            const referenceKinds = operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE && effectiveLocalToolId === 'chatterbox-tts'
+              ? getIncomingKindsForNodePort(node, 'referenceAudio', graph)
+              : [];
+            const ready = analyzeModelStepLocalToolNode(localNode, summary, contextMaps, [mapping.inputKind], referenceKinds);
             if (!ready || summary.readiness.tone === 'error') {
               issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
             } else if (summary.readiness.tone === 'warn') {
@@ -6253,7 +6395,11 @@ module.exports = {
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
   HEAVY_STEP_COOLDOWN_MAX_SECONDS,
   DEFAULT_PIPELINE_RUN_SETTINGS,
+  DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
   AUDIO_WORKFLOW_TOOL_IDS,
+  AUDIOCRAFT_AUDIO_MODE_OPTIONS,
+  CHATTERBOX_AUDIO_MODE_OPTIONS,
   AUDIO_TRANSFORM_TOOL_IDS,
   COLLECTION_MAP_MAPPING_OPTIONS,
   IMAGE_TRANSFORM_TOOL_IDS,
@@ -6288,10 +6434,12 @@ module.exports = {
   createEdge,
   createEmptyPipeline,
   createNode,
+  createPipelineDefinitionCopy,
   createUniqueId,
   evaluateCompatibilityProfile,
   getDefaultGraphWorkflowBindings,
   getDefaultNodeConfig,
+  getPipelineCopyName,
   getGraphWorkflowContract,
   getGraphWorkflowFieldOptions,
   getGraphWorkflowInputBinding,
@@ -6308,11 +6456,13 @@ module.exports = {
   getCollectionMapOperationId,
   getCollectionMapOutputKind,
   getDefaultImageTransformSubtype,
+  isCollectionMapChatterboxReferenceVoiceTts,
   getImageTransformSubtypeLabel,
   getImageTransformSubtypeOptions,
   selectLocalImageBackend,
   getLocalImageCheckpointModels,
   getLocalImageBackendOperationId,
+  getAudioModeOptionsForLocalTool,
   getLocalToolRequirement,
   getModelStepExecutionMode,
   getPipelineNodePorts,
@@ -6324,6 +6474,7 @@ module.exports = {
   getPortAllowedKinds,
   getPortDefinition,
   getSupportedPortKinds,
+  normalizeAudioModeForLocalTool,
   normalizeImageTransformSubtype,
   normalizePipelineDefinition,
   normalizePipelineRunSettings,

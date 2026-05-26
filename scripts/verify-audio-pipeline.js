@@ -872,14 +872,16 @@ function verifyChatterboxReadinessStates(tempRoot, audioPath) {
   assert(referencePort, 'Expected Reference Voice TTS Model Step to expose the dynamic Reference Audio input.');
   assert(pipelineSchema.getPortAllowedKinds(referencePort, { direction: 'input', node: readyDefinition.nodes.find((node) => node.id === 'reference-voice-tts') }).includes(pipelineSchema.PORT_KIND_AUDIO), 'Expected the Reference Audio input to accept audio artifacts.');
 
-  const wrongToolAnalysis = pipelineSchema.analyzePipeline({
+  const staleWrongToolDefinition = {
     ...readyDefinition,
     nodes: readyDefinition.nodes.map((node) => node.id === 'reference-voice-tts' ? { ...node, config: { ...node.config, toolId: 'audiocraft-webui' } } : node),
-  }, {
+  };
+  const wrongToolAnalysis = pipelineSchema.analyzePipeline(staleWrongToolDefinition, {
     tools: [createAudiocraftTool({ appDir: tempRoot, installDir: tempRoot, status: 'stopped' })],
   });
-  assert.strictEqual(wrongToolAnalysis.nodeSummaries['reference-voice-tts'].readiness.tone, 'error', 'Expected Reference Voice TTS readiness to reject AudioCraft.');
-  assert(wrongToolAnalysis.nodeSummaries['reference-voice-tts'].readiness.message.includes('Chatterbox-Turbo'), 'Expected wrong-tool readiness to point users back to Chatterbox-Turbo.');
+  assert.notStrictEqual(wrongToolAnalysis.nodeSummaries['reference-voice-tts'].readiness.tone, 'error', 'Expected stale AudioCraft + Reference Voice TTS to normalize safely instead of crashing or staying invalid.');
+  assert.strictEqual(wrongToolAnalysis.pipeline.nodes.find((node) => node.id === 'reference-voice-tts').config.audioMode, 'music', 'Expected stale AudioCraft Reference Voice TTS mode to normalize to Music.');
+  assert.strictEqual(wrongToolAnalysis.nodeSummaries['reference-voice-tts'].capabilitySummary.targetId, 'audiocraft-webui', 'Expected normalized AudioCraft audio generation to stay on AudioCraft.');
 }
 
 async function verifyChatterboxReferenceVoicePipelineRun(tempRoot, referenceAudioPath) {

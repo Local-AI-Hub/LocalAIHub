@@ -129,23 +129,43 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
       return {
         generateAudioWithLocalAudioTool: async (_tool, request = {}) => {
           const prompt = String(request.prompt || '');
-          localAudioGenerationRequests.push({ ...request });
+          localAudioGenerationRequests.push({ toolId: _tool.id, toolLabel: _tool.name, ...request });
           if (failSecondAudioGeneration && /city street/i.test(prompt)) {
-            throw new Error('mock AudioCraft failure');
+            throw new Error(_tool.id === 'chatterbox-tts' ? 'mock Chatterbox failure' : 'mock AudioCraft failure');
           }
           fs.mkdirSync(TEST_STORAGE_ROOT, { recursive: true });
           const outputPath = path.join(TEST_STORAGE_ROOT, 'audio-' + Date.now() + '-' + Math.random().toString(16).slice(2) + '.wav');
           fs.writeFileSync(outputPath, WAVE_FIXTURE);
+          const isChatterbox = _tool.id === 'chatterbox-tts' || request.audioMode === 'referenceVoiceTts';
           return {
             outputs: {
               audio: {
+                audio: {
+                  channelCount: isChatterbox ? 1 : 2,
+                  durationSeconds: isChatterbox ? 1.5 : 1,
+                  sampleRate: isChatterbox ? 24000 : 16000,
+                },
                 audioGeneration: request.operationId === 'audioGenerate' ? {
+                  backend: isChatterbox ? 'chatterbox-tts' : 'audiocraft',
+                  backendLabel: isChatterbox ? 'Chatterbox-Turbo' : 'AudioCraft',
+                  consentWarning: isChatterbox ? 'Only clone voices you have permission to use.' : '',
+                  device: isChatterbox ? 'cuda' : '',
+                  durationSeconds: isChatterbox ? 1.5 : 1,
+                  gpuName: isChatterbox ? 'Mock RTX' : '',
                   mode: request.audioMode || 'music',
-                  model: request.model || '',
+                  model: request.model || (isChatterbox ? 'ResembleAI/chatterbox-turbo' : ''),
                   operationId: request.operationId,
+                  operationSubtype: request.audioMode || 'music',
+                  packageVersion: isChatterbox ? '0.1.7' : '',
+                  peakAllocatedMb: isChatterbox ? 1234 : 0,
                   prompt: request.prompt || '',
                   promptStyle: request.promptStyle,
+                  referenceAudio: request.referenceAudioArtifact ? { fileName: request.referenceAudioArtifact.fileName, filePath: request.referenceAudioArtifact.filePath, kind: request.referenceAudioArtifact.kind } : null,
+                  referenceAudioPath: request.referenceAudioPath || '',
+                  sampleRate: isChatterbox ? 24000 : 16000,
+                  toolId: _tool.id,
                   toolLabel: _tool.name,
+                  torchVersion: isChatterbox ? '2.6.0+cu124' : '',
                 } : undefined,
                 audioTransformation: request.operationId === 'audioTransform' ? {
                   operationId: request.operationId,
@@ -303,6 +323,8 @@ const {
   PIPELINE_OPERATION_IDS,
   analyzePipeline,
   buildPipelineGraph,
+  getPipelineNodePorts,
+  getPortAllowedKinds,
   createEdge,
   createEmptyPipeline,
   createNode,
@@ -853,6 +875,107 @@ async function main() {
   assert.strictEqual(staleTextToAudioSnapshot.status, 'completed', staleTextToAudioSnapshot.message);
   const staleAudioPrompt = staleTextToAudioSnapshot.nodeStates['map-collection'].outputs.collection.items[0].artifact.audioGeneration.prompt;
   assert.strictEqual(staleAudioPrompt, 'hard rock', 'stale text-to-image default instruction should be ignored for text-to-audio metadata.');
+
+  const referenceVoicePath = writeFixtureFile('collection-chatterbox-reference.wav', WAVE_FIXTURE);
+  mockedInstalledTools = [createTool('audiocraft-webui', 'AudioCraft WebUI'), createTool('chatterbox-tts', 'Chatterbox-Turbo TTS')];
+  const chatterboxCollectionPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'voice-a', text: 'Welcome to Local AI Hub.' },
+      { id: 'voice-b', text: 'Each collection item becomes speech.' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToAudio',
+      operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'chatterbox-tts',
+      audioMode: 'music',
+    },
+  });
+  const referenceAudioNode = createNode('audioInput', { id: 'reference-voice', label: 'Reference Voice', config: { filePath: referenceVoicePath } });
+  chatterboxCollectionPipeline.nodes.splice(1, 0, referenceAudioNode);
+  chatterboxCollectionPipeline.edges.push(createEdge(referenceAudioNode.id, 'audio', 'map-collection', 'referenceAudio'));
+  const chatterboxMapNode = chatterboxCollectionPipeline.nodes.find((node) => node.id === 'map-collection');
+  assert.strictEqual(chatterboxMapNode.config.audioMode, 'referenceVoiceTts', 'collectionMap should normalize stale Chatterbox audio modes to Reference Voice TTS.');
+  const chatterboxPorts = getPipelineNodePorts(chatterboxMapNode, 'input');
+  assert(chatterboxPorts.some((port) => port.id === 'referenceAudio' && getPortAllowedKinds(port, { direction: 'input', node: chatterboxMapNode }).includes('audio')), 'Chatterbox collectionMap should expose a shared Reference Audio input port.');
+
+  const audiocraftPorts = getPipelineNodePorts(textToAudioPipeline.nodes.find((node) => node.id === 'map-collection'), 'input');
+  assert(!audiocraftPorts.some((port) => port.id === 'referenceAudio'), 'AudioCraft collectionMap should not expose the Chatterbox Reference Audio port.');
+
+  const chatterboxMissingReferencePipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [{ id: 'voice-missing-ref', text: 'This should require reference audio.' }],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToAudio',
+      operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'chatterbox-tts',
+      audioMode: 'referenceVoiceTts',
+    },
+  });
+  const missingReferenceAnalysis = analyzePipeline(chatterboxMissingReferencePipeline, { tools: mockedInstalledTools, toolCatalog: mockedInstalledTools });
+  assert.strictEqual(missingReferenceAnalysis.executable, false, 'Chatterbox collectionMap should not analyze as executable without Reference Audio.');
+  assert(missingReferenceAnalysis.issues.some((issue) => /Reference Audio/i.test(issue.message)), 'Missing Chatterbox Reference Audio should produce a clear validation message.');
+
+  localAudioGenerationRequests.length = 0;
+  await runPipeline(chatterboxCollectionPipeline);
+  const chatterboxSnapshot = await waitForRunToFinish();
+  assert.strictEqual(chatterboxSnapshot.status, 'completed', chatterboxSnapshot.message);
+  const chatterboxCollection = chatterboxSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(chatterboxCollection.itemKind, 'audio');
+  assert.strictEqual(chatterboxCollection.itemCount, 2, 'Chatterbox collectionMap should output one audio item per text item.');
+  assert.deepStrictEqual(chatterboxCollection.items.map((entry) => entry.lineage.sourceItemIndex), [0, 1], 'Chatterbox collectionMap should preserve source order lineage.');
+  assert.strictEqual(localAudioGenerationRequests.length, 2, 'Chatterbox collectionMap should generate items sequentially.');
+  assert(localAudioGenerationRequests.every((request) => request.toolId === 'chatterbox-tts' && request.audioMode === 'referenceVoiceTts'), 'Chatterbox collectionMap should call the Chatterbox local audio adapter in Reference Voice TTS mode.');
+  assert(localAudioGenerationRequests.every((request) => request.referenceAudioPath === referenceVoicePath), 'Chatterbox collectionMap should reuse one shared reference audio path for every item.');
+  assert(localAudioGenerationRequests.every((request) => request.cancelSignal), 'Chatterbox collectionMap should pass the active cancellation signal to each helper call.');
+  assert(localAudioGenerationRequests.every((request) => Object.prototype.hasOwnProperty.call(request, 'heavyStepCooldownSeconds')), 'Chatterbox collectionMap should pass the heavy-step cooldown setting through to local audio generation.');
+  const firstChatterboxItem = chatterboxCollection.items[0].artifact;
+  assert.strictEqual(firstChatterboxItem.audioGeneration.operationSubtype, 'referenceVoiceTts', 'Chatterbox item metadata should preserve Reference Voice TTS subtype.');
+  assert.strictEqual(firstChatterboxItem.audioGeneration.backend, 'chatterbox-tts', 'Chatterbox item metadata should preserve backend id.');
+  assert.strictEqual(firstChatterboxItem.audioGeneration.collectionMap.sourceItemId, 'voice-a', 'Chatterbox item metadata should record source item id.');
+  assert.strictEqual(firstChatterboxItem.audioGeneration.collectionMap.referenceAudio.fileName, path.basename(referenceVoicePath), 'Chatterbox item metadata should record reference audio lineage.');
+  const chatterboxSidecarPath = firstChatterboxItem.metadataPaths.find((entry) => entry.endsWith('.audio.json'));
+  assert(chatterboxSidecarPath, 'Chatterbox collectionMap items should save .audio.json sidecar metadata.');
+  const chatterboxSidecar = JSON.parse(fs.readFileSync(chatterboxSidecarPath, 'utf8'));
+  assert.strictEqual(chatterboxSidecar.audioGeneration.operationSubtype, 'referenceVoiceTts', 'Chatterbox sidecar should preserve Reference Voice TTS subtype.');
+  assert.strictEqual(chatterboxSidecar.audioGeneration.collectionMap.referenceAudio.fileName, path.basename(referenceVoicePath), 'Chatterbox sidecar should preserve reference audio lineage.');
+  assert.strictEqual(chatterboxCollection.collectionMapping.operation, 'collectionMap', 'Chatterbox collection manifest should record collectionMap operation.');
+  assert.strictEqual(chatterboxCollection.collectionMapping.backend, 'chatterbox-tts', 'Chatterbox collection manifest should record backend.');
+  assert.strictEqual(chatterboxCollection.collectionMapping.mode, 'referenceVoiceTts', 'Chatterbox collection manifest should record mode.');
+  assert.strictEqual(chatterboxCollection.collectionMapping.referenceAudio.fileName, path.basename(referenceVoicePath), 'Chatterbox collection manifest should record reference audio lineage.');
+  assert.deepStrictEqual(chatterboxCollection.collectionMapping.orderedOutputItemRefs.map((entry) => entry.itemId), ['voice-a', 'voice-b'], 'Chatterbox collection manifest should preserve ordered output item refs.');
+
+  failSecondAudioGeneration = true;
+  localAudioGenerationRequests.length = 0;
+  const failedChatterboxPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'voice-ok', text: 'This item succeeds.' },
+      { id: 'voice-fails', text: 'city street at sunrise' },
+    ],
+    mapConfig: {
+      executionMode: 'localTool',
+      mappingId: 'textToAudio',
+      operationId: PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'chatterbox-tts',
+      audioMode: 'referenceVoiceTts',
+    },
+  });
+  const failedReferenceAudioNode = createNode('audioInput', { id: 'failed-reference-voice', label: 'Reference Voice', config: { filePath: referenceVoicePath } });
+  failedChatterboxPipeline.nodes.splice(1, 0, failedReferenceAudioNode);
+  failedChatterboxPipeline.edges.push(createEdge(failedReferenceAudioNode.id, 'audio', 'map-collection', 'referenceAudio'));
+  await runPipeline(failedChatterboxPipeline);
+  const failedChatterboxSnapshot = await waitForRunToFinish();
+  failSecondAudioGeneration = false;
+  assert.strictEqual(failedChatterboxSnapshot.status, 'failed', 'Chatterbox collectionMap should fail normally when partial success is disabled.');
+  assert(/mock Chatterbox failure/i.test(failedChatterboxSnapshot.message), 'Chatterbox failures should not be masked as AudioCraft failures.');
+
+  const chatterboxExecutionServiceSource = fs.readFileSync(path.join(process.cwd(), 'electron', 'services', 'pipelineExecutionService.js'), 'utf8');
+  assert(chatterboxExecutionServiceSource.includes('Pipeline run cancelled before mapping item'), 'collectionMap runtime should keep cancellation guarded between items.');
+  assert(chatterboxExecutionServiceSource.includes('waitForHeavyStepCooldown(run, node.id, node.label + \' item \' + String(index + 1))'), 'collectionMap runtime should keep heavy-step cooldown between mapped local items.');
+
   const strongVideoHardware = { gpuModel: 'NVIDIA RTX 4090', systemRamMb: 65536, vramMb: 24576 };
   await configService.upsertPromptStyle({ id: 'style-cinematic-video', name: 'Cinematic Video', targetKind: 'video', requiredTerms: ['cinematic lighting', 'smooth camera motion'], negativePrompt: 'jitter' });
   mockedInstalledTools = [createWanTool()];

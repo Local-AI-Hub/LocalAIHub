@@ -31,16 +31,25 @@ function verifyPipelineBuilderSourceGuards() {
   assert(!/selectedNode\.type === 'imageGenerate'/.test(source), 'Expected removed standalone image generation inspector branches to stay gone.');
   assert(!/selectedNode\.type === 'imageAnalyze'/.test(source), 'Expected removed standalone image analysis inspector branches to stay gone.');
   assert(!/selectedNode\.type === 'whisperTranscribe'/.test(source), 'Expected removed standalone transcription inspector branches to stay gone.');
-  assert(source.includes('<option value="continuation">Continuation</option>'), 'Expected Model Step AudioCraft mode picker to expose continuation mode.');
-  assert(source.includes('<option value="referenceVoiceTts">Reference Voice TTS</option>'), 'Expected Model Step audio mode picker to expose Reference Voice TTS.');
+  assert(source.includes('getAudioModeOptionsForLocalTool(getModelStepLocalAudioToolIdForUi(selectedNode)).map'), 'Expected Model Step audio mode picker to render tool-specific mode options.');
+  assert(source.includes('normalizeAudioModeForLocalTool(toolId, nextAudioMode)'), 'Expected Model Step audio mode changes to normalize against the selected local audio tool.');
   assert(source.includes('Only clone voices you have permission to use.'), 'Expected Model Step Reference Voice TTS UI to show the consent warning.');
   assert(source.includes('Connect text to Input and the voice sample to Reference Audio.'), 'Expected Reference Voice TTS UI to name both required inputs.');
-  assert(source.includes("tool.id !== 'chatterbox-tts'"), 'Expected Map Collection local audio tool picker to exclude Chatterbox because it requires a separate Reference Audio input.');
+  assert(source.includes('showCollectionMapChatterboxReferenceVoiceFields'), 'Expected Map Collection to expose bounded Chatterbox-Turbo Reference Voice TTS UI.');
+  assert(source.includes('collection-map-chatterbox-mode'), 'Expected Map Collection Chatterbox UI to show only Reference Voice TTS mode.');
   assert(source.includes('llm-local-audio-seed'), 'Expected Model Step AudioCraft continuation UI to expose seed seconds.');
   assert(source.includes('llm-local-audio-repeat'), 'Expected Model Step AudioCraft continuation UI to expose repeat count.');
   assert(source.includes('Each repeat uses the end of the current audio as the next seed'), 'Expected Model Step AudioCraft continuation UI to explain repeat continuation semantics.');
   assert(source.includes('llm-local-audio-append'), 'Expected Model Step AudioCraft continuation UI to expose append-source output mode.');
   assert(source.includes('Advanced AudioCraft settings'), 'Expected Model Step AudioCraft UI to keep advanced generation settings available but collapsed.');
+  assert(source.includes('data-pipeline-port-dot="true"'), 'Expected Pipeline Builder ports to expose measurable rendered dot centers.');
+  assert(source.includes('getRenderedOrEstimatedPortCenter'), 'Expected Pipeline Builder edges to prefer measured rendered port centers with a geometry fallback.');
+  assert(source.includes('measuredPortOffsets'), 'Expected Pipeline Builder to store measured port geometry as node-relative offsets.');
+  assert(source.includes('centerX - Number(nodePosition.x || 0)'), 'Expected measured port centers to be converted into node-relative offsets.');
+  assert(source.includes('Number(node.position.x || 0) + measuredOffset.x'), 'Expected edges to combine measured offsets with the current node position.');
+  assert(source.includes('ResizeObserver'), 'Expected Pipeline Builder to remeasure port centers when node layout changes.');
+  assert(source.includes('isLocalAudiocraftAudioMode ? ('), 'Expected AudioCraft model and snapshot UI to render only for the AudioCraft local tool.');
+  assert(source.includes('isLocalChatterboxAudioMode ? ('), 'Expected Chatterbox model UI to avoid AudioCraft snapshot controls.');
   assert(source.includes('llm-prompt-style'), 'Expected Model Step inspector to expose the Prompt Style selector.');
   assert(source.includes('collection-map-prompt-style'), 'Expected collectionMap inspector to expose the Prompt Style selector for text mappings.');
   assert(!source.includes('first shared image-transform slice'), 'Expected stale Upscayl first-slice phrasing to stay out of the Model Step inspector.');
@@ -58,6 +67,56 @@ async function main() {
   assert.strictEqual(defaultConfig.executionMode, 'cloud', 'Expected Model Step to default to cloud execution mode.');
   assert.strictEqual(defaultConfig.promptStyleId, '', 'Expected Model Step prompt style to default to none.');
   assert.strictEqual(pipelineSchema.getDefaultNodeConfig('collectionMap').promptStyleId, '', 'Expected collectionMap prompt style to default to none.');
+  assert.deepStrictEqual(
+    pipelineSchema.getAudioModeOptionsForLocalTool('audiocraft-webui').map((entry) => entry.id),
+    ['music', 'sound', 'continuation'],
+    'AudioCraft mode list should exclude Reference Voice TTS.',
+  );
+  assert.deepStrictEqual(
+    pipelineSchema.getAudioModeOptionsForLocalTool('chatterbox-tts').map((entry) => entry.id),
+    ['referenceVoiceTts'],
+    'Chatterbox mode list should exclude Music, Sound, and Continuation.',
+  );
+  assert.strictEqual(pipelineSchema.normalizeAudioModeForLocalTool('audiocraft-webui', 'referenceVoiceTts'), 'music', 'AudioCraft should normalize stale Reference Voice TTS to Music.');
+  assert.strictEqual(pipelineSchema.normalizeAudioModeForLocalTool('chatterbox-tts', 'music'), 'referenceVoiceTts', 'Chatterbox should normalize stale music mode to Reference Voice TTS.');
+  const staleAudiocraftReferenceVoice = pipelineSchema.createNode('llmPrompt', {
+    config: {
+      executionMode: 'localTool',
+      operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'audiocraft-webui',
+      audioMode: 'referenceVoiceTts',
+    },
+  });
+  assert.strictEqual(staleAudiocraftReferenceVoice.config.audioMode, 'music', 'Saved AudioCraft Reference Voice TTS configs should auto-correct to Music.');
+  const staleChatterboxMusic = pipelineSchema.createNode('llmPrompt', {
+    config: {
+      executionMode: 'localTool',
+      operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'chatterbox-tts',
+      audioMode: 'music',
+    },
+  });
+  assert.strictEqual(staleChatterboxMusic.config.audioMode, 'referenceVoiceTts', 'Saved Chatterbox Music configs should auto-correct to Reference Voice TTS.');
+  const staleCollectionAudiocraftReferenceVoice = pipelineSchema.createNode('collectionMap', {
+    config: {
+      executionMode: 'localTool',
+      mappingId: 'textToAudio',
+      operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'audiocraft-webui',
+      audioMode: 'referenceVoiceTts',
+    },
+  });
+  assert.strictEqual(staleCollectionAudiocraftReferenceVoice.config.audioMode, 'music', 'Saved AudioCraft collectionMap Reference Voice TTS configs should auto-correct to Music.');
+  const staleCollectionChatterboxMusic = pipelineSchema.createNode('collectionMap', {
+    config: {
+      executionMode: 'localTool',
+      mappingId: 'textToAudio',
+      operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      toolId: 'chatterbox-tts',
+      audioMode: 'music',
+    },
+  });
+  assert.strictEqual(staleCollectionChatterboxMusic.config.audioMode, 'referenceVoiceTts', 'Saved Chatterbox collectionMap Music configs should auto-correct to Reference Voice TTS.');
 
   const manifestTools = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../electron/config/tools-manifest.json'), 'utf8'));
   const rvcManifest = manifestTools.find((tool) => tool.id === 'rvc');
@@ -145,6 +204,10 @@ async function main() {
   assert(Number.isFinite(height) && height >= pipelineUi.PIPELINE_NODE_MIN_HEIGHT, 'Expected Model Step card height to compute without throwing.');
   const promptPortCenter = pipelineUi.getNodePortCenter(node, 'input', 0);
   assert(Number.isFinite(promptPortCenter.x) && Number.isFinite(promptPortCenter.y), 'Expected Model Step port geometry to compute without throwing.');
+  assert.strictEqual(promptPortCenter.x, node.position.x + pipelineUi.PIPELINE_PORT_DOT_CENTER_X_OFFSET, 'Input edge endpoint should target the rendered input port dot center.');
+  assert.strictEqual(promptPortCenter.y, node.position.y + pipelineUi.PIPELINE_PORT_SECTION_OFFSET + (pipelineUi.PIPELINE_PORT_ROW_HEIGHT / 2), 'Input edge endpoint should match the rendered first port row center.');
+  const outputPortCenter = pipelineUi.getNodePortCenter(node, 'output', 0);
+  assert.strictEqual(outputPortCenter.x, node.position.x + pipelineUi.PIPELINE_NODE_WIDTH - pipelineUi.PIPELINE_PORT_DOT_CENTER_X_OFFSET, 'Output edge endpoint should target the rendered output port dot center.');
 
   const analysis = pipelineUi.analyzePipelineDraft({ nodes: [node], edges: [] }, pipelineUi.buildPipelineDisplayContext({
     hardware: null,

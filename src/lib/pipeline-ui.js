@@ -20,9 +20,11 @@ const {
 } = pipelineShared;
 
 export const PIPELINE_NODE_WIDTH = 272;
-export const PIPELINE_NODE_HEADER_HEIGHT = 60;
+export const PIPELINE_NODE_HEADER_HEIGHT = 73;
 export const PIPELINE_PORT_ROW_HEIGHT = 36;
-export const PIPELINE_PORT_SECTION_OFFSET = 76;
+export const PIPELINE_PORT_SECTION_TOP_PADDING = 16;
+export const PIPELINE_PORT_SECTION_OFFSET = PIPELINE_NODE_HEADER_HEIGHT + PIPELINE_PORT_SECTION_TOP_PADDING;
+export const PIPELINE_PORT_DOT_CENTER_X_OFFSET = 29;
 export const PIPELINE_NODE_MIN_HEIGHT = 168;
 
 const NODE_PALETTE_CATEGORY_ORDER = [
@@ -94,7 +96,7 @@ export function getNodePortCenter(node, direction, portIndex) {
   const safeIndex = Number.isFinite(portIndex) ? portIndex : 0;
   return {
     rowCount,
-    x: direction === 'input' ? node.position.x : node.position.x + PIPELINE_NODE_WIDTH,
+    x: direction === 'input' ? node.position.x + PIPELINE_PORT_DOT_CENTER_X_OFFSET : node.position.x + PIPELINE_NODE_WIDTH - PIPELINE_PORT_DOT_CENTER_X_OFFSET,
     y: baseY + safeIndex * PIPELINE_PORT_ROW_HEIGHT + PIPELINE_PORT_ROW_HEIGHT / 2,
   };
 }
