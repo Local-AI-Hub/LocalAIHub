@@ -31,6 +31,39 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
       getAppPaths: () => ({ runtimesRoot: TEST_STORAGE_ROOT }),
     };
   }
+  if (normalizedParent.endsWith('/electron/services/pipelineExecutionService.js')) {
+    if (request === './providerRegistry') {
+      return { initializeProviderRegistry: async () => {} };
+    }
+    if (request === './providerService') {
+      return {
+        chatWithProvider: async () => ({ message: { content: 'pass' } }),
+        listProviderConnections: async () => ([]),
+        runProviderOperation: async () => ({ message: { content: '' } }),
+      };
+    }
+    if (request === './toolRegistry') {
+      return {
+        getToolCatalog: () => [],
+        initializeToolRegistry: async () => {},
+      };
+    }
+    if (request === './toolStateService') {
+      return {
+        buildMergedToolStateList: async () => [],
+        getResolvedToolState: async () => null,
+      };
+    }
+    if (request === './configService') {
+      return {
+        listGraphWorkflowPresets: async () => [],
+        listPromptStyles: async () => [],
+      };
+    }
+    if (request === './modelService') {
+      return { listDownloadedModels: async () => [] };
+    }
+  }
 
   return originalLoad.call(this, request, parent, isMain);
 };
@@ -40,9 +73,49 @@ const { buildFileArtifact, createArtifactCollection, createTextArtifact } = requ
 const { runCommand } = require('../electron/services/commandService');
 const { resolveFfmpegPath } = require('../electron/services/mediaCompositionService');
 const mediaUtilityService = require('../electron/services/mediaUtilityService');
+const {
+  cancelPipelineRun,
+  getActiveRunSnapshot,
+  resumePipelineValidation,
+  runPipeline,
+} = require('../electron/services/pipelineExecutionService');
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(label, predicate, timeoutMs = 30000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const value = predicate();
+    if (value) {
+      return value;
+    }
+    await wait(50);
+  }
+
+  throw new Error('Timed out while waiting for ' + label + '.');
+}
+
+async function cleanupActiveRun() {
+  const activeRun = getActiveRunSnapshot();
+  if (!activeRun || (activeRun.status !== 'running' && activeRun.status !== 'paused')) {
+    return;
+  }
+
+  try {
+    cancelPipelineRun(activeRun.runId);
+  } catch {
+    return;
+  }
+
+  await waitFor('the active pipeline run to stop', () => {
+    const currentRun = getActiveRunSnapshot();
+    return !currentRun || ['cancelled', 'completed', 'failed'].includes(currentRun.status) ? currentRun || true : null;
+  });
 }
 
 async function runFfmpeg(args, label) {
@@ -277,6 +350,12 @@ function verifySchemaAndUiContracts() {
   assert(panelSource.includes("['yellow', 'Yellow']"), 'Burn Subtitles color controls should use dropdown values, not freeform text.');
   assert(panelSource.includes("['bottomCenter', 'Bottom center']"), 'Burn Subtitles position should use safe dropdown values.');
   assert(panelSource.includes("'Vertical margin', 'bottomMargin'"), 'Burn Subtitles should label MarginV as Vertical margin because ASS applies it to top and bottom positions.');
+  assert(panelSource.includes('Retry caption settings'), 'Validation retry UI should include Burn Subtitles retry settings.');
+  assert(panelSource.includes('pendingValidation.retryControls?.burnSubtitles'), 'Validation retry UI should only render Burn Subtitles controls when the reviewed artifact exposes Burn Subtitles retry metadata.');
+  assert(panelSource.includes('burnSubtitlesCaptionModeOptions'), 'Validation retry UI should filter caption mode choices to the safe reviewed-source modes.');
+  for (const expectedRetryControl of ['validation-burn-subtitles-mode', 'validation-burn-subtitles-font-size', 'validation-burn-subtitles-outline', 'validation-burn-subtitles-shadow', 'validation-burn-subtitles-margin', 'validation-burn-subtitles-text-color', 'validation-burn-subtitles-outline-color', 'validation-burn-subtitles-position', 'validation-burn-subtitles-font-preset', 'validation-burn-subtitles-bold', 'validation-burn-subtitles-italic', 'validation-burn-subtitles-background-box', 'validation-burn-subtitles-background-opacity']) {
+    assert(panelSource.includes(expectedRetryControl), 'Validation retry UI should expose ' + expectedRetryControl + ' for Burn Subtitles artifacts.');
+  }
   assert(panelSource.includes("selectedNode.type === 'exportSubtitles'"), 'Pipeline Builder should render Export Subtitles inspector UI.');
   assert(panelSource.includes('Create a reusable .srt or .vtt subtitle file from transcript segments or caption lines.'), 'Export Subtitles inspector should show help text.');
   assert(panelSource.includes('export-subtitles-format'), 'Export Subtitles inspector should expose output format control.');
@@ -703,7 +782,9 @@ async function verifyRuntimePassCUtilities() {
   assert(manualAss.includes('Dialogue: 0,0:00:00.00,0:00:00.25'), 'Manual caption ASS should use duration per line.');
   const manualBurnSidecar = readJson(manualBurn.outputs.video.metadataPaths.find((entry) => entry.endsWith('.video.json')));
   assert.strictEqual(manualBurnSidecar.subtitleBurn.captionSource.kind, pipelineSchema.PORT_KIND_TEXT, 'Burn sidecar should record text caption source.');
-  assert.deepStrictEqual(manualBurnSidecar.subtitleBurn.style, { backgroundBox: true, backgroundOpacity: 75, bold: true, bottomMargin: 44, fontPreset: 'tahoma', fontSize: 34, italic: true, outline: 3, outlineColor: 'blue', position: 'topLeft', shadow: 2, textColor: 'yellow' }, 'Burn sidecar should record subtitle styling.');
+  assert.deepStrictEqual(manualBurnSidecar.subtitleBurn.style, { backgroundBox: true, backgroundOpacity: 75, bold: true, bottomMargin: 44, fontPreset: 'tahoma', fontSize: 34, italic: true, outline: 3, outlineColor: 'blue', position: 'topLeft', shadow: 2, textColor: 'yellow' }, 'Burn sidecar should record subtitle styling.');  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.pipelineTrace?.burnSubtitlesNodeId, 'burn-manual', 'Burn metadata should trace the Burn Subtitles node id.');
+  assert.strictEqual(manualBurnSidecar.subtitleBurn.pipelineTrace?.burnSubtitlesNodeId, 'burn-manual', 'Burn sidecar should trace the Burn Subtitles node id.');
+  assert.strictEqual(manualBurnSidecar.subtitleBurn.sourceVideoPath, trimVideoPath, 'Burn sidecar should record the exact source video path used for rendering.');
 
   const transcriptCaptions = createTextArtifact('Hello world. Bye.', {
     displayName: 'Transcript captions',
@@ -798,16 +879,294 @@ async function verifyRuntimePassCUtilities() {
   );
 }
 
+function buildBurnSubtitlesValidationRetryPipeline(videoPath, options = {}) {
+  const videoInput = pipelineSchema.createNode('videoInput', {
+    id: 'burn-video-input',
+    label: 'Video Input',
+    config: { filePath: videoPath },
+  });
+  const captionInput = pipelineSchema.createNode('textInput', {
+    id: 'burn-caption-input',
+    label: 'Caption Text',
+    config: { text: 'First caption\nSecond caption' },
+  });
+  const burnSubtitles = pipelineSchema.createNode('burnSubtitles', {
+    id: 'burn-captions',
+    label: 'Burn captions',
+    config: {
+      captionMode: 'manualLines',
+      durationPerCaptionSeconds: 0.25,
+      fontSize: 28,
+      outline: 2,
+      shadow: 1,
+      bottomMargin: 32,
+      textColor: 'white',
+      outlineColor: 'black',
+      fontPreset: 'arial',
+      bold: false,
+      italic: false,
+      position: 'bottomCenter',
+      backgroundBox: false,
+      backgroundOpacity: 50,
+      outputFormat: 'mp4',
+    },
+  });
+  const validation = pipelineSchema.createNode('validation', {
+    id: 'review-burned-video',
+    label: 'Review burned captions',
+    config: { mode: 'user' },
+  });
+  const retryLoop = pipelineSchema.createNode('retryLoop', {
+    id: 'retry-burned-video',
+    label: 'Retry burned captions',
+    config: {
+      maxAttempts: 2,
+      retryTargetNodeId: burnSubtitles.id,
+      stopWhenRetryArtifactRepeats: false,
+      terminationAction: 'fail',
+    },
+  });
+  const videoOutput = pipelineSchema.createNode('videoOutput', {
+    id: 'burn-video-output',
+    label: 'Video Output',
+    config: { title: options.outputTitle || 'Captioned video retry output' },
+  });
+
+  return pipelineSchema.createEmptyPipeline({
+    id: options.id || 'verify-burn-subtitles-validation-retry',
+    name: options.name || 'Verify Burn Subtitles Validation Retry',
+    nodes: [videoInput, captionInput, burnSubtitles, validation, retryLoop, videoOutput],
+    edges: [
+      pipelineSchema.createEdge(videoInput.id, 'video', burnSubtitles.id, 'video'),
+      pipelineSchema.createEdge(captionInput.id, 'text', burnSubtitles.id, 'captions'),
+      pipelineSchema.createEdge(burnSubtitles.id, 'video', validation.id, 'input'),
+      pipelineSchema.createEdge(validation.id, 'pass', retryLoop.id, 'complete'),
+      pipelineSchema.createEdge(validation.id, 'fail', retryLoop.id, 'retry'),
+      pipelineSchema.createEdge(retryLoop.id, 'result', videoOutput.id, 'video'),
+    ],
+  });
+}
+
+function buildPlainVideoValidationPipeline(videoPath) {
+  const videoInput = pipelineSchema.createNode('videoInput', {
+    id: 'plain-video-input',
+    label: 'Video Input',
+    config: { filePath: videoPath },
+  });
+  const validation = pipelineSchema.createNode('validation', {
+    id: 'review-plain-video',
+    label: 'Review plain video',
+    config: { mode: 'user' },
+  });
+  const merge = pipelineSchema.createNode('branchMerge', {
+    id: 'merge-plain-video-review',
+    label: 'Merge review branches',
+  });
+  const videoOutput = pipelineSchema.createNode('videoOutput', {
+    id: 'plain-video-output',
+    label: 'Video Output',
+  });
+
+  return pipelineSchema.createEmptyPipeline({
+    id: 'verify-plain-video-validation-no-burn-controls',
+    name: 'Verify Plain Video Validation Has No Burn Controls',
+    nodes: [videoInput, validation, merge, videoOutput],
+    edges: [
+      pipelineSchema.createEdge(videoInput.id, 'video', validation.id, 'input'),
+      pipelineSchema.createEdge(validation.id, 'pass', merge.id, 'branch'),
+      pipelineSchema.createEdge(validation.id, 'fail', merge.id, 'branch'),
+      pipelineSchema.createEdge(merge.id, 'result', videoOutput.id, 'video'),
+    ],
+  });
+}
+
+function analyzeExecutablePipeline(pipeline, label) {
+  const analysis = pipelineSchema.analyzePipeline(pipeline, {
+    hardware: null,
+    providers: [],
+    toolCatalog: [],
+    tools: [],
+  });
+  assert.strictEqual(analysis.executable, true, analysis.primaryIssue?.message || label + ' should be executable.');
+}
+
+async function runUntilValidationPause(pipeline, validationNodeId, label) {
+  const initialRun = await runPipeline(pipeline);
+  assert(initialRun?.runId, 'Expected a pipeline run id for ' + label + '.');
+  const pause = await waitFor(label + ' validation pause', () => {
+    const run = getActiveRunSnapshot();
+    return run?.status === 'paused' && run?.pendingValidation?.nodeId === validationNodeId && run.runId === initialRun.runId ? run : null;
+  }, 45000);
+  return { initialRun, pause };
+}
+
+function getVideoSidecar(artifact) {
+  const sidecarPath = artifact?.metadataPaths?.find((entry) => String(entry).endsWith('.video.json'));
+  assert(sidecarPath, 'Expected the video artifact to include a video metadata sidecar.');
+  return readJson(sidecarPath);
+}
+
+async function verifyBurnSubtitlesValidationRetryOverrides() {
+  const videoPath = path.join(TEST_STORAGE_ROOT, 'burn-retry-source.mp4');
+  await createSyntheticVideo(videoPath, { audio: true, size: '96x64', rate: 4, duration: 0.8 });
+  const pipeline = buildBurnSubtitlesValidationRetryPipeline(videoPath, {
+    id: 'verify-burn-subtitles-validation-retry-overrides',
+    name: 'Verify Burn Subtitles Validation Retry Overrides',
+  });
+  const savedBurnNode = pipeline.nodes.find((node) => node.id === 'burn-captions');
+  analyzeExecutablePipeline(pipeline, 'Burn Subtitles validation retry pipeline');
+
+  const { initialRun, pause: firstPause } = await runUntilValidationPause(pipeline, 'review-burned-video', 'the first Burn Subtitles review');
+  assert.strictEqual(firstPause.pendingValidation?.artifact?.kind, pipelineSchema.PORT_KIND_VIDEO, 'Expected validation to review the burned-caption video.');
+  const firstBurnedVideoPath = firstPause.pendingValidation.artifact.filePath;
+  assert.strictEqual(firstPause.pendingValidation.artifact.subtitleBurn?.sourceVideoPath, videoPath, 'Expected first burn attempt to use the original clean source video.');
+  assert.strictEqual(firstPause.pendingValidation?.artifact?.subtitleBurn?.pipelineTrace?.burnSubtitlesNodeId, 'burn-captions', 'Expected Burn Subtitles output metadata to trace the source node id.');
+  assert.strictEqual(firstPause.pendingValidation?.retryControls?.burnSubtitles?.nodeId, 'burn-captions', 'Expected Burn Subtitles validation to expose retry controls keyed to the burn node.');
+  assert.deepStrictEqual(firstPause.pendingValidation.retryControls.burnSubtitles.captionModeOptions, ['auto', 'manualLines'], 'Expected Burn Subtitles retry controls to keep caption mode choices safe for text-line inputs.');
+  assert.strictEqual(firstPause.pendingValidation.retryControls.burnSubtitles.settings.fontSize, 28, 'Expected retry controls to start from the effective saved font size.');
+  assert.strictEqual(firstPause.pendingValidation.retryControls.burnSubtitles.settings.position, 'bottomCenter', 'Expected retry controls to start from the effective saved position.');
+  assert.strictEqual(firstPause.pendingValidation.retryControls.burnSubtitles.settings.backgroundBox, false, 'Expected retry controls to start from the effective saved background-box setting.');
+
+  await resumePipelineValidation(firstPause.runId, {
+    decision: 'fail',
+    nodeId: firstPause.pendingValidation.nodeId,
+    requestId: firstPause.pendingValidation.requestId,
+    retryOverrides: {
+      burnSubtitles: {
+        backgroundBox: true,
+        backgroundOpacity: 75,
+        bold: true,
+        bottomMargin: 48,
+        captionMode: 'manualLines',
+        durationPerCaptionSeconds: 0.4,
+        fontPreset: 'tahoma',
+        fontSize: 36,
+        italic: true,
+        outline: 3,
+        outlineColor: 'blue',
+        position: 'topLeft',
+        shadow: 2,
+        textColor: 'yellow',
+      },
+    },
+  });
+
+  const secondPause = await waitFor('the retried Burn Subtitles validation pause', () => {
+    const run = getActiveRunSnapshot();
+    return run?.status === 'paused' && run?.pendingValidation?.nodeId === 'review-burned-video' && run?.pendingValidation?.iteration === 2 ? run : null;
+  }, 45000);
+  const retriedArtifact = secondPause.pendingValidation?.artifact || null;
+  assert.strictEqual(secondPause.nodeStates?.['burn-captions']?.runCount, 2, 'Expected Burn Subtitles to rerun after validation failure.');
+  assert(fs.existsSync(firstBurnedVideoPath), 'Expected the previous burned-caption retry output to remain on disk.');
+  assert.notStrictEqual(retriedArtifact?.filePath, firstBurnedVideoPath, 'Expected retry to produce a new burned-caption video artifact.');
+  assert.strictEqual(retriedArtifact?.subtitleBurn?.sourceVideoPath, videoPath, 'Expected retry burn to use the original clean source video path.');
+  assert.notStrictEqual(retriedArtifact?.subtitleBurn?.sourceVideoPath, firstBurnedVideoPath, 'Expected retry burn not to use the previous burned-caption output as source.');
+  assert.strictEqual(retriedArtifact?.subtitleBurn?.sourceVideoLineage?.ignoredLoopRetryVideo, true, 'Expected retry metadata to record that the loop-carried burned video was ignored as an input.');
+  assert.strictEqual(retriedArtifact?.subtitleBurn?.sourceVideoLineage?.usedOriginalSourceVideo, true, 'Expected retry metadata to record that the original upstream video was used.');
+  assert.strictEqual(retriedArtifact?.subtitleBurn?.sourceVideoLineage?.loopRetryVideoPath, firstBurnedVideoPath, 'Expected retry metadata to identify the ignored previous burned-caption video.');
+  assert.strictEqual(retriedArtifact?.subtitleBurn?.style?.fontSize, 36, 'Expected retry override font size to affect the validation preview video.');
+  assert.strictEqual(retriedArtifact?.subtitleBurn?.style?.position, 'topLeft', 'Expected retry override position to affect the validation preview video.');
+  assert.strictEqual(retriedArtifact?.subtitleBurn?.style?.backgroundBox, true, 'Expected retry override background box to affect the validation preview video.');
+  assert.strictEqual(retriedArtifact?.subtitleBurn?.durationPerCaptionSeconds, 0.4, 'Expected retry override duration to affect manual caption timing.');
+  assert.strictEqual(secondPause.pendingValidation?.retryControls?.burnSubtitles?.settings?.fontSize, 36, 'Expected second review controls to show the retried font size.');
+  assert.strictEqual(secondPause.pendingValidation?.retryControls?.burnSubtitles?.settings?.position, 'topLeft', 'Expected second review controls to show the retried position.');
+  assert.strictEqual(savedBurnNode.config.fontSize, 28, 'Expected retry override not to mutate the saved Burn Subtitles font size.');
+  assert.strictEqual(savedBurnNode.config.position, 'bottomCenter', 'Expected retry override not to mutate the saved Burn Subtitles position.');
+  assert.strictEqual(savedBurnNode.config.backgroundBox, false, 'Expected retry override not to mutate the saved Burn Subtitles background box.');
+  assert(/36px tahoma captions at topLeft/.test(secondPause.nodeStates?.['burn-captions']?.message || ''), 'Expected Burn Subtitles status to summarize effective retry caption styling.');
+
+  await resumePipelineValidation(secondPause.runId, {
+    decision: 'pass',
+    nodeId: secondPause.pendingValidation.nodeId,
+    requestId: secondPause.pendingValidation.requestId,
+  });
+
+  const completedRun = await waitFor('the Burn Subtitles retry override pipeline to finish', () => {
+    const run = getActiveRunSnapshot();
+    return run && ['completed', 'failed'].includes(run.status) && run.runId === initialRun.runId ? run : null;
+  }, 45000);
+  assert.strictEqual(completedRun.status, 'completed', completedRun.message || 'Expected Burn Subtitles retry override pipeline to complete.');
+  const burnArtifact = completedRun.resultsByNodeId?.['burn-captions']?.outputs?.video || null;
+  assert.strictEqual(burnArtifact?.subtitleBurn?.pipelineTrace?.burnSubtitlesNodeId, 'burn-captions', 'Expected final Burn Subtitles artifact metadata to keep the source node id.');
+  assert.strictEqual(burnArtifact?.subtitleBurn?.style?.fontSize, 36, 'Expected final Burn Subtitles metadata to record the effective retry font size.');
+  assert.strictEqual(burnArtifact?.subtitleBurn?.style?.textColor, 'yellow', 'Expected final Burn Subtitles metadata to record the effective retry text color.');
+  assert.strictEqual(burnArtifact?.subtitleBurn?.sourceVideoPath, videoPath, 'Expected final Burn Subtitles metadata to record the original clean source video path.');
+  assert.notStrictEqual(burnArtifact?.subtitleBurn?.sourceVideoPath, firstBurnedVideoPath, 'Expected final Burn Subtitles metadata not to point at the previous burned output as the source.');
+  const burnSidecar = getVideoSidecar(burnArtifact);
+  assert.strictEqual(burnSidecar.subtitleBurn?.pipelineTrace?.burnSubtitlesNodeId, 'burn-captions', 'Expected final Burn Subtitles sidecar to keep the source node id.');
+  assert.strictEqual(burnSidecar.subtitleBurn?.style?.fontSize, 36, 'Expected final Burn Subtitles sidecar to record the effective retry font size.');
+  assert.strictEqual(burnSidecar.subtitleBurn?.style?.position, 'topLeft', 'Expected final Burn Subtitles sidecar to record the effective retry position.');
+  assert.strictEqual(burnSidecar.subtitleBurn?.sourceVideoPath, videoPath, 'Expected final Burn Subtitles sidecar to record the original clean source video path.');
+  assert.strictEqual(burnSidecar.subtitleBurn?.sourceVideoLineage?.ignoredLoopRetryVideo, true, 'Expected final Burn Subtitles sidecar to record that the loop-carried video was ignored.');
+}
+
+async function verifyBurnSubtitlesRetryWithoutOverridesUsesSavedConfig() {
+  const videoPath = path.join(TEST_STORAGE_ROOT, 'burn-retry-default-source.mp4');
+  await createSyntheticVideo(videoPath, { audio: true, size: '96x64', rate: 4, duration: 0.8 });
+  const pipeline = buildBurnSubtitlesValidationRetryPipeline(videoPath, {
+    id: 'verify-burn-subtitles-validation-retry-defaults',
+    name: 'Verify Burn Subtitles Validation Retry Defaults',
+  });
+  analyzeExecutablePipeline(pipeline, 'Burn Subtitles default retry pipeline');
+
+  const { initialRun, pause: firstPause } = await runUntilValidationPause(pipeline, 'review-burned-video', 'the default Burn Subtitles review');
+  await resumePipelineValidation(firstPause.runId, {
+    decision: 'fail',
+    nodeId: firstPause.pendingValidation.nodeId,
+    requestId: firstPause.pendingValidation.requestId,
+  });
+
+  const secondPause = await waitFor('the default Burn Subtitles retry validation pause', () => {
+    const run = getActiveRunSnapshot();
+    return run?.status === 'paused' && run?.pendingValidation?.nodeId === 'review-burned-video' && run?.pendingValidation?.iteration === 2 ? run : null;
+  }, 45000);
+  assert.strictEqual(secondPause.nodeStates?.['burn-captions']?.runCount, 2, 'Expected Burn Subtitles to rerun for retry without override.');
+  assert.strictEqual(secondPause.pendingValidation?.artifact?.subtitleBurn?.style?.fontSize, 28, 'Expected retry without override to keep the saved font size.');
+  assert.strictEqual(secondPause.pendingValidation?.artifact?.subtitleBurn?.style?.position, 'bottomCenter', 'Expected retry without override to keep the saved position.');
+  assert.strictEqual(secondPause.pendingValidation?.artifact?.subtitleBurn?.style?.backgroundBox, false, 'Expected retry without override to keep the saved background box setting.');
+
+  await resumePipelineValidation(secondPause.runId, {
+    decision: 'pass',
+    nodeId: secondPause.pendingValidation.nodeId,
+    requestId: secondPause.pendingValidation.requestId,
+  });
+  const completedRun = await waitFor('the Burn Subtitles default retry pipeline to finish', () => {
+    const run = getActiveRunSnapshot();
+    return run && ['completed', 'failed'].includes(run.status) && run.runId === initialRun.runId ? run : null;
+  }, 45000);
+  assert.strictEqual(completedRun.status, 'completed', completedRun.message || 'Expected Burn Subtitles default retry pipeline to complete.');
+  assert.strictEqual(completedRun.resultsByNodeId?.['burn-captions']?.outputs?.video?.subtitleBurn?.style?.fontSize, 28, 'Expected completed retry without override to keep the saved font size.');
+}
+
+async function verifyValidationDoesNotExposeBurnControlsForPlainVideo() {
+  const videoPath = path.join(TEST_STORAGE_ROOT, 'plain-validation-source.mp4');
+  await createSyntheticVideo(videoPath, { audio: true, size: '96x64', rate: 4, duration: 0.6 });
+  const pipeline = buildPlainVideoValidationPipeline(videoPath);
+  analyzeExecutablePipeline(pipeline, 'Plain video validation pipeline');
+
+  const { pause } = await runUntilValidationPause(pipeline, 'review-plain-video', 'the plain video review');
+  assert.strictEqual(pause.pendingValidation?.artifact?.kind, pipelineSchema.PORT_KIND_VIDEO, 'Expected plain video validation to review a video artifact.');
+  assert.strictEqual(pause.pendingValidation?.retryControls, null, 'Expected unrelated video validation not to expose Burn Subtitles retry controls.');
+}
 async function main() {
+  await cleanupActiveRun();
   verifySchemaAndUiContracts();
   verifySafeFfmpegArgs();
   await verifyRuntimeExtraction();
   await verifyRuntimeNormalization();
   await verifyRuntimePassCUtilities();
+  await cleanupActiveRun();
+  await verifyBurnSubtitlesValidationRetryOverrides();
+  await cleanupActiveRun();
+  await verifyBurnSubtitlesRetryWithoutOverridesUsesSavedConfig();
+  await cleanupActiveRun();
+  await verifyValidationDoesNotExposeBurnControlsForPlainVideo();
+  await cleanupActiveRun();
   console.log('Pipeline media utility verification passed.');
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
+  await cleanupActiveRun();
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
 });

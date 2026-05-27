@@ -1522,6 +1522,9 @@ function createArtifactCollection(items, options = {}) {
   if (options.collectionMapping && typeof options.collectionMapping === 'object') {
     collection.collectionMapping = serializeArtifactForUi(options.collectionMapping);
   }
+  if (options.metadata && typeof options.metadata === 'object') {
+    collection.metadata = serializeArtifactForUi(options.metadata);
+  }
   if (options.sourceCollection && typeof options.sourceCollection === 'object') {
     collection.sourceCollection = serializeArtifactForUi(options.sourceCollection);
   }
@@ -1556,9 +1559,12 @@ function createCompositionArtifact(spec = {}, options = {}) {
             return {
               artifact: itemArtifact,
               durationSeconds: Number(entry?.durationSeconds || track.itemDurationSeconds || 0) || 0,
+              endSeconds: Number.isFinite(Number(entry?.endSeconds)) ? Math.round(Number(entry.endSeconds) * 1000) / 1000 : null,
               index,
               itemId: String(entry?.itemId || buildCollectionItemId(itemArtifact, index)).trim() || buildCollectionItemId(itemArtifact, index),
               lineage: normalizeCollectionLineage(entry?.lineage),
+              metadata: entry?.metadata && typeof entry.metadata === 'object' ? serializeArtifactForUi(entry.metadata) : null,
+              startSeconds: Number.isFinite(Number(entry?.startSeconds)) ? Math.round(Number(entry.startSeconds) * 1000) / 1000 : null,
               summary: String(entry?.summary || summarizeArtifact(itemArtifact)).trim() || summarizeArtifact(itemArtifact),
             };
           })
@@ -1574,6 +1580,7 @@ function createCompositionArtifact(spec = {}, options = {}) {
               itemCount: Number(track.sourceCollection.itemCount || items.length) || items.length,
               itemKind: String(track.sourceCollection.itemKind || track.itemKind || PORT_KIND_IMAGE).trim() || PORT_KIND_IMAGE,
               manifestPath: String(track.sourceCollection.manifestPath || '').trim(),
+              metadata: track.sourceCollection.metadata && typeof track.sourceCollection.metadata === 'object' ? serializeArtifactForUi(track.sourceCollection.metadata) : null,
               summary: String(track.sourceCollection.summary || '').trim(),
             }
           : null;
@@ -1582,12 +1589,15 @@ function createCompositionArtifact(spec = {}, options = {}) {
           id: String(track.id || 'visual-track').trim() || 'visual-track',
           itemCount: items.length,
           itemDurationSeconds: Number(track.itemDurationSeconds || items[0]?.durationSeconds || 0) || 0,
+          imageTimingMode: String(track.imageTimingMode || '').trim(),
           itemKind: String(track.itemKind || PORT_KIND_IMAGE).trim() || PORT_KIND_IMAGE,
           items,
           kind: 'visual-sequence',
           order: 'explicit',
           role: trackRole || 'primary-visual',
+          sceneTransitions: track.sceneTransitions && typeof track.sceneTransitions === 'object' ? serializeArtifactForUi(track.sceneTransitions) : (track.timing?.sceneTransitions && typeof track.timing.sceneTransitions === 'object' ? serializeArtifactForUi(track.timing.sceneTransitions) : null),
           sourceCollection,
+          timing: track.timing && typeof track.timing === 'object' ? serializeArtifactForUi(track.timing) : null,
           summary: String(track.summary || '').trim(),
         };
       }
@@ -2280,20 +2290,26 @@ function buildCompositionManifestTrack(track, directoryPath) {
       id: String(track?.id || '').trim(),
       itemCount: Number(track?.itemCount || track?.items?.length || 0) || 0,
       itemDurationSeconds: Number(track?.itemDurationSeconds || 0) || 0,
+      imageTimingMode: String(track?.imageTimingMode || '').trim(),
       itemKind: String(track?.itemKind || '').trim(),
       kind: 'visual-sequence',
       order: String(track?.order || 'explicit').trim() || 'explicit',
       role: String(track?.role || '').trim(),
+      sceneTransitions: track?.sceneTransitions ? serializeArtifactForUi(track.sceneTransitions) : (track?.timing?.sceneTransitions ? serializeArtifactForUi(track.timing.sceneTransitions) : null),
       sourceCollection: track?.sourceCollection ? serializeArtifactForUi(track.sourceCollection) : null,
       summary: String(track?.summary || '').trim(),
+      timing: track?.timing ? serializeArtifactForUi(track.timing) : null,
       items: (Array.isArray(track?.items) ? track.items : []).map((entry) => ({
         artifact: serializeArtifactForUi(entry?.artifact || null),
         artifactPath: String(entry?.artifact?.filePath || '').trim(),
         durationSeconds: Number(entry?.durationSeconds || 0) || 0,
+        endSeconds: Number.isFinite(Number(entry?.endSeconds)) ? Math.round(Number(entry.endSeconds) * 1000) / 1000 : null,
         index: Number(entry?.index || 0) || 0,
         itemId: String(entry?.itemId || '').trim(),
         lineage: entry?.lineage ? serializeArtifactForUi(entry.lineage) : null,
+        metadata: entry?.metadata ? serializeArtifactForUi(entry.metadata) : null,
         relativeArtifactPath: entry?.artifact?.filePath ? path.relative(directoryPath, entry.artifact.filePath) : '',
+        startSeconds: Number.isFinite(Number(entry?.startSeconds)) ? Math.round(Number(entry.startSeconds) * 1000) / 1000 : null,
         summary: String(entry?.summary || summarizeArtifact(entry?.artifact || null)).trim(),
       })),
     };
@@ -2414,6 +2430,7 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
   const savedCollection = createArtifactCollection(normalizedItems, {
     accumulation: artifact?.accumulation,
     collectionMapping: artifact?.collectionMapping,
+    metadata: artifact?.metadata,
     collectionNormalization: artifact?.collectionNormalization,
     collectionStatus: artifact?.collectionStatus,
     failedItems: artifact?.failedItems,
@@ -2455,6 +2472,7 @@ async function persistArtifactCollection(runDirectories, artifact, options = {})
     summary: savedCollection.summary,
     accumulation: savedCollection.accumulation ? serializeArtifactForUi(savedCollection.accumulation) : null,
     collectionMapping: savedCollection.collectionMapping ? serializeArtifactForUi(savedCollection.collectionMapping) : null,
+    metadata: savedCollection.metadata ? serializeArtifactForUi(savedCollection.metadata) : null,
     collectionNormalization: savedCollection.collectionNormalization ? serializeArtifactForUi(savedCollection.collectionNormalization) : null,
     sourceCollection: savedCollection.sourceCollection ? serializeArtifactForUi(savedCollection.sourceCollection) : null,
     items: savedCollection.items.map((entry) => buildCollectionManifestItem(entry, directoryPath)),

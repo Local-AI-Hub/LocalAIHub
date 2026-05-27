@@ -41,7 +41,7 @@ const {
   isLikelySupportOnlyStableDiffusionModel,
 } = require('./toolAssetSelection.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 16;
+const PIPELINE_SCHEMA_VERSION = 17;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const HEAVY_STEP_COOLDOWN_MAX_SECONDS = 300;
 const DEFAULT_PIPELINE_RUN_SETTINGS = Object.freeze({
@@ -50,6 +50,29 @@ const DEFAULT_PIPELINE_RUN_SETTINGS = Object.freeze({
 });
 const DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME = 1;
 const DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME = 0.22;
+const MEDIA_COMPOSITION_TRANSITION_MODES = Object.freeze({
+  OFF: 'off',
+  SINGLE: 'single',
+  RANDOM_CATEGORY: 'randomCategory',
+  RANDOM_SELECTED: 'randomSelected',
+});
+const MEDIA_COMPOSITION_TRANSITION_CATEGORIES = Object.freeze([
+  { id: 'fades', label: 'Fades / dissolves', transitions: Object.freeze(['fade', 'fadeblack', 'fadewhite', 'fadegrays', 'dissolve', 'fadefast', 'fadeslow']) },
+  { id: 'wipes', label: 'Wipes', transitions: Object.freeze(['wipeleft', 'wiperight', 'wipeup', 'wipedown', 'wipetl', 'wipetr', 'wipebl', 'wipebr']) },
+  { id: 'slides', label: 'Slides', transitions: Object.freeze(['slideleft', 'slideright', 'slideup', 'slidedown']) },
+  { id: 'smoothWipes', label: 'Smooth wipes', transitions: Object.freeze(['smoothleft', 'smoothright', 'smoothup', 'smoothdown']) },
+  { id: 'shapesCrops', label: 'Shapes / crops', transitions: Object.freeze(['circlecrop', 'rectcrop', 'circleopen', 'circleclose']) },
+  { id: 'opensCloses', label: 'Opens / closes', transitions: Object.freeze(['vertopen', 'vertclose', 'horzopen', 'horzclose']) },
+  { id: 'diagonal', label: 'Diagonal', transitions: Object.freeze(['diagtl', 'diagtr', 'diagbl', 'diagbr']) },
+  { id: 'slices', label: 'Slices', transitions: Object.freeze(['hlslice', 'hrslice', 'vuslice', 'vdslice']) },
+  { id: 'blurPixel', label: 'Blur / pixel', transitions: Object.freeze(['hblur', 'pixelize']) },
+  { id: 'squeezeZoom', label: 'Squeeze / zoom', transitions: Object.freeze(['squeezeh', 'squeezev', 'zoomin']) },
+  { id: 'wind', label: 'Wind', transitions: Object.freeze(['hlwind', 'hrwind', 'vuwind', 'vdwind']) },
+  { id: 'cover', label: 'Cover', transitions: Object.freeze(['coverleft', 'coverright', 'coverup', 'coverdown']) },
+  { id: 'reveal', label: 'Reveal', transitions: Object.freeze(['revealleft', 'revealright', 'revealup', 'revealdown']) },
+  { id: 'distanceRadial', label: 'Distance / radial', transitions: Object.freeze(['distance', 'radial']) },
+]);
+const MEDIA_COMPOSITION_XFADE_TRANSITIONS = Object.freeze(MEDIA_COMPOSITION_TRANSITION_CATEGORIES.flatMap((category) => category.transitions));
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
 const PORT_KIND_TEXT = 'text';
@@ -77,6 +100,7 @@ const COLLECTION_ITEM_PORT_KINDS = Object.freeze([
 const VALIDATION_INPUT_PORT_KINDS = Object.freeze([
   ...COLLECTION_ITEM_PORT_KINDS,
   PORT_KIND_PLAN,
+  PORT_KIND_COMPOSITION,
 ]);
 const SUPPORTED_PORT_KINDS = Object.freeze([
   ...COLLECTION_ITEM_PORT_KINDS,
@@ -1183,7 +1207,14 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       },
     ],
     configDefaults: {
+      imageTimingMode: 'fixedDurationPerImage',
       secondsPerItem: 4,
+      sceneTransitionMode: MEDIA_COMPOSITION_TRANSITION_MODES.OFF,
+      sceneTransitionDurationSeconds: 0.5,
+      sceneTransitionCategory: 'fades',
+      sceneTransitionName: 'fade',
+      sceneTransitionSelected: ['fade', 'dissolve'],
+      sceneTransitionAvoidRepeats: true,
       narrationVolume: DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
       backgroundMusicVolume: DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
     },
@@ -6288,10 +6319,19 @@ function analyzePipeline(definition = {}, context = {}) {
             message: 'Connect an ordered image collection before building this media composition.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['fixedDurationPerImage', 'dynamicFromImageMetadata', 'matchNarrationTiming'].includes(String(node.config?.imageTimingMode || 'fixedDurationPerImage').trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported image timing mode before building this media composition.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else {
+          const timingMode = String(node.config?.imageTimingMode || 'fixedDurationPerImage').trim();
           summary.readiness = {
             tone: 'info',
-            message: 'This step keeps the visual collection order explicit and can attach one primary audio track plus one optional background music track before export.',
+            message: timingMode === 'dynamicFromImageMetadata' || timingMode === 'matchNarrationTiming'
+              ? 'Media Composition will use per-image timing metadata from the connected collection when available, with a fixed-duration fallback.'
+              : 'This step keeps the visual collection order explicit and can attach one primary audio track plus one optional background music track before export.',
           };
         }
       }
@@ -6397,6 +6437,9 @@ module.exports = {
   DEFAULT_PIPELINE_RUN_SETTINGS,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  MEDIA_COMPOSITION_TRANSITION_MODES,
+  MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
+  MEDIA_COMPOSITION_XFADE_TRANSITIONS,
   AUDIO_WORKFLOW_TOOL_IDS,
   AUDIOCRAFT_AUDIO_MODE_OPTIONS,
   CHATTERBOX_AUDIO_MODE_OPTIONS,

@@ -88,6 +88,9 @@ const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities,
 const {
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
+  MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
+  MEDIA_COMPOSITION_TRANSITION_MODES,
+  MEDIA_COMPOSITION_XFADE_TRANSITIONS,
   PIPELINE_OPERATION_IDS,
   PORT_KIND_AUDIO,
   PORT_KIND_COLLECTION,
@@ -132,6 +135,10 @@ let activeRunAbortController = null;
 let pendingValidationControl = null;
 
 const PLANNER_PROVIDER_TIMEOUT_MS = 60000;
+const MEDIA_COMPOSITION_TRANSITION_CATEGORY_BY_ID = new Map(
+  MEDIA_COMPOSITION_TRANSITION_CATEGORIES.map((category) => [String(category.id || '').trim(), category]),
+);
+const MEDIA_COMPOSITION_XFADE_TRANSITION_SET = new Set(MEDIA_COMPOSITION_XFADE_TRANSITIONS);
 function normalizeMediaCompositionVolume(value, fallback) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
@@ -142,6 +149,118 @@ function normalizeMediaCompositionVolume(value, fallback) {
 
 function formatMediaCompositionVolumePercent(value, fallback) {
   return Math.round(normalizeMediaCompositionVolume(value, fallback) * 100);
+}
+
+function buildMediaCompositionRetryOverrideConfig(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const hasNarrationVolume = Object.prototype.hasOwnProperty.call(source, 'narrationVolume');
+  const hasBackgroundMusicVolume = Object.prototype.hasOwnProperty.call(source, 'backgroundMusicVolume');
+  const config = {};
+  if (hasNarrationVolume) {
+    config.narrationVolume = normalizeMediaCompositionVolume(source.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME);
+  }
+  if (hasBackgroundMusicVolume) {
+    config.backgroundMusicVolume = normalizeMediaCompositionVolume(source.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME);
+  }
+  return Object.keys(config).length ? config : null;
+}
+
+function getMediaCompositionEffectiveConfig(node, run) {
+  const retryOverride = run?.retryOverridesByNodeId?.[node.id]?.mediaComposition || null;
+  const retryConfig = buildMediaCompositionRetryOverrideConfig(retryOverride);
+  return {
+    ...(node.config || {}),
+    ...(retryConfig || {}),
+  };
+}
+
+function getCompositionAudioMixForRetryControls(artifact) {
+  const audioMix = artifact?.compositionExport?.audioMix && typeof artifact.compositionExport.audioMix === 'object'
+    ? artifact.compositionExport.audioMix
+    : null;
+  return {
+    narrationVolume: normalizeMediaCompositionVolume(audioMix?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+    backgroundMusicVolume: normalizeMediaCompositionVolume(audioMix?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+  };
+}
+
+const BURN_SUBTITLES_CAPTION_MODES = Object.freeze(['auto', 'transcriptSegments', 'subtitleFile', 'manualLines']);
+const BURN_SUBTITLES_TEXT_COLORS = Object.freeze(['white', 'black', 'yellow', 'red', 'blue', 'green', 'cyan', 'magenta', 'lightGray', 'darkGray']);
+const BURN_SUBTITLES_OUTLINE_COLORS = Object.freeze(['black', 'white', 'darkGray', 'lightGray', 'yellow', 'red', 'blue']);
+const BURN_SUBTITLES_FONT_PRESETS = Object.freeze(['arial', 'segoeUi', 'tahoma', 'verdana']);
+const BURN_SUBTITLES_POSITIONS = Object.freeze(['bottomCenter', 'bottomLeft', 'bottomRight', 'topCenter', 'topLeft', 'topRight', 'center']);
+const BURN_SUBTITLES_BACKGROUND_OPACITIES = Object.freeze([25, 50, 75, 100]);
+
+function normalizeBurnSubtitlesNumber(value, fallback, minValue = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.round(Math.max(minValue, numeric) * 10) / 10;
+}
+
+function normalizeBurnSubtitlesBoolean(value) {
+  return value === true || value === 'true' || value === 1 || value === '1';
+}
+
+function normalizeBurnSubtitlesEnum(value, allowedValues, fallback) {
+  const normalized = String(value || fallback).trim();
+  return allowedValues.includes(normalized) ? normalized : fallback;
+}
+
+function normalizeBurnSubtitlesBackgroundOpacity(value, fallback = 50) {
+  const numeric = Number(value);
+  return BURN_SUBTITLES_BACKGROUND_OPACITIES.includes(numeric) ? numeric : fallback;
+}
+
+function buildBurnSubtitlesRetryOverrideConfig(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const config = {};
+  if (Object.prototype.hasOwnProperty.call(source, 'captionMode')) config.captionMode = normalizeBurnSubtitlesEnum(source.captionMode, BURN_SUBTITLES_CAPTION_MODES, 'auto');
+  if (Object.prototype.hasOwnProperty.call(source, 'durationPerCaptionSeconds')) config.durationPerCaptionSeconds = normalizeBurnSubtitlesNumber(source.durationPerCaptionSeconds, 3, 0.1);
+  if (Object.prototype.hasOwnProperty.call(source, 'fontSize')) config.fontSize = normalizeBurnSubtitlesNumber(source.fontSize, 28, 1);
+  if (Object.prototype.hasOwnProperty.call(source, 'outline')) config.outline = normalizeBurnSubtitlesNumber(source.outline, 2, 0);
+  if (Object.prototype.hasOwnProperty.call(source, 'shadow')) config.shadow = normalizeBurnSubtitlesNumber(source.shadow, 1, 0);
+  if (Object.prototype.hasOwnProperty.call(source, 'bottomMargin')) config.bottomMargin = normalizeBurnSubtitlesNumber(source.bottomMargin, 32, 0);
+  if (Object.prototype.hasOwnProperty.call(source, 'textColor')) config.textColor = normalizeBurnSubtitlesEnum(source.textColor, BURN_SUBTITLES_TEXT_COLORS, 'white');
+  if (Object.prototype.hasOwnProperty.call(source, 'outlineColor')) config.outlineColor = normalizeBurnSubtitlesEnum(source.outlineColor, BURN_SUBTITLES_OUTLINE_COLORS, 'black');
+  if (Object.prototype.hasOwnProperty.call(source, 'fontPreset')) config.fontPreset = normalizeBurnSubtitlesEnum(source.fontPreset, BURN_SUBTITLES_FONT_PRESETS, 'arial');
+  if (Object.prototype.hasOwnProperty.call(source, 'bold')) config.bold = normalizeBurnSubtitlesBoolean(source.bold);
+  if (Object.prototype.hasOwnProperty.call(source, 'italic')) config.italic = normalizeBurnSubtitlesBoolean(source.italic);
+  if (Object.prototype.hasOwnProperty.call(source, 'position')) config.position = normalizeBurnSubtitlesEnum(source.position, BURN_SUBTITLES_POSITIONS, 'bottomCenter');
+  if (Object.prototype.hasOwnProperty.call(source, 'backgroundBox')) config.backgroundBox = normalizeBurnSubtitlesBoolean(source.backgroundBox);
+  if (Object.prototype.hasOwnProperty.call(source, 'backgroundOpacity')) config.backgroundOpacity = normalizeBurnSubtitlesBackgroundOpacity(source.backgroundOpacity, 50);
+  return Object.keys(config).length ? config : null;
+}
+
+function getBurnSubtitlesEffectiveConfig(node, run) {
+  const retryOverride = run?.retryOverridesByNodeId?.[node.id]?.burnSubtitles || null;
+  const retryConfig = buildBurnSubtitlesRetryOverrideConfig(retryOverride);
+  return {
+    ...(node.config || {}),
+    ...(retryConfig || {}),
+  };
+}
+
+function getSubtitleBurnSettingsForRetryControls(artifact) {
+  const burn = artifact?.subtitleBurn && typeof artifact.subtitleBurn === 'object' ? artifact.subtitleBurn : {};
+  const style = burn.style && typeof burn.style === 'object' ? burn.style : {};
+  return {
+    backgroundBox: normalizeBurnSubtitlesBoolean(style.backgroundBox),
+    backgroundOpacity: normalizeBurnSubtitlesBackgroundOpacity(style.backgroundOpacity, 50),
+    bold: normalizeBurnSubtitlesBoolean(style.bold),
+    bottomMargin: normalizeBurnSubtitlesNumber(style.bottomMargin, 32, 0),
+    captionMode: normalizeBurnSubtitlesEnum(burn.captionMode, BURN_SUBTITLES_CAPTION_MODES, 'auto'),
+    durationPerCaptionSeconds: normalizeBurnSubtitlesNumber(burn.durationPerCaptionSeconds, 3, 0.1),
+    fontPreset: normalizeBurnSubtitlesEnum(style.fontPreset, BURN_SUBTITLES_FONT_PRESETS, 'arial'),
+    fontSize: normalizeBurnSubtitlesNumber(style.fontSize, 28, 1),
+    italic: normalizeBurnSubtitlesBoolean(style.italic),
+    outline: normalizeBurnSubtitlesNumber(style.outline, 2, 0),
+    outlineColor: normalizeBurnSubtitlesEnum(style.outlineColor, BURN_SUBTITLES_OUTLINE_COLORS, 'black'),
+    position: normalizeBurnSubtitlesEnum(style.position, BURN_SUBTITLES_POSITIONS, 'bottomCenter'),
+    shadow: normalizeBurnSubtitlesNumber(style.shadow, 1, 0),
+    textColor: normalizeBurnSubtitlesEnum(style.textColor, BURN_SUBTITLES_TEXT_COLORS, 'white'),
+  };
 }
 
 const HEAVY_LOCAL_PIPELINE_OPERATION_IDS = new Set([
@@ -652,6 +771,7 @@ function createRunRecord(analysis, graph, runDirectories) {
     pipelineName: analysis.pipeline.name,
     reachableNodeIds: [...analysis.reachableNodeIds],
     resultsByNodeId: {},
+    retryOverridesByNodeId: {},
     revision: 0,
     runId,
     startedAt: new Date().toISOString(),
@@ -1782,6 +1902,85 @@ function buildPlannerRevisionGuidance(correctionArtifacts = []) {
   ].join('\n\n');
 }
 
+function normalizeTimelineSeconds(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return null;
+  }
+  return Math.round(numeric * 1000) / 1000;
+}
+
+function getTimingMetadataFromCollectionItemMetadata(metadata) {
+  const source = metadata && typeof metadata === 'object' ? metadata : {};
+  const startSeconds = normalizeTimelineSeconds(source.startSeconds);
+  const endSeconds = normalizeTimelineSeconds(source.endSeconds);
+  const durationSeconds = normalizeTimelineSeconds(source.durationSeconds)
+    || (startSeconds !== null && endSeconds !== null && endSeconds > startSeconds ? normalizeTimelineSeconds(endSeconds - startSeconds) : null);
+  return {
+    durationSeconds,
+    endSeconds,
+    hasTiming: Number.isFinite(Number(durationSeconds)) && Number(durationSeconds) > 0,
+    startSeconds,
+  };
+}
+
+function buildPlanSceneCollectionMetadata(planArtifact, textItems) {
+  const items = Array.isArray(textItems) ? textItems : [];
+  const timings = items.map((item) => getTimingMetadataFromCollectionItemMetadata(item?.metadata));
+  const timedItemCount = timings.filter((timing) => timing.hasTiming).length;
+  const maxEndSeconds = normalizeTimelineSeconds(Math.max(0, ...timings.map((timing) => Number(timing.endSeconds || 0) || 0)));
+  const summedDurationSeconds = normalizeTimelineSeconds(timings.reduce((total, timing) => total + (Number(timing.durationSeconds || 0) || 0), 0));
+  const planTiming = planArtifact?.plan?.timing && typeof planArtifact.plan.timing === 'object' ? planArtifact.plan.timing : {};
+  const totalPlannedDurationSeconds = normalizeTimelineSeconds(planTiming.totalDurationSeconds) || maxEndSeconds || summedDurationSeconds;
+  return {
+    plan: {
+      schemaFamilyId: String(planArtifact?.plan?.schemaFamilyId || '').trim(),
+      schemaId: String(planArtifact?.plan?.schemaId || '').trim(),
+      schemaVersion: Number(planArtifact?.plan?.schemaVersion || 0) || null,
+      sourcePlanId: String(planArtifact?.id || planArtifact?.artifactId || '').trim(),
+      sourcePlanTitle: String(planArtifact?.plan?.title || planArtifact?.displayName || '').trim(),
+    },
+    timing: {
+      itemCount: items.length,
+      timingMode: timedItemCount ? 'dynamicFromPlanTiming' : 'fixedDurationFallback',
+      timedItemCount,
+      totalPlannedDurationSeconds,
+      source: String(planTiming.source || 'longform scene plan').trim(),
+      coverageNotes: String(planTiming.coverageNotes || '').trim(),
+    },
+  };
+}
+
+function mergeCollectionItemMetadata(sourceMetadata, additions = {}) {
+  const base = sourceMetadata && typeof sourceMetadata === 'object' ? serializeArtifactForUi(sourceMetadata) : {};
+  const extra = additions && typeof additions === 'object' ? serializeArtifactForUi(additions) : {};
+  const merged = {
+    ...base,
+    ...extra,
+  };
+  return Object.keys(merged).length ? merged : null;
+}
+
+function buildMappedCollectionRootMetadata(sourceCollection, mapping, node, outputKind) {
+  const sourceMetadata = sourceCollection?.metadata && typeof sourceCollection.metadata === 'object'
+    ? serializeArtifactForUi(sourceCollection.metadata)
+    : null;
+  if (!sourceMetadata) {
+    return null;
+  }
+
+  return {
+    ...sourceMetadata,
+    collectionMap: {
+      mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+      nodeId: String(node?.id || '').trim(),
+      nodeLabel: String(node?.label || '').trim(),
+      operationId: String(mapping?.operationId || getCollectionMapOperationId(node)).trim(),
+      outputKind: String(outputKind || mapping?.outputKind || '').trim(),
+    },
+  };
+}
+
 function executePlanScenesNode(node, graph, run) {
   const planArtifact = getNodeInputArtifact(node.id, 'plan', graph, run.resultsByNodeId, run);
   if (!planArtifact || String(planArtifact.kind || '').trim() !== PORT_KIND_PLAN) {
@@ -1799,6 +1998,7 @@ function executePlanScenesNode(node, graph, run) {
     displayName: item.displayName || 'Plan item ' + String(index + 1),
     role: 'generated',
   }));
+  const collectionMetadata = buildPlanSceneCollectionMetadata(planArtifact, textItems);
   const collection = createArtifactCollection(sceneArtifacts.map((artifact, index) => ({
     artifact,
     lineage: {
@@ -1812,6 +2012,7 @@ function executePlanScenesNode(node, graph, run) {
   })), {
     displayName: node.label,
     itemKind: PORT_KIND_TEXT,
+    metadata: collectionMetadata,
     role: 'generated',
   });
 
@@ -2487,6 +2688,7 @@ function buildCollectionMapMetadata(mapping, node, executionMode, options = {}) 
     itemCount: Number(options.sourceCollection.itemCount || 0) || 0,
     itemKind: String(options.sourceCollection.itemKind || mapping?.inputKind || '').trim(),
     manifestPath: String(options.sourceCollection.manifestPath || '').trim(),
+    metadata: options.sourceCollection.metadata && typeof options.sourceCollection.metadata === 'object' ? serializeArtifactForUi(options.sourceCollection.metadata) : null,
     summary: String(options.sourceCollection.summary || '').trim(),
   } : null;
   const orderedOutputItemRefs = Array.isArray(options.outputItems) ? options.outputItems.map((entry, index) => ({
@@ -2760,6 +2962,7 @@ async function persistPartialCollectionMapArtifact({ audioContinuationChain, exe
     displayName: node.label,
     failedItems,
     itemKind: outputKind,
+    metadata: buildMappedCollectionRootMetadata(sourceCollection, mapping, node, outputKind),
     role: 'generated',
     sourceCollection: {
       directoryPath: String(sourceCollection?.directoryPath || '').trim(),
@@ -2767,6 +2970,7 @@ async function persistPartialCollectionMapArtifact({ audioContinuationChain, exe
       itemCount: Number(sourceCollection?.itemCount || sourceItems.length) || sourceItems.length,
       itemKind: String(sourceCollection?.itemKind || mapping?.inputKind || '').trim(),
       manifestPath: String(sourceCollection?.manifestPath || '').trim(),
+      metadata: sourceCollection?.metadata ? serializeArtifactForUi(sourceCollection.metadata) : null,
     },
     sourceItemCount: sourceItems.length,
   });
@@ -3575,6 +3779,18 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
       } else if (mappedArtifact?.kind === PORT_KIND_VIDEO) {
         await persistVideoGenerationMetadataSidecar(mappedArtifact);
       }
+      const mappedItemMetadata = mergeCollectionItemMetadata(entry?.metadata, {
+        ...(itemChainMetadata ? { audioContinuationChain: itemChainMetadata } : {}),
+        ...(videoChainItemMetadata ? { videoContinuationChain: videoChainItemMetadata } : {}),
+        collectionMap: {
+          mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+          nodeId: node.id,
+          nodeLabel: node.label,
+          operationId: String(mapping?.operationId || getCollectionMapOperationId(node)).trim(),
+          sourceItemId: itemId,
+          sourceItemIndex: index,
+        },
+      });
       mappedItems.push({
         artifact: mappedArtifact,
         attempts: mappedResult.attempts,
@@ -3588,7 +3804,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
           sourceItemIndex: index,
           parentLineage: entry?.lineage || null,
         },
-        ...(itemChainMetadata || videoChainItemMetadata ? { metadata: { ...(itemChainMetadata ? { audioContinuationChain: itemChainMetadata } : {}), ...(videoChainItemMetadata ? { videoContinuationChain: videoChainItemMetadata } : {}) } } : {}),
+        ...(mappedItemMetadata ? { metadata: mappedItemMetadata } : {}),
         validation: mappedResult.validation,
       });
     } catch (error) {
@@ -3674,10 +3890,12 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
       itemCount: Number(sourceCollection?.itemCount || sourceItems.length) || sourceItems.length,
       itemKind: String(sourceCollection?.itemKind || mapping?.inputKind || '').trim(),
       manifestPath: String(sourceCollection?.manifestPath || '').trim(),
+      metadata: sourceCollection?.metadata ? serializeArtifactForUi(sourceCollection.metadata) : null,
     },
     sourceItemCount: sourceItems.length,
     displayName: node.label,
     itemKind: outputKind,
+    metadata: buildMappedCollectionRootMetadata(sourceCollection, mapping, node, outputKind),
     role: 'generated',
   });
   const persistedCollection = await persistArtifactCollection(run.directories, collection, {
@@ -4404,6 +4622,245 @@ async function buildValidationArtifactDescription(artifact, contextMaps) {
 
   return description;
 }
+function isMediaCompositionExportArtifact(artifact) {
+  return String(artifact?.kind || '').trim() === PORT_KIND_VIDEO
+    && artifact?.compositionExport
+    && typeof artifact.compositionExport === 'object';
+}
+
+function getMediaCompositionNodeFromExportNode(graph, exportNode) {
+  if (!graph || exportNode?.type !== 'mediaExport') {
+    return null;
+  }
+
+  const compositionInputEdge = getIncomingEdgesForPortKey(graph, exportNode.id + ':composition')[0] || null;
+  if (!compositionInputEdge?.source?.nodeId) {
+    return null;
+  }
+
+  const sourceNode = graph.nodeMap.get(compositionInputEdge.source.nodeId) || null;
+  return sourceNode?.type === 'mediaComposition' ? sourceNode : null;
+}
+
+function findMediaCompositionRetryTargetForValidation(graph, validationNode, run, artifact) {
+  if (!isMediaCompositionExportArtifact(artifact)) {
+    return null;
+  }
+
+  const traceNodeId = String(
+    artifact?.compositionExport?.pipelineTrace?.mediaCompositionNodeId
+      || artifact?.compositionExport?.composition?.nodeId
+      || '',
+  ).trim();
+  if (traceNodeId) {
+    const traceNode = graph.nodeMap.get(traceNodeId) || null;
+    if (traceNode?.type === 'mediaComposition') {
+      return traceNode;
+    }
+  }
+
+  const directInput = getNodeInputArtifacts(validationNode.id, 'input', graph, run.resultsByNodeId, run)[0] || null;
+  const directSourceNode = directInput?.edge?.source?.nodeId ? graph.nodeMap.get(directInput.edge.source.nodeId) : null;
+  const directCompositionNode = getMediaCompositionNodeFromExportNode(graph, directSourceNode);
+  if (directCompositionNode) {
+    return directCompositionNode;
+  }
+
+  const artifactPath = String(artifact?.filePath || artifact?.destinationPath || '').trim();
+  const activeLoopNodeIds = cloneLoopContexts(run.nodeStates?.[validationNode.id]?.activeLoops)
+    .map((entry) => String(entry?.loopNodeId || '').trim())
+    .filter(Boolean);
+  const searchNodeIds = activeLoopNodeIds.length
+    ? activeLoopNodeIds.flatMap((loopNodeId) => graph.retryLoopsByNodeId.get(loopNodeId)?.segmentExecutionOrder || [])
+    : graph.executionOrder;
+
+  for (const nodeId of searchNodeIds) {
+    const candidateNode = graph.nodeMap.get(nodeId) || null;
+    if (candidateNode?.type !== 'mediaExport') {
+      continue;
+    }
+
+    const candidateArtifact = run.resultsByNodeId?.[nodeId]?.outputs?.video || null;
+    const candidatePath = String(candidateArtifact?.filePath || candidateArtifact?.destinationPath || '').trim();
+    if (!candidateArtifact || (artifactPath && candidatePath !== artifactPath)) {
+      continue;
+    }
+
+    const compositionNode = getMediaCompositionNodeFromExportNode(graph, candidateNode);
+    if (compositionNode) {
+      return compositionNode;
+    }
+  }
+
+  return null;
+}
+
+function buildMediaCompositionRetryControls(graph, validationNode, run, artifact) {
+  const targetNode = findMediaCompositionRetryTargetForValidation(graph, validationNode, run, artifact);
+  if (!targetNode) {
+    return null;
+  }
+
+  const audioMix = getCompositionAudioMixForRetryControls(artifact);
+  return {
+    mediaComposition: {
+      backgroundMusicVolume: audioMix.backgroundMusicVolume,
+      nodeId: targetNode.id,
+      nodeLabel: targetNode.label || 'Media Composition',
+      narrationVolume: audioMix.narrationVolume,
+      temporary: true,
+    },
+  };
+}
+
+function applyMediaCompositionRetryOverride(run, pendingValidation, payload) {
+  const mediaCompositionControl = pendingValidation?.retryControls?.mediaComposition || null;
+  if (!mediaCompositionControl?.nodeId) {
+    return null;
+  }
+
+  const overrideConfig = buildMediaCompositionRetryOverrideConfig(payload?.retryOverrides?.mediaComposition);
+  if (!overrideConfig) {
+    return null;
+  }
+
+  if (!run.retryOverridesByNodeId || typeof run.retryOverridesByNodeId !== 'object') {
+    run.retryOverridesByNodeId = {};
+  }
+
+  const nodeId = String(mediaCompositionControl.nodeId || '').trim();
+  run.retryOverridesByNodeId[nodeId] = {
+    ...(run.retryOverridesByNodeId[nodeId] || {}),
+    mediaComposition: overrideConfig,
+  };
+  return overrideConfig;
+}
+
+function isBurnSubtitlesArtifact(artifact) {
+  return String(artifact?.kind || '').trim() === PORT_KIND_VIDEO
+    && artifact?.subtitleBurn
+    && typeof artifact.subtitleBurn === 'object'
+    && String(artifact.subtitleBurn.operationId || artifact.subtitleBurn.operation || '').trim() === 'burnSubtitles';
+}
+
+function findBurnSubtitlesRetryTargetForValidation(graph, validationNode, run, artifact) {
+  if (!isBurnSubtitlesArtifact(artifact)) {
+    return null;
+  }
+
+  const traceNodeId = String(
+    artifact?.subtitleBurn?.pipelineTrace?.burnSubtitlesNodeId
+      || artifact?.subtitleBurn?.createdBy?.nodeId
+      || '',
+  ).trim();
+  if (traceNodeId) {
+    const traceNode = graph.nodeMap.get(traceNodeId) || null;
+    if (traceNode?.type === 'burnSubtitles') {
+      return traceNode;
+    }
+  }
+
+  const directInput = getNodeInputArtifacts(validationNode.id, 'input', graph, run.resultsByNodeId, run)[0] || null;
+  const directSourceNode = directInput?.edge?.source?.nodeId ? graph.nodeMap.get(directInput.edge.source.nodeId) : null;
+  if (directSourceNode?.type === 'burnSubtitles') {
+    return directSourceNode;
+  }
+
+  const artifactPath = String(artifact?.filePath || artifact?.destinationPath || '').trim();
+  const activeLoopNodeIds = cloneLoopContexts(run.nodeStates?.[validationNode.id]?.activeLoops)
+    .map((entry) => String(entry?.loopNodeId || '').trim())
+    .filter(Boolean);
+  const searchNodeIds = activeLoopNodeIds.length
+    ? activeLoopNodeIds.flatMap((loopNodeId) => graph.retryLoopsByNodeId.get(loopNodeId)?.segmentExecutionOrder || [])
+    : graph.executionOrder;
+
+  for (const nodeId of searchNodeIds) {
+    const candidateNode = graph.nodeMap.get(nodeId) || null;
+    if (candidateNode?.type !== 'burnSubtitles') {
+      continue;
+    }
+
+    const candidateArtifact = run.resultsByNodeId?.[nodeId]?.outputs?.video || null;
+    const candidatePath = String(candidateArtifact?.filePath || candidateArtifact?.destinationPath || '').trim();
+    if (candidateArtifact && (!artifactPath || candidatePath === artifactPath)) {
+      return candidateNode;
+    }
+  }
+
+  return null;
+}
+
+function getBurnSubtitlesSafeCaptionModeOptions(settings) {
+  const resolvedMode = normalizeBurnSubtitlesEnum(settings?.captionMode, BURN_SUBTITLES_CAPTION_MODES, 'auto');
+  if (resolvedMode === 'subtitleFile') {
+    return ['auto', 'subtitleFile'];
+  }
+  if (resolvedMode === 'transcriptSegments') {
+    return ['auto', 'transcriptSegments'];
+  }
+  if (resolvedMode === 'manualLines') {
+    return ['auto', 'manualLines'];
+  }
+  return ['auto'];
+}
+
+function buildBurnSubtitlesRetryControls(graph, validationNode, run, artifact) {
+  const targetNode = findBurnSubtitlesRetryTargetForValidation(graph, validationNode, run, artifact);
+  if (!targetNode) {
+    return null;
+  }
+
+  const settings = getSubtitleBurnSettingsForRetryControls(artifact);
+  return {
+    burnSubtitles: {
+      captionModeOptions: getBurnSubtitlesSafeCaptionModeOptions(settings),
+      nodeId: targetNode.id,
+      nodeLabel: targetNode.label || 'Burn Subtitles / Captions',
+      settings,
+      temporary: true,
+    },
+  };
+}
+function applyBurnSubtitlesRetryOverride(run, pendingValidation, payload) {
+  const burnSubtitlesControl = pendingValidation?.retryControls?.burnSubtitles || null;
+  if (!burnSubtitlesControl?.nodeId) {
+    return null;
+  }
+
+  const overrideConfig = buildBurnSubtitlesRetryOverrideConfig(payload?.retryOverrides?.burnSubtitles);
+  if (!overrideConfig) {
+    return null;
+  }
+
+  if (!run.retryOverridesByNodeId || typeof run.retryOverridesByNodeId !== 'object') {
+    run.retryOverridesByNodeId = {};
+  }
+
+  const nodeId = String(burnSubtitlesControl.nodeId || '').trim();
+  run.retryOverridesByNodeId[nodeId] = {
+    ...(run.retryOverridesByNodeId[nodeId] || {}),
+    burnSubtitles: overrideConfig,
+  };
+  return overrideConfig;
+}
+
+function buildValidationRetryControls(graph, validationNode, run, artifact) {
+  const controls = {
+    ...(buildMediaCompositionRetryControls(graph, validationNode, run, artifact) || {}),
+    ...(buildBurnSubtitlesRetryControls(graph, validationNode, run, artifact) || {}),
+  };
+  return Object.keys(controls).length ? controls : null;
+}
+
+function applyValidationRetryOverrides(run, pendingValidation, payload) {
+  const mediaComposition = applyMediaCompositionRetryOverride(run, pendingValidation, payload);
+  const burnSubtitles = applyBurnSubtitlesRetryOverride(run, pendingValidation, payload);
+  return {
+    ...(mediaComposition ? { mediaComposition } : {}),
+    ...(burnSubtitles ? { burnSubtitles } : {}),
+  };
+}
+
 async function waitForUserValidation(run, node, artifact, options = {}) {
   if (pendingValidationControl) {
     throw new Error('Local AI Hub is already waiting on another validation decision.');
@@ -4442,6 +4899,7 @@ async function waitForUserValidation(run, node, artifact, options = {}) {
     nodeLabel: node.label,
     requestId: createUniqueId('validation'),
     requestedAt: new Date().toISOString(),
+    retryControls: options.retryControls ? serializeArtifactForUi(options.retryControls) : null,
   };
 
   const decision = await new Promise((resolve) => {
@@ -4558,7 +5016,9 @@ async function executeValidationNode(node, graph, run, contextMaps, reportProgre
   if (node.config?.mode !== 'llm') {
     const planReview = buildPlanValidationReview(artifact);
     const evidenceMode = getUserValidationEvidenceMode(artifact, planReview);
-    const decision = await waitForUserValidation(run, node, artifact);
+    const decision = await waitForUserValidation(run, node, artifact, {
+      retryControls: buildValidationRetryControls(graph, node, run, artifact),
+    });
     const selectedBranch = decision?.decision === 'pass' ? 'pass' : 'fail';
     const reason = decision?.comment ? `User note: ${decision.comment}` : `User selected ${selectedBranch}.`;
     const validationResult = {
@@ -5396,28 +5856,74 @@ async function executeTrimMediaNode(node, graph, run, reportProgress) {
   });
 }
 
+function resolveBurnSubtitlesVideoInputForRun(node, graph, run) {
+  const retryAwareEntries = getNodeInputArtifacts(node.id, 'video', graph, run.resultsByNodeId, run);
+  const loopRetryEntry = retryAwareEntries.find((entry) => entry?.isLoopRetry && entry.artifact) || null;
+  if (!loopRetryEntry) {
+    return {
+      artifact: retryAwareEntries[0]?.artifact || null,
+      sourceVideoLineage: {
+        ignoredLoopRetryVideo: false,
+        inputResolution: 'connected-input',
+        retryAttempt: 1,
+        usedOriginalSourceVideo: true,
+      },
+    };
+  }
+
+  const connectedEntries = getNodeInputArtifacts(node.id, 'video', graph, run.resultsByNodeId, null);
+  const connectedEntry = connectedEntries[0] || null;
+  if (!connectedEntry?.artifact) {
+    return {
+      artifact: loopRetryEntry.artifact,
+      sourceVideoLineage: {
+        ignoredLoopRetryVideo: false,
+        inputResolution: 'loop-retry-artifact-fallback',
+        loopNodeId: String(loopRetryEntry.loopMeta?.loopNodeId || '').trim(),
+        retryAttempt: Number(loopRetryEntry.loopState?.attempt || 1) || 1,
+        usedOriginalSourceVideo: false,
+      },
+    };
+  }
+
+  return {
+    artifact: connectedEntry.artifact,
+    sourceVideoLineage: {
+      ignoredLoopRetryVideo: true,
+      inputResolution: 'connected-input-for-retry',
+      loopNodeId: String(loopRetryEntry.loopMeta?.loopNodeId || '').trim(),
+      loopRetryVideoPath: String(loopRetryEntry.artifact?.filePath || '').trim(),
+      retryAttempt: Number(loopRetryEntry.loopState?.attempt || 1) || 1,
+      usedOriginalSourceVideo: true,
+    },
+  };
+}
+
 async function executeBurnSubtitlesNode(node, graph, run, reportProgress) {
-  const videoArtifact = getNodeInputArtifact(node.id, 'video', graph, run.resultsByNodeId, run);
+  const effectiveConfig = getBurnSubtitlesEffectiveConfig(node, run);
+  const videoInput = resolveBurnSubtitlesVideoInputForRun(node, graph, run);
+  const videoArtifact = videoInput.artifact;
   const captionArtifact = getNodeInputArtifact(node.id, 'captions', graph, run.resultsByNodeId, run);
   return burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, {
-    captionMode: node.config?.captionMode || 'auto',
+    captionMode: effectiveConfig.captionMode || 'auto',
     displayName: node.label || 'Burn Subtitles / Captions',
-    durationPerCaptionSeconds: node.config?.durationPerCaptionSeconds || 3,
-    fontSize: node.config?.fontSize || 28,
-    outline: node.config?.outline ?? 2,
-    shadow: node.config?.shadow ?? 1,
-    bottomMargin: node.config?.bottomMargin ?? 32,
-    textColor: node.config?.textColor || 'white',
-    outlineColor: node.config?.outlineColor || 'black',
-    fontPreset: node.config?.fontPreset || 'arial',
-    bold: node.config?.bold || false,
-    italic: node.config?.italic || false,
-    position: node.config?.position || 'bottomCenter',
-    backgroundBox: node.config?.backgroundBox || false,
-    backgroundOpacity: node.config?.backgroundOpacity ?? 50,
+    durationPerCaptionSeconds: effectiveConfig.durationPerCaptionSeconds || 3,
+    fontSize: effectiveConfig.fontSize || 28,
+    outline: effectiveConfig.outline ?? 2,
+    shadow: effectiveConfig.shadow ?? 1,
+    bottomMargin: effectiveConfig.bottomMargin ?? 32,
+    textColor: effectiveConfig.textColor || 'white',
+    outlineColor: effectiveConfig.outlineColor || 'black',
+    fontPreset: effectiveConfig.fontPreset || 'arial',
+    bold: effectiveConfig.bold || false,
+    italic: effectiveConfig.italic || false,
+    position: effectiveConfig.position || 'bottomCenter',
+    backgroundBox: effectiveConfig.backgroundBox || false,
+    backgroundOpacity: effectiveConfig.backgroundOpacity ?? 50,
     node,
-    outputFormat: node.config?.outputFormat || 'mp4',
+    outputFormat: effectiveConfig.outputFormat || 'mp4',
     reportProgress,
+    sourceVideoLineage: videoInput.sourceVideoLineage,
     runDirectories: run.directories,
   });
 }
@@ -5435,27 +5941,348 @@ async function executeExportSubtitlesNode(node, graph, run, reportProgress) {
   });
 }
 
+function normalizeMediaCompositionImageTimingMode(value) {
+  const mode = String(value || '').trim();
+  if (mode === 'dynamicFromImageMetadata' || mode === 'matchNarrationTiming') {
+    return 'dynamicFromImageMetadata';
+  }
+  return 'fixedDurationPerImage';
+}
+
+function normalizeMediaCompositionTransitionMode(value) {
+  const mode = String(value || '').trim();
+  return Object.values(MEDIA_COMPOSITION_TRANSITION_MODES).includes(mode) ? mode : MEDIA_COMPOSITION_TRANSITION_MODES.OFF;
+}
+
+function normalizeMediaCompositionTransitionDuration(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 0.5;
+  }
+  return normalizeTimelineSeconds(Math.max(0.1, Math.min(2, numeric))) || 0.5;
+}
+
+function normalizeMediaCompositionTransitionName(value, fallback = 'fade') {
+  const name = String(value || '').trim();
+  return MEDIA_COMPOSITION_XFADE_TRANSITION_SET.has(name) ? name : fallback;
+}
+
+function normalizeMediaCompositionTransitionCategory(value) {
+  const categoryId = String(value || '').trim();
+  return MEDIA_COMPOSITION_TRANSITION_CATEGORY_BY_ID.has(categoryId) ? categoryId : 'fades';
+}
+
+function normalizeMediaCompositionSelectedTransitions(value) {
+  const selected = Array.isArray(value) ? value : [];
+  const normalized = [];
+  for (const entry of selected) {
+    const name = String(entry || '').trim();
+    if (MEDIA_COMPOSITION_XFADE_TRANSITION_SET.has(name) && !normalized.includes(name)) {
+      normalized.push(name);
+    }
+  }
+  return normalized.length ? normalized : ['fade', 'dissolve'];
+}
+
+function getMediaCompositionTransitionConfig(config = {}) {
+  const mode = normalizeMediaCompositionTransitionMode(config.sceneTransitionMode);
+  return {
+    avoidRepeats: config.sceneTransitionAvoidRepeats !== false,
+    category: normalizeMediaCompositionTransitionCategory(config.sceneTransitionCategory),
+    configuredDurationSeconds: normalizeMediaCompositionTransitionDuration(config.sceneTransitionDurationSeconds),
+    mode,
+    selectedTransitions: normalizeMediaCompositionSelectedTransitions(config.sceneTransitionSelected),
+    singleTransition: normalizeMediaCompositionTransitionName(config.sceneTransitionName),
+  };
+}
+
+function hashMediaCompositionTransitionSeed(seedParts) {
+  return crypto.createHash('sha256').update(seedParts.map((part) => String(part || '')).join('|')).digest('hex');
+}
+
+function selectDeterministicTransition(candidates, seed, boundaryIndex, previousTransition, avoidRepeats) {
+  const options = candidates.filter((name) => MEDIA_COMPOSITION_XFADE_TRANSITION_SET.has(name));
+  if (!options.length) {
+    return 'fade';
+  }
+  const digest = hashMediaCompositionTransitionSeed([seed, boundaryIndex, options.join(',')]);
+  let selected = options[parseInt(digest.slice(0, 8), 16) % options.length];
+  if (avoidRepeats && previousTransition && options.length > 1 && selected === previousTransition) {
+    const currentIndex = options.indexOf(selected);
+    selected = options[(currentIndex + 1) % options.length];
+  }
+  return selected;
+}
+
+function getTransitionCandidatesForBoundary(transitionConfig) {
+  if (transitionConfig.mode === MEDIA_COMPOSITION_TRANSITION_MODES.SINGLE) {
+    return [transitionConfig.singleTransition];
+  }
+  if (transitionConfig.mode === MEDIA_COMPOSITION_TRANSITION_MODES.RANDOM_CATEGORY) {
+    return [...(MEDIA_COMPOSITION_TRANSITION_CATEGORY_BY_ID.get(transitionConfig.category)?.transitions || ['fade'])];
+  }
+  if (transitionConfig.mode === MEDIA_COMPOSITION_TRANSITION_MODES.RANDOM_SELECTED) {
+    return transitionConfig.selectedTransitions;
+  }
+  return [];
+}
+
+function buildSceneTransitionPlan(visualItems, effectiveConfig, timingPlan) {
+  const transitionConfig = getMediaCompositionTransitionConfig(effectiveConfig);
+  const totalVisualDurationSeconds = normalizeTimelineSeconds(timingPlan.totalVisualDurationSeconds) || 0;
+  const basePlan = {
+    avoidRepeats: transitionConfig.avoidRepeats,
+    boundaries: [],
+    category: transitionConfig.category,
+    configuredDurationSeconds: transitionConfig.configuredDurationSeconds,
+    enabled: false,
+    mode: transitionConfig.mode,
+    notes: [],
+    requested: transitionConfig,
+    selectedTransitions: transitionConfig.selectedTransitions,
+    singleTransition: transitionConfig.singleTransition,
+    timingModeInteraction: timingPlan.timingMetadataUsed
+      ? 'Transitions are applied at timed image boundaries while preserving dynamic narration/transcript timing.'
+      : 'Transitions are applied at fixed-duration image boundaries while preserving the intended slideshow duration.',
+    totalVisualDurationSeconds,
+  };
+
+  if (transitionConfig.mode === MEDIA_COMPOSITION_TRANSITION_MODES.OFF) {
+    basePlan.notes.push('Scene transitions are off.');
+    return basePlan;
+  }
+  if (!Array.isArray(visualItems) || visualItems.length < 2) {
+    basePlan.notes.push('A single image does not need scene transitions.');
+    return basePlan;
+  }
+
+  const seed = hashMediaCompositionTransitionSeed([
+    transitionConfig.mode,
+    transitionConfig.category,
+    transitionConfig.singleTransition,
+    transitionConfig.selectedTransitions.join(','),
+    transitionConfig.configuredDurationSeconds,
+    visualItems.map((item) => String(item.itemId || item.artifact?.filePath || '')).join(','),
+    visualItems.map((item) => String(item.durationSeconds || '')).join(','),
+  ]);
+  let previousTransition = '';
+  let cumulativeBoundarySeconds = 0;
+  for (let index = 0; index < visualItems.length - 1; index += 1) {
+    const outgoing = visualItems[index];
+    const incoming = visualItems[index + 1];
+    const outgoingDurationSeconds = Math.max(0, Number(outgoing?.durationSeconds || 0) || 0);
+    const incomingDurationSeconds = Math.max(0, Number(incoming?.durationSeconds || 0) || 0);
+    cumulativeBoundarySeconds = normalizeTimelineSeconds(cumulativeBoundarySeconds + outgoingDurationSeconds) || (cumulativeBoundarySeconds + outgoingDurationSeconds);
+    const maxBoundaryDuration = Math.min(
+      transitionConfig.configuredDurationSeconds,
+      outgoingDurationSeconds * 0.45,
+      incomingDurationSeconds * 0.45,
+    );
+    const effectiveDurationSeconds = normalizeTimelineSeconds(Math.max(0, maxBoundaryDuration)) || 0;
+    const candidates = getTransitionCandidatesForBoundary(transitionConfig);
+    const selectedTransition = transitionConfig.mode === MEDIA_COMPOSITION_TRANSITION_MODES.SINGLE
+      ? normalizeMediaCompositionTransitionName(transitionConfig.singleTransition)
+      : selectDeterministicTransition(candidates, seed, index, previousTransition, transitionConfig.avoidRepeats);
+    const notes = [];
+    if (effectiveDurationSeconds < transitionConfig.configuredDurationSeconds - 0.001) {
+      notes.push('Transition duration was clamped because one or both scenes are short.');
+    }
+    if (effectiveDurationSeconds <= 0.001) {
+      notes.push('Transition was skipped because a scene duration was too short.');
+    }
+    basePlan.boundaries.push({
+      boundaryIndex: index,
+      boundarySeconds: cumulativeBoundarySeconds,
+      incomingDurationSeconds: normalizeTimelineSeconds(incomingDurationSeconds),
+      incomingItemId: String(incoming?.itemId || '').trim(),
+      notes,
+      offsetSeconds: normalizeTimelineSeconds(Math.max(0, cumulativeBoundarySeconds - effectiveDurationSeconds)),
+      outgoingDurationSeconds: normalizeTimelineSeconds(outgoingDurationSeconds),
+      outgoingItemId: String(outgoing?.itemId || '').trim(),
+      requestedDurationSeconds: transitionConfig.configuredDurationSeconds,
+      selectedTransition,
+      effectiveDurationSeconds,
+      wasClamped: effectiveDurationSeconds < transitionConfig.configuredDurationSeconds - 0.001,
+    });
+    if (effectiveDurationSeconds > 0.001) {
+      previousTransition = selectedTransition;
+    }
+  }
+
+  basePlan.enabled = basePlan.boundaries.some((boundary) => Number(boundary.effectiveDurationSeconds || 0) > 0.001);
+  if (!basePlan.enabled) {
+    basePlan.notes.push('All scene transitions were skipped because the image durations were too short.');
+  }
+  return basePlan;
+}
+
+function getAudioArtifactDurationSeconds(artifact) {
+  const candidates = [
+    artifact?.audio?.durationSeconds,
+    artifact?.transcription?.durationSeconds,
+    artifact?.audioGeneration?.finalOutputDurationSeconds,
+    artifact?.audioGeneration?.generatedDurationSeconds,
+    artifact?.audioGeneration?.durationSeconds,
+    artifact?.audioStitch?.finalOutputDurationSeconds,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeTimelineSeconds(candidate);
+    if (normalized && normalized > 0) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function getCollectionPlannedDurationSeconds(collection) {
+  const timing = collection?.metadata?.timing && typeof collection.metadata.timing === 'object'
+    ? collection.metadata.timing
+    : null;
+  return normalizeTimelineSeconds(timing?.totalPlannedDurationSeconds || timing?.totalDurationSeconds);
+}
+
+function buildFixedVisualTimingItems(visualCollection, durationSeconds) {
+  return (Array.isArray(visualCollection.items) ? visualCollection.items : [])
+    .map((entry, index) => ({
+      artifact: entry?.artifact || null,
+      durationSeconds,
+      endSeconds: normalizeTimelineSeconds((index + 1) * durationSeconds),
+      itemId: String(entry?.itemId || '').trim() || `visual-${index + 1}`,
+      lineage: entry?.lineage || null,
+      metadata: entry?.metadata || null,
+      startSeconds: normalizeTimelineSeconds(index * durationSeconds),
+      summary: String(entry?.summary || summarizeArtifact(entry?.artifact || null)).trim(),
+    }))
+    .filter((entry) => entry.artifact);
+}
+
+function buildDynamicVisualTiming(visualCollection, fixedDurationSeconds, primaryAudioArtifact, backgroundMusicArtifact) {
+  const sourceEntries = Array.isArray(visualCollection.items) ? visualCollection.items : [];
+  const validTiming = [];
+  for (let index = 0; index < sourceEntries.length; index += 1) {
+    const entry = sourceEntries[index];
+    const timing = getTimingMetadataFromCollectionItemMetadata(entry?.metadata);
+    if (!timing.hasTiming) {
+      return {
+        fallbackReason: 'One or more image items did not include valid start/end or duration timing metadata.',
+        items: buildFixedVisualTimingItems(visualCollection, fixedDurationSeconds),
+        metadataUsed: false,
+      };
+    }
+    if (timing.startSeconds !== null && timing.endSeconds !== null && timing.endSeconds <= timing.startSeconds) {
+      return {
+        fallbackReason: 'One or more image items had an end time that was not after its start time.',
+        items: buildFixedVisualTimingItems(visualCollection, fixedDurationSeconds),
+        metadataUsed: false,
+      };
+    }
+    if (index > 0 && timing.startSeconds !== null && validTiming[index - 1]?.endSeconds !== null && timing.startSeconds < validTiming[index - 1].endSeconds - 0.05) {
+      return {
+        fallbackReason: 'Image timing metadata overlaps between adjacent items.',
+        items: buildFixedVisualTimingItems(visualCollection, fixedDurationSeconds),
+        metadataUsed: false,
+      };
+    }
+    validTiming.push(timing);
+  }
+
+  let cursorSeconds = 0;
+  const items = sourceEntries
+    .map((entry, index) => {
+      const timing = validTiming[index] || {};
+      const startSeconds = timing.startSeconds !== null ? timing.startSeconds : normalizeTimelineSeconds(cursorSeconds);
+      const durationSeconds = normalizeTimelineSeconds(timing.durationSeconds) || fixedDurationSeconds;
+      const endSeconds = timing.endSeconds !== null ? timing.endSeconds : normalizeTimelineSeconds(startSeconds + durationSeconds);
+      cursorSeconds = normalizeTimelineSeconds(cursorSeconds + durationSeconds) || cursorSeconds + durationSeconds;
+      return {
+        artifact: entry?.artifact || null,
+        durationSeconds,
+        endSeconds,
+        itemId: String(entry?.itemId || '').trim() || `visual-${index + 1}`,
+        lineage: entry?.lineage || null,
+        metadata: entry?.metadata || null,
+        startSeconds,
+        summary: String(entry?.summary || summarizeArtifact(entry?.artifact || null)).trim(),
+      };
+    })
+    .filter((entry) => entry.artifact);
+
+  const targetNarrationDurationSeconds = getAudioArtifactDurationSeconds(primaryAudioArtifact);
+  const targetBackgroundMusicDurationSeconds = getAudioArtifactDurationSeconds(backgroundMusicArtifact);
+  const targetPlannedDurationSeconds = getCollectionPlannedDurationSeconds(visualCollection);
+  const targetDurationSeconds = targetNarrationDurationSeconds || targetPlannedDurationSeconds || targetBackgroundMusicDurationSeconds;
+  let totalVisualDurationSeconds = normalizeTimelineSeconds(items.reduce((total, entry) => total + (Number(entry.durationSeconds || 0) || 0), 0)) || 0;
+  let extendedFinalImageSeconds = 0;
+  if (items.length && targetDurationSeconds && targetDurationSeconds > totalVisualDurationSeconds + 0.05) {
+    extendedFinalImageSeconds = normalizeTimelineSeconds(targetDurationSeconds - totalVisualDurationSeconds) || 0;
+    const lastItem = items[items.length - 1];
+    const lastStartSeconds = normalizeTimelineSeconds(lastItem.startSeconds)
+      ?? normalizeTimelineSeconds(totalVisualDurationSeconds - (Number(lastItem.durationSeconds || 0) || 0))
+      ?? 0;
+    lastItem.durationSeconds = normalizeTimelineSeconds(Number(lastItem.durationSeconds || 0) + extendedFinalImageSeconds) || lastItem.durationSeconds;
+    lastItem.startSeconds = lastStartSeconds;
+    lastItem.endSeconds = normalizeTimelineSeconds(lastStartSeconds + lastItem.durationSeconds);
+    totalVisualDurationSeconds = normalizeTimelineSeconds(items.reduce((total, entry) => total + (Number(entry.durationSeconds || 0) || 0), 0)) || totalVisualDurationSeconds;
+  }
+
+  return {
+    extendedFinalImageSeconds,
+    items,
+    metadataUsed: true,
+    targetBackgroundMusicDurationSeconds,
+    targetNarrationDurationSeconds,
+    targetPlannedDurationSeconds,
+    targetDurationSeconds,
+    totalVisualDurationSeconds,
+  };
+}
+
+function buildVisualTimingPlan(visualCollection, effectiveConfig, primaryAudioArtifact, backgroundMusicArtifact) {
+  const fixedDurationSeconds = Math.max(0.1, Number(effectiveConfig.secondsPerItem || 0) || 4);
+  const requestedMode = normalizeMediaCompositionImageTimingMode(effectiveConfig.imageTimingMode);
+  const dynamicTiming = requestedMode === 'dynamicFromImageMetadata'
+    ? buildDynamicVisualTiming(visualCollection, fixedDurationSeconds, primaryAudioArtifact, backgroundMusicArtifact)
+    : null;
+  const visualItems = dynamicTiming?.items || buildFixedVisualTimingItems(visualCollection, fixedDurationSeconds);
+  const effectiveMode = dynamicTiming?.metadataUsed ? 'dynamicFromImageMetadata' : 'fixedDurationPerImage';
+  const fallbackDurationSeconds = requestedMode === 'dynamicFromImageMetadata' && !dynamicTiming?.metadataUsed ? fixedDurationSeconds : null;
+  const fallbackReason = dynamicTiming?.fallbackReason && fallbackDurationSeconds !== null
+    ? dynamicTiming.fallbackReason + ' Fallback used ' + fallbackDurationSeconds + ' seconds per image.'
+    : dynamicTiming?.fallbackReason || '';
+  const totalVisualDurationSeconds = normalizeTimelineSeconds(visualItems.reduce((total, entry) => total + (Number(entry.durationSeconds || 0) || 0), 0));
+  const perImageDurations = visualItems.map((entry, index) => ({
+    durationSeconds: normalizeTimelineSeconds(entry.durationSeconds),
+    endSeconds: normalizeTimelineSeconds(entry.endSeconds),
+    itemId: String(entry.itemId || '').trim(),
+    itemIndex: index,
+    startSeconds: normalizeTimelineSeconds(entry.startSeconds),
+  }));
+
+  return {
+    effectiveMode,
+    fallbackDurationSeconds,
+    fallbackReason,
+    fixedDurationSeconds,
+    perImageDurations,
+    requestedMode,
+    targetBackgroundMusicDurationSeconds: dynamicTiming?.targetBackgroundMusicDurationSeconds || getAudioArtifactDurationSeconds(backgroundMusicArtifact),
+    targetNarrationDurationSeconds: dynamicTiming?.targetNarrationDurationSeconds || getAudioArtifactDurationSeconds(primaryAudioArtifact),
+    targetPlannedDurationSeconds: dynamicTiming?.targetPlannedDurationSeconds || getCollectionPlannedDurationSeconds(visualCollection),
+    targetDurationSeconds: dynamicTiming?.targetDurationSeconds || null,
+    timingMetadataUsed: Boolean(dynamicTiming?.metadataUsed),
+    totalVisualDurationSeconds,
+    extendedFinalImageSeconds: dynamicTiming?.extendedFinalImageSeconds || 0,
+    visualItems,
+  };
+}
 async function executeMediaCompositionNode(node, graph, run) {
+  const effectiveConfig = getMediaCompositionEffectiveConfig(node, run);
   const visualCollection = getNodeInputArtifact(node.id, 'visuals', graph, run.resultsByNodeId, run);
   if (!isArtifactCollection(visualCollection)) {
     throw new Error('This media composition step needs an ordered image collection on the Visual Collection input.');
   }
   if (String(visualCollection.itemKind || '').trim() !== PORT_KIND_IMAGE) {
     throw new Error('This first media composition pass only accepts ordered image collections as the visual track input.');
-  }
-
-  const durationSeconds = Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4);
-  const visualItems = (Array.isArray(visualCollection.items) ? visualCollection.items : [])
-    .map((entry, index) => ({
-      artifact: entry?.artifact || null,
-      durationSeconds,
-      itemId: String(entry?.itemId || '').trim() || `visual-${index + 1}`,
-      lineage: entry?.lineage || null,
-      summary: String(entry?.summary || summarizeArtifact(entry?.artifact || null)).trim(),
-    }))
-    .filter((entry) => entry.artifact);
-  if (!visualItems.length) {
-    throw new Error('This media composition does not have any saved images to assemble yet.');
   }
 
   const audioArtifact = getNodeInputArtifact(node.id, 'audio', graph, run.resultsByNodeId, run);
@@ -5468,10 +6295,17 @@ async function executeMediaCompositionNode(node, graph, run) {
     throw new Error('The Background Music input needs one audio artifact when it is connected.');
   }
 
+  const timingPlan = buildVisualTimingPlan(visualCollection, effectiveConfig, audioArtifact, backgroundMusicArtifact);
+  const visualItems = timingPlan.visualItems;
+  const sceneTransitionPlan = buildSceneTransitionPlan(visualItems, effectiveConfig, timingPlan);
+  if (!visualItems.length) {
+    throw new Error('This media composition does not have any saved images to assemble yet.');
+  }
+
   const composition = createCompositionArtifact({
     audioMix: {
-      backgroundMusicVolume: normalizeMediaCompositionVolume(node.config?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
-      narrationVolume: normalizeMediaCompositionVolume(node.config?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+      backgroundMusicVolume: normalizeMediaCompositionVolume(effectiveConfig.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+      narrationVolume: normalizeMediaCompositionVolume(effectiveConfig.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
     },
     displayName: node.label,
     exportKind: PORT_KIND_VIDEO,
@@ -5480,18 +6314,37 @@ async function executeMediaCompositionNode(node, graph, run) {
     tracks: [
       {
         id: 'visual-track',
-        itemDurationSeconds: durationSeconds,
+        imageTimingMode: timingPlan.effectiveMode,
+        itemDurationSeconds: timingPlan.fixedDurationSeconds,
         itemKind: PORT_KIND_IMAGE,
         items: visualItems,
         kind: 'visual-sequence',
         role: 'primary-visual',
+        sceneTransitions: sceneTransitionPlan,
         sourceCollection: {
           directoryPath: String(visualCollection.directoryPath || '').trim(),
           displayName: String(visualCollection.displayName || '').trim(),
           itemCount: Number(visualCollection.itemCount || visualItems.length) || visualItems.length,
           itemKind: String(visualCollection.itemKind || '').trim() || PORT_KIND_IMAGE,
           manifestPath: String(visualCollection.manifestPath || '').trim(),
+          metadata: visualCollection.metadata ? serializeArtifactForUi(visualCollection.metadata) : null,
           summary: String(visualCollection.summary || '').trim(),
+        },
+        timing: {
+          effectiveMode: timingPlan.effectiveMode,
+          extendedFinalImageSeconds: timingPlan.extendedFinalImageSeconds,
+          fallbackDurationSeconds: timingPlan.fallbackDurationSeconds,
+          fallbackReason: timingPlan.fallbackReason,
+          fixedDurationSeconds: timingPlan.fixedDurationSeconds,
+          imageTimingMode: timingPlan.effectiveMode,
+          perImageDurations: timingPlan.perImageDurations,
+          requestedMode: timingPlan.requestedMode,
+          targetBackgroundMusicDurationSeconds: timingPlan.targetBackgroundMusicDurationSeconds,
+          targetNarrationDurationSeconds: timingPlan.targetNarrationDurationSeconds,
+          targetPlannedDurationSeconds: timingPlan.targetPlannedDurationSeconds,
+          timingMetadataUsed: timingPlan.timingMetadataUsed,
+          totalVisualDurationSeconds: timingPlan.totalVisualDurationSeconds,
+          sceneTransitions: sceneTransitionPlan,
         },
       },
       ...(audioArtifact ? [{
@@ -5519,31 +6372,45 @@ async function executeMediaCompositionNode(node, graph, run) {
     target: 'artifacts',
   });
 
+  const timingMessage = timingPlan.timingMetadataUsed
+    ? ' using per-image timing metadata'
+    : timingPlan.requestedMode === 'dynamicFromImageMetadata'
+      ? ' using fixed image timing because timing metadata was missing or invalid'
+      : ' using fixed image timing';
+  const fallbackMessage = timingPlan.fallbackReason ? ' Fallback reason: ' + timingPlan.fallbackReason : '';
   return {
     message: audioArtifact && backgroundMusicArtifact
-      ? `Media Composition prepared the ordered images with primary narration at ${formatMediaCompositionVolumePercent(node.config?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}% and background music at ${formatMediaCompositionVolumePercent(node.config?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}%.`
+      ? `Media Composition prepared the ordered images${timingMessage} with primary narration at ${formatMediaCompositionVolumePercent(effectiveConfig.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}% and background music at ${formatMediaCompositionVolumePercent(effectiveConfig.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}%.${fallbackMessage}`
       : audioArtifact
-        ? 'Media Composition prepared the ordered images with the connected primary audio track.'
+        ? 'Media Composition prepared the ordered images' + timingMessage + ' with the connected primary audio track.' + fallbackMessage
         : backgroundMusicArtifact
-          ? 'Media Composition prepared the ordered images with background music and no primary narration yet.'
-          : 'Media Composition prepared the ordered images without any audio tracks yet.',
+          ? 'Media Composition prepared the ordered images' + timingMessage + ' with background music and no primary narration yet.' + fallbackMessage
+          : 'Media Composition prepared the ordered images' + timingMessage + ' without any audio tracks yet.' + fallbackMessage,
     outputs: {
       composition: persistedComposition,
     },
     preview: summarizeArtifact(persistedComposition),
   };
 }
-
 async function executeMediaExportNode(node, graph, run, reportProgress) {
-  const compositionArtifact = getNodeInputArtifact(node.id, 'composition', graph, run.resultsByNodeId, run);
+  const compositionInput = getNodeInputArtifacts(node.id, 'composition', graph, run.resultsByNodeId, run)[0] || null;
+  const compositionArtifact = compositionInput?.artifact || null;
   if (!isCompositionArtifact(compositionArtifact)) {
     throw new Error('This media export step needs a saved media composition before it can render a video.');
   }
 
+  const mediaCompositionNode = compositionInput?.edge?.source?.nodeId
+    ? graph.nodeMap.get(compositionInput.edge.source.nodeId) || null
+    : null;
   const exportResult = await exportCompositionArtifactToVideo(compositionArtifact, {
     fitMode: String(node.config?.fitMode || '').trim() === 'cover' ? 'cover' : 'contain',
     fps: Math.max(1, Number(node.config?.fps || 0) || 30),
     height: Math.max(16, Number(node.config?.height || 0) || 720),
+    mediaCompositionNodeId: mediaCompositionNode?.type === 'mediaComposition' ? mediaCompositionNode.id : '',
+    mediaCompositionNodeLabel: mediaCompositionNode?.type === 'mediaComposition' ? mediaCompositionNode.label : '',
+    mediaExportNodeId: node.id,
+    mediaExportNodeLabel: node.label,
+    cancelSignal: activeRunAbortController?.signal || null,
     reportProgress,
     runDirectories: run.directories,
     stopMode: String(node.config?.stopMode || '').trim() === 'visuals' ? 'visuals' : 'shortest',
@@ -5626,6 +6493,7 @@ async function executeCollectionInputNode(node, run) {
         }),
         itemId,
         lineage: buildCollectionInputLineage(node, itemId, index),
+        metadata: item.metadata && typeof item.metadata === 'object' ? serializeArtifactForUi(item.metadata) : null,
       });
       continue;
     }
@@ -5648,12 +6516,14 @@ async function executeCollectionInputNode(node, run) {
       }),
       itemId,
       lineage: buildCollectionInputLineage(node, itemId, index),
+      metadata: item.metadata && typeof item.metadata === 'object' ? serializeArtifactForUi(item.metadata) : null,
     });
   }
 
   const collection = createArtifactCollection(collectionItems, {
     displayName: node.label,
     itemKind: itemType,
+    metadata: node.config?.metadata && typeof node.config.metadata === 'object' ? serializeArtifactForUi(node.config.metadata) : null,
     role: 'input',
   });
   const persistedCollection = await persistArtifactCollection(run.directories, collection, {
@@ -6554,6 +7424,9 @@ function resumePipelineValidation(runId, payload = {}) {
   }
 
   const comment = String(payload.comment || '').trim();
+  const retryOverrideConfig = decision === 'fail'
+    ? applyValidationRetryOverrides(activeRun, pendingValidation, payload)
+    : null;
   const nodeState = activeRun.nodeStates?.[pendingValidation.nodeId] || null;
   activeRun.pendingValidation = null;
   activeRun.status = 'running';
@@ -6570,6 +7443,7 @@ function resumePipelineValidation(runId, payload = {}) {
     action: 'route',
     comment,
     decision,
+    retryOverrides: retryOverrideConfig && Object.keys(retryOverrideConfig).length ? retryOverrideConfig : null,
   });
   return getActiveRunSnapshot();
 }

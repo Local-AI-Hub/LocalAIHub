@@ -1635,13 +1635,14 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
     const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
     throw new Error(operationLabel + ' could not render captions into this video. ' + (failureLine || 'Check the video and caption timing input, then try again.'));
   }
+  const createdBy = buildCreatedBy(options.node, 'burnSubtitles');
   const subtitleBurn = {
     backend: 'ffmpeg',
     backendLabel: 'Bundled ffmpeg',
     captionCount: subtitleSource.captionCount,
     captionMode: subtitleSource.mode,
     captionSource: buildArtifactReference(captionArtifact),
-    createdBy: buildCreatedBy(options.node, 'burnSubtitles'),
+    createdBy,
     durationPerCaptionSeconds: subtitleSource.mode === 'manualLines' ? Math.max(0.1, Number(options.durationPerCaptionSeconds || 3) || 3) : null,
     ffmpegMode: command.mode,
     generatedSubtitleFormat: subtitleSource.subtitleFormat,
@@ -1649,9 +1650,15 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
     operation: 'burnSubtitles',
     operationId: 'burnSubtitles',
     outputFormat,
+    pipelineTrace: {
+      burnSubtitlesNodeId: createdBy.nodeId,
+      burnSubtitlesNodeLabel: createdBy.nodeLabel,
+    },
     position: 'bottom',
-    style: subtitleStyle,
     sourceVideo: buildVideoReference(videoArtifact),
+    sourceVideoLineage: options.sourceVideoLineage && typeof options.sourceVideoLineage === 'object' ? { ...options.sourceVideoLineage } : null,
+    sourceVideoPath: sourcePath,
+    style: subtitleStyle,
   };
   const artifact = await buildFileArtifact(outputPath, {
     displayName: String(options.displayName || options.node?.label || 'Captioned video').trim() || 'Captioned video',
@@ -1665,7 +1672,7 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
   if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
   return {
     destinationPath: outputPath,
-    message: operationLabel + ' rendered captions into an MP4 video.',
+    message: operationLabel + ' rendered captions into an MP4 video using ' + subtitleStyle.fontSize + 'px ' + subtitleStyle.fontPreset + ' captions at ' + subtitleStyle.position + '.',
     outputs: { video: artifact },
     preview: summarizeArtifact(artifact),
   };

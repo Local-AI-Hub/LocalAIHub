@@ -87,6 +87,8 @@ const {
   DEFAULT_PIPELINE_RUN_SETTINGS,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
+  MEDIA_COMPOSITION_TRANSITION_MODES,
   normalizeAudioModeForLocalTool,
   normalizePipelineRunSettings,
   DEFAULT_PLANNING_SCHEMA_ID,
@@ -113,6 +115,34 @@ const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
 const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ? getPlanningSchemaOptions() : [];
 const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
 const EMPTY_GRAPH_WORKFLOW_PRESETS = Object.freeze([]);
+const MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS = Array.isArray(MEDIA_COMPOSITION_TRANSITION_CATEGORIES) ? MEDIA_COMPOSITION_TRANSITION_CATEGORIES : [];
+const MEDIA_COMPOSITION_TRANSITION_MODE_OPTIONS = Object.freeze([
+  ['off', 'Off'],
+  ['single', 'Single transition'],
+  ['randomCategory', 'Random from category'],
+  ['randomSelected', 'Random from selected list'],
+]);
+
+function formatMediaCompositionTransitionLabel(value) {
+  return String(value || '')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/([a-z]+)(left|right|up|down|black|white|grays|fast|slow)$/i, '$1 $2')
+    .replace(/^./, (letter) => letter.toUpperCase());
+}
+
+function getMediaCompositionTransitionMode(value) {
+  const mode = String(value || '').trim();
+  return Object.values(MEDIA_COMPOSITION_TRANSITION_MODES || {}).includes(mode) ? mode : 'off';
+}
+
+function getMediaCompositionTransitionCategory(value) {
+  const categoryId = String(value || '').trim();
+  return MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS.some((category) => category.id === categoryId) ? categoryId : 'fades';
+}
+
+function getMediaCompositionSelectedTransitions(value) {
+  return Array.isArray(value) && value.length ? value : ['fade', 'dissolve'];
+}
 
 function isDraftSecondsValue(value) {
   return /^\d*(?:\.\d*)?$/.test(String(value || ''));
@@ -143,6 +173,120 @@ function formatAudioMixSummary(audioMix) {
     return `This export used the primary narration track at ${narrationPercent}%.`;
   }
   return 'This export did not include audio.';
+}
+
+const BURN_SUBTITLES_CAPTION_MODE_OPTIONS = Object.freeze([
+  ['auto', 'Auto'], ['transcriptSegments', 'Transcript segments'], ['subtitleFile', 'Subtitle file'], ['manualLines', 'Manual text lines'],
+]);
+const BURN_SUBTITLES_TEXT_COLOR_OPTIONS = Object.freeze([
+  ['white', 'White'], ['black', 'Black'], ['yellow', 'Yellow'], ['red', 'Red'], ['blue', 'Blue'], ['green', 'Green'], ['cyan', 'Cyan'], ['magenta', 'Magenta'], ['lightGray', 'Light gray'], ['darkGray', 'Dark gray'],
+]);
+const BURN_SUBTITLES_OUTLINE_COLOR_OPTIONS = Object.freeze([
+  ['black', 'Black'], ['white', 'White'], ['darkGray', 'Dark gray'], ['lightGray', 'Light gray'], ['yellow', 'Yellow'], ['red', 'Red'], ['blue', 'Blue'],
+]);
+const BURN_SUBTITLES_POSITION_OPTIONS = Object.freeze([
+  ['bottomCenter', 'Bottom center'], ['bottomLeft', 'Bottom left'], ['bottomRight', 'Bottom right'], ['topCenter', 'Top center'], ['topLeft', 'Top left'], ['topRight', 'Top right'], ['center', 'Center'],
+]);
+const BURN_SUBTITLES_FONT_PRESET_OPTIONS = Object.freeze([
+  ['arial', 'Arial'], ['segoeUi', 'Segoe UI'], ['tahoma', 'Tahoma'], ['verdana', 'Verdana'],
+]);
+const BURN_SUBTITLES_BACKGROUND_OPACITY_OPTIONS = Object.freeze([
+  ['25', '25%'], ['50', '50%'], ['75', '75%'], ['100', '100%'],
+]);
+
+function normalizeRetryNumber(value, fallback, minValue = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.round(Math.max(minValue, numeric) * 10) / 10;
+}
+
+function normalizeRetryOption(value, options, fallback) {
+  const normalized = String(value || fallback).trim();
+  return options.some(([optionValue]) => optionValue === normalized) ? normalized : fallback;
+}
+
+function normalizeRetryBackgroundOpacity(value, fallback = 50) {
+  const numeric = Number(value);
+  return [25, 50, 75, 100].includes(numeric) ? numeric : fallback;
+}
+
+function getPendingMediaCompositionRetryDefaults(pendingValidation) {
+  const control = pendingValidation?.retryControls?.mediaComposition || null;
+  if (!control) {
+    return null;
+  }
+
+  return {
+    backgroundMusicVolume: normalizeVolumeGain(control.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    narrationVolume: normalizeVolumeGain(control.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+  };
+}
+
+function getMediaCompositionRetryPayload(retryOverrides) {
+  if (!retryOverrides || typeof retryOverrides !== 'object') {
+    return null;
+  }
+
+  return {
+    backgroundMusicVolume: normalizeVolumeGain(retryOverrides.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    narrationVolume: normalizeVolumeGain(retryOverrides.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+  };
+}
+
+function getPendingBurnSubtitlesRetryDefaults(pendingValidation) {
+  const settings = pendingValidation?.retryControls?.burnSubtitles?.settings || null;
+  if (!settings) {
+    return null;
+  }
+
+  return {
+    backgroundBox: settings.backgroundBox === true,
+    backgroundOpacity: normalizeRetryBackgroundOpacity(settings.backgroundOpacity, 50),
+    bold: settings.bold === true,
+    bottomMargin: normalizeRetryNumber(settings.bottomMargin, 32, 0),
+    captionMode: normalizeRetryOption(settings.captionMode, BURN_SUBTITLES_CAPTION_MODE_OPTIONS, 'auto'),
+    durationPerCaptionSeconds: normalizeRetryNumber(settings.durationPerCaptionSeconds, 3, 0.1),
+    fontPreset: normalizeRetryOption(settings.fontPreset, BURN_SUBTITLES_FONT_PRESET_OPTIONS, 'arial'),
+    fontSize: normalizeRetryNumber(settings.fontSize, 28, 1),
+    italic: settings.italic === true,
+    outline: normalizeRetryNumber(settings.outline, 2, 0),
+    outlineColor: normalizeRetryOption(settings.outlineColor, BURN_SUBTITLES_OUTLINE_COLOR_OPTIONS, 'black'),
+    position: normalizeRetryOption(settings.position, BURN_SUBTITLES_POSITION_OPTIONS, 'bottomCenter'),
+    shadow: normalizeRetryNumber(settings.shadow, 1, 0),
+    textColor: normalizeRetryOption(settings.textColor, BURN_SUBTITLES_TEXT_COLOR_OPTIONS, 'white'),
+  };
+}
+
+function getBurnSubtitlesRetryPayload(retryOverrides) {
+  if (!retryOverrides || typeof retryOverrides !== 'object') {
+    return null;
+  }
+
+  return {
+    backgroundBox: retryOverrides.backgroundBox === true,
+    backgroundOpacity: normalizeRetryBackgroundOpacity(retryOverrides.backgroundOpacity, 50),
+    bold: retryOverrides.bold === true,
+    bottomMargin: normalizeRetryNumber(retryOverrides.bottomMargin, 32, 0),
+    captionMode: normalizeRetryOption(retryOverrides.captionMode, BURN_SUBTITLES_CAPTION_MODE_OPTIONS, 'auto'),
+    durationPerCaptionSeconds: normalizeRetryNumber(retryOverrides.durationPerCaptionSeconds, 3, 0.1),
+    fontPreset: normalizeRetryOption(retryOverrides.fontPreset, BURN_SUBTITLES_FONT_PRESET_OPTIONS, 'arial'),
+    fontSize: normalizeRetryNumber(retryOverrides.fontSize, 28, 1),
+    italic: retryOverrides.italic === true,
+    outline: normalizeRetryNumber(retryOverrides.outline, 2, 0),
+    outlineColor: normalizeRetryOption(retryOverrides.outlineColor, BURN_SUBTITLES_OUTLINE_COLOR_OPTIONS, 'black'),
+    position: normalizeRetryOption(retryOverrides.position, BURN_SUBTITLES_POSITION_OPTIONS, 'bottomCenter'),
+    shadow: normalizeRetryNumber(retryOverrides.shadow, 1, 0),
+    textColor: normalizeRetryOption(retryOverrides.textColor, BURN_SUBTITLES_TEXT_COLOR_OPTIONS, 'white'),
+  };
+}
+
+function getPendingValidationRetryDefaults(pendingValidation) {
+  return {
+    mediaComposition: getPendingMediaCompositionRetryDefaults(pendingValidation),
+    burnSubtitles: getPendingBurnSubtitlesRetryDefaults(pendingValidation),
+  };
 }
 
 function getPipelinePortCenterKey(nodeId, direction, portId) {
@@ -960,7 +1104,10 @@ function buildNodePreview(node, runState) {
   }
 
   if (node.type === 'mediaComposition') {
-    return `${Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4)}s per image | optional narration + music`;
+    const timingMode = node.config?.imageTimingMode === 'dynamicFromImageMetadata' || node.config?.imageTimingMode === 'matchNarrationTiming' ? 'match narration timing' : `${Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4)}s per image`;
+    const transitionMode = getMediaCompositionTransitionMode(node.config?.sceneTransitionMode);
+    const transitionLabel = transitionMode === 'off' ? '' : ' | scene transitions';
+    return `${timingMode}${transitionLabel} | optional narration + music`;
   }
 
   if (node.type === 'mediaExport') {
@@ -2106,7 +2253,7 @@ function ResultCard({ result, onOpenPath, onRevealPath }) {
     </div>
   );
 }
-function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, onDecide, onOpenPath, onRevealPath, busy }) {
+function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, onChangeComment, onChangeRetryOverride, onDecide, onOpenPath, onRevealPath, busy }) {
   if (!pendingValidation) {
     return null;
   }
@@ -2120,7 +2267,14 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
   const collectionMapLabel = collectionMapContext
     ? 'Map item ' + String(Number(collectionMapContext.itemIndex || 0) + 1) + ' of ' + collectionMapContext.itemCount + (collectionMapContext.itemId ? ' (' + collectionMapContext.itemId + ')' : '')
     : '';
-  return (
+  const mediaCompositionRetryControl = pendingValidation.retryControls?.mediaComposition || null;
+  const mediaCompositionRetryValues = retryOverrides?.mediaComposition || getPendingMediaCompositionRetryDefaults(pendingValidation);
+  const burnSubtitlesRetryControl = pendingValidation.retryControls?.burnSubtitles || null;
+  const burnSubtitlesRetryValues = retryOverrides?.burnSubtitles || getPendingBurnSubtitlesRetryDefaults(pendingValidation);
+  const burnSubtitlesCaptionModeOptions = BURN_SUBTITLES_CAPTION_MODE_OPTIONS.filter(([optionValue]) => {
+    const allowedOptions = Array.isArray(burnSubtitlesRetryControl?.captionModeOptions) ? burnSubtitlesRetryControl.captionModeOptions : [];
+    return !allowedOptions.length || allowedOptions.includes(optionValue);
+  });  return (
     <div className="rounded-[26px] border border-violet-400/30 bg-violet-400/10 p-4 text-violet-50">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -2146,7 +2300,108 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
       <PlanReviewEvidence planReview={pendingValidation.planReview || pendingValidation.reviewContext?.planReview} />
       {artifactPath ? <input className="store-input mt-4" readOnly value={artifactPath} /> : null}
       <PathButtons onOpenPath={onOpenPath} onRevealPath={onRevealPath} path={artifactPath} />
-      <label className="mt-4 block text-xs uppercase tracking-[0.18em] text-violet-100/80" htmlFor="validation-comment">
+      {mediaCompositionRetryControl && mediaCompositionRetryValues ? (
+        <div className="mt-4 border-t border-violet-200/20 pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.18em] text-violet-100/80">Retry settings</p>
+              <p className="mt-2 text-sm font-semibold text-white">{mediaCompositionRetryControl.nodeLabel || 'Media Composition'}</p>
+            </div>
+            <span className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-violet-100/80">Temporary</span>
+          </div>
+          <p className="mt-3 text-xs leading-5 text-violet-50/80">These levels apply only if you choose Fail to retry the next export. The saved pipeline stays unchanged.</p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-narration-volume">Narration volume</label>
+              <div className="mt-3 flex items-center gap-3">
+                <input className="min-w-0 flex-1 accent-cyan-300" disabled={busy} id="validation-media-composition-narration-volume" max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { narrationVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME) })} step="1" type="range" value={formatVolumePercent(mediaCompositionRetryValues.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)} />
+                <input className="store-input w-24" disabled={busy} max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { narrationVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME) })} step="1" type="number" value={formatVolumePercent(mediaCompositionRetryValues.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)} />
+              </div>
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-background-volume">Background music volume</label>
+              <div className="mt-3 flex items-center gap-3">
+                <input className="min-w-0 flex-1 accent-cyan-300" disabled={busy} id="validation-media-composition-background-volume" max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { backgroundMusicVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME) })} step="1" type="range" value={formatVolumePercent(mediaCompositionRetryValues.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)} />
+                <input className="store-input w-24" disabled={busy} max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { backgroundMusicVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME) })} step="1" type="number" value={formatVolumePercent(mediaCompositionRetryValues.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)} />
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {burnSubtitlesRetryControl && burnSubtitlesRetryValues ? (
+        <div className="mt-4 border-t border-violet-200/20 pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.18em] text-violet-100/80">Retry caption settings</p>
+              <p className="mt-2 text-sm font-semibold text-white">{burnSubtitlesRetryControl.nodeLabel || 'Burn Subtitles / Captions'}</p>
+            </div>
+            <span className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-violet-100/80">Temporary</span>
+          </div>
+          <p className="mt-3 text-xs leading-5 text-violet-50/80">These settings apply only if you choose Fail to retry the next burned-caption video. The saved pipeline stays unchanged.</p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-mode">Caption timing</label>
+              <select className="store-input mt-3" disabled={busy} id="validation-burn-subtitles-mode" onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { captionMode: event.target.value })} value={burnSubtitlesRetryValues.captionMode || 'auto'}>
+                {burnSubtitlesCaptionModeOptions.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+              </select>
+            </div>
+            {burnSubtitlesRetryValues.captionMode === 'manualLines' ? (
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-duration">Duration per caption</label>
+                <input className="store-input mt-3" disabled={busy} id="validation-burn-subtitles-duration" inputMode="decimal" min="0.1" onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { durationPerCaptionSeconds: normalizeRetryNumber(event.target.value, 3, 0.1) })} step="0.1" type="number" value={burnSubtitlesRetryValues.durationPerCaptionSeconds ?? 3} />
+              </div>
+            ) : null}
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-4">
+            {[
+              ['validation-burn-subtitles-font-size', 'Font size', 'fontSize', 28, 1],
+              ['validation-burn-subtitles-outline', 'Outline', 'outline', 2, 0],
+              ['validation-burn-subtitles-shadow', 'Shadow', 'shadow', 1, 0],
+              ['validation-burn-subtitles-margin', 'Vertical margin', 'bottomMargin', 32, 0],
+            ].map(([inputId, label, key, fallback, minValue]) => (
+              <div key={inputId}>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor={inputId}>{label}</label>
+                <input className="store-input mt-3" disabled={busy} id={inputId} inputMode="decimal" min={String(minValue)} onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { [key]: normalizeRetryNumber(event.target.value, fallback, minValue) })} step="0.1" type="number" value={burnSubtitlesRetryValues[key] ?? fallback} />
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            {[
+              ['validation-burn-subtitles-text-color', 'Text color', 'textColor', 'white', BURN_SUBTITLES_TEXT_COLOR_OPTIONS],
+              ['validation-burn-subtitles-outline-color', 'Outline color', 'outlineColor', 'black', BURN_SUBTITLES_OUTLINE_COLOR_OPTIONS],
+              ['validation-burn-subtitles-position', 'Position', 'position', 'bottomCenter', BURN_SUBTITLES_POSITION_OPTIONS],
+              ['validation-burn-subtitles-font-preset', 'Font preset', 'fontPreset', 'arial', BURN_SUBTITLES_FONT_PRESET_OPTIONS],
+            ].map(([inputId, label, key, fallback, options]) => (
+              <div key={inputId}>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor={inputId}>{label}</label>
+                <select className="store-input mt-3" disabled={busy} id={inputId} onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { [key]: event.target.value })} value={String(burnSubtitlesRetryValues[key] || fallback)}>
+                  {options.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                </select>
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-4">
+            {[
+              ['validation-burn-subtitles-bold', 'Bold', 'bold'],
+              ['validation-burn-subtitles-italic', 'Italic', 'italic'],
+              ['validation-burn-subtitles-background-box', 'Background box', 'backgroundBox'],
+            ].map(([inputId, label, key]) => (
+              <label className="flex items-center gap-3 border border-white/10 bg-slate-950/30 px-3 py-3 text-sm text-violet-50/90" htmlFor={inputId} key={inputId}>
+                <input checked={burnSubtitlesRetryValues[key] === true} className="h-4 w-4 accent-cyan-300" disabled={busy} id={inputId} onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { [key]: event.target.checked })} type="checkbox" />
+                <span>{label}</span>
+              </label>
+            ))}
+            {burnSubtitlesRetryValues.backgroundBox === true ? (
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-background-opacity">Background opacity</label>
+                <select className="store-input mt-3" disabled={busy} id="validation-burn-subtitles-background-opacity" onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { backgroundOpacity: Number(event.target.value) })} value={String(burnSubtitlesRetryValues.backgroundOpacity ?? 50)}>
+                  {BURN_SUBTITLES_BACKGROUND_OPACITY_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                </select>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}      <label className="mt-4 block text-xs uppercase tracking-[0.18em] text-violet-100/80" htmlFor="validation-comment">
         Optional note
       </label>
       <textarea
@@ -2168,7 +2423,7 @@ function ValidationDecisionCard({ pendingValidation, comment, onChangeComment, o
   );
 }
 
-function PipelineTimeline({ draft, runState, validationComment, onChangeValidationComment, onDecideValidation, onOpenPath, onRevealPath, validationBusy }) {
+function PipelineTimeline({ draft, runState, validationComment, validationRetryOverrides, onChangeValidationComment, onChangeValidationRetryOverride, onDecideValidation, onOpenPath, onRevealPath, validationBusy }) {
   const activeNodeState = runState?.currentNodeId ? runState.nodeStates?.[runState.currentNodeId] || null : null;
   const activeAttemptLabel = formatAttemptLabel(activeNodeState?.iteration, activeNodeState?.loopMaxAttempts);
   const loopStates = Object.values(runState?.loopStates || {});
@@ -2236,10 +2491,12 @@ function PipelineTimeline({ draft, runState, validationComment, onChangeValidati
           busy={validationBusy}
           comment={validationComment}
           onChangeComment={onChangeValidationComment}
+          onChangeRetryOverride={onChangeValidationRetryOverride}
           onDecide={onDecideValidation}
           onOpenPath={onOpenPath}
           onRevealPath={onRevealPath}
           pendingValidation={runState.pendingValidation}
+          retryOverrides={validationRetryOverrides}
         />
       ) : null}
 
@@ -2741,6 +2998,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const [cancelBusy, setCancelBusy] = useState(false);
   const [validationBusy, setValidationBusy] = useState(false);
   const [validationComment, setValidationComment] = useState('');
+  const [validationRetryOverrides, setValidationRetryOverrides] = useState(null);
   const [dirty, setDirty] = useState(false);
   const [modelOptionsByNodeId, setModelOptionsByNodeId] = useState({});
   const [graphWorkflowPresets, setGraphWorkflowPresets] = useState(() => (Array.isArray(initialGraphWorkflowPresets) ? initialGraphWorkflowPresets : []));
@@ -3636,6 +3894,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
 
   useEffect(() => {
     setValidationComment('');
+    setValidationRetryOverrides(getPendingValidationRetryDefaults(runState?.pendingValidation));
   }, [runState?.pendingValidation?.requestId]);
 
   useEffect(() => {
@@ -4611,6 +4870,20 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     onToast(result.data?.message || 'Local AI Hub is stopping the active pipeline and will shut down any tool it started for the run.', 'success');
   }
 
+  function handleValidationRetryOverrideChange(section, patch) {
+    setValidationRetryOverrides((current) => {
+      const defaults = getPendingValidationRetryDefaults(runState?.pendingValidation);
+      const nextSection = String(section || '').trim();
+      return {
+        ...(current || defaults || {}),
+        [nextSection]: {
+          ...((current || defaults || {})[nextSection] || {}),
+          ...(patch || {}),
+        },
+      };
+    });
+  }
+
   async function handleValidationDecision(decision) {
     const pendingValidation = runState?.pendingValidation;
     if (!runState?.runId || !pendingValidation?.nodeId) {
@@ -4619,11 +4892,19 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
 
     setValidationBusy(true);
     try {
+      const retryDefaults = getPendingValidationRetryDefaults(pendingValidation);
+      const retryPayload = decision === 'fail'
+        ? {
+            ...(pendingValidation.retryControls?.mediaComposition ? { mediaComposition: getMediaCompositionRetryPayload(validationRetryOverrides?.mediaComposition || retryDefaults.mediaComposition) } : {}),
+            ...(pendingValidation.retryControls?.burnSubtitles ? { burnSubtitles: getBurnSubtitlesRetryPayload(validationRetryOverrides?.burnSubtitles || retryDefaults.burnSubtitles) } : {}),
+          }
+        : null;
       const result = await window.localAIHub.resumePipelineValidation({
         comment: validationComment,
         decision,
         nodeId: pendingValidation.nodeId,
         requestId: pendingValidation.requestId,
+        retryOverrides: retryPayload && Object.keys(retryPayload).length ? retryPayload : null,
         runId: runState.runId,
       });
       if (!result?.ok) {
@@ -4635,6 +4916,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
         applyRunSnapshot(result.data.run);
       }
       setValidationComment('');
+      setValidationRetryOverrides(null);
       onToast(result.data?.message || 'Validation decision saved.', 'success');
     } catch (error) {
       onToast(error?.message || 'Local AI Hub could not continue that validation step.', 'error');
@@ -6699,7 +6981,27 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                 {selectedNode.type === 'mediaComposition' ? (
                   <div className="space-y-4">
                     <div>
-                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-seconds">Seconds per image</label>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-timing-mode">Image timing</label>
+                      <select
+                        className="store-input mt-3"
+                        id="media-composition-timing-mode"
+                        onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                          ...currentNode,
+                          config: {
+                            ...currentNode.config,
+                            imageTimingMode: event.target.value === 'dynamicFromImageMetadata' ? 'dynamicFromImageMetadata' : 'fixedDurationPerImage',
+                          },
+                        }))}
+                        value={selectedNode.config?.imageTimingMode === 'dynamicFromImageMetadata' || selectedNode.config?.imageTimingMode === 'matchNarrationTiming' ? 'dynamicFromImageMetadata' : 'fixedDurationPerImage'}
+                      >
+                        <option value="fixedDurationPerImage">Fixed duration per image</option>
+                        <option value="dynamicFromImageMetadata">Match narration/transcript timing</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-seconds">
+                        {selectedNode.config?.imageTimingMode === 'dynamicFromImageMetadata' || selectedNode.config?.imageTimingMode === 'matchNarrationTiming' ? 'Fallback seconds per image' : 'Seconds per image'}
+                      </label>
                       <input
                         className="store-input mt-3"
                         id="media-composition-seconds"
@@ -6715,6 +7017,135 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         type="number"
                         value={selectedNode.config?.secondsPerItem || 4}
                       />
+                      {selectedNode.config?.imageTimingMode === 'dynamicFromImageMetadata' || selectedNode.config?.imageTimingMode === 'matchNarrationTiming' ? (
+                        <p className="mt-2 text-xs leading-5 text-slate-400">
+                          Used only as a fallback if transcript/image timing metadata is unavailable or invalid.
+                        </p>
+                      ) : null}
+                    </div>
+                    {selectedNode.config?.imageTimingMode === 'dynamicFromImageMetadata' || selectedNode.config?.imageTimingMode === 'matchNarrationTiming' ? (
+                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                        Uses per-image timing from the longform plan/transcript when available.
+                      </div>
+                    ) : null}
+                    <div className="space-y-3 border-t border-white/10 pt-4">
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-transition-mode">Scene transitions</label>
+                          <select
+                            className="store-input mt-3"
+                            id="media-composition-transition-mode"
+                            onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                              ...currentNode,
+                              config: {
+                                ...currentNode.config,
+                                sceneTransitionMode: getMediaCompositionTransitionMode(event.target.value),
+                              },
+                            }))}
+                            value={getMediaCompositionTransitionMode(selectedNode.config?.sceneTransitionMode)}
+                          >
+                            {MEDIA_COMPOSITION_TRANSITION_MODE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                          </select>
+                        </div>
+                        {getMediaCompositionTransitionMode(selectedNode.config?.sceneTransitionMode) !== 'off' ? (
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-transition-duration">Transition duration</label>
+                            <input
+                              className="store-input mt-3"
+                              id="media-composition-transition-duration"
+                              max="2"
+                              min="0.1"
+                              onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                                ...currentNode,
+                                config: {
+                                  ...currentNode.config,
+                                  sceneTransitionDurationSeconds: Math.max(0.1, Math.min(2, Number(event.target.value || 0) || 0.5)),
+                                },
+                              }))}
+                              step="0.1"
+                              type="number"
+                              value={selectedNode.config?.sceneTransitionDurationSeconds ?? 0.5}
+                            />
+                          </div>
+                        ) : null}
+                      </div>
+                      {getMediaCompositionTransitionMode(selectedNode.config?.sceneTransitionMode) === 'single' ? (
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-transition-name">Transition</label>
+                          <select
+                            className="store-input mt-3"
+                            id="media-composition-transition-name"
+                            onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, sceneTransitionName: event.target.value } }))}
+                            value={selectedNode.config?.sceneTransitionName || 'fade'}
+                          >
+                            {MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS.map((category) => (
+                              <optgroup key={category.id} label={category.label}>
+                                {category.transitions.map((transitionName) => <option key={transitionName} value={transitionName}>{formatMediaCompositionTransitionLabel(transitionName)}</option>)}
+                              </optgroup>
+                            ))}
+                          </select>
+                        </div>
+                      ) : null}
+                      {getMediaCompositionTransitionMode(selectedNode.config?.sceneTransitionMode) === 'randomCategory' ? (
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-transition-category">Transition category</label>
+                          <select
+                            className="store-input mt-3"
+                            id="media-composition-transition-category"
+                            onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, sceneTransitionCategory: getMediaCompositionTransitionCategory(event.target.value) } }))}
+                            value={getMediaCompositionTransitionCategory(selectedNode.config?.sceneTransitionCategory)}
+                          >
+                            {MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS.map((category) => <option key={category.id} value={category.id}>{category.label}</option>)}
+                          </select>
+                        </div>
+                      ) : null}
+                      {getMediaCompositionTransitionMode(selectedNode.config?.sceneTransitionMode) === 'randomSelected' ? (
+                        <div>
+                          <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Selected transitions</p>
+                          <div className="mt-3 max-h-56 overflow-y-auto border border-white/10 bg-slate-950/30 p-3">
+                            {MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS.map((category) => (
+                              <div className="mb-4 last:mb-0" key={category.id}>
+                                <p className="text-[11px] uppercase tracking-[0.16em] text-slate-500">{category.label}</p>
+                                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                                  {category.transitions.map((transitionName) => {
+                                    const selectedTransitions = getMediaCompositionSelectedTransitions(selectedNode.config?.sceneTransitionSelected);
+                                    return (
+                                      <label className="flex items-center gap-2 text-sm text-slate-300" htmlFor={`media-composition-transition-selected-${transitionName}`} key={transitionName}>
+                                        <input
+                                          checked={selectedTransitions.includes(transitionName)}
+                                          className="h-4 w-4 accent-cyan-300"
+                                          id={`media-composition-transition-selected-${transitionName}`}
+                                          onChange={(event) => updateNode(selectedNode.id, (currentNode) => {
+                                            const currentSelected = getMediaCompositionSelectedTransitions(currentNode.config?.sceneTransitionSelected);
+                                            const nextSelected = event.target.checked
+                                              ? [...new Set([...currentSelected, transitionName])]
+                                              : currentSelected.filter((entry) => entry !== transitionName);
+                                            return { ...currentNode, config: { ...currentNode.config, sceneTransitionSelected: nextSelected.length ? nextSelected : ['fade'] } };
+                                          })}
+                                          type="checkbox"
+                                        />
+                                        <span>{formatMediaCompositionTransitionLabel(transitionName)}</span>
+                                      </label>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      {getMediaCompositionTransitionMode(selectedNode.config?.sceneTransitionMode) === 'randomCategory' || getMediaCompositionTransitionMode(selectedNode.config?.sceneTransitionMode) === 'randomSelected' ? (
+                        <label className="flex items-center gap-3 text-sm text-slate-300" htmlFor="media-composition-transition-avoid-repeats">
+                          <input
+                            checked={selectedNode.config?.sceneTransitionAvoidRepeats !== false}
+                            className="h-4 w-4 accent-cyan-300"
+                            id="media-composition-transition-avoid-repeats"
+                            onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, sceneTransitionAvoidRepeats: event.target.checked } }))}
+                            type="checkbox"
+                          />
+                          <span>Avoid immediate repeats</span>
+                        </label>
+                      ) : null}
                     </div>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div>
@@ -7011,12 +7442,14 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                 <PipelineTimeline
                   draft={draft}
                   onChangeValidationComment={setValidationComment}
+                  onChangeValidationRetryOverride={handleValidationRetryOverrideChange}
                   onDecideValidation={handleValidationDecision}
                   onOpenPath={openPath}
                   onRevealPath={(pathValue) => openPath(pathValue, true)}
                   runState={runState}
                   validationBusy={validationBusy}
                   validationComment={validationComment}
+                  validationRetryOverrides={validationRetryOverrides}
                 />
               </div>
             ) : null}

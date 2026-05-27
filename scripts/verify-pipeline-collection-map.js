@@ -690,6 +690,33 @@ async function main() {
   assert(providerImageGenerationPrompts.every((prompt) => prompt.includes('anime film still') && prompt.includes('hand-painted background') && prompt.includes('soft sunlight')), 'collection text-to-image prompt style should apply required terms to every item prompt.');
   assert.strictEqual(mapState.outputs.collection.items[0].artifact.imageGeneration.promptStyle.id, 'style-anime-test', 'collection text-to-image metadata should record selected prompt style.');
 
+  providerImageGenerationPrompts.length = 0;
+  const timedImagePipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [
+      { id: 'timed-a', text: 'opening visual prompt', metadata: { startSeconds: 0, endSeconds: 18, durationSeconds: 18, narrationExcerpt: 'opening narration' } },
+      { id: 'timed-b', text: 'closing visual prompt', metadata: { startSeconds: 18, endSeconds: 40, durationSeconds: 22, narrationExcerpt: 'closing narration' } },
+    ],
+    mapConfig: {
+      executionMode: 'cloud',
+      mappingId: 'textToImage',
+      operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+      providerId: 'openai',
+      model: 'mock-image-model',
+      instruction: 'Generate the planned image.',
+    },
+  });
+  timedImagePipeline.nodes.find((node) => node.id === 'collection-input').config.metadata = {
+    timing: { timingMode: 'dynamicFromPlanTiming', totalPlannedDurationSeconds: 40, timedItemCount: 2 },
+  };
+  await runPipeline(timedImagePipeline);
+  const timedImageSnapshot = await waitForRunToFinish();
+  assert.strictEqual(timedImageSnapshot.status, 'completed', timedImageSnapshot.message);
+  const timedImageCollection = timedImageSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(timedImageCollection.items[1].metadata.startSeconds, 18, 'text-to-image collectionMap should preserve source startSeconds metadata.');
+  assert.strictEqual(timedImageCollection.items[1].metadata.durationSeconds, 22, 'text-to-image collectionMap should preserve source durationSeconds metadata.');
+  assert.strictEqual(timedImageCollection.metadata.timing.totalPlannedDurationSeconds, 40, 'text-to-image collectionMap should preserve collection timing metadata.');
+
   mockedInstalledTools = [createTool('audiocraft-webui', 'AudioCraft WebUI')];
   const textToAudioPipeline = buildCollectionInputMapPipeline({
     itemType: 'text',

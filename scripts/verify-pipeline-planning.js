@@ -8,6 +8,12 @@ const TEST_STORAGE_ROOT = path.join(process.cwd(), 'temp', 'verify-pipeline-plan
 function buildMockPlanReply() {
   return JSON.stringify({
     title: 'Episode 1 scene plan',
+    timing: {
+      timingMode: 'transcriptSegments',
+      totalDurationSeconds: 8.5,
+      source: 'Mock Whisper transcript segments',
+      coverageNotes: 'Two scenes cover the full mock narration without gaps or overlaps.',
+    },
     overview: {
       meaningIntent: 'Frame the episode as a grounded setup that earns curiosity and emotional investment.',
       viewerTakeaway: 'The viewer should understand the stakes, the central tension, and why the protagonist keeps going.',
@@ -25,6 +31,11 @@ function buildMockPlanReply() {
         sceneConcept: 'A grounded opening image that places the protagonist in a modest but visually rich environment.',
         treatmentApproach: 'Use restrained camera language, readable geography, and practical detail over spectacle.',
         narrationDraft: 'Open by naming the setting and the protagonist\'s present limitation in plain language.',
+        narrationExcerpt: 'A determined protagonist wakes before sunrise and realizes time is running out.',
+        sourceTranscriptSegmentIds: ['0'],
+        startSeconds: 0,
+        endSeconds: 3.25,
+        durationSeconds: 3.25,
         visualPromptDraft: 'Cinematic interior, grounded lived-in details, protagonist at the center, soft morning light, practical realism, high continuity.',
         riskNotes: ['Avoid inventing props or wardrobe details not supported by the source.'],
       },
@@ -36,6 +47,11 @@ function buildMockPlanReply() {
         sceneConcept: 'A moment of hesitation followed by a concrete decision that changes the episode direction.',
         treatmentApproach: 'Make the emotional beat clear first, then attach a strong visual action that can drive later shot work.',
         narrationDraft: 'Explain the cost of staying still and the reason the protagonist decides to act now.',
+        narrationExcerpt: 'They choose to leave home to confront the problem they have been avoiding.',
+        sourceTranscriptSegmentIds: ['1'],
+        startSeconds: 3.25,
+        endSeconds: 8.5,
+        durationSeconds: 5.25,
         visualPromptDraft: 'Character-driven turning point, visible hesitation, then decisive action, grounded cinematic realism, continuity with prior scene.',
         riskNotes: ['Leave room for later generation passes to refine exact blocking.'],
       },
@@ -128,6 +144,9 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
           assert(/planner request/i.test(String(payload.timeoutMessage || '')), 'Expected planner to pass a planner-specific timeout message.');
           assert.strictEqual(payload.responseFormat?.type, 'json_schema', 'Expected planner to request provider structured JSON when the planning schema defines it.');
           assert(payload.responseFormat?.schema?.properties?.scenes, 'Expected planner structured output request to include the longform scene JSON schema.');
+          assert(payload.responseFormat?.schema?.properties?.timing, 'Expected planner structured output request to include longform timing metadata.');
+          assert(payload.responseFormat?.schema?.properties?.scenes?.items?.properties?.startSeconds, 'Expected longform scene JSON schema to include startSeconds.');
+          assert(/cover the entire narration|no overlaps|no accidental gaps/i.test(messageText), 'Expected planner prompt to request full-duration timestamp coverage.');
           return {
             message: {
               content: buildMockPlanReply(),
@@ -416,6 +435,11 @@ async function main() {
   assert.strictEqual(sceneCollection.itemKind, 'text', 'Expected Plan Scenes to produce a text collection.');
   assert.strictEqual(sceneCollection.items.length, 2, 'Expected Plan Scenes to produce one text item per scene.');
   assert(/Visual prompt draft:/i.test(sceneCollection.items[0].artifact.text), 'Expected scene text items to carry prompt draft content.');
+  assert.strictEqual(sceneCollection.metadata?.timing?.timingMode, 'dynamicFromPlanTiming', 'Expected Plan Scenes collection metadata to opt into dynamic plan timing.');
+  assert.strictEqual(sceneCollection.metadata?.timing?.totalPlannedDurationSeconds, 8.5, 'Expected Plan Scenes collection metadata to preserve planned duration.');
+  assert.strictEqual(sceneCollection.items[1].metadata?.startSeconds, 3.25, 'Expected Plan Scenes item metadata to preserve startSeconds.');
+  assert.strictEqual(sceneCollection.items[1].metadata?.durationSeconds, 5.25, 'Expected Plan Scenes item metadata to preserve durationSeconds.');
+  assert(/Narration excerpt:/i.test(sceneCollection.items[0].artifact.text), 'Expected scene text items to carry narration excerpt context.');
 
   const collectionResult = completedRun.terminalResults?.find((entry) => entry.kind === 'collection') || null;
   assert(collectionResult, 'Expected a terminal collection result from Plan Scenes.');

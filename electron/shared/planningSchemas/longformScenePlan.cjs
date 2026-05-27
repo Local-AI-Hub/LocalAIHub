@@ -38,6 +38,12 @@ const CONSTRAINT_CONFLICT_RULES = Object.freeze([
 
 const SCENE_PLAN_RESPONSE_SHAPE_EXAMPLE = Object.freeze({
   title: 'Episode scene plan',
+  timing: {
+    timingMode: 'transcriptSegments',
+    totalDurationSeconds: 40,
+    source: 'Whisper transcript segments',
+    coverageNotes: 'Scenes cover the full timestamped narration without gaps or overlaps.',
+  },
   overview: {
     meaningIntent: 'What the story section is really trying to communicate.',
     viewerTakeaway: 'What the viewer should remember after the sequence.',
@@ -55,6 +61,11 @@ const SCENE_PLAN_RESPONSE_SHAPE_EXAMPLE = Object.freeze({
       sceneConcept: 'What happens visually in the scene.',
       treatmentApproach: 'How Local AI Hub should approach the scene.',
       narrationDraft: 'Optional narration or dialogue handling note.',
+      narrationExcerpt: 'The source narration text covered by this scene.',
+      sourceTranscriptSegmentIds: ['0', '1'],
+      startSeconds: 0,
+      endSeconds: 5.8,
+      durationSeconds: 5.8,
       visualPromptDraft: 'A practical prompt draft for later image or video work.',
       riskNotes: ['Ambiguities or continuity risks for this scene.'],
     },
@@ -65,9 +76,20 @@ const SCENE_PLAN_RESPONSE_SHAPE_EXAMPLE = Object.freeze({
 const SCENE_PLAN_RESPONSE_JSON_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
-  required: ['title', 'overview', 'scenes', 'openQuestions'],
+  required: ['title', 'timing', 'overview', 'scenes', 'openQuestions'],
   properties: {
     title: { type: 'string', description: 'Short title for the scene plan.' },
+    timing: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['timingMode', 'totalDurationSeconds', 'source', 'coverageNotes'],
+      properties: {
+        timingMode: { type: 'string', description: 'Use transcriptSegments when timestamped narration exists, estimated when only text length is available, or untimed when no useful timing source exists.' },
+        totalDurationSeconds: { type: ['number', 'null'], description: 'Total planned narration or visual duration in seconds when known.' },
+        source: { type: 'string', description: 'Timing source, such as Whisper transcript segments, audio duration, or estimated reading time.' },
+        coverageNotes: { type: 'string', description: 'Explain whether the scenes cover the full narration duration and mention any intentional gap.' },
+      },
+    },
     overview: {
       type: 'object',
       additionalProperties: false,
@@ -87,7 +109,7 @@ const SCENE_PLAN_RESPONSE_JSON_SCHEMA = Object.freeze({
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['sceneId', 'sourceSpanLabel', 'meaningIntent', 'viewerTakeaway', 'sceneConcept', 'treatmentApproach', 'narrationDraft', 'visualPromptDraft', 'riskNotes'],
+        required: ['sceneId', 'sourceSpanLabel', 'meaningIntent', 'viewerTakeaway', 'sceneConcept', 'treatmentApproach', 'narrationDraft', 'narrationExcerpt', 'sourceTranscriptSegmentIds', 'startSeconds', 'endSeconds', 'durationSeconds', 'visualPromptDraft', 'riskNotes'],
         properties: {
           sceneId: { type: 'string' },
           sourceSpanLabel: { type: 'string' },
@@ -96,6 +118,11 @@ const SCENE_PLAN_RESPONSE_JSON_SCHEMA = Object.freeze({
           sceneConcept: { type: 'string' },
           treatmentApproach: { type: 'string' },
           narrationDraft: { type: 'string' },
+          narrationExcerpt: { type: 'string', description: 'Source narration or transcript excerpt covered by this visual scene.' },
+          sourceTranscriptSegmentIds: { type: 'array', items: { type: 'string' }, description: 'Transcript segment indexes or ids used for this scene timing.' },
+          startSeconds: { type: ['number', 'null'], description: 'Scene start time in seconds from narration start when known.' },
+          endSeconds: { type: ['number', 'null'], description: 'Scene end time in seconds from narration start when known.' },
+          durationSeconds: { type: ['number', 'null'], description: 'Scene duration in seconds. Prefer endSeconds - startSeconds when timestamps exist.' },
           visualPromptDraft: { type: 'string' },
           riskNotes: { type: 'array', items: { type: 'string' } },
         },
@@ -112,9 +139,9 @@ const LONGFORM_SCENE_PLAN_SCHEMA = Object.freeze({
   id: LONGFORM_SCENE_PLAN_SCHEMA_ID,
   label: 'Scene plan',
   maturity: 'usable',
-  promptSummary: 'Create a staged longform-media scene plan that makes narrative intent, viewer takeaway, scene concept, treatment, risk notes, and prompt drafts explicit for each scene.',
-  shapeSummary: 'Overview plus ordered scenes with intent, takeaway, concept, treatment, risk notes, and prompt drafts.',
-  systemPrompt: 'You are the Local AI Hub Planner. Reason inside the provided planning schema, keep uncertainty explicit, do not invent source facts, and return JSON only.',
+  promptSummary: 'Create a timing-aware longform-media scene plan. When transcript or narration timestamps exist, segment the narration by timestamped semantic beats, create enough visual scenes to cover the full duration, and put startSeconds, endSeconds, durationSeconds, narrationExcerpt, sourceTranscriptSegmentIds, and visualPromptDraft on every scene.',
+  shapeSummary: 'Timing summary plus ordered scenes with intent, takeaway, concept, treatment, narration excerpt, source segment ids, start/end/duration seconds, risk notes, and prompt drafts.',
+  systemPrompt: 'You are the Local AI Hub Planner. Reason inside the provided planning schema, keep uncertainty explicit, do not invent source facts, and return JSON only. For timestamped narration, use transcript segment timing to cover the entire narration with ordered visual scenes: no zero-duration scenes, no overlaps, no accidental gaps, and the final scene should reach the narration end or target duration. Use semantic boundaries where possible instead of blindly dividing by a fixed image duration; if exact timestamps are unavailable, estimate reasonable durations and say so in timing.coverageNotes.',
   responseShapeExample: SCENE_PLAN_RESPONSE_SHAPE_EXAMPLE,
   sourceRequirements: Object.freeze({
     requireTextContext: true,
@@ -191,6 +218,24 @@ function createReviewFinding(severity, category, title, detail, options = {}) {
   };
 }
 
+function normalizeTimingSeconds(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return null;
+  }
+  return Math.round(numeric * 1000) / 1000;
+}
+
+function normalizeScenePlanTiming(value) {
+  const input = isRecord(value) ? value : {};
+  return {
+    timingMode: normalizeString(input.timingMode || input.mode),
+    totalDurationSeconds: normalizeTimingSeconds(input.totalDurationSeconds || input.durationSeconds),
+    source: normalizeTextBlock(input.source || input.timingSource),
+    coverageNotes: normalizeTextBlock(input.coverageNotes || input.notes),
+  };
+}
+
 function normalizeScenePlanOverview(value) {
   const input = isRecord(value) ? value : {};
   return {
@@ -213,6 +258,11 @@ function normalizeScenePlanScene(value, index) {
     sceneConcept: normalizeTextBlock(input.sceneConcept || input.concept),
     treatmentApproach: normalizeTextBlock(input.treatmentApproach || input.treatment),
     narrationDraft: normalizeTextBlock(input.narrationDraft || input.narration),
+    narrationExcerpt: normalizeTextBlock(input.narrationExcerpt || input.sourceText || input.sourceExcerpt || input.narration),
+    sourceTranscriptSegmentIds: normalizeStringList(input.sourceTranscriptSegmentIds || input.transcriptSegmentIds || input.sourceSegmentIds),
+    startSeconds: normalizeTimingSeconds(input.startSeconds ?? input.start),
+    endSeconds: normalizeTimingSeconds(input.endSeconds ?? input.end),
+    durationSeconds: normalizeTimingSeconds(input.durationSeconds ?? input.duration),
     visualPromptDraft: normalizeTextBlock(input.visualPromptDraft || input.promptDraft || input.prompt),
     riskNotes: normalizeStringList(input.riskNotes),
   };
@@ -232,6 +282,7 @@ function validatePlan(value) {
     schemaFamilyId: LONGFORM_MEDIA_SCHEMA_FAMILY_ID,
     schemaId: LONGFORM_SCENE_PLAN_SCHEMA_ID,
     title: normalizeString(value.title, 'Scene plan'),
+    timing: normalizeScenePlanTiming(value.timing),
     overview: normalizeScenePlanOverview(value.overview),
     scenes: (Array.isArray(value.scenes) ? value.scenes : []).map((scene, index) => normalizeScenePlanScene(scene, index)).filter(Boolean),
     openQuestions: normalizeStringList(value.openQuestions),
@@ -461,6 +512,20 @@ function buildReviewDocument(planValue, options = {}) {
   };
 }
 
+function resolveSceneTiming(scene) {
+  const startSeconds = normalizeTimingSeconds(scene.startSeconds);
+  const endSeconds = normalizeTimingSeconds(scene.endSeconds);
+  const derivedDuration = startSeconds !== null && endSeconds !== null && endSeconds > startSeconds
+    ? normalizeTimingSeconds(endSeconds - startSeconds)
+    : null;
+  const durationSeconds = normalizeTimingSeconds(scene.durationSeconds) || derivedDuration;
+  return {
+    startSeconds,
+    endSeconds,
+    durationSeconds,
+  };
+}
+
 function buildSceneText(scene, index, plan) {
   const parts = [
     (scene.sourceSpanLabel || scene.sceneId || 'Scene ' + String(index + 1)),
@@ -470,6 +535,9 @@ function buildSceneText(scene, index, plan) {
     scene.treatmentApproach ? 'Treatment: ' + scene.treatmentApproach : '',
     scene.visualPromptDraft ? 'Visual prompt draft: ' + scene.visualPromptDraft : '',
     scene.narrationDraft ? 'Narration draft: ' + scene.narrationDraft : '',
+    scene.narrationExcerpt ? 'Narration excerpt: ' + scene.narrationExcerpt : '',
+    scene.startSeconds !== null || scene.endSeconds !== null || scene.durationSeconds !== null ? 'Timing: start ' + (scene.startSeconds ?? 'unknown') + 's, end ' + (scene.endSeconds ?? 'unknown') + 's, duration ' + (scene.durationSeconds ?? 'unknown') + 's' : '',
+    Array.isArray(scene.sourceTranscriptSegmentIds) && scene.sourceTranscriptSegmentIds.length ? 'Source transcript segments: ' + scene.sourceTranscriptSegmentIds.join(', ') : '',
     Array.isArray(scene.riskNotes) && scene.riskNotes.length ? 'Risk notes: ' + scene.riskNotes.join(' | ') : '',
     Array.isArray(plan?.openQuestions) && plan.openQuestions.length ? 'Plan open questions: ' + plan.openQuestions.join(' | ') : '',
   ].filter(Boolean);
@@ -484,11 +552,33 @@ function buildTextCollectionItems(planValue) {
   }
 
   const plan = validation.value;
-  return plan.scenes.map((scene, index) => ({
-    displayName: scene.sourceSpanLabel || scene.sceneId || 'Scene ' + String(index + 1),
-    itemId: scene.sceneId || '',
-    text: buildSceneText(scene, index, plan),
-  }));
+  const sceneTimings = plan.scenes.map((scene) => resolveSceneTiming(scene));
+  const timedScenes = sceneTimings.filter((timing) => Number.isFinite(Number(timing.durationSeconds)) && Number(timing.durationSeconds) > 0);
+  return plan.scenes.map((scene, index) => {
+    const timing = sceneTimings[index] || {};
+    return {
+      displayName: scene.sourceSpanLabel || scene.sceneId || 'Scene ' + String(index + 1),
+      itemId: scene.sceneId || '',
+      metadata: {
+        durationSeconds: timing.durationSeconds,
+        endSeconds: timing.endSeconds,
+        narrationExcerpt: scene.narrationExcerpt || scene.narrationDraft || '',
+        plan: {
+          schemaFamilyId: LONGFORM_MEDIA_SCHEMA_FAMILY_ID,
+          schemaId: LONGFORM_SCENE_PLAN_SCHEMA_ID,
+          schemaVersion: PLANNING_SCHEMA_VERSION,
+          sourcePlanId: normalizeString(planValue?.id || planValue?.artifactId),
+          sourcePlanTitle: plan.title,
+        },
+        sourceSpanLabel: scene.sourceSpanLabel,
+        sourceTranscriptSegmentIds: scene.sourceTranscriptSegmentIds,
+        startSeconds: timing.startSeconds,
+        timingMode: timedScenes.length ? 'dynamicFromPlanTiming' : 'fixedDurationFallback',
+        visualPromptText: scene.visualPromptDraft,
+      },
+      text: buildSceneText(scene, index, plan),
+    };
+  });
 }
 
 const LONGFORM_SCENE_PLAN_ADAPTER = Object.freeze({
