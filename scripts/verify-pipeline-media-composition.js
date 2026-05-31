@@ -1,4 +1,4 @@
-﻿const assert = require('assert');
+const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');
@@ -76,7 +76,9 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
 };
 
 const {
+  DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
+  MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS,
   analyzePipeline,
   createEdge,
   createEmptyPipeline,
@@ -89,6 +91,11 @@ const {
   resumePipelineValidation,
   runPipeline,
 } = require('../electron/services/pipelineExecutionService');
+const {
+  createAssetLibrary,
+  importAssetLibraryItems,
+  listAssetLibraries,
+} = require('../electron/services/assetLibraryService');
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -192,6 +199,7 @@ function buildMediaCompositionPipeline(assetPaths, options = {}) {
       ...(options.narrationVolume !== undefined ? { narrationVolume: options.narrationVolume } : {}),
       ...(options.backgroundMusicVolume !== undefined ? { backgroundMusicVolume: options.backgroundMusicVolume } : {}),
       ...(options.transitionConfig && typeof options.transitionConfig === 'object' ? options.transitionConfig : {}),
+      ...(options.soundEffectsConfig && typeof options.soundEffectsConfig === 'object' ? options.soundEffectsConfig : {}),
     },
   });
   const exportNode = createNode('mediaExport', {
@@ -295,6 +303,7 @@ function buildTimedMediaCompositionPipeline(assetPaths, options = {}) {
       imageTimingMode: options.imageTimingMode || 'dynamicFromImageMetadata',
       secondsPerItem: Number(options.secondsPerItem || 0) || 4,
       ...(options.transitionConfig && typeof options.transitionConfig === 'object' ? options.transitionConfig : {}),
+      ...(options.soundEffectsConfig && typeof options.soundEffectsConfig === 'object' ? options.soundEffectsConfig : {}),
     },
   });
   const exportNode = createNode('mediaExport', {
@@ -393,6 +402,20 @@ async function prepareAssets() {
   return { backgroundMusic, imageOne, imageThree, imageTwo, narration };
 }
 
+async function prepareSoundEffectsLibrary(assetPaths, name = 'Verify SFX', filenames = ['impact.wav', 'swell.wav']) {
+  const existing = await listAssetLibraries('soundEffects');
+  const reusable = existing.find((library) => String(library.name || '') === name && Array.isArray(library.items) && library.items.length >= 2);
+  if (reusable) {
+    return reusable;
+  }
+  const created = await createAssetLibrary('soundEffects', name);
+  const sourceOne = path.join(path.dirname(assetPaths.narration), filenames[0] || 'impact.wav');
+  const sourceTwo = path.join(path.dirname(assetPaths.narration), filenames[1] || 'swell.wav');
+  fs.writeFileSync(sourceOne, createWaveBuffer(0.75));
+  fs.writeFileSync(sourceTwo, createWaveBuffer(2.5));
+  const imported = await importAssetLibraryItems('soundEffects', created.library.id, [sourceOne, sourceTwo]);
+  return imported.library;
+}
 async function runAndWaitForPipeline(pipeline) {
   const initialRun = await runPipeline(pipeline);
   assert(initialRun?.runId, 'Expected a pipeline run id for the media composition pipeline.');
@@ -993,10 +1016,232 @@ async function verifyMediaCompositionWithoutBackgroundMusic() {
   assert.strictEqual(exportArtifact.compositionExport.backgroundMusicTrack, null, 'Expected narration-only exports to omit background music metadata.');
 }
 
+function verifyMediaCompositionSoundEffectsDefaultsAndUi() {
+  const definition = getNodeTypeDefinition('mediaComposition');
+  assert.strictEqual(definition.configDefaults.soundEffectsEnabled, false, 'Media Composition should default sound effects off.');
+  assert(Array.isArray(definition.configDefaults.soundEffectsLayers), 'Media Composition should default SFX layers to an array.');
+  assert.strictEqual(definition.configDefaults.soundEffectsLayers.length, 0, 'Media Composition should default to no SFX layers.');
+  assert.strictEqual(definition.configDefaults.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME, 'Media Composition should default sound effects volume conservatively.');
+  assert.strictEqual(definition.configDefaults.soundEffectsSchedulingMode, 'randomInterval', 'Media Composition should default to random interval SFX scheduling.');
+  const uiSource = fs.readFileSync(PIPELINE_BUILDER_PANEL_PATH, 'utf8');
+  assert(/media-composition-sfx-enabled/.test(uiSource), 'Expected the Media Composition inspector to expose the SFX enable control.');
+  assert(/Add SFX layer/.test(uiSource), 'Expected the Media Composition inspector to add SFX layers.');
+  assert(/soundEffectsLayers/.test(uiSource), 'Expected the Media Composition inspector to write layered SFX config.');
+  assert(/media-composition-sfx-library/.test(uiSource), 'Expected the Media Composition inspector to expose the SFX library dropdown.');
+  assert(/Settings &gt; Asset Libraries/.test(uiSource), 'Expected the Media Composition inspector to point empty SFX libraries to Settings > Asset Libraries.');
+  assert(/listAssetLibraries\?\.\('soundEffects'\)/.test(uiSource), 'Expected the Media Composition inspector to use Asset Library listing IPC.');
+  assert(!/soundEffectsFilePath/.test(uiSource), 'Expected SFX controls not to accept arbitrary file paths.');
+}
+
+function assertSoundEffectSpacing(events, minSpacingSeconds) {
+  for (let index = 1; index < events.length; index += 1) {
+    assert(Number(events[index].timeSeconds) - Number(events[index - 1].timeSeconds) >= minSpacingSeconds - 0.001, 'Expected sound effect scheduling to respect minimum spacing.');
+  }
+}
+
+function assertNoImmediateSoundEffectRepeats(events) {
+  for (let index = 1; index < events.length; index += 1) {
+    assert.notStrictEqual(events[index].itemId, events[index - 1].itemId, 'Expected sound effect scheduling to avoid immediate repeats when possible.');
+  }
+}
+
+async function verifySoundEffectsSchedulingAndExportMetadata() {
+  const assetPaths = await prepareAssets();
+  const library = await prepareSoundEffectsLibrary(assetPaths);
+  const pipeline = buildMediaCompositionPipeline(assetPaths, {
+    includeBackgroundMusic: false,
+    includeNarration: false,
+    includeThirdImage: true,
+    secondsPerItem: 3,
+    stopMode: 'visuals',
+    title: 'Sound effects storyboard export',
+    outputTitle: 'Sound effects storyboard final',
+    soundEffectsConfig: {
+      soundEffectsAvoidRepeats: true,
+      soundEffectsDensity: 'dense',
+      soundEffectsEnabled: true,
+      soundEffectsFadeSeconds: 0.05,
+      soundEffectsLibraryId: library.id,
+      soundEffectsMaxSimultaneous: 1,
+      soundEffectsMinSpacingSeconds: 0.5,
+      soundEffectsSchedulingMode: 'both',
+      soundEffectsSeed: 'verify-sfx-both',
+      soundEffectsVolume: 0.25,
+    },
+  });
+  const completedRun = await runAndWaitForPipeline(pipeline);
+  verifyCompletedRun(completedRun);
+
+  const compositionResult = completedRun.resultsByNodeId?.['compose-scenes']?.outputs?.composition || null;
+  const soundEffects = compositionResult?.composition?.soundEffects || null;
+  assert.strictEqual(soundEffects?.enabled, true, 'Expected sound effects to be enabled in composition metadata.');
+  assert.strictEqual(soundEffects.layerCount, 1, 'Expected legacy single-library SFX config to normalize to one layer.');
+  assert.strictEqual(soundEffects.layers?.[0]?.libraryId, library.id, 'Expected the selected Sound Effects library id in layer metadata.');
+  assert.strictEqual(soundEffects.layers?.[0]?.libraryName, library.name, 'Expected the selected Sound Effects library name in layer metadata.');
+  assert.strictEqual(soundEffects.layers?.[0]?.schedulingMode, 'both', 'Expected both scheduling mode in layer metadata.');
+  assert.strictEqual(soundEffects.layers?.[0]?.volume, 0.25, 'Expected sound effects volume in layer metadata.');
+  assert(soundEffects.scheduledEvents.length >= 2, 'Expected scheduled SFX events.');
+  assert(soundEffects.scheduledEvents.every((event) => event.layerId && Number(event.layerIndex) === 0), 'Expected scheduled SFX events to record layer identity.');
+  assert(soundEffects.scheduledEvents.some((event) => event.reason === 'sceneAligned'), 'Expected a scene-aligned SFX event.');
+  assert(soundEffects.scheduledEvents.some((event) => event.reason === 'randomInterval'), 'Expected a random interval SFX event.');
+  assert(soundEffects.scheduledEvents.every((event) => Number(event.timeSeconds) > 0 && Number(event.timeSeconds) < 9), 'Expected SFX events to stay inside the visual duration and avoid time zero.');
+  assert(soundEffects.scheduledEvents.every((event) => !event.filePath), 'Expected composition metadata not to expose managed file paths.');
+  assertSoundEffectSpacing(soundEffects.scheduledEvents, 0.5);
+  assertNoImmediateSoundEffectRepeats(soundEffects.scheduledEvents);
+  assert.strictEqual(compositionResult.composition.audioMix.soundEffectsVolume, 0.25, 'Expected composition audio mix to include SFX volume.');
+
+  const exportArtifact = getExportArtifact(completedRun);
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsVolume, 0.25, 'Expected Media Export metadata to carry SFX volume.');
+  assert.strictEqual(exportArtifact.compositionExport.audioMix.soundEffectsEventCount, soundEffects.scheduledEvents.length, 'Expected Media Export audio mix to count scheduled SFX events.');
+  assert.strictEqual(exportArtifact.compositionExport.audioMix.soundEffectsLayerCount, 1, 'Expected Media Export audio mix to count SFX layers.');
+  assert.strictEqual(exportArtifact.compositionExport.soundEffects?.enabled, true, 'Expected Media Export metadata to carry SFX summary.');
+  assert.strictEqual(exportArtifact.compositionExport.soundEffects.layers?.length, 1, 'Expected Media Export metadata to carry per-layer SFX summary.');
+  assert(exportArtifact.compositionExport.soundEffects.scheduledEvents.every((event) => !event.filePath), 'Expected Media Export metadata not to expose managed file paths.');
+  const exportSidecar = JSON.parse(fs.readFileSync(exportArtifact.metadataPaths[0], 'utf8'));
+  assert.strictEqual(exportSidecar.soundEffects?.scheduledEvents?.length, soundEffects.scheduledEvents.length, 'Expected export sidecar to record the SFX schedule.');
+}
+
+function verifyFailedRunXfadeFallbackCoverage() {
+  const mediaCompositionSource = fs.readFileSync(MEDIA_COMPOSITION_SERVICE_PATH, 'utf8');
+  const pipelineExecutionSource = fs.readFileSync(PIPELINE_EXECUTION_SERVICE_PATH, 'utf8');
+  assert(MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS.includes('squeezev'), 'Expected the failed-run squeezev transition to be marked unstable.');
+  assert(/MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITION_SET/.test(pipelineExecutionSource), 'Expected composition scheduling to exclude unstable xfade transitions.');
+  assert(/MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS/.test(mediaCompositionSource), 'Expected Media Export support detection to exclude unstable xfade transitions.');
+  assert(/buildFfmpegFailureMessage/.test(mediaCompositionSource) && /stderrTail/.test(mediaCompositionSource), 'Expected FFmpeg export failures to include useful diagnostic tails.');
+}
+
+async function verifyMultipleSoundEffectsLayers() {
+  const assetPaths = await prepareAssets();
+  const environmentalLibrary = await prepareSoundEffectsLibrary(assetPaths, 'Verify Environmental SFX', ['wind.wav', 'leaves.wav']);
+  const accentLibrary = await prepareSoundEffectsLibrary(assetPaths, 'Verify Accent SFX', ['hit.wav', 'whisper.wav']);
+  const pipeline = buildMediaCompositionPipeline(assetPaths, {
+    includeBackgroundMusic: true,
+    includeNarration: true,
+    includeThirdImage: true,
+    secondsPerItem: 2,
+    stopMode: 'visuals',
+    title: 'Layered sound effects export',
+    outputTitle: 'Layered sound effects final',
+    soundEffectsConfig: {
+      soundEffectsEnabled: true,
+      soundEffectsLayers: [
+        {
+          avoidRepeats: true,
+          density: 'sparse',
+          fadeSeconds: 0.05,
+          id: 'environment-layer',
+          libraryId: environmentalLibrary.id,
+          maxSimultaneous: 1,
+          minSpacingSeconds: 0.25,
+          name: 'Environmental',
+          schedulingMode: 'sceneAligned',
+          seed: 'verify-layer-scene',
+          volume: 0.2,
+        },
+        {
+          avoidRepeats: true,
+          density: 'dense',
+          fadeSeconds: 0.05,
+          id: 'accent-layer',
+          libraryId: accentLibrary.id,
+          maxSimultaneous: 1,
+          minSpacingSeconds: 0.25,
+          name: 'Accent',
+          schedulingMode: 'randomInterval',
+          seed: 'verify-layer-random',
+          volume: 0.25,
+        },
+      ],
+    },
+  });
+  const completedRun = await runAndWaitForPipeline(pipeline);
+  verifyCompletedRun(completedRun);
+
+  const compositionResult = completedRun.resultsByNodeId?.['compose-scenes']?.outputs?.composition || null;
+  const soundEffects = compositionResult?.composition?.soundEffects || null;
+  assert.strictEqual(soundEffects?.enabled, true, 'Expected layered sound effects to be enabled.');
+  assert.strictEqual(soundEffects.layers?.length, 2, 'Expected two SFX layers in composition metadata.');
+  assert(soundEffects.layers.some((layer) => layer.layerId === 'environment-layer' && layer.schedulingMode === 'sceneAligned'), 'Expected the scene-aligned layer to be recorded.');
+  assert(soundEffects.layers.some((layer) => layer.layerId === 'accent-layer' && layer.schedulingMode === 'randomInterval'), 'Expected the random interval layer to be recorded.');
+  assert(soundEffects.scheduledEvents.some((event) => event.layerId === 'environment-layer' && event.reason === 'sceneAligned'), 'Expected scene-aligned layer events.');
+  assert(soundEffects.scheduledEvents.some((event) => event.layerId === 'accent-layer' && event.reason === 'randomInterval'), 'Expected random interval layer events.');
+  assert(soundEffects.scheduledEvents.every((event, index, events) => index === 0 || Number(events[index - 1].timeSeconds) <= Number(event.timeSeconds)), 'Expected combined SFX schedule to be sorted.');
+  assert(soundEffects.scheduledEvents.every((event) => !event.filePath), 'Expected layered composition metadata not to expose managed file paths.');
+
+  const exportArtifact = getExportArtifact(completedRun);
+  const exportedSoundEffects = exportArtifact?.compositionExport?.soundEffects || null;
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsLayerCount, 2, 'Expected Media Export audio mix to record both SFX layers.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsInputCount, soundEffects.scheduledEvents.length, 'Expected each scheduled SFX event to become one FFmpeg audio input.');
+  assert.strictEqual(exportedSoundEffects?.layers?.length, 2, 'Expected Media Export metadata to carry both SFX layers.');
+  assert(exportedSoundEffects.layers.every((layer) => Array.isArray(layer.scheduledEvents)), 'Expected Media Export metadata to preserve per-layer schedules.');
+  assert(exportedSoundEffects.scheduledEvents.every((event) => !event.filePath), 'Expected layered export metadata not to expose managed file paths.');
+}
+async function verifySoundEffectsTrimNearEnd() {
+  const assetPaths = await prepareAssets();
+  const created = await createAssetLibrary('soundEffects', 'Verify Long SFX');
+  const sourcePath = path.join(path.dirname(assetPaths.narration), 'long-effect.wav');
+  fs.writeFileSync(sourcePath, createWaveBuffer(3));
+  const imported = await importAssetLibraryItems('soundEffects', created.library.id, [sourcePath]);
+  const pipeline = buildMediaCompositionPipeline(assetPaths, {
+    includeBackgroundMusic: false,
+    includeNarration: false,
+    secondsPerItem: 1,
+    stopMode: 'visuals',
+    title: 'Trimmed sound effects export',
+    outputTitle: 'Trimmed sound effects final',
+    soundEffectsConfig: {
+      soundEffectsEnabled: true,
+      soundEffectsLibraryId: imported.library.id,
+      soundEffectsMinSpacingSeconds: 0,
+      soundEffectsSchedulingMode: 'sceneAligned',
+      soundEffectsSeed: 'verify-trim-sfx',
+      soundEffectsVolume: 0.25,
+    },
+  });
+  const completedRun = await runAndWaitForPipeline(pipeline);
+  verifyCompletedRun(completedRun);
+  const exportArtifact = getExportArtifact(completedRun);
+  const events = exportArtifact?.compositionExport?.soundEffects?.scheduledEvents || [];
+  assert(events.some((event) => event.trimmed === true), 'Expected SFX near the end to be trimmed in export metadata.');
+  assert(events.every((event) => Number(event.timeSeconds || 0) + Number(event.durationSeconds || 0) <= 2.001), 'Expected trimmed SFX not to extend the visual duration.');
+}
+
+async function verifyMissingSoundEffectsLibrarySkipsClearly() {
+  const assetPaths = await prepareAssets();
+  const pipeline = buildMediaCompositionPipeline(assetPaths, {
+    includeBackgroundMusic: false,
+    includeNarration: false,
+    secondsPerItem: 1,
+    stopMode: 'visuals',
+    soundEffectsConfig: {
+      soundEffectsEnabled: true,
+      soundEffectsLibraryId: 'missing-sfx-library',
+      soundEffectsSchedulingMode: 'randomInterval',
+    },
+  });
+  const completedRun = await runAndWaitForPipeline(pipeline);
+  verifyCompletedRun(completedRun);
+  const soundEffects = completedRun.resultsByNodeId?.['compose-scenes']?.outputs?.composition?.composition?.soundEffects || null;
+  assert.strictEqual(soundEffects?.enabled, true, 'Expected missing-library metadata to preserve that SFX were requested.');
+  assert.strictEqual(soundEffects.scheduledEvents.length, 0, 'Expected missing SFX library to produce no scheduled events.');
+  assert(/could not find the selected Sound Effects library/i.test(soundEffects.notes.join(' ')), 'Expected a clear missing-library note.');
+}
+
+function verifySoundEffectsPathSafetyImplementation() {
+  const mediaCompositionSource = fs.readFileSync(MEDIA_COMPOSITION_SERVICE_PATH, 'utf8');
+  const pipelineExecutionSource = fs.readFileSync(PIPELINE_EXECUTION_SERVICE_PATH, 'utf8');
+  assert(/resolveAssetLibraryPreviewFile\('soundEffects'/.test(mediaCompositionSource), 'Expected Media Export to resolve SFX through the managed asset library service.');
+  assert(/resolveAssetLibraryPreviewFile\('soundEffects'/.test(pipelineExecutionSource), 'Expected Media Composition to validate SFX through the managed asset library service.');
+  assert(/const \{ filePath, \.\.\.safeEvent \}/.test(mediaCompositionSource), 'Expected SFX export metadata to strip managed file paths.');
+}
+
 async function main() {
   verifyMediaCompositionInspectorFallbackField();
   verifyMediaCompositionTransitionDefaults();
+  verifyMediaCompositionSoundEffectsDefaultsAndUi();
   verifyMediaExportTransitionRenderGuards();
+  verifySoundEffectsPathSafetyImplementation();
+  verifyFailedRunXfadeFallbackCoverage();
   await cleanupActiveRun();
   await verifyMediaCompositionWithBackgroundMusic();
   await cleanupActiveRun();
@@ -1025,6 +1270,14 @@ async function main() {
   await verifyOneImageTransitionCompositionDoesNotFail();
   await cleanupActiveRun();
   await verifyMediaCompositionWithoutBackgroundMusic();
+  await cleanupActiveRun();
+  await verifySoundEffectsSchedulingAndExportMetadata();
+  await cleanupActiveRun();
+  await verifyMultipleSoundEffectsLayers();
+  await cleanupActiveRun();
+  await verifySoundEffectsTrimNearEnd();
+  await cleanupActiveRun();
+  await verifyMissingSoundEffectsLibrarySkipsClearly();
   await cleanupActiveRun();
   console.log('Pipeline media composition verification passed.');
 }

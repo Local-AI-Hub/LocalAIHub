@@ -1624,6 +1624,7 @@ function createCompositionArtifact(spec = {}, options = {}) {
   const composition = {
     schemaVersion: 1,
     audioMix: compositionSpec.audioMix && typeof compositionSpec.audioMix === 'object' ? serializeArtifactForUi(compositionSpec.audioMix) : null,
+    soundEffects: compositionSpec.soundEffects && typeof compositionSpec.soundEffects === 'object' ? serializeArtifactForUi(compositionSpec.soundEffects) : null,
     exportKind: String(compositionSpec.exportKind || PORT_KIND_VIDEO).trim() || PORT_KIND_VIDEO,
     recipeId: String(compositionSpec.recipeId || MEDIA_COMPOSITION_RECIPE_ID).trim() || MEDIA_COMPOSITION_RECIPE_ID,
     recipeLabel: String(compositionSpec.recipeLabel || MEDIA_COMPOSITION_RECIPE_LABEL).trim() || MEDIA_COMPOSITION_RECIPE_LABEL,
@@ -2345,6 +2346,7 @@ async function persistCompositionArtifact(runDirectories, artifact, options = {}
     exportKind: artifact?.composition?.exportKind,
     recipeId: artifact?.composition?.recipeId,
     audioMix: artifact?.composition?.audioMix,
+    soundEffects: artifact?.composition?.soundEffects,
     recipeLabel: artifact?.composition?.recipeLabel,
     role: artifact?.role,
     tracks: serializeArtifactForUi(artifact?.composition?.tracks || []),

@@ -2342,6 +2342,7 @@ export default function App() {
                 onMigrateLegacyStorage={migrateLegacyStorage}
                 onPreviewCleanup={() => previewCleanup()}
                 onRunCleanup={runCleanupNow}
+                onToast={pushToast}
                 onDeletePromptStyle={deletePromptStyle}
                 onSaveCloseBehavior={saveCloseBehaviorPreference}
                 onSavePromptStyle={savePromptStyle}

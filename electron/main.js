@@ -7,6 +7,7 @@ const {
   ipcMain,
   Menu,
   Notification,
+  protocol,
   Tray,
   nativeImage,
   shell,
@@ -68,6 +69,19 @@ const {
   stopTool,
 } = require('./services/processService');
 const { listSnapshots, restoreSnapshot, saveSnapshot } = require('./services/snapshotService');
+const {
+  LIBRARY_TYPES,
+  PREVIEW_URL_SCHEME,
+  createAssetLibrary,
+  deleteAssetLibrary,
+  getAssetLibraryItemPreview,
+  importAssetLibraryItems,
+  listAssetLibraries,
+  removeAssetLibraryItem,
+  renameAssetLibrary,
+  resolveAssetLibraryPreviewRequest,
+  updateColorPaletteItem,
+} = require('./services/assetLibraryService');
 const { inspectCleanupTargets, runCleanup } = require('./services/storageCleanupService');
 const { dismissManagedDataMigration, getStorageOverview, setManagedDataRoot } = require('./services/storageLocationService');
 const { getToolCatalog, getToolManifest, initializeToolRegistry } = require('./services/toolRegistry');
@@ -98,6 +112,21 @@ const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
 const TOOL_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const LIVE_RESOURCE_CACHE_TTL_MS = 5000;
+try {
+  protocol.registerSchemesAsPrivileged([
+    {
+      scheme: PREVIEW_URL_SCHEME,
+      privileges: {
+        secure: true,
+        standard: true,
+        stream: true,
+        supportFetchAPI: true,
+      },
+    },
+  ]);
+} catch {
+  // Electron only allows scheme registration before app readiness; ignore duplicate registration in test-like reloads.
+}
 
 let mainWindow = null;
 let tray = null;
@@ -858,6 +887,34 @@ async function runSilentToolUpdateCheck(tools = null) {
   }
 }
 
+async function registerAssetLibraryPreviewProtocol() {
+  if (registerAssetLibraryPreviewProtocol.registered) {
+    return;
+  }
+
+  protocol.handle(PREVIEW_URL_SCHEME, async (request) => {
+    try {
+      const preview = await resolveAssetLibraryPreviewRequest(request.url);
+      const buffer = await fs.promises.readFile(preview.filePath);
+      return new Response(buffer, {
+        headers: {
+          'cache-control': 'no-store',
+          'content-type': preview.mimeType,
+        },
+      });
+    } catch (error) {
+      return new Response(humanizeError(error, 'Local AI Hub could not load that asset preview.'), {
+        status: 404,
+        headers: {
+          'content-type': 'text/plain; charset=utf-8',
+        },
+      });
+    }
+  });
+
+  registerAssetLibraryPreviewProtocol.registered = true;
+}
+registerAssetLibraryPreviewProtocol.registered = false;
 async function withPlainEnglishErrors(handler, fallbackMessage) {
   try {
     const data = await handler();
@@ -980,6 +1037,72 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not restart to install the update.'),
   );
 
+  ipcMain.handle('asset-libraries:list', (_event, payload) =>
+    withPlainEnglishErrors(async () => ({
+      libraries: await listAssetLibraries(typeof payload === 'string' ? payload : payload?.type),
+    }), 'Local AI Hub could not load asset libraries.'),
+  );
+
+  ipcMain.handle('asset-libraries:create', (_event, payload) =>
+    withPlainEnglishErrors(async () => createAssetLibrary(payload?.type, payload?.name), 'Local AI Hub could not create that asset library.'),
+  );
+
+  ipcMain.handle('asset-libraries:rename', (_event, payload) =>
+    withPlainEnglishErrors(async () => renameAssetLibrary(payload?.type, payload?.libraryId, payload?.name), 'Local AI Hub could not rename that asset library.'),
+  );
+
+  ipcMain.handle('asset-libraries:delete', (_event, payload) =>
+    withPlainEnglishErrors(async () => deleteAssetLibrary(payload?.type, payload?.libraryId), 'Local AI Hub could not delete that asset library.'),
+  );
+
+  ipcMain.handle('asset-libraries:pick-files', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const type = String(payload?.type || '').trim();
+      const pickerConfig = {
+        soundEffects: {
+          title: 'Import sound effect files',
+          filters: [
+            { name: 'Audio files', extensions: ['wav', 'mp3', 'flac', 'ogg', 'm4a'] },
+            { name: 'All files', extensions: ['*'] },
+          ],
+        },
+        fonts: {
+          title: 'Import font files',
+          filters: [
+            { name: 'Font files', extensions: ['ttf', 'otf'] },
+            { name: 'All files', extensions: ['*'] },
+          ],
+        },
+      };
+      if (!pickerConfig[type] || !LIBRARY_TYPES[type]) {
+        throw new Error('Choose Sound Effects or Fonts before importing files.');
+      }
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: pickerConfig[type].title,
+        properties: ['openFile', 'multiSelections'],
+        filters: pickerConfig[type].filters,
+      });
+      return {
+        canceled: Boolean(result.canceled),
+        filePaths: result.filePaths || [],
+      };
+    }, 'Local AI Hub could not open the asset import picker.'),
+  );
+
+  ipcMain.handle('asset-libraries:get-preview', (_event, payload) =>
+    withPlainEnglishErrors(async () => getAssetLibraryItemPreview(payload?.type, payload?.libraryId, payload?.itemId), 'Local AI Hub could not prepare that asset preview.'),
+  );
+  ipcMain.handle('asset-libraries:import-items', (_event, payload) =>
+    withPlainEnglishErrors(async () => importAssetLibraryItems(payload?.type, payload?.libraryId, payload?.files), 'Local AI Hub could not import those asset files.'),
+  );
+
+  ipcMain.handle('asset-libraries:remove-item', (_event, payload) =>
+    withPlainEnglishErrors(async () => removeAssetLibraryItem(payload?.type, payload?.libraryId, payload?.itemId), 'Local AI Hub could not remove that asset library item.'),
+  );
+
+  ipcMain.handle('asset-libraries:update-color', (_event, payload) =>
+    withPlainEnglishErrors(async () => updateColorPaletteItem(payload?.libraryId, payload?.item), 'Local AI Hub could not save that color.'),
+  );
   ipcMain.handle('tools:install', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const toolId = typeof payload === 'string' ? payload : payload?.toolId;
@@ -1989,6 +2112,7 @@ function registerIpcHandlers() {
 async function startApplication() {
   app.setAppUserModelId(APP_USER_MODEL_ID);
   await ensureStorage();
+  await registerAssetLibraryPreviewProtocol();
   const initialConfig = await readConfig();
   setCloseBehaviorPreference(initialConfig.closeBehavior);
   createWindow();

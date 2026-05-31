@@ -87,6 +87,9 @@ const {
   DEFAULT_PIPELINE_RUN_SETTINGS,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
+  MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
+  MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_TRANSITION_MODES,
   normalizeAudioModeForLocalTool,
@@ -122,6 +125,16 @@ const MEDIA_COMPOSITION_TRANSITION_MODE_OPTIONS = Object.freeze([
   ['randomCategory', 'Random from category'],
   ['randomSelected', 'Random from selected list'],
 ]);
+const MEDIA_COMPOSITION_SOUND_EFFECTS_MODE_OPTIONS = Object.freeze([
+  ['randomInterval', 'Random intervals'],
+  ['sceneAligned', 'Scene aligned'],
+  ['both', 'Both'],
+]);
+const MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITY_OPTIONS = Object.freeze([
+  ['sparse', 'Sparse'],
+  ['normal', 'Normal'],
+  ['dense', 'Dense'],
+]);
 
 function formatMediaCompositionTransitionLabel(value) {
   return String(value || '')
@@ -130,6 +143,80 @@ function formatMediaCompositionTransitionLabel(value) {
     .replace(/^./, (letter) => letter.toUpperCase());
 }
 
+function getMediaCompositionSoundEffectsMode(value) {
+  const mode = String(value || '').trim();
+  return Object.values(MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES || {}).includes(mode) ? mode : 'randomInterval';
+}
+
+function getMediaCompositionSoundEffectsDensity(value) {
+  const density = String(value || '').trim();
+  return (MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES || []).includes(density) ? density : 'normal';
+}
+
+function normalizeSoundEffectsSpacing(value, fallback = 4) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(0, Math.round(numeric * 10) / 10);
+}
+function createMediaCompositionSoundEffectsLayer(libraries = [], index = 0) {
+  const layerNumber = Math.max(1, Number(index || 0) + 1);
+  return {
+    id: `sfx-layer-${Date.now().toString(36)}-${layerNumber}`,
+    name: `Layer ${layerNumber}`,
+    libraryId: libraries[0]?.id || '',
+    schedulingMode: 'randomInterval',
+    volume: DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
+    density: 'normal',
+    minSpacingSeconds: 4,
+    maxSimultaneous: 2,
+    avoidRepeats: true,
+    fadeSeconds: 0.05,
+    seed: '',
+  };
+}
+
+function normalizeMediaCompositionSoundEffectsLayerForUi(layer = {}, index = 0, libraries = [], fallbackConfig = {}) {
+  const fallbackLayer = createMediaCompositionSoundEffectsLayer(libraries, index);
+  return {
+    ...fallbackLayer,
+    ...(layer && typeof layer === 'object' ? layer : {}),
+    avoidRepeats: layer?.avoidRepeats !== false,
+    density: getMediaCompositionSoundEffectsDensity(layer?.density ?? fallbackConfig.soundEffectsDensity),
+    fadeSeconds: normalizeSoundEffectsSpacing(layer?.fadeSeconds ?? fallbackConfig.soundEffectsFadeSeconds ?? 0.05, 0.05),
+    id: String(layer?.id || fallbackLayer.id).trim() || fallbackLayer.id,
+    libraryId: String(layer?.libraryId ?? fallbackConfig.soundEffectsLibraryId ?? fallbackLayer.libraryId).trim(),
+    maxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(layer?.maxSimultaneous ?? fallbackConfig.soundEffectsMaxSimultaneous ?? 2) || 2))),
+    minSpacingSeconds: normalizeSoundEffectsSpacing(layer?.minSpacingSeconds ?? fallbackConfig.soundEffectsMinSpacingSeconds ?? 4, 4),
+    name: String(layer?.name || `Layer ${index + 1}`).trim() || `Layer ${index + 1}`,
+    schedulingMode: getMediaCompositionSoundEffectsMode(layer?.schedulingMode ?? layer?.mode ?? fallbackConfig.soundEffectsSchedulingMode),
+    seed: String(layer?.seed ?? fallbackConfig.soundEffectsSeed ?? '').trim(),
+    volume: normalizeVolumeGain(layer?.volume ?? fallbackConfig.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
+  };
+}
+
+function getMediaCompositionSoundEffectsLayersForUi(config = {}, libraries = []) {
+  const layers = Array.isArray(config.soundEffectsLayers) ? config.soundEffectsLayers : [];
+  if (layers.length) {
+    return layers.map((layer, index) => normalizeMediaCompositionSoundEffectsLayerForUi(layer, index, libraries, config));
+  }
+  if (config.soundEffectsEnabled === true || config.soundEffectsLibraryId) {
+    return [normalizeMediaCompositionSoundEffectsLayerForUi({
+      libraryId: config.soundEffectsLibraryId || libraries[0]?.id || '',
+      schedulingMode: config.soundEffectsSchedulingMode,
+      volume: config.soundEffectsVolume,
+      density: config.soundEffectsDensity,
+      minSpacingSeconds: config.soundEffectsMinSpacingSeconds,
+      maxSimultaneous: config.soundEffectsMaxSimultaneous,
+      avoidRepeats: config.soundEffectsAvoidRepeats,
+      fadeSeconds: config.soundEffectsFadeSeconds,
+      seed: config.soundEffectsSeed,
+      name: 'Layer 1',
+    }, 0, libraries, config)];
+  }
+  return [];
+}
 function getMediaCompositionTransitionMode(value) {
   const mode = String(value || '').trim();
   return Object.values(MEDIA_COMPOSITION_TRANSITION_MODES || {}).includes(mode) ? mode : 'off';
@@ -163,6 +250,10 @@ function formatVolumePercent(value, fallback) {
 function formatAudioMixSummary(audioMix) {
   const narrationPercent = formatVolumePercent(audioMix?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME);
   const backgroundPercent = formatVolumePercent(audioMix?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME);
+  const sfxPercent = formatVolumePercent(audioMix?.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME);
+  if (audioMix?.soundEffectsEnabled && Number(audioMix?.soundEffectsEventCount || 0) > 0) {
+    return `This export mixed ${audioMix.soundEffectsEventCount} sound effect${audioMix.soundEffectsEventCount === 1 ? '' : 's'} at ${sfxPercent}%.`;
+  }
   if (audioMix?.mode === 'mixed-with-background-music') {
     return `Background music was mixed beneath narration at ${backgroundPercent}%; narration was kept at ${narrationPercent}%.`;
   }
@@ -193,6 +284,8 @@ const BURN_SUBTITLES_FONT_PRESET_OPTIONS = Object.freeze([
 const BURN_SUBTITLES_BACKGROUND_OPACITY_OPTIONS = Object.freeze([
   ['25', '25%'], ['50', '50%'], ['75', '75%'], ['100', '100%'],
 ]);
+const BURN_SUBTITLES_FONT_SOURCE_OPTIONS = Object.freeze([['preset', 'Built-in preset'], ['assetLibrary', 'Asset Library font']]);
+const BURN_SUBTITLES_COLOR_SOURCE_OPTIONS = Object.freeze([['manual', 'Manual colors'], ['palette', 'Color Palette library']]);
 
 function normalizeRetryNumber(value, fallback, minValue = 0) {
   const numeric = Number(value);
@@ -249,10 +342,19 @@ function getPendingBurnSubtitlesRetryDefaults(pendingValidation) {
     captionMode: normalizeRetryOption(settings.captionMode, BURN_SUBTITLES_CAPTION_MODE_OPTIONS, 'auto'),
     durationPerCaptionSeconds: normalizeRetryNumber(settings.durationPerCaptionSeconds, 3, 0.1),
     fontPreset: normalizeRetryOption(settings.fontPreset, BURN_SUBTITLES_FONT_PRESET_OPTIONS, 'arial'),
+    fontSource: normalizeRetryOption(settings.fontSource, BURN_SUBTITLES_FONT_SOURCE_OPTIONS, 'preset'),
+    fontLibraryId: String(settings.fontLibraryId || '').trim(),
+    fontItemId: String(settings.fontItemId || '').trim(),
     fontSize: normalizeRetryNumber(settings.fontSize, 28, 1),
     italic: settings.italic === true,
     outline: normalizeRetryNumber(settings.outline, 2, 0),
     outlineColor: normalizeRetryOption(settings.outlineColor, BURN_SUBTITLES_OUTLINE_COLOR_OPTIONS, 'black'),
+    backgroundColor: normalizeRetryOption(settings.backgroundColor, BURN_SUBTITLES_TEXT_COLOR_OPTIONS, 'black'),
+    colorSource: normalizeRetryOption(settings.colorSource, BURN_SUBTITLES_COLOR_SOURCE_OPTIONS, 'manual'),
+    colorPaletteLibraryId: String(settings.colorPaletteLibraryId || '').trim(),
+    textColorPaletteItemId: String(settings.textColorPaletteItemId || '').trim(),
+    outlineColorPaletteItemId: String(settings.outlineColorPaletteItemId || '').trim(),
+    backgroundColorPaletteItemId: String(settings.backgroundColorPaletteItemId || '').trim(),
     position: normalizeRetryOption(settings.position, BURN_SUBTITLES_POSITION_OPTIONS, 'bottomCenter'),
     shadow: normalizeRetryNumber(settings.shadow, 1, 0),
     textColor: normalizeRetryOption(settings.textColor, BURN_SUBTITLES_TEXT_COLOR_OPTIONS, 'white'),
@@ -272,10 +374,19 @@ function getBurnSubtitlesRetryPayload(retryOverrides) {
     captionMode: normalizeRetryOption(retryOverrides.captionMode, BURN_SUBTITLES_CAPTION_MODE_OPTIONS, 'auto'),
     durationPerCaptionSeconds: normalizeRetryNumber(retryOverrides.durationPerCaptionSeconds, 3, 0.1),
     fontPreset: normalizeRetryOption(retryOverrides.fontPreset, BURN_SUBTITLES_FONT_PRESET_OPTIONS, 'arial'),
+    fontSource: normalizeRetryOption(retryOverrides.fontSource, BURN_SUBTITLES_FONT_SOURCE_OPTIONS, 'preset'),
+    fontLibraryId: String(retryOverrides.fontLibraryId || '').trim(),
+    fontItemId: String(retryOverrides.fontItemId || '').trim(),
     fontSize: normalizeRetryNumber(retryOverrides.fontSize, 28, 1),
     italic: retryOverrides.italic === true,
     outline: normalizeRetryNumber(retryOverrides.outline, 2, 0),
     outlineColor: normalizeRetryOption(retryOverrides.outlineColor, BURN_SUBTITLES_OUTLINE_COLOR_OPTIONS, 'black'),
+    backgroundColor: normalizeRetryOption(retryOverrides.backgroundColor, BURN_SUBTITLES_TEXT_COLOR_OPTIONS, 'black'),
+    colorSource: normalizeRetryOption(retryOverrides.colorSource, BURN_SUBTITLES_COLOR_SOURCE_OPTIONS, 'manual'),
+    colorPaletteLibraryId: String(retryOverrides.colorPaletteLibraryId || '').trim(),
+    textColorPaletteItemId: String(retryOverrides.textColorPaletteItemId || '').trim(),
+    outlineColorPaletteItemId: String(retryOverrides.outlineColorPaletteItemId || '').trim(),
+    backgroundColorPaletteItemId: String(retryOverrides.backgroundColorPaletteItemId || '').trim(),
     position: normalizeRetryOption(retryOverrides.position, BURN_SUBTITLES_POSITION_OPTIONS, 'bottomCenter'),
     shadow: normalizeRetryNumber(retryOverrides.shadow, 1, 0),
     textColor: normalizeRetryOption(retryOverrides.textColor, BURN_SUBTITLES_TEXT_COLOR_OPTIONS, 'white'),
@@ -2253,7 +2364,7 @@ function ResultCard({ result, onOpenPath, onRevealPath }) {
     </div>
   );
 }
-function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, onChangeComment, onChangeRetryOverride, onDecide, onOpenPath, onRevealPath, busy }) {
+function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fontLibraries = [], colorPaletteLibraries = [], onChangeComment, onChangeRetryOverride, onDecide, onOpenPath, onRevealPath, busy }) {
   if (!pendingValidation) {
     return null;
   }
@@ -2274,7 +2385,9 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, on
   const burnSubtitlesCaptionModeOptions = BURN_SUBTITLES_CAPTION_MODE_OPTIONS.filter(([optionValue]) => {
     const allowedOptions = Array.isArray(burnSubtitlesRetryControl?.captionModeOptions) ? burnSubtitlesRetryControl.captionModeOptions : [];
     return !allowedOptions.length || allowedOptions.includes(optionValue);
-  });  return (
+  });
+  const retryFontLibrary = fontLibraries.find((library) => library.id === burnSubtitlesRetryValues?.fontLibraryId) || fontLibraries[0] || null;
+  const retryPaletteLibrary = colorPaletteLibraries.find((library) => library.id === burnSubtitlesRetryValues?.colorPaletteLibraryId) || colorPaletteLibraries[0] || null;  return (
     <div className="rounded-[26px] border border-violet-400/30 bg-violet-400/10 p-4 text-violet-50">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -2366,19 +2479,91 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, on
             ))}
           </div>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
-            {[
-              ['validation-burn-subtitles-text-color', 'Text color', 'textColor', 'white', BURN_SUBTITLES_TEXT_COLOR_OPTIONS],
-              ['validation-burn-subtitles-outline-color', 'Outline color', 'outlineColor', 'black', BURN_SUBTITLES_OUTLINE_COLOR_OPTIONS],
-              ['validation-burn-subtitles-position', 'Position', 'position', 'bottomCenter', BURN_SUBTITLES_POSITION_OPTIONS],
-              ['validation-burn-subtitles-font-preset', 'Font preset', 'fontPreset', 'arial', BURN_SUBTITLES_FONT_PRESET_OPTIONS],
-            ].map(([inputId, label, key, fallback, options]) => (
-              <div key={inputId}>
-                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor={inputId}>{label}</label>
-                <select className="store-input mt-3" disabled={busy} id={inputId} onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { [key]: event.target.value })} value={String(burnSubtitlesRetryValues[key] || fallback)}>
-                  {options.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-font-source">Font source</label>
+              <select className="store-input mt-3" disabled={busy} id="validation-burn-subtitles-font-source" onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { fontSource: event.target.value, fontLibraryId: event.target.value === 'assetLibrary' ? (retryFontLibrary?.id || '') : '', fontItemId: event.target.value === 'assetLibrary' ? (retryFontLibrary?.items?.[0]?.id || '') : '' })} value={burnSubtitlesRetryValues.fontSource || 'preset'}>
+                {BURN_SUBTITLES_FONT_SOURCE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+              </select>
+            </div>
+            {burnSubtitlesRetryValues.fontSource === 'assetLibrary' ? (
+              <>
+                <div>
+                  <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-font-library">Font library</label>
+                  <select className="store-input mt-3" disabled={busy || !fontLibraries.length} id="validation-burn-subtitles-font-library" onChange={(event) => { const library = fontLibraries.find((entry) => entry.id === event.target.value) || null; onChangeRetryOverride?.('burnSubtitles', { fontLibraryId: event.target.value, fontItemId: library?.items?.[0]?.id || '' }); }} value={burnSubtitlesRetryValues.fontLibraryId || retryFontLibrary?.id || ''}>
+                    {!fontLibraries.length ? <option value="">No Font libraries</option> : null}
+                    {fontLibraries.map((library) => <option key={library.id} value={library.id}>{library.name} ({library.items?.length || 0})</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-font-item">Imported font</label>
+                  <select className="store-input mt-3" disabled={busy || !retryFontLibrary?.items?.length} id="validation-burn-subtitles-font-item" onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { fontItemId: event.target.value })} value={burnSubtitlesRetryValues.fontItemId || retryFontLibrary?.items?.[0]?.id || ''}>
+                    {!retryFontLibrary?.items?.length ? <option value="">No imported fonts</option> : null}
+                    {(retryFontLibrary?.items || []).map((item) => <option key={item.id} value={item.id}>{item.displayName || item.name}</option>)}
+                  </select>
+                </div>
+              </>
+            ) : null}
+            {burnSubtitlesRetryValues.fontSource !== 'assetLibrary' ? (
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-font-preset">Font preset</label>
+                <select className="store-input mt-3" disabled={busy} id="validation-burn-subtitles-font-preset" onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { fontPreset: event.target.value })} value={String(burnSubtitlesRetryValues.fontPreset || 'arial')}>
+                  {BURN_SUBTITLES_FONT_PRESET_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
                 </select>
               </div>
-            ))}
+            ) : null}
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-color-source">Color source</label>
+              <select className="store-input mt-3" disabled={busy} id="validation-burn-subtitles-color-source" onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { colorSource: event.target.value, colorPaletteLibraryId: event.target.value === 'palette' ? (retryPaletteLibrary?.id || '') : '', textColorPaletteItemId: event.target.value === 'palette' ? (retryPaletteLibrary?.items?.[0]?.id || '') : '', outlineColorPaletteItemId: event.target.value === 'palette' ? (retryPaletteLibrary?.items?.[0]?.id || '') : '', backgroundColorPaletteItemId: event.target.value === 'palette' ? (retryPaletteLibrary?.items?.[0]?.id || '') : '' })} value={burnSubtitlesRetryValues.colorSource || 'manual'}>
+                {BURN_SUBTITLES_COLOR_SOURCE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+              </select>
+            </div>
+          </div>
+          {burnSubtitlesRetryValues.colorSource === 'palette' ? (
+            <div className="mt-4 grid gap-3 sm:grid-cols-4">
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-palette-library">Palette library</label>
+                <select className="store-input mt-3" disabled={busy || !colorPaletteLibraries.length} id="validation-burn-subtitles-palette-library" onChange={(event) => { const library = colorPaletteLibraries.find((entry) => entry.id === event.target.value) || null; const itemId = library?.items?.[0]?.id || ''; onChangeRetryOverride?.('burnSubtitles', { colorPaletteLibraryId: event.target.value, textColorPaletteItemId: itemId, outlineColorPaletteItemId: itemId, backgroundColorPaletteItemId: itemId }); }} value={burnSubtitlesRetryValues.colorPaletteLibraryId || retryPaletteLibrary?.id || ''}>
+                  {!colorPaletteLibraries.length ? <option value="">No Color Palette libraries</option> : null}
+                  {colorPaletteLibraries.map((library) => <option key={library.id} value={library.id}>{library.name} ({library.items?.length || 0})</option>)}
+                </select>
+              </div>
+              {[
+                ['validation-burn-subtitles-palette-text', 'Text', 'textColorPaletteItemId'],
+                ['validation-burn-subtitles-palette-outline', 'Outline', 'outlineColorPaletteItemId'],
+                ['validation-burn-subtitles-palette-background', 'Background', 'backgroundColorPaletteItemId'],
+              ].map(([inputId, label, key]) => (
+                <div key={inputId}>
+                  <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor={inputId}>{label}</label>
+                  <select className="store-input mt-3" disabled={busy || !retryPaletteLibrary?.items?.length} id={inputId} onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { [key]: event.target.value })} value={burnSubtitlesRetryValues[key] || retryPaletteLibrary?.items?.[0]?.id || ''}>
+                    {!retryPaletteLibrary?.items?.length ? <option value="">No colors</option> : null}
+                    {(retryPaletteLibrary?.items || []).map((item) => <option key={item.id} value={item.id}>{item.name} ({item.hex})</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-4 grid gap-3 sm:grid-cols-3">
+              {[
+                ['validation-burn-subtitles-text-color', 'Text color', 'textColor', 'white', BURN_SUBTITLES_TEXT_COLOR_OPTIONS],
+                ['validation-burn-subtitles-outline-color', 'Outline color', 'outlineColor', 'black', BURN_SUBTITLES_OUTLINE_COLOR_OPTIONS],
+                ['validation-burn-subtitles-background-color', 'Background color', 'backgroundColor', 'black', BURN_SUBTITLES_TEXT_COLOR_OPTIONS],
+              ].map(([inputId, label, key, fallback, options]) => (
+                <div key={inputId}>
+                  <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor={inputId}>{label}</label>
+                  <select className="store-input mt-3" disabled={busy} id={inputId} onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { [key]: event.target.value })} value={String(burnSubtitlesRetryValues[key] || fallback)}>
+                    {options.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-burn-subtitles-position">Position</label>
+              <select className="store-input mt-3" disabled={busy} id="validation-burn-subtitles-position" onChange={(event) => onChangeRetryOverride?.('burnSubtitles', { position: event.target.value })} value={String(burnSubtitlesRetryValues.position || 'bottomCenter')}>
+                {BURN_SUBTITLES_POSITION_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+              </select>
+            </div>
           </div>
           <div className="mt-4 grid gap-3 sm:grid-cols-4">
             {[
@@ -2423,7 +2608,7 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, on
   );
 }
 
-function PipelineTimeline({ draft, runState, validationComment, validationRetryOverrides, onChangeValidationComment, onChangeValidationRetryOverride, onDecideValidation, onOpenPath, onRevealPath, validationBusy }) {
+function PipelineTimeline({ draft, runState, validationComment, validationRetryOverrides, fontLibraries = [], colorPaletteLibraries = [], onChangeValidationComment, onChangeValidationRetryOverride, onDecideValidation, onOpenPath, onRevealPath, validationBusy }) {
   const activeNodeState = runState?.currentNodeId ? runState.nodeStates?.[runState.currentNodeId] || null : null;
   const activeAttemptLabel = formatAttemptLabel(activeNodeState?.iteration, activeNodeState?.loopMaxAttempts);
   const loopStates = Object.values(runState?.loopStates || {});
@@ -2497,6 +2682,8 @@ function PipelineTimeline({ draft, runState, validationComment, validationRetryO
           onRevealPath={onRevealPath}
           pendingValidation={runState.pendingValidation}
           retryOverrides={validationRetryOverrides}
+          fontLibraries={fontLibraries}
+          colorPaletteLibraries={colorPaletteLibraries}
         />
       ) : null}
 
@@ -3002,6 +3189,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const [dirty, setDirty] = useState(false);
   const [modelOptionsByNodeId, setModelOptionsByNodeId] = useState({});
   const [graphWorkflowPresets, setGraphWorkflowPresets] = useState(() => (Array.isArray(initialGraphWorkflowPresets) ? initialGraphWorkflowPresets : []));
+  const [soundEffectLibraries, setSoundEffectLibraries] = useState([]);
+  const [fontLibraries, setFontLibraries] = useState([]);
+  const [colorPaletteLibraries, setColorPaletteLibraries] = useState([]);
   const [graphWorkflowPresetName, setGraphWorkflowPresetName] = useState('');
   const [graphWorkflowPresetStatus, setGraphWorkflowPresetStatus] = useState(null);
   const [graphWorkflowPresetBusy, setGraphWorkflowPresetBusy] = useState(false);
@@ -3082,6 +3272,10 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const graph = useMemo(() => buildPipelineGraph(draft), [draft]);
   const selectedNode = useMemo(() => draft.nodes.find((node) => node.id === selectedNodeId) || null, [draft.nodes, selectedNodeId]);
   const selectedEdge = useMemo(() => draft.edges.find((edge) => edge.id === selectedEdgeId) || null, [draft.edges, selectedEdgeId]);
+  const selectedSoundEffectsLibrary = useMemo(() => (selectedNode?.type === 'mediaComposition' ? soundEffectLibraries.find((library) => library.id === selectedNode.config?.soundEffectsLibraryId) || null : null), [selectedNode, soundEffectLibraries]);
+  const selectedFontLibrary = useMemo(() => (selectedNode?.type === 'burnSubtitles' ? fontLibraries.find((library) => library.id === selectedNode.config?.fontLibraryId) || fontLibraries[0] || null : null), [fontLibraries, selectedNode]);
+  const selectedColorPaletteLibrary = useMemo(() => (selectedNode?.type === 'burnSubtitles' ? colorPaletteLibraries.find((library) => library.id === selectedNode.config?.colorPaletteLibraryId) || colorPaletteLibraries[0] || null : null), [colorPaletteLibraries, selectedNode]);
+  const selectedSoundEffectsLayers = useMemo(() => (selectedNode?.type === 'mediaComposition' ? getMediaCompositionSoundEffectsLayersForUi(selectedNode.config || {}, soundEffectLibraries) : []), [selectedNode, soundEffectLibraries]);
   const selectedRetryLoopMeta = useMemo(
     () => (selectedNode?.type === 'retryLoop' ? graph.retryLoopsByNodeId?.get?.(selectedNode.id) || null : null),
     [graph, selectedNode],
@@ -3122,6 +3316,23 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      window.localAIHub.listAssetLibraries?.('soundEffects'),
+      window.localAIHub.listAssetLibraries?.('fonts'),
+      window.localAIHub.listAssetLibraries?.('colorPalettes'),
+    ]).then(([soundResult, fontResult, paletteResult]) => {
+      if (!cancelled) {
+        if (soundResult?.ok) setSoundEffectLibraries(soundResult.data?.libraries || []);
+        if (fontResult?.ok) setFontLibraries(fontResult.data?.libraries || []);
+        if (paletteResult?.ok) setColorPaletteLibraries(paletteResult.data?.libraries || []);
+      }
+    }).catch(() => null);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const audioTools = useMemo(() => (tools || []).filter((tool) => AUDIO_WORKFLOW_TOOL_IDS.includes(tool.id) && !AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const audioTransformTools = useMemo(() => (tools || []).filter((tool) => AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const imageTools = useMemo(() => (tools || []).filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
@@ -6670,6 +6881,62 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                     ) : null}
                     <div className="rounded-[24px] border border-white/10 bg-white/5 p-4">
                       <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Style</p>
+                      <div className="mt-4 grid gap-3 md:grid-cols-2">
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="burn-subtitles-font-source">Font source</label>
+                          <select className="store-input mt-3" id="burn-subtitles-font-source" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, fontSource: event.target.value, fontLibraryId: event.target.value === 'assetLibrary' ? (selectedFontLibrary?.id || '') : '', fontItemId: event.target.value === 'assetLibrary' ? (selectedFontLibrary?.items?.[0]?.id || '') : '' } }))} value={String(selectedNode.config?.fontSource || 'preset').trim() === 'assetLibrary' ? 'assetLibrary' : 'preset'}>
+                            {BURN_SUBTITLES_FONT_SOURCE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="burn-subtitles-color-source">Color source</label>
+                          <select className="store-input mt-3" id="burn-subtitles-color-source" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, colorSource: event.target.value, colorPaletteLibraryId: event.target.value === 'palette' ? (selectedColorPaletteLibrary?.id || '') : '', textColorPaletteItemId: event.target.value === 'palette' ? (selectedColorPaletteLibrary?.items?.[0]?.id || '') : '', outlineColorPaletteItemId: event.target.value === 'palette' ? (selectedColorPaletteLibrary?.items?.[0]?.id || '') : '', backgroundColorPaletteItemId: event.target.value === 'palette' ? (selectedColorPaletteLibrary?.items?.[0]?.id || '') : '' } }))} value={String(selectedNode.config?.colorSource || 'manual').trim() === 'palette' ? 'palette' : 'manual'}>
+                            {BURN_SUBTITLES_COLOR_SOURCE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                          </select>
+                        </div>
+                      </div>
+                      {String(selectedNode.config?.fontSource || 'preset').trim() === 'assetLibrary' ? (
+                        <div className="mt-4 grid gap-3 md:grid-cols-2">
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="burn-subtitles-font-library">Font library</label>
+                            <select className="store-input mt-3" disabled={!fontLibraries.length} id="burn-subtitles-font-library" onChange={(event) => { const library = fontLibraries.find((entry) => entry.id === event.target.value) || null; updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, fontLibraryId: event.target.value, fontItemId: library?.items?.[0]?.id || '' } })); }} value={selectedNode.config?.fontLibraryId || selectedFontLibrary?.id || ''}>
+                              {!fontLibraries.length ? <option value="">No Font libraries</option> : null}
+                              {fontLibraries.map((library) => <option key={library.id} value={library.id}>{library.name} ({library.items?.length || 0})</option>)}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="burn-subtitles-font-item">Imported font</label>
+                            <select className="store-input mt-3" disabled={!selectedFontLibrary?.items?.length} id="burn-subtitles-font-item" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, fontItemId: event.target.value } }))} value={selectedNode.config?.fontItemId || selectedFontLibrary?.items?.[0]?.id || ''}>
+                              {!selectedFontLibrary?.items?.length ? <option value="">No imported fonts</option> : null}
+                              {(selectedFontLibrary?.items || []).map((item) => <option key={item.id} value={item.id}>{item.displayName || item.name}</option>)}
+                            </select>
+                          </div>
+                        </div>
+                      ) : null}
+                      {String(selectedNode.config?.colorSource || 'manual').trim() === 'palette' ? (
+                        <div className="mt-4 grid gap-3 md:grid-cols-4">
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="burn-subtitles-palette-library">Palette library</label>
+                            <select className="store-input mt-3" disabled={!colorPaletteLibraries.length} id="burn-subtitles-palette-library" onChange={(event) => { const library = colorPaletteLibraries.find((entry) => entry.id === event.target.value) || null; const itemId = library?.items?.[0]?.id || ''; updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, colorPaletteLibraryId: event.target.value, textColorPaletteItemId: itemId, outlineColorPaletteItemId: itemId, backgroundColorPaletteItemId: itemId } })); }} value={selectedNode.config?.colorPaletteLibraryId || selectedColorPaletteLibrary?.id || ''}>
+                              {!colorPaletteLibraries.length ? <option value="">No Color Palette libraries</option> : null}
+                              {colorPaletteLibraries.map((library) => <option key={library.id} value={library.id}>{library.name} ({library.items?.length || 0})</option>)}
+                            </select>
+                          </div>
+                          {[
+                            ['burn-subtitles-palette-text', 'Text', 'textColorPaletteItemId'],
+                            ['burn-subtitles-palette-outline', 'Outline', 'outlineColorPaletteItemId'],
+                            ['burn-subtitles-palette-background', 'Background', 'backgroundColorPaletteItemId'],
+                          ].map(([inputId, label, configKey]) => (
+                            <div key={inputId}>
+                              <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={inputId}>{label}</label>
+                              <select className="store-input mt-3" disabled={!selectedColorPaletteLibrary?.items?.length} id={inputId} onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, [configKey]: event.target.value } }))} value={selectedNode.config?.[configKey] || selectedColorPaletteLibrary?.items?.[0]?.id || ''}>
+                                {!selectedColorPaletteLibrary?.items?.length ? <option value="">No colors</option> : null}
+                                {(selectedColorPaletteLibrary?.items || []).map((item) => <option key={item.id} value={item.id}>{item.name} ({item.hex})</option>)}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
                       <div className="mt-4 grid grid-cols-2 gap-3">
                         {[
                           ['burn-subtitles-font-size', 'Font size', 'fontSize', 28],
@@ -6706,6 +6973,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                           ['burn-subtitles-outline-color', 'Outline color', 'outlineColor', 'black', [
                             ['black', 'Black'], ['white', 'White'], ['darkGray', 'Dark gray'], ['lightGray', 'Light gray'], ['yellow', 'Yellow'], ['red', 'Red'], ['blue', 'Blue'],
                           ]],
+                          ['burn-subtitles-background-color', 'Background color', 'backgroundColor', 'black', BURN_SUBTITLES_TEXT_COLOR_OPTIONS],
                           ['burn-subtitles-position', 'Position', 'position', 'bottomCenter', [
                             ['bottomCenter', 'Bottom center'], ['bottomLeft', 'Bottom left'], ['bottomRight', 'Bottom right'], ['topCenter', 'Top center'], ['topLeft', 'Top left'], ['topRight', 'Top right'], ['center', 'Center'],
                           ]],
@@ -7147,6 +7415,158 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         </label>
                       ) : null}
                     </div>
+                    <div className="space-y-3 border-t border-white/10 pt-4">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <label className="flex items-center gap-3 text-sm font-medium text-slate-200" htmlFor="media-composition-sfx-enabled">
+                          <input
+                            checked={selectedNode.config?.soundEffectsEnabled === true}
+                            className="h-4 w-4 accent-cyan-300"
+                            id="media-composition-sfx-enabled"
+                            onChange={(event) => updateNode(selectedNode.id, (currentNode) => {
+                              const currentLayers = getMediaCompositionSoundEffectsLayersForUi(currentNode.config || {}, soundEffectLibraries);
+                              const nextLayers = event.target.checked && !currentLayers.length
+                                ? [createMediaCompositionSoundEffectsLayer(soundEffectLibraries, 0)]
+                                : currentLayers;
+                              return {
+                                ...currentNode,
+                                config: {
+                                  ...currentNode.config,
+                                  soundEffectsEnabled: event.target.checked,
+                                  soundEffectsLayers: nextLayers,
+                                },
+                              };
+                            })}
+                            type="checkbox"
+                          />
+                          <span>Enable sound effects</span>
+                        </label>
+                        {selectedNode.config?.soundEffectsEnabled === true ? (
+                          <button
+                            className="ghost-button px-3 py-1.5 text-xs"
+                            onClick={() => updateNode(selectedNode.id, (currentNode) => {
+                              const currentLayers = getMediaCompositionSoundEffectsLayersForUi(currentNode.config || {}, soundEffectLibraries);
+                              return {
+                                ...currentNode,
+                                config: {
+                                  ...currentNode.config,
+                                  soundEffectsEnabled: true,
+                                  soundEffectsLayers: [...currentLayers, createMediaCompositionSoundEffectsLayer(soundEffectLibraries, currentLayers.length)],
+                                },
+                              };
+                            })}
+                            type="button"
+                          >
+                            Add SFX layer
+                          </button>
+                        ) : null}
+                      </div>
+                      {selectedNode.config?.soundEffectsEnabled === true ? (
+                        <div className="space-y-3">
+                          {!soundEffectLibraries.length ? <p className="text-xs leading-5 text-slate-400">Create a Sound Effects library in Settings &gt; Asset Libraries.</p> : null}
+                          {selectedSoundEffectsLayers.length ? selectedSoundEffectsLayers.map((layer, index) => {
+                            const updateLayer = (patch) => updateNode(selectedNode.id, (currentNode) => {
+                              const currentLayers = getMediaCompositionSoundEffectsLayersForUi(currentNode.config || {}, soundEffectLibraries);
+                              const nextLayers = currentLayers.map((entry, entryIndex) => (entryIndex === index ? { ...entry, ...patch } : entry));
+                              return {
+                                ...currentNode,
+                                config: {
+                                  ...currentNode.config,
+                                  soundEffectsEnabled: true,
+                                  soundEffectsLayers: nextLayers,
+                                },
+                              };
+                            });
+                            const selectedLayerLibrary = soundEffectLibraries.find((library) => library.id === layer.libraryId) || null;
+                            return (
+                              <div className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3" key={layer.id || index}>
+                                <div className="flex flex-wrap items-center justify-between gap-3">
+                                  <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">SFX layer {index + 1}</p>
+                                  <button
+                                    className="ghost-button px-2 py-1 text-xs"
+                                    onClick={() => updateNode(selectedNode.id, (currentNode) => {
+                                      const currentLayers = getMediaCompositionSoundEffectsLayersForUi(currentNode.config || {}, soundEffectLibraries);
+                                      return {
+                                        ...currentNode,
+                                        config: {
+                                          ...currentNode.config,
+                                          soundEffectsEnabled: true,
+                                          soundEffectsLayers: currentLayers.filter((entry, entryIndex) => entryIndex !== index),
+                                        },
+                                      };
+                                    })}
+                                    type="button"
+                                  >
+                                    Remove
+                                  </button>
+                                </div>
+                                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                                  <div>
+                                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-layer-name-${index}`}>Layer name</label>
+                                    <input className="store-input mt-3" id={`media-composition-sfx-layer-name-${index}`} onChange={(event) => updateLayer({ name: event.target.value })} value={layer.name || `Layer ${index + 1}`} />
+                                  </div>
+                                  <div>
+                                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-library-${index}`}>Sound Effects library</label>
+                                    <select
+                                      className="store-input mt-3"
+                                      disabled={!soundEffectLibraries.length}
+                                      id={`media-composition-sfx-library-${index}`}
+                                      onChange={(event) => updateLayer({ libraryId: event.target.value })}
+                                      value={layer.libraryId || soundEffectLibraries[0]?.id || ''}
+                                    >
+                                      {!soundEffectLibraries.length ? <option value="">No Sound Effects libraries</option> : null}
+                                      {soundEffectLibraries.map((library) => <option key={library.id} value={library.id}>{library.name} ({library.items?.length || 0})</option>)}
+                                    </select>
+                                  </div>
+                                  <div>
+                                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-mode-${index}`}>Scheduling mode</label>
+                                    <select className="store-input mt-3" id={`media-composition-sfx-mode-${index}`} onChange={(event) => updateLayer({ schedulingMode: getMediaCompositionSoundEffectsMode(event.target.value) })} value={getMediaCompositionSoundEffectsMode(layer.schedulingMode)}>
+                                      {MEDIA_COMPOSITION_SOUND_EFFECTS_MODE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                                    </select>
+                                  </div>
+                                  <div>
+                                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-density-${index}`}>Frequency</label>
+                                    <select className="store-input mt-3" id={`media-composition-sfx-density-${index}`} onChange={(event) => updateLayer({ density: getMediaCompositionSoundEffectsDensity(event.target.value) })} value={getMediaCompositionSoundEffectsDensity(layer.density)}>
+                                      {MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITY_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                                    </select>
+                                  </div>
+                                  <div>
+                                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-spacing-${index}`}>Minimum seconds between effects</label>
+                                    <input className="store-input mt-3" id={`media-composition-sfx-spacing-${index}`} min="0" onChange={(event) => updateLayer({ minSpacingSeconds: normalizeSoundEffectsSpacing(event.target.value, 4) })} step="0.5" type="number" value={layer.minSpacingSeconds ?? 4} />
+                                  </div>
+                                  <div>
+                                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-simultaneous-${index}`}>Max simultaneous effects</label>
+                                    <input className="store-input mt-3" id={`media-composition-sfx-simultaneous-${index}`} min="1" max="8" onChange={(event) => updateLayer({ maxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(event.target.value || 0) || 2))) })} step="1" type="number" value={layer.maxSimultaneous ?? 2} />
+                                  </div>
+                                  <div>
+                                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-volume-${index}`}>Layer volume</label>
+                                    <div className="mt-3 flex items-center gap-3">
+                                      <input className="min-w-0 flex-1 accent-cyan-300" id={`media-composition-sfx-volume-${index}`} max="200" min="0" onChange={(event) => updateLayer({ volume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME) })} step="1" type="range" value={formatVolumePercent(layer.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME)} />
+                                      <input className="store-input w-24" max="200" min="0" onChange={(event) => updateLayer({ volume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME) })} step="1" type="number" value={formatVolumePercent(layer.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME)} />
+                                    </div>
+                                  </div>
+                                  <div className="grid gap-3 sm:grid-cols-2">
+                                    <label className="flex items-center gap-3 pt-7 text-sm text-slate-300" htmlFor={`media-composition-sfx-avoid-repeats-${index}`}><input checked={layer.avoidRepeats !== false} className="h-4 w-4 accent-cyan-300" id={`media-composition-sfx-avoid-repeats-${index}`} onChange={(event) => updateLayer({ avoidRepeats: event.target.checked })} type="checkbox" />Avoid repeats</label>
+                                    <div>
+                                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-fade-${index}`}>Fade seconds</label>
+                                      <input className="store-input mt-3" id={`media-composition-sfx-fade-${index}`} min="0" max="2" onChange={(event) => updateLayer({ fadeSeconds: normalizeSoundEffectsSpacing(event.target.value, 0.05) })} step="0.05" type="number" value={layer.fadeSeconds ?? 0.05} />
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-seed-${index}`}>Seed</label>
+                                    <input className="store-input mt-3" id={`media-composition-sfx-seed-${index}`} onChange={(event) => updateLayer({ seed: event.target.value })} placeholder="Deterministic default" value={layer.seed || ''} />
+                                  </div>
+                                </div>
+                                {selectedLayerLibrary?.items?.length ? <p className="mt-3 text-xs leading-5 text-slate-400">Uses managed files from {selectedLayerLibrary.name}; source import paths are not used.</p> : null}
+                              </div>
+                            );
+                          }) : (
+                            <div className="rounded-[18px] border border-dashed border-white/10 bg-white/5 px-4 py-4 text-sm leading-6 text-slate-400">
+                              Add at least one SFX layer before running with sound effects enabled.
+                            </div>
+                          )}
+                        </div>
+                      ) : null}
+                    </div>
                     <div className="grid gap-3 sm:grid-cols-2">
                       <div>
                         <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-narration-volume">Narration volume</label>
@@ -7164,11 +7584,10 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       </div>
                     </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Connect an ordered image collection to the Visual Collection input and optionally add one primary audio artifact plus one background music artifact. Connecting or disconnecting the Background Music input is the explicit include control; export applies the selected narration and background music levels when those tracks are present.
+                      Connect an ordered image collection to the Visual Collection input and optionally add one primary audio artifact plus one background music artifact. Connecting or disconnecting the Background Music input is the explicit include control; export applies the selected narration, background music, and sound effects levels when those tracks are present.
                     </div>
                   </div>
                 ) : null}
-
                 {selectedNode.type === 'mediaExport' ? (
                   <div className="space-y-4">
                     <div>
@@ -7450,6 +7869,8 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   validationBusy={validationBusy}
                   validationComment={validationComment}
                   validationRetryOverrides={validationRetryOverrides}
+                  fontLibraries={fontLibraries}
+                  colorPaletteLibraries={colorPaletteLibraries}
                 />
               </div>
             ) : null}

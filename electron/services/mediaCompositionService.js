@@ -18,10 +18,13 @@ try {
 const { runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, isCompositionArtifact, serializeArtifactForUi, summarizeArtifact } = require('./pipelineArtifactService');
+const { resolveAssetLibraryPreviewFile } = require('./assetLibraryService');
 const {
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   MEDIA_COMPOSITION_XFADE_TRANSITIONS,
+  MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS,
   PORT_KIND_VIDEO,
 } = require('../shared/pipelineSchema.cjs');
 
@@ -48,6 +51,7 @@ function resolveCompositionAudioMix(compositionArtifact) {
   return {
     backgroundMusicVolume: normalizeAudioVolume(mix.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
     narrationVolume: normalizeAudioVolume(mix.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+    soundEffectsVolume: normalizeAudioVolume(mix.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
   };
 }
 
@@ -68,6 +72,25 @@ function firstNonEmptyLine(value) {
     .find(Boolean) || '';
 }
 
+function getDiagnosticTail(value, limit = 12) {
+  return String(value || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-Math.max(1, Number(limit || 0) || 12))
+    .join('\n');
+}
+
+function buildFfmpegFailureMessage(commandResult) {
+  const code = commandResult?.code;
+  const stderrTail = getDiagnosticTail(commandResult?.stderr, 10);
+  const stdoutTail = getDiagnosticTail(commandResult?.stdout, 5);
+  const diagnostic = stderrTail || stdoutTail || firstNonEmptyLine(commandResult?.stderr) || firstNonEmptyLine(commandResult?.stdout) || '';
+  const codeMessage = Number(code || 0) ? `FFmpeg stopped with exit code ${code}.` : 'FFmpeg stopped before producing a valid video.';
+  return diagnostic
+    ? `Local AI Hub could not render the media composition to video. ${codeMessage} Last FFmpeg diagnostic: ${diagnostic}`
+    : `Local AI Hub could not render the media composition to video. ${codeMessage}`;
+}
 function resolveFfmpegPath() {
   const packagedPath = app?.isPackaged
     ? path.join(process.resourcesPath, 'bin', 'ffmpeg.exe')
@@ -186,7 +209,8 @@ function summarizeSceneTransitionPlanForLog(sceneTransitions) {
 
 function parseSupportedXfadeTransitions(helpText) {
   const supported = new Set();
-  const transitionSet = new Set(MEDIA_COMPOSITION_XFADE_TRANSITIONS);
+  const unstableTransitionSet = new Set(MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS);
+  const transitionSet = new Set(MEDIA_COMPOSITION_XFADE_TRANSITIONS.filter((transition) => !unstableTransitionSet.has(transition)));
   for (const line of String(helpText || '').split(/\r?\n/)) {
     const match = line.trim().match(/^([a-z][a-z0-9]*)\s+-?\d+\s+/i);
     if (match && transitionSet.has(match[1])) {
@@ -298,20 +322,23 @@ function calculateVisualDurationSeconds(visualTrack) {
   return items.reduce((total, entry) => total + Math.max(0, Number(entry?.durationSeconds || visualTrack?.itemDurationSeconds || 0) || 0), 0);
 }
 
-function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visualDurationSeconds, audioMix = {}) {
+function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visualDurationSeconds, audioMix = {}, soundEffectsExport = null, soundEffectsPlan = null) {
   const primaryAudioArtifact = primaryAudioTrack?.artifact || null;
   const backgroundMusicArtifact = backgroundMusicTrack?.artifact || null;
+  const soundEffectEvents = Array.isArray(soundEffectsExport?.events) ? soundEffectsExport.events : [];
+  const primaryConfigured = soundEffectsPlan?.requested || soundEffectsPlan || null;
   const hasPrimaryAudio = Boolean(primaryAudioArtifact?.filePath);
   const hasBackgroundMusic = Boolean(backgroundMusicArtifact?.filePath);
-  const shouldLoopBackgroundMusic = hasBackgroundMusic && (hasPrimaryAudio || stopMode === 'visuals');
+  const hasSoundEffects = soundEffectEvents.length > 0;
+  const shouldLoopBackgroundMusic = hasBackgroundMusic && (hasPrimaryAudio || hasSoundEffects || stopMode === 'visuals');
 
-  let mode = 'silent';
+  let baseMode = 'silent';
   if (hasPrimaryAudio && hasBackgroundMusic) {
-    mode = 'mixed-with-background-music';
+    baseMode = 'mixed-with-background-music';
   } else if (hasPrimaryAudio) {
-    mode = 'primary-audio-only';
+    baseMode = 'primary-audio-only';
   } else if (hasBackgroundMusic) {
-    mode = 'background-music-only';
+    baseMode = 'background-music-only';
   }
 
   return {
@@ -319,28 +346,156 @@ function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visua
     backgroundMusicTrack,
     backgroundMusicVolume: normalizeAudioVolume(audioMix.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
     narrationVolume: normalizeAudioVolume(audioMix.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+    soundEffectsEnabled: soundEffectsPlan?.enabled === true,
+    soundEffectsEvents: soundEffectEvents,
+    soundEffectsFadeSeconds: Math.max(0, Math.min(2, Number(primaryConfigured?.fadeSeconds ?? soundEffectsPlan?.fadeSeconds ?? 0) || 0)),
+    soundEffectsMetadata: buildSoundEffectsExportMetadata(soundEffectsPlan, soundEffectsExport),
+    soundEffectsVolume: normalizeAudioVolume(audioMix.soundEffectsVolume ?? primaryConfigured?.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
     hasBackgroundMusic,
     hasPrimaryAudio,
-    mode,
-    outputDurationSeconds: stopMode === 'visuals' && visualDurationSeconds > 0 ? Math.round(visualDurationSeconds * 1000) / 1000 : null,
+    hasSoundEffects,
+    hasAnyAudio: hasPrimaryAudio || hasBackgroundMusic || hasSoundEffects,
+    mode: getSoundEffectsAudioMode(baseMode, hasSoundEffects),
+    outputDurationSeconds: (stopMode === 'visuals' || hasSoundEffects) && visualDurationSeconds > 0 ? Math.round(visualDurationSeconds * 1000) / 1000 : null,
     primaryAudioArtifact,
     primaryAudioTrack,
     shouldLoopBackgroundMusic,
     stopMode,
   };
 }
-
 function buildAudioMixMetadata(audioPlan) {
+  const soundEffectsLayers = Array.isArray(audioPlan.soundEffectsMetadata?.layers) ? audioPlan.soundEffectsMetadata.layers : [];
   return {
     backgroundMusicLooping: audioPlan.hasBackgroundMusic ? audioPlan.shouldLoopBackgroundMusic : false,
     backgroundMusicVolume: audioPlan.backgroundMusicVolume,
     narrationVolume: audioPlan.narrationVolume,
+    soundEffectsEnabled: audioPlan.soundEffectsEnabled,
+    soundEffectsEventCount: audioPlan.soundEffectsEvents.length,
+    soundEffectsInputCount: audioPlan.soundEffectsEvents.length,
+    soundEffectsLayerCount: soundEffectsLayers.length,
+    soundEffectsVolume: audioPlan.soundEffectsVolume,
     mode: audioPlan.mode,
     outputDurationSeconds: audioPlan.outputDurationSeconds || null,
     stopMode: audioPlan.stopMode,
   };
 }
+function getCompositionSoundEffectsPlan(compositionArtifact) {
+  const plan = compositionArtifact?.composition?.soundEffects && typeof compositionArtifact.composition.soundEffects === 'object'
+    ? compositionArtifact.composition.soundEffects
+    : null;
+  if (!plan || plan.enabled !== true) {
+    return { enabled: false, events: [], notes: plan?.notes || [], requested: plan?.requested || null };
+  }
+  const events = Array.isArray(plan.scheduledEvents) ? plan.scheduledEvents : [];
+  return { ...plan, events };
+}
 
+async function resolveSoundEffectEventsForExport(soundEffectsPlan, visualDurationSeconds) {
+  if (!soundEffectsPlan?.enabled) {
+    return { events: [], notes: soundEffectsPlan?.notes || [] };
+  }
+
+  const notes = Array.isArray(soundEffectsPlan.notes) ? [...soundEffectsPlan.notes] : [];
+  const resolvedEvents = [];
+  for (const event of soundEffectsPlan.events || []) {
+    const timeSeconds = Math.max(0, Number(event?.timeSeconds || 0) || 0);
+    if (!Number.isFinite(timeSeconds) || timeSeconds >= visualDurationSeconds - 0.001) {
+      notes.push(`Skipped ${event?.itemName || 'a sound effect'} because it would start after the composition ends.`);
+      continue;
+    }
+
+    try {
+      const preview = await resolveAssetLibraryPreviewFile('soundEffects', event.libraryId, event.itemId);
+      const availableDurationSeconds = Number(event?.durationSeconds || preview.item?.durationSeconds || 0) || 0;
+      const remainingSeconds = Math.max(0.05, visualDurationSeconds - timeSeconds);
+      const durationSeconds = availableDurationSeconds > 0
+        ? Math.max(0.05, Math.min(availableDurationSeconds, remainingSeconds))
+        : remainingSeconds;
+      const trimmed = availableDurationSeconds > 0 && availableDurationSeconds > remainingSeconds + 0.001;
+      if (trimmed) {
+        notes.push(`Trimmed ${event?.itemName || preview.item?.displayName || 'a sound effect'} so it ends with the composition.`);
+      }
+      resolvedEvents.push({
+        ...event,
+        durationSeconds: Math.round(durationSeconds * 1000) / 1000,
+        filePath: preview.filePath,
+        itemName: event?.itemName || preview.item?.displayName || preview.item?.originalFilename || preview.item?.id,
+        libraryId: preview.libraryId,
+        timeSeconds: Math.round(timeSeconds * 1000) / 1000,
+        trimmed,
+      });
+    } catch (error) {
+      notes.push(error?.message || `Skipped ${event?.itemName || 'a sound effect'} because Local AI Hub could not read the managed file.`);
+    }
+  }
+
+  return { events: resolvedEvents, notes };
+}
+
+function buildSoundEffectsExportMetadata(soundEffectsPlan, soundEffectsExport) {
+  const enabled = soundEffectsPlan?.enabled === true;
+  const safeEvents = (soundEffectsExport?.events || []).map((event) => {
+    const { filePath, ...safeEvent } = event || {};
+    return serializeArtifactForUi(safeEvent);
+  });
+  const layers = Array.isArray(soundEffectsPlan?.layers)
+    ? soundEffectsPlan.layers.map((layer, index) => {
+      const layerId = String(layer?.layerId || layer?.id || '').trim();
+      const layerIndex = Number(layer?.layerIndex ?? layer?.index ?? index);
+      const scheduledEvents = safeEvents.filter((event) => {
+        if (layerId && String(event?.layerId || '').trim() === layerId) {
+          return true;
+        }
+        return Number(event?.layerIndex ?? -1) === layerIndex;
+      });
+      return serializeArtifactForUi({
+        ...(layer || {}),
+        scheduledEventCount: scheduledEvents.length,
+        scheduledEvents,
+      });
+    })
+    : [];
+  return {
+    ...(soundEffectsPlan || {}),
+    enabled,
+    finalSfxInputCount: safeEvents.length,
+    layers,
+    notes: soundEffectsExport?.notes || soundEffectsPlan?.notes || [],
+    scheduledEventCount: safeEvents.length,
+    scheduledEvents: safeEvents,
+  };
+}
+function getSoundEffectsAudioMode(baseMode, hasSoundEffects) {
+  if (!hasSoundEffects) {
+    return baseMode;
+  }
+  if (baseMode === 'silent') {
+    return 'sound-effects-only';
+  }
+  return `${baseMode}-with-sound-effects`;
+}
+
+function formatDelayMilliseconds(value) {
+  return String(Math.max(0, Math.round((Number(value || 0) || 0) * 1000)));
+}
+
+function buildSoundEffectFilterChain(inputIndex, event, index, volume, fadeSeconds) {
+  const durationSeconds = Math.max(0.05, Number(event?.durationSeconds || 0) || 0.05);
+  const safeFadeSeconds = Math.max(0, Math.min(Number(fadeSeconds || 0) || 0, durationSeconds / 2));
+  const filters = [
+    `[${inputIndex}:a]atrim=0:${formatFfmpegSeconds(durationSeconds)}`,
+    'asetpts=PTS-STARTPTS',
+    'aresample=async=1:first_pts=0',
+    'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo',
+    `volume=${formatVolumeFilterValue(volume)}`,
+  ];
+  if (safeFadeSeconds > 0.001) {
+    filters.push(`afade=t=in:st=0:d=${formatFfmpegSeconds(safeFadeSeconds)}`);
+    filters.push(`afade=t=out:st=${formatFfmpegSeconds(Math.max(0, durationSeconds - safeFadeSeconds))}:d=${formatFfmpegSeconds(safeFadeSeconds)}`);
+  }
+  filters.push(`adelay=${formatDelayMilliseconds(event?.timeSeconds)}:all=1[sfx${index}]`);
+  return filters.join(',');
+}
 function buildCompositionExportMetadata(compositionArtifact, visualTrack, audioPlan, exportProfile, options = {}) {
   const audioArtifact = audioPlan.primaryAudioArtifact;
   const backgroundMusicArtifact = audioPlan.backgroundMusicArtifact;
@@ -396,6 +551,7 @@ function buildCompositionExportMetadata(compositionArtifact, visualTrack, audioP
           summary: audioPlan.backgroundMusicTrack?.summary || summarizeArtifact(backgroundMusicArtifact),
         })
       : null,
+    soundEffects: serializeArtifactForUi(audioPlan.soundEffectsMetadata),
     audioMix: buildAudioMixMetadata(audioPlan),
   };
 }
@@ -450,12 +606,16 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
   const stopMode = String(options.stopMode || '').trim() === 'visuals' ? 'visuals' : 'shortest';
   const visualDurationSeconds = calculateVisualDurationSeconds(visualTrack);
   const audioMix = resolveCompositionAudioMix(compositionArtifact);
+  const soundEffectsPlan = getCompositionSoundEffectsPlan(compositionArtifact);
+  const soundEffectsExport = await resolveSoundEffectEventsForExport(soundEffectsPlan, visualDurationSeconds);
   const audioPlan = buildAudioPlan(
     getPrimaryAudioTrack(compositionArtifact),
     getBackgroundMusicTrack(compositionArtifact),
     stopMode,
     visualDurationSeconds,
     audioMix,
+    soundEffectsExport,
+    soundEffectsPlan,
   );
   const ffmpegPath = resolveFfmpegPath();
   const plannedSceneTransitions = visualTrack?.sceneTransitions || visualTrack?.timing?.sceneTransitions || null;
@@ -473,7 +633,7 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     fitMode: String(options.fitMode || '').trim() === 'cover' ? 'cover' : 'contain',
     stopMode,
     videoCodec: 'libx264',
-    audioCodec: audioPlan.hasPrimaryAudio || audioPlan.hasBackgroundMusic ? 'aac' : 'none',
+    audioCodec: audioPlan.hasAnyAudio ? 'aac' : 'none',
     container: 'mp4',
     pixelFormat: 'yuv420p',
     concatManifestPath: concatManifestPath || null,
@@ -537,18 +697,33 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     args.push('-i', audioPlan.backgroundMusicArtifact.filePath);
   }
 
+  const firstSoundEffectInputIndex = (shouldRenderSceneTransitions ? visualItems.length : 1)
+    + (audioPlan.hasPrimaryAudio ? 1 : 0)
+    + (audioPlan.hasBackgroundMusic ? 1 : 0);
+  audioPlan.soundEffectsEvents.forEach((event) => {
+    args.push('-i', event.filePath);
+  });
+
   let audioMapTarget = '';
   const audioFilters = [];
-  if (audioPlan.mode === 'mixed-with-background-music') {
-    audioFilters.push(`[${primaryAudioInputIndex}:a]aresample=async=1:first_pts=0,volume=${formatVolumeFilterValue(audioPlan.narrationVolume)}[primary]`);
-    audioFilters.push(`[${backgroundMusicInputIndex}:a]aresample=async=1:first_pts=0,volume=${formatVolumeFilterValue(audioPlan.backgroundMusicVolume)}[music]`);
-    audioFilters.push('[primary][music]amix=inputs=2:duration=longest:dropout_transition=2[aout]');
+  const audioMixLabels = [];
+  if (audioPlan.hasPrimaryAudio) {
+    audioFilters.push(`[${primaryAudioInputIndex}:a]aresample=async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume=${formatVolumeFilterValue(audioPlan.narrationVolume)}[primary]`);
+    audioMixLabels.push('[primary]');
+  }
+  if (audioPlan.hasBackgroundMusic) {
+    audioFilters.push(`[${backgroundMusicInputIndex}:a]aresample=async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume=${formatVolumeFilterValue(audioPlan.backgroundMusicVolume)}[music]`);
+    audioMixLabels.push('[music]');
+  }
+  audioPlan.soundEffectsEvents.forEach((event, index) => {
+    audioFilters.push(buildSoundEffectFilterChain(firstSoundEffectInputIndex + index, event, index, event.volume ?? audioPlan.soundEffectsVolume, event.fadeSeconds ?? audioPlan.soundEffectsFadeSeconds));
+    audioMixLabels.push(`[sfx${index}]`);
+  });
+  if (audioMixLabels.length > 1) {
+    audioFilters.push(`${audioMixLabels.join('')}amix=inputs=${audioMixLabels.length}:duration=longest:dropout_transition=2[aout]`);
     audioMapTarget = '[aout]';
-  } else if (audioPlan.mode === 'primary-audio-only') {
-    audioFilters.push(`[${primaryAudioInputIndex}:a]aresample=async=1:first_pts=0,volume=${formatVolumeFilterValue(audioPlan.narrationVolume)}[aout]`);
-    audioMapTarget = '[aout]';
-  } else if (audioPlan.mode === 'background-music-only') {
-    audioFilters.push(`[${backgroundMusicInputIndex}:a]aresample=async=1:first_pts=0,volume=${formatVolumeFilterValue(audioPlan.backgroundMusicVolume)}[aout]`);
+  } else if (audioMixLabels.length === 1) {
+    audioFilters.push(`${audioMixLabels[0]}anull[aout]`);
     audioMapTarget = '[aout]';
   }
 
@@ -591,7 +766,7 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     args.push('-map', audioMapTarget);
   }
 
-  if (audioPlan.hasPrimaryAudio || audioPlan.hasBackgroundMusic) {
+  if (audioPlan.hasAnyAudio) {
     args.push('-c:a', exportProfile.audioCodec);
     if (audioPlan.outputDurationSeconds) {
       args.push('-t', String(audioPlan.outputDurationSeconds));
@@ -623,12 +798,14 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     await logger.warn('Media Export ffmpeg render failed.', {
       code: commandResult.code || 0,
       message: failureLine || '',
+      stderrTail: getDiagnosticTail(commandResult.stderr, 16),
+      stdoutTail: getDiagnosticTail(commandResult.stdout, 8),
       outputPath,
       renderMode: shouldRenderSceneTransitions ? 'xfade-transitions' : 'concat-sequence',
       transitionPlan: summarizeSceneTransitionPlanForLog(sceneTransitions),
       visualDurationSeconds,
     }).catch(() => null);
-    throw new Error(failureLine || 'Local AI Hub could not render the media composition to video.');
+    throw new Error(buildFfmpegFailureMessage(commandResult));
   }
 
   await logger.info('Media Export ffmpeg render finished.', {
@@ -650,13 +827,19 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
   artifact.metadataPaths = [metadataPath];
   artifact.summary = summarizeArtifact(artifact);
 
-  const message = audioPlan.mode === 'mixed-with-background-music'
+  const soundEffectsSummary = audioPlan.hasSoundEffects
+    ? ` Sound effects: ${audioPlan.soundEffectsEvents.length} scheduled at ${formatVolumePercent(audioPlan.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME)}%.`
+    : '';
+  const baseMessage = audioPlan.hasPrimaryAudio && audioPlan.hasBackgroundMusic
     ? `Media Export rendered a video from ${visualItems.length} images with background music at ${formatVolumePercent(audioPlan.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}% and narration at ${formatVolumePercent(audioPlan.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}%.`
-    : audioPlan.mode === 'primary-audio-only'
+    : audioPlan.hasPrimaryAudio
       ? `Media Export rendered a video from ${visualItems.length} images with ${audioPlan.primaryAudioArtifact.fileName} as the primary audio track at ${formatVolumePercent(audioPlan.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}%.`
-      : audioPlan.mode === 'background-music-only'
+      : audioPlan.hasBackgroundMusic
         ? `Media Export rendered a video from ${visualItems.length} images with ${audioPlan.backgroundMusicArtifact.fileName} as the soundtrack at ${formatVolumePercent(audioPlan.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}%.`
-        : `Media Export rendered a silent video from ${visualItems.length} images.`;
+        : audioPlan.hasSoundEffects
+          ? `Media Export rendered a video from ${visualItems.length} images with sound effects only.`
+          : `Media Export rendered a silent video from ${visualItems.length} images.`;
+  const message = baseMessage + soundEffectsSummary;
 
   return {
     artifact,

@@ -15,7 +15,7 @@ const {
 const CONFIG_VERSION = 4;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
 const LEGACY_APP_DATA_DIR_NAMES = ['NestAI'];
-const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'runtimes', 'logs', 'temp', 'cache'];
+const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'runtimes', 'logs', 'temp', 'cache', 'libraries'];
 const UNINSTALL_METADATA_FILE = 'uninstall-cleanup.ini';
 
 let configOperationQueue = Promise.resolve();
@@ -148,6 +148,7 @@ function buildManagedSubdirectoryPaths(rootPath) {
     cacheRoot: path.join(managedRoot, 'cache'),
     downloadsRoot: path.join(managedRoot, 'downloads'),
     logsRoot: path.join(managedRoot, 'logs'),
+    librariesRoot: path.join(managedRoot, 'libraries'),
     modelsRoot: path.join(managedRoot, 'models'),
     runtimesRoot: path.join(managedRoot, 'runtimes'),
     snapshotsRoot: path.join(managedRoot, 'snapshots'),
@@ -202,6 +203,7 @@ function buildUninstallCleanupTargets(paths) {
     cacheRoot: hasExternalManagedRoot ? includeIfExternal(paths.cacheRoot) : '',
     downloadsRoot: hasExternalManagedRoot ? includeIfExternal(paths.downloadsRoot) : '',
     logsRoot: hasExternalManagedRoot ? includeIfExternal(paths.logsRoot) : '',
+    librariesRoot: hasExternalManagedRoot ? includeIfExternal(paths.librariesRoot) : '',
     modelsRoot: hasExternalManagedRoot ? includeIfExternal(paths.modelsRoot) : '',
     runtimesRoot: hasExternalManagedRoot ? includeIfExternal(paths.runtimesRoot) : '',
     snapshotsRoot: hasExternalManagedRoot ? includeIfExternal(paths.snapshotsRoot) : '',
@@ -225,6 +227,7 @@ async function writeUninstallCleanupMetadata(paths) {
     `RuntimesRoot=${escapeIniValue(targets.runtimesRoot)}`,
     `TempRoot=${escapeIniValue(targets.tempRoot)}`,
     `LogsRoot=${escapeIniValue(targets.logsRoot)}`,
+    `LibrariesRoot=${escapeIniValue(targets.librariesRoot)}`,
   ];
 
   await fs.ensureDir(paths.configRoot);
@@ -639,6 +642,7 @@ async function prepareStorage() {
     fs.ensureDir(paths.modelsRoot),
     fs.ensureDir(paths.runtimesRoot),
     fs.ensureDir(paths.logsRoot),
+    fs.ensureDir(paths.librariesRoot),
     fs.ensureDir(paths.tempRoot),
     fs.ensureDir(paths.cacheRoot),
   ]);

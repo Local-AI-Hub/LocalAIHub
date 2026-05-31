@@ -7,6 +7,7 @@ const { chatWithProvider, listProviderConnections, runProviderOperation } = requ
 const { initializeProviderRegistry } = require('./providerRegistry');
 const { getToolCatalog } = require('./toolRegistry');
 const { listGraphWorkflowPresets, listPromptStyles } = require('./configService');
+const { listAssetLibraries, resolveAssetLibraryPreviewFile } = require('./assetLibraryService');
 const { listDownloadedModels } = require('./modelService');
 const { buildMergedToolStateList, getResolvedToolState } = require('./toolStateService');
 const { DEFAULT_WHISPER_MODEL, transcribeWithWhisper } = require('./whisperService');
@@ -88,9 +89,13 @@ const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities,
 const {
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
+  MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
+  MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_TRANSITION_MODES,
   MEDIA_COMPOSITION_XFADE_TRANSITIONS,
+  MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS,
   PIPELINE_OPERATION_IDS,
   PORT_KIND_AUDIO,
   PORT_KIND_COLLECTION,
@@ -138,7 +143,8 @@ const PLANNER_PROVIDER_TIMEOUT_MS = 60000;
 const MEDIA_COMPOSITION_TRANSITION_CATEGORY_BY_ID = new Map(
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES.map((category) => [String(category.id || '').trim(), category]),
 );
-const MEDIA_COMPOSITION_XFADE_TRANSITION_SET = new Set(MEDIA_COMPOSITION_XFADE_TRANSITIONS);
+const MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITION_SET = new Set(MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS || []);
+const MEDIA_COMPOSITION_XFADE_TRANSITION_SET = new Set(MEDIA_COMPOSITION_XFADE_TRANSITIONS.filter((transition) => !MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITION_SET.has(transition)));
 function normalizeMediaCompositionVolume(value, fallback) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
@@ -190,6 +196,8 @@ const BURN_SUBTITLES_OUTLINE_COLORS = Object.freeze(['black', 'white', 'darkGray
 const BURN_SUBTITLES_FONT_PRESETS = Object.freeze(['arial', 'segoeUi', 'tahoma', 'verdana']);
 const BURN_SUBTITLES_POSITIONS = Object.freeze(['bottomCenter', 'bottomLeft', 'bottomRight', 'topCenter', 'topLeft', 'topRight', 'center']);
 const BURN_SUBTITLES_BACKGROUND_OPACITIES = Object.freeze([25, 50, 75, 100]);
+const BURN_SUBTITLES_FONT_SOURCES = Object.freeze(['preset', 'assetLibrary']);
+const BURN_SUBTITLES_COLOR_SOURCES = Object.freeze(['manual', 'palette']);
 
 function normalizeBurnSubtitlesNumber(value, fallback, minValue = 0) {
   const numeric = Number(value);
@@ -213,6 +221,10 @@ function normalizeBurnSubtitlesBackgroundOpacity(value, fallback = 50) {
   return BURN_SUBTITLES_BACKGROUND_OPACITIES.includes(numeric) ? numeric : fallback;
 }
 
+function normalizeBurnSubtitlesAssetId(value) {
+  return String(value || '').trim();
+}
+
 function buildBurnSubtitlesRetryOverrideConfig(value) {
   const source = value && typeof value === 'object' ? value : {};
   const config = {};
@@ -224,7 +236,16 @@ function buildBurnSubtitlesRetryOverrideConfig(value) {
   if (Object.prototype.hasOwnProperty.call(source, 'bottomMargin')) config.bottomMargin = normalizeBurnSubtitlesNumber(source.bottomMargin, 32, 0);
   if (Object.prototype.hasOwnProperty.call(source, 'textColor')) config.textColor = normalizeBurnSubtitlesEnum(source.textColor, BURN_SUBTITLES_TEXT_COLORS, 'white');
   if (Object.prototype.hasOwnProperty.call(source, 'outlineColor')) config.outlineColor = normalizeBurnSubtitlesEnum(source.outlineColor, BURN_SUBTITLES_OUTLINE_COLORS, 'black');
+  if (Object.prototype.hasOwnProperty.call(source, 'backgroundColor')) config.backgroundColor = normalizeBurnSubtitlesEnum(source.backgroundColor, BURN_SUBTITLES_TEXT_COLORS, 'black');
   if (Object.prototype.hasOwnProperty.call(source, 'fontPreset')) config.fontPreset = normalizeBurnSubtitlesEnum(source.fontPreset, BURN_SUBTITLES_FONT_PRESETS, 'arial');
+  if (Object.prototype.hasOwnProperty.call(source, 'fontSource')) config.fontSource = normalizeBurnSubtitlesEnum(source.fontSource, BURN_SUBTITLES_FONT_SOURCES, 'preset');
+  if (Object.prototype.hasOwnProperty.call(source, 'fontLibraryId')) config.fontLibraryId = normalizeBurnSubtitlesAssetId(source.fontLibraryId);
+  if (Object.prototype.hasOwnProperty.call(source, 'fontItemId')) config.fontItemId = normalizeBurnSubtitlesAssetId(source.fontItemId);
+  if (Object.prototype.hasOwnProperty.call(source, 'colorSource')) config.colorSource = normalizeBurnSubtitlesEnum(source.colorSource, BURN_SUBTITLES_COLOR_SOURCES, 'manual');
+  if (Object.prototype.hasOwnProperty.call(source, 'colorPaletteLibraryId')) config.colorPaletteLibraryId = normalizeBurnSubtitlesAssetId(source.colorPaletteLibraryId);
+  if (Object.prototype.hasOwnProperty.call(source, 'textColorPaletteItemId')) config.textColorPaletteItemId = normalizeBurnSubtitlesAssetId(source.textColorPaletteItemId);
+  if (Object.prototype.hasOwnProperty.call(source, 'outlineColorPaletteItemId')) config.outlineColorPaletteItemId = normalizeBurnSubtitlesAssetId(source.outlineColorPaletteItemId);
+  if (Object.prototype.hasOwnProperty.call(source, 'backgroundColorPaletteItemId')) config.backgroundColorPaletteItemId = normalizeBurnSubtitlesAssetId(source.backgroundColorPaletteItemId);
   if (Object.prototype.hasOwnProperty.call(source, 'bold')) config.bold = normalizeBurnSubtitlesBoolean(source.bold);
   if (Object.prototype.hasOwnProperty.call(source, 'italic')) config.italic = normalizeBurnSubtitlesBoolean(source.italic);
   if (Object.prototype.hasOwnProperty.call(source, 'position')) config.position = normalizeBurnSubtitlesEnum(source.position, BURN_SUBTITLES_POSITIONS, 'bottomCenter');
@@ -253,10 +274,19 @@ function getSubtitleBurnSettingsForRetryControls(artifact) {
     captionMode: normalizeBurnSubtitlesEnum(burn.captionMode, BURN_SUBTITLES_CAPTION_MODES, 'auto'),
     durationPerCaptionSeconds: normalizeBurnSubtitlesNumber(burn.durationPerCaptionSeconds, 3, 0.1),
     fontPreset: normalizeBurnSubtitlesEnum(style.fontPreset, BURN_SUBTITLES_FONT_PRESETS, 'arial'),
+    fontSource: normalizeBurnSubtitlesEnum(style.fontSource, BURN_SUBTITLES_FONT_SOURCES, 'preset'),
+    fontLibraryId: normalizeBurnSubtitlesAssetId(style.fontAsset?.libraryId),
+    fontItemId: normalizeBurnSubtitlesAssetId(style.fontAsset?.itemId),
     fontSize: normalizeBurnSubtitlesNumber(style.fontSize, 28, 1),
     italic: normalizeBurnSubtitlesBoolean(style.italic),
     outline: normalizeBurnSubtitlesNumber(style.outline, 2, 0),
     outlineColor: normalizeBurnSubtitlesEnum(style.outlineColor, BURN_SUBTITLES_OUTLINE_COLORS, 'black'),
+    backgroundColor: normalizeBurnSubtitlesEnum(style.backgroundColor, BURN_SUBTITLES_TEXT_COLORS, 'black'),
+    colorSource: normalizeBurnSubtitlesEnum(style.colorSource, BURN_SUBTITLES_COLOR_SOURCES, 'manual'),
+    colorPaletteLibraryId: normalizeBurnSubtitlesAssetId(style.palette?.libraryId),
+    textColorPaletteItemId: normalizeBurnSubtitlesAssetId(style.palette?.colors?.text?.itemId),
+    outlineColorPaletteItemId: normalizeBurnSubtitlesAssetId(style.palette?.colors?.outline?.itemId),
+    backgroundColorPaletteItemId: normalizeBurnSubtitlesAssetId(style.palette?.colors?.background?.itemId),
     position: normalizeBurnSubtitlesEnum(style.position, BURN_SUBTITLES_POSITIONS, 'bottomCenter'),
     shadow: normalizeBurnSubtitlesNumber(style.shadow, 1, 0),
     textColor: normalizeBurnSubtitlesEnum(style.textColor, BURN_SUBTITLES_TEXT_COLORS, 'white'),
@@ -5914,7 +5944,16 @@ async function executeBurnSubtitlesNode(node, graph, run, reportProgress) {
     bottomMargin: effectiveConfig.bottomMargin ?? 32,
     textColor: effectiveConfig.textColor || 'white',
     outlineColor: effectiveConfig.outlineColor || 'black',
+    backgroundColor: effectiveConfig.backgroundColor || 'black',
     fontPreset: effectiveConfig.fontPreset || 'arial',
+    fontSource: effectiveConfig.fontSource || 'preset',
+    fontLibraryId: effectiveConfig.fontLibraryId || '',
+    fontItemId: effectiveConfig.fontItemId || '',
+    colorSource: effectiveConfig.colorSource || 'manual',
+    colorPaletteLibraryId: effectiveConfig.colorPaletteLibraryId || '',
+    textColorPaletteItemId: effectiveConfig.textColorPaletteItemId || '',
+    outlineColorPaletteItemId: effectiveConfig.outlineColorPaletteItemId || '',
+    backgroundColorPaletteItemId: effectiveConfig.backgroundColorPaletteItemId || '',
     bold: effectiveConfig.bold || false,
     italic: effectiveConfig.italic || false,
     position: effectiveConfig.position || 'bottomCenter',
@@ -5923,6 +5962,7 @@ async function executeBurnSubtitlesNode(node, graph, run, reportProgress) {
     node,
     outputFormat: effectiveConfig.outputFormat || 'mp4',
     reportProgress,
+    retryOverride: buildBurnSubtitlesRetryOverrideConfig(run?.retryOverridesByNodeId?.[node.id]?.burnSubtitles),
     sourceVideoLineage: videoInput.sourceVideoLineage,
     runDirectories: run.directories,
   });
@@ -6027,6 +6067,327 @@ function getTransitionCandidatesForBoundary(transitionConfig) {
   return [];
 }
 
+function normalizeMediaCompositionSoundEffectsMode(value) {
+  const mode = String(value || '').trim();
+  return Object.values(MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES).includes(mode)
+    ? mode
+    : MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.RANDOM_INTERVAL;
+}
+
+function normalizeMediaCompositionSoundEffectsDensity(value) {
+  const density = String(value || '').trim();
+  return MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES.includes(density) ? density : 'normal';
+}
+
+function normalizeMediaCompositionSoundEffectsLayer(layer = {}, index = 0, fallback = {}) {
+  const source = layer && typeof layer === 'object' ? layer : {};
+  const fallbackSource = fallback && typeof fallback === 'object' ? fallback : {};
+  const layerIndex = Math.max(0, Number(index || 0) || 0);
+  return {
+    avoidRepeats: source.avoidRepeats !== undefined ? source.avoidRepeats !== false : fallbackSource.soundEffectsAvoidRepeats !== false,
+    density: normalizeMediaCompositionSoundEffectsDensity(source.density ?? fallbackSource.soundEffectsDensity),
+    enabled: source.enabled !== false,
+    fadeSeconds: Math.max(0, Math.min(2, Number(source.fadeSeconds ?? fallbackSource.soundEffectsFadeSeconds ?? 0.05) || 0)),
+    id: String(source.id || `sfx-layer-${layerIndex + 1}`).trim() || `sfx-layer-${layerIndex + 1}`,
+    index: layerIndex,
+    libraryId: String(source.libraryId ?? fallbackSource.soundEffectsLibraryId ?? '').trim(),
+    maxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(source.maxSimultaneous ?? fallbackSource.soundEffectsMaxSimultaneous ?? 2) || 2))),
+    minSpacingSeconds: normalizeTimelineSeconds(Math.max(0, Number(source.minSpacingSeconds ?? fallbackSource.soundEffectsMinSpacingSeconds ?? 4) || 0)) ?? 4,
+    mode: normalizeMediaCompositionSoundEffectsMode(source.schedulingMode ?? source.mode ?? fallbackSource.soundEffectsSchedulingMode),
+    name: String(source.name || `Layer ${layerIndex + 1}`).trim() || `Layer ${layerIndex + 1}`,
+    seed: String(source.seed ?? fallbackSource.soundEffectsSeed ?? '').trim(),
+    volume: normalizeMediaCompositionVolume(source.volume ?? fallbackSource.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
+  };
+}
+
+function getMediaCompositionSoundEffectsLayers(config = {}) {
+  const nested = config.soundEffects && typeof config.soundEffects === 'object' ? config.soundEffects : null;
+  const rawLayers = Array.isArray(config.soundEffectsLayers)
+    ? config.soundEffectsLayers
+    : Array.isArray(nested?.layers)
+      ? nested.layers
+      : [];
+  if (rawLayers.length) {
+    return rawLayers.map((layer, index) => normalizeMediaCompositionSoundEffectsLayer(layer, index, config)).filter((layer) => layer.enabled !== false);
+  }
+  const legacyLibraryId = String(config.soundEffectsLibraryId || nested?.libraryId || '').trim();
+  if (config.soundEffectsEnabled === true || nested?.enabled === true || legacyLibraryId) {
+    return [normalizeMediaCompositionSoundEffectsLayer({
+      avoidRepeats: config.soundEffectsAvoidRepeats,
+      density: config.soundEffectsDensity,
+      fadeSeconds: config.soundEffectsFadeSeconds,
+      libraryId: legacyLibraryId,
+      maxSimultaneous: config.soundEffectsMaxSimultaneous,
+      minSpacingSeconds: config.soundEffectsMinSpacingSeconds,
+      name: 'Layer 1',
+      schedulingMode: config.soundEffectsSchedulingMode || nested?.schedulingMode,
+      seed: config.soundEffectsSeed,
+      volume: config.soundEffectsVolume,
+    }, 0, config)];
+  }
+  return [];
+}
+
+function normalizeMediaCompositionSoundEffectsConfig(config = {}) {
+  const enabled = config.soundEffectsEnabled === true || config.soundEffects?.enabled === true;
+  const layers = enabled ? getMediaCompositionSoundEffectsLayers(config) : [];
+  return {
+    enabled,
+    layers,
+    legacy: {
+      avoidRepeats: config.soundEffectsAvoidRepeats !== false,
+      density: normalizeMediaCompositionSoundEffectsDensity(config.soundEffectsDensity),
+      fadeSeconds: Math.max(0, Math.min(2, Number(config.soundEffectsFadeSeconds ?? 0.05) || 0)),
+      libraryId: String(config.soundEffectsLibraryId || '').trim(),
+      maxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(config.soundEffectsMaxSimultaneous ?? 2) || 2))),
+      minSpacingSeconds: normalizeTimelineSeconds(Math.max(0, Number(config.soundEffectsMinSpacingSeconds ?? 4) || 0)) ?? 4,
+      mode: normalizeMediaCompositionSoundEffectsMode(config.soundEffectsSchedulingMode),
+      seed: String(config.soundEffectsSeed || '').trim(),
+      volume: normalizeMediaCompositionVolume(config.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
+    },
+  };
+}
+
+function deterministicFloat(seedParts) {
+  const digest = hashMediaCompositionTransitionSeed(seedParts);
+  return parseInt(digest.slice(0, 8), 16) / 0xffffffff;
+}
+
+function getSoundEffectDensityIntervalSeconds(density) {
+  if (density === 'dense') {
+    return 7;
+  }
+  if (density === 'sparse') {
+    return 18;
+  }
+  return 11;
+}
+
+function getSceneBoundarySeconds(visualItems) {
+  const boundaries = [];
+  let cursorSeconds = 0;
+  for (let index = 0; index < visualItems.length - 1; index += 1) {
+    const item = visualItems[index];
+    const nextItem = visualItems[index + 1];
+    const boundarySeconds = Number.isFinite(Number(item?.endSeconds))
+      ? Number(item.endSeconds)
+      : cursorSeconds + (Number(item?.durationSeconds || 0) || 0);
+    cursorSeconds = boundarySeconds;
+    if (boundarySeconds > 0.05 && Number(nextItem?.durationSeconds || 0) >= 0.35) {
+      boundaries.push({ boundaryIndex: index, boundarySeconds: normalizeTimelineSeconds(boundarySeconds) || boundarySeconds });
+    }
+  }
+  return boundaries;
+}
+
+function canPlaceSoundEffectEvent(events, timeSeconds, itemId, layerConfig) {
+  const minSpacingSeconds = Math.max(0, Number(layerConfig.minSpacingSeconds || 0) || 0);
+  if (events.some((event) => Math.abs(Number(event.timeSeconds || 0) - timeSeconds) < minSpacingSeconds - 0.001)) {
+    return false;
+  }
+  if (layerConfig.avoidRepeats) {
+    const ordered = [...events, { itemId, timeSeconds }].sort((left, right) => Number(left.timeSeconds || 0) - Number(right.timeSeconds || 0));
+    const candidateIndex = ordered.findIndex((event) => event.itemId === itemId && Number(event.timeSeconds || 0) === timeSeconds);
+    const previous = candidateIndex > 0 ? ordered[candidateIndex - 1] : null;
+    const next = candidateIndex >= 0 && candidateIndex < ordered.length - 1 ? ordered[candidateIndex + 1] : null;
+    if (previous?.itemId === itemId || next?.itemId === itemId) {
+      return false;
+    }
+  }
+  const sameTimeCount = events.filter((event) => Math.abs(Number(event.timeSeconds || 0) - timeSeconds) < 0.5).length;
+  return sameTimeCount < layerConfig.maxSimultaneous;
+}
+
+function createSoundEffectEvent(item, library, timeSeconds, mode, layerConfig, notes = []) {
+  const durationSeconds = Number(item.durationSeconds || 0) > 0 ? normalizeTimelineSeconds(item.durationSeconds) : null;
+  return {
+    durationSeconds,
+    fadeSeconds: layerConfig.fadeSeconds,
+    itemId: item.id,
+    itemName: item.displayName || item.originalFilename || item.id,
+    layerId: layerConfig.id,
+    layerIndex: layerConfig.index,
+    layerName: layerConfig.name,
+    libraryId: library.id,
+    libraryName: library.name,
+    reason: mode,
+    sourceLibrary: library.name,
+    timeSeconds: normalizeTimelineSeconds(timeSeconds) || 0,
+    volume: layerConfig.volume,
+    ...(notes.length ? { notes } : {}),
+  };
+}
+
+function addSoundEffectEvent(events, item, library, timeSeconds, mode, layerConfig, notes = []) {
+  if (!item || !Number.isFinite(Number(timeSeconds))) {
+    return false;
+  }
+  const normalizedTime = normalizeTimelineSeconds(Math.max(0, Number(timeSeconds) || 0)) || 0;
+  if (!canPlaceSoundEffectEvent(events, normalizedTime, item.id, layerConfig)) {
+    return false;
+  }
+  events.push(createSoundEffectEvent(item, library, normalizedTime, mode, layerConfig, notes));
+  events.sort((left, right) => Number(left.timeSeconds || 0) - Number(right.timeSeconds || 0));
+  return true;
+}
+
+function addDeterministicSoundEffectEvent(events, items, library, timeSeconds, mode, layerConfig, seedParts, notes = []) {
+  if (!Array.isArray(items) || !items.length) {
+    return null;
+  }
+  const startIndex = Math.floor(deterministicFloat(seedParts) * items.length) % items.length;
+  for (let offset = 0; offset < items.length; offset += 1) {
+    const item = items[(startIndex + offset) % items.length];
+    if (addSoundEffectEvent(events, item, library, timeSeconds, mode, layerConfig, notes)) {
+      return item;
+    }
+  }
+  return null;
+}
+
+async function resolveManagedSoundEffectItems(library, notes) {
+  const sourceItems = Array.isArray(library?.items) ? library.items : [];
+  const resolvedItems = [];
+  for (const item of sourceItems) {
+    try {
+      const preview = await resolveAssetLibraryPreviewFile('soundEffects', library.id, item.id);
+      resolvedItems.push({
+        channels: preview.item?.channels || item.channels || null,
+        durationSeconds: Number(preview.item?.durationSeconds || item.durationSeconds || 0) || null,
+        extension: preview.item?.extension || item.extension || '',
+        id: preview.item.id,
+        displayName: preview.item?.displayName || item.displayName || item.originalFilename || item.id,
+        originalFilename: preview.item?.originalFilename || item.originalFilename || '',
+        sampleRate: preview.item?.sampleRate || item.sampleRate || null,
+      });
+    } catch (error) {
+      notes.push(error?.message || 'Skipped a sound effect because the managed library file could not be read.');
+    }
+  }
+  return resolvedItems;
+}
+
+async function buildSoundEffectsLayerSchedule(visualItems, timingPlan, layerConfig, librariesById) {
+  const totalDurationSeconds = normalizeTimelineSeconds(timingPlan.totalVisualDurationSeconds) || 0;
+  const layerPlan = {
+    avoidRepeats: layerConfig.avoidRepeats,
+    density: layerConfig.density,
+    enabled: layerConfig.enabled !== false,
+    fadeSeconds: layerConfig.fadeSeconds,
+    layerId: layerConfig.id,
+    layerIndex: layerConfig.index,
+    layerName: layerConfig.name,
+    libraryId: layerConfig.libraryId,
+    libraryName: '',
+    maxSimultaneous: layerConfig.maxSimultaneous,
+    minSpacingSeconds: layerConfig.minSpacingSeconds,
+    notes: [],
+    scheduledEvents: [],
+    schedulingMode: layerConfig.mode,
+    seed: layerConfig.seed,
+    totalDurationSeconds,
+    volume: layerConfig.volume,
+  };
+  if (!layerConfig.libraryId) {
+    layerPlan.notes.push('Choose a Sound Effects library for this layer.');
+    return layerPlan;
+  }
+  if (totalDurationSeconds <= 0.05) {
+    layerPlan.notes.push('Sound effects were skipped because the composition duration is too short.');
+    return layerPlan;
+  }
+
+  const library = librariesById.get(layerConfig.libraryId) || null;
+  if (!library) {
+    layerPlan.notes.push('Local AI Hub could not find the selected Sound Effects library.');
+    return layerPlan;
+  }
+  layerPlan.libraryName = library.name || library.id;
+  const items = await resolveManagedSoundEffectItems(library, layerPlan.notes);
+  if (!items.length) {
+    layerPlan.notes.push('The selected Sound Effects library does not have any valid managed audio files.');
+    return layerPlan;
+  }
+
+  const seed = layerConfig.seed || hashMediaCompositionTransitionSeed([
+    layerConfig.id,
+    layerConfig.libraryId,
+    layerConfig.mode,
+    layerConfig.density,
+    layerConfig.minSpacingSeconds,
+    visualItems.map((item) => String(item.itemId || item.artifact?.fileName || '')).join(','),
+    visualItems.map((item) => String(item.durationSeconds || '')).join(','),
+  ]);
+
+  if (layerConfig.mode === MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.SCENE_ALIGNED || layerConfig.mode === MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.BOTH) {
+    getSceneBoundarySeconds(visualItems).forEach((boundary, index) => {
+      const sceneDurationSeconds = Number(visualItems[index + 1]?.durationSeconds || 0) || 0;
+      if (sceneDurationSeconds < Math.max(0.5, layerConfig.minSpacingSeconds * 0.5)) {
+        layerPlan.notes.push('Skipped a scene-aligned sound effect because one scene was too short.');
+        return;
+      }
+      const offsetSeconds = (deterministicFloat([seed, 'scene', index]) - 0.5) * Math.min(0.8, layerConfig.minSpacingSeconds * 0.25);
+      const timeSeconds = Math.min(Math.max(0.1, boundary.boundarySeconds + offsetSeconds), Math.max(0.1, totalDurationSeconds - 0.1));
+      addDeterministicSoundEffectEvent(layerPlan.scheduledEvents, items, library, timeSeconds, 'sceneAligned', layerConfig, [seed, 'scene-item', index]);
+    });
+  }
+
+  if (layerConfig.mode === MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.RANDOM_INTERVAL || layerConfig.mode === MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.BOTH) {
+    const intervalSeconds = Math.max(layerConfig.minSpacingSeconds, getSoundEffectDensityIntervalSeconds(layerConfig.density));
+    const targetCount = Math.max(1, Math.floor(totalDurationSeconds / intervalSeconds));
+    for (let index = 0; index < targetCount; index += 1) {
+      const segmentStart = (totalDurationSeconds / targetCount) * index;
+      const segmentEnd = (totalDurationSeconds / targetCount) * (index + 1);
+      const jitter = deterministicFloat([seed, 'random-time', index]);
+      const timeSeconds = Math.min(Math.max(0.1, segmentStart + ((segmentEnd - segmentStart) * jitter)), Math.max(0.1, totalDurationSeconds - 0.1));
+      addDeterministicSoundEffectEvent(layerPlan.scheduledEvents, items, library, timeSeconds, 'randomInterval', layerConfig, [seed, 'random-item', index]);
+    }
+  }
+
+  if (!layerPlan.scheduledEvents.length) {
+    layerPlan.notes.push('No sound effects were scheduled after spacing and timing rules were applied.');
+  }
+  return layerPlan;
+}
+
+async function buildSoundEffectsSchedule(visualItems, effectiveConfig, timingPlan) {
+  const config = normalizeMediaCompositionSoundEffectsConfig(effectiveConfig);
+  const totalDurationSeconds = normalizeTimelineSeconds(timingPlan.totalVisualDurationSeconds) || 0;
+  const plan = {
+    enabled: config.enabled,
+    layerCount: config.layers.length,
+    layers: [],
+    notes: [],
+    requested: config,
+    scheduledEvents: [],
+    totalDurationSeconds,
+    volume: config.layers[0]?.volume ?? config.legacy.volume,
+  };
+  if (!config.enabled) {
+    plan.notes.push('Sound effects are off.');
+    return plan;
+  }
+  if (!config.layers.length) {
+    plan.notes.push('Add at least one Sound Effects layer before enabling sound effects.');
+    return plan;
+  }
+
+  const libraries = await listAssetLibraries('soundEffects');
+  const librariesById = new Map((libraries || []).map((library) => [library.id, library]));
+  for (const layerConfig of config.layers) {
+    const layerPlan = await buildSoundEffectsLayerSchedule(visualItems, timingPlan, layerConfig, librariesById);
+    plan.layers.push(layerPlan);
+    plan.notes.push(...(layerPlan.notes || []).map((note) => `${layerPlan.layerName}: ${note}`));
+    plan.scheduledEvents.push(...(layerPlan.scheduledEvents || []));
+  }
+  plan.scheduledEvents.sort((left, right) => Number(left.timeSeconds || 0) - Number(right.timeSeconds || 0));
+  plan.layerCount = plan.layers.length;
+  plan.scheduledEventCount = plan.scheduledEvents.length;
+  if (!plan.scheduledEvents.length) {
+    plan.notes.push('No sound effects were scheduled across enabled layers.');
+  }
+  return plan;
+}
 function buildSceneTransitionPlan(visualItems, effectiveConfig, timingPlan) {
   const transitionConfig = getMediaCompositionTransitionConfig(effectiveConfig);
   const totalVisualDurationSeconds = normalizeTimelineSeconds(timingPlan.totalVisualDurationSeconds) || 0;
@@ -6301,16 +6662,19 @@ async function executeMediaCompositionNode(node, graph, run) {
   if (!visualItems.length) {
     throw new Error('This media composition does not have any saved images to assemble yet.');
   }
+  const soundEffectsPlan = await buildSoundEffectsSchedule(visualItems, effectiveConfig, timingPlan);
 
   const composition = createCompositionArtifact({
     audioMix: {
       backgroundMusicVolume: normalizeMediaCompositionVolume(effectiveConfig.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
       narrationVolume: normalizeMediaCompositionVolume(effectiveConfig.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+      soundEffectsVolume: soundEffectsPlan.volume,
     },
+    soundEffects: soundEffectsPlan,
     displayName: node.label,
     exportKind: PORT_KIND_VIDEO,
     recipeId: 'image-sequence-optional-audio-bed',
-    recipeLabel: 'Image sequence with optional narration and background music',
+    recipeLabel: 'Image sequence with optional narration, background music, and sound effects',
     tracks: [
       {
         id: 'visual-track',
@@ -6378,14 +6742,18 @@ async function executeMediaCompositionNode(node, graph, run) {
       ? ' using fixed image timing because timing metadata was missing or invalid'
       : ' using fixed image timing';
   const fallbackMessage = timingPlan.fallbackReason ? ' Fallback reason: ' + timingPlan.fallbackReason : '';
+  const soundEffectsLayerLabel = Number(soundEffectsPlan.layerCount || 0) === 1 ? '1 layer' : `${soundEffectsPlan.layerCount || 0} layers`;
+  const soundEffectsMessage = soundEffectsPlan.enabled
+    ? ` Sound effects: ${soundEffectsPlan.scheduledEvents.length} scheduled across ${soundEffectsLayerLabel}.` + (soundEffectsPlan.notes?.length ? ' Note: ' + soundEffectsPlan.notes[0] : '')
+    : '';
   return {
     message: audioArtifact && backgroundMusicArtifact
-      ? `Media Composition prepared the ordered images${timingMessage} with primary narration at ${formatMediaCompositionVolumePercent(effectiveConfig.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}% and background music at ${formatMediaCompositionVolumePercent(effectiveConfig.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}%.${fallbackMessage}`
+      ? `Media Composition prepared the ordered images${timingMessage} with primary narration at ${formatMediaCompositionVolumePercent(effectiveConfig.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}% and background music at ${formatMediaCompositionVolumePercent(effectiveConfig.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}%.${fallbackMessage}${soundEffectsMessage}`
       : audioArtifact
-        ? 'Media Composition prepared the ordered images' + timingMessage + ' with the connected primary audio track.' + fallbackMessage
+        ? 'Media Composition prepared the ordered images' + timingMessage + ' with the connected primary audio track.' + fallbackMessage + soundEffectsMessage
         : backgroundMusicArtifact
-          ? 'Media Composition prepared the ordered images' + timingMessage + ' with background music and no primary narration yet.' + fallbackMessage
-          : 'Media Composition prepared the ordered images' + timingMessage + ' without any audio tracks yet.' + fallbackMessage,
+          ? 'Media Composition prepared the ordered images' + timingMessage + ' with background music and no primary narration yet.' + fallbackMessage + soundEffectsMessage
+          : 'Media Composition prepared the ordered images' + timingMessage + ' without any audio tracks yet.' + fallbackMessage + soundEffectsMessage,
     outputs: {
       composition: persistedComposition,
     },

@@ -50,6 +50,13 @@ const DEFAULT_PIPELINE_RUN_SETTINGS = Object.freeze({
 });
 const DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME = 1;
 const DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME = 0.22;
+const DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME = 0.25;
+const MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES = Object.freeze({
+  RANDOM_INTERVAL: 'randomInterval',
+  SCENE_ALIGNED: 'sceneAligned',
+  BOTH: 'both',
+});
+const MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES = Object.freeze(['sparse', 'normal', 'dense']);
 const MEDIA_COMPOSITION_TRANSITION_MODES = Object.freeze({
   OFF: 'off',
   SINGLE: 'single',
@@ -73,6 +80,7 @@ const MEDIA_COMPOSITION_TRANSITION_CATEGORIES = Object.freeze([
   { id: 'distanceRadial', label: 'Distance / radial', transitions: Object.freeze(['distance', 'radial']) },
 ]);
 const MEDIA_COMPOSITION_XFADE_TRANSITIONS = Object.freeze(MEDIA_COMPOSITION_TRANSITION_CATEGORIES.flatMap((category) => category.transitions));
+const MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS = Object.freeze(['squeezeh', 'squeezev']);
 const DEFAULT_POSITION_X = 120;
 const DEFAULT_POSITION_Y = 120;
 const PORT_KIND_TEXT = 'text';
@@ -1090,7 +1098,16 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       bottomMargin: 32,
       textColor: 'white',
       outlineColor: 'black',
+      backgroundColor: 'black',
       fontPreset: 'arial',
+      fontSource: 'preset',
+      fontLibraryId: '',
+      fontItemId: '',
+      colorSource: 'manual',
+      colorPaletteLibraryId: '',
+      textColorPaletteItemId: '',
+      outlineColorPaletteItemId: '',
+      backgroundColorPaletteItemId: '',
       bold: false,
       italic: false,
       position: 'bottomCenter',
@@ -1217,6 +1234,17 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       sceneTransitionAvoidRepeats: true,
       narrationVolume: DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
       backgroundMusicVolume: DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+      soundEffectsEnabled: false,
+      soundEffectsLibraryId: '',
+      soundEffectsSchedulingMode: MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.RANDOM_INTERVAL,
+      soundEffectsVolume: DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
+      soundEffectsDensity: 'normal',
+      soundEffectsMinSpacingSeconds: 4,
+      soundEffectsMaxSimultaneous: 2,
+      soundEffectsAvoidRepeats: true,
+      soundEffectsFadeSeconds: 0.05,
+      soundEffectsSeed: '',
+      soundEffectsLayers: [],
     },
   }),
   mediaExport: Object.freeze({
@@ -6116,6 +6144,8 @@ function analyzePipeline(definition = {}, context = {}) {
         const captionMode = String(node.config?.captionMode || 'auto').trim();
         const durationPerCaptionSeconds = Number(node.config?.durationPerCaptionSeconds || 0) || 0;
         const outputFormat = String(node.config?.outputFormat || 'mp4').trim().toLowerCase();
+        const fontSource = String(node.config?.fontSource || 'preset').trim();
+        const colorSource = String(node.config?.colorSource || 'manual').trim();
         if (!videoKinds.includes(PORT_KIND_VIDEO)) {
           summary.readiness = {
             tone: 'error',
@@ -6152,6 +6182,30 @@ function analyzePipeline(definition = {}, context = {}) {
             message: 'Caption outline, shadow, and bottom margin cannot be negative.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['preset', 'assetLibrary'].includes(fontSource)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose whether captions use a built-in font preset or an imported Font library item.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (fontSource === 'assetLibrary' && (!String(node.config?.fontLibraryId || '').trim() || !String(node.config?.fontItemId || '').trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose an imported Font library item before using an asset-library caption font.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['manual', 'palette'].includes(colorSource)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose whether caption colors use manual presets or a Color Palette library.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (colorSource === 'palette' && (!String(node.config?.colorPaletteLibraryId || '').trim() || !String(node.config?.textColorPaletteItemId || '').trim() || !String(node.config?.outlineColorPaletteItemId || '').trim() || !String(node.config?.backgroundColorPaletteItemId || '').trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose palette colors for caption text, outline, and background before using Color Palette styling.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (!['white', 'black', 'yellow', 'red', 'blue', 'green', 'cyan', 'magenta', 'lightGray', 'darkGray'].includes(String(node.config?.textColor || 'white').trim())) {
           summary.readiness = {
             tone: 'error',
@@ -6164,7 +6218,13 @@ function analyzePipeline(definition = {}, context = {}) {
             message: 'Choose a supported caption outline color.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (!['arial', 'segoeUi', 'tahoma', 'verdana'].includes(String(node.config?.fontPreset || 'arial').trim())) {
+        } else if (!['white', 'black', 'yellow', 'red', 'blue', 'green', 'cyan', 'magenta', 'lightGray', 'darkGray'].includes(String(node.config?.backgroundColor || 'black').trim())) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a supported caption background color.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (fontSource === 'preset' && !['arial', 'segoeUi', 'tahoma', 'verdana'].includes(String(node.config?.fontPreset || 'arial').trim())) {
           summary.readiness = {
             tone: 'error',
             message: 'Choose a supported caption font preset.',
@@ -6437,9 +6497,13 @@ module.exports = {
   DEFAULT_PIPELINE_RUN_SETTINGS,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
+  MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES,
+  MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
   MEDIA_COMPOSITION_TRANSITION_MODES,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_XFADE_TRANSITIONS,
+  MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS,
   AUDIO_WORKFLOW_TOOL_IDS,
   AUDIOCRAFT_AUDIO_MODE_OPTIONS,
   CHATTERBOX_AUDIO_MODE_OPTIONS,

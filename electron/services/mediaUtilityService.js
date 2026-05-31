@@ -2,6 +2,7 @@ const path = require('path');
 const fs = require('fs-extra');
 
 const { runCommand } = require('./commandService');
+const { resolveAssetLibraryFontForUse, resolveColorPaletteItemForUse } = require('./assetLibraryService');
 const { resolveFfmpegPath } = require('./mediaCompositionService');
 const {
   buildFileArtifact,
@@ -1232,14 +1233,14 @@ function sanitizeAssText(value) {
 function buildAssContent(captions, style = {}) {
   const normalized = normalizeSubtitleStyle(style);
   const borderStyle = normalized.backgroundBox ? 3 : 1;
-  const backColour = normalized.backgroundBox ? buildAssBackgroundColor('black', String(normalized.backgroundOpacity)) : '&H00000000';
+  const backColour = normalized.backgroundBox ? buildAssBackgroundColor(normalized.backgroundColorValue, String(normalized.backgroundOpacity)) : '&H00000000';
   const styleValues = [
     'Default',
-    SUBTITLE_FONT_PRESETS[normalized.fontPreset].ass,
+    getSubtitleFontName(normalized),
     normalized.fontSize,
-    SUBTITLE_COLOR_VALUES[normalized.textColor].ass,
+    getSubtitleColorAss(normalized, 'text'),
     '&H000000FF',
-    SUBTITLE_COLOR_VALUES[normalized.outlineColor].ass,
+    getSubtitleColorAss(normalized, 'outline'),
     backColour,
     normalized.bold ? -1 : 0,
     normalized.italic ? -1 : 0,
@@ -1309,16 +1310,16 @@ function buildManualLineCaptions(text, durationPerCaptionSeconds) {
     }));
 }
 const SUBTITLE_COLOR_VALUES = Object.freeze({
-  black: Object.freeze({ ass: '&H00000000', label: 'Black' }),
-  blue: Object.freeze({ ass: '&H00FF0000', label: 'Blue' }),
-  cyan: Object.freeze({ ass: '&H00FFFF00', label: 'Cyan' }),
-  darkGray: Object.freeze({ ass: '&H00404040', label: 'Dark gray' }),
-  green: Object.freeze({ ass: '&H00008000', label: 'Green' }),
-  lightGray: Object.freeze({ ass: '&H00C0C0C0', label: 'Light gray' }),
-  magenta: Object.freeze({ ass: '&H00FF00FF', label: 'Magenta' }),
-  red: Object.freeze({ ass: '&H000000FF', label: 'Red' }),
-  white: Object.freeze({ ass: '&H00FFFFFF', label: 'White' }),
-  yellow: Object.freeze({ ass: '&H0000FFFF', label: 'Yellow' }),
+  black: Object.freeze({ ass: '&H00000000', hex: '#000000', label: 'Black' }),
+  blue: Object.freeze({ ass: '&H00FF0000', hex: '#0000FF', label: 'Blue' }),
+  cyan: Object.freeze({ ass: '&H00FFFF00', hex: '#00FFFF', label: 'Cyan' }),
+  darkGray: Object.freeze({ ass: '&H00404040', hex: '#404040', label: 'Dark gray' }),
+  green: Object.freeze({ ass: '&H00008000', hex: '#008000', label: 'Green' }),
+  lightGray: Object.freeze({ ass: '&H00C0C0C0', hex: '#C0C0C0', label: 'Light gray' }),
+  magenta: Object.freeze({ ass: '&H00FF00FF', hex: '#FF00FF', label: 'Magenta' }),
+  red: Object.freeze({ ass: '&H000000FF', hex: '#FF0000', label: 'Red' }),
+  white: Object.freeze({ ass: '&H00FFFFFF', hex: '#FFFFFF', label: 'White' }),
+  yellow: Object.freeze({ ass: '&H0000FFFF', hex: '#FFFF00', label: 'Yellow' }),
 });
 
 const SUBTITLE_OUTLINE_COLOR_KEYS = Object.freeze(['black', 'white', 'darkGray', 'lightGray', 'yellow', 'red', 'blue']);
@@ -1379,8 +1380,41 @@ function normalizeSubtitleBoolean(value) {
   return value === true || value === 'true' || value === 1 || value === '1';
 }
 
-function buildAssBackgroundColor(colorKey, opacityKey) {
-  const color = SUBTITLE_COLOR_VALUES[colorKey]?.ass || SUBTITLE_COLOR_VALUES.black.ass;
+function normalizeHexColorValue(value, fallback = '#000000') {
+  const raw = String(value || fallback).trim();
+  const normalized = raw.startsWith('#') ? raw : '#' + raw;
+  const match = normalized.match(/^#([0-9a-fA-F]{6})$/);
+  if (!match) {
+    throw new Error('Burn Subtitles / Captions could not use that palette color. Choose a valid saved color.');
+  }
+  return '#' + match[1].toUpperCase();
+}
+
+function hexToAssColor(value) {
+  const hex = normalizeHexColorValue(value);
+  const red = hex.slice(1, 3);
+  const green = hex.slice(3, 5);
+  const blue = hex.slice(5, 7);
+  return '&H00' + blue + green + red;
+}
+
+function getSubtitleFontName(style = {}) {
+  const normalized = normalizeSubtitleStyle(style);
+  return String(normalized.fontFamily || SUBTITLE_FONT_PRESETS[normalized.fontPreset].ass).replace(/[\r\n,]+/g, ' ').trim() || SUBTITLE_FONT_PRESETS.arial.ass;
+}
+
+function getSubtitleColorAss(style = {}, slot = 'text') {
+  const normalized = normalizeSubtitleStyle(style);
+  const value = slot === 'outline'
+    ? normalized.outlineColorValue
+    : slot === 'background'
+      ? normalized.backgroundColorValue
+      : normalized.textColorValue;
+  return hexToAssColor(value);
+}
+
+function buildAssBackgroundColor(colorValue, opacityKey) {
+  const color = hexToAssColor(colorValue || SUBTITLE_COLOR_VALUES.black.hex);
   const alpha = SUBTITLE_BACKGROUND_OPACITY_VALUES[opacityKey]?.alpha || SUBTITLE_BACKGROUND_OPACITY_VALUES[50].alpha;
   return '&H' + alpha + color.slice(4);
 }
@@ -1402,23 +1436,41 @@ function normalizeSubtitleStyle(options = {}) {
   const bottomMargin = Math.max(0, Number(options.bottomMargin ?? 32) || 0);
   const textColor = normalizeSubtitleEnum(options.textColor, SUBTITLE_TEXT_COLOR_KEYS, 'white', 'text color');
   const outlineColor = normalizeSubtitleEnum(options.outlineColor, SUBTITLE_OUTLINE_COLOR_KEYS, 'black', 'outline color');
+  const backgroundColor = normalizeSubtitleEnum(options.backgroundColor, SUBTITLE_TEXT_COLOR_KEYS, 'black', 'background color');
   const position = normalizeSubtitleEnum(options.position, Object.keys(SUBTITLE_POSITION_VALUES), 'bottomCenter', 'position');
   const fontPreset = normalizeSubtitleEnum(options.fontPreset, Object.keys(SUBTITLE_FONT_PRESETS), 'arial', 'font preset');
+  const fontSource = String(options.fontSource || '').trim() === 'assetLibrary' ? 'assetLibrary' : 'preset';
+  const colorSource = String(options.colorSource || '').trim() === 'palette' ? 'palette' : 'manual';
   const backgroundBox = normalizeSubtitleBoolean(options.backgroundBox);
   const backgroundOpacity = normalizeSubtitleEnum(String(options.backgroundOpacity ?? 50), Object.keys(SUBTITLE_BACKGROUND_OPACITY_VALUES), '50', 'background opacity');
+  const fontFamily = fontSource === 'assetLibrary'
+    ? String(options.fontFamily || options.fontAsset?.fontFamily || '').replace(/[\r\n,]+/g, ' ').trim()
+    : SUBTITLE_FONT_PRESETS[fontPreset].ass;
+  const textColorValue = normalizeHexColorValue(options.textColorValue || options.resolvedTextColorHex || SUBTITLE_COLOR_VALUES[textColor].hex, SUBTITLE_COLOR_VALUES.white.hex);
+  const outlineColorValue = normalizeHexColorValue(options.outlineColorValue || options.resolvedOutlineColorHex || SUBTITLE_COLOR_VALUES[outlineColor].hex, SUBTITLE_COLOR_VALUES.black.hex);
+  const backgroundColorValue = normalizeHexColorValue(options.backgroundColorValue || options.resolvedBackgroundColorHex || SUBTITLE_COLOR_VALUES[backgroundColor].hex, SUBTITLE_COLOR_VALUES.black.hex);
   return {
     backgroundBox,
+    backgroundColor,
+    backgroundColorValue,
     backgroundOpacity: Number(backgroundOpacity),
     bottomMargin: Math.round(bottomMargin * 10) / 10,
     bold: normalizeSubtitleBoolean(options.bold),
+    colorSource,
+    fontAsset: options.fontAsset && typeof options.fontAsset === 'object' ? { ...options.fontAsset } : null,
+    fontFamily: fontFamily || SUBTITLE_FONT_PRESETS[fontPreset].ass,
     fontPreset,
     fontSize: Math.round(fontSize * 10) / 10,
+    fontSource,
     italic: normalizeSubtitleBoolean(options.italic),
     outline: Math.round(outline * 10) / 10,
     outlineColor,
+    outlineColorValue,
+    palette: options.palette && typeof options.palette === 'object' ? { ...options.palette } : null,
     position,
     shadow: Math.round(shadow * 10) / 10,
     textColor,
+    textColorValue,
   };
 }
 
@@ -1429,10 +1481,10 @@ function buildSubtitleForceStyle(style = {}, options = {}) {
     : getSubtitleAssAlignment(normalized.position);
   const forceStyle = [
     'Alignment=' + alignment,
-    'Fontname=' + SUBTITLE_FONT_PRESETS[normalized.fontPreset].ass,
+    'Fontname=' + getSubtitleFontName(normalized),
     'Fontsize=' + normalized.fontSize,
-    'PrimaryColour=' + SUBTITLE_COLOR_VALUES[normalized.textColor].ass,
-    'OutlineColour=' + SUBTITLE_COLOR_VALUES[normalized.outlineColor].ass,
+    'PrimaryColour=' + getSubtitleColorAss(normalized, 'text'),
+    'OutlineColour=' + getSubtitleColorAss(normalized, 'outline'),
     'Bold=' + (normalized.bold ? -1 : 0),
     'Italic=' + (normalized.italic ? -1 : 0),
     'Outline=' + normalized.outline,
@@ -1441,7 +1493,7 @@ function buildSubtitleForceStyle(style = {}, options = {}) {
   ];
   if (normalized.backgroundBox) {
     forceStyle.push('BorderStyle=3');
-    forceStyle.push('BackColour=' + buildAssBackgroundColor('black', String(normalized.backgroundOpacity)));
+    forceStyle.push('BackColour=' + buildAssBackgroundColor(normalized.backgroundColorValue, String(normalized.backgroundOpacity)));
   }
   return forceStyle.join(',');
 }
@@ -1556,7 +1608,7 @@ async function prepareSubtitleSource(captionArtifact, options = {}) {
   });
   const suffix = resolved.mode === 'transcriptSegments' ? 'transcript-captions' : 'manual-captions';
   const subtitlePath = await nextSubtitlePath(options.runDirectories, options.node, suffix, '.ass');
-  await fs.writeFile(subtitlePath, buildAssContent(resolved.captions, options), 'utf8');
+  await fs.writeFile(subtitlePath, buildAssContent(resolved.captions, options.subtitleStyle || options), 'utf8');
   return { captionCount: resolved.captionCount, mode: resolved.mode, subtitleFormat: 'ass', subtitlePath };
 }
 
@@ -1603,11 +1655,15 @@ async function exportSubtitlesArtifact(captionArtifact, options = {}) {
   };
 }
 
-function buildBurnSubtitlesCommandArgs(sourcePath, subtitlePath, outputPath, style = {}) {
+function buildBurnSubtitlesCommandArgs(sourcePath, subtitlePath, outputPath, style = {}, fontRuntime = null) {
   const extension = path.extname(String(subtitlePath || '')).toLowerCase();
-  const filter = extension === '.ass'
-    ? "subtitles='" + escapeSubtitleFilterPath(subtitlePath) + "'"
-    : "subtitles='" + escapeSubtitleFilterPath(subtitlePath) + "':force_style='" + escapeSubtitleForceStyle(buildSubtitleForceStyle(style, { alignmentMode: 'filter' })) + "'";
+  let filter = "subtitles='" + escapeSubtitleFilterPath(subtitlePath) + "'";
+  if (fontRuntime?.fontsDir) {
+    filter += ":fontsdir='" + escapeSubtitleFilterPath(fontRuntime.fontsDir) + "'";
+  }
+  if (extension !== '.ass') {
+    filter += ":force_style='" + escapeSubtitleForceStyle(buildSubtitleForceStyle(style, { alignmentMode: 'filter' })) + "'";
+  }
   return {
     args: [
       '-y', '-i', sourcePath,
@@ -1620,16 +1676,113 @@ function buildBurnSubtitlesCommandArgs(sourcePath, subtitlePath, outputPath, sty
   };
 }
 
+async function resolveSubtitlePaletteStyle(options = {}) {
+  const colorSource = String(options.colorSource || '').trim() === 'palette' ? 'palette' : 'manual';
+  if (colorSource !== 'palette') {
+    return { palette: null };
+  }
+  const libraryId = String(options.colorPaletteLibraryId || '').trim();
+  if (!libraryId) {
+    throw new Error('Burn Subtitles / Captions needs a Color Palette library before using palette colors.');
+  }
+  const slots = [
+    ['text', 'textColorPaletteItemId', 'text color'],
+    ['outline', 'outlineColorPaletteItemId', 'outline color'],
+    ['background', 'backgroundColorPaletteItemId', 'background color'],
+  ];
+  const colors = {};
+  let paletteLibrary = null;
+  for (const [slot, key, label] of slots) {
+    const itemId = String(options[key] || '').trim();
+    if (!itemId) {
+      throw new Error('Burn Subtitles / Captions needs a palette ' + label + ' before using palette colors.');
+    }
+    const resolved = await resolveColorPaletteItemForUse(libraryId, itemId);
+    paletteLibrary = resolved.library;
+    colors[slot] = {
+      itemId: resolved.item.id,
+      itemName: resolved.item.name,
+      name: resolved.item.name,
+      value: resolved.item.hex,
+    };
+  }
+  return {
+    backgroundColorValue: colors.background.value,
+    outlineColorValue: colors.outline.value,
+    palette: {
+      colors,
+      libraryId: paletteLibrary.id,
+      libraryName: paletteLibrary.name,
+      source: 'assetLibrary',
+    },
+    textColorValue: colors.text.value,
+  };
+}
+
+async function resolveSubtitleFontStyle(options = {}) {
+  const fontSource = String(options.fontSource || '').trim() === 'assetLibrary' ? 'assetLibrary' : 'preset';
+  if (fontSource !== 'assetLibrary') {
+    return { fontAsset: null, fontRuntime: null };
+  }
+  const libraryId = String(options.fontLibraryId || '').trim();
+  const itemId = String(options.fontItemId || '').trim();
+  if (!libraryId || !itemId) {
+    throw new Error('Burn Subtitles / Captions needs a Font library and imported font before using an asset-library font.');
+  }
+  const resolved = await resolveAssetLibraryFontForUse(libraryId, itemId);
+  const artifactsDir = path.resolve(String(options.runDirectories?.artifactsDir || '').trim());
+  if (!artifactsDir) {
+    throw new Error('Burn Subtitles / Captions could not prepare a run-scoped font folder.');
+  }
+  const fontsDir = path.join(artifactsDir, 'subtitle-fonts', sanitizeSegment(options.node?.id || 'burn-subtitles'));
+  await fs.ensureDir(fontsDir);
+  const extension = path.extname(resolved.filePath).toLowerCase();
+  const copiedFontPath = path.join(fontsDir, sanitizeSegment(resolved.library.id) + '-' + sanitizeSegment(resolved.item.id) + extension);
+  await fs.copy(resolved.filePath, copiedFontPath, { overwrite: true });
+  return {
+    fontAsset: {
+      extension,
+      fontFamily: resolved.item.fontFamily,
+      itemId: resolved.item.id,
+      itemName: resolved.item.displayName || resolved.item.name || resolved.item.id,
+      libraryId: resolved.library.id,
+      libraryName: resolved.library.name,
+      source: 'assetLibrary',
+    },
+    fontFamily: resolved.item.fontFamily,
+    fontRuntime: {
+      copied: true,
+      fontsDir,
+      strategy: 'run-scoped-fontsdir',
+    },
+  };
+}
+
+async function resolveSubtitleStyleForRender(options = {}) {
+  const paletteStyle = await resolveSubtitlePaletteStyle(options);
+  const fontStyle = await resolveSubtitleFontStyle(options);
+  const style = normalizeSubtitleStyle({
+    ...options,
+    ...paletteStyle,
+    ...fontStyle,
+  });
+  return {
+    fontRuntime: fontStyle.fontRuntime,
+    style,
+  };
+}
+
 async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, options = {}) {
   const operationLabel = 'Burn Subtitles / Captions';
   const outputFormat = normalizeVideoOutputFormat(options.outputFormat, operationLabel);
   const sourcePath = await resolveSourceVideoPath(videoArtifact, operationLabel);
-  const subtitleSource = await prepareSubtitleSource(captionArtifact, options);
-  const subtitleStyle = normalizeSubtitleStyle(options);
+  const styleResolution = await resolveSubtitleStyleForRender(options);
+  const subtitleStyle = styleResolution.style;
+  const subtitleSource = await prepareSubtitleSource(captionArtifact, { ...options, subtitleStyle });
   const outputPath = await nextOutputPath(options.runDirectories, options.node, 'captioned', '.' + outputFormat);
   options.reportProgress?.('Burning captions.', 'Rendering timed captions directly into the video with the bundled ffmpeg runtime...');
   const ffmpegPath = resolveFfmpegPath();
-  const command = buildBurnSubtitlesCommandArgs(sourcePath, subtitleSource.subtitlePath, outputPath, subtitleStyle);
+  const command = buildBurnSubtitlesCommandArgs(sourcePath, subtitleSource.subtitlePath, outputPath, subtitleStyle, styleResolution.fontRuntime);
   const commandResult = await runCommand(ffmpegPath, command.args, { allowFailure: true });
   if (Number(commandResult.code || 0) !== 0 || !(await fs.pathExists(outputPath))) {
     const failureLine = firstNonEmptyLine(commandResult.stderr) || firstNonEmptyLine(commandResult.stdout);
@@ -1647,6 +1800,7 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
     ffmpegMode: command.mode,
     generatedSubtitleFormat: subtitleSource.subtitleFormat,
     generatedSubtitlePath: subtitleSource.subtitlePath,
+    fontRuntime: styleResolution.fontRuntime ? { copied: true, strategy: styleResolution.fontRuntime.strategy } : null,
     operation: 'burnSubtitles',
     operationId: 'burnSubtitles',
     outputFormat,
@@ -1659,6 +1813,8 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
     sourceVideoLineage: options.sourceVideoLineage && typeof options.sourceVideoLineage === 'object' ? { ...options.sourceVideoLineage } : null,
     sourceVideoPath: sourcePath,
     style: subtitleStyle,
+    styleWarnings: [],
+    retryOverride: options.retryOverride && typeof options.retryOverride === 'object' ? { ...options.retryOverride, temporary: true } : null,
   };
   const artifact = await buildFileArtifact(outputPath, {
     displayName: String(options.displayName || options.node?.label || 'Captioned video').trim() || 'Captioned video',
@@ -1672,7 +1828,7 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
   if (metadataPaths.length) artifact.metadataPaths = metadataPaths;
   return {
     destinationPath: outputPath,
-    message: operationLabel + ' rendered captions into an MP4 video using ' + subtitleStyle.fontSize + 'px ' + subtitleStyle.fontPreset + ' captions at ' + subtitleStyle.position + '.',
+    message: operationLabel + ' rendered captions into an MP4 video using ' + subtitleStyle.fontSize + 'px ' + (subtitleStyle.fontSource === 'assetLibrary' ? (subtitleStyle.fontAsset?.itemName || subtitleStyle.fontFamily || 'asset-library font') : subtitleStyle.fontPreset) + ' captions at ' + subtitleStyle.position + '.',
     outputs: { video: artifact },
     preview: summarizeArtifact(artifact),
   };
@@ -1702,8 +1858,10 @@ module.exports = {
     normalizeFramePosition,
     normalizeTimestampSeconds,
     normalizeSubtitleStyle,
+    resolveSubtitleStyleForRender,
     getSubtitleAssAlignment,
     getSubtitleFilterAlignment,
     buildSubtitleForceStyle,
+    hexToAssColor,
   },
 };

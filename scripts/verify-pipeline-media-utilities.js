@@ -73,6 +73,7 @@ const { buildFileArtifact, createArtifactCollection, createTextArtifact } = requ
 const { runCommand } = require('../electron/services/commandService');
 const { resolveFfmpegPath } = require('../electron/services/mediaCompositionService');
 const mediaUtilityService = require('../electron/services/mediaUtilityService');
+const { createAssetLibrary, importAssetLibraryItems, updateColorPaletteItem } = require('../electron/services/assetLibraryService');
 const {
   cancelPipelineRun,
   getActiveRunSnapshot,
@@ -395,6 +396,7 @@ function verifySafeFfmpegArgs() {
   const trimArgs = mediaUtilityService._test.buildTrimCommandArgs('input.mp4', 'trimmed.mp4', pipelineSchema.PORT_KIND_VIDEO, { startSeconds: 0, durationSeconds: 1 }).args;
   const burnArgs = mediaUtilityService._test.buildBurnSubtitlesCommandArgs('input.mp4', path.join(TEST_STORAGE_ROOT, 'captions.srt'), 'captioned.mp4', { backgroundBox: true, backgroundOpacity: 75, bold: true, bottomMargin: 44, fontPreset: 'tahoma', fontSize: 34, italic: true, outline: 3, outlineColor: 'blue', position: 'topLeft', shadow: 2, textColor: 'yellow' }).args;
   const assBurnCommand = mediaUtilityService._test.buildBurnSubtitlesCommandArgs('input.mp4', path.join(TEST_STORAGE_ROOT, 'captions.ass'), 'captioned.mp4', { position: 'topCenter' });
+  const assetFontCommand = mediaUtilityService._test.buildBurnSubtitlesCommandArgs('input.mp4', path.join(TEST_STORAGE_ROOT, 'captions.ass'), 'captioned.mp4', { fontSource: 'assetLibrary', fontFamily: 'Caption Fixture', position: 'topCenter' }, { fontsDir: path.join(TEST_STORAGE_ROOT, 'subtitle-fonts', 'fixture') });
   assert(Array.isArray(firstFrameArgs), 'First-frame extraction args should be an array.');
   assert(Array.isArray(lastFrameArgs) && lastFrameArgs.includes('reverse'), 'Last-frame extraction should use an explicit ffmpeg reverse filter args array.');
   assert.strictEqual(timestampFrameCommand.timestampSeconds, 0.5, 'Timestamp-frame command should preserve timestamp seconds.');
@@ -407,6 +409,7 @@ function verifySafeFfmpegArgs() {
   assert(burnArgs.some((entry) => /force_style=.*Alignment=5.*Fontname=Tahoma.*Fontsize=34.*PrimaryColour=&H0000FFFF.*OutlineColour=&H00FF0000.*Bold=-1.*Italic=-1.*Outline=3.*Shadow=2.*MarginV=44.*BorderStyle=3.*BackColour=&H40000000/.test(String(entry))), 'Burn Subtitles should pass expanded styling through SRT/VTT-compatible force_style.');
   assert.strictEqual(assBurnCommand.mode, 'burn-ass-subtitles-filter', 'Generated ASS subtitle burns should use the ASS subtitle filter path.');
   assert(assBurnCommand.args.some((entry) => String(entry).startsWith('subtitles=') && !String(entry).includes('force_style=')), 'Generated ASS subtitle burns should not override ASS Alignment with force_style.');
+  assert(assetFontCommand.args.some((entry) => String(entry).includes(':fontsdir=') && !String(entry).includes('force_style=')), 'Imported font subtitle burns should pass a run-scoped fontsdir to libass.');
   assert.throws(() => mediaUtilityService._test.normalizeSubtitleStyle({ textColor: 'chartreuse' }), /text color style option/i, 'Freeform caption text colors should not be accepted.');
   assert.throws(() => mediaUtilityService._test.normalizeSubtitleStyle({ outlineColor: 'orange' }), /outline color style option/i, 'Freeform caption outline colors should not be accepted.');
   assert.throws(() => mediaUtilityService._test.normalizeSubtitleStyle({ position: 'somewhere' }), /position style option/i, 'Freeform caption positions should not be accepted.');
@@ -775,14 +778,24 @@ async function verifyRuntimePassCUtilities() {
   assert(fs.existsSync(manualBurn.outputs.video.filePath), 'Burn Subtitles should create a captioned video.');
   assert.strictEqual(manualBurn.outputs.video.subtitleBurn.captionMode, 'manualLines', 'Manual caption burn should record mode.');
   assert.strictEqual(manualBurn.outputs.video.subtitleBurn.captionCount, 2, 'Manual caption burn should count lines.');
-  assert.deepStrictEqual(manualBurn.outputs.video.subtitleBurn.style, { backgroundBox: true, backgroundOpacity: 75, bold: true, bottomMargin: 44, fontPreset: 'tahoma', fontSize: 34, italic: true, outline: 3, outlineColor: 'blue', position: 'topLeft', shadow: 2, textColor: 'yellow' }, 'Manual caption burn should record subtitle styling.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.style.fontPreset, 'tahoma', 'Manual caption burn should record the built-in font preset.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.style.fontSource, 'preset', 'Manual caption burn should record built-in font source.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.style.colorSource, 'manual', 'Manual caption burn should record manual color source.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.style.textColorValue, '#FFFF00', 'Manual caption burn should record resolved text color value.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.style.outlineColorValue, '#0000FF', 'Manual caption burn should record resolved outline color value.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.style.backgroundColorValue, '#000000', 'Manual caption burn should record resolved background color value.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.style.fontSize, 34, 'Manual caption burn should record font size.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.style.position, 'topLeft', 'Manual caption burn should record position.');
   assert.strictEqual(manualBurn.outputs.video.subtitleBurn.generatedSubtitleFormat, 'ass', 'Manual caption burn should generate styled ASS subtitles for burn-in.');
   const manualAss = fs.readFileSync(manualBurn.outputs.video.subtitleBurn.generatedSubtitlePath, 'utf8');
   assert(manualAss.includes('Style: Default,Tahoma,34,&H0000FFFF,&H000000FF,&H00FF0000,&H40000000,-1,-1,0,0,100,100,0,0,3,3,2,7,10,10,44,1'), 'Manual caption ASS should encode expanded style and top-left alignment.');
   assert(manualAss.includes('Dialogue: 0,0:00:00.00,0:00:00.25'), 'Manual caption ASS should use duration per line.');
   const manualBurnSidecar = readJson(manualBurn.outputs.video.metadataPaths.find((entry) => entry.endsWith('.video.json')));
   assert.strictEqual(manualBurnSidecar.subtitleBurn.captionSource.kind, pipelineSchema.PORT_KIND_TEXT, 'Burn sidecar should record text caption source.');
-  assert.deepStrictEqual(manualBurnSidecar.subtitleBurn.style, { backgroundBox: true, backgroundOpacity: 75, bold: true, bottomMargin: 44, fontPreset: 'tahoma', fontSize: 34, italic: true, outline: 3, outlineColor: 'blue', position: 'topLeft', shadow: 2, textColor: 'yellow' }, 'Burn sidecar should record subtitle styling.');  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.pipelineTrace?.burnSubtitlesNodeId, 'burn-manual', 'Burn metadata should trace the Burn Subtitles node id.');
+  assert.strictEqual(manualBurnSidecar.subtitleBurn.style.fontPreset, 'tahoma', 'Burn sidecar should record built-in font preset.');
+  assert.strictEqual(manualBurnSidecar.subtitleBurn.style.colorSource, 'manual', 'Burn sidecar should record manual color source.');
+  assert.strictEqual(manualBurnSidecar.subtitleBurn.style.textColorValue, '#FFFF00', 'Burn sidecar should record resolved text color.');
+  assert.strictEqual(manualBurn.outputs.video.subtitleBurn.pipelineTrace?.burnSubtitlesNodeId, 'burn-manual', 'Burn metadata should trace the Burn Subtitles node id.');
   assert.strictEqual(manualBurnSidecar.subtitleBurn.pipelineTrace?.burnSubtitlesNodeId, 'burn-manual', 'Burn sidecar should trace the Burn Subtitles node id.');
   assert.strictEqual(manualBurnSidecar.subtitleBurn.sourceVideoPath, trimVideoPath, 'Burn sidecar should record the exact source video path used for rendering.');
 

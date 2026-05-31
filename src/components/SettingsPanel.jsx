@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import AssetLibraryManager from './AssetLibraryManager';
 import { formatBytes, formatDiskAvailability } from '../lib/formatters';
 
 const PROMPT_STYLE_EMPTY_DRAFT = Object.freeze({
@@ -125,6 +126,7 @@ export default function SettingsPanel({
   onMigrateLegacyStorage,
   onPreviewCleanup,
   onRunCleanup,
+  onToast,
   onDeletePromptStyle,
   onSaveCloseBehavior,
   onSavePromptStyle,
@@ -272,6 +274,16 @@ export default function SettingsPanel({
         </div>
       </SettingsSection>
 
+      <SettingsSection
+        eyebrow="Libraries"
+        id="asset-libraries"
+        openSection={openSection}
+        setOpenSection={setOpenSection}
+        summary="Manage local Sound Effects, Fonts, and Color Palettes in Local AI Hub managed storage."
+        title="Asset Libraries"
+      >
+        <AssetLibraryManager onToast={onToast} />
+      </SettingsSection>
       <SettingsSection
         action={(
           <button className="primary-button" disabled={busyMap['settings:save-close-behavior']} onClick={onSaveCloseBehavior} type="button">
