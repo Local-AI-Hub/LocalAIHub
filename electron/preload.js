@@ -90,7 +90,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   stopTool: (toolId) => invoke('tools:stop', toolId),
   testProviderConnection: (providerId) => invoke('providers:test', providerId),
   transcribeWithWhisper: (payload) => invoke('whisper:transcribe', payload),
-  uninstallTool: (toolId) => invoke('tools:uninstall', toolId),
+  uninstallTool: (payload) => invoke('tools:uninstall', payload),
   updateTool: (payload) => invoke('tools:update', payload),
   onInstallProgress: (handler) => {
     const listener = (_event, payload) => handler(payload);

@@ -379,14 +379,21 @@ async function maybeNotifyStoppedTool(tool) {
 }
 
 async function launchToolFromExplicitUserAction(tool, options = {}) {
-  await launchToolFromUserAction(tool, options);
+  const launchedTool = await launchToolFromUserAction(tool, options);
   await recordToolLaunch(tool).catch(() => null);
   const nextState = await buildAppState();
   const nextTool = toolLookup(tool.id, nextState.tools);
-  openInternalToolInterface(nextTool);
+  openInternalToolInterface({
+    ...nextTool,
+    interfaceMode: launchedTool?.interfaceMode || nextTool?.interfaceMode,
+  });
   return {
     nextState,
-    nextTool,
+    nextTool: {
+      ...nextTool,
+      interfaceMode: launchedTool?.interfaceMode || nextTool?.interfaceMode,
+      lastLaunchWarning: launchedTool?.lastLaunchWarning || nextTool?.lastLaunchWarning,
+    },
   };
 }
 
@@ -1107,6 +1114,7 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const toolId = typeof payload === 'string' ? payload : payload?.toolId;
       const tool = await installTool(toolId, {
+        capability: payload?.capability || payload?.installCapability || null,
         installRoot: payload?.installRoot || null,
         lowDiskConfirmed: Boolean(payload?.lowDiskConfirmed),
         onGuidedInstallerComplete: async () => {
@@ -1145,7 +1153,12 @@ function registerIpcHandlers() {
           };
         }
 
-        const launchOptions = {};
+        const requestedLaunchMode = typeof payload === 'object' && payload
+          ? String(payload.launchMode || payload.launchModeId || '').trim().toLowerCase()
+          : '';
+        const launchOptions = requestedLaunchMode
+          ? { launchMode: requestedLaunchMode }
+          : {};
         if (tool.id === 'aider') {
           const projectDir = String(payload?.projectDir || tool.lastProjectDir || '').trim();
           const aiderSession = payload?.aiderSession || {};
@@ -1194,7 +1207,7 @@ function registerIpcHandlers() {
             ...aiderLaunch.persistedFields,
           });
         }
-        if (tool.id === 'koboldcpp') {
+        if (tool.id === 'koboldcpp' && requestedLaunchMode !== 'desktop') {
           const koboldLaunch = await buildKoboldCppLaunchConfiguration(tool);
           launchOptions.launchProfileOverride = koboldLaunch.launchProfileOverride;
           launchOptions.successMessage = koboldLaunch.launchMessage;
@@ -1272,10 +1285,12 @@ function registerIpcHandlers() {
   ipcMain.handle('tools:repair', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const toolId = typeof payload === 'string' ? payload : payload?.toolId;
+      const capability = typeof payload === 'string' ? null : payload?.capability || payload?.installCapability || null;
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
       await prepareToolForMaintenance(tool);
       const repairedTool = await repairToolInstallation(tool, {
+        capability,
         onProgress: (progressPayload) => sendInstallProgress(progressPayload),
         removeOrphanedToolFolders: Boolean(payload?.removeOrphanedToolFolders),
       });
@@ -1296,14 +1311,16 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not inspect that repair right now.'),
   );
 
-  ipcMain.handle('tools:uninstall', (_event, toolId) =>
+  ipcMain.handle('tools:uninstall', (_event, payload) =>
     withPlainEnglishErrors(async () => {
+      const toolId = typeof payload === 'string' ? payload : payload?.toolId;
+      const capability = typeof payload === 'string' ? null : payload?.capability || payload?.installCapability || null;
       const state = await buildAppState();
       const tool = toolLookup(toolId, state.tools);
       if (tool.source === 'managed') {
         await prepareToolForMaintenance(tool);
       }
-      const removedTool = await uninstallTool(tool);
+      const removedTool = await uninstallTool(tool, { capability });
       invalidateDiscoveryCache();
       await invalidateStatisticsIndexSections(['storage'], 'tool-uninstalled', { toolId: tool.id }).catch(() => null);
       return {

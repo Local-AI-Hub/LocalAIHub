@@ -182,6 +182,217 @@ function buildHealthUrl(tool, launchUrl) {
   }
 }
 
+function normalizeLaunchModeId(value, fallback = 'default') {
+  return sanitizeManifestId(String(value || fallback).trim().toLowerCase());
+}
+
+function hasOwnValue(target, key) {
+  return Object.prototype.hasOwnProperty.call(target || {}, key);
+}
+
+function getLaunchModeLabel(modeId, interfaceMode) {
+  if (modeId === 'webui') {
+    return 'Web UI';
+  }
+
+  if (modeId === 'desktop') {
+    return 'Desktop App';
+  }
+
+  if (modeId === 'service') {
+    return 'Service';
+  }
+
+  if (modeId === 'cli') {
+    return 'CLI';
+  }
+
+  if (String(interfaceMode || '').startsWith('embedded-')) {
+    return 'Built-in Interface';
+  }
+
+  return 'Launch';
+}
+
+function normalizeLaunchMode(tool, rawMode, index = 0) {
+  const mode = rawMode && typeof rawMode === 'object' ? rawMode : {};
+  const interfaceMode = mode.interfaceMode || tool.interfaceMode || 'external-browser';
+  const launchCommand = assertSafeCommandString(
+    mode.launchCommand || tool.launchCommand,
+    `${tool.id} launch mode ${mode.id || index + 1} command`,
+  );
+  const externalLaunchCommand = mode.externalLaunchCommand
+    ? assertSafeCommandString(mode.externalLaunchCommand, `${tool.id} launch mode ${mode.id || index + 1} external command`)
+    : tool.externalLaunchCommand || launchCommand;
+  const defaultPort = hasOwnValue(mode, 'defaultPort') ? mode.defaultPort : tool.defaultPort || null;
+  const launchUrl = hasOwnValue(mode, 'launchUrl')
+    ? mode.launchUrl || null
+    : interfaceMode === 'desktop-app'
+      ? null
+      : buildLaunchUrl({
+          launchUrl: tool.launchUrl,
+          defaultPort,
+        });
+  const healthUrl = hasOwnValue(mode, 'healthUrl')
+    ? mode.healthUrl || null
+    : launchUrl
+      ? buildHealthUrl(
+          {
+            ...tool,
+            healthCheckPath: hasOwnValue(mode, 'healthCheckPath') ? mode.healthCheckPath : tool.healthCheckPath,
+            healthUrl: null,
+          },
+          launchUrl,
+        )
+      : null;
+  const id = normalizeLaunchModeId(mode.id, index === 0 ? 'default' : `mode-${index + 1}`);
+
+  return {
+    id,
+    capability: mode.capability || (id === 'desktop' ? 'desktop' : id === 'webui' ? 'webui' : id),
+    label: mode.label || getLaunchModeLabel(id, interfaceMode),
+    kind: mode.kind || id,
+    interfaceMode,
+    launchCommand,
+    externalLaunchCommand,
+    launchEnv: mode.launchEnv || tool.launchEnv || {},
+    externalLaunchEnv: mode.externalLaunchEnv || tool.externalLaunchEnv || mode.launchEnv || tool.launchEnv || {},
+    launchEnvironment: mode.launchEnvironment && typeof mode.launchEnvironment === 'object' && !Array.isArray(mode.launchEnvironment)
+      ? mode.launchEnvironment
+      : tool.launchEnvironment && typeof tool.launchEnvironment === 'object' && !Array.isArray(tool.launchEnvironment)
+        ? tool.launchEnvironment
+        : {},
+    defaultPort,
+    launchUrl,
+    healthUrl,
+    healthCheckPath: hasOwnValue(mode, 'healthCheckPath') ? mode.healthCheckPath : tool.healthCheckPath || '',
+    executableCandidates: Array.isArray(mode.executableCandidates) ? mode.executableCandidates : null,
+    batchCandidates: Array.isArray(mode.batchCandidates) ? mode.batchCandidates : null,
+    pythonCandidates: Array.isArray(mode.pythonCandidates) ? mode.pythonCandidates : null,
+    processNames: mode.processNames || deriveProcessNames({
+      ...tool,
+      launchCommand,
+      externalLaunchCommand,
+    }),
+  };
+}
+
+function normalizeLaunchModes(tool) {
+  const declaredModes = Array.isArray(tool.launchModes) ? tool.launchModes : [];
+  const rawModes = declaredModes.length
+    ? declaredModes
+    : [
+        {
+          id: tool.interfaceMode === 'desktop-app' ? 'desktop' : tool.interfaceMode === 'embedded-chat' ? 'service' : 'webui',
+          label: tool.interfaceMode === 'desktop-app' ? 'Desktop App' : null,
+        },
+      ];
+  const seen = new Set();
+  const modes = rawModes.map((mode, index) => normalizeLaunchMode(tool, mode, index)).filter((mode) => {
+    if (seen.has(mode.id)) {
+      return false;
+    }
+
+    seen.add(mode.id);
+    return true;
+  });
+  const requestedPreferred = tool.preferredLaunchMode ? normalizeLaunchModeId(tool.preferredLaunchMode) : null;
+  const preferredLaunchMode = modes.some((mode) => mode.id === requestedPreferred)
+    ? requestedPreferred
+    : modes[0]?.id || null;
+
+  return {
+    launchModes: modes,
+    preferredLaunchMode,
+  };
+}
+
+function normalizeCompanionDesktopDefinition(toolId, rawCompanion) {
+  if (!rawCompanion || typeof rawCompanion !== 'object') {
+    return null;
+  }
+
+  const companionId = sanitizeManifestId(`${toolId}-${rawCompanion.id || 'desktop'}`);
+  const installInstructions = rawCompanion.installInstructions || {};
+  const launchCommand = assertSafeCommandString(rawCompanion.launchCommand || `"${rawCompanion.name || 'Desktop App'}.exe"`, `${toolId} companion desktop launch command`);
+  const externalLaunchCommand = rawCompanion.externalLaunchCommand
+    ? assertSafeCommandString(rawCompanion.externalLaunchCommand, `${toolId} companion desktop external launch command`)
+    : launchCommand;
+  const normalizedInstallInstructions = {
+    kind: installInstructions.kind || 'installer-exe',
+    runtime: installInstructions.runtime || 'binary',
+    archiveName: deriveArchiveName(rawCompanion.downloadUrl, installInstructions.archiveName),
+    downloadFileName: installInstructions.downloadFileName || null,
+    installSummary: installInstructions.installSummary || 'Downloads and opens the official desktop installer.',
+    venvFolder: installInstructions.venvFolder || '.venv',
+    pythonRequirement: installInstructions.pythonRequirement || null,
+    configTargets: installInstructions.configTargets || [],
+    pythonRequirementDetection: installInstructions.pythonRequirementDetection || [],
+    pipInstalls: installInstructions.pipInstalls || [],
+    runtimeAssets: installInstructions.runtimeAssets || [],
+    packagingBootstrapPackages: installInstructions.packagingBootstrapPackages || [],
+    preflightChecks: installInstructions.preflightChecks || [],
+    installerArgs: installInstructions.installerArgs || [],
+    managedInstallSupported: installInstructions.managedInstallSupported === true,
+    materializationTimeoutMs: Number(installInstructions.materializationTimeoutMs) > 0
+      ? Number(installInstructions.materializationTimeoutMs)
+      : null,
+    externalPythonCandidates: installInstructions.externalPythonCandidates || [],
+    externalExecutableCandidates: installInstructions.externalExecutableCandidates || [],
+    externalBatchCandidates: installInstructions.externalBatchCandidates || [],
+    compatibility: installInstructions.compatibility || null,
+  };
+  const companion = {
+    id: companionId,
+    parentToolId: toolId,
+    capability: rawCompanion.id || 'desktop',
+    name: rawCompanion.name || 'Desktop App',
+    description: rawCompanion.description || '',
+    icon: rawCompanion.icon || null,
+    category: rawCompanion.category || null,
+    downloadUrl: assertSecureRemoteUrl(rawCompanion.downloadUrl, `${toolId} companion desktop download URL`),
+    interfaceMode: 'desktop-app',
+    launchCommand,
+    externalLaunchCommand,
+    launchEnv: rawCompanion.launchEnv || {},
+    externalLaunchEnv: rawCompanion.externalLaunchEnv || rawCompanion.launchEnv || {},
+    launchEnvironment: rawCompanion.launchEnvironment && typeof rawCompanion.launchEnvironment === 'object' && !Array.isArray(rawCompanion.launchEnvironment)
+      ? rawCompanion.launchEnvironment
+      : {},
+    installInstructions: normalizedInstallInstructions,
+    detectionPaths: rawCompanion.detectionPaths || [],
+    discovery: {
+      folderNames: mergeUnique(rawCompanion.discovery?.folderNames || []),
+      markerPaths: mergeUnique(rawCompanion.discovery?.markerPaths || []),
+      pathExecutables: mergeUnique(rawCompanion.discovery?.pathExecutables || []),
+      pythonModules: mergeUnique(rawCompanion.discovery?.pythonModules || []),
+    },
+    defaultPort: null,
+    launchUrl: null,
+    healthUrl: null,
+    processNames: rawCompanion.processNames || deriveProcessNames({
+      launchCommand,
+      externalLaunchCommand,
+    }),
+  };
+  companion.launchModes = [
+    normalizeLaunchMode(companion, {
+      id: rawCompanion.id || 'desktop',
+      capability: rawCompanion.id || 'desktop',
+      label: 'Desktop App',
+      kind: 'desktop',
+      interfaceMode: 'desktop-app',
+      launchCommand,
+      externalLaunchCommand,
+      executableCandidates: normalizedInstallInstructions.externalExecutableCandidates,
+      processNames: companion.processNames,
+    }),
+  ];
+  companion.preferredLaunchMode = companion.launchModes[0]?.id || 'desktop';
+  companion.installContract = getManifestInstallContract(companion);
+  return companion;
+}
+
 function deriveProcessNames(tool) {
   const candidates = [tool.launchCommand, tool.externalLaunchCommand].filter(Boolean);
   const names = new Set();
@@ -238,6 +449,12 @@ function normalizeToolDefinition(tool) {
   const externalLaunchCommand = tool.externalLaunchCommand
     ? assertSafeCommandString(tool.externalLaunchCommand, `${toolId} external launch command`)
     : launchCommand;
+  const launchModeConfig = normalizeLaunchModes({
+    ...tool,
+    id: toolId,
+    launchCommand,
+    externalLaunchCommand,
+  });
   const normalizedInstallInstructions = {
     kind: installInstructions.kind || 'zip',
     runtime: installInstructions.runtime || 'binary',
@@ -276,6 +493,7 @@ function normalizeToolDefinition(tool) {
     id: toolId,
     installInstructions: normalizedInstallInstructions,
   });
+  const companionDesktop = normalizeCompanionDesktopDefinition(toolId, tool.companionDesktop);
 
   return {
     id: toolId,
@@ -288,7 +506,10 @@ function normalizeToolDefinition(tool) {
     launchEnv: tool.launchEnv || {},
     externalLaunchEnv: tool.externalLaunchEnv || tool.launchEnv || {},
     launchEnvironment: tool.launchEnvironment && typeof tool.launchEnvironment === 'object' && !Array.isArray(tool.launchEnvironment) ? tool.launchEnvironment : {},
+    launchModes: launchModeConfig.launchModes,
+    preferredLaunchMode: launchModeConfig.preferredLaunchMode,
     installContract,
+    companionDesktop,
     installInstructions: normalizedInstallInstructions,
     launchCommand,
     externalLaunchCommand,
@@ -305,11 +526,9 @@ function normalizeToolDefinition(tool) {
     startupTimeoutMs: Number(tool.startupTimeoutMs) > 0 ? Number(tool.startupTimeoutMs) : null,
     modelManager: tool.modelManager && typeof tool.modelManager === 'object' ? tool.modelManager : null,
     pipelineCapabilities: getToolPipelineCapabilities(toolId),
-    processNames: tool.processNames || deriveProcessNames({
-      ...tool,
-      externalLaunchCommand,
-      launchCommand,
-    }),
+    processNames: tool.processNames || mergeUnique(
+      launchModeConfig.launchModes.flatMap((mode) => mode.processNames || []),
+    ),
   };
 }
 
@@ -344,7 +563,32 @@ function getToolCatalog() {
     defaultPort: tool.defaultPort,
     launchUrl: tool.launchUrl,
     interfaceMode: tool.interfaceMode,
+    launchModes: tool.launchModes,
+    preferredLaunchMode: tool.preferredLaunchMode,
     installSummary: tool.installInstructions.installSummary,
+    companionDesktop: tool.companionDesktop,
+    installCapabilities: tool.companionDesktop
+      ? [
+          {
+            id: 'webui',
+            label: 'WebUI',
+            installLabel: 'Install WebUI',
+            installedLabel: 'WebUI Installed',
+            installContract: tool.installContract,
+            installKind: tool.installInstructions.kind,
+            installSummary: tool.installInstructions.installSummary,
+          },
+          {
+            id: 'desktop',
+            label: 'Desktop App',
+            installLabel: 'Install Desktop App',
+            installedLabel: 'Desktop Installed',
+            installContract: tool.companionDesktop.installContract,
+            installKind: tool.companionDesktop.installInstructions.kind,
+            installSummary: tool.companionDesktop.installInstructions.installSummary,
+          },
+        ]
+      : null,
     installKind: tool.installInstructions.kind,
     installContract: tool.installContract,
     downloadUrl: tool.downloadUrl,
@@ -466,6 +710,10 @@ function resolveCommandPath(token, baseDir, explicitPath = null, options = {}) {
   return path.join(baseDir, token);
 }
 
+function isBareCommand(command) {
+  return Boolean(command) && !path.isAbsolute(command) && !/[\\/]/.test(command);
+}
+
 function createFolderOnlyProfile(installDir) {
   return {
     kind: 'folder',
@@ -561,12 +809,13 @@ function buildLaunchProfileFromCommand(command, context = {}) {
   if (/\.(bat|cmd)$/i.test(tokens[0])) {
     return {
       kind: 'batch',
-      command: resolveCommandPath(tokens[0], context.baseDir, context.executablePath),
-      workingDir: context.workingDir || context.baseDir,
-      allowExternalWorkingDir: Boolean(context.allowExternalWorkingDir),
-      args: tokens.slice(1),
-      env: context.env || {},
-    };
+        command: resolveCommandPath(tokens[0], context.baseDir, context.executablePath),
+        workingDir: context.workingDir || context.baseDir,
+        allowExternalWorkingDir: Boolean(context.allowExternalWorkingDir),
+        allowExternalExecutable: Boolean(context.allowExternalExecutable),
+        args: tokens.slice(1),
+        env: context.env || {},
+      };
   }
 
   const executable = resolveCommandPath(tokens[0], context.baseDir, context.executablePath);
@@ -575,14 +824,62 @@ function buildLaunchProfileFromCommand(command, context = {}) {
     executable,
     workingDir: context.workingDir || path.dirname(executable),
     allowExternalWorkingDir: Boolean(context.allowExternalWorkingDir),
+    allowExternalExecutable: Boolean(context.allowExternalExecutable),
     args: tokens.slice(1),
     env: context.env || {},
   };
 }
 
-function buildManagedLaunchProfile(toolState, manifest) {
+function getModeCandidateList(launchMode, installInstructions, candidateKey, fallbackKey) {
+  if (launchMode && launchMode[candidateKey] !== null) {
+    return launchMode[candidateKey] || [];
+  }
+
+  return installInstructions[fallbackKey] || [];
+}
+
+function findManagedBinaryExecutableForMode(toolState, manifest, launchMode = null) {
+  if (!launchMode) {
+    return findManagedBinaryExecutable(toolState, manifest);
+  }
+
+  const searchRoots = mergeUnique([toolState.appDir, toolState.installDir].filter(Boolean));
+  if (!searchRoots.length) {
+    return null;
+  }
+
+  const launchToken = tokenizeCommand(launchMode.launchCommand || manifest.launchCommand)[0] || '';
+  const candidates = mergeUnique([
+    launchToken,
+    ...getModeCandidateList(launchMode, manifest.installInstructions || {}, 'executableCandidates', 'externalExecutableCandidates'),
+  ]);
+  return findExistingManagedCandidate(searchRoots, candidates);
+}
+
+function detectedPathMatchesLaunchMode(detectedPath, launchMode, launchCommand) {
+  if (!detectedPath || !launchMode) {
+    return Boolean(detectedPath);
+  }
+
+  const expectedNames = mergeUnique([
+    path.basename(tokenizeCommand(launchCommand)[0] || ''),
+    ...(launchMode.executableCandidates || []),
+    ...(launchMode.batchCandidates || []),
+    ...(launchMode.pythonCandidates || []),
+  ])
+    .map((entry) => path.basename(String(entry || '')).toLowerCase())
+    .filter(Boolean);
+  if (!expectedNames.length) {
+    return Boolean(detectedPath);
+  }
+
+  return expectedNames.includes(path.basename(detectedPath).toLowerCase());
+}
+
+function buildManagedLaunchProfile(toolState, manifest, launchMode = null) {
   const baseDir = toolState.appDir || toolState.installDir;
-  const launchToken = tokenizeCommand(manifest.launchCommand)[0] || '';
+  const launchCommand = launchMode?.launchCommand || manifest.launchCommand;
+  const launchToken = tokenizeCommand(launchCommand)[0] || '';
   const normalizedLaunchToken = launchToken.toLowerCase();
   const usesPythonLauncher =
     normalizedLaunchToken === 'python'
@@ -593,32 +890,74 @@ function buildManagedLaunchProfile(toolState, manifest) {
       ? path.join(toolState.venvDir, 'Scripts', 'python.exe')
       : null;
   const executablePath = manifest.installInstructions.runtime === 'binary'
-    ? findManagedBinaryExecutable(toolState, manifest)
+    ? findManagedBinaryExecutableForMode(toolState, manifest, launchMode)
     : null;
 
-  return buildLaunchProfileFromCommand(manifest.launchCommand, {
+  return buildLaunchProfileFromCommand(launchCommand, {
     baseDir,
     workingDir: usesPythonLauncher ? baseDir : executablePath ? path.dirname(executablePath) : baseDir,
     executablePath,
     pythonPath,
-    port: manifest.defaultPort,
-    env: manifest.launchEnv || {},
+    port: launchMode?.defaultPort || manifest.defaultPort,
+    env: launchMode?.launchEnv || manifest.launchEnv || {},
   });
 }
 
-function buildExternalLaunchProfile(manifest, installDir, detectedPath = null) {
-  const launchCommand = manifest.externalLaunchCommand || manifest.launchCommand;
+function buildCompanionDesktopLaunchProfile(toolState, manifest) {
+  const companion = manifest?.companionDesktop;
+  const companionState = toolState?.desktopCompanion;
+  if (!companion || !companionState?.installed) {
+    return null;
+  }
+
+  const installDir =
+    companionState.installDir ||
+    companionState.appDir ||
+    (companionState.detectedPath ? path.dirname(companionState.detectedPath) : null);
+  if (!installDir) {
+    return null;
+  }
+
+  return buildExternalLaunchProfile(
+    companion,
+    installDir,
+    companionState.detectedPath || companionState.executablePath || null,
+    companion.launchModes?.[0] || null,
+  );
+}
+
+function launchModeCapabilityIsInstalled(toolState, launchMode) {
+  const capability = launchMode.capability || launchMode.id;
+  const installedCapabilities = toolState?.installedCapabilities;
+  if (!installedCapabilities || typeof installedCapabilities !== 'object') {
+    return true;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(installedCapabilities, capability)) {
+    return Boolean(installedCapabilities[capability]);
+  }
+
+  return true;
+}
+
+function buildExternalLaunchProfile(manifest, installDir, detectedPath = null, launchMode = null) {
+  const launchCommand = launchMode?.externalLaunchCommand || launchMode?.launchCommand || manifest.externalLaunchCommand || manifest.launchCommand;
   const installInstructions = manifest.installInstructions || {};
   const baseContext = {
     baseDir: installDir,
     workingDir: installDir,
-    port: manifest.defaultPort,
-    env: manifest.externalLaunchEnv || manifest.launchEnv || {},
+    allowExternalWorkingDir: true,
+    allowExternalExecutable: true,
+    port: launchMode?.defaultPort || manifest.defaultPort,
+    env: launchMode?.externalLaunchEnv || launchMode?.launchEnv || manifest.externalLaunchEnv || manifest.launchEnv || {},
   };
   const detectedPythonPath = detectedPath && /python(?:\.exe)?$/i.test(path.basename(detectedPath)) ? detectedPath : null;
 
   if (/^(python|py)(\s|$)/i.test(launchCommand)) {
-    const pythonRelative = firstExistingRelativePath(installDir, installInstructions.externalPythonCandidates);
+    const pythonRelative = firstExistingRelativePath(
+      installDir,
+      getModeCandidateList(launchMode, installInstructions, 'pythonCandidates', 'externalPythonCandidates'),
+    );
     const pythonPath = detectedPythonPath || (pythonRelative ? path.join(installDir, pythonRelative) : null);
     if (pythonPath) {
       return buildLaunchProfileFromCommand(launchCommand, {
@@ -629,9 +968,15 @@ function buildExternalLaunchProfile(manifest, installDir, detectedPath = null) {
   }
 
   const executableCandidates = [
-    detectedPath,
-    firstExistingRelativePath(installDir, installInstructions.externalExecutableCandidates),
-    firstExistingRelativePath(installDir, installInstructions.externalBatchCandidates),
+    detectedPathMatchesLaunchMode(detectedPath, launchMode, launchCommand) ? detectedPath : null,
+    firstExistingRelativePath(
+      installDir,
+      getModeCandidateList(launchMode, installInstructions, 'executableCandidates', 'externalExecutableCandidates'),
+    ),
+    firstExistingRelativePath(
+      installDir,
+      getModeCandidateList(launchMode, installInstructions, 'batchCandidates', 'externalBatchCandidates'),
+    ),
   ].filter(Boolean);
 
   for (const candidate of executableCandidates) {
@@ -667,9 +1012,129 @@ function buildExternalLaunchProfile(manifest, installDir, detectedPath = null) {
   return createFolderOnlyProfile(installDir);
 }
 
+function resolveLaunchProfileTargetPath(launchProfile) {
+  if (!launchProfile?.target) {
+    return null;
+  }
+
+  if (path.isAbsolute(launchProfile.target)) {
+    return launchProfile.target;
+  }
+
+  const baseDir = launchProfile.workingDir || '';
+  return baseDir ? path.resolve(baseDir, launchProfile.target) : null;
+}
+
+function launchProfileExistsSync(launchProfile, fallbackDir = null) {
+  if (!launchProfile) {
+    return false;
+  }
+
+  if (launchProfile.kind === 'binary' && launchProfile.executable) {
+    return fs.existsSync(launchProfile.executable);
+  }
+
+  if ((launchProfile.kind === 'python-script' || launchProfile.kind === 'python-module') && launchProfile.pythonPath) {
+    if (!isBareCommand(launchProfile.pythonPath) && !fs.existsSync(launchProfile.pythonPath)) {
+      return false;
+    }
+
+    if (launchProfile.kind === 'python-script') {
+      const targetPath = resolveLaunchProfileTargetPath(launchProfile);
+      return Boolean(targetPath && fs.existsSync(targetPath));
+    }
+
+    return true;
+  }
+
+  if (launchProfile.kind === 'embedded') {
+    if (!launchProfile.pythonPath) {
+      return Boolean(fallbackDir && fs.existsSync(fallbackDir));
+    }
+
+    return isBareCommand(launchProfile.pythonPath)
+      ? Boolean(fallbackDir && fs.existsSync(fallbackDir))
+      : fs.existsSync(launchProfile.pythonPath);
+  }
+
+  if (launchProfile.kind === 'batch' && launchProfile.command) {
+    return fs.existsSync(launchProfile.command);
+  }
+
+  return Boolean(fallbackDir && fs.existsSync(fallbackDir));
+}
+
+function applyLaunchModeMetadata(launchMode, launchProfile) {
+  return {
+    id: launchMode.id,
+    capability: launchMode.capability || launchMode.id,
+    label: launchMode.label,
+    kind: launchMode.kind,
+    interfaceMode: launchMode.interfaceMode,
+    launchUrl: launchMode.launchUrl,
+    healthUrl: launchMode.healthUrl,
+    defaultPort: launchMode.defaultPort,
+    processNames: launchMode.processNames || [],
+    profileKind: launchProfile?.kind || null,
+  };
+}
+
+function buildLaunchModeState(toolState, manifest, options = {}) {
+  const source = options.source || toolState?.source || 'managed';
+  const detectedPath = options.detectedPath || toolState?.detectedPath || null;
+  const fallbackDir = toolState?.installDir || toolState?.appDir || null;
+  const availableModes = [];
+  const declaredLaunchModes = (manifest.launchModes || []).map((launchMode) => ({
+    id: launchMode.id,
+    capability: launchMode.capability || launchMode.id,
+    label: launchMode.label,
+    kind: launchMode.kind,
+    interfaceMode: launchMode.interfaceMode,
+  }));
+  const launchModeProfiles = {};
+
+  for (const launchMode of manifest.launchModes || []) {
+    if (!launchModeCapabilityIsInstalled(toolState, launchMode)) {
+      continue;
+    }
+
+    const launchProfile = launchMode.id === 'desktop' && manifest.companionDesktop
+      ? buildCompanionDesktopLaunchProfile(toolState, manifest)
+      : source === 'external'
+        ? buildExternalLaunchProfile(manifest, toolState.installDir || toolState.appDir, detectedPath, launchMode)
+        : buildManagedLaunchProfile(toolState, manifest, launchMode);
+
+    if (!launchProfileExistsSync(launchProfile, fallbackDir)) {
+      continue;
+    }
+
+    availableModes.push(applyLaunchModeMetadata(launchMode, launchProfile));
+    launchModeProfiles[launchMode.id] = launchProfile;
+  }
+
+  const preferredLaunchMode = availableModes.some((mode) => mode.id === manifest.preferredLaunchMode)
+    ? manifest.preferredLaunchMode
+    : availableModes[0]?.id || null;
+  const launchProfile = preferredLaunchMode ? launchModeProfiles[preferredLaunchMode] : null;
+  const preferredMode = availableModes.find((mode) => mode.id === preferredLaunchMode) || null;
+
+  return {
+    activeLaunchMode: preferredLaunchMode,
+    declaredLaunchModes,
+    interfaceMode: preferredMode?.interfaceMode || manifest.interfaceMode,
+    launchModeProfiles,
+    launchModes: availableModes,
+    launchProfile,
+    launchSupported: Boolean(launchProfile),
+    preferredLaunchMode,
+  };
+}
+
 module.exports = {
+  buildLaunchModeState,
   buildExternalLaunchProfile,
   buildManagedLaunchProfile,
+  buildCompanionDesktopLaunchProfile,
   buildLaunchProfileFromCommand,
   createFolderOnlyProfile,
   firstExistingRelativePath,

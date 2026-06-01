@@ -18,9 +18,43 @@ function installPlanText(manifest) {
 }
 
 function installButtonLabel(manifest) {
-  return manifest?.installContract?.lifecycleMode === 'official-installer' ? 'Official Install' : 'Install';
+  return manifest?.installContract?.lifecycleMode === 'official-installer' ? 'Install Desktop App' : 'Install';
 }
-function StoreCard({ manifest, compatibility, progress, busy, onInstall }) {
+
+function installCapabilities(manifest) {
+  return Array.isArray(manifest?.installCapabilities) && manifest.installCapabilities.length
+    ? manifest.installCapabilities
+    : [{ id: 'default', installLabel: installButtonLabel(manifest), installedLabel: 'Installed' }];
+}
+
+function capabilityInstalled(tool, capabilityId) {
+  if (!tool) {
+    return false;
+  }
+
+  const capability = String(capabilityId || 'webui').trim().toLowerCase();
+  if (capability === 'default') {
+    return Boolean(tool);
+  }
+
+  if (tool.installedCapabilities && Object.prototype.hasOwnProperty.call(tool.installedCapabilities, capability)) {
+    return Boolean(tool.installedCapabilities[capability]);
+  }
+
+  if (capability === 'desktop') {
+    return Boolean(tool.desktopCompanion?.installed || (tool.launchModes || []).some((mode) => mode.id === 'desktop'));
+  }
+
+  if (capability === 'webui') {
+    return Boolean(tool.source === 'managed' || (tool.launchModes || []).some((mode) => mode.id === 'webui'));
+  }
+
+  return true;
+}
+
+function StoreCard({ manifest, compatibility, progress, busy, busyMap, installedTool, onInstall }) {
+  const capabilities = installCapabilities(manifest);
+  const hasCapabilityChoices = capabilities.length > 1;
   return (
     <article className="store-card h-full">
       <div className="flex h-full min-h-0 flex-col gap-2 overflow-hidden">
@@ -37,9 +71,25 @@ function StoreCard({ manifest, compatibility, progress, busy, onInstall }) {
             </div>
           </div>
 
-          <button className="primary-button compact-card-button shrink-0" disabled={busy} onClick={() => onInstall(manifest.id)} type="button">
-            {busy ? 'Installing...' : installButtonLabel(manifest)}
-          </button>
+          <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
+            {capabilities.map((capability) => {
+              const installed = capabilityInstalled(installedTool, capability.id);
+              const capabilityBusy = hasCapabilityChoices
+                ? Boolean(busyMap?.[`install:${manifest.id}:${capability.id}`])
+                : busy;
+              return (
+                <button
+                  key={capability.id}
+                  className={installed ? 'ghost-button compact-card-button' : 'primary-button compact-card-button'}
+                  disabled={installed || capabilityBusy}
+                  onClick={() => onInstall(manifest.id, capability.id)}
+                  type="button"
+                >
+                  {capabilityBusy ? 'Installing...' : installed ? capability.installedLabel || 'Installed' : capability.installLabel || installButtonLabel(manifest)}
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         <div className="flex flex-wrap gap-1.5 overflow-hidden">
@@ -82,8 +132,10 @@ function StoreCard({ manifest, compatibility, progress, busy, onInstall }) {
 function areStoreCardPropsEqual(prevProps, nextProps) {
   return (
     prevProps.manifest === nextProps.manifest &&
+    prevProps.installedTool === nextProps.installedTool &&
     prevProps.progress === nextProps.progress &&
     prevProps.busy === nextProps.busy &&
+    prevProps.busyMap === nextProps.busyMap &&
     prevProps.compatibility?.label === nextProps.compatibility?.label &&
     prevProps.compatibility?.message === nextProps.compatibility?.message &&
     prevProps.compatibility?.tone === nextProps.compatibility?.tone

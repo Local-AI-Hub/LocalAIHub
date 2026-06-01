@@ -17,6 +17,7 @@
     "build": "npm run build:ui && electron-builder",
     "sign:manifest": "node scripts/sign-tools-manifest.js",
     "verify:manifest": "node scripts/sign-tools-manifest.js --verify",
+    "verify:launch-modes": "node scripts/verify-launch-modes.js",
     "verify:asset-libraries": "node scripts/verify-asset-library-manager.js",
     "preview": "vite preview",
     "remediate:lifecycle": "node scripts/remediate-local-ai-hub.js",

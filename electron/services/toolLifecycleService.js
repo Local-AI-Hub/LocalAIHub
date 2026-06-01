@@ -188,7 +188,7 @@ function getToolActionSemantics(toolState, manifest, options = {}) {
 
   return {
     installKind,
-    installLabel: installKind === 'official-install' ? 'Official Install' : 'Install',
+    installLabel: installKind === 'official-install' ? 'Install Desktop App' : 'Install',
     installedByLocalAIHub,
     lifecycleClass,
     ownsInstallFiles: uninstallKind !== 'remove-from-library',

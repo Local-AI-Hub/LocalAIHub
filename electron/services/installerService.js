@@ -11,12 +11,13 @@ const { getAppPaths, humanizeError, normalizeOptionalDirectoryPath, readConfig, 
 const { verifyDownloadedFileIntegrity } = require('./downloadIntegrityService');
 const { compareVersions, resolvePythonCommand, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
+const { detectHardwareSnapshot } = require('./hardwareService');
 const { detectPythonRequirement, describePythonRequirement } = require('./pythonRequirementService');
 const { ensureManagedPythonRuntime } = require('./pythonRuntimeService');
 const { applyRepairCleanup, getDiskPreflight, inspectRepairCleanup, preflightPathRemoval, removePathWithRetries } = require('./storageMaintenanceService');
 const { syncDiscoveredTools } = require('./toolDiscoveryService');
 const { getCachedToolUpdateEntry, refreshInstalledToolUpdates } = require('./toolUpdateService');
-const { buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
+const { buildLaunchModeState, buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
 const { INSTALL_DESTINATION_CONTROL, getToolActionSemantics, isDirectManagedTool, isOfficialInstallerTool, normalizeToolLifecycle } = require('./toolLifecycleService');
 const {
   enrichToolWithWindowsUninstall,
@@ -38,6 +39,45 @@ const INSTALLER_MATERIALIZATION_POLL_MS = 1000;
 const GUIDED_INSTALLER_LAUNCH_SETTLE_MS = 1500;
 const OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS = 45000;
 const OFFICIAL_UNINSTALL_SETTLE_POLL_MS = 1000;
+const MANAGED_CUDA_PYTORCH_INSTALL_TOOL_IDS = new Set(['comfyui']);
+const PYTORCH_CUDA_INSTALL_BUILDS = [
+  {
+    channel: 'cu126',
+    label: 'CUDA 12.6',
+    minCudaVersion: [12, 6],
+    torch: '2.6.0',
+    torchvision: '0.21.0',
+    torchaudio: '2.6.0',
+    indexUrl: 'https://download.pytorch.org/whl/cu126',
+  },
+  {
+    channel: 'cu124',
+    label: 'CUDA 12.4',
+    minCudaVersion: [12, 4],
+    torch: '2.6.0',
+    torchvision: '0.21.0',
+    torchaudio: '2.6.0',
+    indexUrl: 'https://download.pytorch.org/whl/cu124',
+  },
+  {
+    channel: 'cu121',
+    label: 'CUDA 12.1',
+    minCudaVersion: [12, 1],
+    torch: '2.5.1',
+    torchvision: '0.20.1',
+    torchaudio: '2.5.1',
+    indexUrl: 'https://download.pytorch.org/whl/cu121',
+  },
+  {
+    channel: 'cu118',
+    label: 'CUDA 11.8',
+    minCudaVersion: [11, 8],
+    torch: '2.6.0',
+    torchvision: '0.21.0',
+    torchaudio: '2.6.0',
+    indexUrl: 'https://download.pytorch.org/whl/cu118',
+  },
+];
 const VERSION_PATTERN = /v?(\d+(?:\.\d+){1,3})/i;
 const activeToolInstallOperations = new Map();
 
@@ -298,11 +338,15 @@ function buildRepairOutcomeMessage(toolName, notes = []) {
 async function getToolInstallPreflight(toolRequest) {
   const payload = typeof toolRequest === 'string' ? { toolId: toolRequest } : toolRequest || {};
   const toolId = String(payload.toolId || '').trim().toLowerCase();
+  const capability = String(payload.capability || payload.installCapability || 'webui').trim().toLowerCase();
   await initializeToolRegistry();
-  const manifest = getToolManifest(toolId);
-  if (!manifest) {
+  const baseManifest = getToolManifest(toolId);
+  if (!baseManifest) {
     throw new Error('Local AI Hub does not recognize that tool.');
   }
+  const manifest = capability === 'desktop' && baseManifest.companionDesktop
+    ? baseManifest.companionDesktop
+    : baseManifest;
 
   const installRoot = await resolvePreferredInstallRoot(payload.installRoot || null);
   const logger = createLogger('installer', {
@@ -325,6 +369,7 @@ async function getToolInstallPreflight(toolRequest) {
     sizeKnown: estimate.sizeKnown,
     targetPath: installRoot,
     toolId,
+    capability: manifest === baseManifest ? 'webui' : 'desktop',
     toolName: manifest.name,
   };
 }
@@ -713,6 +758,148 @@ async function resolveInstallPreflightContext(manifest, logger) {
   }
 
   return { env };
+}
+
+function parseVersionParts(value) {
+  return String(value || '')
+    .split('.')
+    .map((part) => Number.parseInt(part.replace(/[^0-9].*$/, ''), 10))
+    .filter((part) => Number.isFinite(part));
+}
+
+function isLegacyNvidiaModel(model) {
+  return /\b(gtx|tesla p|quadro p)\b/i.test(String(model || '')) && !/\brtx\b/i.test(String(model || ''));
+}
+
+function selectManagedCudaPyTorchBuild(hardware) {
+  if (!hardware?.nvidiaSmiAvailable || !/nvidia/i.test(`${hardware.gpuVendor || ''} ${hardware.gpuModel || ''}`)) {
+    return null;
+  }
+
+  const cudaVersion = parseVersionParts(hardware.nvidiaCudaVersion);
+  if (!cudaVersion.length) {
+    return null;
+  }
+
+  const candidates = PYTORCH_CUDA_INSTALL_BUILDS.filter((build) => compareVersions(cudaVersion, build.minCudaVersion) >= 0);
+  if (!candidates.length) {
+    return null;
+  }
+
+  return [...candidates].sort((left, right) => {
+    const comparison = compareVersions(left.minCudaVersion, right.minCudaVersion);
+    return isLegacyNvidiaModel(hardware.gpuModel) ? comparison : comparison * -1;
+  })[0];
+}
+
+async function removeStaleManagedTorchArtifacts(toolState, logger) {
+  const sitePackagesDir = path.join(toolState.venvDir || '', 'Lib', 'site-packages');
+  if (!(await fs.pathExists(sitePackagesDir))) {
+    return;
+  }
+
+  const entries = await fs.readdir(sitePackagesDir, { withFileTypes: true });
+  const staleEntries = entries
+    .filter((entry) => entry.name.startsWith('~') && /orch/i.test(entry.name))
+    .map((entry) => path.join(sitePackagesDir, entry.name));
+
+  for (const targetPath of staleEntries) {
+    await fs.remove(targetPath).catch(() => null);
+    await logger.info('Removed a stale PyTorch package artifact before installing CUDA wheels.', {
+      targetPath,
+    });
+  }
+}
+
+async function verifyManagedCudaPyTorch(toolState, build, logger) {
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  const verificationSnippet = [
+    'import json',
+    'info = {}',
+    'import torch',
+    "info['torchVersion'] = getattr(torch, '__version__', 'unknown')",
+    "info['cudaAvailable'] = bool(torch.cuda.is_available())",
+    "info['cudaVersion'] = getattr(torch.version, 'cuda', None)",
+    "info['deviceName'] = torch.cuda.get_device_name(0) if info['cudaAvailable'] else None",
+    'print(json.dumps(info))',
+  ].join('; ');
+  const result = await runCommand(pythonPath, ['-c', verificationSnippet], {
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+    errorMessage: `Local AI Hub could not verify ${toolState.name || 'this tool'}'s CUDA PyTorch runtime.`,
+  });
+  const payload = String(result.stdout || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .reverse()
+    .find((line) => line.startsWith('{'));
+  if (!payload) {
+    throw new Error('Local AI Hub could not read the PyTorch CUDA verification result.');
+  }
+
+  const verification = JSON.parse(payload);
+  if (!verification.cudaAvailable) {
+    throw new Error(`PyTorch still cannot see CUDA after installing the ${build.label} build.`);
+  }
+
+  await logger.info('Managed CUDA PyTorch verification succeeded.', verification);
+  return verification;
+}
+
+async function ensureManagedCudaPyTorch(toolState, manifest, logger, onProgress) {
+  if (!MANAGED_CUDA_PYTORCH_INSTALL_TOOL_IDS.has(manifest?.id)) {
+    return null;
+  }
+
+  const hardware = await detectHardwareSnapshot().catch(() => null);
+  const build = selectManagedCudaPyTorchBuild(hardware);
+  if (!build) {
+    await logger.warn('Skipping managed CUDA PyTorch install because this PC does not expose a supported NVIDIA CUDA runtime.', {
+      gpuModel: hardware?.gpuModel || null,
+      gpuVendor: hardware?.gpuVendor || null,
+      nvidiaCudaVersion: hardware?.nvidiaCudaVersion || null,
+      nvidiaSmiAvailable: Boolean(hardware?.nvidiaSmiAvailable),
+    });
+    return null;
+  }
+
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  await advanceStep(logger, onProgress, {
+    toolId: toolState.id,
+    percent: 91,
+    stage: 'dependencies',
+    message: `Installing NVIDIA PyTorch ${build.label}.`,
+  });
+  await removeStaleManagedTorchArtifacts(toolState, logger);
+  await runCommand(
+    pythonPath,
+    [
+      '-m',
+      'pip',
+      'install',
+      '--upgrade',
+      '--force-reinstall',
+      '--no-cache-dir',
+      `torch==${build.torch}`,
+      `torchvision==${build.torchvision}`,
+      `torchaudio==${build.torchaudio}`,
+      '--index-url',
+      build.indexUrl,
+    ],
+    {
+      cwd: toolState.appDir,
+      env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+      errorMessage: `Local AI Hub could not install NVIDIA PyTorch ${build.label} for ${manifest.name}.`,
+    },
+  );
+
+  await logger.info('Managed CUDA PyTorch install finished.', {
+    build: build.channel,
+    gpuModel: hardware?.gpuModel || null,
+    indexUrl: build.indexUrl,
+  });
+  return verifyManagedCudaPyTorch(toolState, build, logger);
 }
 
 async function verifyCachedDownload(manifest, archivePath, logger) {
@@ -2257,12 +2444,20 @@ async function verifyManagedToolInstall(toolState, manifest, logger) {
   const safeToolState = ensureManagedToolStatePaths(toolState);
   await ensureChatterboxServerLaunchShim(safeToolState, manifest, logger);
   const launchProfile = buildManagedLaunchProfile(safeToolState, manifest);
+  const launchModeState = buildLaunchModeState(
+    {
+      ...safeToolState,
+      launchProfile,
+    },
+    manifest,
+    { source: 'managed' },
+  );
 
   if (!(await toolIsAvailable({
     ...safeToolState,
-    launchProfile,
+    launchProfile: launchModeState.launchProfile || launchProfile,
   }))) {
-    throw new Error(await buildManagedLauncherValidationFailureMessage(safeToolState, manifest, launchProfile));
+    throw new Error(await buildManagedLauncherValidationFailureMessage(safeToolState, manifest, launchModeState.launchProfile || launchProfile));
   }
 
   if (getToolRuntime(manifest) === 'python' && safeToolState.venvDir) {
@@ -2272,6 +2467,7 @@ async function verifyManagedToolInstall(toolState, manifest, logger) {
     }
 
     await ensureToolRuntimeAssets(safeToolState, manifest, logger);
+    await ensureManagedCudaPyTorch(safeToolState, manifest, logger, null);
 
     await runCommand(pythonPath, ['-m', 'pip', 'check'], {
       cwd: safeToolState.appDir,
@@ -2288,7 +2484,8 @@ async function verifyManagedToolInstall(toolState, manifest, logger) {
 
   return {
     ...safeToolState,
-    launchProfile,
+    ...launchModeState,
+    launchProfile: launchModeState.launchProfile || launchProfile,
   };
 }
 
@@ -2376,7 +2573,11 @@ function createManagedToolState(manifest, installDir, appDir, venvDir, archivePa
     managedPythonInstallDir: managedRuntime?.installDir || null,
   }, manifest);
 
-  toolState.launchProfile = buildManagedLaunchProfile(toolState, manifest);
+  const launchModeState = buildLaunchModeState(toolState, manifest, { source: 'managed' });
+  Object.assign(toolState, launchModeState);
+  if (!toolState.launchProfile) {
+    toolState.launchProfile = buildManagedLaunchProfile(toolState, manifest);
+  }
   if (toolState.launchProfile?.kind === 'binary') {
     toolState.executablePath = toolState.launchProfile.executable;
   }
@@ -3276,6 +3477,146 @@ function buildGuidedInstallerHandoffMessage(manifest) {
   return `Local AI Hub launched ${manifest.name}'s official installer. Finish setup there and Local AI Hub will detect it automatically when setup closes.`;
 }
 
+async function persistCompanionDesktopDetection(baseManifest, companionManifest, managedPaths, logger, options = {}) {
+  const discoveredTools = await syncDiscoveredTools({ force: true }).catch(() => ({}));
+  const detectedTool = discoveredTools[baseManifest.id];
+  if (!detectedTool?.desktopCompanion?.installed) {
+    await logger.warn('The companion desktop installer closed without leaving a detectable desktop app.', {
+      baseToolId: baseManifest.id,
+      detectionPaths: companionManifest.detectionPaths || [],
+    });
+    await advanceStep(logger, options.onProgress, {
+      toolId: baseManifest.id,
+      percent: 100,
+      stage: 'complete',
+      message: `${companionManifest.name} was not detected. Use Install Desktop App when setup is finished.`,
+    });
+    return null;
+  }
+
+  const trackedToolState = normalizeToolLifecycle({
+    ...detectedTool,
+    desktopCompanion: {
+      ...detectedTool.desktopCompanion,
+      downloadCachePath: managedPaths.archivePath,
+      installedByLocalAIHub: true,
+      source: 'official-installer',
+    },
+  }, baseManifest);
+  await upsertTool(trackedToolState);
+  await logger.info('Companion desktop installer detection succeeded after setup closed.', {
+    baseToolId: baseManifest.id,
+    detectedPath: trackedToolState.desktopCompanion?.displayPath || trackedToolState.desktopCompanion?.detectedPath || null,
+  });
+  await advanceStep(logger, options.onProgress, {
+    toolId: baseManifest.id,
+    percent: 100,
+    stage: 'complete',
+    message: `${companionManifest.name} is ready.`,
+  });
+  if (typeof options.onCompleted === 'function') {
+    await options.onCompleted({
+      manifest: baseManifest,
+      toolState: trackedToolState,
+    });
+  }
+  return trackedToolState;
+}
+
+function trackCompanionInstallerHandoff(baseManifest, companionManifest, managedPaths, installerRun, logger, options = {}) {
+  void installerRun.completion
+    .then(async (result) => {
+      await logger.info('The companion desktop installer process exited.', {
+        archivePath: managedPaths.archivePath,
+        exitCode: result?.code ?? 0,
+        exitSignal: result?.signal || null,
+        launchMethod: installerRun.launchMethod,
+        pid: installerRun.pid,
+      });
+      await persistCompanionDesktopDetection(baseManifest, companionManifest, managedPaths, logger, options);
+    })
+    .catch(async (error) => {
+      await logger.warn('The companion desktop installer process exited with an error.', {
+        archivePath: managedPaths.archivePath,
+        error,
+        launchMethod: installerRun.launchMethod,
+        pid: installerRun.pid,
+      });
+    });
+}
+
+async function installCompanionDesktopTool(baseManifest, options, logger) {
+  const companionManifest = baseManifest.companionDesktop;
+  if (!companionManifest) {
+    throw new Error(`${baseManifest.name} does not have an official desktop companion installer.`);
+  }
+
+  const managedPaths = buildManagedPaths(companionManifest, { installRoot: options.installRoot });
+  const progress = (payload) => {
+    if (typeof options.onProgress === 'function') {
+      options.onProgress({
+        ...payload,
+        toolId: baseManifest.id,
+      });
+    }
+  };
+
+  await logger.info('Companion desktop installer requested.', {
+    baseToolId: baseManifest.id,
+    companionToolId: companionManifest.id,
+    archivePath: managedPaths.archivePath,
+  });
+
+  await advanceStep(logger, progress, {
+    toolId: baseManifest.id,
+    percent: 5,
+    stage: 'preparing',
+    message: `Preparing ${companionManifest.name}.`,
+  });
+  await ensureCachedDownload(companionManifest, managedPaths.archivePath, logger, progress, baseManifest.id);
+  await advanceStep(logger, progress, {
+    toolId: baseManifest.id,
+    percent: 72,
+    stage: 'installing',
+    message: `Finish the official ${companionManifest.name} installer. Local AI Hub will detect it after setup finishes.`,
+  });
+
+  const installerRun = await runInstallerExecutableFile(
+    managedPaths.archivePath,
+    resolveInstallerArgs(companionManifest, managedPaths.installDir, managedPaths.appDir),
+    logger,
+    `Local AI Hub could not run the ${companionManifest.name} installer.`,
+    { windowsHide: false },
+  );
+  const trackedLaunch = createTrackedPromise(installerRun.completion);
+  await sleep(GUIDED_INSTALLER_LAUNCH_SETTLE_MS);
+
+  if (trackedLaunch.settled && trackedLaunch.error) {
+    const launchError = new Error(`Local AI Hub tried to open ${companionManifest.name}'s official installer, but it exited before the setup window stayed open.`);
+    launchError.cause = trackedLaunch.error;
+    throw launchError;
+  }
+
+  if (trackedLaunch.settled && Number.isInteger(trackedLaunch.value?.code) && trackedLaunch.value.code > 0) {
+    const launchError = new Error(`Local AI Hub tried to open ${companionManifest.name}'s official installer, but it exited immediately with code ${trackedLaunch.value.code}.`);
+    launchError.code = trackedLaunch.value.code;
+    throw launchError;
+  }
+
+  await setToolIgnored(baseManifest.id, false);
+  trackCompanionInstallerHandoff(baseManifest, companionManifest, managedPaths, installerRun, logger, {
+    onCompleted: options.onGuidedInstallerComplete,
+    onProgress: progress,
+  });
+
+  return {
+    handoffPending: true,
+    id: baseManifest.id,
+    installActionMessage: buildGuidedInstallerHandoffMessage(companionManifest),
+    name: baseManifest.name,
+  };
+}
+
 function trackGuidedInstallerHandoff(manifest, managedPaths, installerRun, logger, options = {}) {
   void installerRun.completion
     .then(async (result) => {
@@ -3558,6 +3899,7 @@ async function installToolUnlocked(toolId, options = {}) {
     toolId,
     toolName: manifest.name,
   });
+  const capability = String(options.capability || options.installCapability || 'webui').trim().toLowerCase();
   const installRoot = await resolvePreferredInstallRoot(options.installRoot || null);
   const managedPaths = buildManagedPaths(manifest, { installRoot });
   let existingTool = null;
@@ -3565,6 +3907,13 @@ async function installToolUnlocked(toolId, options = {}) {
 
   try {
     await setToolIgnored(toolId, false);
+    if (capability === 'desktop' && manifest.companionDesktop) {
+      return installCompanionDesktopTool(manifest, {
+        ...options,
+        installRoot,
+      }, logger);
+    }
+
     const discoveredTools = await syncDiscoveredTools({ force: true });
     existingTool = discoveredTools[toolId];
     rollbackManagedInstallOnFailure =
@@ -3787,6 +4136,7 @@ async function repairToolInstallationUnlocked(toolState, options = {}) {
     const installRoot = resolveStoredInstallRoot(toolState);
     const managedPaths = buildManagedPaths(manifest, { installRoot });
     const installKind = manifest.installInstructions.kind || 'zip';
+    const capability = String(options.capability || options.installCapability || 'webui').trim().toLowerCase();
     const lifecycleManaged = isDirectManagedTool(toolState, manifest);
     const usesOfficialInstaller = isOfficialInstallerTool(toolState, manifest);
     if (toolState.source === 'managed') {
@@ -3799,6 +4149,46 @@ async function repairToolInstallationUnlocked(toolState, options = {}) {
       installRoot,
       lifecycleMode: toolState.lifecycleMode || null,
     });
+
+    if (capability === 'desktop' && manifest.companionDesktop) {
+      const companionManifest = manifest.companionDesktop;
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 15,
+        stage: 'checking',
+        message: `Checking for ${companionManifest.name}.`,
+      });
+
+      const discoveredTools = await syncDiscoveredTools({ force: true });
+      const detectedTool = discoveredTools[toolState.id];
+      if (detectedTool?.desktopCompanion?.installed) {
+        const repairedTool = normalizeToolLifecycle({
+          ...detectedTool,
+          lastError: null,
+          lastRepairMessage: `${companionManifest.name} was detected and is ready.`,
+          status: detectedTool.status === 'error' || detectedTool.status === 'starting' ? 'stopped' : detectedTool.status || 'stopped',
+        }, manifest);
+        await upsertTool(repairedTool);
+        await advanceStep(logger, options.onProgress, {
+          toolId: toolState.id,
+          percent: 100,
+          stage: 'complete',
+          message: repairedTool.lastRepairMessage,
+        });
+        return repairedTool;
+      }
+
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 40,
+        stage: 'repairing',
+        message: `Opening the ${companionManifest.name} installer again.`,
+      });
+      return installCompanionDesktopTool(manifest, {
+        ...options,
+        installRoot,
+      }, logger);
+    }
 
     await advanceStep(logger, options.onProgress, {
       toolId: toolState.id,
@@ -4062,7 +4452,10 @@ async function repairToolInstallationUnlocked(toolState, options = {}) {
       status: 'stopped',
     }, manifest);
 
-    updatedState.launchProfile = buildManagedLaunchProfile(updatedState, manifest);
+    Object.assign(updatedState, buildLaunchModeState(updatedState, manifest, { source: 'managed' }));
+    if (!updatedState.launchProfile) {
+      updatedState.launchProfile = buildManagedLaunchProfile(updatedState, manifest);
+    }
     const verifiedUpdatedState = await verifyManagedToolInstall(updatedState, manifest, logger);
     await upsertTool(verifiedUpdatedState);
 
@@ -4331,7 +4724,7 @@ async function getPostUninstallDetection(toolState, matchesTrackedExternalInstal
   };
 }
 
-async function uninstallTool(toolState) {
+async function uninstallTool(toolState, options = {}) {
   await initializeToolRegistry();
   const manifest = getToolManifest(toolState?.id);
   if (!manifest) {
@@ -4341,6 +4734,36 @@ async function uninstallTool(toolState) {
   let safeToolState = normalizeToolLifecycle(toolState, manifest);
   if (safeToolState.source === 'managed') {
     safeToolState = ensureManagedToolStatePaths(safeToolState);
+  }
+
+  const capability = String(options.capability || options.installCapability || '').trim().toLowerCase();
+  const webuiInstalled = Boolean(safeToolState.installedCapabilities?.webui);
+  const desktopInstalled = Boolean(safeToolState.installedCapabilities?.desktop || safeToolState.desktopCompanion?.installed);
+  if (manifest.companionDesktop && capability) {
+    const desktopRoot = normalizeOptionalDirectoryPath(
+      safeToolState.desktopCompanion?.installDir ||
+      safeToolState.desktopCompanion?.appDir ||
+      safeToolState.desktopCompanion?.detectedPath ||
+      '',
+    );
+    const webuiRoot = normalizeOptionalDirectoryPath(safeToolState.installDir || safeToolState.appDir || '');
+    const capabilitiesSharePath = Boolean(
+      desktopRoot &&
+      webuiRoot &&
+      (isPathInside(webuiRoot, desktopRoot) || isPathInside(desktopRoot, webuiRoot)),
+    );
+
+    if (capability === 'desktop' && desktopInstalled && webuiInstalled) {
+      if (capabilitiesSharePath) {
+        throw new Error(`${manifest.name}'s Desktop App is installed in the same folder as its WebUI files. Local AI Hub will not run a desktop uninstaller that could remove the WebUI too. Use Windows Apps & Features or reinstall the Desktop App to its own folder first.`);
+      }
+
+      throw new Error(`${manifest.name}'s Desktop App uses its official Windows uninstaller. Capability-specific desktop uninstall is not automated in this build, so Local AI Hub will not risk removing the WebUI by mistake.`);
+    }
+
+    if (capability === 'webui' && desktopInstalled && webuiInstalled && capabilitiesSharePath) {
+      throw new Error(`${manifest.name}'s WebUI and Desktop App share the same folder. Local AI Hub will not uninstall one capability when that could remove the other too.`);
+    }
   }
 
   const actionSemantics = getToolActionSemantics(safeToolState, manifest, {

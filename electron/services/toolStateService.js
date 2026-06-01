@@ -6,26 +6,38 @@ const { resolveManagedToolPaths } = require('./pathSafetyService');
 const { resolveToolStatus } = require('./processService');
 const { listSnapshots } = require('./snapshotService');
 const { syncDiscoveredTools } = require('./toolDiscoveryService');
-const { buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
+const { buildLaunchModeState, buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
 const { hydrateKoboldCppToolState } = require('./koboldCppService');
 const { allowsLocalSnapshots, normalizeToolLifecycle } = require('./toolLifecycleService');
 
 function refreshManagedLaunchState(tool, manifest) {
-  if (!manifest?.id || tool?.source !== 'managed') {
+  if (!manifest?.id || (tool?.source !== 'managed' && !tool?.desktopCompanion?.installed)) {
     return tool;
   }
 
-  const launchProfile = buildManagedLaunchProfile(tool, manifest);
+  const launchProfile = tool?.source === 'managed' ? buildManagedLaunchProfile(tool, manifest) : null;
+  const launchModeState = buildLaunchModeState(
+    {
+      ...tool,
+      launchProfile,
+    },
+    manifest,
+    {
+      detectedPath: tool?.detectedPath || null,
+      source: tool?.source || 'managed',
+    },
+  );
   return {
     ...tool,
+    ...launchModeState,
     configTargets: manifest.installInstructions?.configTargets || tool.configTargets || [],
     executablePath: launchProfile?.kind === 'binary' ? launchProfile.executable : tool.executablePath || null,
     healthUrl: manifest.healthUrl,
-    interfaceMode: manifest.interfaceMode || tool.interfaceMode,
+    interfaceMode: launchModeState.interfaceMode || manifest.interfaceMode || tool.interfaceMode,
     launchCommand: manifest.launchCommand || tool.launchCommand,
-    launchProfile,
+    launchProfile: launchModeState.launchProfile || launchProfile,
     launchUrl: manifest.launchUrl,
-    processNames: manifest.processNames || tool.processNames || [],
+    processNames: manifest.processNames || launchModeState.launchModes?.flatMap((mode) => mode.processNames || []) || tool.processNames || [],
     startupTimeoutMs: manifest.startupTimeoutMs || null,
   };
 }

@@ -34,6 +34,59 @@ function embeddedActionLabel(tool) {
   return 'Open workspace';
 }
 
+function availableLaunchModes(tool) {
+  return (Array.isArray(tool?.launchModes) ? tool.launchModes : []).filter((mode) => mode?.id && mode?.profileKind);
+}
+
+function preferredLaunchMode(tool, modes = availableLaunchModes(tool)) {
+  return modes.find((mode) => mode.id === tool?.preferredLaunchMode) || modes[0] || null;
+}
+
+function launchModeActionLabel(mode) {
+  if (!mode) {
+    return 'Launch';
+  }
+
+  if (mode.id === 'webui') {
+    return 'Launch WebUI';
+  }
+
+  if (mode.id === 'desktop') {
+    return 'Launch Desktop App';
+  }
+
+  if (mode.id === 'service') {
+    return 'Launch Service';
+  }
+
+  if (mode.id === 'cli') {
+    return 'Launch CLI';
+  }
+
+  return `Launch ${mode.label || 'Interface'}`;
+}
+
+function singleLaunchActionLabel(tool, mode) {
+  if (mode) {
+    return launchModeActionLabel(mode);
+  }
+
+  const interfaceMode = String(tool?.interfaceMode || '').trim().toLowerCase();
+  if (interfaceMode === 'desktop-app') {
+    return 'Launch Desktop App';
+  }
+
+  if (interfaceMode === 'external-browser' || tool?.launchUrl || tool?.healthUrl) {
+    return 'Launch WebUI';
+  }
+
+  if (interfaceMode === 'embedded-chat') {
+    return 'Launch Service';
+  }
+
+  return 'Launch';
+}
+
 function lifecycleMode(tool) {
   return String(tool?.lifecycleMode || (tool?.source === 'managed' ? 'managed' : 'external'))
     .trim()
@@ -139,6 +192,61 @@ function uninstallBusyLabel(tool) {
   return 'Uninstalling...';
 }
 
+function capabilityInstalled(tool, capability) {
+  return Boolean(tool?.installedCapabilities?.[capability]);
+}
+
+function isDualCapabilityTool(tool) {
+  return Object.prototype.hasOwnProperty.call(tool?.installedCapabilities || {}, 'webui')
+    && Object.prototype.hasOwnProperty.call(tool?.installedCapabilities || {}, 'desktop');
+}
+
+function bothCapabilitiesInstalled(tool) {
+  return capabilityInstalled(tool, 'webui') && capabilityInstalled(tool, 'desktop');
+}
+
+function singleInstalledCapability(tool) {
+  if (!isDualCapabilityTool(tool) || bothCapabilitiesInstalled(tool)) {
+    return null;
+  }
+
+  if (capabilityInstalled(tool, 'desktop')) {
+    return 'desktop';
+  }
+
+  if (capabilityInstalled(tool, 'webui')) {
+    return 'webui';
+  }
+
+  return null;
+}
+
+function repairCapabilityLabel(capability) {
+  return capability === 'desktop' ? 'Repair Desktop App' : 'Repair WebUI';
+}
+
+function uninstallCapabilityLabel(capability) {
+  return capability === 'desktop' ? 'Uninstall Desktop App' : 'Uninstall WebUI';
+}
+
+function primaryUninstallLabel(tool) {
+  if (bothCapabilitiesInstalled(tool)) {
+    return 'Uninstall options';
+  }
+
+  if (isDualCapabilityTool(tool)) {
+    if (capabilityInstalled(tool, 'desktop')) {
+      return uninstallCapabilityLabel('desktop');
+    }
+
+    if (capabilityInstalled(tool, 'webui')) {
+      return uninstallCapabilityLabel('webui');
+    }
+  }
+
+  return uninstallActionLabel(tool);
+}
+
 function installNote(tool) {
   const notes = [];
   const mode = lifecycleMode(tool);
@@ -195,9 +303,52 @@ function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
     );
   }
 
+  const modes = availableLaunchModes(tool);
+  const preferredMode = preferredLaunchMode(tool, modes);
+  const launchBusy = busyMap[`launch:${tool.id}`];
+
+  if (modes.length > 1 && preferredMode) {
+    return (
+      <div className="flex items-center gap-1">
+        <button
+          className="primary-button compact-card-button"
+          disabled={launchBusy}
+          onClick={() => onLaunch(tool.id, { launchMode: preferredMode.id })}
+          title={`Preferred interface: ${preferredMode.label}`}
+          type="button"
+        >
+          {launchBusy ? 'Launching...' : launchModeActionLabel(preferredMode)}
+        </button>
+        <details className="relative">
+          <summary className="ghost-button compact-card-button cursor-pointer list-none px-2" title="Choose launch interface">
+            v
+          </summary>
+          <div className="absolute right-0 z-20 mt-1 min-w-44 rounded-2xl border border-white/10 bg-slate-950 p-1 shadow-xl">
+            {modes.map((mode) => (
+              <button
+                key={mode.id}
+                className="w-full rounded-xl px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+                disabled={launchBusy}
+                onClick={() => onLaunch(tool.id, { launchMode: mode.id })}
+                type="button"
+              >
+                {launchModeActionLabel(mode)}
+              </button>
+            ))}
+          </div>
+        </details>
+      </div>
+    );
+  }
+
   return (
-    <button className="primary-button compact-card-button" disabled={busyMap[`launch:${tool.id}`]} onClick={() => onLaunch(tool.id)} type="button">
-      {busyMap[`launch:${tool.id}`] ? 'Launching...' : 'Launch'}
+    <button
+      className="primary-button compact-card-button"
+      disabled={launchBusy}
+      onClick={() => onLaunch(tool.id, preferredMode ? { launchMode: preferredMode.id } : undefined)}
+      type="button"
+    >
+      {launchBusy ? 'Launching...' : singleLaunchActionLabel(tool, preferredMode)}
     </button>
   );
 }
@@ -299,7 +450,11 @@ function LibraryCard({
   const hasUpdate = Boolean(updateInfo?.updateAvailable);
   const note = installNote(tool);
   const consentNote = voiceCloneConsentMessage(tool);
-  const uninstallLabel = uninstallActionLabel(tool);
+  const uninstallLabel = primaryUninstallLabel(tool);
+  const hasBothCapabilities = bothCapabilitiesInstalled(tool);
+  const singleCapability = singleInstalledCapability(tool);
+  const singleRepairBusyKey = singleCapability ? `repair:${tool.id}:${singleCapability}` : `repair:${tool.id}`;
+  const singleUninstallBusyKey = singleCapability ? `uninstall:${tool.id}:${singleCapability}` : `uninstall:${tool.id}`;
   const installSource = installSourceLabel(tool);
   const lastSeen = formatTimestamp(tool.installedAt || tool.detectedAt);
 
@@ -355,11 +510,11 @@ function LibraryCard({
           </button>
           <button
             className="ghost-button compact-card-button"
-            disabled={busyMap[`uninstall:${tool.id}`]}
-            onClick={() => onUninstall(tool)}
+            disabled={!hasBothCapabilities && busyMap[singleUninstallBusyKey]}
+            onClick={() => (hasBothCapabilities ? onToggleSettings(tool.id) : onUninstall(tool, singleCapability))}
             type="button"
           >
-            {busyMap[`uninstall:${tool.id}`] ? uninstallBusyLabel(tool) : uninstallLabel}
+            {!hasBothCapabilities && busyMap[singleUninstallBusyKey] ? uninstallBusyLabel(tool) : uninstallLabel}
           </button>
         </div>
       </div>
@@ -387,9 +542,23 @@ function LibraryCard({
               <p className="text-xs uppercase tracking-[0.22em] text-rose-200/80">Launch issue</p>
               <p className="mt-1 line-clamp-2 leading-5" title={tool.lastError}>{tool.lastError}</p>
             </div>
-            {canRepair ? (
-              <button className="ghost-button compact-card-button" disabled={busyMap[`repair:${tool.id}`]} onClick={() => onRepair(tool.id)} type="button">
-                {busyMap[`repair:${tool.id}`] ? 'Repairing...' : 'Repair'}
+            {canRepair && hasBothCapabilities ? (
+              <div className="flex flex-wrap gap-1.5">
+                {['webui', 'desktop'].map((capability) => (
+                  <button
+                    className="ghost-button compact-card-button"
+                    disabled={busyMap[`repair:${tool.id}:${capability}`]}
+                    key={capability}
+                    onClick={() => onRepair(capability)}
+                    type="button"
+                  >
+                    {busyMap[`repair:${tool.id}:${capability}`] ? 'Repairing...' : repairCapabilityLabel(capability)}
+                  </button>
+                ))}
+              </div>
+            ) : canRepair ? (
+              <button className="ghost-button compact-card-button" disabled={busyMap[singleRepairBusyKey]} onClick={() => onRepair(singleCapability)} type="button">
+                {busyMap[singleRepairBusyKey] ? 'Repairing...' : singleCapability ? repairCapabilityLabel(singleCapability) : 'Repair'}
               </button>
             ) : null}
           </div>
@@ -428,10 +597,39 @@ function LibraryCard({
                   {busyMap[`update:${tool.id}`] ? 'Updating...' : `Update to ${updateInfo.availableVersion || 'latest'}`}
                 </button>
               ) : null}
-              {canRepair ? (
-                <button className="ghost-button w-full justify-center" disabled={busyMap[`repair:${tool.id}`]} onClick={() => onRepair(tool.id)} type="button">
-                  {busyMap[`repair:${tool.id}`] ? 'Repairing...' : 'Repair install'}
+              {canRepair && hasBothCapabilities ? (
+                <>
+                  {['webui', 'desktop'].map((capability) => (
+                    <button
+                      className="ghost-button w-full justify-center"
+                      disabled={busyMap[`repair:${tool.id}:${capability}`]}
+                      key={`repair-${capability}`}
+                      onClick={() => onRepair(capability)}
+                      type="button"
+                    >
+                      {busyMap[`repair:${tool.id}:${capability}`] ? 'Repairing...' : repairCapabilityLabel(capability)}
+                    </button>
+                  ))}
+                </>
+              ) : canRepair ? (
+                <button className="ghost-button w-full justify-center" disabled={busyMap[singleRepairBusyKey]} onClick={() => onRepair(singleCapability)} type="button">
+                  {busyMap[singleRepairBusyKey] ? 'Repairing...' : singleCapability ? repairCapabilityLabel(singleCapability) : 'Repair install'}
                 </button>
+              ) : null}
+              {hasBothCapabilities ? (
+                <>
+                  {['webui', 'desktop'].map((capability) => (
+                    <button
+                      className="ghost-button w-full justify-center"
+                      disabled={busyMap[`uninstall:${tool.id}:${capability}`]}
+                      key={`uninstall-${capability}`}
+                      onClick={() => onUninstall(tool, capability)}
+                      type="button"
+                    >
+                      {busyMap[`uninstall:${tool.id}:${capability}`] ? uninstallBusyLabel(tool) : uninstallCapabilityLabel(capability)}
+                    </button>
+                  ))}
+                </>
               ) : null}
             </div>
             {hasUpdate ? (

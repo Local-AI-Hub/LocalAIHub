@@ -101,6 +101,52 @@ function buildLowDiskConfirmationMessage(subject, preflight) {
   return `${subject} may leave ${preflight.mount} very low on free space, and Local AI Hub could not confirm the file size first. Continue?`;
 }
 
+function getInstallCapabilities(manifest) {
+  return Array.isArray(manifest?.installCapabilities) && manifest.installCapabilities.length
+    ? manifest.installCapabilities
+    : [
+        {
+          id: 'default',
+          label: manifest?.installContract?.lifecycleMode === 'official-installer' ? 'Desktop App' : 'WebUI',
+          installLabel: manifest?.installContract?.lifecycleMode === 'official-installer' ? 'Install Desktop App' : 'Install',
+          installedLabel: 'Installed',
+        },
+      ];
+}
+
+function capabilityIsInstalled(tool, capabilityId) {
+  if (!tool) {
+    return false;
+  }
+
+  const capability = String(capabilityId || 'webui').trim().toLowerCase();
+  if (capability === 'default') {
+    return Boolean(tool);
+  }
+
+  if (tool.installedCapabilities && Object.prototype.hasOwnProperty.call(tool.installedCapabilities, capability)) {
+    return Boolean(tool.installedCapabilities[capability]);
+  }
+
+  if (capability === 'desktop') {
+    return Boolean(tool.desktopCompanion?.installed || (tool.launchModes || []).some((mode) => mode.id === 'desktop'));
+  }
+
+  if (capability === 'webui') {
+    return Boolean(tool.source === 'managed' || (tool.launchModes || []).some((mode) => mode.id === 'webui'));
+  }
+
+  return true;
+}
+
+function allInstallCapabilitiesInstalled(manifest, tool) {
+  if (!Array.isArray(manifest?.installCapabilities) || !manifest.installCapabilities.length) {
+    return Boolean(tool);
+  }
+
+  return getInstallCapabilities(manifest).every((capability) => capabilityIsInstalled(tool, capability.id));
+}
+
 function Toast({ toast, onDismiss }) {
   const toneClass =
     toast.tone === 'error'
@@ -345,9 +391,8 @@ export default function App() {
   }, [appState.manifests]);
 
   const availableStoreTools = useMemo(() => {
-    const installedToolIds = new Set(tools.map((tool) => tool.id));
-    return (appState.manifests || []).filter((manifest) => !installedToolIds.has(manifest.id));
-  }, [appState.manifests, tools]);
+    return (appState.manifests || []).filter((manifest) => !allInstallCapabilitiesInstalled(manifest, toolMap[manifest.id]));
+  }, [appState.manifests, toolMap]);
 
   const storeTools = useMemo(() => {
     return availableStoreTools.filter((manifest) => {
@@ -578,7 +623,7 @@ export default function App() {
       return false;
     }
 
-    if (toolId === 'koboldcpp' && !options.skipKoboldSetup) {
+    if (toolId === 'koboldcpp' && options.launchMode !== 'desktop' && !options.skipKoboldSetup) {
       const liveSetupResult = await window.localAIHub.getKoboldCppSetup({ toolId });
       if (!liveSetupResult?.ok) {
         pushToast(liveSetupResult?.message || 'Local AI Hub could not load KoboldCpp setup.', 'error');
@@ -597,7 +642,11 @@ export default function App() {
       }
     }
 
-    return runAction(`launch:${toolId}`, () => window.localAIHub.launchTool(toolId));
+    return runAction(`launch:${toolId}`, () =>
+      window.localAIHub.launchTool(
+        options.launchMode ? { toolId, launchMode: options.launchMode } : toolId,
+      ),
+    );
   }
 
   function toggleLibraryToolSettings(toolId) {
@@ -617,7 +666,7 @@ export default function App() {
       return null;
     }
 
-    return key.split(':').slice(1).join(':');
+    return key.split(':')[1] || null;
   }
 
   function pushToast(message, tone = 'success', options = {}) {
@@ -1217,8 +1266,14 @@ export default function App() {
     await runAction(`update:${toolId}`, () => window.localAIHub.updateTool({ toolId }));
   }
 
-  async function uninstallLibraryTool(tool) {
+  async function uninstallLibraryTool(tool, capability = null) {
     if (!tool?.id) {
+      return;
+    }
+
+    const capabilityId = capability ? String(capability).trim().toLowerCase() : null;
+    if (!capabilityId && tool.installedCapabilities?.webui && tool.installedCapabilities?.desktop) {
+      pushToast(`${tool.name} has both WebUI and Desktop App installed. Capability-specific uninstall is paused in this build so Local AI Hub does not remove both by accident.`, 'error');
       return;
     }
 
@@ -1228,8 +1283,12 @@ export default function App() {
         : tool.lifecycleMode === 'official-installer' && tool.installedByLocalAIHub
           ? 'official-uninstall'
           : 'remove-from-library');
-    const confirmationMessage =
-      uninstallKind === 'uninstall'
+    const capabilityLabel = capabilityId === 'desktop' ? 'Desktop App' : capabilityId === 'webui' ? 'WebUI' : null;
+    const confirmationMessage = capabilityLabel
+      ? capabilityId === 'desktop'
+        ? `Uninstall the ${tool.name} Desktop App? Local AI Hub will only continue if it can avoid touching the WebUI install.`
+        : `Uninstall the ${tool.name} WebUI? Local AI Hub will only continue if it can avoid touching the Desktop App install.`
+      : uninstallKind === 'uninstall'
         ? `Uninstall ${tool.name} from Local AI Hub? This will delete the Local AI Hub-managed files from ${tool.installDir} and move it back to Store.`
         : uninstallKind === 'official-uninstall'
           ? `Uninstall ${tool.name}? Local AI Hub will run the official Windows uninstaller for this copy, wait for Apps & Features to stop reporting it, and only then move it out of Library. If Windows uninstall data is missing, Local AI Hub will only remove the files and shortcuts it still owns and clear stale Apps & Features data it can verify.`
@@ -1243,7 +1302,8 @@ export default function App() {
       setSettingsToolId(null);
     }
 
-    await runAction(`uninstall:${tool.id}`, () => window.localAIHub.uninstallTool(tool.id));
+    const busyKey = capabilityId ? `uninstall:${tool.id}:${capabilityId}` : `uninstall:${tool.id}`;
+    await runAction(busyKey, () => window.localAIHub.uninstallTool({ toolId: tool.id, capability: capabilityId }));
   }
   async function chooseFolderIntoDraft(busyKey, applyDraft, errorMessage) {
     markBusy(busyKey, true);
@@ -1503,9 +1563,10 @@ export default function App() {
     return succeeded;
   }
 
-  async function installStoreTool(toolId) {
+  async function installStoreTool(toolId, capability = 'webui') {
     const manifest = manifestMap[toolId];
     const subject = manifest?.name || 'This tool';
+    const capabilityId = String(capability || 'webui').trim().toLowerCase();
     const installRoot = effectiveStoreInstallRoot;
     if (!installRoot) {
       pushToast('Choose an install folder before starting this install.', 'error');
@@ -1513,6 +1574,7 @@ export default function App() {
     }
 
     const preflightResult = await window.localAIHub.getToolInstallPreflight({
+      capability: capabilityId,
       installRoot,
       toolId,
     });
@@ -1546,8 +1608,10 @@ export default function App() {
       }
     }
 
-    await runAction(`install:${toolId}`, () =>
+    const busyKey = manifest?.installCapabilities?.length ? `install:${toolId}:${capabilityId}` : `install:${toolId}`;
+    await runAction(busyKey, () =>
       window.localAIHub.installTool({
+        capability: capabilityId,
         installRoot: preflight?.installRoot || installRoot,
         lowDiskConfirmed,
         toolId,
@@ -1555,20 +1619,25 @@ export default function App() {
     );
   }
 
-  async function repairLibraryTool(tool) {
+  async function repairLibraryTool(tool, capability = null) {
     if (!tool?.id) {
       return;
     }
 
-    const previewResult = await window.localAIHub.getRepairPreview(tool.id);
-    if (!previewResult?.ok) {
-      pushToast(previewResult?.message || 'Local AI Hub could not inspect that repair right now.', 'error');
-      return;
+    const capabilityId = capability ? String(capability).trim().toLowerCase() : null;
+    const preview = {};
+    let removeOrphanedToolFolders = false;
+    if (capabilityId !== 'desktop') {
+      const previewResult = await window.localAIHub.getRepairPreview(tool.id);
+      if (!previewResult?.ok) {
+        pushToast(previewResult?.message || 'Local AI Hub could not inspect that repair right now.', 'error');
+        return;
+      }
+
+      Object.assign(preview, previewResult.data || {});
     }
 
-    const preview = previewResult.data || {};
-    let removeOrphanedToolFolders = false;
-    if (preview.orphanedToolFolderCount > 0) {
+    if (capabilityId !== 'desktop' && preview.orphanedToolFolderCount > 0) {
       const automaticCleanup = [];
       if (preview.duplicateFolderCount > 0) {
         automaticCleanup.push(`${preview.duplicateFolderCount} duplicate ${pluralizeLabel(preview.duplicateFolderCount, 'install folder')}`);
@@ -1585,8 +1654,9 @@ export default function App() {
       removeOrphanedToolFolders = window.confirm(orphanMessage);
     }
 
-    await runAction(`repair:${tool.id}`, () =>
-      window.localAIHub.repairTool({ toolId: tool.id, removeOrphanedToolFolders }),
+    const busyKey = capabilityId ? `repair:${tool.id}:${capabilityId}` : `repair:${tool.id}`;
+    await runAction(busyKey, () =>
+      window.localAIHub.repairTool({ toolId: tool.id, capability: capabilityId, removeOrphanedToolFolders }),
     );
   }
 
@@ -2152,7 +2222,7 @@ export default function App() {
                         onOpenFolder={(toolId) => runAction(`folder:${toolId}`, () => window.localAIHub.openToolFolder(toolId))}
                         onMigrateManagedData={migrateLegacyStorage}
                         onOpenInterface={openEmbeddedToolUi}
-                        onRepair={() => repairLibraryTool(tool)}
+                        onRepair={(capability) => repairLibraryTool(tool, capability)}
                         onRestoreSnapshot={(toolId, snapshotFileName) =>
                           runAction(`restore:${toolId}`, () => window.localAIHub.restoreSnapshot({ toolId, snapshotFileName }))
                         }
@@ -2282,7 +2352,9 @@ export default function App() {
                       <StoreCard
                         key={manifest.id}
                         busy={busyMap[`install:${manifest.id}`]}
+                        busyMap={busyMap}
                         compatibility={evaluateCompatibility(manifest, appState.hardware)}
+                        installedTool={toolMap[manifest.id]}
                         manifest={manifest}
                         onInstall={installStoreTool}
                         progress={progressMap[manifest.id]}

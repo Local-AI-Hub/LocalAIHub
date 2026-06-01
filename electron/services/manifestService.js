@@ -19,6 +19,7 @@ const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/Local-AI-Hub/Loca
 const REMOTE_MANIFEST_SIGNATURE_URL = `${REMOTE_MANIFEST_URL}.sig`;
 const ALLOWED_INSTALL_KINDS = new Set(['zip', 'single-file', 'installer-exe', 'pip-package']);
 const ALLOWED_RUNTIME_KINDS = new Set(['python', 'binary']);
+const ALLOWED_LAUNCH_MODE_KINDS = new Set(['webui', 'desktop', 'service', 'cli', 'embedded']);
 
 let loadedManifest = null;
 let refreshPromise = null;
@@ -72,6 +73,51 @@ function validateManifestTool(rawTool) {
 
   if (rawTool.externalLaunchCommand) {
     assertSafeCommandString(rawTool.externalLaunchCommand, `${rawTool.id} external launch command`);
+  }
+
+  if (rawTool.preferredLaunchMode !== undefined && typeof rawTool.preferredLaunchMode !== 'string') {
+    throw new Error(`Local AI Hub rejected ${rawTool.id} because its preferred launch mode was invalid.`);
+  }
+
+  if (rawTool.launchModes !== undefined) {
+    if (!Array.isArray(rawTool.launchModes)) {
+      throw new Error(`Local AI Hub rejected ${rawTool.id} because its launch modes were invalid.`);
+    }
+
+    const launchModeIds = new Set();
+    for (const mode of rawTool.launchModes) {
+      if (!mode || typeof mode !== 'object') {
+        throw new Error(`Local AI Hub rejected ${rawTool.id} because one of its launch modes was invalid.`);
+      }
+
+      const modeId = sanitizeManifestId(mode.id);
+      if (launchModeIds.has(modeId)) {
+        throw new Error(`Local AI Hub rejected ${rawTool.id} because a launch mode was declared more than once.`);
+      }
+      launchModeIds.add(modeId);
+
+      if (mode.kind !== undefined && !ALLOWED_LAUNCH_MODE_KINDS.has(String(mode.kind || '').trim().toLowerCase())) {
+        throw new Error(`Local AI Hub rejected ${rawTool.id} because one of its launch modes uses an unsupported kind.`);
+      }
+
+      if (mode.launchCommand) {
+        assertSafeCommandString(mode.launchCommand, `${rawTool.id} ${modeId} launch command`);
+      }
+
+      if (mode.externalLaunchCommand) {
+        assertSafeCommandString(mode.externalLaunchCommand, `${rawTool.id} ${modeId} external launch command`);
+      }
+
+      for (const field of ['executableCandidates', 'batchCandidates', 'pythonCandidates', 'processNames']) {
+        if (mode[field] !== undefined && (!Array.isArray(mode[field]) || mode[field].some((entry) => typeof entry !== 'string' || !entry.trim()))) {
+          throw new Error(`Local AI Hub rejected ${rawTool.id} because ${modeId} has invalid launch metadata.`);
+        }
+      }
+    }
+
+    if (rawTool.preferredLaunchMode && !launchModeIds.has(String(rawTool.preferredLaunchMode).trim().toLowerCase())) {
+      throw new Error(`Local AI Hub rejected ${rawTool.id} because its preferred launch mode does not exist.`);
+    }
   }
 
   if (

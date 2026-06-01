@@ -6,6 +6,47 @@
     "icon": "CF",
     "category": "Image generation",
     "downloadUrl": "https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.zip",
+    "companionDesktop": {
+      "id": "desktop",
+      "name": "ComfyUI Desktop",
+      "description": "Official ComfyUI Desktop companion app. It installs and manages its own desktop Python environment separately from the Local AI Hub WebUI/source install.",
+      "downloadUrl": "https://download.comfy.org/windows/nsis/x64",
+      "installInstructions": {
+        "kind": "installer-exe",
+        "runtime": "binary",
+        "downloadFileName": "ComfyUI-Desktop-Setup.exe",
+        "installSummary": "Downloads and opens the official ComfyUI Desktop installer. Finish setup in the installer window; Local AI Hub will detect the desktop app afterward.",
+        "installerArgs": [],
+        "managedInstallSupported": false,
+        "materializationTimeoutMs": 900000,
+        "configTargets": [],
+        "externalExecutableCandidates": [
+          "ComfyUI.exe"
+        ]
+      },
+      "launchCommand": "\"ComfyUI.exe\"",
+      "externalLaunchCommand": "\"ComfyUI.exe\"",
+      "detectionPaths": [
+        "%LOCALAPPDATA%\\Programs\\ComfyUI\\ComfyUI.exe",
+        "%LOCALAPPDATA%\\Programs\\@comfyorgcomfyui-electron\\ComfyUI.exe",
+        "%PROGRAMFILES%\\ComfyUI\\ComfyUI.exe",
+        "%ProgramFiles(x86)%\\ComfyUI\\ComfyUI.exe"
+      ],
+      "discovery": {
+        "folderNames": [
+          "ComfyUI",
+          "@comfyorgcomfyui-electron"
+        ],
+        "markerPaths": [
+          "ComfyUI.exe"
+        ],
+        "pathExecutables": [],
+        "pythonModules": []
+      },
+      "processNames": [
+        "ComfyUI.exe"
+      ]
+    },
     "installInstructions": {
       "kind": "zip",
       "runtime": "python",
@@ -25,7 +66,12 @@
       "pipInstalls": [
         {
           "kind": "requirements",
-          "value": "requirements.txt"
+          "value": "requirements.txt",
+          "excludePatterns": [
+            "^torch\\b",
+            "^torchvision\\b",
+            "^torchaudio\\b"
+          ]
         }
       ],
       "externalPythonCandidates": [
@@ -47,6 +93,31 @@
       }
     },
     "launchCommand": "python main.py --listen 127.0.0.1 --port {port}",
+    "launchModes": [
+      {
+        "id": "webui",
+        "capability": "webui",
+        "label": "Web UI",
+        "kind": "webui",
+        "interfaceMode": "external-browser"
+      },
+      {
+        "id": "desktop",
+        "capability": "desktop",
+        "label": "Desktop App",
+        "kind": "desktop",
+        "interfaceMode": "desktop-app",
+        "launchCommand": "\"ComfyUI.exe\"",
+        "externalLaunchCommand": "\"ComfyUI.exe\"",
+        "executableCandidates": [
+          "ComfyUI.exe"
+        ],
+        "processNames": [
+          "ComfyUI.exe"
+        ]
+      }
+    ],
+    "preferredLaunchMode": "webui",
     "defaultPort": 8188,
     "healthCheckPath": "/",
     "startupTimeoutMs": 240000,
@@ -116,6 +187,29 @@
       }
     },
     "launchCommand": "ollama.exe serve",
+    "launchModes": [
+      {
+        "id": "service",
+        "label": "Built-in Chat",
+        "kind": "service",
+        "interfaceMode": "embedded-chat"
+      },
+      {
+        "id": "desktop",
+        "label": "Desktop App",
+        "kind": "desktop",
+        "interfaceMode": "desktop-app",
+        "launchCommand": "\"ollama app.exe\"",
+        "externalLaunchCommand": "\"ollama app.exe\"",
+        "executableCandidates": [
+          "ollama app.exe"
+        ],
+        "processNames": [
+          "ollama app.exe"
+        ]
+      }
+    ],
+    "preferredLaunchMode": "service",
     "defaultPort": 11434,
     "healthCheckPath": "/api/tags",
     "detectionPaths": [
@@ -256,6 +350,47 @@
     "icon": "IV",
     "category": "Image generation",
     "downloadUrl": "https://pypi.org/project/invokeai/",
+    "companionDesktop": {
+      "id": "desktop",
+      "name": "InvokeAI Launcher",
+      "description": "Official Invoke Community Edition launcher. It installs, updates, reinstalls, and runs Invoke separately from the Local AI Hub pip/WebUI runtime.",
+      "downloadUrl": "https://github.com/invoke-ai/launcher/releases/download/v1.8.1/Invoke.Community.Edition.Setup.latest.exe",
+      "installInstructions": {
+        "kind": "installer-exe",
+        "runtime": "binary",
+        "downloadFileName": "Invoke.Community.Edition.Setup.latest.exe",
+        "installSummary": "Downloads and opens the official InvokeAI Launcher installer. Finish setup in the installer window; Local AI Hub will detect the launcher afterward.",
+        "installerArgs": [],
+        "managedInstallSupported": false,
+        "materializationTimeoutMs": 900000,
+        "configTargets": [],
+        "externalExecutableCandidates": [
+          "Invoke Community Edition.exe"
+        ]
+      },
+      "launchCommand": "\"Invoke Community Edition.exe\"",
+      "externalLaunchCommand": "\"Invoke Community Edition.exe\"",
+      "detectionPaths": [
+        "%LOCALAPPDATA%\\Programs\\invoke-community-edition\\Invoke Community Edition.exe",
+        "%LOCALAPPDATA%\\Programs\\Invoke Community Edition\\Invoke Community Edition.exe",
+        "%PROGRAMFILES%\\Invoke Community Edition\\Invoke Community Edition.exe",
+        "%ProgramFiles(x86)%\\Invoke Community Edition\\Invoke Community Edition.exe"
+      ],
+      "discovery": {
+        "folderNames": [
+          "invoke-community-edition",
+          "Invoke Community Edition"
+        ],
+        "markerPaths": [
+          "Invoke Community Edition.exe"
+        ],
+        "pathExecutables": [],
+        "pythonModules": []
+      },
+      "processNames": [
+        "Invoke Community Edition.exe"
+      ]
+    },
     "installInstructions": {
       "kind": "pip-package",
       "runtime": "python",
@@ -294,6 +429,31 @@
     },
     "launchCommand": "..\\.venv\\Scripts\\invokeai-web.exe --root .. --config invokeai.yaml",
     "externalLaunchCommand": "invokeai-web.exe --root {installDir} --config invokeai.yaml",
+    "launchModes": [
+      {
+        "id": "webui",
+        "capability": "webui",
+        "label": "Web UI",
+        "kind": "webui",
+        "interfaceMode": "external-browser"
+      },
+      {
+        "id": "desktop",
+        "capability": "desktop",
+        "label": "Desktop App",
+        "kind": "desktop",
+        "interfaceMode": "desktop-app",
+        "launchCommand": "\"Invoke Community Edition.exe\"",
+        "externalLaunchCommand": "\"Invoke Community Edition.exe\"",
+        "executableCandidates": [
+          "Invoke Community Edition.exe"
+        ],
+        "processNames": [
+          "Invoke Community Edition.exe"
+        ]
+      }
+    ],
+    "preferredLaunchMode": "webui",
     "defaultPort": 9090,
     "healthCheckPath": "/api/v1/app/version",
     "detectionPaths": [
@@ -654,6 +814,33 @@
       }
     },
     "launchCommand": "koboldcpp.exe --host 127.0.0.1 --port {port}",
+    "launchModes": [
+      {
+        "id": "webui",
+        "label": "Web UI",
+        "kind": "webui",
+        "interfaceMode": "external-browser"
+      },
+      {
+        "id": "desktop",
+        "label": "Desktop App",
+        "kind": "desktop",
+        "interfaceMode": "desktop-app",
+        "launchCommand": "koboldcpp.exe",
+        "externalLaunchCommand": "koboldcpp.exe",
+        "executableCandidates": [
+          "koboldcpp.exe",
+          "koboldcpp_nocuda.exe",
+          "koboldcpp_oldpc.exe"
+        ],
+        "processNames": [
+          "koboldcpp.exe",
+          "koboldcpp_nocuda.exe",
+          "koboldcpp_oldpc.exe"
+        ]
+      }
+    ],
+    "preferredLaunchMode": "webui",
     "defaultPort": 5001,
     "healthCheckPath": "/",
     "detectionPaths": [
@@ -919,6 +1106,7 @@
     "description": "A local RAG tool for private chats with your own documents, so you can upload PDFs, Word docs, and text files and discuss their contents without data leaving your machine.",
     "icon": "AL",
     "category": "LLM tools",
+    "interfaceMode": "desktop-app",
     "downloadUrl": "https://cdn.anythingllm.com/latest/AnythingLLMDesktop.exe",
     "installInstructions": {
       "kind": "installer-exe",
@@ -1525,6 +1713,76 @@
     }
   },
   {
+    "id": "opencode",
+    "name": "OpenCode",
+    "description": "OpenCode is a coding agent with desktop and terminal interfaces. Configure providers inside OpenCode; IDE extension integration is not managed by Local AI Hub yet.",
+    "icon": "OC",
+    "category": "Coding tools",
+    "interfaceMode": "desktop-app",
+    "downloadUrl": "https://github.com/anomalyco/opencode/releases/latest/download/opencode-desktop-win-x64.exe",
+    "installInstructions": {
+      "kind": "installer-exe",
+      "runtime": "binary",
+      "downloadFileName": "opencode-desktop-win-x64.exe",
+      "installSummary": "Downloads and opens the official OpenCode Desktop installer. Finish setup in the installer window; Local AI Hub will detect OpenCode afterward.",
+      "installerArgs": [],
+      "managedInstallSupported": false,
+      "materializationTimeoutMs": 900000,
+      "configTargets": [],
+      "externalExecutableCandidates": [
+        "OpenCode.exe"
+      ],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 0,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "\"OpenCode.exe\"",
+    "launchModes": [
+      {
+        "id": "desktop",
+        "label": "Desktop App",
+        "kind": "desktop",
+        "interfaceMode": "desktop-app",
+        "launchCommand": "\"OpenCode.exe\"",
+        "externalLaunchCommand": "\"OpenCode.exe\"",
+        "executableCandidates": [
+          "OpenCode.exe"
+        ],
+        "processNames": [
+          "OpenCode.exe"
+        ]
+      }
+    ],
+    "preferredLaunchMode": "desktop",
+    "detectionPaths": [
+      "%LOCALAPPDATA%\\Programs\\@opencode-aidesktop\\OpenCode.exe",
+      "%LOCALAPPDATA%\\Programs\\OpenCode\\OpenCode.exe",
+      "%LOCALAPPDATA%\\Programs\\opencode\\OpenCode.exe",
+      "%LOCALAPPDATA%\\OpenCode\\OpenCode.exe",
+      "%PROGRAMFILES%\\OpenCode\\OpenCode.exe",
+      "%ProgramFiles(x86)%\\OpenCode\\OpenCode.exe",
+      "%APPDATA%\\OpenCode\\OpenCode.exe"
+    ],
+    "discovery": {
+      "folderNames": [
+        "@opencode-aidesktop",
+        "OpenCode",
+        "opencode"
+      ],
+      "markerPaths": [
+        "OpenCode.exe"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    },
+    "processNames": [
+      "OpenCode.exe"
+    ]
+  },
+  {
     "id": "aider",
     "name": "Aider",
     "description": "An AI pair programming tool that uses local or remote LLMs to assist with coding directly in a project folder, now with a built-in Local AI Hub console.",
@@ -1614,6 +1872,15 @@
       }
     },
     "launchCommand": "tabby.exe serve --port {port}",
+    "launchModes": [
+      {
+        "id": "service",
+        "label": "Web/API Service",
+        "kind": "service",
+        "interfaceMode": "external-browser"
+      }
+    ],
+    "preferredLaunchMode": "service",
     "defaultPort": 8080,
     "healthCheckPath": "/",
     "detectionPaths": [

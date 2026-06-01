@@ -1597,7 +1597,9 @@ function resolveLaunchProfile(toolState, launchProfile) {
   }
 
   if (launchProfile.kind === 'binary') {
-    const executable = ensureManagedRuntimePath(toolState, launchProfile.executable, 'launcher executable');
+    const executable = launchProfile.allowExternalExecutable
+      ? path.resolve(launchProfile.executable)
+      : ensureManagedRuntimePath(toolState, launchProfile.executable, 'launcher executable');
     return {
       ...launchProfile,
       executable,
@@ -1606,7 +1608,9 @@ function resolveLaunchProfile(toolState, launchProfile) {
   }
 
   if (launchProfile.kind === 'batch') {
-    const command = ensureManagedRuntimePath(toolState, launchProfile.command, 'launcher script');
+    const command = launchProfile.allowExternalExecutable
+      ? path.resolve(launchProfile.command)
+      : ensureManagedRuntimePath(toolState, launchProfile.command, 'launcher script');
     return {
       ...launchProfile,
       command,
@@ -1636,6 +1640,68 @@ function resolveLaunchProfile(toolState, launchProfile) {
 
 function getToolInterfaceMode(toolState) {
   return toolState?.interfaceMode || 'external-browser';
+}
+
+function normalizeLaunchModeId(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function selectLaunchMode(toolState, requestedLaunchMode = null) {
+  const modes = Array.isArray(toolState?.launchModes) ? toolState.launchModes : [];
+  const profiles = toolState?.launchModeProfiles && typeof toolState.launchModeProfiles === 'object'
+    ? toolState.launchModeProfiles
+    : {};
+  const requestedModeId = normalizeLaunchModeId(requestedLaunchMode);
+  const preferredModeId = normalizeLaunchModeId(toolState?.preferredLaunchMode || toolState?.activeLaunchMode);
+  const modeId = requestedModeId || preferredModeId;
+
+  if (!modes.length) {
+    if (requestedModeId) {
+      throw new Error(`${toolState.name} does not expose that launch mode.`);
+    }
+
+    return {
+      mode: null,
+      profile: toolState.launchProfile || null,
+      toolState,
+    };
+  }
+
+  const mode = modes.find((entry) => normalizeLaunchModeId(entry.id) === modeId) || (!requestedModeId ? modes[0] : null);
+  if (!mode) {
+    const declaredModes = Array.isArray(toolState?.declaredLaunchModes) ? toolState.declaredLaunchModes : [];
+    const declaredMode = declaredModes.find((entry) => normalizeLaunchModeId(entry.id) === requestedModeId);
+    if (declaredMode?.interfaceMode === 'desktop-app' || declaredMode?.kind === 'desktop') {
+      throw new Error('Desktop app is not installed for this tool. Use Web UI or install the Desktop App from Store.');
+    }
+
+    throw new Error(`${toolState.name} does not expose that launch mode.`);
+  }
+
+  const profile = profiles[mode.id] || (mode.id === toolState.activeLaunchMode ? toolState.launchProfile : null);
+  if (!profile) {
+    if (mode.interfaceMode === 'desktop-app' || mode.kind === 'desktop') {
+      throw new Error('Desktop app is not installed for this tool. Use Web UI or install the Desktop App from Store.');
+    }
+
+    throw new Error(`${toolState.name} cannot launch that interface yet. Use another launch option or repair/reinstall.`);
+  }
+
+  const hasOwn = (target, key) => Object.prototype.hasOwnProperty.call(target || {}, key);
+  return {
+    mode,
+    profile,
+    toolState: {
+      ...toolState,
+      activeLaunchMode: mode.id,
+      defaultPort: hasOwn(mode, 'defaultPort') ? mode.defaultPort : toolState.defaultPort,
+      healthUrl: hasOwn(mode, 'healthUrl') ? mode.healthUrl : toolState.healthUrl,
+      interfaceMode: mode.interfaceMode || toolState.interfaceMode,
+      launchProfile: profile,
+      launchUrl: hasOwn(mode, 'launchUrl') ? mode.launchUrl : toolState.launchUrl,
+      processNames: Array.isArray(mode.processNames) && mode.processNames.length ? mode.processNames : toolState.processNames,
+    },
+  };
 }
 
 function getExpectedLocalMarkers(toolState) {
@@ -3125,6 +3191,9 @@ async function launchToolInternal(toolState, options = {}) {
     throw new Error('Local AI Hub could not find that tool in its installed list.');
   }
 
+  const selectedLaunch = selectLaunchMode(toolState, options.launchMode || options.launchModeId || null);
+  toolState = selectedLaunch.toolState;
+
   let launchStoragePreflight = null;
   const markStarting = async () => {
     await persistToolRuntimeState(toolState, 'starting', {
@@ -3448,6 +3517,8 @@ module.exports = {
     getAiderOllamaTimeoutRetryClassification,
     getPipelineOnlyLaunchMessage,
     inspectWanLibraryLaunchReadiness,
+    resolveLaunchProfile,
+    selectLaunchMode,
     stopRuntimeProcessTree,
   },
 };
