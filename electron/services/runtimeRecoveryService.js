@@ -8,15 +8,6 @@ const { repairToolInstallation } = require('./installerService');
 
 const PYTORCH_REPAIR_BUILDS = [
   {
-    channel: 'cu126',
-    label: 'CUDA 12.6',
-    minCudaVersion: [12, 6],
-    torch: '2.6.0',
-    torchvision: '0.21.0',
-    torchaudio: '2.6.0',
-    indexUrl: 'https://download.pytorch.org/whl/cu126',
-  },
-  {
     channel: 'cu124',
     label: 'CUDA 12.4',
     minCudaVersion: [12, 4],
@@ -350,6 +341,16 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
     };
   }
 
+  if (/(?:torch\.version\.cuda.*(?:none|null|empty)|cpu-only PyTorch|not a CUDA-enabled PyTorch|PyTorch is not CUDA-enabled)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'torch-cpu-build-detected',
+      action: 'repair-pytorch-cuda',
+      summary: `${toolState.name} is using a CPU-only PyTorch build instead of the NVIDIA CUDA build Local AI Hub expects.`,
+      repairingMessage: `Local AI Hub is reinstalling CUDA-enabled PyTorch for ${gpuModel}.`,
+    };
+  }
+
   if (/found no nvidia driver on your system/i.test(stderr)) {
     return {
       recognized: true,
@@ -362,6 +363,16 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
     };
   }
 
+  if (/(?:CUDA driver version is insufficient|NVIDIA driver on your system is too old|driver version is insufficient for CUDA runtime|CUDA runtime version.*driver|the provided PTX was compiled with an unsupported toolchain)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'nvidia-driver-too-old-for-torch',
+      action: 'none',
+      summary: `${toolState.name} found the NVIDIA GPU, but the installed NVIDIA driver is too old for its PyTorch CUDA runtime. Update the NVIDIA driver, then run Repair so Local AI Hub can install the matching CUDA PyTorch build.`,
+      repairingMessage: null,
+    };
+  }
+
   if (/moduleNotFoundError:\s+No module named ['"]torch['"]/i.test(stderr)) {
     return {
       recognized: true,
@@ -369,6 +380,16 @@ function diagnoseLaunchFailure(toolState, stderrText, hardware) {
       action: 'repair-pytorch-cuda',
       summary: `${toolState.name} is missing PyTorch in its Python environment.`,
       repairingMessage: `Local AI Hub is reinstalling PyTorch with the correct CUDA build for ${gpuModel}.`,
+    };
+  }
+
+  if (/(?:torchvision|torchaudio).*(?:Couldn't load custom C\+\+ ops|undefined symbol|DLL load failed|compiled with different CUDA versions|incompatible with torch)|(?:RuntimeError|ImportError).*?(?:torchvision|torchaudio).*?(?:torch|CUDA)/i.test(stderr)) {
+    return {
+      recognized: true,
+      id: 'torch-companion-package-mismatch',
+      action: 'repair-pytorch-cuda',
+      summary: `${toolState.name} has a mismatched PyTorch, torchvision, or torchaudio install.`,
+      repairingMessage: `Local AI Hub is reinstalling the matching CUDA PyTorch stack for ${gpuModel}.`,
     };
   }
 
@@ -611,12 +632,11 @@ function selectPyTorchRepairCandidates(hardware) {
     return [];
   }
 
-  const sorted = [...candidates].sort((left, right) => {
-    const comparison = compareVersions(left.minCudaVersion, right.minCudaVersion);
-    return isLegacyNvidiaModel(hardware.gpuModel) ? comparison : comparison * -1;
-  });
+  return [...candidates].sort((left, right) => compareVersions(right.minCudaVersion, left.minCudaVersion));
+}
 
-  return sorted;
+function buildPyTorchRepairPackageSpec(build, packageName) {
+  return `${packageName}==${build[packageName]}+${build.channel}`;
 }
 
 function getManagedPythonPath(toolState) {
@@ -654,9 +674,9 @@ async function reinstallPyTorchBuild(toolState, build, logger) {
       '--upgrade',
       '--force-reinstall',
       '--no-cache-dir',
-      `torch==${build.torch}`,
-      `torchvision==${build.torchvision}`,
-      `torchaudio==${build.torchaudio}`,
+      buildPyTorchRepairPackageSpec(build, 'torch'),
+      buildPyTorchRepairPackageSpec(build, 'torchvision'),
+      buildPyTorchRepairPackageSpec(build, 'torchaudio'),
       '--index-url',
       build.indexUrl,
     ],
@@ -676,15 +696,22 @@ async function verifyPyTorchBuild(toolState, build, logger) {
   const pythonPath = getManagedPythonPath(toolState);
   await removeStaleTorchArtifacts(toolState, logger);
   const verificationSnippet = [
-    'import json',
+    'import importlib, json',
     'info = {}',
     'import torch',
     "info['torchVersion'] = getattr(torch, '__version__', 'unknown')",
     "info['cudaAvailable'] = bool(torch.cuda.is_available())",
     "info['cudaVersion'] = getattr(torch.version, 'cuda', None)",
     "info['deviceName'] = torch.cuda.get_device_name(0) if info['cudaAvailable'] else None",
+    "info['imports'] = {}",
+    "for module_name in ['torchvision', 'torchaudio']:",
+    "    try:",
+    "        module = importlib.import_module(module_name)",
+    "        info['imports'][module_name] = getattr(module, '__version__', 'imported')",
+    "    except Exception as exc:",
+    "        info['imports'][module_name] = exc.__class__.__name__ + ': ' + str(exc)",
     'print(json.dumps(info))',
-  ].join('; ');
+  ].join('\n');
 
   const result = await runCommand(pythonPath, ['-c', verificationSnippet], {
     cwd: toolState.appDir,
@@ -703,8 +730,20 @@ async function verifyPyTorchBuild(toolState, build, logger) {
   }
 
   const verification = JSON.parse(payload);
+  const torchVersion = String(verification.torchVersion || '').trim();
+  const torchCudaVersion = String(verification.cudaVersion || '').trim();
+  if (!torchCudaVersion || /\+cpu\b/i.test(torchVersion)) {
+    throw new Error(`PyTorch is still CPU-only after reinstalling the ${build.label} build.`);
+  }
+
   if (!verification.cudaAvailable) {
-    throw new Error(`PyTorch still cannot see CUDA after reinstalling the ${build.label} build.`);
+    throw new Error(`PyTorch still cannot see the NVIDIA GPU after reinstalling the ${build.label} build. Update the NVIDIA driver, close other GPU tools, then run Repair again.`);
+  }
+
+  const failedCompanionImports = Object.entries(verification.imports || {})
+    .filter(([, value]) => /(?:error|exception|modulenotfound|importerror)/i.test(String(value || '')));
+  if (failedCompanionImports.length) {
+    throw new Error('torchvision or torchaudio still does not match the installed PyTorch CUDA build.');
   }
 
   await logger.info('PyTorch verification succeeded.', verification);
@@ -897,6 +936,7 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
 
 module.exports = {
   attemptAutomaticLaunchRecovery,
+  buildPyTorchRepairPackageSpec,
   diagnoseLaunchFailure,
   selectPyTorchRepairCandidates,
 };

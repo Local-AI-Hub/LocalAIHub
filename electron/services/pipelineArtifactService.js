@@ -419,6 +419,7 @@ function serializeAudioSourceReference(reference = null) {
     mimeType: String(reference.mimeType || '').trim(),
     sizeBytes: Number(reference.sizeBytes || 0) || 0,
     summary: String(reference.summary || '').trim(),
+    width: Number(reference.width || 0) || 0,
   };
 
   return Object.values(normalized).some(Boolean) ? normalized : null;
@@ -796,10 +797,13 @@ function serializeImageSourceReference(reference = null) {
     filePath: String(reference.filePath || '').trim(),
     fileUrl: String(reference.fileUrl || '').trim(),
     formatLabel: String(reference.formatLabel || '').trim(),
+    height: Number(reference.height || 0) || 0,
+    id: String(reference.id || reference.artifactId || '').trim(),
     kind: String(reference.kind || '').trim(),
     mimeType: String(reference.mimeType || '').trim(),
     sizeBytes: Number(reference.sizeBytes || 0) || 0,
     summary: String(reference.summary || '').trim(),
+    width: Number(reference.width || 0) || 0,
   };
 
   return Object.values(normalized).some(Boolean) ? normalized : null;
@@ -815,15 +819,26 @@ function serializeImageGenerationForUi(generation = null) {
     backend: String(generation.backend || '').trim(),
     backendLabel: String(generation.backendLabel || '').trim(),
     cfgScale: Number(generation.cfgScale || 0) || 0,
+    collectionMap: generation.collectionMap && typeof generation.collectionMap === 'object' ? serializeArtifactForUi(generation.collectionMap) : null,
+    extension: String(generation.extension || '').trim(),
     height: Number(generation.height || 0) || 0,
+    mimeType: String(generation.mimeType || '').trim(),
     model: String(generation.model || '').trim(),
     negativePrompt: String(generation.negativePrompt || '').trim(),
+    operation: String(generation.operation || generation.operationSubtype || '').trim(),
     operationId: String(generation.operationId || '').trim(),
+    operationSubtype: String(generation.operationSubtype || generation.operation || '').trim(),
     prompt: String(generation.prompt || '').trim(),
     promptStyle: serializePromptStyleApplication(generation.promptStyle),
+    provider: String(generation.provider || generation.backend || '').trim(),
     quality: String(generation.quality || '').trim(),
+    requestSettings: generation.requestSettings && typeof generation.requestSettings === 'object' ? serializeArtifactForUi(generation.requestSettings) : null,
+    revisedPrompt: String(generation.revisedPrompt || '').trim(),
+    safetyNotes: Array.isArray(generation.safetyNotes) ? generation.safetyNotes.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
     seed: Number.isFinite(seed) ? seed : null,
     size: String(generation.size || '').trim(),
+    sourceImage: serializeImageSourceReference(generation.sourceImage),
+    sourceText: String(generation.sourceText || '').trim(),
     steps: Number(generation.steps || 0) || 0,
     toolId: String(generation.toolId || '').trim(),
     toolLabel: String(generation.toolLabel || '').trim(),
@@ -831,6 +846,9 @@ function serializeImageGenerationForUi(generation = null) {
   };
 
   return Object.entries(normalized).some(([, value]) => {
+    if (Array.isArray(value)) {
+      return value.length > 0;
+    }
     if (value && typeof value === 'object') {
       return true;
     }
@@ -882,21 +900,31 @@ function serializeVideoGenerationForUi(generation = null) {
     mode: String(generation.mode || generation.operationSubtype || '').trim(),
     model: String(generation.model || '').trim(),
     negativePrompt: String(generation.negativePrompt || '').trim(),
+    operation: String(generation.operation || generation.operationSubtype || generation.mode || '').trim(),
     operationId: String(generation.operationId || '').trim(),
     operationSubtype: String(generation.operationSubtype || generation.mode || '').trim(),
+    polling: generation.polling && typeof generation.polling === 'object' ? serializeArtifactForUi(generation.polling) : null,
     prompt: String(generation.prompt || '').trim(),
     promptStyle: serializePromptStyleApplication(generation.promptStyle),
+    provider: String(generation.provider || generation.backend || '').trim(),
+    providerOperationId: String(generation.providerOperationId || generation.operationName || '').trim(),
+    providerRawStatusSummary: generation.providerRawStatusSummary && typeof generation.providerRawStatusSummary === 'object' ? serializeArtifactForUi(generation.providerRawStatusSummary) : null,
     quality: Number(generation.quality || 0) || null,
     collectionMap: generation.collectionMap && typeof generation.collectionMap === 'object' ? serializeArtifactForUi(generation.collectionMap) : null,
     collectionMapItemMode: String(generation.collectionMapItemMode || '').trim(),
     collectionMapVideoChain: generation.collectionMapVideoChain && typeof generation.collectionMapVideoChain === 'object' ? serializeArtifactForUi(generation.collectionMapVideoChain) : null,
+    requestSettings: generation.requestSettings && typeof generation.requestSettings === 'object' ? serializeArtifactForUi(generation.requestSettings) : null,
+    returnedVideo: generation.returnedVideo && typeof generation.returnedVideo === 'object' ? serializeArtifactForUi(generation.returnedVideo) : null,
+    safetyNotes: Array.isArray(generation.safetyNotes) ? generation.safetyNotes.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
     seed: Number.isFinite(seed) ? seed : null,
     size: String(generation.size || '').trim(),
+    sourceInputImage: serializeImageSourceReference(generation.sourceInputImage),
     sourceImage: serializeImageSourceReference(generation.sourceImage),
     steps: steps > 0 ? steps : null,
     toolId: String(generation.toolId || '').trim(),
     toolLabel: String(generation.toolLabel || '').trim(),
     usedReferenceImage: Boolean(generation.usedReferenceImage),
+    video: generation.video && typeof generation.video === 'object' ? serializeArtifactForUi(generation.video) : null,
   };
 
   return Object.entries(normalized).some(([, value]) => {
@@ -2005,6 +2033,7 @@ async function saveBase64Artifact(runDirectories, base64Payload, options = {}) {
     imageTransformation: options.imageTransformation,
     kind: options.kind,
     role: options.role || 'generated',
+    videoGeneration: options.videoGeneration,
   });
 }
 
@@ -2028,6 +2057,7 @@ async function saveBufferArtifact(runDirectories, bufferPayload, options = {}) {
     imageTransformation: options.imageTransformation,
     kind: options.kind,
     role: options.role || 'generated',
+    videoGeneration: options.videoGeneration,
   });
 }
 

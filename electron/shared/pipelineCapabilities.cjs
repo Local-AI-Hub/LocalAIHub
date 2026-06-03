@@ -231,14 +231,10 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_TEXT]),
       }),
       [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: Object.freeze({
-        inputKinds: Object.freeze([MODALITY_TEXT]),
-        notes: 'Image generation uses a dedicated OpenAI image model such as gpt-image-1.',
-        outputKinds: Object.freeze([MODALITY_IMAGE]),
-      }),
-      [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
-        notes: 'Video generation uses a Sora video model such as sora-2 or sora-2-pro. Image input also needs motion guidance in the step instruction box.',
-        outputKinds: Object.freeze([MODALITY_VIDEO]),
+        notes: 'Image generation uses a dedicated OpenAI image model such as gpt-image-1. Image input needs an edit instruction.',
+        operationSubtypes: Object.freeze(['textToImage', 'imageToImage']),
+        outputKinds: Object.freeze([MODALITY_IMAGE]),
       }),
       [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT]),
@@ -291,6 +287,19 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         inputKinds: Object.freeze([MODALITY_TEXT]),
         notes: 'Gemini text-to-speech can turn text into a saved speech artifact when you choose a TTS-capable Gemini model.',
         outputKinds: Object.freeze([MODALITY_AUDIO]),
+      }),
+      [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        notes: 'Gemini image generation can create an image from text, or edit a source image with a text instruction when a compatible Gemini image model is selected.',
+        operationSubtypes: Object.freeze(['textToImage', 'imageToImage']),
+        outputKinds: Object.freeze([MODALITY_IMAGE]),
+      }),
+      [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        notes: 'Google Veo creates videos from text, or from an image plus motion guidance, through Gemini long-running operations.',
+        operationSubtypes: Object.freeze(['textToVideo', 'imageToVideo']),
+        outputKinds: Object.freeze([MODALITY_VIDEO]),
+        requiresModel: false,
       }),
     }),
     targetType: 'provider',
@@ -362,6 +371,19 @@ const PROVIDER_PIPELINE_CAPABILITIES = Object.freeze({
         outputKinds: Object.freeze([MODALITY_AUDIO]),
         requiresModel: false,
       }),
+      [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        notes: 'xAI image generation can create an image from text, or edit a source image with a text instruction when a compatible image model is selected.',
+        operationSubtypes: Object.freeze(['textToImage', 'imageToImage']),
+        outputKinds: Object.freeze([MODALITY_IMAGE]),
+      }),
+      [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+        notes: 'xAI Grok Imagine creates videos from text, or animates a still image with motion guidance through xAI asynchronous video operations.',
+        operationSubtypes: Object.freeze(['textToVideo', 'imageToVideo']),
+        outputKinds: Object.freeze([MODALITY_VIDEO]),
+        requiresModel: false,
+      }),
     }),
     targetType: 'provider',
   }),
@@ -383,33 +405,36 @@ const PROVIDER_MODEL_CAPABILITY_RULES = Object.freeze({
       pattern: /^(gpt-4o-mini-tts|tts-1(?:-hd)?)$/i,
     }),
     Object.freeze({
-      capabilityLabels: Object.freeze(['Image generation']),
+      capabilityLabels: Object.freeze(['Image generation', 'Image editing']),
       capabilitySource: 'explicit',
       exclusive: true,
       operations: Object.freeze({
         [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: Object.freeze({
-          inputKinds: Object.freeze([MODALITY_TEXT]),
-          notes: 'Creates an image from a text prompt.',
+          inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+          notes: 'Creates an image from text, or edits a source image with a text instruction.',
+          operationSubtypes: Object.freeze(['textToImage', 'imageToImage']),
           outputKinds: Object.freeze([MODALITY_IMAGE]),
         }),
       }),
-      pattern: /^(gpt-image-1(?:.5|-mini)?)$/i,
+      pattern: /^(gpt-image-1(?:\.5|-mini)?|chatgpt-image-latest)$/i,
     }),
+  ]),
+  google: Object.freeze([
     Object.freeze({
-      capabilityLabels: Object.freeze(['Video generation', 'Image reference']),
+      capabilityLabels: Object.freeze(['Video generation', 'Image reference', 'Long-running operation']),
       capabilitySource: 'explicit',
       exclusive: true,
       operations: Object.freeze({
         [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: Object.freeze({
           inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
-          notes: 'Creates a video from text or from an image plus motion guidance.',
+          notes: 'Creates a video from text or from an image plus motion guidance through Google Veo.',
+          operationSubtypes: Object.freeze(['textToVideo', 'imageToVideo']),
           outputKinds: Object.freeze([MODALITY_VIDEO]),
+          requiresModel: false,
         }),
       }),
-      pattern: /^sora-2(?:-pro)?(?:-\d{4}-\d{2}-\d{2})?$/i,
+      pattern: /^models\/veo-[a-z0-9.-]+$/i,
     }),
-  ]),
-  google: Object.freeze([
     Object.freeze({
       capabilityLabels: Object.freeze(['Speech generation']),
       capabilitySource: 'explicit',
@@ -423,12 +448,58 @@ const PROVIDER_MODEL_CAPABILITY_RULES = Object.freeze({
       }),
       pattern: /^models\/gemini-[a-z0-9.-]*tts$/i,
     }),
+    Object.freeze({
+      capabilityLabels: Object.freeze(['Image generation', 'Image editing']),
+      capabilitySource: 'explicit',
+      exclusive: true,
+      operations: Object.freeze({
+        [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: Object.freeze({
+          inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+          notes: 'Creates an image from text, or edits a source image with a text instruction through Gemini image generation.',
+          operationSubtypes: Object.freeze(['textToImage', 'imageToImage']),
+          outputKinds: Object.freeze([MODALITY_IMAGE]),
+        }),
+      }),
+      pattern: /^models\/gemini-(?:[a-z0-9.-]+-image|2\.0-flash-preview-image-generation)$/i,
+    }),
+  ]),
+  xai: Object.freeze([
+    Object.freeze({
+      capabilityLabels: Object.freeze(['Video generation', 'Image reference', 'Async operation']),
+      capabilitySource: 'explicit',
+      exclusive: true,
+      operations: Object.freeze({
+        [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: Object.freeze({
+          inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+          notes: 'Creates a video from text or from an image plus motion guidance through xAI Grok Imagine.',
+          operationSubtypes: Object.freeze(['textToVideo', 'imageToVideo']),
+          outputKinds: Object.freeze([MODALITY_VIDEO]),
+          requiresModel: false,
+        }),
+      }),
+      pattern: /^grok-imagine-video(?:-[a-z0-9.-]+)?$/i,
+    }),
+    Object.freeze({
+      capabilityLabels: Object.freeze(['Image generation', 'Image editing']),
+      capabilitySource: 'explicit',
+      exclusive: true,
+      operations: Object.freeze({
+        [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: Object.freeze({
+          inputKinds: Object.freeze([MODALITY_TEXT, MODALITY_IMAGE]),
+          notes: 'Creates an image from text, or edits a source image with a text instruction through xAI image generation.',
+          operationSubtypes: Object.freeze(['textToImage', 'imageToImage']),
+          outputKinds: Object.freeze([MODALITY_IMAGE]),
+        }),
+      }),
+      pattern: /^grok-imagine-image(?:-[a-z0-9.-]+)?$/i,
+    }),
   ]),
 });
 
 const PROVIDER_MODEL_FALLBACK_OPERATION_IDS = Object.freeze({
   openai: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.IMAGE_ANALYZE, PIPELINE_OPERATION_IDS.VALIDATION_LLM]),
   google: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.IMAGE_ANALYZE, PIPELINE_OPERATION_IDS.VALIDATION_LLM]),
+  xai: Object.freeze([PIPELINE_OPERATION_IDS.LLM_PROMPT, PIPELINE_OPERATION_IDS.VALIDATION_LLM, PIPELINE_OPERATION_IDS.AUDIO_GENERATE, PIPELINE_OPERATION_IDS.VIDEO_GENERATE]),
 });
 
 function normalizeId(value) {
@@ -659,3 +730,4 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
+

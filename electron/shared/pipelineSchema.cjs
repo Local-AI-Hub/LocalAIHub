@@ -211,12 +211,28 @@ const COLLECTION_MAP_MAPPING_OPTIONS = Object.freeze([
     modes: Object.freeze(['cloud', 'localTool']),
   }),
   Object.freeze({
+    id: 'cloudImageToVideo',
+    label: 'Cloud image to video',
+    inputKind: PORT_KIND_IMAGE,
+    outputKind: PORT_KIND_VIDEO,
+    operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+    modes: Object.freeze(['cloud']),
+  }),
+  Object.freeze({
     id: 'imageToImage',
     label: 'Image to image',
     inputKind: PORT_KIND_IMAGE,
     outputKind: PORT_KIND_IMAGE,
     operationId: PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM,
     modes: Object.freeze(['localTool']),
+  }),
+  Object.freeze({
+    id: 'cloudImageToImage',
+    label: 'Cloud image to image',
+    inputKind: PORT_KIND_IMAGE,
+    outputKind: PORT_KIND_IMAGE,
+    operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+    modes: Object.freeze(['cloud']),
   }),
   Object.freeze({
     id: 'audioToText',
@@ -802,6 +818,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       imageQuality: 'auto',
       imageBackground: 'auto',
       videoSize: '1280x720',
+      videoAspectRatio: '16:9',
+      videoResolution: '720p',
       videoFps: 15,
       videoQuality: 5,
       videoItemMode: 'independent',
@@ -1877,9 +1895,21 @@ function getCollectionMapVideoFirstItemBehavior(node) {
     : 'textToVideo';
 }
 
+function doesCollectionMapCloudVideoChainSupportImageInput(node) {
+  const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+  if (!['google', 'xai'].includes(providerId)) {
+    return false;
+  }
+
+  const operation = String(node?.config?.model || '').trim()
+    ? getProviderModelCapabilities(providerId, node.config.model)?.operations?.[PIPELINE_OPERATION_IDS.VIDEO_GENERATE]
+    : getProviderPipelineOperation(providerId, PIPELINE_OPERATION_IDS.VIDEO_GENERATE);
+  return Boolean(operation?.inputKinds?.includes(PORT_KIND_IMAGE));
+}
+
 function isCollectionMapVideoContinuationChainEnabled(node) {
   return getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-    && getCollectionMapInputKind(node) === PORT_KIND_TEXT
+    && [PORT_KIND_TEXT, PORT_KIND_IMAGE].includes(getCollectionMapInputKind(node))
     && getCollectionMapOutputKind(node) === PORT_KIND_VIDEO
     && getCollectionMapVideoItemMode(node) === 'sequentialLastFrame';
 }
@@ -3803,7 +3833,7 @@ function getModelStepSupportState(node, capabilitySummary, contextMaps = {}, con
           capabilitySummary.operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
             ? 'Selected model does not support image generation on ' + capabilitySummary.targetLabel + '. Choose a dedicated image model such as gpt-image-1 before running this step.'
             : capabilitySummary.operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-              ? 'Selected model does not support video generation on ' + capabilitySummary.targetLabel + '. Choose a Sora video model such as sora-2 before running this step.'
+              ? 'Selected model does not support video generation on ' + capabilitySummary.targetLabel + '. Choose a Google Veo model such as veo-3.1-generate-preview or an xAI Grok Imagine video model such as grok-imagine-video before running this step.'
               : capabilitySummary.operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                 ? capabilitySummary.targetId === 'google'
                   ? 'Selected model does not support speech generation on ' + capabilitySummary.targetLabel + '. Choose a Gemini TTS model such as gemini-2.5-flash-preview-tts before running this step.'
@@ -5287,6 +5317,17 @@ function analyzePipeline(definition = {}, context = {}) {
               message: 'This video step is using an image input. Add motion guidance in the instruction box before running it.',
             };
             issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+          } else if (
+            executionMode === 'cloud'
+            && operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+            && connectedKinds.includes(PORT_KIND_IMAGE)
+            && !String(node.config?.instruction || '').trim()
+          ) {
+            summary.readiness = {
+              tone: 'error',
+              message: 'Add an image edit instruction before running cloud image-to-image generation.',
+            };
+            issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
           } else if (executionMode === 'cloud') {
             const providerStatus = getSelectedProviderStatus(node.config?.providerId, contextMaps);
             summary.readiness = {
@@ -5730,10 +5771,28 @@ function analyzePipeline(definition = {}, context = {}) {
             message: validationIssue.message,
           };
           issues.push(buildNodeIssue(node, validationIssue.tone, validationIssue.message));
-        } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && isCollectionMapVideoContinuationChainEnabled(node) && executionMode !== 'localTool') {
+        } else if (executionMode === 'cloud' && operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE && mapping.inputKind === PORT_KIND_IMAGE && !String(node.config?.instruction || '').trim()) {
           summary.readiness = {
             tone: 'error',
-            message: 'Sequential video continuity uses Wan2.1 image-to-video with a generated last-frame reference, so it is only available in local tool mode in this pass. Use independent clips for cloud video mapping.',
+            message: 'Add a shared image edit instruction before mapping a cloud image-to-image collection.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (executionMode === 'cloud' && operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && mapping.inputKind === PORT_KIND_IMAGE && !String(node.config?.instruction || '').trim()) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Add shared motion guidance before mapping a cloud image-to-video collection.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && isCollectionMapVideoContinuationChainEnabled(node) && executionMode === 'cloud' && !doesCollectionMapCloudVideoChainSupportImageInput(node)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Previous-last-frame chaining for cloud video needs a Google Veo or xAI Grok Imagine model that accepts image input. Choose a supported cloud video model or use independent clips.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && isCollectionMapVideoContinuationChainEnabled(node) && executionMode === 'graphWorkflow') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Previous-last-frame chaining is available for Wan local video maps, Google Veo cloud video maps, and xAI Grok Imagine cloud video maps only.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (executionMode === 'graphWorkflow') {
@@ -5829,7 +5888,7 @@ function analyzePipeline(definition = {}, context = {}) {
                 message: isCollectionMapAudioContinuationChainEnabled(node)
                   ? 'AudioCraft WebUI will generate this text collection as a sequential continuation chain, emit ordered audio segments, and record the final cumulative track in the collection manifest.'
                   : isCollectionMapVideoContinuationChainEnabled(node)
-                    ? 'Wan2.1 WebUI will render this text collection as an ordered video collection. The first item follows the configured first-item behavior, later accepted items use the previous clip last frame as the next reference image, and ffmpeg frame extraction plus chain metadata are recorded in the manifest.'
+                    ? 'Wan2.1 WebUI will render this collection as an ordered video collection. The first item follows the configured first-item behavior, later accepted items use the previous clip last frame as the next reference image, and ffmpeg frame extraction plus chain metadata are recorded in the manifest.'
                     : summary.readiness.message + ' Map Collection will emit an ordered ' + formatPortKindLabel(createCollectionPortKind(mapping.outputKind)).toLowerCase() + ' and keep item lineage.',
               };
               issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
@@ -5879,7 +5938,9 @@ function analyzePipeline(definition = {}, context = {}) {
                   }
                 : {
                     tone: 'info',
-                    message: (providerStatus.provider?.name || 'That provider') + ' will run ' + mapping.label.toLowerCase() + ' once per item and keep the original collection order.',
+                    message: isCollectionMapVideoContinuationChainEnabled(node)
+                      ? (providerStatus.provider?.name || 'That provider') + ' will render this collection sequentially, using each previous clip last frame as the next image reference and keeping item lineage.'
+                      : (providerStatus.provider?.name || 'That provider') + ' will run ' + mapping.label.toLowerCase() + ' once per item and keep the original collection order.',
                   };
           issues.push(buildNodeIssue(node, summary.readiness.tone, summary.readiness.message));
         }
@@ -6593,3 +6654,6 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
+
+
+

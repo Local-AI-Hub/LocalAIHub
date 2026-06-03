@@ -1273,7 +1273,7 @@ export default function App() {
 
     const capabilityId = capability ? String(capability).trim().toLowerCase() : null;
     if (!capabilityId && tool.installedCapabilities?.webui && tool.installedCapabilities?.desktop) {
-      pushToast(`${tool.name} has both WebUI and Desktop App installed. Capability-specific uninstall is paused in this build so Local AI Hub does not remove both by accident.`, 'error');
+      pushToast(`${tool.name} has both WebUI and Desktop App installed. Open settings and choose Uninstall WebUI or Uninstall Desktop App so Local AI Hub can preserve the other capability.`, 'error');
       return;
     }
 

@@ -14,6 +14,7 @@ const videoLastFrameExtractionRequests = [];
 const videoStitchCommandRequests = [];
 const localAudioStitchRequests = [];
 const providerImageGenerationPrompts = [];
+const providerVideoGenerationRequests = [];
 const perItemValidationRequests = [];
 const perItemValidationDecisionsByItemLabel = new Map();
 function flattenMockProviderText(value) {
@@ -100,16 +101,47 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
     }    if (request === './providerService') {
       return {
         chatWithProvider: async (_providerId, payload = {}) => ({ message: { content: buildMockValidationReply(payload) } }),
-        listProviderConnections: async () => ([{
-          id: 'openai',
-          name: 'OpenAI',
-          isConnected: true,
-          lastTestedAt: new Date().toISOString(),
-          lastTestSucceeded: true,
-        }]),
+        listProviderConnections: async () => ([
+          {
+            id: 'openai',
+            name: 'OpenAI',
+            isConnected: true,
+            lastTestedAt: new Date().toISOString(),
+            lastTestSucceeded: true,
+          },
+          {
+            id: 'google',
+            name: 'Google (Gemini)',
+            isConnected: true,
+            lastTestedAt: new Date().toISOString(),
+            lastTestSucceeded: true,
+          },
+          {
+            id: 'xai',
+            name: 'xAI (Grok)',
+            isConnected: true,
+            lastTestedAt: new Date().toISOString(),
+            lastTestSucceeded: true,
+          },
+        ]),
         runProviderOperation: async (_providerId, payload = {}) => {
           if (payload.operationId === 'audioGenerate') return { audios: [{ buffer: WAVE_FIXTURE, extension: '.wav', sampleRate: 16000, channelCount: 1, bitDepth: 16 }] };
-          if (payload.operationId === 'videoGenerate') return { videos: [{ buffer: Buffer.from('video-output'), extension: '.mp4' }] };
+          if (payload.operationId === 'videoGenerate') {
+            providerVideoGenerationRequests.push({ providerId: _providerId, ...payload });
+            const videoIdPrefix = _providerId === 'xai' ? 'xai-mock-video-' : 'operations/mock-veo-';
+            const videoId = videoIdPrefix + providerVideoGenerationRequests.length;
+            return {
+              model: payload.model || (_providerId === 'xai' ? 'grok-imagine-video' : 'models/veo-3.1-generate-preview'),
+              operation: payload.imageReference ? 'imageToVideo' : 'textToVideo',
+              polling: { attemptCount: 1, durationMs: 25 },
+              provider: _providerId,
+              providerOperationId: videoId,
+              providerRawStatusSummary: _providerId === 'xai' ? { requestId: videoId, status: 'succeeded' } : { done: true, name: videoId },
+              requestedSettings: { aspectRatio: payload.aspectRatio || '16:9', resolution: payload.resolution || '720p' },
+              safetyNotes: [],
+              videos: [{ buffer: Buffer.from('video-output'), extension: '.mp4', mimeType: 'video/mp4' }],
+            };
+          }
           if (payload.operationId === 'imageAnalyze') return { message: { content: 'cloud image description' } };
           providerImageGenerationPrompts.push(String(payload.prompt || ''));
           return { images: [{ base64Data: ONE_PIXEL_PNG }] };
@@ -596,9 +628,9 @@ async function main() {
   const analysis = analyzePipeline(pipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true, lastTestedAt: new Date().toISOString(), lastTestSucceeded: true }] });
   assert.strictEqual(analysis.executable, true, 'collection map pipeline should analyze as executable with a connected provider');
 
-  const cloudVideoPipeline = buildCollectionMapPipeline({ operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE, mapConfig: { model: 'mock-video-model', videoSize: '1280x720' } });
+  const cloudVideoPipeline = buildCollectionMapPipeline({ operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE, mapConfig: { providerId: 'google', model: 'models/veo-3.1-generate-preview', videoSize: '1280x720' } });
   assert.deepStrictEqual(buildPipelineGraph(cloudVideoPipeline).errors, [], 'collection:text -> collection:video should be structurally valid.');
-  const cloudVideoAnalysis = analyzePipeline(cloudVideoPipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true, lastTestedAt: new Date().toISOString(), lastTestSucceeded: true }] });
+  const cloudVideoAnalysis = analyzePipeline(cloudVideoPipeline, { providers: [{ id: 'google', name: 'Google (Gemini)', isConnected: true, lastTestedAt: new Date().toISOString(), lastTestSucceeded: true }] });
   assert.strictEqual(cloudVideoAnalysis.executable, true, cloudVideoAnalysis.primaryIssue?.message || 'cloud text-to-video collection map should analyze as executable with a connected provider.');
 
 
@@ -1062,20 +1094,181 @@ async function main() {
   assert(missingWanModelsAnalysis.issues.some((issue) => /Wan model assets|model folders|models\\Wan-AI/i.test(issue.message)), 'missing Wan model folders should be reported honestly.');
   const lowHardwareVideoAnalysis = analyzePipeline(textToVideoPipeline, { tools: [createWanTool()], toolCatalog: [createWanTool()], hardware: { gpuModel: 'NVIDIA GTX 1060', systemRamMb: 16384, vramMb: 6144 } });
   assert(lowHardwareVideoAnalysis.issues.some((issue) => /below|higher-VRAM|hardware targets/i.test(issue.message)), 'below-target Wan hardware should surface a conservative readiness warning.');
+  providerVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
   const cloudVideoChainPipeline = buildCollectionInputMapPipeline({
     itemType: 'text',
-    items: [{ id: 'cloud-chain-a', text: 'opening shot' }],
+    items: [{ id: 'cloud-chain-a', text: 'opening shot' }, { id: 'cloud-chain-b', text: 'follow the same subject into golden light' }],
+    mapConfig: {
+      executionMode: 'cloud',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      providerId: 'google',
+      model: 'models/veo-3.1-generate-preview',
+      instruction: 'Keep a smooth documentary camera move.',
+      negativePrompt: 'jitter',
+      videoAspectRatio: '16:9',
+      videoItemMode: 'sequentialLastFrame',
+      videoResolution: '720p',
+    },
+  });
+  const cloudVideoChainAnalysis = analyzePipeline(cloudVideoChainPipeline, { providers: [{ id: 'google', name: 'Google (Gemini)', isConnected: true }] });
+  assert.strictEqual(cloudVideoChainAnalysis.executable, true, cloudVideoChainAnalysis.primaryIssue?.message || 'Google Veo previous-last-frame collection chain should analyze as executable.');
+  await runPipeline(cloudVideoChainPipeline);
+  const cloudVideoChainSnapshot = await waitForRunToFinish();
+  assert.strictEqual(cloudVideoChainSnapshot.status, 'completed', cloudVideoChainSnapshot.message);
+  const cloudVideoChainCollection = cloudVideoChainSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(cloudVideoChainCollection.itemKind, 'video', 'cloud text-to-video should output a video collection.');
+  assert.strictEqual(cloudVideoChainCollection.collectionMapping.providerId, 'google', 'cloud video manifest should record Google provider.');
+  assert.strictEqual(cloudVideoChainCollection.collectionMapping.model, 'models/veo-3.1-generate-preview', 'cloud video manifest should record selected Veo model.');
+  assert.strictEqual(cloudVideoChainCollection.collectionMapping.videoChain.enabled, true, 'cloud video manifest should record enabled chaining.');
+  assert.strictEqual(cloudVideoChainCollection.collectionMapping.videoChain.chainMode, 'previousLastFrameAsNextStartImage', 'cloud video manifest should record chain mode.');
+  assert.deepStrictEqual(cloudVideoChainCollection.items.map((entry) => entry.lineage.sourceItemIndex), [0, 1], 'cloud text-to-video should preserve source order lineage.');
+  assert.strictEqual(providerVideoGenerationRequests.length, 2, 'cloud text-to-video chain should generate each item sequentially.');
+  assert.strictEqual(providerVideoGenerationRequests[0].providerId, 'google', 'cloud text-to-video should use the Google provider path.');
+  assert.strictEqual(providerVideoGenerationRequests[0].operationSubtype, 'textToVideo', 'first chained text item should start as text-to-video.');
+  assert.strictEqual(providerVideoGenerationRequests[1].operationSubtype, 'imageToVideo', 'second chained text item should use image-to-video.');
+  assert(providerVideoGenerationRequests[1].imageReference?.buffer, 'second chained text item should pass the extracted last frame as imageReference.');
+  assert.strictEqual(videoLastFrameExtractionRequests.length, 1, 'cloud text-to-video chain should extract one previous last frame for item 2.');
+  assert.strictEqual(cloudVideoChainCollection.items[1].metadata.videoContinuationChain.previousLastFrameArtifactPath, videoLastFrameExtractionRequests[0].artifact.filePath, 'cloud chain metadata should record the extracted frame used by item 2.');
+  assert.strictEqual(cloudVideoChainCollection.items[1].artifact.videoGeneration.providerOperationId, 'operations/mock-veo-2', 'cloud video sidecar metadata should record provider operation id.');
+  assert.strictEqual(cloudVideoChainCollection.items[1].artifact.videoGeneration.operationSubtype, 'imageToVideo', 'cloud video sidecar metadata should record imageToVideo operation subtype.');
+
+  const staleOpenAiVideoPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [{ id: 'sora-stale-a', text: 'opening shot' }],
     mapConfig: {
       executionMode: 'cloud',
       mappingId: 'textToVideo',
       operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
       providerId: 'openai',
-      model: 'mock-video-model',
+      model: 'sora-2',
+    },
+  });
+  const staleOpenAiVideoAnalysis = analyzePipeline(staleOpenAiVideoPipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true }] });
+  assert(staleOpenAiVideoAnalysis.issues.some((issue) => /does not support video generation|Google Veo/i.test(issue.message)), 'stale OpenAI/Sora collection video configs should be capability-gated off.');
+
+  providerVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
+  const imageAPath = writeFixtureFile('cloud-video-source-a.png', Buffer.from(ONE_PIXEL_PNG, 'base64'));
+  const imageBPath = writeFixtureFile('cloud-video-source-b.png', Buffer.from(ONE_PIXEL_PNG, 'base64'));
+  const cloudImageToVideoPipeline = buildCollectionInputMapPipeline({
+    itemType: 'image',
+    items: [{ id: 'image-video-a', filePath: imageAPath }, { id: 'image-video-b', filePath: imageBPath }],
+    mapConfig: {
+      executionMode: 'cloud',
+      mappingId: 'cloudImageToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      providerId: 'google',
+      model: 'models/veo-3.1-generate-preview',
+      instruction: 'Animate each image with a slow push-in.',
       videoItemMode: 'sequentialLastFrame',
     },
   });
-  const cloudVideoChainAnalysis = analyzePipeline(cloudVideoChainPipeline, { providers: [{ id: 'openai', name: 'OpenAI', isConnected: true }] });
-  assert(cloudVideoChainAnalysis.issues.some((issue) => /only available in local tool mode|Use independent clips/i.test(issue.message)), 'cloud sequential video chains should be rejected with a clear readiness issue.');
+  const cloudImageToVideoAnalysis = analyzePipeline(cloudImageToVideoPipeline, { providers: [{ id: 'google', name: 'Google (Gemini)', isConnected: true }] });
+  assert.strictEqual(cloudImageToVideoAnalysis.executable, true, cloudImageToVideoAnalysis.primaryIssue?.message || 'Google Veo image-to-video collection map should analyze as executable.');
+  await runPipeline(cloudImageToVideoPipeline);
+  const cloudImageToVideoSnapshot = await waitForRunToFinish();
+  assert.strictEqual(cloudImageToVideoSnapshot.status, 'completed', cloudImageToVideoSnapshot.message);
+  const cloudImageToVideoCollection = cloudImageToVideoSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(cloudImageToVideoCollection.collectionMapping.mappingId, 'cloudImageToVideo', 'image-to-video collection should preserve mapping metadata.');
+  assert.deepStrictEqual(cloudImageToVideoCollection.items.map((entry) => entry.lineage.sourceItemIndex), [0, 1], 'image-to-video collection should preserve source order lineage.');
+  assert.strictEqual(providerVideoGenerationRequests.length, 2, 'cloud image-to-video should generate each image item once.');
+  assert.strictEqual(providerVideoGenerationRequests[0].operationSubtype, 'imageToVideo', 'image collection item 1 should use image-to-video.');
+  assert.strictEqual(providerVideoGenerationRequests[1].operationSubtype, 'imageToVideo', 'chained image collection item 2 should still use image-to-video.');
+  assert.strictEqual(providerVideoGenerationRequests[1].imageReference.fileName, videoLastFrameExtractionRequests[0].artifact.fileName, 'chained image item 2 should pass the previous last frame as the next reference image.');
+  assert.strictEqual(cloudImageToVideoCollection.items[0].metadata.videoContinuationChain.referenceRole, 'firstImageInput', 'image-to-video chain metadata should record the first source-image start.');
+  assert.strictEqual(cloudImageToVideoCollection.items[1].metadata.videoContinuationChain.referenceRole, 'previousLastFrame', 'image-to-video chain metadata should record previous-last-frame use.');
+  assert.strictEqual(cloudImageToVideoCollection.items[1].artifact.videoGeneration.sourceInputImage.filePath, imageBPath, 'image-to-video metadata should preserve current source image lineage even when chained.');
+
+  providerVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
+  const xaiTextToVideoPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [{ id: 'xai-text-a', text: 'wide shot of neon rain' }, { id: 'xai-text-b', text: 'close shot of reflected lights' }],
+    mapConfig: {
+      executionMode: 'cloud',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      providerId: 'xai',
+      model: 'grok-imagine-video',
+      instruction: 'Use gentle cinematic motion.',
+      durationSeconds: 8,
+      videoAspectRatio: '16:9',
+      videoResolution: '720p',
+      videoItemMode: 'independent',
+    },
+  });
+  const xaiTextToVideoAnalysis = analyzePipeline(xaiTextToVideoPipeline, { providers: [{ id: 'xai', name: 'xAI (Grok)', isConnected: true }] });
+  assert.strictEqual(xaiTextToVideoAnalysis.executable, true, xaiTextToVideoAnalysis.primaryIssue?.message || 'xAI text-to-video collection map should analyze as executable.');
+  await runPipeline(xaiTextToVideoPipeline);
+  const xaiTextToVideoSnapshot = await waitForRunToFinish();
+  assert.strictEqual(xaiTextToVideoSnapshot.status, 'completed', xaiTextToVideoSnapshot.message);
+  const xaiTextToVideoCollection = xaiTextToVideoSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(xaiTextToVideoCollection.itemKind, 'video', 'xAI text-to-video should output a video collection.');
+  assert.strictEqual(xaiTextToVideoCollection.collectionMapping.providerId, 'xai', 'xAI text-to-video manifest should record provider.');
+  assert.strictEqual(xaiTextToVideoCollection.collectionMapping.videoChain.enabled, false, 'xAI independent collection map should keep chaining disabled.');
+  assert.strictEqual(xaiTextToVideoCollection.collectionMapping.videoChain.providerChainingSupportStatus, 'supported', 'xAI manifest should record image-reference chain support status.');
+  assert.deepStrictEqual(xaiTextToVideoCollection.items.map((entry) => entry.lineage.sourceItemIndex), [0, 1], 'xAI text-to-video should preserve source order lineage.');
+  assert.strictEqual(providerVideoGenerationRequests.length, 2, 'xAI text-to-video should generate each item sequentially.');
+  assert(providerVideoGenerationRequests.every((request) => request.providerId === 'xai'), 'xAI text-to-video should use the xAI provider path.');
+  assert(providerVideoGenerationRequests.every((request) => request.operationSubtype === 'textToVideo'), 'xAI text collection items should route as text-to-video.');
+  assert(providerVideoGenerationRequests.every((request) => !request.imageReference), 'xAI independent text-to-video should not pass image references.');
+  const xaiFirstVideo = xaiTextToVideoCollection.items[0].artifact;
+  assert.strictEqual(xaiFirstVideo.videoGeneration.provider, 'xai', 'xAI sidecar metadata should record provider.');
+  assert.strictEqual(xaiFirstVideo.videoGeneration.model, 'grok-imagine-video', 'xAI sidecar metadata should record model.');
+  assert.strictEqual(xaiFirstVideo.videoGeneration.operationSubtype, 'textToVideo', 'xAI sidecar metadata should record textToVideo operation.');
+  assert.strictEqual(xaiFirstVideo.videoGeneration.collectionMap.sourceItemId, 'xai-text-a', 'xAI video metadata should preserve source item id.');
+  assert(xaiFirstVideo.videoGeneration.providerOperationId, 'xAI video metadata should include provider request id.');
+
+  providerVideoGenerationRequests.length = 0;
+  videoLastFrameExtractionRequests.length = 0;
+  const xaiImageToVideoPipeline = buildCollectionInputMapPipeline({
+    itemType: 'image',
+    items: [{ id: 'xai-image-video-a', filePath: imageAPath }, { id: 'xai-image-video-b', filePath: imageBPath }],
+    mapConfig: {
+      executionMode: 'cloud',
+      mappingId: 'cloudImageToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      providerId: 'xai',
+      model: 'grok-imagine-video',
+      instruction: 'Animate the still with a slow camera drift.',
+      durationSeconds: 8,
+      videoItemMode: 'sequentialLastFrame',
+      videoResolution: '720p',
+    },
+  });
+  const xaiImageToVideoAnalysis = analyzePipeline(xaiImageToVideoPipeline, { providers: [{ id: 'xai', name: 'xAI (Grok)', isConnected: true }] });
+  assert.strictEqual(xaiImageToVideoAnalysis.executable, true, xaiImageToVideoAnalysis.primaryIssue?.message || 'xAI image-to-video collection map should analyze as executable.');
+  await runPipeline(xaiImageToVideoPipeline);
+  const xaiImageToVideoSnapshot = await waitForRunToFinish();
+  assert.strictEqual(xaiImageToVideoSnapshot.status, 'completed', xaiImageToVideoSnapshot.message);
+  const xaiImageToVideoCollection = xaiImageToVideoSnapshot.nodeStates['map-collection'].outputs.collection;
+  assert.strictEqual(xaiImageToVideoCollection.collectionMapping.providerId, 'xai', 'xAI image-to-video manifest should record provider.');
+  assert.strictEqual(xaiImageToVideoCollection.collectionMapping.videoChain.enabled, true, 'xAI image-to-video manifest should record enabled chaining.');
+  assert.strictEqual(xaiImageToVideoCollection.collectionMapping.videoChain.providerChainingSupportStatus, 'supported', 'xAI chain manifest should record supported chaining.');
+  assert.strictEqual(providerVideoGenerationRequests.length, 2, 'xAI image-to-video should generate each image item once.');
+  assert(providerVideoGenerationRequests.every((request) => request.providerId === 'xai'), 'xAI image-to-video should use the xAI provider path.');
+  assert(providerVideoGenerationRequests.every((request) => request.operationSubtype === 'imageToVideo'), 'xAI image collection items should route as image-to-video.');
+  assert.strictEqual(videoLastFrameExtractionRequests.length, 1, 'xAI cloud video chain should extract the previous last frame.');
+  assert.strictEqual(providerVideoGenerationRequests[1].imageReference.fileName, videoLastFrameExtractionRequests[0].artifact.fileName, 'xAI chained image item 2 should pass the previous last frame as the next starting image.');
+  assert.strictEqual(xaiImageToVideoCollection.items[1].metadata.videoContinuationChain.referenceRole, 'previousLastFrame', 'xAI image-to-video chain metadata should record previous-last-frame use.');
+  assert.strictEqual(xaiImageToVideoCollection.items[1].artifact.videoGeneration.sourceInputImage.filePath, imageBPath, 'xAI image-to-video metadata should preserve current source image lineage when chained.');
+
+  const unsupportedCloudChainPipeline = buildCollectionInputMapPipeline({
+    itemType: 'text',
+    items: [{ id: 'unsupported-cloud-chain-a', text: 'opening shot' }],
+    mapConfig: {
+      executionMode: 'cloud',
+      mappingId: 'textToVideo',
+      operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+      providerId: 'google',
+      model: 'models/gemini-2.5-flash',
+      videoItemMode: 'sequentialLastFrame',
+    },
+  });
+  const unsupportedCloudChainAnalysis = analyzePipeline(unsupportedCloudChainPipeline, { providers: [{ id: 'google', name: 'Google (Gemini)', isConnected: true }] });
+  assert(unsupportedCloudChainAnalysis.issues.some((issue) => /image-to-video|accepts image input|Selected model does not support video generation/i.test(issue.message)), 'unsupported Google chaining model should fail clearly.');
   const missingInitialReferenceAnalysis = analyzePipeline(buildCollectionInputMapPipeline({
     itemType: 'text',
     items: [{ id: 'missing-ref-a', text: 'opening shot' }],

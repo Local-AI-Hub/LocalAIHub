@@ -387,7 +387,7 @@ function buildMediaCompositionValidationRetryPipeline(assetPaths, options = {}) 
 }
 
 async function prepareAssets() {
-  const assetRoot = path.join(TEST_STORAGE_ROOT, 'fixtures');
+  const assetRoot = path.join(TEST_STORAGE_ROOT, 'fixtures', 'case-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8));
   fs.mkdirSync(assetRoot, { recursive: true });
   const imageOne = path.join(assetRoot, 'scene-1.gif');
   const imageTwo = path.join(assetRoot, 'scene-2.gif');

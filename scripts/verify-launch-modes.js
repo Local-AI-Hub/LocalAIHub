@@ -343,11 +343,14 @@ async function main() {
   assert(libraryCardSource.includes('Pipeline Builder'), 'Pipeline-only Library cards should keep their existing Pipeline Builder action.');
   assert(libraryCardSource.includes("onLaunch(tool.id, { launchMode: mode.id })"), 'Library mode actions should pass only the mode id.');
 
+  const installerSource = fs.readFileSync(path.join(process.cwd(), 'electron', 'services', 'installerService.js'), 'utf8');
   const appSource = fs.readFileSync(path.join(process.cwd(), 'src', 'App.jsx'), 'utf8');
   assert(appSource.includes('allInstallCapabilitiesInstalled'), 'Store visibility should account for partial WebUI/Desktop capability installs.');
   assert(appSource.includes("capability === 'default'"), 'Single-identity tools such as Ollama should count as installed when they already exist in Library.');
   assert(appSource.includes('capability: capabilityId'), 'Store install requests should pass only a capability id, not executable paths.');
-  assert(appSource.includes('Capability-specific uninstall is paused'), 'Dual-capability uninstall should not remove both installs accidentally.');
+  assert(!appSource.includes('Capability-specific uninstall is paused'), 'Dual-capability uninstall should no longer be paused in the renderer.');
+  assert(installerSource.includes('uninstallDualWebuiCapability'), 'Dual-capability WebUI uninstall should use a guarded capability-specific service path.');
+  assert(installerSource.includes('uninstallDualDesktopCapability'), 'Dual-capability Desktop App uninstall should use a guarded official-uninstaller service path.');
   assert(appSource.includes('repairLibraryTool(tool, capability'), 'Library repair actions should be capability-aware.');
   assert(appSource.includes('uninstallTool({ toolId: tool.id, capability: capabilityId })'), 'Library uninstall requests should pass capability ids instead of raw paths.');
 
@@ -363,7 +366,6 @@ async function main() {
   assert(libraryCardSourceAgain.includes('Uninstall WebUI'), 'Dual-capability Library cards should label WebUI uninstall explicitly.');
   assert(libraryCardSourceAgain.includes('Uninstall Desktop App'), 'Dual-capability Library cards should label Desktop App uninstall explicitly.');
 
-  const installerSource = fs.readFileSync(path.join(process.cwd(), 'electron', 'services', 'installerService.js'), 'utf8');
   assert(installerSource.includes('ensureManagedCudaPyTorch'), 'ComfyUI install/repair should install and verify a managed CUDA PyTorch build before pip check.');
   assert(installerSource.includes("MANAGED_CUDA_PYTORCH_INSTALL_TOOL_IDS = new Set(['comfyui'])"), 'Managed CUDA PyTorch install should stay scoped to ComfyUI in this pass.');
   assert(installerSource.includes('persistCompanionDesktopDetection'), 'Companion desktop installs should be marked installed only after a detection pass.');

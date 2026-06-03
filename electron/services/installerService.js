@@ -42,15 +42,6 @@ const OFFICIAL_UNINSTALL_SETTLE_POLL_MS = 1000;
 const MANAGED_CUDA_PYTORCH_INSTALL_TOOL_IDS = new Set(['comfyui']);
 const PYTORCH_CUDA_INSTALL_BUILDS = [
   {
-    channel: 'cu126',
-    label: 'CUDA 12.6',
-    minCudaVersion: [12, 6],
-    torch: '2.6.0',
-    torchvision: '0.21.0',
-    torchaudio: '2.6.0',
-    indexUrl: 'https://download.pytorch.org/whl/cu126',
-  },
-  {
     channel: 'cu124',
     label: 'CUDA 12.4',
     minCudaVersion: [12, 4],
@@ -767,10 +758,6 @@ function parseVersionParts(value) {
     .filter((part) => Number.isFinite(part));
 }
 
-function isLegacyNvidiaModel(model) {
-  return /\b(gtx|tesla p|quadro p)\b/i.test(String(model || '')) && !/\brtx\b/i.test(String(model || ''));
-}
-
 function selectManagedCudaPyTorchBuild(hardware) {
   if (!hardware?.nvidiaSmiAvailable || !/nvidia/i.test(`${hardware.gpuVendor || ''} ${hardware.gpuModel || ''}`)) {
     return null;
@@ -786,10 +773,28 @@ function selectManagedCudaPyTorchBuild(hardware) {
     return null;
   }
 
-  return [...candidates].sort((left, right) => {
-    const comparison = compareVersions(left.minCudaVersion, right.minCudaVersion);
-    return isLegacyNvidiaModel(hardware.gpuModel) ? comparison : comparison * -1;
-  })[0];
+  return [...candidates].sort((left, right) => compareVersions(right.minCudaVersion, left.minCudaVersion))[0];
+}
+
+function buildManagedCudaPyTorchPackageSpec(build, packageName) {
+  const version = build?.[packageName];
+  const channel = String(build?.channel || '').trim();
+  if (!version || !channel) {
+    throw new Error('Local AI Hub could not identify the PyTorch CUDA package version to install.');
+  }
+
+  return `${packageName}==${version}+${channel}`;
+}
+
+function buildManagedCudaPyTorchUnsupportedMessage(manifest, hardware) {
+  const gpuModel = String(hardware?.gpuModel || '').trim();
+  const cudaVersion = String(hardware?.nvidiaCudaVersion || '').trim();
+  const minimum = PYTORCH_CUDA_INSTALL_BUILDS[PYTORCH_CUDA_INSTALL_BUILDS.length - 1]?.label || 'a supported CUDA runtime';
+  if (!hardware?.nvidiaSmiAvailable || !/nvidia/i.test(`${hardware?.gpuVendor || ''} ${gpuModel}`)) {
+    return `${manifest.name} WebUI needs a CUDA-enabled PyTorch build for managed NVIDIA acceleration, but Local AI Hub could not detect a working NVIDIA driver on this PC. Install or update the NVIDIA driver, then run Repair again.`;
+  }
+
+  return `${manifest.name} WebUI needs a CUDA-enabled PyTorch build, but this PC reports NVIDIA CUDA runtime ${cudaVersion || 'unknown'}. Local AI Hub needs ${minimum} or newer from the NVIDIA driver. Update the NVIDIA driver, then run Repair again.`;
 }
 
 async function removeStaleManagedTorchArtifacts(toolState, logger) {
@@ -814,15 +819,22 @@ async function removeStaleManagedTorchArtifacts(toolState, logger) {
 async function verifyManagedCudaPyTorch(toolState, build, logger) {
   const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
   const verificationSnippet = [
-    'import json',
+    'import importlib, json',
     'info = {}',
     'import torch',
     "info['torchVersion'] = getattr(torch, '__version__', 'unknown')",
     "info['cudaAvailable'] = bool(torch.cuda.is_available())",
     "info['cudaVersion'] = getattr(torch.version, 'cuda', None)",
     "info['deviceName'] = torch.cuda.get_device_name(0) if info['cudaAvailable'] else None",
+    "info['imports'] = {}",
+    "for module_name in ['torchvision', 'torchaudio']:",
+    "    try:",
+    "        module = importlib.import_module(module_name)",
+    "        info['imports'][module_name] = getattr(module, '__version__', 'imported')",
+    "    except Exception as exc:",
+    "        info['imports'][module_name] = exc.__class__.__name__ + ': ' + str(exc)",
     'print(json.dumps(info))',
-  ].join('; ');
+  ].join('\n');
   const result = await runCommand(pythonPath, ['-c', verificationSnippet], {
     cwd: toolState.appDir,
     env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
@@ -839,8 +851,20 @@ async function verifyManagedCudaPyTorch(toolState, build, logger) {
   }
 
   const verification = JSON.parse(payload);
+  const torchVersion = String(verification.torchVersion || '').trim();
+  const torchCudaVersion = String(verification.cudaVersion || '').trim();
+  if (!torchCudaVersion || /\+cpu\b/i.test(torchVersion)) {
+    throw new Error(`${toolState.name || 'This tool'} has a CPU-only PyTorch build (${torchVersion || 'unknown'}). Run Repair so Local AI Hub can reinstall the NVIDIA ${build.label} PyTorch wheels.`);
+  }
+
   if (!verification.cudaAvailable) {
-    throw new Error(`PyTorch still cannot see CUDA after installing the ${build.label} build.`);
+    throw new Error(`${toolState.name || 'This tool'} has NVIDIA PyTorch ${torchVersion || build.label}, but PyTorch still cannot use the GPU. Update the NVIDIA driver, close other GPU tools, then run Repair again.`);
+  }
+
+  const failedCompanionImports = Object.entries(verification.imports || {})
+    .filter(([, value]) => /(?:error|exception|modulenotfound|importerror)/i.test(String(value || '')));
+  if (failedCompanionImports.length) {
+    throw new Error(`${toolState.name || 'This tool'} installed PyTorch CUDA, but torchvision or torchaudio does not match it. Run Repair so Local AI Hub can reinstall the matching NVIDIA PyTorch stack.`);
   }
 
   await logger.info('Managed CUDA PyTorch verification succeeded.', verification);
@@ -855,13 +879,13 @@ async function ensureManagedCudaPyTorch(toolState, manifest, logger, onProgress)
   const hardware = await detectHardwareSnapshot().catch(() => null);
   const build = selectManagedCudaPyTorchBuild(hardware);
   if (!build) {
-    await logger.warn('Skipping managed CUDA PyTorch install because this PC does not expose a supported NVIDIA CUDA runtime.', {
+    await logger.warn('Managed CUDA PyTorch install could not select a supported NVIDIA wheel.', {
       gpuModel: hardware?.gpuModel || null,
       gpuVendor: hardware?.gpuVendor || null,
       nvidiaCudaVersion: hardware?.nvidiaCudaVersion || null,
       nvidiaSmiAvailable: Boolean(hardware?.nvidiaSmiAvailable),
     });
-    return null;
+    throw new Error(buildManagedCudaPyTorchUnsupportedMessage(manifest, hardware));
   }
 
   const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
@@ -881,9 +905,9 @@ async function ensureManagedCudaPyTorch(toolState, manifest, logger, onProgress)
       '--upgrade',
       '--force-reinstall',
       '--no-cache-dir',
-      `torch==${build.torch}`,
-      `torchvision==${build.torchvision}`,
-      `torchaudio==${build.torchaudio}`,
+      buildManagedCudaPyTorchPackageSpec(build, 'torch'),
+      buildManagedCudaPyTorchPackageSpec(build, 'torchvision'),
+      buildManagedCudaPyTorchPackageSpec(build, 'torchaudio'),
       '--index-url',
       build.indexUrl,
     ],
@@ -1920,6 +1944,138 @@ function buildAudiocraftPipelineInstallFailureMessage(probe) {
   return 'Local AI Hub installed AudioCraft WebUI, but it could not load the Python packages needed for pipeline audio generation. Run Repair or reinstall AudioCraft WebUI, then try again.';
 }
 
+function buildComfyUiDependencyVerificationScript() {
+  return [
+    'import importlib, json, os, sys',
+    'checks = [["torchvision", "torchvision"], ["torchaudio", "torchaudio"], ["torchsde", "torchsde"], ["numpy", "NumPy"], ["PIL", "Pillow"], ["yaml", "PyYAML"], ["aiohttp", "aiohttp"], ["safetensors", "safetensors"], ["psutil", "psutil"], ["tqdm", "tqdm"]]',
+    'missing = []',
+    'failures = []',
+    'versions = {}',
+    'cuda_available = False',
+    'cuda_version = ""',
+    'torch_version = ""',
+    'device_name = ""',
+    'try:',
+    '    torch = importlib.import_module("torch")',
+    '    torch_version = str(getattr(torch, "__version__", "") or "")',
+    '    cuda_version = str(getattr(getattr(torch, "version", None), "cuda", "") or "")',
+    '    cuda_available = bool(torch.cuda.is_available())',
+    '    device_name = str(torch.cuda.get_device_name(0)) if cuda_available else ""',
+    'except ModuleNotFoundError as exc:',
+    '    missing.append(str(getattr(exc, "name", "") or "torch"))',
+    'except Exception as exc:',
+    '    failures.append({"module": "torch", "errorType": exc.__class__.__name__, "message": str(exc)})',
+    'for module_name, label in checks:',
+    '    try:',
+    '        module = importlib.import_module(module_name)',
+    '        versions[module_name] = str(getattr(module, "__version__", "imported") or "imported")',
+    '    except ModuleNotFoundError as exc:',
+    '        missing.append(str(getattr(exc, "name", "") or label))',
+    '    except Exception as exc:',
+    '        failures.append({"module": module_name, "label": label, "errorType": exc.__class__.__name__, "message": str(exc)})',
+    'main_present = os.path.exists("main.py")',
+    'ready = bool(main_present and not missing and not failures and cuda_version and cuda_available and "+cpu" not in torch_version.lower())',
+    'payload = {"ready": ready, "mainPresent": main_present, "missing": sorted(set(missing)), "failures": failures, "versions": versions, "cudaAvailable": cuda_available, "cudaVersion": cuda_version, "torchVersion": torch_version, "deviceName": device_name}',
+    'print(json.dumps(payload))',
+    'sys.exit(0 if payload["ready"] else 3)',
+  ].join('\n');
+}
+
+function buildComfyUiDependencyFailureMessage(probe = null) {
+  const torchVersion = String(probe?.torchVersion || '').trim();
+  const cudaVersion = String(probe?.cudaVersion || '').trim();
+  const missing = Array.isArray(probe?.missing) ? probe.missing.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+  const failures = Array.isArray(probe?.failures) ? probe.failures : [];
+
+  if (probe?.mainPresent === false) {
+    return 'ComfyUI WebUI finished installing, but main.py is missing from its managed source folder. Run Repair again while online, or reinstall ComfyUI WebUI.';
+  }
+
+  if (!cudaVersion || /\+cpu\b/i.test(torchVersion)) {
+    const suffix = torchVersion ? ` Current torch version: ${torchVersion}.` : '';
+    return 'ComfyUI WebUI is using a CPU-only PyTorch build instead of an NVIDIA CUDA build. Run Repair so Local AI Hub can reinstall CUDA PyTorch 2.6.0 from the CUDA 12.4 wheel index.' + suffix;
+  }
+
+  if (probe?.cudaAvailable === false) {
+    return `ComfyUI WebUI has CUDA PyTorch${torchVersion ? ' ' + torchVersion : ''}, but PyTorch cannot use the NVIDIA GPU on this PC. Update the NVIDIA driver, close other GPU tools, then run Repair again.`;
+  }
+
+  if (missing.length) {
+    return 'ComfyUI WebUI finished installing, but its Python environment is still missing: ' + missing.join(', ') + '. Run Repair again while online, or reinstall ComfyUI WebUI.';
+  }
+
+  if (failures.length) {
+    const details = failures
+      .map((entry) => String(entry?.module || entry?.label || '').trim())
+      .filter(Boolean)
+      .slice(0, 5)
+      .join(', ');
+    return 'ComfyUI WebUI finished installing, but some launch-critical Python packages could not import' + (details ? ': ' + details : '') + '. Run Repair again while online, or reinstall ComfyUI WebUI.';
+  }
+
+  return 'ComfyUI WebUI finished installing, but Local AI Hub could not verify its CUDA PyTorch runtime. Run Repair again while online, or reinstall ComfyUI WebUI.';
+}
+
+async function verifyComfyUiManagedRuntimeReadiness(toolState, manifest, logger) {
+  if (manifest?.id !== 'comfyui') {
+    return null;
+  }
+
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  if (!(await fs.pathExists(pythonPath))) {
+    throw new Error('ComfyUI WebUI finished installing, but its Python environment is missing.');
+  }
+
+  const result = await runCommand(pythonPath, ['-c', buildComfyUiDependencyVerificationScript()], {
+    allowFailure: true,
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+  });
+  const probe = parseRvcDependencyProbe(result.stdout);
+  if (Number(result.code || 0) === 0 && probe?.ready !== false) {
+    await logger.info('ComfyUI WebUI CUDA and launch-critical Python dependencies verified.', {
+      cudaAvailable: probe?.cudaAvailable,
+      cudaVersion: probe?.cudaVersion || '',
+      deviceName: probe?.deviceName || '',
+      torchVersion: probe?.torchVersion || '',
+    });
+    return probe;
+  }
+
+  throw new Error(buildComfyUiDependencyFailureMessage(probe));
+}
+
+async function runManagedPipCheck(toolState, manifest, logger) {
+  const pythonPath = path.join(toolState.venvDir, 'Scripts', 'python.exe');
+  const options = {
+    cwd: toolState.appDir,
+    env: buildManagedProcessEnv(toolState, {}, { requireVirtualEnv: true }),
+    errorMessage: `Local AI Hub installed ${manifest.name}, but its Python environment still has dependency conflicts.`,
+  };
+
+  if (manifest?.id !== 'comfyui') {
+    await runCommand(pythonPath, ['-m', 'pip', 'check'], options);
+    return null;
+  }
+
+  const result = await runCommand(pythonPath, ['-m', 'pip', 'check'], {
+    ...options,
+    allowFailure: true,
+  });
+  if (Number(result.code || 0) === 0) {
+    return null;
+  }
+
+  const pipCheckOutput = String(result.stdout || result.stderr || '').trim();
+  await logger.warn('pip check reported ComfyUI dependency warnings; Local AI Hub will rely on CUDA launch-readiness validation before deciding whether repair succeeded.', {
+    pipCheckOutput,
+  });
+  return {
+    code: result.code,
+    output: pipCheckOutput,
+  };
+}
+
 function getRuntimeAssetLabel(asset = {}) {
   return String(asset.label || asset.relativePath || asset.url || 'runtime asset').trim() || 'runtime asset';
 }
@@ -2469,11 +2625,8 @@ async function verifyManagedToolInstall(toolState, manifest, logger) {
     await ensureToolRuntimeAssets(safeToolState, manifest, logger);
     await ensureManagedCudaPyTorch(safeToolState, manifest, logger, null);
 
-    await runCommand(pythonPath, ['-m', 'pip', 'check'], {
-      cwd: safeToolState.appDir,
-      env: buildManagedProcessEnv(safeToolState, {}, { requireVirtualEnv: true }),
-      errorMessage: `Local AI Hub installed ${manifest.name}, but its Python environment still has dependency conflicts.`,
-    });
+    await runManagedPipCheck(safeToolState, manifest, logger);
+    await verifyComfyUiManagedRuntimeReadiness(safeToolState, manifest, logger);
     await verifyAudiocraftManagedPipelineReadiness(safeToolState, manifest, logger);
     await verifyChatterboxManagedPipelineReadiness(safeToolState, manifest, logger);
     await verifyRvcManagedRuntimeReadiness(safeToolState, manifest, logger);
@@ -4724,6 +4877,347 @@ async function getPostUninstallDetection(toolState, matchesTrackedExternalInstal
   };
 }
 
+function normalizeDualCapabilityId(value) {
+  const capability = String(value || '').trim().toLowerCase();
+  return capability || null;
+}
+
+function assertKnownDualCapabilityId(manifest, capability) {
+  if (!manifest?.companionDesktop || !capability) {
+    return;
+  }
+
+  if (!['webui', 'desktop'].includes(capability)) {
+    throw new Error('Local AI Hub only accepts WebUI or Desktop App as uninstall choices for this tool.');
+  }
+}
+
+function getDesktopCompanionRoot(toolState) {
+  return normalizeOptionalDirectoryPath(
+    toolState?.desktopCompanion?.installDir ||
+    toolState?.desktopCompanion?.appDir ||
+    (toolState?.desktopCompanion?.detectedPath ? path.dirname(toolState.desktopCompanion.detectedPath) : '') ||
+    '',
+  );
+}
+
+function getWebuiCapabilityRoot(toolState) {
+  return normalizeOptionalDirectoryPath(toolState?.installDir || toolState?.appDir || '');
+}
+
+function capabilitiesShareInstallPath(toolState) {
+  const desktopRoot = getDesktopCompanionRoot(toolState);
+  const webuiRoot = getWebuiCapabilityRoot(toolState);
+  return Boolean(
+    desktopRoot &&
+    webuiRoot &&
+    (isPathInside(webuiRoot, desktopRoot) || isPathInside(desktopRoot, webuiRoot)),
+  );
+}
+
+function buildSharedCapabilityPathMessage(manifest, capability) {
+  const targetLabel = capability === 'desktop' ? 'Desktop App' : 'WebUI';
+  return `${manifest.name}'s ${targetLabel} shares a folder with the other install. Local AI Hub will not recursively delete or run an uninstaller against a shared folder because that could remove both capabilities. Open Windows Apps & Features or move one capability into its own folder before uninstalling it.`;
+}
+
+function buildDesktopCompanionUninstallState(toolState, baseManifest) {
+  const companionManifest = baseManifest?.companionDesktop;
+  const companion = toolState?.desktopCompanion || {};
+  const executablePath = companion.executablePath || companion.detectedPath || null;
+  const installDir = normalizeOptionalDirectoryPath(
+    companion.installDir ||
+    companion.appDir ||
+    (executablePath ? path.dirname(executablePath) : '') ||
+    '',
+  );
+  if (!companionManifest || !installDir || !executablePath) {
+    throw new Error(`${baseManifest?.name || 'This tool'} does not have a detected Desktop App install to uninstall.`);
+  }
+
+  return normalizeToolLifecycle({
+    id: toolState.id,
+    name: companionManifest.name,
+    source: 'external',
+    installDir,
+    appDir: installDir,
+    detectedPath: executablePath,
+    displayPath: companion.displayPath || executablePath,
+    executablePath,
+    installedByLocalAIHub: Boolean(companion.installedByLocalAIHub),
+    windowsInstallLocation: companion.windowsInstallLocation || null,
+    windowsUninstallCommand: companion.windowsUninstallCommand || null,
+    windowsUninstallDisplayName: companion.windowsUninstallDisplayName || null,
+    windowsUninstallKeyPath: companion.windowsUninstallKeyPath || null,
+    windowsUninstallQuietCommand: companion.windowsUninstallQuietCommand || null,
+  }, companionManifest);
+}
+
+function buildCompanionOnlyPreservedState(toolState, manifest) {
+  const companion = toolState?.desktopCompanion || null;
+  const executablePath = companion?.executablePath || companion?.detectedPath || null;
+  const installDir = getDesktopCompanionRoot(toolState);
+  if (!companion?.installed || !installDir || !executablePath) {
+    return null;
+  }
+
+  const baseState = normalizeToolLifecycle({
+    ...toolState,
+    source: 'external',
+    companionOnly: true,
+    installDir,
+    appDir: installDir,
+    detectedPath: executablePath,
+    displayPath: companion.displayPath || executablePath,
+    executablePath,
+    venvDir: null,
+    desktopCompanion: companion,
+    installedCapabilities: {
+      webui: false,
+      desktop: true,
+    },
+    externalInstallDetected: false,
+    externalInstallDir: null,
+    externalInstallDisplayPath: null,
+    externalDetectedPath: null,
+    lastError: null,
+    lastRepairMessage: null,
+    status: toolState.status === 'error' || toolState.status === 'starting' ? 'stopped' : toolState.status || 'stopped',
+  }, manifest);
+  const launchModeState = buildLaunchModeState(baseState, manifest, {
+    detectedPath: executablePath,
+    source: 'external',
+  });
+
+  return normalizeToolLifecycle({
+    ...baseState,
+    ...launchModeState,
+    interfaceMode: launchModeState.interfaceMode || 'desktop-app',
+    launchSupported: Boolean(launchModeState.launchProfile),
+    processNames: manifest.processNames || launchModeState.launchModes.flatMap((mode) => mode.processNames || []) || [],
+  }, manifest);
+}
+
+function buildWebuiOnlyPreservedState(toolState, manifest) {
+  const baseState = normalizeToolLifecycle({
+    ...toolState,
+    desktopCompanion: null,
+    installedCapabilities: {
+      ...(toolState.installedCapabilities || {}),
+      webui: true,
+      desktop: false,
+    },
+    lastError: null,
+    lastRepairMessage: null,
+    status: toolState.status === 'error' || toolState.status === 'starting' ? 'stopped' : toolState.status || 'stopped',
+  }, manifest);
+  const launchModeState = buildLaunchModeState(baseState, manifest, {
+    detectedPath: baseState.detectedPath || null,
+    source: baseState.source || 'managed',
+  });
+
+  return normalizeToolLifecycle({
+    ...baseState,
+    ...launchModeState,
+    interfaceMode: launchModeState.interfaceMode || manifest.interfaceMode,
+    launchSupported: Boolean(launchModeState.launchProfile),
+    processNames: manifest.processNames || launchModeState.launchModes.flatMap((mode) => mode.processNames || []) || baseState.processNames || [],
+  }, manifest);
+}
+
+async function waitForCompanionDesktopUninstallOutcome(baseToolState, baseManifest, companionManifest, companionUninstallState, logger) {
+  const deadline = Date.now() + OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS;
+  let lastContext = null;
+  let lastDetectedTool = null;
+
+  while (Date.now() <= deadline) {
+    lastContext = await resolveToolUninstallContext(companionUninstallState, companionManifest, { refresh: true }).catch(() => null);
+    const discoveredTools = await syncDiscoveredTools({ force: true, persist: false });
+    lastDetectedTool = discoveredTools[baseManifest.id];
+    const desktopStillDetected = Boolean(lastDetectedTool?.desktopCompanion?.installed);
+    const vendorEntryStillPresent = Boolean(lastContext?.entry);
+
+    if (!vendorEntryStillPresent && !desktopStillDetected) {
+      return {
+        complete: true,
+        detectedTool: lastDetectedTool,
+        uninstallContext: lastContext,
+      };
+    }
+
+    if (Date.now() + OFFICIAL_UNINSTALL_SETTLE_POLL_MS > deadline) {
+      break;
+    }
+
+    await logger?.info?.('Waiting for the official Desktop App uninstaller to finish.', {
+      toolId: baseToolState?.id || null,
+      windowsUninstallKeyPath: lastContext?.entry?.keyPath || null,
+    });
+    await wait(OFFICIAL_UNINSTALL_SETTLE_POLL_MS);
+  }
+
+  if (!lastContext) {
+    lastContext = await resolveToolUninstallContext(companionUninstallState, companionManifest, { refresh: true }).catch(() => null);
+  }
+
+  if (!lastDetectedTool) {
+    const discoveredTools = await syncDiscoveredTools({ force: true, persist: false });
+    lastDetectedTool = discoveredTools[baseManifest.id];
+  }
+
+  return {
+    complete: false,
+    detectedTool: lastDetectedTool,
+    uninstallContext: lastContext,
+  };
+}
+
+async function refreshAfterCapabilityUninstall(toolId) {
+  const discoveredTools = await syncDiscoveredTools({ force: true });
+  return discoveredTools[toolId] || null;
+}
+
+async function uninstallDualWebuiCapability(safeToolState, manifest, logger, buildResultMessage) {
+  if (!safeToolState.installedCapabilities?.webui) {
+    throw new Error(`${manifest.name} WebUI is not installed.`);
+  }
+
+  if (safeToolState.source !== 'managed') {
+    throw new Error(`${manifest.name} WebUI is not managed by Local AI Hub, so Local AI Hub will not delete its files.`);
+  }
+
+  if ((safeToolState.installedCapabilities?.desktop || safeToolState.desktopCompanion?.installed) && capabilitiesShareInstallPath(safeToolState)) {
+    throw new Error(buildSharedCapabilityPathMessage(manifest, 'webui'));
+  }
+
+  const managedWebuiState = ensureManagedToolStatePaths(safeToolState);
+  await logger.info('Capability-specific WebUI uninstall requested.', {
+    installDir: managedWebuiState.installDir,
+    toolId: managedWebuiState.id,
+  });
+  await preflightOwnedInstallRemoval(managedWebuiState, logger, 'managed-webui-capability-uninstall-preflight', 'uninstall WebUI');
+  await removeOwnedInstallCopy(managedWebuiState, logger, 'managed-webui-capability-uninstall');
+  const modelAssetCleanup = await removeManagedModelManagerAssets(managedWebuiState, logger, 'managed-webui-capability-uninstall-model-assets');
+  const shortcutCleanup = await removeToolWindowsShortcuts(managedWebuiState, logger);
+  const preservedCompanion = buildCompanionOnlyPreservedState(managedWebuiState, manifest);
+
+  if (preservedCompanion) {
+    await upsertTool(preservedCompanion);
+  } else {
+    await removeTool(managedWebuiState.id);
+  }
+
+  await setToolIgnored(managedWebuiState.id, false);
+  const refreshedTool = await refreshAfterCapabilityUninstall(managedWebuiState.id);
+  if (refreshedTool?.installedCapabilities?.desktop) {
+    return {
+      ...refreshedTool,
+      lastError: null,
+      status: refreshedTool.status || 'stopped',
+      uninstallMessage: buildResultMessage(`${manifest.name} WebUI was uninstalled. The Desktop App was preserved.`, {
+        removedModelAssetRootCount: modelAssetCleanup.removedModelAssetRootCount,
+        removedShortcutCount: shortcutCleanup.removedCount,
+      }),
+    };
+  }
+
+  await removeTool(managedWebuiState.id);
+  return {
+    ...managedWebuiState,
+    lastError: null,
+    status: 'stopped',
+    uninstallMessage: buildResultMessage(`${manifest.name} WebUI was uninstalled and no Desktop App was detected afterward.`, {
+      removedModelAssetRootCount: modelAssetCleanup.removedModelAssetRootCount,
+      removedShortcutCount: shortcutCleanup.removedCount,
+    }),
+  };
+}
+
+async function uninstallDualDesktopCapability(safeToolState, manifest, logger, clearStaleEntries) {
+  const companionManifest = manifest.companionDesktop;
+  if (!safeToolState.installedCapabilities?.desktop && !safeToolState.desktopCompanion?.installed) {
+    throw new Error(`${companionManifest.name} is not installed.`);
+  }
+
+  if (safeToolState.installedCapabilities?.webui && capabilitiesShareInstallPath(safeToolState)) {
+    throw new Error(buildSharedCapabilityPathMessage(manifest, 'desktop'));
+  }
+
+  const companionUninstallState = buildDesktopCompanionUninstallState(safeToolState, manifest);
+  const uninstallContext = await resolveToolUninstallContext(companionUninstallState, companionManifest, { refresh: true }).catch(() => null);
+  const staleCleanup = await clearStaleEntries(uninstallContext?.staleEntries || []);
+  const refreshedContext = await resolveToolUninstallContext(companionUninstallState, companionManifest, { refresh: true }).catch(() => null);
+  const workingUninstallEntry = refreshedContext?.entry || uninstallContext?.entry || null;
+
+  if (!workingUninstallEntry) {
+    const refreshedTool = await refreshAfterCapabilityUninstall(safeToolState.id);
+    if (!refreshedTool?.desktopCompanion?.installed) {
+      if (refreshedTool?.installedCapabilities?.webui) {
+        return {
+          ...refreshedTool,
+          lastError: null,
+          uninstallMessage: `${companionManifest.name} was already gone. Local AI Hub refreshed ${manifest.name} so only WebUI remains.`,
+        };
+      }
+
+      await removeTool(safeToolState.id);
+      await setToolIgnored(safeToolState.id, false);
+      return {
+        ...safeToolState,
+        lastError: null,
+        status: 'stopped',
+        uninstallMessage: `${companionManifest.name} was already gone, so Local AI Hub removed ${manifest.name} from Library.`,
+      };
+    }
+
+    const staleNote = staleCleanup.clearedCount > 0
+      ? ` Local AI Hub cleared ${staleCleanup.clearedCount} stale Windows uninstall ${pluralize(staleCleanup.clearedCount, 'entry')} first.`
+      : '';
+    throw new Error(`${companionManifest.name} does not expose a safe Windows uninstall command Local AI Hub can run.${staleNote} Open Windows Apps & Features, uninstall ${companionManifest.name}, then refresh Local AI Hub. The WebUI folder was left untouched.`);
+  }
+
+  await logger.info('Capability-specific Desktop App official uninstall requested.', {
+    baseToolId: safeToolState.id,
+    companionName: companionManifest.name,
+    desktopInstallDir: companionUninstallState.installDir,
+    webuiInstallDir: safeToolState.installDir || null,
+    windowsUninstallKeyPath: workingUninstallEntry.keyPath || null,
+  });
+
+  await runWindowsUninstaller(workingUninstallEntry, logger, companionManifest.name);
+  const uninstallOutcome = await waitForCompanionDesktopUninstallOutcome(
+    safeToolState,
+    manifest,
+    companionManifest,
+    companionUninstallState,
+    logger,
+  );
+
+  if (!uninstallOutcome.complete) {
+    throw new Error(`${companionManifest.name} still appears to be installed after its official Windows uninstaller finished. Open Windows Apps & Features to finish removing it, then refresh Local AI Hub. The WebUI folder was left untouched.`);
+  }
+
+  await clearStaleEntries(uninstallOutcome.uninstallContext?.staleEntries || []);
+  if (safeToolState.installedCapabilities?.webui) {
+    const webuiOnlyState = buildWebuiOnlyPreservedState(safeToolState, manifest);
+    await upsertTool(webuiOnlyState);
+    await setToolIgnored(safeToolState.id, false);
+    const refreshedTool = await refreshAfterCapabilityUninstall(safeToolState.id);
+    return {
+      ...(refreshedTool || webuiOnlyState),
+      lastError: null,
+      uninstallMessage: `${companionManifest.name} was uninstalled with its official Windows uninstaller. ${manifest.name} WebUI was preserved.`,
+    };
+  }
+
+  await removeTool(safeToolState.id);
+  await setToolIgnored(safeToolState.id, false);
+  return {
+    ...safeToolState,
+    lastError: null,
+    status: 'stopped',
+    uninstallMessage: `${companionManifest.name} was uninstalled with its official Windows uninstaller.`,
+  };
+}
 async function uninstallTool(toolState, options = {}) {
   await initializeToolRegistry();
   const manifest = getToolManifest(toolState?.id);
@@ -4736,35 +5230,8 @@ async function uninstallTool(toolState, options = {}) {
     safeToolState = ensureManagedToolStatePaths(safeToolState);
   }
 
-  const capability = String(options.capability || options.installCapability || '').trim().toLowerCase();
-  const webuiInstalled = Boolean(safeToolState.installedCapabilities?.webui);
-  const desktopInstalled = Boolean(safeToolState.installedCapabilities?.desktop || safeToolState.desktopCompanion?.installed);
-  if (manifest.companionDesktop && capability) {
-    const desktopRoot = normalizeOptionalDirectoryPath(
-      safeToolState.desktopCompanion?.installDir ||
-      safeToolState.desktopCompanion?.appDir ||
-      safeToolState.desktopCompanion?.detectedPath ||
-      '',
-    );
-    const webuiRoot = normalizeOptionalDirectoryPath(safeToolState.installDir || safeToolState.appDir || '');
-    const capabilitiesSharePath = Boolean(
-      desktopRoot &&
-      webuiRoot &&
-      (isPathInside(webuiRoot, desktopRoot) || isPathInside(desktopRoot, webuiRoot)),
-    );
-
-    if (capability === 'desktop' && desktopInstalled && webuiInstalled) {
-      if (capabilitiesSharePath) {
-        throw new Error(`${manifest.name}'s Desktop App is installed in the same folder as its WebUI files. Local AI Hub will not run a desktop uninstaller that could remove the WebUI too. Use Windows Apps & Features or reinstall the Desktop App to its own folder first.`);
-      }
-
-      throw new Error(`${manifest.name}'s Desktop App uses its official Windows uninstaller. Capability-specific desktop uninstall is not automated in this build, so Local AI Hub will not risk removing the WebUI by mistake.`);
-    }
-
-    if (capability === 'webui' && desktopInstalled && webuiInstalled && capabilitiesSharePath) {
-      throw new Error(`${manifest.name}'s WebUI and Desktop App share the same folder. Local AI Hub will not uninstall one capability when that could remove the other too.`);
-    }
-  }
+  const capability = normalizeDualCapabilityId(options.capability || options.installCapability || '');
+  assertKnownDualCapabilityId(manifest, capability);
 
   const actionSemantics = getToolActionSemantics(safeToolState, manifest, {
     installedByLocalAIHub: safeToolState.installedByLocalAIHub,
@@ -4822,6 +5289,24 @@ async function uninstallTool(toolState, options = {}) {
   };
 
   try {
+    const buildCapabilityResultMessage = (baseMessage, artifactCleanup = null) =>
+      appendUninstallFollowup(
+        baseMessage,
+        buildUninstallFollowupNotes({
+          deferredCleanupCount: Number(artifactCleanup?.deferredCleanupCount || 0),
+          removedShortcutCount: Number(artifactCleanup?.removedShortcutCount || 0),
+          removedModelAssetRootCount: Number(artifactCleanup?.removedModelAssetRootCount || 0),
+        }),
+      );
+
+    if (manifest.companionDesktop && capability === 'webui') {
+      return await uninstallDualWebuiCapability(safeToolState, manifest, logger, buildCapabilityResultMessage);
+    }
+
+    if (manifest.companionDesktop && capability === 'desktop') {
+      return await uninstallDualDesktopCapability(safeToolState, manifest, logger, clearStaleEntries);
+    }
+
     const uninstallContext =
       actionSemantics.ownsInstallFiles || manifest.installInstructions.kind === 'installer-exe'
         ? await resolveToolUninstallContext(safeToolState, manifest, { refresh: true }).catch(() => null)
@@ -5349,6 +5834,10 @@ async function updateToolInstallation(toolState, options = {}) {
         source: 'managed',
         installedByLocalAIHub: updatedState.installedByLocalAIHub !== false,
       }, manifest));
+
+      if (runtimeKind === 'python') {
+        updatedState = await verifyManagedToolInstall(updatedState, manifest, logger);
+      }
     }
 
     await upsertTool(updatedState);
@@ -5396,9 +5885,20 @@ module.exports = {
   uninstallTool,
   updateToolInstallation,
   _test: {
+    buildComfyUiDependencyFailureMessage,
+    buildComfyUiDependencyVerificationScript,
+    buildCompanionOnlyPreservedState,
+    buildDesktopCompanionUninstallState,
+    buildManagedCudaPyTorchPackageSpec,
+    buildManagedCudaPyTorchUnsupportedMessage,
+    buildWebuiOnlyPreservedState,
+    capabilitiesShareInstallPath,
+    buildFilteredRequirementsPath,
     collectManagedModelAssetRootsForUninstall,
     collectRepairPreservedModelAssetRoots,
+    normalizeDualCapabilityId,
     preserveModelManagerAssetsForAction,
     removeManagedModelManagerAssets,
+    selectManagedCudaPyTorchBuild,
   },
 };

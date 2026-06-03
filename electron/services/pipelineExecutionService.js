@@ -2232,24 +2232,36 @@ function applyNodePromptStyle(contextMaps = {}, node = {}, prompt = '', targetKi
   };
 }
 
-function buildImageGenerationMetadata(node, executionTarget, promptRequest, options = {}) {
+function buildImageGenerationMetadata(node, executionTarget, promptRequest = {}, options = {}) {
+  const operation = String(options.operation || options.operationSubtype || 'textToImage').trim() || 'textToImage';
   return {
     backend: String(options.backend || executionTarget?.id || '').trim(),
     backendLabel: String(options.backendLabel || executionTarget?.name || '').trim(),
     cfgScale: node.config?.cfgScale,
-    height: node.config?.height,
+    collectionMap: options.collectionMap && typeof options.collectionMap === 'object' ? serializeArtifactForUi(options.collectionMap) : null,
+    extension: String(options.extension || '').trim(),
+    height: Number(options.height || node.config?.height || 0) || 0,
+    mimeType: String(options.mimeType || '').trim(),
     model: String(options.model || node.config?.model || '').trim(),
     negativePrompt: promptRequest.negativePrompt,
+    operation,
     operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+    operationSubtype: operation,
     prompt: promptRequest.prompt,
     promptStyle: promptRequest.promptStyle,
+    provider: String(options.provider || options.backend || executionTarget?.id || '').trim(),
     quality: node.config?.imageQuality,
+    requestSettings: options.requestSettings && typeof options.requestSettings === 'object' ? serializeArtifactForUi(options.requestSettings) : null,
+    revisedPrompt: String(options.revisedPrompt || '').trim(),
+    safetyNotes: Array.isArray(options.safetyNotes) ? options.safetyNotes.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
     seed: node.config?.seed,
     size: node.config?.imageSize,
+    sourceImage: buildImageArtifactReference(options.sourceImageArtifact || options.sourceImage),
+    sourceText: String(options.sourceText || promptRequest.sourceText || '').trim(),
     steps: node.config?.steps,
     toolId: String(executionTarget?.id || '').trim(),
     toolLabel: String(executionTarget?.name || '').trim(),
-    width: node.config?.width,
+    width: Number(options.width || node.config?.width || 0) || 0,
   };
 }
 
@@ -2269,29 +2281,93 @@ function buildImageGenerationPrompt(node, inputArtifact) {
 
   const promptPrefix = String(node.config?.instruction || '').trim();
   return promptPrefix ? promptPrefix + '\n\nPrompt:\n' + promptText : promptText;
-
 }
 
-async function generateMappedImageArtifact(node, textArtifact, options = {}) {
+async function buildCloudImageGenerationRequest(node, inputArtifact, contextMaps = {}) {
+  if (!inputArtifact) {
+    throw new Error('This cloud image generation step did not receive any input.');
+  }
+
+  if (inputArtifact.kind === PORT_KIND_TEXT) {
+    const basePrompt = buildImageGenerationPrompt(node, inputArtifact);
+    const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image');
+    promptRequest.sourceText = String(inputArtifact.text || '').trim();
+    return {
+      imageReference: null,
+      operation: 'textToImage',
+      prompt: promptRequest.prompt,
+      promptRequest,
+      sourceImageArtifact: null,
+      sourceText: promptRequest.sourceText,
+    };
+  }
+
+  if (inputArtifact.kind !== PORT_KIND_IMAGE) {
+    throw new Error('Cloud image generation can use either text input or an image input plus an edit instruction.');
+  }
+
+  const instruction = String(node.config?.instruction || '').trim();
+  if (!instruction) {
+    throw new Error('Add an image edit instruction before running cloud image-to-image generation.');
+  }
+
+  const imagePart = await buildImageMessageContentPart(inputArtifact);
+  const promptRequest = applyNodePromptStyle(contextMaps, node, instruction, 'image');
+  return {
+    imageReference: {
+      base64Data: imagePart.data,
+      buffer: Buffer.from(imagePart.data, 'base64'),
+      fileName: imagePart.fileName,
+      mimeType: imagePart.mimeType,
+    },
+    operation: 'imageToImage',
+    prompt: promptRequest.prompt,
+    promptRequest,
+    sourceImageArtifact: inputArtifact,
+    sourceText: '',
+  };
+}
+
+function buildCollectionMapImageItemMetadata({ imageRequest, inputArtifact, itemCount, itemIndex, mapping, node, sourceEntry }) {
+  return {
+    inputKind: String(mapping?.inputKind || inputArtifact?.kind || '').trim(),
+    itemCount,
+    itemId: String(sourceEntry?.itemId || inputArtifact?.id || '').trim(),
+    itemIndex,
+    mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+    nodeId: String(node?.id || '').trim(),
+    nodeLabel: String(node?.label || '').trim(),
+    operation: String(imageRequest?.operation || '').trim(),
+    operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+    outputKind: String(mapping?.outputKind || PORT_KIND_IMAGE).trim(),
+    sourceItemId: String(sourceEntry?.itemId || inputArtifact?.id || '').trim(),
+    sourceItemIndex: itemIndex,
+    sourceText: String(imageRequest?.sourceText || '').trim(),
+  };
+}
+
+async function generateMappedImageArtifact(node, inputArtifact, options = {}) {
   const contextMaps = options.contextMaps || {};
   const run = options.run || null;
   const reportProgress = options.reportProgress;
   const itemIndex = Number(options.itemIndex || 0) || 0;
   const itemCount = Number(options.itemCount || 0) || 0;
   const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '');
-  const basePrompt = buildImageGenerationPrompt(node, textArtifact);
   const executionMode = node.config?.executionMode === 'localTool'
     ? 'localTool'
     : node.config?.executionMode === 'graphWorkflow'
       ? 'graphWorkflow'
       : 'cloud';
-  const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image', {
-    negativePrompt: executionMode === 'localTool' ? node.config?.negativePrompt : '',
-    supportNegativePrompt: executionMode === 'localTool',
-  });
-  const prompt = promptRequest.prompt;
+  const mapping = options.mapping || getCollectionMapMapping(node) || null;
+
+  if (executionMode !== 'cloud' && inputArtifact?.kind !== PORT_KIND_TEXT) {
+    throw new Error('Local and graph image generation collection maps currently need text items. Choose Cloud image to image for image items.');
+  }
 
   if (executionMode === 'graphWorkflow') {
+    const basePrompt = buildImageGenerationPrompt(node, inputArtifact);
+    const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image');
+    const prompt = promptRequest.prompt;
     const support = getGraphWorkflowOperationBackendSupport(node, GRAPH_WORKFLOW_OPERATION_BACKEND_IDS.TEXT_TO_IMAGE, contextMaps);
     if (!support.usable) {
       throw new Error(support.message || 'Configure a compatible text-to-image graph workflow before using it for collection mapping.');
@@ -2318,12 +2394,17 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
     if (!imageArtifact || imageArtifact.kind !== PORT_KIND_IMAGE) {
       throw new Error((tool.name || 'The graph workflow tool') + ' finished the graph workflow, but it did not return an image artifact.');
     }
-    imageArtifact.imageGeneration = buildImageGenerationMetadata(node, tool, promptRequest, { backend: 'graphWorkflow', backendLabel: tool.name });
+    imageArtifact.imageGeneration = buildImageGenerationMetadata(node, tool, promptRequest, { backend: 'graphWorkflow', backendLabel: tool.name, operation: 'textToImage', sourceText: String(inputArtifact?.text || '').trim() });
 
     return imageArtifact;
   }
 
   if (executionMode === 'localTool') {
+    const basePrompt = buildImageGenerationPrompt(node, inputArtifact);
+    const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image', {
+      negativePrompt: node.config?.negativePrompt,
+      supportNegativePrompt: true,
+    });
     const tool = options.localTool || await getSelectedImageToolOrThrow(contextMaps, node, 'collection image mapping');
     reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for image generation.', 'Running ' + node.label + '...');
     const generated = await generateImageWithWorkflowTool(tool, {
@@ -2331,7 +2412,7 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
       height: node.config?.height,
       model: String(node.config?.model || '').trim(),
       negativePrompt: promptRequest.negativePrompt,
-      prompt,
+      prompt: promptRequest.prompt,
       seed: node.config?.seed,
       steps: node.config?.steps,
       width: node.config?.width,
@@ -2342,7 +2423,7 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
       extension: '.png',
       kind: PORT_KIND_IMAGE,
       role: 'generated',
-      imageGeneration: buildImageGenerationMetadata(node, tool, promptRequest, { model: String(node.config?.model || '').trim() }),
+      imageGeneration: buildImageGenerationMetadata(node, tool, promptRequest, { model: String(node.config?.model || '').trim(), operation: 'textToImage', sourceText: String(inputArtifact?.text || '').trim() }),
     });
   }
 
@@ -2359,17 +2440,27 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
     throw new Error('That cloud provider is not connected on this PC yet. Open Settings to save its API key first.');
   }
 
-  reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + ' for image generation.', 'Running ' + node.label + '...');
+  const imageRequest = await buildCloudImageGenerationRequest(node, inputArtifact, contextMaps);
+  const requestSettings = {
+    background: node.config?.imageBackground,
+    imageReference: imageRequest.imageReference ? { fileName: imageRequest.imageReference.fileName, mimeType: imageRequest.imageReference.mimeType } : null,
+    quality: node.config?.imageQuality,
+    size: node.config?.imageSize,
+  };
+  reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + (imageRequest.operation === 'imageToImage' ? ' for cloud image editing.' : ' for cloud image generation.'), 'Running ' + node.label + '...');
   const result = await runProviderOperation(providerId, {
     background: node.config?.imageBackground,
+    imageReference: imageRequest.imageReference,
     model,
     operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
-    prompt,
+    operationSubtype: imageRequest.operation,
+    prompt: imageRequest.prompt,
     providerId,
     quality: node.config?.imageQuality,
     size: node.config?.imageSize,
   });
-  const base64Image = String(result?.images?.[0]?.base64Data || '').trim();
+  const generatedImage = result?.images?.[0] || null;
+  const base64Image = String(generatedImage?.base64Data || '').trim();
   if (!base64Image) {
     throw new Error((provider.name || 'The selected provider') + ' finished the request, but it did not return an image.');
   }
@@ -2377,10 +2468,26 @@ async function generateMappedImageArtifact(node, textArtifact, options = {}) {
   return saveBase64Artifact(run.directories, base64Image, {
     baseName: node.label + '-item-' + String(itemIndex + 1).padStart(3, '0') + '-' + Date.now(),
     displayName: node.label + ' item ' + String(itemIndex + 1),
-    extension: '.png',
+    extension: String(generatedImage.extension || '.png').trim() || '.png',
     kind: PORT_KIND_IMAGE,
     role: 'generated',
-    imageGeneration: buildImageGenerationMetadata(node, provider, promptRequest, { backend: providerId, backendLabel: provider.name, model }),
+    imageGeneration: buildImageGenerationMetadata(node, provider, imageRequest.promptRequest, {
+      backend: providerId,
+      backendLabel: provider.name,
+      collectionMap: buildCollectionMapImageItemMetadata({ imageRequest, inputArtifact, itemCount, itemIndex, mapping, node, sourceEntry: options.sourceEntry }),
+      extension: String(generatedImage.extension || '.png').trim() || '.png',
+      height: generatedImage.height,
+      mimeType: generatedImage.mimeType,
+      model,
+      operation: imageRequest.operation,
+      provider: providerId,
+      requestSettings,
+      revisedPrompt: generatedImage.revisedPrompt,
+      safetyNotes: generatedImage.safetyNotes,
+      sourceImageArtifact: imageRequest.sourceImageArtifact,
+      sourceText: imageRequest.sourceText,
+      width: generatedImage.width,
+    }),
   });
 }
 
@@ -2399,7 +2506,7 @@ const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for
 
 function getCollectionMapEffectiveInstruction(node, operationId) {
   const instruction = String(node?.config?.instruction || '').trim();
-  if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE && instruction === COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION) {
+  if (instruction === COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION && (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE || getCollectionMapInputKind(node) !== PORT_KIND_TEXT)) {
     return '';
   }
   return instruction;
@@ -2578,13 +2685,79 @@ function getCollectionMapVideoFirstItemBehaviorForRun(node) {
 
 function isCollectionMapVideoContinuationChainEnabledForRun(node, mapping, executionMode) {
   const toolId = String(node?.config?.toolId || '').trim().toLowerCase();
+  const inputKind = String(mapping?.inputKind || '').trim();
+  const isVideoMap = getCollectionMapVideoItemModeForRun(node) === 'sequentialLastFrame'
+    && (inputKind === PORT_KIND_TEXT || inputKind === PORT_KIND_IMAGE);
+  if (!isVideoMap || String(mapping?.outputKind || '').trim() !== PORT_KIND_VIDEO) {
+    return false;
+  }
+
+  if (String(mapping?.operationId || getCollectionMapOperationId(node)).trim() !== PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
+    return false;
+  }
+
+  if (executionMode === 'cloud') {
+    return true;
+  }
+
   return executionMode === 'localTool'
-    && getCollectionMapVideoItemModeForRun(node) === 'sequentialLastFrame'
     && String(mapping?.id || node?.config?.mappingId || '').trim() === 'textToVideo'
     && String(mapping?.inputKind || '').trim() === PORT_KIND_TEXT
-    && String(mapping?.outputKind || '').trim() === PORT_KIND_VIDEO
     && String(mapping?.operationId || getCollectionMapOperationId(node)).trim() === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
     && (!toolId || toolId === 'wan21-webui');
+}
+
+function getProviderVideoOperationForConfiguredModel(providerId, model) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  const normalizedModel = String(model || '').trim();
+  if (!normalizedProviderId) {
+    return null;
+  }
+
+  return normalizedModel
+    ? getProviderModelCapabilities(normalizedProviderId, normalizedModel)?.operations?.[PIPELINE_OPERATION_IDS.VIDEO_GENERATE] || null
+    : getProviderPipelineOperation(normalizedProviderId, PIPELINE_OPERATION_IDS.VIDEO_GENERATE);
+}
+
+function assertCollectionMapVideoContinuationChainSupportedForRun(node, mapping, executionMode) {
+  if (!isCollectionMapVideoContinuationChainEnabledForRun(node, mapping, executionMode)) {
+    return;
+  }
+
+  if (executionMode === 'localTool') {
+    return;
+  }
+
+  if (executionMode !== 'cloud') {
+    throw new Error('Previous-last-frame video chaining is only available for Wan local video maps, Google Veo cloud video maps, and xAI Grok Imagine cloud video maps.');
+  }
+
+  const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+  if (!['google', 'xai'].includes(providerId)) {
+    throw new Error('Collection video chaining is available for Google Veo and xAI Grok Imagine only. Choose a supported cloud video provider or turn chaining off.');
+  }
+
+  const operation = getProviderVideoOperationForConfiguredModel(providerId, node?.config?.model);
+  if (!operation?.inputKinds?.includes(PORT_KIND_IMAGE)) {
+    throw new Error('Previous-last-frame chaining needs a cloud video model that accepts image input. Choose a Google Veo or xAI Grok Imagine image-to-video model, or turn chaining off.');
+  }
+}
+
+function getCollectionMapVideoProviderChainSupportStatus(node, executionMode) {
+  if (String(executionMode || '').trim() !== 'cloud') {
+    return 'not-applicable';
+  }
+
+  const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+  if (!providerId) {
+    return 'unknown';
+  }
+  if (!['google', 'xai'].includes(providerId)) {
+    return 'unsupported';
+  }
+
+  const operation = getProviderVideoOperationForConfiguredModel(providerId, node?.config?.model);
+  return operation?.inputKinds?.includes(PORT_KIND_IMAGE) ? 'supported' : 'unsupported';
 }
 
 function buildCollectionMapVideoContinuationChainState(node) {
@@ -2669,7 +2842,12 @@ function buildCollectionMapVideoItemMetadata({ chainState, executionMode, inputA
     outputKind: String(mapping?.outputKind || '').trim(),
     promptStyle: videoRequest?.promptStyle || null,
     sourceItemId: String(itemId || '').trim(),
+    sourceItemIndex: itemIndex,
   };
+  if (inputArtifact?.kind === PORT_KIND_IMAGE) {
+    base.sourceImage = buildImageArtifactReference(inputArtifact);
+    base.sourceImageLineage = inputArtifact?.lineage ? serializeArtifactForUi(inputArtifact.lineage) : null;
+  }
 
   if (!chainState?.enabled) {
     return {
@@ -2684,11 +2862,18 @@ function buildCollectionMapVideoItemMetadata({ chainState, executionMode, inputA
     collectionMap: base,
     collectionMapItemMode: 'sequentialLastFrame',
     collectionMapVideoChain: {
+      chainIndex: itemIndex,
+      chainMode: 'previousLastFrameAsNextStartImage',
+      chainSourceItemId: String(itemId || '').trim(),
+      chainSourceItemIndex: itemIndex,
       enabled: true,
       firstItemBehavior: chainState.firstItemBehavior || 'textToVideo',
       itemMode: 'sequentialLastFrame',
       previousClip: buildVideoArtifactReference(chainState.lastAcceptedArtifact),
+      previousVideoArtifactId: String(chainState.lastAcceptedArtifact?.id || chainState.lastAcceptedArtifact?.artifactId || '').trim(),
+      previousVideoArtifactPath: String(chainState.lastAcceptedArtifact?.filePath || '').trim(),
       previousLastFrame: referenceRole === 'previousLastFrame' ? referenceImage : null,
+      previousLastFrameArtifactPath: referenceRole === 'previousLastFrame' ? String(referenceImageArtifact?.filePath || '').trim() : '',
       referenceImage,
       referenceRole: String(referenceRole || '').trim() || 'none',
     },
@@ -2741,6 +2926,7 @@ function buildCollectionMapMetadata(mapping, node, executionMode, options = {}) 
     label: String(mapping?.label || node?.label || 'Map Collection').trim(),
     mapping: String(mapping?.id || node?.config?.mappingId || '').trim(),
     mappingId: String(mapping?.id || node?.config?.mappingId || '').trim(),
+    model: String(node?.config?.model || '').trim(),
     nodeId: String(node?.id || '').trim(),
     nodeLabel: String(node?.label || '').trim(),
     operation: 'collectionMap',
@@ -2772,6 +2958,12 @@ function buildCollectionMapMetadata(mapping, node, executionMode, options = {}) 
     } : {}),
     toolId: String(node?.config?.toolId || '').trim(),
     providerId: String(node?.config?.providerId || '').trim(),
+    videoChain: String(mapping?.operationId || getCollectionMapOperationId(node)).trim() === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? {
+      chainMode: videoContinuationChain ? 'previousLastFrameAsNextStartImage' : '',
+      enabled: Boolean(videoContinuationChain),
+      itemMode: videoContinuationChain?.itemMode || getCollectionMapVideoItemModeForRun(node),
+      providerChainingSupportStatus: getCollectionMapVideoProviderChainSupportStatus(node, executionMode),
+    } : null,
   };
 }
 const COLLECTION_MAP_PER_ITEM_VALIDATION_MAX_ATTEMPTS = 8;
@@ -3280,6 +3472,10 @@ async function resolveCollectionMapVideoReferenceArtifact(node, options = {}) {
   }
 
   if (itemIndex === 0) {
+    if (getCollectionMapInputKind(node) === PORT_KIND_IMAGE) {
+      return { artifact: null, role: 'firstImageInput' };
+    }
+
     if (chainState.firstItemBehavior === 'initialReferenceImage') {
       const artifact = await buildInitialVideoChainReferenceArtifact(node, chainState);
       return { artifact, role: 'initialReferenceImage' };
@@ -3360,6 +3556,10 @@ async function generateMappedVideoArtifact(node, inputArtifact, options = {}) {
   if (!providerId) {
     throw new Error('Choose a connected cloud provider before running this video collection map.');
   }
+  const providerVideoOperation = getProviderVideoOperationForConfiguredModel(providerId, model);
+  if (!providerVideoOperation) {
+    throw new Error('That cloud provider does not support collection video generation in Local AI Hub yet. Choose Google Veo or xAI Grok Imagine.');
+  }
   if (doesProviderOperationRequireExplicitModel(providerId, PIPELINE_OPERATION_IDS.VIDEO_GENERATE) && !model) {
     throw new Error('Choose or enter a video model before running this collection map.');
   }
@@ -3370,13 +3570,19 @@ async function generateMappedVideoArtifact(node, inputArtifact, options = {}) {
 
   reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + ' for video generation.', 'Running ' + node.label + '...');
   const result = await runProviderOperation(providerId, {
+    aspectRatio: operationNode.config?.videoAspectRatio,
+    durationSeconds: operationNode.config?.durationSeconds,
     imageReference: videoRequest.referenceImage,
     model,
     onProgress: (message) => reportProgress?.(message, 'Running ' + node.label + '...'),
     operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+    operationSubtype: videoRequest.referenceImage ? 'imageToVideo' : 'textToVideo',
+    negativePrompt: providerId.toLowerCase() === 'google' ? videoRequest.negativePrompt : '',
     prompt: videoRequest.prompt,
     providerId,
+    resolution: operationNode.config?.videoResolution,
     seconds: Math.max(1, Number(operationNode.config?.durationSeconds || 8) || 8),
+    signal: activeRunAbortController?.signal || null,
     size: videoRequest.size,
   });
   const generatedVideo = result?.videos?.[0] || null;
@@ -3397,15 +3603,31 @@ async function generateMappedVideoArtifact(node, inputArtifact, options = {}) {
       collectionMapItemMode: videoMapMetadata.collectionMapItemMode,
       collectionMapVideoChain: videoMapMetadata.collectionMapVideoChain,
       mode: videoRequest.referenceImage ? 'image-to-video' : 'text-to-video',
-      model,
-      negativePrompt: videoRequest.negativePrompt,
+      model: result?.model || model,
+      negativePrompt: providerId.toLowerCase() === 'google' ? videoRequest.negativePrompt : '',
+      operation: videoRequest.referenceImage ? 'imageToVideo' : 'textToVideo',
       operationId: PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
-      operationSubtype: videoRequest.referenceImage ? 'image-to-video' : 'text-to-video',
+      provider: providerId,
+      providerOperationId: result?.providerOperationId || generatedVideo.id || '',
+      providerRawStatusSummary: result?.providerRawStatusSummary || null,
+      polling: result?.polling || null,
+      requestSettings: result?.requestedSettings || null,
+      returnedVideo: {
+        extension: String(generatedVideo.extension || '.mp4').trim() || '.mp4',
+        mimeType: String(generatedVideo.mimeType || '').trim(),
+      },
+      safetyNotes: Array.isArray(result?.safetyNotes) ? result.safetyNotes : [],
+      operationSubtype: videoRequest.referenceImage ? 'imageToVideo' : 'textToVideo',
       prompt: videoRequest.prompt,
       promptStyle: videoRequest.promptStyle,
       size: videoRequest.size,
+      sourceInputImage: videoRequest.sourceInputImageArtifact || null,
       sourceImage: videoRequest.sourceImageArtifact,
       usedReferenceImage: Boolean(videoRequest.referenceImage),
+      video: {
+        durationSeconds: Number(result?.durationSeconds || generatedVideo.durationSeconds || 0) || null,
+        resolution: String(result?.requestedSettings?.resolution || operationNode.config?.videoResolution || '').trim(),
+      },
     },
   });
   return persistVideoGenerationMetadataSidecar(artifact);
@@ -3428,7 +3650,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-    return generateMappedImageArtifact(node, inputArtifact, options);
+    return generateMappedImageArtifact(operationNode, inputArtifact, { ...options, mapping: options.mapping || getCollectionMapMapping(node) });
   }
 
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
@@ -3721,6 +3943,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
   const videoContinuationChain = isCollectionMapVideoContinuationChainEnabledForRun(node, mapping, executionMode)
     ? buildCollectionMapVideoContinuationChainState(node)
     : null;
+  assertCollectionMapVideoContinuationChainSupportedForRun(node, mapping, executionMode);
   const useItemCooldown = isHeavyLocalPipelineNode(node);
   for (let index = 0; index < sourceItems.length; index += 1) {
     if (run.cancelRequested || activeRunAbortController?.signal?.aborted) {
@@ -3789,6 +4012,7 @@ async function executeCollectionMapNode(node, graph, run, contextMaps, reportPro
         videoContinuationChain.lastAcceptedArtifact = mappedArtifact;
         videoChainItemMetadata = {
           ...(videoChainItemMetadata || {}),
+          extractedLastFrameArtifactPath: String(lastFrameArtifact?.filePath || '').trim(),
           lastFrameReference: buildImageArtifactReference(lastFrameArtifact),
           lastFrameReferencePrepared: Boolean(lastFrameArtifact),
         };
@@ -3950,7 +4174,7 @@ function formatArtifactCollectionLineageLabel(kind) {
   if (kind === PORT_KIND_FILE) return 'File Collection';
   return 'Text Collection';
 }
-async function buildVideoReferenceImageRequest(referenceArtifact, size) {
+async function buildVideoReferenceImageRequest(referenceArtifact, size, options = {}) {
   if (!referenceArtifact) {
     return {
       referenceImage: null,
@@ -3968,8 +4192,9 @@ async function buildVideoReferenceImageRequest(referenceArtifact, size) {
     throw new Error('The reference image for this video step could not be found anymore. Choose it again and rerun the pipeline.');
   }
 
+  const enforceSize = options.enforceSize !== false;
   const [expectedWidth, expectedHeight] = String(size || '').split('x').map((value) => Number(value || 0));
-  if (expectedWidth > 0 && expectedHeight > 0 && referenceArtifact.width && referenceArtifact.height) {
+  if (enforceSize && expectedWidth > 0 && expectedHeight > 0 && referenceArtifact.width && referenceArtifact.height) {
     if (Number(referenceArtifact.width) !== expectedWidth || Number(referenceArtifact.height) !== expectedHeight) {
       throw new Error('This video step is set to ' + size + ', but the reference image is ' + referenceArtifact.width + 'x' + referenceArtifact.height + '. Choose a matching video size or supply a matching image.');
     }
@@ -3993,6 +4218,7 @@ async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}
   const size = String(node.config?.videoSize || '1280x720').trim() || '1280x720';
   const motionPrompt = String(node.config?.instruction || '').trim();
   const referenceImageArtifact = options.referenceImageArtifact || null;
+  const enforceReferenceImageSize = node.config?.executionMode !== 'cloud';
 
   if (inputArtifact.kind === PORT_KIND_TEXT) {
     const promptText = String(inputArtifact.text || '').trim();
@@ -4005,7 +4231,7 @@ async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}
       negativePrompt: String(node.config?.negativePrompt || '').trim(),
       supportNegativePrompt: true,
     });
-    const referenceRequest = await buildVideoReferenceImageRequest(referenceImageArtifact, size);
+    const referenceRequest = await buildVideoReferenceImageRequest(referenceImageArtifact, size, { enforceSize: enforceReferenceImageSize });
     return {
       negativePrompt: promptRequest.negativePrompt,
       prompt: promptRequest.prompt,
@@ -4017,20 +4243,21 @@ async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}
     };
   }
 
-  if (inputArtifact.kind === PORT_KIND_IMAGE && inputArtifact.filePath) {
+  if (inputArtifact.kind === PORT_KIND_IMAGE && (inputArtifact.filePath || referenceImageArtifact?.filePath)) {
     if (!motionPrompt) {
       throw new Error('This video generation step is using an image input. Add motion guidance in the instruction box before running it.');
     }
 
-    const filePath = path.resolve(String(inputArtifact.filePath || '').trim());
+    const effectiveImageArtifact = referenceImageArtifact?.filePath ? referenceImageArtifact : inputArtifact;
+    const filePath = path.resolve(String(effectiveImageArtifact.filePath || '').trim());
     if (!filePath || !(await fs.pathExists(filePath))) {
       throw new Error('The reference image for this video step could not be found anymore. Choose it again and rerun the pipeline.');
     }
 
     const [expectedWidth, expectedHeight] = size.split('x').map((value) => Number(value || 0));
-    if (expectedWidth > 0 && expectedHeight > 0 && inputArtifact.width && inputArtifact.height) {
-      if (Number(inputArtifact.width) !== expectedWidth || Number(inputArtifact.height) !== expectedHeight) {
-        throw new Error('This video step is set to ' + size + ', but the connected image is ' + inputArtifact.width + 'x' + inputArtifact.height + '. Choose a matching video size or supply a matching image.');
+    if (enforceReferenceImageSize && expectedWidth > 0 && expectedHeight > 0 && effectiveImageArtifact.width && effectiveImageArtifact.height) {
+      if (Number(effectiveImageArtifact.width) !== expectedWidth || Number(effectiveImageArtifact.height) !== expectedHeight) {
+        throw new Error('This video step is set to ' + size + ', but the connected image is ' + effectiveImageArtifact.width + 'x' + effectiveImageArtifact.height + '. Choose a matching video size or supply a matching image.');
       }
     }
 
@@ -4039,11 +4266,12 @@ async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}
       prompt: motionPrompt,
       referenceImage: {
         buffer: await fs.readFile(filePath),
-        fileName: String(inputArtifact.fileName || path.basename(filePath)).trim() || path.basename(filePath),
-        mimeType: String(inputArtifact.mimeType || 'image/png').trim() || 'image/png',
+        fileName: String(effectiveImageArtifact.fileName || path.basename(filePath)).trim() || path.basename(filePath),
+        mimeType: String(effectiveImageArtifact.mimeType || 'image/png').trim() || 'image/png',
       },
       referenceImagePath: filePath,
-      sourceImageArtifact: inputArtifact,
+      sourceImageArtifact: effectiveImageArtifact,
+      sourceInputImageArtifact: inputArtifact,
       size,
     };
   }
@@ -7314,35 +7542,63 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     }
 
     if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-      const basePrompt = buildImageGenerationPrompt(node, promptArtifact);
-      const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image');
-      const prompt = promptRequest.prompt;
-      reportProgress?.('Sending the prompt to ' + provider.name + ' for image generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
+      const imageRequest = await buildCloudImageGenerationRequest(node, promptArtifact, contextMaps);
+      const requestSettings = {
+        background: node.config?.imageBackground,
+        imageReference: imageRequest.imageReference ? { fileName: imageRequest.imageReference.fileName, mimeType: imageRequest.imageReference.mimeType } : null,
+        quality: node.config?.imageQuality,
+        size: node.config?.imageSize,
+      };
+      reportProgress?.(
+        imageRequest.operation === 'imageToImage'
+          ? 'Sending the source image and instruction to ' + provider.name + ' for cloud image editing.'
+          : 'Sending the prompt to ' + provider.name + ' for cloud image generation.',
+        'Running ' + node.label + ' with ' + provider.name + '...',
+      );
       const result = await runProviderOperation(providerId, {
         background: node.config?.imageBackground,
+        imageReference: imageRequest.imageReference,
         model,
         operationId,
-        prompt,
+        operationSubtype: imageRequest.operation,
+        prompt: imageRequest.prompt,
         providerId,
         quality: node.config?.imageQuality,
         size: node.config?.imageSize,
       });
-      const base64Image = String(result?.images?.[0]?.base64Data || '').trim();
+      const generatedImage = result?.images?.[0] || null;
+      const base64Image = String(generatedImage?.base64Data || '').trim();
       if (!base64Image) {
         throw new Error(sourceLabel + ' finished the request, but it did not return an image.');
       }
 
+      const extension = String(generatedImage.extension || '.png').trim() || '.png';
       const artifact = await saveBase64Artifact(run.directories, base64Image, {
         baseName: node.label + '-' + Date.now(),
         displayName: node.label,
-        extension: '.png',
-        kind: 'image',
+        extension,
+        kind: PORT_KIND_IMAGE,
         role: 'generated',
-        imageGeneration: buildImageGenerationMetadata(node, provider, promptRequest, { backend: providerId, backendLabel: provider.name, model }),
+        imageGeneration: buildImageGenerationMetadata(node, provider, imageRequest.promptRequest, {
+          backend: providerId,
+          backendLabel: provider.name,
+          extension,
+          height: generatedImage.height,
+          mimeType: generatedImage.mimeType,
+          model,
+          operation: imageRequest.operation,
+          provider: providerId,
+          requestSettings,
+          revisedPrompt: generatedImage.revisedPrompt,
+          safetyNotes: generatedImage.safetyNotes,
+          sourceImageArtifact: imageRequest.sourceImageArtifact,
+          sourceText: imageRequest.sourceText,
+          width: generatedImage.width,
+        }),
       });
       return {
         destinationPath: artifact.filePath,
-        message: sourceLabel + ' generated an image and saved the intermediate file to ' + artifact.filePath + '.',
+        message: sourceLabel + (imageRequest.operation === 'imageToImage' ? ' generated an edited image' : ' generated an image') + ' and saved the intermediate file to ' + artifact.filePath + '.',
         outputs: {
           image: artifact,
         },
@@ -7354,13 +7610,19 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       const videoRequest = await buildVideoGenerationRequest(node, promptArtifact, contextMaps);
       reportProgress?.('Sending the prompt to ' + provider.name + ' for video generation.', 'Running ' + node.label + ' with ' + provider.name + '...');
       const result = await runProviderOperation(providerId, {
+        aspectRatio: node.config?.videoAspectRatio,
+        durationSeconds: node.config?.durationSeconds,
         imageReference: videoRequest.referenceImage,
         model,
+        negativePrompt: videoRequest.negativePrompt,
         onProgress: (message) => reportProgress?.(message, 'Running ' + node.label + ' with ' + provider.name + '...'),
         operationId,
+        operationSubtype: videoRequest.referenceImage ? 'imageToVideo' : 'textToVideo',
         prompt: videoRequest.prompt,
         providerId,
-        seconds: 8,
+        resolution: node.config?.videoResolution,
+        seconds: Math.max(1, Number(node.config?.durationSeconds || 8) || 8),
+        signal: activeRunAbortController?.signal || null,
         size: videoRequest.size,
       });
       const videoBuffer = result?.videos?.[0]?.buffer || null;
@@ -7378,13 +7640,27 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           backend: providerId,
           backendLabel: provider.name,
           mode: videoRequest.referenceImage ? 'image-to-video' : 'text-to-video',
-          model,
+          model: result?.model || model,
           negativePrompt: videoRequest.negativePrompt,
           operationId,
-          operationSubtype: videoRequest.referenceImage ? 'image-to-video' : 'text-to-video',
+          provider: providerId,
+          providerOperationId: result?.providerOperationId || result?.videos?.[0]?.id || '',
+          providerRawStatusSummary: result?.providerRawStatusSummary || null,
+          polling: result?.polling || null,
+          requestSettings: result?.requestedSettings || null,
+          returnedVideo: {
+            durationSeconds: Number(result?.videos?.[0]?.durationSeconds || 0) || 0,
+            extension: String(result?.videos?.[0]?.extension || '.mp4').trim() || '.mp4',
+            mimeType: String(result?.videos?.[0]?.mimeType || '').trim(),
+            resolution: String(result?.videos?.[0]?.resolution || '').trim(),
+          },
+          safetyNotes: Array.isArray(result?.safetyNotes) ? result.safetyNotes : [],
+          operationSubtype: videoRequest.referenceImage ? 'imageToVideo' : 'textToVideo',
           prompt: videoRequest.prompt,
           promptStyle: videoRequest.promptStyle,
           size: videoRequest.size,
+          sourceImage: videoRequest.sourceImageArtifact,
+          usedReferenceImage: Boolean(videoRequest.referenceImage),
         },
       });
       return {
@@ -7824,3 +8100,4 @@ module.exports = {
   runPipeline,
   setPipelineEventSink,
 };
+

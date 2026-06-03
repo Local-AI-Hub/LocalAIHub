@@ -456,13 +456,13 @@ function getTemplateDetailLines(readiness) {
     ...(readiness?.notes || []),
   ];
 }
-function getCollectionMapDefaultInstruction(operationId) {
-  return operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION : '';
+function getCollectionMapDefaultInstruction(operationId, mapping = null) {
+  return operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE && mapping?.inputKind === 'text' ? COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION : '';
 }
 
 function getCollectionMapInstructionValue(node, operationId) {
   const instruction = String(node?.config?.instruction || '');
-  if (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE && instruction.trim() === COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION) {
+  if (instruction.trim() === COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION && (operationId !== PIPELINE_OPERATION_IDS.IMAGE_GENERATE || getCollectionMapMapping(node)?.inputKind !== 'text')) {
     return '';
   }
   return instruction;
@@ -546,20 +546,24 @@ function getCollectionMapRefreshLabel(operationId) {
   return 'Refresh models';
 }
 
-function getCollectionMapInstructionLabel(operationId, executionMode) {
+function getCollectionMapInstructionLabel(operationId, executionMode, mapping = null) {
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE && mapping?.inputKind === 'image') return 'Shared image edit instruction';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) return 'Prompt prefix / style guidance';
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return executionMode === 'localTool' ? 'Prompt shaping / audio guidance' : 'Speech guidance / delivery hint';
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Transformation note';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Analysis instruction';
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && mapping?.inputKind === 'image') return 'Shared motion guidance';
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return 'Motion guidance / prompt prefix';
   return 'Shared instruction';
 }
 
-function getCollectionMapInstructionPlaceholder(operationId, executionMode) {
+function getCollectionMapInstructionPlaceholder(operationId, executionMode, mapping = null) {
+  if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE && mapping?.inputKind === 'image') return 'Describe how each source image should be edited.';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) return 'Optional style or scene guidance to prepend to each text prompt.';
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) return executionMode === 'localTool' ? 'Optional genre, mood, instrumentation, or sound-design guidance prepended to each text item.' : 'Optional delivery guidance for each speech request.';
   if (operationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM) return 'Optional note stored with each transformed audio item.';
   if (operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) return 'Optional analysis request for each image.';
+  if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE && mapping?.inputKind === 'image') return 'Describe the motion to apply to every source image. Required for image-to-video.';
   if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) return 'Optional motion guidance prepended to each text prompt. Required when a clip uses a reference image.';
   return 'Optional instruction applied to each mapped item.';
 }
@@ -1278,6 +1282,61 @@ function getModelTargetConfig(node) {
 function getSelectedModelStepOperationId(node) {
   return getModelStepOperationId(node);
 }
+function providerSupportsPipelineOperation(provider, operationId) {
+  const normalizedOperationId = String(operationId || '').trim();
+  return Boolean(normalizedOperationId && provider?.pipelineCapabilities?.operations?.[normalizedOperationId]);
+}
+
+function getCloudProvidersForOperation(connectedProviders = [], operationId = '') {
+  const normalizedOperationId = String(operationId || '').trim();
+  if (!normalizedOperationId) {
+    return connectedProviders || [];
+  }
+  return (connectedProviders || []).filter((provider) => providerSupportsPipelineOperation(provider, normalizedOperationId));
+}
+
+const MODEL_STEP_OPERATION_OPTIONS = Object.freeze([
+  Object.freeze({ id: PIPELINE_OPERATION_IDS.LLM_PROMPT, label: 'Text response' }),
+  Object.freeze({ id: PIPELINE_OPERATION_IDS.IMAGE_GENERATE, label: 'Image generation' }),
+  Object.freeze({ id: PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM, label: 'Image transform' }),
+  Object.freeze({ id: PIPELINE_OPERATION_IDS.AUDIO_GENERATE, label: 'Audio generation' }),
+  Object.freeze({ id: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, label: 'Audio transcription' }),
+  Object.freeze({ id: PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM, label: 'Audio transform' }),
+  Object.freeze({ id: PIPELINE_OPERATION_IDS.VIDEO_GENERATE, label: 'Video generation' }),
+]);
+
+function getModelStepOperationOptionsForUi(node, connectedProviders = []) {
+  const executionMode = node?.config?.executionMode === 'ollama'
+    ? 'ollama'
+    : node?.config?.executionMode === 'localTool'
+      ? 'localTool'
+      : 'cloud';
+  if (executionMode === 'ollama') {
+    return MODEL_STEP_OPERATION_OPTIONS.filter((entry) => entry.id === PIPELINE_OPERATION_IDS.LLM_PROMPT);
+  }
+  if (executionMode === 'localTool') {
+    return MODEL_STEP_OPERATION_OPTIONS.filter((entry) => [
+      PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
+      PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM,
+      PIPELINE_OPERATION_IDS.AUDIO_GENERATE,
+      PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE,
+      PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM,
+      PIPELINE_OPERATION_IDS.VIDEO_GENERATE,
+    ].includes(entry.id));
+  }
+
+  const providerId = String(node?.config?.providerId || '').trim().toLowerCase();
+  const selectedProvider = providerId ? (connectedProviders || []).find((provider) => String(provider.id || '').trim().toLowerCase() === providerId) : null;
+  return MODEL_STEP_OPERATION_OPTIONS.filter((entry) => {
+    if ([PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM, PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM].includes(entry.id)) {
+      return false;
+    }
+    if (selectedProvider) {
+      return providerSupportsPipelineOperation(selectedProvider, entry.id);
+    }
+    return getCloudProvidersForOperation(connectedProviders, entry.id).length > 0;
+  });
+}
 
 function getModelStepLocalAudioToolIdForUi(node) {
   const selectedToolId = String(node?.config?.toolId || '').trim().toLowerCase();
@@ -1360,6 +1419,50 @@ function getCloudAudioModelHelp(providerId) {
   }
 
   return 'Choose a speech-capable model when the provider exposes one. Some providers may keep speech routing behind a provider-managed runtime instead.';
+}
+
+function getCloudVideoModelPlaceholder(providerId) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (normalizedProviderId === 'xai') {
+    return 'Blank for grok-imagine-video, or pick a Grok Imagine video model';
+  }
+  if (normalizedProviderId === 'google') {
+    return 'Blank for veo-3.1-generate-preview, or pick a Veo model';
+  }
+  return 'Enter or pick a cloud video model';
+}
+
+function getCloudVideoResolutionOptions(providerId) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (normalizedProviderId === 'xai') {
+    return [
+      { id: '720p', label: '720p' },
+      { id: '480p', label: '480p' },
+    ];
+  }
+  return [
+    { id: '720p', label: '720p' },
+    { id: '1080p', label: '1080p' },
+  ];
+}
+
+function getCloudVideoHelp(providerId) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  if (normalizedProviderId === 'xai') {
+    return 'Cloud Video Generation uses xAI Grok Imagine. Text to video uses the connected text prompt; image to video uses the connected image and the motion guidance in the instruction box.';
+  }
+  if (normalizedProviderId === 'google') {
+    return 'Cloud Video Generation uses Google Veo. Text to video uses the connected text prompt; image to video uses the connected image and the motion guidance in the instruction box.';
+  }
+  return 'Cloud Video Generation supports connected providers with text-to-video and image-to-video capability.';
+}
+
+function supportsCloudVideoNegativePrompt(providerId) {
+  return String(providerId || '').trim().toLowerCase() === 'google';
+}
+
+function supportsCollectionMapCloudVideoChaining(providerId) {
+  return ['google', 'xai'].includes(String(providerId || '').trim().toLowerCase());
 }
 
 function getCloudAudioVoicePlaceholder(providerId) {
@@ -2804,6 +2907,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
       : 'cloud';
   const selectedOperationId = node.type === 'llmPrompt' ? getSelectedModelStepOperationId(node) : PIPELINE_OPERATION_IDS.LLM_PROMPT;
   const selectedCloudProviderId = String(node.config?.[providerIdKey] || '').trim().toLowerCase();
+  const cloudProviderOptions = node.type === 'llmPrompt' ? getCloudProvidersForOperation(connectedProviders, selectedOperationId) : connectedProviders;
   const localToolOptions = selectedOperationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE
     ? localTranscriptionTools
     : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
@@ -2911,7 +3015,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                   ...currentNode.config,
                   [executionModeKey]: nextExecutionMode,
                   ...(currentNode.type === 'llmPrompt' ? { operationId: nextOperationId, toolId: nextToolId, ...(nextExecutionMode === 'localTool' && nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? { audioMode: normalizeAudioModeForLocalTool(nextToolId, currentNode.config?.audioMode) } : {}) } : {}),
-                  [providerIdKey]: nextExecutionMode === 'cloud' ? currentNode.config?.[providerIdKey] || '' : '',
+                  [providerIdKey]: nextExecutionMode === 'cloud' && (currentNode.type !== 'llmPrompt' || providerSupportsPipelineOperation((connectedProviders || []).find((provider) => String(provider.id || '').trim().toLowerCase() === String(currentNode.config?.[providerIdKey] || '').trim().toLowerCase()), nextOperationId)) ? currentNode.config?.[providerIdKey] || '' : '',
                   model: '',
                 },
               };
@@ -2946,7 +3050,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
             value={node.config?.[providerIdKey] || ''}
           >
             <option value="">Choose a connected provider</option>
-            {connectedProviders.map((provider) => (
+            {cloudProviderOptions.map((provider) => (
               <option key={provider.id} value={provider.id}>
                 {provider.name}
               </option>
@@ -3053,7 +3157,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
               },
             }))
           }
-          placeholder={isLocalTranscriptionMode ? 'base' : isLocalAudioMode ? (isLocalChatterboxAudioMode ? 'Managed Chatterbox-Turbo model' : 'Blank for default, or pick a downloaded AudioCraft snapshot') : isLocalAudioTransformMode ? 'Enter or pick an RVC voice model file' : isLocalImageAnalysisMode ? 'clip or deepdanbooru' : isLocalImageTransformMode ? 'Optional Upscayl paired model set' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? getCloudAudioModelPlaceholder(selectedCloudProviderId) : 'Enter or pick a model'}
+          placeholder={isLocalTranscriptionMode ? 'base' : isLocalAudioMode ? (isLocalChatterboxAudioMode ? 'Managed Chatterbox-Turbo model' : 'Blank for default, or pick a downloaded AudioCraft snapshot') : isLocalAudioTransformMode ? 'Enter or pick an RVC voice model file' : isLocalImageAnalysisMode ? 'clip or deepdanbooru' : isLocalImageTransformMode ? 'Optional Upscayl paired model set' : isLocalVideoMode ? 'Optional Wan model folder name such as Wan2.1-T2V-1.3B' : executionMode === 'localTool' ? 'Enter or pick a checkpoint file name' : selectedOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? getCloudAudioModelPlaceholder(selectedCloudProviderId) : selectedOperationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? getCloudVideoModelPlaceholder(selectedCloudProviderId) : 'Enter or pick a model'}
           value={node.config?.model || ''}
         />
         {isLocalAudiocraftAudioMode ? (
@@ -3133,7 +3237,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
                     : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                       ? getCloudAudioModelRefreshHint(selectedCloudProviderId)
                       : node.type === 'llmPrompt' && getSelectedModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
-                        ? 'Loads cloud video models for this provider step.'
+                        ? 'Loads cloud video models for this provider step. Google Veo and xAI Grok Imagine are the supported cloud video providers here.'
                         : 'Loads models from the selected cloud provider.'}
             </span>
           </div>
@@ -3610,7 +3714,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       outputBindings: executionMode === 'graphWorkflow' ? currentConfig.outputBindings || graphDefaults.outputBindings : currentConfig.outputBindings,
       workflowFormat: executionMode === 'graphWorkflow' ? currentConfig.workflowFormat || graphDefaults.workflowFormat : currentConfig.workflowFormat,
       model: '',
-      instruction: getCollectionMapDefaultInstruction(operationId),
+      instruction: getCollectionMapDefaultInstruction(operationId, mapping),
       failureMode: currentConfig.failureMode === 'partial' ? 'partial' : 'fail-fast',
       perItemValidation: currentConfig.perItemValidation && typeof currentConfig.perItemValidation === 'object'
         ? currentConfig.perItemValidation
@@ -3644,6 +3748,8 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       nextConfig.audioVoice = currentConfig.audioVoice || '';
     } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
       nextConfig.videoSize = currentConfig.videoSize || '1280x720';
+      nextConfig.videoAspectRatio = currentConfig.videoAspectRatio || (nextConfig.videoSize === '720x1280' ? '9:16' : '16:9');
+      nextConfig.videoResolution = currentConfig.videoResolution || '720p';
       nextConfig.videoFps = Number(currentConfig.videoFps || 15) || 15;
       nextConfig.videoQuality = Number(currentConfig.videoQuality || 5) || 5;
       nextConfig.videoItemMode = currentConfig.videoItemMode === 'sequentialLastFrame' ? 'sequentialLastFrame' : 'independent';
@@ -5745,6 +5851,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                       ? videoTools
                                       : imageTools;
                             const currentToolId = String(currentNode.config?.toolId || '').trim();
+                            const currentProviderId = String(currentNode.config?.providerId || '').trim().toLowerCase();
+                            const currentProvider = currentProviderId ? connectedProviders.find((provider) => String(provider.id || '').trim().toLowerCase() === currentProviderId) : null;
+                            const nextProviderId = currentNode.config?.executionMode === 'cloud' && currentProvider && !providerSupportsPipelineOperation(currentProvider, nextOperationId) ? '' : currentNode.config?.providerId || '';
                             const nextToolId = currentNode.config?.executionMode === 'localTool'
                               ? (nextLocalToolOptions.some((tool) => tool.id === currentToolId) ? currentToolId : nextLocalToolOptions[0]?.id || '')
                               : currentToolId;
@@ -5754,6 +5863,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                 ...currentNode.config,
                                 model: '',
                                 operationId: nextOperationId,
+                                providerId: nextProviderId,
                                 toolId: nextToolId,
                                 ...(currentNode.config?.executionMode === 'localTool' && nextOperationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE ? { audioMode: normalizeAudioModeForLocalTool(nextToolId, currentNode.config?.audioMode) } : {}),
                               },
@@ -5762,13 +5872,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         }
                         value={getSelectedModelStepOperationId(selectedNode)}
                       >
-                        <option value={PIPELINE_OPERATION_IDS.LLM_PROMPT}>Text response</option>
-                        <option value={PIPELINE_OPERATION_IDS.IMAGE_GENERATE}>Image generation</option>
-                        {selectedNode.config?.executionMode === 'localTool' ? <option value={PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM}>Image transform</option> : null}
-                        {selectedNode.config?.executionMode !== 'ollama' ? <option value={PIPELINE_OPERATION_IDS.AUDIO_GENERATE}>Audio generation</option> : null}
-                        {selectedNode.config?.executionMode === 'localTool' ? <option value={PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE}>Audio transcription</option> : null}
-                        {selectedNode.config?.executionMode === 'localTool' ? <option value={PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM}>Audio transform</option> : null}
-                        <option value={PIPELINE_OPERATION_IDS.VIDEO_GENERATE}>Video generation</option>
+                        {getModelStepOperationOptionsForUi(selectedNode, connectedProviders).map((option) => (
+                          <option key={option.id} value={option.id}>{option.label}</option>
+                        ))}
                       </select>
                       <p className="mt-2 text-xs leading-5 text-slate-400">
                         {selectedNode.config?.executionMode === 'ollama'
@@ -5784,7 +5890,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                     ? 'Local video tool mode returns a video artifact from the Video output port. Use the Graph Workflow step for ComfyUI video workflows.'
                                     : 'Local image tool mode returns an image artifact from the Image output port.'
                             : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
-                              ? 'This step returns an image artifact from the Image output port.'
+                              ? 'Cloud Image Generation sends text, or a source image plus an edit instruction, to the selected provider and returns an image artifact from the Image output port.'
                               : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                                 ? 'This step returns a saved audio artifact from the Audio output port.'
                                 : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM
@@ -5799,7 +5905,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                     <div>
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-instruction">
                         {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
-                          ? 'Prompt prefix / style guidance'
+                          ? (selectedNode.config?.executionMode === 'cloud' ? 'Prompt prefix / image edit instruction' : 'Prompt prefix / style guidance')
                           : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                             ? selectedNode.config?.executionMode === 'localTool'
                               ? (isModelStepChatterboxAudioMode(selectedNode) ? 'Reference voice speech guidance' : 'Prompt shaping / audio guidance')
@@ -5817,7 +5923,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         id="llm-instruction"
                         onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))}
                         placeholder={getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
-                          ? 'Optional style or scene guidance to prepend to the incoming prompt.'
+                          ? (selectedNode.config?.executionMode === 'cloud' ? 'For text input, optional style guidance. For image input, describe how the source image should be edited.' : 'Optional style or scene guidance to prepend to the incoming prompt.')
                           : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE
                             ? selectedNode.config?.executionMode === 'localTool'
                               ? (isModelStepChatterboxAudioMode(selectedNode) ? 'Optional guidance for the spoken delivery. The connected text remains the words to speak, and the Reference Audio input supplies the voice sample.' : 'Optional guidance for the generated audio. In Music mode, use this for mood, style, or instrumentation. In Continuation mode, use this only as optional text conditioning for the continuation.')
@@ -5965,8 +6071,14 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       </div>
                     ) : selectedNode.config?.executionMode !== 'ollama' && getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE ? (
                       <div className="space-y-3">
-                        <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-video-size">Video size</label><select className="store-input mt-3" id="llm-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="1280x720">1280 x 720 (landscape)</option><option value="720x1280">720 x 1280 (portrait)</option></select></div>
-                        <p className="text-xs leading-5 text-slate-400">Local AI Hub currently requests an 8 second Sora clip and saves the finished video locally. If you connect an image here, make sure it matches the selected video size.</p>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-video-mode">Mode</label><select className="store-input mt-3" id="llm-video-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoOperationMode: event.target.value } }))} value={selectedNode.config?.videoOperationMode || 'auto'}><option value="auto">Auto from input</option><option value="textToVideo">Text to video</option><option value="imageToVideo">Image to video</option></select></div>
+                          <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-video-aspect">Aspect ratio</label><select className="store-input mt-3" id="llm-video-aspect" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoAspectRatio: event.target.value, videoSize: event.target.value === '9:16' ? '720x1280' : '1280x720' } }))} value={selectedNode.config?.videoAspectRatio || (selectedNode.config?.videoSize === '720x1280' ? '9:16' : '16:9')}><option value="16:9">16:9 landscape</option><option value="9:16">9:16 portrait</option></select></div>
+                          <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-video-duration">Duration seconds</label><input className="store-input mt-3" id="llm-video-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div>
+                          <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-video-resolution">Resolution</label><select className="store-input mt-3" id="llm-video-resolution" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoResolution: event.target.value } }))} value={getCloudVideoResolutionOptions(selectedNode.config?.providerId).some((option) => option.id === selectedNode.config?.videoResolution) ? selectedNode.config?.videoResolution : '720p'}>{getCloudVideoResolutionOptions(selectedNode.config?.providerId).map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></div>
+                        </div>
+                        {supportsCloudVideoNegativePrompt(selectedNode.config?.providerId) ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-cloud-video-negative-prompt">Negative prompt</label><textarea className="store-input mt-3 min-h-[90px] resize-none" id="llm-cloud-video-negative-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder="Optional negative prompt for Google Veo." value={selectedNode.config?.negativePrompt || ''} /></div> : null}
+                        <p className="text-xs leading-5 text-slate-400">{getCloudVideoHelp(selectedNode.config?.providerId)}</p>
                       </div>
                     ) : null}
                     {getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.LLM_PROMPT ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="llm-system-prompt">System prompt</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="llm-system-prompt" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, systemPrompt: event.target.value } }))} placeholder="Optional persistent instruction for this step." value={selectedNode.config?.systemPrompt || ''} /></div> : null}
@@ -6517,6 +6629,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                   const showCollectionMapWanVideoItemMode = showCollectionMapVideoGenerationFields && collectionMapExecutionMode === 'localTool' && (!selectedCollectionMapToolId || selectedCollectionMapToolId === 'wan21-webui');
                   const collectionMapVideoItemMode = selectedNode.config?.videoItemMode === 'sequentialLastFrame' ? 'sequentialLastFrame' : 'independent';
                   const showCollectionMapVideoChainFields = showCollectionMapWanVideoItemMode && collectionMapVideoItemMode === 'sequentialLastFrame';
+                  const selectedCollectionMapProviderId = String(selectedNode.config?.providerId || '').trim().toLowerCase();
+                  const showCollectionMapCloudVideoChainToggle = showCollectionMapCloudVideoGenerationFields && supportsCollectionMapCloudVideoChaining(selectedCollectionMapProviderId);
+                  const showCollectionMapCloudVideoChainFields = showCollectionMapCloudVideoChainToggle && collectionMapVideoItemMode === 'sequentialLastFrame';
                   const showCollectionMapImageTransformFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM;
                   const showCollectionMapTranscriptionFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE;
                   const showCollectionMapAudioTransformFields = collectionMapOperationId === PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM;
@@ -6611,10 +6726,11 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         {showCollectionMapLocalImageGenerationFields ? <><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-width">Width</label><input className="store-input mt-3" id="collection-map-width" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, width: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.width || 832} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-height">Height</label><input className="store-input mt-3" id="collection-map-height" min="256" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, height: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.height || 832} /></div></div><div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-steps">Steps</label><input className="store-input mt-3" id="collection-map-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cfg">CFG scale</label><input className="store-input mt-3" id="collection-map-cfg" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, cfgScale: Number(event.target.value || 0) || 0 } }))} step="0.5" type="number" value={selectedNode.config?.cfgScale || 7} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-seed">Seed</label><input className="store-input mt-3" id="collection-map-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div></> : null}
                       </div>
                     ) : (
-                      <div className="space-y-4"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-provider">Provider</label><select className="store-input mt-3" id="collection-map-provider" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, providerId: event.target.value, model: '' } }))} value={selectedNode.config?.providerId || ''}><option value="">Choose provider</option>{connectedProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></div>{showCollectionMapCloudModelField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model">Model</label><input className="store-input mt-3" id="collection-map-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder={showCollectionMapAudioGenerationFields ? 'Provider audio model' : showCollectionMapVideoGenerationFields ? 'Provider video model' : showCollectionMapImageAnalysisFields ? 'Provider vision model' : 'Provider image model'} value={selectedNode.config?.model || ''} /></div> : null}{showCollectionMapCloudImageGenerationFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-size">Image size</label><select className="store-input mt-3" id="collection-map-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-quality">Quality</label><select className="store-input mt-3" id="collection-map-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-background">Background</label><select className="store-input mt-3" id="collection-map-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div></div> : null}{showCollectionMapCloudVideoGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cloud-video-size">Video size</label><select className="store-input mt-3" id="collection-map-cloud-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="832x480">832 x 480</option><option value="1280x720">1280 x 720</option></select></div> : null}{showCollectionMapAudioGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-voice">Voice</label><input className="store-input mt-3" id="collection-map-voice" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioVoice: event.target.value } }))} placeholder="Provider voice" value={selectedNode.config?.audioVoice || ''} /></div> : null}</div>
+                      <div className="space-y-4"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-provider">Provider</label><select className="store-input mt-3" id="collection-map-provider" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, providerId: event.target.value, model: '', videoItemMode: supportsCollectionMapCloudVideoChaining(event.target.value) ? currentNode.config?.videoItemMode : 'independent' } }))} value={selectedNode.config?.providerId || ''}><option value="">Choose provider</option>{getCloudProvidersForOperation(connectedProviders, collectionMapOperationId).map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></div>{showCollectionMapCloudModelField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model">Model</label><input className="store-input mt-3" id="collection-map-model" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value } }))} placeholder={showCollectionMapAudioGenerationFields ? 'Provider audio model' : showCollectionMapVideoGenerationFields ? getCloudVideoModelPlaceholder(selectedNode.config?.providerId) : showCollectionMapImageAnalysisFields ? 'Provider vision model' : 'Provider image model'} value={selectedNode.config?.model || ''} /></div> : null}{showCollectionMapCloudImageGenerationFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-size">Image size</label><select className="store-input mt-3" id="collection-map-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageSize: event.target.value } }))} value={selectedNode.config?.imageSize || '1024x1024'}><option value="1024x1024">1024 x 1024</option><option value="1536x1024">1536 x 1024</option><option value="1024x1536">1024 x 1536</option><option value="auto">Auto</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-quality">Quality</label><select className="store-input mt-3" id="collection-map-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageQuality: event.target.value } }))} value={selectedNode.config?.imageQuality || 'auto'}><option value="auto">Auto</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-background">Background</label><select className="store-input mt-3" id="collection-map-background" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, imageBackground: event.target.value } }))} value={selectedNode.config?.imageBackground || 'auto'}><option value="auto">Auto</option><option value="opaque">Opaque</option><option value="transparent">Transparent</option></select></div></div> : null}{showCollectionMapAudioGenerationFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-voice">Voice</label><input className="store-input mt-3" id="collection-map-voice" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioVoice: event.target.value } }))} placeholder="Provider voice" value={selectedNode.config?.audioVoice || ''} /></div> : null}</div>
                     )}
-                    {showCollectionMapInstructionField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-instruction">{getCollectionMapInstructionLabel(collectionMapOperationId, collectionMapExecutionMode)}</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="collection-map-instruction" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder={getCollectionMapInstructionPlaceholder(collectionMapOperationId, collectionMapExecutionMode)} value={collectionMapInstructionValue} /></div> : null}
-                    {(showCollectionMapLocalImageGenerationFields || showCollectionMapVideoGenerationFields) ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[100px] resize-none" id="collection-map-negative" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder={showCollectionMapVideoGenerationFields ? 'Optional negative prompt for every mapped video.' : 'Optional negative prompt for every mapped image.'} value={selectedNode.config?.negativePrompt || ''} /></div> : null}
+                    {showCollectionMapCloudVideoGenerationFields ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cloud-video-aspect">Aspect ratio</label><select className="store-input mt-3" id="collection-map-cloud-video-aspect" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoAspectRatio: event.target.value, videoSize: event.target.value === '9:16' ? '720x1280' : '1280x720' } }))} value={selectedNode.config?.videoAspectRatio || (selectedNode.config?.videoSize === '720x1280' ? '9:16' : '16:9')}><option value="16:9">16:9 landscape</option><option value="9:16">9:16 portrait</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cloud-video-duration">Duration seconds</label><input className="store-input mt-3" id="collection-map-cloud-video-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-cloud-video-resolution">Resolution</label><select className="store-input mt-3" id="collection-map-cloud-video-resolution" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoResolution: event.target.value } }))} value={getCloudVideoResolutionOptions(selectedNode.config?.providerId).some((option) => option.id === selectedNode.config?.videoResolution) ? selectedNode.config?.videoResolution : '720p'}>{getCloudVideoResolutionOptions(selectedNode.config?.providerId).map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></div></div>{showCollectionMapCloudVideoChainToggle ? <div className="rounded-[18px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3"><label className="flex items-center gap-3 text-sm font-medium text-white" htmlFor="collection-map-cloud-video-chain"><input checked={collectionMapVideoItemMode === 'sequentialLastFrame'} className="h-4 w-4 accent-cyan-300" id="collection-map-cloud-video-chain" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoItemMode: event.target.checked ? 'sequentialLastFrame' : 'independent' } }))} type="checkbox" />Chain from previous video's last frame</label>{showCollectionMapCloudVideoChainFields ? <p className="mt-2 text-xs leading-5 text-cyan-100/80">{selectedCollectionMapProviderId === 'xai' ? 'xAI Grok Imagine receives the previous generated clip last frame as the next starting image. Current text items still provide the prompt; image items keep their source lineage.' : 'Google Veo receives the previous generated clip last frame as the next starting image. Current text items still provide the prompt; image items keep their source lineage.'}</p> : null}</div> : null}</div> : null}
+                    {showCollectionMapInstructionField ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-instruction">{getCollectionMapInstructionLabel(collectionMapOperationId, collectionMapExecutionMode, selectedCollectionMapMapping)}</label><textarea className="store-input mt-3 min-h-[120px] resize-none" id="collection-map-instruction" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, instruction: event.target.value } }))} placeholder={getCollectionMapInstructionPlaceholder(collectionMapOperationId, collectionMapExecutionMode, selectedCollectionMapMapping)} value={collectionMapInstructionValue} /></div> : null}
+                    {(showCollectionMapLocalImageGenerationFields || showCollectionMapWanVideoItemMode || (showCollectionMapCloudVideoGenerationFields && supportsCloudVideoNegativePrompt(selectedNode.config?.providerId))) ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[100px] resize-none" id="collection-map-negative" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, negativePrompt: event.target.value } }))} placeholder={showCollectionMapVideoGenerationFields ? 'Optional negative prompt for every mapped video.' : 'Optional negative prompt for every mapped image.'} value={selectedNode.config?.negativePrompt || ''} /></div> : null}
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-failure-mode">On item failure</label>
                       <select className="store-input mt-3" id="collection-map-failure-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, failureMode: event.target.value === 'partial' ? 'partial' : 'fail-fast', partialSuccess: { ...(currentNode.config?.partialSuccess || {}), enabled: event.target.value === 'partial' } } }))} value={collectionMapFailureMode}>
@@ -7894,3 +8010,5 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     </section>
   );
 }
+
+

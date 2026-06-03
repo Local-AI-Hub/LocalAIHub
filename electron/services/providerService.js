@@ -14,10 +14,20 @@ const REQUEST_TIMEOUT_MS = 15000;
 const PROVIDER_DOWNLOAD_TIMEOUT_MS = 300000;
 const OPENAI_VIDEO_STATUS_TIMEOUT_MS = 10 * 60 * 1000;
 const OPENAI_VIDEO_STATUS_POLL_MS = 5000;
+const GOOGLE_VIDEO_DEFAULT_MODEL = 'veo-3.1-generate-preview';
+const GOOGLE_VIDEO_STATUS_TIMEOUT_MS = 10 * 60 * 1000;
+const GOOGLE_VIDEO_STATUS_POLL_MS = 10000;
+const XAI_VIDEO_DEFAULT_MODEL = 'grok-imagine-video';
+const XAI_VIDEO_STATUS_TIMEOUT_MS = 10 * 60 * 1000;
+const XAI_VIDEO_STATUS_POLL_MS = 5000;
 const OPENAI_IMAGE_SIZES = new Set(['1024x1024', '1536x1024', '1024x1536', 'auto']);
 const OPENAI_IMAGE_QUALITIES = new Set(['auto', 'low', 'medium', 'high']);
 const OPENAI_IMAGE_BACKGROUNDS = new Set(['auto', 'opaque', 'transparent']);
 const OPENAI_VIDEO_SIZES = new Set(['1280x720', '720x1280']);
+const GOOGLE_VIDEO_ASPECT_RATIOS = new Set(['16:9', '9:16']);
+const GOOGLE_VIDEO_RESOLUTIONS = new Set(['720p', '1080p', '4k']);
+const XAI_VIDEO_ASPECT_RATIOS = new Set(['16:9', '9:16']);
+const XAI_VIDEO_RESOLUTIONS = new Set(['480p', '720p']);
 const DEFAULT_GOOGLE_TTS_VOICE = 'Kore';
 const DEFAULT_OPENAI_TTS_VOICE = 'alloy';
 const DEFAULT_XAI_TTS_VOICE = 'eve';
@@ -118,6 +128,13 @@ function buildProviderHeaders(provider, apiKey, contentType = 'application/json'
 
 async function requestProviderJson(provider, apiKey, endpoint, options = {}) {
   const controller = new AbortController();
+  const externalSignal = options.signal || null;
+  const abortFromExternalSignal = () => controller.abort();
+  if (externalSignal?.aborted) {
+    controller.abort();
+  } else if (externalSignal) {
+    externalSignal.addEventListener('abort', abortFromExternalSignal, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), options.timeoutMs || REQUEST_TIMEOUT_MS);
 
   try {
@@ -152,6 +169,10 @@ async function requestProviderJson(provider, apiKey, endpoint, options = {}) {
     return payload;
   } catch (error) {
     if (error.name === 'AbortError') {
+      if (externalSignal?.aborted) {
+        throw new Error(String(options.cancelMessage || '').trim() || `${provider.name} request was cancelled.`);
+      }
+
       const timeoutMessage = String(options.timeoutMessage || '').trim();
       if (timeoutMessage) {
         throw new Error(timeoutMessage);
@@ -163,11 +184,21 @@ async function requestProviderJson(provider, apiKey, endpoint, options = {}) {
     throw error;
   } finally {
     clearTimeout(timer);
+    if (externalSignal) {
+      externalSignal.removeEventListener('abort', abortFromExternalSignal);
+    }
   }
 }
 
 async function requestProviderBuffer(provider, apiKey, endpoint, options = {}) {
   const controller = new AbortController();
+  const externalSignal = options.signal || null;
+  const abortFromExternalSignal = () => controller.abort();
+  if (externalSignal?.aborted) {
+    controller.abort();
+  } else if (externalSignal) {
+    externalSignal.addEventListener('abort', abortFromExternalSignal, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), options.timeoutMs || PROVIDER_DOWNLOAD_TIMEOUT_MS);
 
   try {
@@ -205,17 +236,52 @@ async function requestProviderBuffer(provider, apiKey, endpoint, options = {}) {
     };
   } catch (error) {
     if (error.name === 'AbortError') {
+      if (externalSignal?.aborted) {
+        throw new Error(String(options.cancelMessage || '').trim() || `${provider.name} download was cancelled.`);
+      }
+
       throw new Error(`${provider.name} took too long to return the finished file.`);
     }
 
     throw error;
   } finally {
     clearTimeout(timer);
+    if (externalSignal) {
+      externalSignal.removeEventListener('abort', abortFromExternalSignal);
+    }
   }
 }
 
-function waitForProvider(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function waitForProvider(ms, signal = null, cancelMessage = 'Provider request was cancelled.') {
+  if (signal?.aborted) {
+    return Promise.reject(new Error(cancelMessage));
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(new Error(cancelMessage));
+    };
+    const timer = setTimeout(finish, ms);
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
 }
 function matchesBlockedModel(provider, modelId) {
   const blockedPatterns = provider.configuration?.blockedModelPatterns || [];
@@ -339,8 +405,11 @@ function normalizeGoogleModels(provider, payload) {
       supportsGenerateContent: Array.isArray(entry?.supportedGenerationMethods)
         ? entry.supportedGenerationMethods.includes('generateContent')
         : false,
+      supportsPredictLongRunning: Array.isArray(entry?.supportedGenerationMethods)
+        ? entry.supportedGenerationMethods.includes('predictLongRunning')
+        : false,
     }))
-    .filter((entry) => entry.id && entry.supportsGenerateContent);
+    .filter((entry) => entry.id && (entry.supportsGenerateContent || entry.supportsPredictLongRunning));
 }
 
 function selectPreferredModel(provider, models, savedModel) {
@@ -1127,6 +1196,197 @@ async function sendProviderSpeechGeneration(provider, apiKey, payload) {
   throw new Error(provider.name + ' does not support cloud audio generation in Local AI Hub yet.');
 }
 
+function normalizeProviderImageMimeType(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'image/jpg') {
+    return 'image/jpeg';
+  }
+  if (['image/png', 'image/jpeg', 'image/webp'].includes(normalized)) {
+    return normalized;
+  }
+  return 'image/png';
+}
+
+function getProviderImageExtension(mimeType) {
+  const normalized = normalizeProviderImageMimeType(mimeType);
+  if (normalized === 'image/jpeg') {
+    return '.jpg';
+  }
+  if (normalized === 'image/webp') {
+    return '.webp';
+  }
+  return '.png';
+}
+
+function normalizeProviderImageBase64(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+  const inlineData = parseInlineDataUrl(raw);
+  return inlineData?.data || raw;
+}
+
+async function readProviderImageReference(payload = {}) {
+  const reference = payload.imageReference && typeof payload.imageReference === 'object' ? payload.imageReference : null;
+  if (!reference) {
+    return null;
+  }
+
+  const mimeType = normalizeProviderImageMimeType(reference.mimeType || reference.contentType || 'image/png');
+  const fileName = String(reference.fileName || ('source' + getProviderImageExtension(mimeType))).trim() || ('source' + getProviderImageExtension(mimeType));
+  let buffer = Buffer.isBuffer(reference.buffer) ? reference.buffer : null;
+  if (!buffer && reference.data) {
+    buffer = Buffer.from(normalizeProviderImageBase64(reference.data), 'base64');
+  }
+  if (!buffer && reference.base64Data) {
+    buffer = Buffer.from(normalizeProviderImageBase64(reference.base64Data), 'base64');
+  }
+  if (!buffer && reference.filePath) {
+    const filePath = String(reference.filePath || '').trim();
+    if (filePath && await fs.pathExists(filePath)) {
+      buffer = await fs.readFile(filePath);
+    }
+  }
+
+  if (!buffer?.length) {
+    throw new Error('The source image could not be read. Choose a valid PNG, JPG, or WEBP image and try again.');
+  }
+
+  return {
+    base64Data: buffer.toString('base64'),
+    buffer,
+    dataUrl: 'data:' + mimeType + ';base64,' + buffer.toString('base64'),
+    fileName,
+    mimeType,
+  };
+}
+
+function getProviderImageSafetyNotes(provider, payload = {}) {
+  const notes = [];
+  const promptFeedback = payload?.promptFeedback || payload?.prompt_feedback || null;
+  const blockReason = String(promptFeedback?.blockReason || promptFeedback?.block_reason || '').trim();
+  if (blockReason) {
+    notes.push(provider.name + ' reported a safety block: ' + blockReason + '.');
+  }
+
+  const candidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
+  candidates.forEach((candidate) => {
+    const finishReason = String(candidate?.finishReason || candidate?.finish_reason || '').trim();
+    if (finishReason && /safety|blocked|prohibited|policy/i.test(finishReason)) {
+      notes.push(provider.name + ' filtered the response: ' + finishReason + '.');
+    }
+    const safetyRatings = Array.isArray(candidate?.safetyRatings || candidate?.safety_ratings)
+      ? (candidate.safetyRatings || candidate.safety_ratings)
+      : [];
+    safetyRatings.forEach((rating) => {
+      const category = String(rating?.category || '').trim();
+      const probability = String(rating?.probability || '').trim();
+      const blocked = rating?.blocked === true;
+      if (blocked || /high|medium/i.test(probability)) {
+        notes.push([category, probability, blocked ? 'blocked' : 'flagged'].filter(Boolean).join(' '));
+      }
+    });
+  });
+
+  return [...new Set(notes.map((entry) => String(entry || '').trim()).filter(Boolean))];
+}
+
+async function downloadProviderImageUrl(provider, apiKey, url) {
+  const normalizedUrl = String(url || '').trim();
+  if (!/^https?:\/\//i.test(normalizedUrl)) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROVIDER_DOWNLOAD_TIMEOUT_MS);
+  try {
+    const response = await fetch(normalizedUrl, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(provider.name + ' returned an image URL, but Local AI Hub could not download it.');
+    }
+    const mimeType = normalizeProviderImageMimeType(String(response.headers.get('content-type') || 'image/png'));
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!buffer.length) {
+      throw new Error(provider.name + ' returned an empty image file.');
+    }
+    return {
+      base64Data: buffer.toString('base64'),
+      extension: getProviderImageExtension(mimeType),
+      mimeType,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function normalizeProviderImageEntry(provider, apiKey, entry, fallbackMimeType = 'image/png') {
+  const inlineData = parseInlineDataUrl(entry?.url || entry?.image_url || entry?.data || '');
+  const base64Data = normalizeProviderImageBase64(entry?.b64_json || entry?.base64Data || entry?.base64 || inlineData?.data || '');
+  const mimeType = normalizeProviderImageMimeType(entry?.mimeType || entry?.mime_type || inlineData?.mimeType || fallbackMimeType);
+  if (base64Data) {
+    return {
+      base64Data,
+      extension: getProviderImageExtension(mimeType),
+      mimeType,
+      revisedPrompt: String(entry?.revised_prompt || entry?.revisedPrompt || '').trim(),
+      safetyNotes: Array.isArray(entry?.safetyNotes) ? entry.safetyNotes : [],
+    };
+  }
+
+  const url = String(entry?.url || entry?.image_url || '').trim();
+  const downloaded = await downloadProviderImageUrl(provider, apiKey, url);
+  if (downloaded) {
+    return {
+      ...downloaded,
+      revisedPrompt: String(entry?.revised_prompt || entry?.revisedPrompt || '').trim(),
+      safetyNotes: Array.isArray(entry?.safetyNotes) ? entry.safetyNotes : [],
+    };
+  }
+
+  return null;
+}
+
+async function normalizeProviderImageDataResponse(provider, apiKey, response, options = {}) {
+  const data = Array.isArray(response?.data)
+    ? response.data
+    : Array.isArray(response?.images)
+      ? response.images
+      : [];
+  for (const entry of data) {
+    const image = await normalizeProviderImageEntry(provider, apiKey, entry, options.fallbackMimeType || 'image/png');
+    if (image?.base64Data) {
+      return image;
+    }
+  }
+
+  const safetyNotes = getProviderImageSafetyNotes(provider, response);
+  if (safetyNotes.length) {
+    throw new Error(provider.name + ' blocked or filtered that image request. Adjust the prompt or source image and try again.');
+  }
+  throw new Error(provider.name + ' finished the request, but it did not return an image.');
+}
+
+function buildProviderImageGenerationResult(provider, model, operation, image) {
+  return {
+    createdAt: new Date().toISOString(),
+    images: [
+      {
+        base64Data: image.base64Data,
+        extension: image.extension || getProviderImageExtension(image.mimeType),
+        height: Number(image.height || 0) || 0,
+        mimeType: normalizeProviderImageMimeType(image.mimeType),
+        revisedPrompt: String(image.revisedPrompt || '').trim(),
+        safetyNotes: Array.isArray(image.safetyNotes) ? image.safetyNotes : [],
+        width: Number(image.width || 0) || 0,
+      },
+    ],
+    model,
+    operation,
+    provider: provider.id,
+  };
+}
+
 async function sendOpenAiImageGeneration(provider, apiKey, payload) {
   if (provider.id !== 'openai') {
     throw new Error(provider.name + ' does not support cloud image generation in Local AI Hub yet.');
@@ -1134,12 +1394,34 @@ async function sendOpenAiImageGeneration(provider, apiKey, payload) {
 
   const prompt = String(payload.prompt || '').trim();
   if (!prompt) {
-    throw new Error('Enter a text prompt before generating an image.');
+    throw new Error('Enter a text prompt or edit instruction before generating an image.');
   }
 
   const model = String(payload.model || '').trim();
   if (!model) {
     throw new Error('Choose an OpenAI image model before generating an image.');
+  }
+
+  const imageReference = await readProviderImageReference(payload);
+  if (imageReference) {
+    const formData = new FormData();
+    formData.append('background', normalizeAllowedValue(payload.background, OPENAI_IMAGE_BACKGROUNDS, 'auto'));
+    formData.append('image', new Blob([imageReference.buffer], { type: imageReference.mimeType }), imageReference.fileName);
+    formData.append('model', model);
+    formData.append('n', '1');
+    formData.append('output_format', 'png');
+    formData.append('prompt', prompt);
+    formData.append('quality', normalizeAllowedValue(payload.quality, OPENAI_IMAGE_QUALITIES, 'auto'));
+    formData.append('size', normalizeAllowedValue(payload.size, OPENAI_IMAGE_SIZES, '1024x1024'));
+
+    const response = await requestProviderJson(provider, apiKey, '/images/edits', {
+      method: 'POST',
+      body: formData,
+      contentType: null,
+      timeoutMs: PROVIDER_DOWNLOAD_TIMEOUT_MS,
+    });
+    const image = await normalizeProviderImageDataResponse(provider, apiKey, response);
+    return buildProviderImageGenerationResult(provider, model, 'imageToImage', image);
   }
 
   const response = await requestProviderJson(provider, apiKey, '/images/generations', {
@@ -1153,26 +1435,673 @@ async function sendOpenAiImageGeneration(provider, apiKey, payload) {
       quality: normalizeAllowedValue(payload.quality, OPENAI_IMAGE_QUALITIES, 'auto'),
       size: normalizeAllowedValue(payload.size, OPENAI_IMAGE_SIZES, '1024x1024'),
     }),
+    timeoutMs: PROVIDER_DOWNLOAD_TIMEOUT_MS,
+  });
+  const image = await normalizeProviderImageDataResponse(provider, apiKey, response);
+  return buildProviderImageGenerationResult(provider, model, 'textToImage', image);
+}
+
+function collectGoogleInlineImageParts(response = {}) {
+  const candidates = Array.isArray(response?.candidates) ? response.candidates : [];
+  return candidates.flatMap((candidate) => {
+    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    return parts
+      .map((part) => part?.inlineData || part?.inline_data || null)
+      .filter((inlineData) => inlineData && String(inlineData.data || '').trim());
+  });
+}
+
+async function sendGoogleImageGeneration(provider, apiKey, payload) {
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw new Error('Enter a text prompt or edit instruction before generating an image.');
+  }
+
+  const model = String(payload.model || '').trim();
+  if (!model) {
+    throw new Error('Choose a Gemini image model before generating an image.');
+  }
+
+  const imageReference = await readProviderImageReference(payload);
+  const modelPath = model.startsWith('models/') ? model : 'models/' + model;
+  const parts = [{ text: prompt }];
+  if (imageReference) {
+    parts.push({ inlineData: { mimeType: imageReference.mimeType, data: imageReference.base64Data } });
+  }
+
+  const response = await requestProviderJson(provider, apiKey, modelPath + ':generateContent', {
+    method: 'POST',
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        responseModalities: ['TEXT', 'IMAGE'],
+      },
+    }),
+    timeoutMs: PROVIDER_DOWNLOAD_TIMEOUT_MS,
   });
 
-  const image = Array.isArray(response?.data)
-    ? response.data.find((entry) => String(entry?.b64_json || '').trim())
-    : null;
-  const base64Data = String(image?.b64_json || '').trim();
-  if (!base64Data) {
+  const inlineImage = collectGoogleInlineImageParts(response)[0] || null;
+  if (!inlineImage) {
+    const safetyNotes = getProviderImageSafetyNotes(provider, response);
+    if (safetyNotes.length) {
+      throw new Error(provider.name + ' blocked or filtered that image request. Adjust the prompt or source image and try again.');
+    }
     throw new Error(provider.name + ' finished the request, but it did not return an image.');
   }
 
+  return buildProviderImageGenerationResult(provider, model, imageReference ? 'imageToImage' : 'textToImage', {
+    base64Data: String(inlineImage.data || '').trim(),
+    extension: getProviderImageExtension(inlineImage.mimeType || 'image/png'),
+    mimeType: inlineImage.mimeType || 'image/png',
+    safetyNotes: getProviderImageSafetyNotes(provider, response),
+  });
+}
+
+async function sendXaiImageGeneration(provider, apiKey, payload) {
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw new Error('Enter a text prompt or edit instruction before generating an image.');
+  }
+
+  const model = String(payload.model || '').trim();
+  if (!model) {
+    throw new Error('Choose an xAI image model before generating an image.');
+  }
+
+  const imageReference = await readProviderImageReference(payload);
+  const endpoint = imageReference ? '/images/edits' : '/images/generations';
+  const body = {
+    model,
+    prompt,
+    response_format: 'b64_json',
+  };
+  if (imageReference) {
+    body.image = {
+      type: 'image_url',
+      url: imageReference.dataUrl,
+    };
+  }
+
+  const response = await requestProviderJson(provider, apiKey, endpoint, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    timeoutMs: PROVIDER_DOWNLOAD_TIMEOUT_MS,
+  });
+  const image = await normalizeProviderImageDataResponse(provider, apiKey, response);
+  return buildProviderImageGenerationResult(provider, model, imageReference ? 'imageToImage' : 'textToImage', image);
+}
+
+async function sendProviderImageGeneration(provider, apiKey, payload) {
+  if (provider.id === 'openai') {
+    return sendOpenAiImageGeneration(provider, apiKey, payload);
+  }
+
+  if (provider.configuration?.protocol === 'google-gemini') {
+    return sendGoogleImageGeneration(provider, apiKey, payload);
+  }
+
+  if (provider.id === 'xai') {
+    return sendXaiImageGeneration(provider, apiKey, payload);
+  }
+
+  throw new Error(provider.name + ' does not support cloud image generation in Local AI Hub yet.');
+}
+
+function normalizeProviderImageGenerationError(provider, error) {
+  const rawMessage = redactSensitiveText(String(error?.message || error || '').trim(), { additionalSecrets: [] });
+  const lower = rawMessage.toLowerCase();
+  if (/api key|apikey|unauthorized|invalid key|forbidden|permission|401|403/.test(lower)) {
+    return provider.name + ' could not run image generation because the API key is missing, invalid, or not allowed to use that model.';
+  }
+  if (/quota|billing|insufficient|credits|payment/.test(lower)) {
+    return provider.name + ' says this account does not have enough image-generation quota or billing access for that request.';
+  }
+  if (/rate.?limit|too many requests|429/.test(lower)) {
+    return provider.name + ' is rate limiting image generation right now. Wait a moment, then try again.';
+  }
+  if (/safety|policy|blocked|filtered|harm|prohibited/.test(lower)) {
+    return provider.name + ' blocked or filtered that image request for safety. Adjust the prompt or source image and try again.';
+  }
+  if (/image|file|mime|png|jpg|jpeg|webp|base64|malformed/.test(lower)) {
+    return rawMessage || 'Local AI Hub could not read or send the source image. Use a valid PNG, JPG, or WEBP image and try again.';
+  }
+  return humanizeError(error, 'Local AI Hub could not run that ' + provider.name + ' image generation step.');
+}
+
+function normalizeGoogleVideoModelPath(model) {
+  const normalized = String(model || GOOGLE_VIDEO_DEFAULT_MODEL).trim() || GOOGLE_VIDEO_DEFAULT_MODEL;
+  return normalized.startsWith('models/') ? normalized : 'models/' + normalized;
+}
+
+function normalizeGoogleVideoAspectRatio(value, size) {
+  const normalized = String(value || '').trim();
+  if (GOOGLE_VIDEO_ASPECT_RATIOS.has(normalized)) {
+    return normalized;
+  }
+
+  const [width, height] = String(size || '').split('x').map((entry) => Number(entry || 0));
+  if (width > 0 && height > 0) {
+    return width > height ? '16:9' : '9:16';
+  }
+
+  return '16:9';
+}
+
+function normalizeGoogleVideoResolution(value) {
+  return normalizeAllowedValue(value, GOOGLE_VIDEO_RESOLUTIONS, '720p');
+}
+
+function buildGoogleVideoRawStatusSummary(operation = {}) {
+  const error = operation?.error && typeof operation.error === 'object' ? operation.error : null;
+  const response = operation?.response && typeof operation.response === 'object' ? operation.response : null;
+  const samples = response?.generateVideoResponse?.generatedSamples || response?.generatedVideos || [];
+  return {
+    done: operation?.done === true,
+    errorCode: error?.code || null,
+    errorMessage: error?.message ? redactSensitiveText(String(error.message).trim()) : '',
+    name: String(operation?.name || '').trim(),
+    sampleCount: Array.isArray(samples) ? samples.length : 0,
+  };
+}
+
+function getGoogleVideoSafetyNotes(payload = {}) {
+  const notes = [];
+  const status = payload?.metadata?.status || payload?.response?.generateVideoResponse?.safetyAttributes || null;
+  const errorMessage = String(payload?.error?.message || '').trim();
+  if (/safety|policy|blocked|filtered|harm|prohibited/i.test(errorMessage)) {
+    notes.push(errorMessage);
+  }
+  if (status && typeof status === 'object') {
+    const blockReason = String(status.blockReason || status.block_reason || '').trim();
+    if (blockReason) {
+      notes.push('Google reported a safety block: ' + blockReason + '.');
+    }
+  }
+  return [...new Set(notes.map((entry) => redactSensitiveText(String(entry || '').trim())).filter(Boolean))];
+}
+
+function getGoogleVideoFromOperation(operation = {}) {
+  const generatedSamples = operation?.response?.generateVideoResponse?.generatedSamples;
+  if (Array.isArray(generatedSamples) && generatedSamples.length) {
+    return generatedSamples[0]?.video || null;
+  }
+
+  const generatedVideos = operation?.response?.generatedVideos || operation?.response?.generated_videos;
+  if (Array.isArray(generatedVideos) && generatedVideos.length) {
+    return generatedVideos[0]?.video || generatedVideos[0] || null;
+  }
+
+  return null;
+}
+
+function getProviderVideoExtension(mimeType, uri = '') {
+  const normalized = String(mimeType || '').toLowerCase();
+  if (normalized.includes('webm') || /\.webm(?:$|[?#])/i.test(uri)) return '.webm';
+  if (normalized.includes('quicktime') || /\.mov(?:$|[?#])/i.test(uri)) return '.mov';
+  return '.mp4';
+}
+
+function getGoogleVideoDownloadUri(video = {}) {
+  return String(video?.uri || video?.downloadUri || video?.download_uri || video?.fileUri || video?.file_uri || '').trim();
+}
+
+function getGoogleVideoBytes(video = {}) {
+  const raw = String(video?.videoBytes || video?.video_bytes || '').trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    const buffer = Buffer.from(raw, 'base64');
+    return buffer.length ? buffer : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cancelGoogleVideoOperation(provider, apiKey, operationName, signal) {
+  const normalizedName = String(operationName || '').trim();
+  if (!normalizedName || !signal?.aborted) {
+    return false;
+  }
+
+  try {
+    await requestProviderJson(provider, apiKey, normalizedName + ':cancel', {
+      method: 'POST',
+      timeoutMs: 15000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function sendGoogleVideoGeneration(provider, apiKey, payload) {
+  if (provider.id !== 'google') {
+    throw new Error(provider.name + ' does not support cloud video generation in Local AI Hub yet.');
+  }
+
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw new Error('Enter a prompt or motion instruction before generating a video.');
+  }
+
+  const model = String(payload.model || GOOGLE_VIDEO_DEFAULT_MODEL).trim() || GOOGLE_VIDEO_DEFAULT_MODEL;
+  const modelPath = normalizeGoogleVideoModelPath(model);
+  const signal = payload.signal || null;
+  const onProgress = typeof payload.onProgress === 'function' ? payload.onProgress : null;
+  const pollIntervalMs = Math.max(0, Number(payload.pollIntervalMs ?? GOOGLE_VIDEO_STATUS_POLL_MS) || 0);
+  const statusTimeoutMs = Math.max(1, Number(payload.timeoutMs || GOOGLE_VIDEO_STATUS_TIMEOUT_MS) || GOOGLE_VIDEO_STATUS_TIMEOUT_MS);
+  const imageReference = await readProviderImageReference(payload);
+  const operation = imageReference ? 'imageToVideo' : 'textToVideo';
+  const settings = {
+    aspectRatio: normalizeGoogleVideoAspectRatio(payload.aspectRatio, payload.size),
+    durationSeconds: Math.max(1, Number(payload.seconds || payload.durationSeconds || 8) || 8),
+    negativePrompt: String(payload.negativePrompt || '').trim(),
+    resolution: normalizeGoogleVideoResolution(payload.resolution),
+  };
+  const instance = { prompt };
+  if (imageReference) {
+    instance.image = {
+      inlineData: {
+        data: imageReference.base64Data,
+        mimeType: imageReference.mimeType,
+      },
+    };
+  }
+  const parameters = {
+    aspectRatio: settings.aspectRatio,
+    resolution: settings.resolution,
+  };
+  if (settings.negativePrompt) {
+    parameters.negativePrompt = settings.negativePrompt;
+  }
+
+  onProgress?.('Generating video with Google Veo...');
+  const started = await requestProviderJson(provider, apiKey, modelPath + ':predictLongRunning', {
+    cancelMessage: 'Google Veo video generation was cancelled before the request finished.',
+    method: 'POST',
+    body: JSON.stringify({
+      instances: [instance],
+      parameters,
+    }),
+    signal,
+    timeoutMs: 60000,
+  });
+
+  const operationName = String(started?.name || '').trim();
+  if (!operationName) {
+    throw new Error(provider.name + ' accepted the request, but it did not return a video operation name.');
+  }
+
+  const startedAt = Date.now();
+  let attempts = 0;
+  let latestPayload = started;
+  while (latestPayload?.done !== true) {
+    if (signal?.aborted) {
+      const providerCancelled = await cancelGoogleVideoOperation(provider, apiKey, operationName, signal);
+      throw new Error(providerCancelled
+        ? 'Google Veo video generation was cancelled.'
+        : 'Google Veo polling stopped because the pipeline was cancelled. The cloud job may continue on Google for a short time.');
+    }
+
+    if (Date.now() - startedAt > statusTimeoutMs) {
+      throw new Error(provider.name + ' is still generating that video after the timeout. Try again later or shorten the request.');
+    }
+
+    attempts += 1;
+    onProgress?.('Waiting for Google Veo operation...');
+    try {
+      await waitForProvider(pollIntervalMs, signal, 'Google Veo polling stopped because the pipeline was cancelled.');
+      latestPayload = await requestProviderJson(provider, apiKey, operationName, {
+        cancelMessage: 'Google Veo polling stopped because the pipeline was cancelled.',
+        method: 'GET',
+        signal,
+        timeoutMs: 60000,
+      });
+    } catch (error) {
+      if (signal?.aborted) {
+        const providerCancelled = await cancelGoogleVideoOperation(provider, apiKey, operationName, signal);
+        throw new Error(providerCancelled
+          ? 'Google Veo video generation was cancelled.'
+          : 'Google Veo polling stopped because the pipeline was cancelled. The cloud job may continue on Google for a short time.');
+      }
+      throw error;
+    }
+  }
+
+  if (latestPayload?.error) {
+    const failureMessage = latestPayload.error.message || provider.name + ' could not finish that video request.';
+    throw new Error(redactSensitiveText(String(failureMessage).trim(), { additionalSecrets: [apiKey] }));
+  }
+
+  const returnedVideo = getGoogleVideoFromOperation(latestPayload);
+  if (!returnedVideo) {
+    const safetyNotes = getGoogleVideoSafetyNotes(latestPayload);
+    if (safetyNotes.length) {
+      throw new Error(provider.name + ' blocked or filtered that video request for safety. Adjust the prompt or source image and try again.');
+    }
+    throw new Error(provider.name + ' finished the request, but it did not return a video.');
+  }
+
+  onProgress?.('Downloading generated video...');
+  const inlineBuffer = getGoogleVideoBytes(returnedVideo);
+  const downloadUri = getGoogleVideoDownloadUri(returnedVideo);
+  let buffer = inlineBuffer;
+  let mimeType = String(returnedVideo.mimeType || returnedVideo.mime_type || 'video/mp4').trim() || 'video/mp4';
+  if (!buffer && downloadUri) {
+    const downloaded = await requestProviderBuffer(provider, apiKey, downloadUri, {
+      cancelMessage: 'Google Veo video download stopped because the pipeline was cancelled.',
+      contentType: null,
+      method: 'GET',
+      signal,
+      timeoutMs: PROVIDER_DOWNLOAD_TIMEOUT_MS,
+    });
+    buffer = downloaded.buffer;
+    mimeType = downloaded.contentType.startsWith('video/') ? downloaded.contentType : mimeType;
+  }
+
+  if (!buffer?.length) {
+    throw new Error(provider.name + ' finished the request, but the video file was empty.');
+  }
+
+  const extension = getProviderVideoExtension(mimeType, downloadUri);
   return {
     createdAt: new Date().toISOString(),
-    images: [
+    model,
+    operation,
+    polling: {
+      attemptCount: attempts,
+      durationMs: Date.now() - startedAt,
+    },
+    provider: provider.id,
+    providerOperationId: operationName,
+    providerRawStatusSummary: buildGoogleVideoRawStatusSummary(latestPayload),
+    requestedSettings: settings,
+    safetyNotes: getGoogleVideoSafetyNotes(latestPayload),
+    videos: [
       {
-        base64Data,
-        mimeType: 'image/png',
+        buffer,
+        extension,
+        id: operationName,
+        mimeType,
       },
     ],
-    model,
   };
+}
+
+function normalizeXaiVideoAspectRatio(value, size) {
+  const normalized = String(value || '').trim();
+  if (XAI_VIDEO_ASPECT_RATIOS.has(normalized)) {
+    return normalized;
+  }
+
+  const [width, height] = String(size || '').split('x').map((entry) => Number(entry || 0));
+  if (width > 0 && height > 0) {
+    return width > height ? '16:9' : '9:16';
+  }
+
+  return '16:9';
+}
+
+function normalizeXaiVideoResolution(value) {
+  return normalizeAllowedValue(value, XAI_VIDEO_RESOLUTIONS, '720p');
+}
+
+function normalizeXaiVideoDuration(value) {
+  const seconds = Math.max(1, Number(value || 8) || 8);
+  return Math.min(15, Math.floor(seconds));
+}
+
+function buildXaiVideoRawStatusSummary(payload = {}) {
+  const video = payload?.video && typeof payload.video === 'object' ? payload.video : null;
+  const error = payload?.error && typeof payload.error === 'object' ? payload.error : null;
+  return {
+    errorCode: error?.code || null,
+    errorMessage: error?.message ? redactSensitiveText(String(error.message).trim()) : '',
+    hasVideo: Boolean(video?.url || video?.b64_json || video?.base64 || video?.data),
+    model: String(payload?.model || '').trim(),
+    requestId: String(payload?.request_id || payload?.requestId || payload?.id || '').trim(),
+    status: String(payload?.status || '').trim(),
+    videoDuration: Number(video?.duration || video?.duration_seconds || 0) || 0,
+    videoResolution: String(video?.resolution || '').trim(),
+  };
+}
+
+function getXaiVideoSafetyNotes(payload = {}) {
+  const notes = [];
+  const video = payload?.video && typeof payload.video === 'object' ? payload.video : null;
+  const moderation = video?.respect_moderation;
+  const status = String(payload?.status || '').trim();
+  const errorMessage = String(payload?.error?.message || payload?.message || '').trim();
+  if (moderation === false) {
+    notes.push('xAI reported that the generated video did not pass moderation.');
+  }
+  if (/safety|policy|blocked|filtered|moderation|prohibited/i.test(status + ' ' + errorMessage)) {
+    notes.push(errorMessage || 'xAI blocked or filtered that video request for safety.');
+  }
+  return [...new Set(notes.map((entry) => redactSensitiveText(String(entry || '').trim())).filter(Boolean))];
+}
+
+function getXaiVideoFromPayload(payload = {}) {
+  if (payload?.video && typeof payload.video === 'object') {
+    return payload.video;
+  }
+
+  const videos = Array.isArray(payload?.videos) ? payload.videos : [];
+  if (videos.length) {
+    return videos[0];
+  }
+
+  const data = Array.isArray(payload?.data) ? payload.data : [];
+  if (data.length) {
+    return data[0]?.video || data[0];
+  }
+
+  return null;
+}
+
+function getProviderVideoBytes(video = {}) {
+  const raw = String(video?.b64_json || video?.base64 || video?.data || video?.videoBytes || video?.video_bytes || '').trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = parseInlineDataUrl(raw);
+    const buffer = Buffer.from(parsed?.data || raw, 'base64');
+    return buffer.length ? buffer : null;
+  } catch {
+    return null;
+  }
+}
+
+async function sendXaiVideoGeneration(provider, apiKey, payload) {
+  if (provider.id !== 'xai') {
+    throw new Error(provider.name + ' does not support cloud video generation in Local AI Hub yet.');
+  }
+
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw new Error('Enter a prompt or motion instruction before generating a video.');
+  }
+
+  const model = String(payload.model || XAI_VIDEO_DEFAULT_MODEL).trim() || XAI_VIDEO_DEFAULT_MODEL;
+  const signal = payload.signal || null;
+  const onProgress = typeof payload.onProgress === 'function' ? payload.onProgress : null;
+  const pollIntervalMs = Math.max(0, Number(payload.pollIntervalMs ?? XAI_VIDEO_STATUS_POLL_MS) || 0);
+  const statusTimeoutMs = Math.max(1, Number(payload.timeoutMs || XAI_VIDEO_STATUS_TIMEOUT_MS) || XAI_VIDEO_STATUS_TIMEOUT_MS);
+  const imageReference = await readProviderImageReference(payload);
+  const operation = imageReference ? 'imageToVideo' : 'textToVideo';
+  const settings = {
+    aspectRatio: normalizeXaiVideoAspectRatio(payload.aspectRatio, payload.size),
+    durationSeconds: normalizeXaiVideoDuration(payload.seconds || payload.durationSeconds || 8),
+    resolution: normalizeXaiVideoResolution(payload.resolution),
+  };
+  const body = {
+    model,
+    prompt,
+    duration: settings.durationSeconds,
+    aspect_ratio: settings.aspectRatio,
+    resolution: settings.resolution,
+  };
+  if (imageReference) {
+    body.image = { url: imageReference.dataUrl };
+  }
+
+  onProgress?.('Generating video with xAI Grok Imagine...');
+  const started = await requestProviderJson(provider, apiKey, '/videos/generations', {
+    cancelMessage: 'xAI Grok Imagine video generation was cancelled before the request finished.',
+    method: 'POST',
+    body: JSON.stringify(body),
+    signal,
+    timeoutMs: 60000,
+  });
+
+  const startedVideo = getXaiVideoFromPayload(started);
+  const requestId = String(started?.request_id || started?.requestId || started?.id || startedVideo?.id || '').trim();
+  let attempts = 0;
+  let latestPayload = started;
+  const startedAt = Date.now();
+  let latestStatus = String(latestPayload?.status || (startedVideo ? 'done' : '')).trim().toLowerCase();
+
+  if (!startedVideo && !requestId) {
+    throw new Error(provider.name + ' accepted the request, but it did not return a video operation ID.');
+  }
+
+  while (!getXaiVideoFromPayload(latestPayload) || !['done', 'completed', 'complete', 'succeeded', 'success'].includes(latestStatus || '')) {
+    if (!requestId) {
+      break;
+    }
+
+    if (['failed', 'failure', 'error', 'expired', 'cancelled', 'canceled', 'rejected', 'blocked'].includes(latestStatus)) {
+      const failureMessage = latestPayload?.error?.message || latestPayload?.message || provider.name + ' could not finish that video request.';
+      throw new Error(redactSensitiveText(String(failureMessage).trim(), { additionalSecrets: [apiKey] }));
+    }
+
+    if (signal?.aborted) {
+      throw new Error('xAI Grok Imagine polling stopped because the pipeline was cancelled. The cloud job may continue on xAI for a short time.');
+    }
+
+    if (Date.now() - startedAt > statusTimeoutMs) {
+      throw new Error(provider.name + ' is still generating that video after the timeout. Try again later or shorten the request.');
+    }
+
+    attempts += 1;
+    onProgress?.('Waiting for xAI video operation...');
+    await waitForProvider(pollIntervalMs, signal, 'xAI Grok Imagine polling stopped because the pipeline was cancelled.');
+    latestPayload = await requestProviderJson(provider, apiKey, '/videos/' + encodeURIComponent(requestId), {
+      cancelMessage: 'xAI Grok Imagine polling stopped because the pipeline was cancelled.',
+      method: 'GET',
+      signal,
+      timeoutMs: 60000,
+    });
+    latestStatus = String(latestPayload?.status || '').trim().toLowerCase();
+  }
+
+  const returnedVideo = getXaiVideoFromPayload(latestPayload);
+  if (!returnedVideo) {
+    const safetyNotes = getXaiVideoSafetyNotes(latestPayload);
+    if (safetyNotes.length) {
+      throw new Error(provider.name + ' blocked or filtered that video request for safety. Adjust the prompt or source image and try again.');
+    }
+    throw new Error(provider.name + ' finished the request, but it did not return a video.');
+  }
+
+  if (returnedVideo.respect_moderation === false) {
+    throw new Error(provider.name + ' blocked or filtered that video request for safety. Adjust the prompt or source image and try again.');
+  }
+
+  onProgress?.('Downloading generated video...');
+  const downloadUri = String(returnedVideo.url || returnedVideo.uri || returnedVideo.downloadUrl || returnedVideo.download_url || '').trim();
+  let buffer = getProviderVideoBytes(returnedVideo);
+  let mimeType = String(returnedVideo.mimeType || returnedVideo.mime_type || 'video/mp4').trim() || 'video/mp4';
+  if (!buffer && downloadUri) {
+    const downloaded = await requestProviderBuffer(provider, apiKey, downloadUri, {
+      cancelMessage: 'xAI Grok Imagine video download stopped because the pipeline was cancelled.',
+      contentType: null,
+      method: 'GET',
+      signal,
+      timeoutMs: PROVIDER_DOWNLOAD_TIMEOUT_MS,
+    });
+    buffer = downloaded.buffer;
+    mimeType = downloaded.contentType.startsWith('video/') ? downloaded.contentType : mimeType;
+  }
+
+  if (!buffer?.length) {
+    throw new Error(provider.name + ' finished the request, but the video file was empty.');
+  }
+
+  const extension = getProviderVideoExtension(mimeType, downloadUri);
+  return {
+    createdAt: new Date().toISOString(),
+    model,
+    operation,
+    polling: {
+      attemptCount: attempts,
+      durationMs: Date.now() - startedAt,
+    },
+    provider: provider.id,
+    providerOperationId: requestId,
+    providerRawStatusSummary: buildXaiVideoRawStatusSummary(latestPayload),
+    requestedSettings: settings,
+    safetyNotes: getXaiVideoSafetyNotes(latestPayload),
+    videos: [
+      {
+        buffer,
+        durationSeconds: Number(returnedVideo.duration || returnedVideo.duration_seconds || 0) || settings.durationSeconds,
+        extension,
+        id: requestId,
+        mimeType,
+        resolution: String(returnedVideo.resolution || settings.resolution || '').trim(),
+      },
+    ],
+  };
+}
+async function sendProviderVideoGeneration(provider, apiKey, payload) {
+  if (provider.id === 'google') {
+    return sendGoogleVideoGeneration(provider, apiKey, payload);
+  }
+
+  if (provider.id === 'xai') {
+    return sendXaiVideoGeneration(provider, apiKey, payload);
+  }
+
+  throw new Error(provider.name + ' does not support cloud video generation in Local AI Hub yet.');
+}
+
+function normalizeProviderVideoGenerationError(provider, error) {
+  const rawMessage = redactSensitiveText(String(error?.message || error || '').trim(), { additionalSecrets: [] });
+  const lower = rawMessage.toLowerCase();
+  if (/api key|apikey|unauthorized|invalid key|forbidden|permission|401|403/.test(lower)) {
+    const providerRuntime = provider.id === 'xai' ? 'xAI Grok Imagine' : 'Google Veo';
+    return provider.name + ' could not run video generation because the API key is missing, invalid, or not allowed to use ' + providerRuntime + '.';
+  }
+  if (/quota|billing|insufficient|credits|payment/.test(lower)) {
+    return provider.name + ' says this account does not have enough video-generation quota or billing access for that request.';
+  }
+  if (/rate.?limit|too many requests|429/.test(lower)) {
+    return provider.name + ' is rate limiting video generation right now. Wait a moment, then try again.';
+  }
+  if (/timeout|still generating|timed out/.test(lower)) {
+    return provider.name + ' did not finish the video before Local AI Hub stopped waiting. Try again later or shorten the request.';
+  }
+  if (/safety|policy|blocked|filtered|harm|prohibited/.test(lower)) {
+    return provider.name + ' blocked or filtered that video request for safety. Adjust the prompt or source image and try again.';
+  }
+  if (/unsupported|model|not found|404/.test(lower)) {
+    return provider.id === 'xai'
+      ? provider.name + ' does not appear to support that video model. Choose a current Grok Imagine video model and try again.'
+      : provider.name + ' does not appear to support that video model. Choose a current Veo model and try again.';
+  }
+  if (/image|file|mime|png|jpg|jpeg|webp|base64|malformed|too large/.test(lower)) {
+    return rawMessage || 'Local AI Hub could not read or send the source image. Use a valid PNG, JPG, or WEBP image and try again.';
+  }
+  if (/download|empty video|video file/.test(lower)) {
+    return rawMessage || provider.name + ' finished the request, but Local AI Hub could not download the generated video.';
+  }
+  if (/cancel/.test(lower)) {
+    return rawMessage || provider.name + ' video generation was cancelled.';
+  }
+  return humanizeError(error, 'Local AI Hub could not run that ' + provider.name + ' video generation step.');
 }
 
 async function sendOpenAiVideoGeneration(provider, apiKey, payload) {
@@ -1552,20 +2481,24 @@ async function runProviderOperation(providerId, payload = {}) {
   try {
     let result = null;
     if (operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE) {
-      result = await sendOpenAiImageGeneration(provider, apiKey, payload);
+      result = await sendProviderImageGeneration(provider, apiKey, payload);
     } else if (operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE) {
-      result = await sendOpenAiVideoGeneration(provider, apiKey, payload);
+      result = await sendProviderVideoGeneration(provider, apiKey, payload);
     } else if (operationId === PIPELINE_OPERATION_IDS.AUDIO_GENERATE) {
       result = await sendProviderSpeechGeneration(provider, apiKey, payload);
     } else {
       throw new Error(provider.name + ' does not support that pipeline operation yet.');
     }
 
-    await recordProviderUsageSuccess(provider.id, model, operationId);
+    await recordProviderUsageSuccess(provider.id, result?.model || model, operationId);
 
     return result;
   } catch (error) {
-    const message = humanizeError(error, 'Local AI Hub could not run that ' + provider.name + ' provider step.');
+    const message = operationId === PIPELINE_OPERATION_IDS.IMAGE_GENERATE
+      ? normalizeProviderImageGenerationError(provider, error)
+      : operationId === PIPELINE_OPERATION_IDS.VIDEO_GENERATE
+        ? normalizeProviderVideoGenerationError(provider, error)
+        : humanizeError(error, 'Local AI Hub could not run that ' + provider.name + ' provider step.');
     await logger.warn('Provider operation request failed.', {
       message,
       operationId,
@@ -1587,7 +2520,5 @@ module.exports = {
   setProviderStateChangeSink,
   testProviderConnection,
 };
-
-
 
 
