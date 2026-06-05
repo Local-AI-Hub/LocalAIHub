@@ -10,6 +10,8 @@ const {
   buildPipelineWizardContext,
   buildPipelineWizardDraft,
   buildPipelineWizardMessages,
+  buildPipelineWizardStructuredOutputRequest,
+  getPipelineWizardRequestProfile,
   inferRecipeIdFromIntent,
   parsePipelineWizardPlan,
 } = require('../electron/shared/pipelineWizard.cjs');
@@ -36,7 +38,47 @@ const providers = [
     lastTestedAt: new Date().toISOString(),
     name: 'Google Gemini',
   },
+  {
+    id: 'xai',
+    isConnected: true,
+    lastTestSucceeded: true,
+    lastTestedAt: new Date().toISOString(),
+    name: 'xAI',
+  },
 ];
+
+const assetLibraries = {
+  soundEffects: [
+    {
+      id: 'sfx-halloween',
+      name: 'Halloween Sounds',
+      items: [{ id: 'door-creak', name: 'Door creak' }, { id: 'wind-gust', name: 'Wind gust' }],
+    },
+    {
+      id: 'sfx-ambience',
+      name: 'Ambience Beds',
+      items: [{ id: 'night-ambience', name: 'Night ambience' }],
+    },
+  ],
+  fonts: [
+    {
+      id: 'font-horror',
+      name: 'Horror Fonts',
+      items: [{ id: 'nosifer-regular', name: 'Nosifer Regular' }],
+    },
+  ],
+  colorPalettes: [
+    {
+      id: 'palette-horror',
+      name: 'Horror Palette',
+      items: [
+        { id: 'blood-red', name: 'Blood red', hex: '#c1121f' },
+        { id: 'bone-white', name: 'Bone white', hex: '#f8f0dd' },
+        { id: 'grave-black', name: 'Grave black', hex: '#050505' },
+      ],
+    },
+  ],
+};
 
 const tools = [
   {
@@ -122,6 +164,14 @@ function buildMediaCapabilityContext(overrides = {}) {
       installDir: 'C:/mock/rvc',
       launchProfile: { kind: 'python-script', pythonPath: 'C:/mock/python.exe' },
       name: 'RVC',
+      status: 'stopped',
+    },
+    {
+      compatibility: { minimumRamMb: 8192, minimumVramMb: 4096, recommendedRamMb: 16384, recommendedVramMb: 8192 },
+      id: 'chatterbox-tts',
+      installDir: 'C:/mock/chatterbox',
+      launchProfile: { kind: 'python-script', pythonPath: 'C:/mock/python.exe' },
+      name: 'Chatterbox-Turbo TTS',
       status: 'stopped',
     },
     {
@@ -586,12 +636,13 @@ function testCollectionTextPromptsToImagesDraft(context) {
 
   assertNoStructuralErrors(result.pipeline);
   assertKnownNodeTypes(result.pipeline);
-  for (const expectedType of ['textInput', 'collectionBuilder', 'collectionMap', 'collectionOutput']) {
+  for (const expectedType of ['collectionInput', 'collectionMap', 'collectionOutput']) {
     assert(result.pipeline.nodes.some((node) => node.type === expectedType), 'Expected collection-aware prompt-to-image graph to include ' + expectedType + '.');
   }
+  assert.strictEqual(result.pipeline.nodes.some((node) => node.type === 'collectionBuilder'), false, 'Explicit prompt collections should not require a synthetic Collection Builder.');
   assert.strictEqual(result.pipeline.nodes.some((node) => node.type === 'imageOutput'), false, 'Collection request should not collapse to a single image output.');
   assert.strictEqual(result.pipeline.nodes.some((node) => node.type === 'imageGenerate'), false, 'Collection request should use collectionMap rather than a single imageGenerate node.');
-  assert(/Collection Builder -> Map Collection -> Collection Output/i.test(result.summary.message), 'Summary should describe collection-aware lowering.');
+  assert(/Collection Input -> Map Collection -> Collection Output/i.test(result.summary.message), 'Summary should describe collection-aware lowering.');
 }
 
 function testPlanScenesCanMapToImages(context) {
@@ -615,7 +666,7 @@ function testPlanScenesCanMapToImages(context) {
 function testUnsupportedCollectionMappingStaysHonest(context) {
   const intent = 'collection mapping verification';
   const plan = parsePipelineWizardPlan(JSON.stringify({
-    title: 'Unsupported image collection mapping',
+    title: 'Cloud image collection mapping',
     intentIr: {
       sources: [{ name: 'sourceImage', modality: 'image', role: 'Source image' }],
       artifacts: [
@@ -624,7 +675,7 @@ function testUnsupportedCollectionMappingStaysHonest(context) {
       ],
       stages: [
         { id: 'collectImages', kind: 'build_collection', input: 'sourceImage', output: 'imageCollection' },
-        { id: 'mapImages', kind: 'generate_image', input: 'imageCollection', output: 'generatedImages' },
+        { id: 'mapImages', kind: 'generate_image', input: 'imageCollection', output: 'generatedImages', mappingMode: 'cloudImageToImage' },
       ],
       outputs: [{ artifact: 'generatedImages', kind: 'collection:image', title: 'Generated images' }],
     },
@@ -639,8 +690,11 @@ function testUnsupportedCollectionMappingStaysHonest(context) {
   assertNoStructuralErrors(result.pipeline);
   assertKnownNodeTypes(result.pipeline);
   assert(result.pipeline.nodes.some((node) => node.type === 'collectionBuilder'), 'Expected source collection to be preserved.');
-  assert.strictEqual(result.pipeline.nodes.some((node) => node.type === 'collectionMap'), false, 'Unsupported image collection mapping must not become a fake collectionMap.');
-  assert(result.summary.gaps.some((gap) => /only ordered text collections|only map text collections/i.test(gap)), 'Expected honest unsupported collection mapping gap.');
+  const mapNode = result.pipeline.nodes.find((node) => node.type === 'collectionMap');
+  assert(mapNode, 'Expected image collection mapping to lower to collectionMap.');
+  assert.strictEqual(mapNode.config.mappingId, 'cloudImageToImage', 'Expected image collection mapping to use cloud image-to-image.');
+  assert.strictEqual(mapNode.config.executionMode, 'cloud', 'Expected image collection mapping to use a cloud provider.');
+  assert.strictEqual(mapNode.config.providerId, 'google', 'Expected image collection mapping to keep the Google provider target.');
 }
 
 function testGeminiVideoInputTextGeneration(context) {
@@ -838,6 +892,534 @@ function testUnavailableLocalTransformStaysHonest() {
   assertNoInventedRuntimeFileOrModelPaths(result.pipeline);
 }
 
+function buildDirectIrDraft({ context, intent, intentIr, wizardTarget }) {
+  const plan = parsePipelineWizardPlan(JSON.stringify({ title: 'Pass 1 direct IR fixture', intentIr }), { intent });
+  return buildPipelineWizardDraft({ context, intent, modelPlan: plan, wizardTarget });
+}
+
+function getFirstCollectionMap(pipeline) {
+  return pipeline.nodes.find((node) => node.type === 'collectionMap') || null;
+}
+
+function testCloudImageGenerationPassOneDrafts(context) {
+  const textImage = buildDirectIrDraft({
+    context,
+    intent: 'Generate a cloud image with OpenAI.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-image-1' },
+    intentIr: {
+      sources: [{ name: 'prompt', modality: 'text', role: 'Prompt' }],
+      stages: [{ id: 'image', kind: 'generate_image', input: 'prompt', output: 'generatedImage', operationSubtype: 'textToImage', providerPreference: 'openai' }],
+      outputs: [{ artifact: 'generatedImage', kind: 'image', title: 'Generated image' }],
+    },
+  });
+  assertNoStructuralErrors(textImage.pipeline);
+  const imageStep = getModelStepByOperation(textImage.pipeline, 'imageGenerate');
+  assert(imageStep, 'Expected cloud text-to-image to lower through Model Step imageGenerate.');
+  assert.strictEqual(imageStep.config.executionMode, 'cloud');
+  assert.strictEqual(imageStep.config.providerId, 'openai');
+
+  const imageEdit = buildDirectIrDraft({
+    context,
+    intent: 'Edit this source image with OpenAI.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-image-1' },
+    intentIr: {
+      sources: [{ name: 'sourceImage', modality: 'image', role: 'Source image' }],
+      stages: [{ id: 'edit', kind: 'generate_image', input: 'sourceImage', output: 'editedImage', operationSubtype: 'imageToImage', providerPreference: 'openai' }],
+      outputs: [{ artifact: 'editedImage', kind: 'image', title: 'Edited image' }],
+    },
+  });
+  assertNoStructuralErrors(imageEdit.pipeline);
+  assert(imageEdit.pipeline.nodes.some((node) => node.type === 'imageInput'), 'Expected image-to-image to preserve image input.');
+  const editStep = getModelStepByOperation(imageEdit.pipeline, 'imageGenerate');
+  assert(editStep, 'Expected cloud image-to-image to lower through Model Step imageGenerate.');
+  assert.strictEqual(editStep.config.executionMode, 'cloud');
+  assert.strictEqual(editStep.config.providerId, 'openai');
+}
+
+function testCloudImageCollectionMapPassOneDrafts(context) {
+  const textMap = buildDirectIrDraft({
+    context,
+    intent: 'Generate one cloud image per prompt.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-image-1' },
+    intentIr: {
+      sources: [{ name: 'prompts', modality: 'collection:text', role: 'Prompts' }],
+      stages: [{ id: 'mapImages', kind: 'generate_image', input: 'prompts', output: 'images', mappingMode: 'textToImage', providerPreference: 'openai' }],
+      outputs: [{ artifact: 'images', kind: 'collection:image', title: 'Images' }],
+    },
+  });
+  assertNoStructuralErrors(textMap.pipeline);
+  const textMapNode = getFirstCollectionMap(textMap.pipeline);
+  assert(textMapNode, 'Expected collection text-to-image to lower to collectionMap.');
+  assert.strictEqual(textMapNode.config.mappingId, 'textToImage');
+  assert.strictEqual(textMapNode.config.providerId, 'openai');
+
+}
+function testCloudVideoGenerationPassOneDrafts(context) {
+  const textVideo = buildDirectIrDraft({
+    context,
+    intent: 'Generate a Google cloud video from text.',
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'models/veo-3.1-generate-preview' },
+    intentIr: {
+      sources: [{ name: 'prompt', modality: 'text', role: 'Prompt' }],
+      stages: [{ id: 'video', kind: 'generate_video', input: 'prompt', output: 'video', operationSubtype: 'textToVideo', providerPreference: 'google' }],
+      outputs: [{ artifact: 'video', kind: 'video', title: 'Video' }],
+    },
+  });
+  assertNoStructuralErrors(textVideo.pipeline);
+  const textVideoStep = getModelStepByOperation(textVideo.pipeline, 'videoGenerate');
+  assert(textVideoStep, 'Expected cloud text-to-video to lower through Model Step videoGenerate.');
+  assert.strictEqual(textVideoStep.config.executionMode, 'cloud');
+  assert.strictEqual(textVideoStep.config.providerId, 'google');
+
+  const imageVideo = buildDirectIrDraft({
+    context,
+    intent: 'Generate an xAI video from this image.',
+    wizardTarget: { mode: 'cloud', providerId: 'xai', model: 'grok-imagine-video' },
+    intentIr: {
+      sources: [{ name: 'sourceImage', modality: 'image', role: 'Source image' }],
+      stages: [{ id: 'video', kind: 'generate_video', input: 'sourceImage', output: 'video', operationSubtype: 'imageToVideo', providerPreference: 'xai' }],
+      outputs: [{ artifact: 'video', kind: 'video', title: 'Video' }],
+    },
+  });
+  assertNoStructuralErrors(imageVideo.pipeline);
+  assert(imageVideo.pipeline.nodes.some((node) => node.type === 'imageInput'), 'Expected image-to-video to preserve image input.');
+  const imageVideoStep = getModelStepByOperation(imageVideo.pipeline, 'videoGenerate');
+  assert(imageVideoStep, 'Expected cloud image-to-video to lower through Model Step videoGenerate.');
+  assert.strictEqual(imageVideoStep.config.executionMode, 'cloud');
+  assert.strictEqual(imageVideoStep.config.providerId, 'xai');
+}
+
+function testCloudVideoCollectionMapPassOneDrafts(context) {
+  const textMap = buildDirectIrDraft({
+    context,
+    intent: 'Generate one Google video per prompt and chain previous last frames.',
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'models/veo-3.1-generate-preview' },
+    intentIr: {
+      sources: [{ name: 'prompts', modality: 'collection:text', role: 'Prompts' }],
+      stages: [{ id: 'mapVideos', kind: 'generate_video', input: 'prompts', output: 'videos', mappingMode: 'textToVideo', providerPreference: 'google', previousLastFrameChaining: true }],
+      outputs: [{ artifact: 'videos', kind: 'collection:video', title: 'Videos' }],
+    },
+  });
+  assertNoStructuralErrors(textMap.pipeline);
+  const textMapNode = getFirstCollectionMap(textMap.pipeline);
+  assert(textMapNode, 'Expected collection text-to-video to lower to collectionMap.');
+  assert.strictEqual(textMapNode.config.mappingId, 'textToVideo');
+  assert.strictEqual(textMapNode.config.providerId, 'google');
+  assert.strictEqual(textMapNode.config.videoItemMode, 'sequentialLastFrame');
+
+  const imageMap = buildDirectIrDraft({
+    context,
+    intent: 'Generate one xAI video per source image.',
+    wizardTarget: { mode: 'cloud', providerId: 'xai', model: 'grok-imagine-video' },
+    intentIr: {
+      sources: [{ name: 'images', modality: 'collection:image', role: 'Images' }],
+      stages: [{ id: 'mapVideos', kind: 'generate_video', input: 'images', output: 'videos', mappingMode: 'cloudImageToVideo', providerPreference: 'xai' }],
+      outputs: [{ artifact: 'videos', kind: 'collection:video', title: 'Videos' }],
+    },
+  });
+  assertNoStructuralErrors(imageMap.pipeline);
+  const imageMapNode = getFirstCollectionMap(imageMap.pipeline);
+  assert(imageMapNode, 'Expected collection image-to-video to lower to collectionMap.');
+  assert.strictEqual(imageMapNode.config.mappingId, 'cloudImageToVideo');
+  assert.strictEqual(imageMapNode.config.providerId, 'xai');
+}
+
+function testCloudVideoProviderFilteringPassOne() {
+  const context = buildMediaCapabilityContext({
+    providers: providers.filter((provider) => provider.id === 'openai'),
+    tools: tools,
+  });
+  const result = buildDirectIrDraft({
+    context,
+    intent: 'Generate an OpenAI Sora video from this prompt.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'sora-2' },
+    intentIr: {
+      sources: [{ name: 'prompt', modality: 'text', role: 'Prompt' }],
+      stages: [{ id: 'video', kind: 'generate_video', input: 'prompt', output: 'video', operationSubtype: 'textToVideo', providerPreference: 'openai' }],
+      outputs: [{ artifact: 'video', kind: 'video', title: 'Video' }],
+    },
+  });
+  assertNoStructuralErrors(result.pipeline);
+  const videoStep = getModelStepByOperation(result.pipeline, 'videoGenerate');
+  assert(videoStep, 'Expected unsupported OpenAI video request to remain editable.');
+  assert.notStrictEqual(videoStep.config.providerId, 'openai', 'OpenAI must not be selected for wizard cloud video generation.');
+  assert(result.summary.gaps.some((gap) => /OpenAI\/Sora video is not available|Google or xAI/i.test(gap)), 'Expected OpenAI video provider filtering gap.');
+}
+
+function testChatterboxReferenceVoicePassOneDrafts() {
+  const context = buildMediaCapabilityContext();
+  const single = buildDirectIrDraft({
+    context,
+    intent: 'Use this reference voice audio to say the text.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+    intentIr: {
+      sources: [
+        { name: 'speechText', modality: 'text', role: 'Speech text' },
+        { name: 'referenceVoiceAudio', modality: 'audio', role: 'Reference voice audio' },
+      ],
+      stages: [{ id: 'voice', kind: 'generate_audio', input: 'speechText', inputs: ['speechText', 'referenceVoiceAudio'], output: 'voiceAudio', operationSubtype: 'referenceVoiceTts', referenceAudio: 'referenceVoiceAudio' }],
+      outputs: [{ artifact: 'voiceAudio', kind: 'audio', title: 'Voice audio' }],
+    },
+  });
+  assertNoStructuralErrors(single.pipeline);
+  const voiceStep = getModelStepByOperation(single.pipeline, 'audioGenerate');
+  assert(voiceStep, 'Expected Reference Voice TTS to lower through Model Step audioGenerate.');
+  assert.strictEqual(voiceStep.config.executionMode, 'localTool');
+  assert.strictEqual(voiceStep.config.toolId, 'chatterbox-tts');
+  assert.strictEqual(voiceStep.config.audioMode, 'referenceVoiceTts');
+  assert(single.pipeline.edges.some((edge) => edge.target.nodeId === voiceStep.id && edge.target.portId === 'referenceAudio'), 'Expected Reference Voice TTS Model Step to receive referenceAudio.');
+
+  const collection = buildDirectIrDraft({
+    context,
+    intent: 'Use one shared reference voice audio for each line in this collection.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+    intentIr: {
+      sources: [
+        { name: 'voiceLines', modality: 'collection:text', role: 'Voice lines' },
+        { name: 'referenceVoiceAudio', modality: 'audio', role: 'Reference voice audio' },
+      ],
+      stages: [{ id: 'voiceLines', kind: 'generate_audio', input: 'voiceLines', inputs: ['voiceLines', 'referenceVoiceAudio'], output: 'generatedVoiceLines', operationSubtype: 'referenceVoiceTts', mappingMode: 'textToAudio', referenceAudio: 'referenceVoiceAudio' }],
+      outputs: [{ artifact: 'generatedVoiceLines', kind: 'collection:audio', title: 'Generated voice lines' }],
+    },
+  });
+  assertNoStructuralErrors(collection.pipeline);
+  const mapNode = getFirstCollectionMap(collection.pipeline);
+  assert(mapNode, 'Expected Reference Voice TTS collection to lower to collectionMap.');
+  assert.strictEqual(mapNode.config.mappingId, 'textToAudio');
+  assert.strictEqual(mapNode.config.toolId, 'chatterbox-tts');
+  assert.strictEqual(mapNode.config.audioMode, 'referenceVoiceTts');
+  assert(collection.pipeline.edges.some((edge) => edge.target.nodeId === mapNode.id && edge.target.portId === 'referenceAudio'), 'Expected Reference Voice TTS collectionMap to receive shared referenceAudio.');
+}
+function testMediaCompositionPassTwoDrafts(context) {
+  const result = buildDirectIrDraft({
+    context,
+    intent: 'Compose an image collection into a narration-synced slideshow with transitions, background music, and Halloween sound effects.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+    intentIr: {
+      sources: [
+        { name: 'images', modality: 'collection:image', role: 'Ordered image collection' },
+        { name: 'narrationAudio', modality: 'audio', role: 'Narration audio' },
+        { name: 'backgroundMusic', modality: 'audio', role: 'Background music' },
+      ],
+      stages: [
+        {
+          id: 'compose',
+          kind: 'compose_media',
+          input: 'images',
+          inputs: ['images', 'narrationAudio', 'backgroundMusic'],
+          output: 'composition',
+          mediaComposition: {
+            timingMode: 'dynamicFromImageMetadata',
+            fallbackSecondsPerImage: 5,
+            transitionsEnabled: true,
+            transitionMode: 'randomCategory',
+            transitionCategory: 'wipes',
+            narrationVolume: 0.82,
+            backgroundMusicVolume: 0.2,
+            soundEffectsEnabled: true,
+            soundEffectsVolume: 0.31,
+            soundEffectLibraryRefs: ['Halloween Sounds', 'sfx-ambience'],
+          },
+        },
+        { id: 'export', kind: 'export', input: 'composition', output: 'video' },
+      ],
+      outputs: [{ artifact: 'video', kind: 'video', title: 'Slideshow video' }],
+    },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  const compositionNode = result.pipeline.nodes.find((node) => node.type === 'mediaComposition');
+  assert(compositionNode, 'Expected Media Composition node from compose_media IR.');
+  assert.strictEqual(compositionNode.config.imageTimingMode, 'dynamicFromImageMetadata');
+  assert.strictEqual(compositionNode.config.secondsPerItem, 5);
+  assert.strictEqual(compositionNode.config.sceneTransitionMode, 'randomCategory');
+  assert.strictEqual(compositionNode.config.sceneTransitionCategory, 'wipes');
+  assert.strictEqual(compositionNode.config.narrationVolume, 0.82);
+  assert.strictEqual(compositionNode.config.backgroundMusicVolume, 0.2);
+  assert.strictEqual(compositionNode.config.soundEffectsEnabled, true);
+  assert.strictEqual(compositionNode.config.soundEffectsVolume, 0.31);
+  assert.strictEqual(compositionNode.config.soundEffectsLibraryId, 'sfx-halloween');
+  assert.deepStrictEqual(compositionNode.config.soundEffectsLayers.map((layer) => layer.libraryId), ['sfx-halloween', 'sfx-ambience']);
+  assert(result.pipeline.edges.some((edge) => edge.target.nodeId === compositionNode.id && edge.target.portId === 'audio'), 'Expected narration audio to connect to Media Composition primary audio.');
+  assert(result.pipeline.edges.some((edge) => edge.target.nodeId === compositionNode.id && edge.target.portId === 'backgroundMusic'), 'Expected background music to connect to Media Composition backgroundMusic.');
+}
+
+function testBurnSubtitlesPassTwoDrafts(context) {
+  const result = buildDirectIrDraft({
+    context,
+    intent: 'Burn large bold horror captions into a video using the Horror Fonts library and Horror Palette, validate it, and retry on failure.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+    intentIr: {
+      sources: [
+        { name: 'sourceVideo', modality: 'video', role: 'Source video' },
+        { name: 'captionText', modality: 'text', role: 'Caption text' },
+      ],
+      stages: [
+        {
+          id: 'burnCaptions',
+          kind: 'burn_subtitles',
+          input: 'sourceVideo',
+          inputs: ['sourceVideo', 'captionText'],
+          output: 'captionedVideo',
+          burnSubtitles: {
+            fontLibraryRef: 'Horror Fonts',
+            colorPaletteRef: 'Horror Palette',
+            position: 'bottomCenter',
+            styleIntent: 'large bold horror',
+          },
+        },
+        { id: 'validateCaptions', kind: 'validate', input: 'captionedVideo', output: 'reviewedCaptionedVideo' },
+        { id: 'retryCaptions', kind: 'retry', input: 'reviewedCaptionedVideo', output: 'approvedCaptionedVideo', retryTarget: 'burnCaptions', maxAttempts: 4 },
+      ],
+      outputs: [{ artifact: 'approvedCaptionedVideo', kind: 'video', title: 'Captioned video' }],
+    },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  const burnNode = result.pipeline.nodes.find((node) => node.type === 'burnSubtitles');
+  assert(burnNode, 'Expected Burn Subtitles node from burn_subtitles IR.');
+  assert.strictEqual(burnNode.config.fontSource, 'assetLibrary');
+  assert.strictEqual(burnNode.config.fontLibraryId, 'font-horror');
+  assert.strictEqual(burnNode.config.fontItemId, 'nosifer-regular');
+  assert.strictEqual(burnNode.config.colorSource, 'palette');
+  assert.strictEqual(burnNode.config.colorPaletteLibraryId, 'palette-horror');
+  assert.strictEqual(burnNode.config.textColorPaletteItemId, 'blood-red');
+  assert.strictEqual(burnNode.config.outlineColorPaletteItemId, 'bone-white');
+  assert.strictEqual(burnNode.config.backgroundColorPaletteItemId, 'grave-black');
+  assert.strictEqual(burnNode.config.position, 'bottomCenter');
+  assert.strictEqual(burnNode.config.fontSize, 36);
+  assert.strictEqual(burnNode.config.bold, true);
+  const retryNode = result.pipeline.nodes.find((node) => node.type === 'retryLoop');
+  assert(retryNode, 'Expected retry loop after caption validation.');
+  assert.strictEqual(retryNode.config.retryTargetNodeId, burnNode.id, 'Expected caption retry to target Burn Subtitles.');
+}
+function assertNormalizeDraft({ context, sourceKind, outputKind, nodeType, outputFormat, expectedFormat }) {
+  const result = buildDirectIrDraft({
+    context,
+    intent: 'Normalize or convert media format.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+    intentIr: {
+      sources: [{ name: 'sourceMedia', modality: sourceKind, role: 'Source media' }],
+      stages: [{ id: 'normalize', kind: 'normalize_media', input: 'sourceMedia', output: 'normalizedMedia', normalizeMedia: { mediaKind: outputKind.replace('collection:', ''), outputFormat } }],
+      outputs: [{ artifact: 'normalizedMedia', kind: outputKind, title: 'Normalized media' }],
+    },
+  });
+  assertNoStructuralErrors(result.pipeline);
+  assertKnownNodeTypes(result.pipeline);
+  const normalizeNode = result.pipeline.nodes.find((node) => node.type === nodeType);
+  assert(normalizeNode, 'Expected ' + nodeType + ' for ' + sourceKind + ' conversion.');
+  assert.strictEqual(normalizeNode.config.outputFormat, expectedFormat);
+  assert(!result.pipeline.nodes.some((node) => node.type === 'llmPrompt'), 'Normalize/convert requests should not route through Model Step.');
+  assert(result.pipeline.nodes.some((node) => node.type === (String(outputKind).startsWith('collection:') ? 'collectionOutput' : outputKind + 'Output')), 'Expected matching output node for ' + outputKind + '.');
+  return result;
+}
+
+function testNormalizeMediaPassThreeDrafts(context) {
+  assertNormalizeDraft({ context, sourceKind: 'audio', outputKind: 'audio', nodeType: 'normalizeAudioCollection', outputFormat: 'wav', expectedFormat: 'wav' });
+  assertNormalizeDraft({ context, sourceKind: 'collection:audio', outputKind: 'collection:audio', nodeType: 'normalizeAudioCollection', outputFormat: 'mp3', expectedFormat: 'mp3' });
+  assertNormalizeDraft({ context, sourceKind: 'video', outputKind: 'video', nodeType: 'normalizeVideoCollection', outputFormat: 'mp4', expectedFormat: 'mp4' });
+  assertNormalizeDraft({ context, sourceKind: 'collection:video', outputKind: 'collection:video', nodeType: 'normalizeVideoCollection', outputFormat: 'webm', expectedFormat: 'webm' });
+  assertNormalizeDraft({ context, sourceKind: 'image', outputKind: 'image', nodeType: 'normalizeImage', outputFormat: 'jpg', expectedFormat: 'jpg' });
+  assertNormalizeDraft({ context, sourceKind: 'collection:image', outputKind: 'collection:image', nodeType: 'normalizeImage', outputFormat: 'webp', expectedFormat: 'webp' });
+
+  const unsupported = assertNormalizeDraft({ context, sourceKind: 'audio', outputKind: 'audio', nodeType: 'normalizeAudioCollection', outputFormat: 'aac', expectedFormat: 'auto' });
+  assert(unsupported.summary.gaps.some((gap) => /aac|not supported|normalized-format/i.test(gap)), 'Unsupported normalize format should be surfaced as a repairable warning.');
+}
+
+function testNormalizeIntentRepairPassThree(context) {
+  const audio = buildPipelineWizardDraft({
+    context,
+    intent: 'convert this mp3 to wav',
+    modelPlan: parsePipelineWizardPlan('', { intent: 'convert this mp3 to wav' }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+  assertNoStructuralErrors(audio.pipeline);
+  assert(audio.pipeline.nodes.some((node) => node.type === 'normalizeAudioCollection' && node.config.outputFormat === 'wav'), 'MP3 to WAV should compile to Normalize Audio.');
+  assert(!audio.pipeline.nodes.some((node) => node.type === 'llmPrompt'), 'MP3 to WAV should not compile to audio generation or Model Step.');
+
+  const images = buildPipelineWizardDraft({
+    context,
+    intent: 'convert these images to webp',
+    modelPlan: parsePipelineWizardPlan('', { intent: 'convert these images to webp' }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+  assertNoStructuralErrors(images.pipeline);
+  assert(images.pipeline.nodes.some((node) => node.type === 'collectionInput'), 'Collection image conversion should use a collection source.');
+  assert(images.pipeline.nodes.some((node) => node.type === 'normalizeImage' && node.config.outputFormat === 'webp'), 'Image collection conversion should compile to Normalize Image.');
+}
+
+function testHeavyCooldownPassThreeRunSettings(context) {
+  const intent = 'Generate one image per prompt and wait 45 seconds between heavy local generations.';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-image-1' },
+  });
+  assertNoStructuralErrors(result.pipeline);
+  assert.strictEqual(result.pipeline.runSettings.enableHeavyStepCooldown, true, 'Wizard should enable heavy step cooldown only when requested.');
+  assert.strictEqual(result.pipeline.runSettings.heavyStepCooldownSeconds, 45, 'Wizard should parse requested cooldown seconds.');
+  assert(!result.pipeline.nodes.some((node) => JSON.stringify(node.config || {}).includes('heavyStepCooldown')), 'Cooldown should stay in pipeline runSettings, not node config.');
+}
+
+function testCollectionMapPerItemValidationPassThree(context) {
+  const intent = 'Turn a collection of prompts into images, review each generated image, and retry failed items.';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-image-1' },
+  });
+  assertNoStructuralErrors(result.pipeline);
+  const mapNode = getFirstCollectionMap(result.pipeline);
+  assert(mapNode, 'Expected prompt collection image generation to lower to collectionMap.');
+  assert.strictEqual(mapNode.config.perItemValidation?.enabled, true, 'Per-item validation should be enabled for each generated item review.');
+  assert.strictEqual(mapNode.config.perItemValidation?.mode, 'user');
+  assert.strictEqual(mapNode.config.perItemValidation?.maxAttempts, 3, 'Retry failed items should raise per-item attempts.');
+  assert.strictEqual(mapNode.config.failureMode, 'fail-fast');
+}
+
+function testWholeCollectionValidationStillSupportedPassThree(context) {
+  const result = buildDirectIrDraft({
+    context,
+    intent: 'Generate images for a prompt collection, then validate the final collection as a whole and retry the map if it fails.',
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-image-1' },
+    intentIr: {
+      sources: [{ name: 'prompts', modality: 'collection:text', role: 'Prompt collection' }],
+      stages: [
+        { id: 'mapImages', kind: 'generate_image', input: 'prompts', output: 'images', mappingMode: 'textToImage', providerPreference: 'openai' },
+        { id: 'validateCollection', kind: 'validate', input: 'images', output: 'reviewedImages', validationMode: 'llm', purpose: 'Validate the generated image collection as a whole.' },
+        { id: 'retryCollection', kind: 'retry', input: 'reviewedImages', output: 'approvedImages', retryTarget: 'mapImages', maxAttempts: 3 },
+      ],
+      outputs: [{ artifact: 'approvedImages', kind: 'collection:image', title: 'Approved image collection' }],
+    },
+  });
+  assertNoStructuralErrors(result.pipeline);
+  const mapNode = getFirstCollectionMap(result.pipeline);
+  assert(mapNode, 'Expected whole-collection validation draft to still include collectionMap.');
+  assert.notStrictEqual(mapNode.config.perItemValidation?.enabled, true, 'Whole-collection validation should not force per-item collectionMap validation.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'validation'), 'Whole-collection validation should still compile to Validation node.');
+  assert(result.pipeline.nodes.some((node) => node.type === 'retryLoop'), 'Whole-collection retry should still compile to Retry Loop.');
+}
+function testDeterministicMediaUtilitiesFinalPass(context) {
+  const buildPromptDraft = (intent) => buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+  const nodeTypes = (result) => result.pipeline.nodes.map((node) => node.type);
+  const operationIds = (result) => result.pipeline.nodes.map((node) => node.config?.operationId).filter(Boolean);
+  const assertSubsequence = (actual, expected, message) => {
+    let cursor = -1;
+    for (const item of expected) {
+      const nextIndex = actual.findIndex((candidate, index) => index > cursor && candidate === item);
+      assert(nextIndex >= 0, message + ' Missing ordered node ' + item + ' in ' + actual.join(' -> '));
+      cursor = nextIndex;
+    }
+  };
+
+
+  const trimVideo = buildPromptDraft('trim this video to the first 10 seconds');
+  assertNoStructuralErrors(trimVideo.pipeline);
+  const trimVideoNode = trimVideo.pipeline.nodes.find((node) => node.type === 'trimMedia');
+  assert(trimVideoNode, 'Trim video prompt should lower to Trim Media.');
+  assert.strictEqual(trimVideoNode.config.startSeconds, 0);
+  assert.strictEqual(trimVideoNode.config.endSeconds, 10);
+  assert(trimVideo.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Trim video should keep video output.');
+  assert(!trimVideo.pipeline.nodes.some((node) => node.type === 'llmPrompt'), 'Trim video should not use Model Step.');
+
+  const trimAudio = buildPromptDraft('cut this audio from 5 seconds to 20 seconds');
+  assertNoStructuralErrors(trimAudio.pipeline);
+  const trimAudioNode = trimAudio.pipeline.nodes.find((node) => node.type === 'trimMedia');
+  assert(trimAudioNode, 'Trim audio prompt should lower to Trim Media.');
+  assert.strictEqual(trimAudioNode.config.startSeconds, 5);
+  assert.strictEqual(trimAudioNode.config.endSeconds, 20);
+  assert(trimAudio.pipeline.nodes.some((node) => node.type === 'audioOutput'), 'Trim audio should keep audio output.');
+
+  const extractedAudio = buildPromptDraft('extract audio from this video');
+  assertNoStructuralErrors(extractedAudio.pipeline);
+  assert(extractedAudio.pipeline.nodes.some((node) => node.type === 'extractAudio'), 'Extract audio prompt should lower to Extract Audio.');
+  assert(extractedAudio.pipeline.nodes.some((node) => node.type === 'audioOutput'), 'Extract audio should output audio.');
+  assert(!extractedAudio.pipeline.nodes.some((node) => node.type === 'llmPrompt'), 'Extract audio should not use Model Step.');
+
+  const lastFrame = buildPromptDraft('grab the last frame from this video');
+  assertNoStructuralErrors(lastFrame.pipeline);
+  const lastFrameNode = lastFrame.pipeline.nodes.find((node) => node.type === 'extractVideoFrame');
+  assert(lastFrameNode, 'Last-frame prompt should lower to Extract Video Frame.');
+  assert.strictEqual(lastFrameNode.config.framePosition, 'last');
+  assert(lastFrame.pipeline.nodes.some((node) => node.type === 'imageOutput'), 'Extract frame should output image.');
+
+  const defaultFrame = buildPromptDraft('make a thumbnail from this video');
+  assertNoStructuralErrors(defaultFrame.pipeline);
+  const defaultFrameNode = defaultFrame.pipeline.nodes.find((node) => node.type === 'extractVideoFrame');
+  assert(defaultFrameNode, 'Thumbnail prompt should lower to Extract Video Frame.');
+  assert.strictEqual(defaultFrameNode.config.framePosition, 'first');
+  assert(defaultFrame.summary.gaps.some((gap) => /defaults to the first frame/i.test(gap)), 'Unspecified thumbnail frame should include a first-frame assumption.');
+
+  const exportedSubtitles = buildPromptDraft('export subtitles as srt from this transcript');
+  assertNoStructuralErrors(exportedSubtitles.pipeline);
+  const exportNode = exportedSubtitles.pipeline.nodes.find((node) => node.type === 'exportSubtitles');
+  assert(exportNode, 'Export subtitles prompt should lower to Export Subtitles.');
+  assert.strictEqual(exportNode.config.outputFormat, 'srt');
+  assert(exportedSubtitles.pipeline.nodes.some((node) => node.type === 'fileOutput'), 'Export subtitles should output a file.');
+  assert(!exportedSubtitles.pipeline.nodes.some((node) => node.type === 'burnSubtitles'), 'Export subtitles should not burn captions into video.');
+
+  const burnedSubtitles = buildPromptDraft('burn subtitles into this video');
+  assertNoStructuralErrors(burnedSubtitles.pipeline);
+  assert(burnedSubtitles.pipeline.nodes.some((node) => node.type === 'burnSubtitles'), 'Burn subtitles prompt should still lower to Burn Subtitles.');
+  assert(!burnedSubtitles.pipeline.nodes.some((node) => node.type === 'exportSubtitles'), 'Burn subtitles should not lower to Export Subtitles.');
+
+  const stitchedAudio = buildPromptDraft('stitch these audio clips together');
+  assertNoStructuralErrors(stitchedAudio.pipeline);
+  assert(stitchedAudio.pipeline.nodes.some((node) => node.type === 'audioStitch'), 'Audio stitch prompt should lower to Audio Stitch.');
+  assert(stitchedAudio.pipeline.nodes.some((node) => node.type === 'audioOutput'), 'Audio stitch should output audio.');
+  assert(!stitchedAudio.pipeline.nodes.some((node) => node.type === 'videoStitch'), 'Audio stitch should not also lower to Video Stitch.');
+
+  const stitchedVideo = buildPromptDraft('stitch these videos together');
+  assertNoStructuralErrors(stitchedVideo.pipeline);
+  assert(stitchedVideo.pipeline.nodes.some((node) => node.type === 'videoStitch'), 'Video stitch prompt should lower to Video Stitch.');
+  assert(stitchedVideo.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Video stitch should output video.');
+
+  const slideshow = buildPromptDraft('turn these images into a slideshow video');
+  assertNoStructuralErrors(slideshow.pipeline);
+  assert(slideshow.pipeline.nodes.some((node) => node.type === 'mediaComposition'), 'Slideshow prompts should still lower to Media Composition.');
+  assert(!slideshow.pipeline.nodes.some((node) => node.type === 'videoStitch'), 'Slideshow prompts should not lower to Video Stitch.');
+
+  const audioUtilityToText = buildPromptDraft('start with an audio input, trim that audio to ten seconds, transcribe it, then output the transcript as text');
+  assertNoStructuralErrors(audioUtilityToText.pipeline);
+  assertSubsequence(nodeTypes(audioUtilityToText), ['audioInput', 'trimMedia', 'llmPrompt', 'textOutput'], 'Audio utility plus transcription chain should preserve ordered stages.');
+  assert(operationIds(audioUtilityToText).includes('whisperTranscribe'), 'Audio utility plus transcription should lower transcription through Whisper.');
+  const audioUtilityTrim = audioUtilityToText.pipeline.nodes.find((node) => node.type === 'trimMedia');
+  assert.strictEqual(audioUtilityTrim.config.endSeconds, 10, 'Trim-to-duration wording should parse number-word seconds.');
+  assert(!audioUtilityToText.pipeline.nodes.some((node) => node.type === 'audioOutput'), 'Intermediate trimmed audio should not become the final output when transcript text is requested.');
+
+  const videoUtilityToText = buildPromptDraft('start with a video input, trim the clip to the first ten seconds, extract the audio, transcribe it, then send the transcript to a text output');
+  assertNoStructuralErrors(videoUtilityToText.pipeline);
+  assertSubsequence(nodeTypes(videoUtilityToText), ['videoInput', 'trimMedia', 'extractAudio', 'llmPrompt', 'textOutput'], 'Video utility plus transcription chain should preserve ordered stages.');
+  assert(operationIds(videoUtilityToText).includes('whisperTranscribe'), 'Extracted audio should feed Whisper transcription.');
+  assert(!videoUtilityToText.pipeline.nodes.some((node) => node.type === 'videoOutput' || node.type === 'audioOutput'), 'Intermediate video/audio utility artifacts should not become final outputs when transcript text is requested.');
+
+  const audioTrimNormalize = buildPromptDraft('take an audio input, trim it to the first ten seconds, normalize the audio to wav, then output the audio');
+  assertNoStructuralErrors(audioTrimNormalize.pipeline);
+  assertSubsequence(nodeTypes(audioTrimNormalize), ['audioInput', 'trimMedia', 'normalizeAudioCollection', 'audioOutput'], 'Trim and normalize should compose in user order before audio output.');
+
+  const frameToImage = buildPromptDraft('start with a video input, grab a frame at five seconds, use Google cloud image generation to make a polished variation, then output the image');
+  assertNoStructuralErrors(frameToImage.pipeline);
+  assertSubsequence(nodeTypes(frameToImage), ['videoInput', 'extractVideoFrame', 'llmPrompt', 'imageOutput'], 'Extracted video frame should feed cloud image generation and finish as an image.');
+  assert(operationIds(frameToImage).includes('imageGenerate'), 'Frame-to-image workflow should use image generation, not generic text generation.');
+  const timestampFrame = frameToImage.pipeline.nodes.find((node) => node.type === 'extractVideoFrame');
+  assert.strictEqual(timestampFrame.config.framePosition, 'timestamp');
+  assert.strictEqual(timestampFrame.config.timestampSeconds, 5, 'Frame timestamp should parse number-word seconds.');
+  assert(!frameToImage.pipeline.nodes.some((node) => node.type === 'mediaComposition' || node.type === 'textOutput'), 'Image-output workflows should not be routed into composition or text output just because the source is video.');
+
+  const captionBurn = buildPromptDraft('start with a video input and a caption text input, burn subtitles into the video using bold bottom captions, then output the captioned video');
+  assertNoStructuralErrors(captionBurn.pipeline);
+  assertSubsequence(nodeTypes(captionBurn), ['videoInput', 'textInput', 'burnSubtitles', 'videoOutput'], 'Caption burn should preserve video plus caption inputs and finish as video.');
+  assert(!captionBurn.pipeline.nodes.some((node) => node.type === 'llmPrompt' || node.type === 'textOutput'), 'Caption burn should not invent generic text generation or text output.');
+}
 function testWizardProviderModelLabelAvoidsObjectString(context) {
   const intent = 'Summarize a plain text input.';
   const fallbackPlan = parsePipelineWizardPlan('', { intent });
@@ -872,9 +1454,70 @@ function testHallucinatedPlanFallsBack(context) {
   assert(result.pipeline.nodes.some((node) => node.type === 'llmPrompt' && node.config?.operationId === 'whisperTranscribe'), 'Expected hallucinated plan to instantiate bounded Whisper transcription through Model Step.');
 }
 
-const context = buildPipelineWizardContext({ hardware, manifests: tools, providers, tools });
+function testConstrainedWizardPromptIsCompactAndBudgeted(context) {
+  const intent = 'Compose an image collection into a narration-synced slideshow with fallback 8 seconds per image, random wipes, narration at 100%, quiet background music, and Halloween sound effects.';
+  const target = { mode: 'cloud', providerId: 'groq', model: 'openai/gpt-oss-120b' };
+  const profile = getPipelineWizardRequestProfile({ context, intent, wizardTarget: target });
+  const messages = buildPipelineWizardMessages({ context, intent, wizardTarget: { ...target, requestProfile: profile } });
+  const promptText = JSON.stringify(messages);
+  const userPayload = JSON.parse(messages[1].content);
+  assert.strictEqual(profile.compactMode, true, 'Groq GPT-OSS wizard requests should use compact mode.');
+  assert.strictEqual(profile.maxOutputTokens, 1024, 'Groq GPT-OSS wizard responses should stay within the constrained response budget.');
+  assert(promptText.includes('Using compact wizard mode for this model.'), 'Compact mode prompt should include the plain-English compact note.');
+  assert(promptText.length < 14000, 'Compact constrained-model prompt should stay small enough to avoid the observed Groq TPM failure.');
+  assert(userPayload.allowedNodeTypes.length < context.nodeTypes.length, 'Compact mode should filter node type context to the relevant surface.');
+  assert(userPayload.allowedNodeTypes.includes('mediaComposition'), 'Compact media prompts should still include Media Composition.');
+  assert(userPayload.allowedNodeTypes.includes('mediaExport'), 'Compact media prompts should still include Media Export.');
+  assert(!userPayload.allowedNodeTypes.includes('burnSubtitles'), 'Compact media prompts should omit unrelated node families.');
+
+  const fullSchemaText = JSON.stringify(buildPipelineWizardStructuredOutputRequest());
+  const compactSchemaText = JSON.stringify(buildPipelineWizardStructuredOutputRequest({ compactMode: true }));
+  assert(compactSchemaText.length < fullSchemaText.length, 'Compact structured output schema should reduce Gemini schema-mode prompt weight.');
+}
+
+function testMediaCompositionMalformedRepairReliability(context) {
+  const intent = 'Compose an image collection into a narration-synced slideshow with fallback 8 seconds per image, random wipes, narration at 100%, quiet background music, and Halloween sound effects.';
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('not valid json', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
+  });
+  const nodeTypes = result.pipeline.nodes.map((node) => node.type);
+  for (const expectedType of ['collectionInput', 'audioInput', 'mediaComposition', 'mediaExport', 'videoOutput']) {
+    assert(nodeTypes.includes(expectedType), 'Malformed media composition repair should include ' + expectedType + '.');
+  }
+  assert.strictEqual(nodeTypes.filter((type) => type === 'audioInput').length, 2, 'Media composition repair should include narration and background music audio inputs.');
+  assert(!nodeTypes.includes('audioOutput'), 'Media composition repair should not recover into an audio output pipeline.');
+  const mediaNode = result.pipeline.nodes.find((node) => node.type === 'mediaComposition');
+  assert(mediaNode, 'Expected Media Composition node.');
+  assert.strictEqual(mediaNode.config.imageTimingMode, 'dynamicFromImageMetadata', 'Narration-synced slideshows should use dynamic image timing.');
+  assert.strictEqual(mediaNode.config.secondsPerItem, 8, 'Fallback seconds per image should be preserved from malformed-output repair.');
+  assert.strictEqual(mediaNode.config.sceneTransitionMode, 'randomCategory', 'Random wipes should use random transition category mode.');
+  assert.strictEqual(mediaNode.config.sceneTransitionCategory, 'wipes', 'Random wipes should preserve the wipes category.');
+  assert.strictEqual(mediaNode.config.narrationVolume, 1, 'Narration at 100% should preserve full narration volume.');
+  assert.strictEqual(mediaNode.config.backgroundMusicVolume, 0.18, 'Quiet background music should lower only the music mix level.');
+  assert.strictEqual(mediaNode.config.soundEffectsEnabled, true, 'Halloween sound effects should enable SFX layers.');
+  assert.strictEqual(mediaNode.config.soundEffectsLibraryId, 'sfx-halloween', 'Halloween SFX should resolve the matching asset library when available.');
+  assert.strictEqual(mediaNode.config.soundEffectsLayers.length, 1, 'Resolved SFX library should become a SFX layer.');
+  assert(!result.summary.gaps.some((gap) => /generatedAudio|audio output/i.test(gap)), 'Media repair should not leave an audio-output gap.');
+
+  const noLibraryContext = buildPipelineWizardContext({ hardware, manifests: tools, providers, tools, assetLibraries: { soundEffects: [], fonts: [], colorPalettes: [] } });
+  const missingLibraryResult = buildPipelineWizardDraft({
+    context: noLibraryContext,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
+  });
+  const missingMediaNode = missingLibraryResult.pipeline.nodes.find((node) => node.type === 'mediaComposition');
+  assert(missingMediaNode?.config.soundEffectsEnabled, 'Missing SFX libraries should not disable requested sound effects.');
+  assert(missingLibraryResult.summary.gaps.some((gap) => /Sound Effects|asset library/i.test(gap)), 'Missing SFX library should be surfaced as an explicit assumption/gap.');
+}
+const context = buildPipelineWizardContext({ hardware, manifests: tools, providers, tools, assetLibraries });
 testWizardPromptBoundary(context);
 testLocalWizardPromptIsCompactAndGrounded(context);
+testConstrainedWizardPromptIsCompactAndBudgeted(context);
+testMediaCompositionMalformedRepairReliability(context);
 testTextToImageDraft(context);
 testIntentIrTextToImageDraft(context);
 testIntentIrPlanningValidationRetryDraft(context);
@@ -901,6 +1544,11 @@ testUnsupportedVideoInputProviderIsSurfaced(context);
 testFileInputTextGenerationForSupportedProvider(context);
 testWizardProviderModelLabelAvoidsObjectString(context);
 testHallucinatedPlanFallsBack(context);
+testCloudImageGenerationPassOneDrafts(context);
+testCloudImageCollectionMapPassOneDrafts(context);
+testCloudVideoGenerationPassOneDrafts(context);
+testCloudVideoCollectionMapPassOneDrafts(context);
+testCloudVideoProviderFilteringPassOne();
+testChatterboxReferenceVoicePassOneDrafts();
 
 console.log('Pipeline wizard verifier passed.');
-

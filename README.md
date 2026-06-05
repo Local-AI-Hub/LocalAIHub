@@ -18,7 +18,7 @@ Some antivirus tools may block the download, quarantine the installer, or interr
 
 These warnings are expected for unsigned apps and do not mean Local AI Hub is malware, but you should only continue if you trust the release source.
 
-## Untested Features as of v0.40.0
+## Untested Features as of v0.41.0
 
 The following features are implemented and covered by automated verification where practical, but have not yet been validated with real-world hardware, local model assets, or live cloud-provider accounts. Treat them as experimental until they are manually tested.
 

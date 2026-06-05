@@ -31,6 +31,7 @@ const {
   buildPipelineWizardDraft,
   buildPipelineWizardMessages,
   buildPipelineWizardStructuredOutputRequest,
+  getPipelineWizardRequestProfile,
   parsePipelineWizardPlan,
 } = pipelineWizardShared;
 
@@ -3390,8 +3391,8 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   );
   const connectedProviders = useMemo(() => (providers || []).filter((provider) => provider.isConnected), [providers]);
   const wizardContext = useMemo(
-    () => buildPipelineWizardContext({ hardware, manifests, providers, tools: pipelineTools }),
-    [hardware, manifests, pipelineTools, providers],
+    () => buildPipelineWizardContext({ hardware, manifests, providers, tools: pipelineTools, assetLibraries: { soundEffects: soundEffectLibraries, fonts: fontLibraries, colorPalettes: colorPaletteLibraries } }),
+    [colorPaletteLibraries, fontLibraries, hardware, manifests, pipelineTools, providers, soundEffectLibraries],
   );
   const wizardTarget = useMemo(() => ({
     mode: wizardExecutionMode === 'ollama' ? 'ollama' : 'cloud',
@@ -4956,10 +4957,18 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       : 'The wizard model did not return a draft within the allowed time. Try a simpler request, a stronger model, or split the workflow into stages.';
 
     try {
-      const messages = buildPipelineWizardMessages({
+      const requestProfile = getPipelineWizardRequestProfile({
         context: wizardContext,
         intent: normalizedIntent,
         wizardTarget: { ...wizardTarget, model: wizardModelId },
+      });
+      if (requestProfile.note) {
+        onToast(requestProfile.note, 'info');
+      }
+      const messages = buildPipelineWizardMessages({
+        context: wizardContext,
+        intent: normalizedIntent,
+        wizardTarget: { ...wizardTarget, model: wizardModelId, requestProfile },
       });
       const lifecycleResult = await runPipelineWizardLifecycle({
         context: wizardContext,
@@ -4988,8 +4997,8 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               providerId: wizardProviderId,
               timeoutMessage,
               timeoutMs: requestTimeoutMs,
-              maxOutputTokens: 4096,
-              responseFormat: buildPipelineWizardStructuredOutputRequest(),
+              maxOutputTokens: requestProfile.maxOutputTokens || 4096,
+              responseFormat: buildPipelineWizardStructuredOutputRequest({ compactMode: requestProfile.compactMode }),
             }),
       });
 

@@ -70,7 +70,7 @@ async function testValidStructuredLongformIntentIrCompilesDirectly() {
     title: 'Voiceover storyboard video draft',
     summary: 'Transcribe voiceover, plan scenes, validate prompts, map prompts to images, compose with audio, and export video.',
     recipeId: 'audio-transcribe',
-    gaps: ['Prompt validation and retry are whole-collection controls today, not per-item collectionMap retries.'],
+    gaps: ['Prompt collection validation before mapping is modeled as a whole-collection review; per-item validation and retry belong on downstream Map Collection item-generation steps.'],
     userRefinementNotes: ['Review model and media export settings before running.'],
     intentIr: {
       sources: [{ name: 'sourceAudio', modality: 'audio', role: 'Source audio' }],
@@ -95,7 +95,7 @@ async function testValidStructuredLongformIntentIrCompilesDirectly() {
       ],
       outputs: [{ artifact: 'exportedVideo', kind: 'video', title: 'Final video' }],
       assumptions: [],
-      gaps: ['Prompt validation and retry are whole-collection controls today, not per-item collectionMap retries.'],
+      gaps: ['Prompt collection validation before mapping is modeled as a whole-collection review; per-item validation and retry belong on downstream Map Collection item-generation steps.'],
     },
   };
   const result = await runLifecycle(intent, {
@@ -138,7 +138,7 @@ async function testMisleadingCollectionMapAssumptionIsFiltered() {
   });
   const allUserText = [result.draftResult.summary.message, ...(result.draftResult.summary.gaps || [])].join(' ');
   assert(!/internal workflow that includes llmPrompt, validation, and retryLoop/i.test(allUserText), 'Misleading per-item collectionMap assumption should be filtered.');
-  assert(/whole-collection controls|does not yet retry individual prompt items/i.test(allUserText), 'Expected honest whole-collection validation limitation.');
+  assert(!/does not yet retry individual prompt items|per-item collectionMap retries/i.test(allUserText), 'Per-item collectionMap validation should no longer be described as unsupported.');
 }
 
 async function testProviderTimeoutResolvesWithRecoveredDraft() {
