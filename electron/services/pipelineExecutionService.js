@@ -148,8 +148,28 @@ const LONGFORM_CHUNKED_PLANNER_THRESHOLD_SECONDS = 60;
 const LONGFORM_CHUNK_TARGET_DURATION_SECONDS = 60;
 const LONGFORM_CHUNK_MAX_DURATION_SECONDS = 90;
 const LONGFORM_CHUNK_CONTEXT_OVERLAP_SECONDS = 5;
-const LONGFORM_CHUNK_RECENT_PROMPT_COUNT = 5;
+const LONGFORM_CHUNK_RECENT_PROMPT_COUNT = 3;
 const LONGFORM_CHUNK_MAX_REQUEST_CHARACTERS = 14000;
+const LONGFORM_CHUNK_CONTEXT_PROFILES = Object.freeze({
+  normal: Object.freeze({ contextSegmentLimit: 1, globalSummaryMode: 'normal', previousSummaryChars: 320, promptChars: 160, promptCount: 3 }),
+  reduced: Object.freeze({ contextSegmentLimit: 1, globalSummaryMode: 'reduced', previousSummaryChars: 180, promptChars: 120, promptCount: 2 }),
+  minimal: Object.freeze({ contextSegmentLimit: 0, globalSummaryMode: 'minimal', previousSummaryChars: 100, promptChars: 80, promptCount: 1 }),
+  bare: Object.freeze({ contextSegmentLimit: 0, globalSummaryMode: 'minimal', previousSummaryChars: 0, promptChars: 0, promptCount: 0 }),
+});
+const LONGFORM_CHUNK_CONTEXT_PROFILE_ORDER = Object.freeze(['normal', 'reduced', 'minimal', 'bare']);
+const LONGFORM_CHUNK_MIN_DURATION_SECONDS = 10;
+const LONGFORM_CHUNK_ABSOLUTE_MIN_DURATION_SECONDS = 5;
+const LONGFORM_ADAPTIVE_CHUNK_DURATIONS_SECONDS = Object.freeze([60, 45, 30, 20, 15, 10]);
+const LONGFORM_APPROX_CHARS_PER_TOKEN = 4;
+const LONGFORM_PLANNER_DEFAULT_TOTAL_TOKEN_BUDGET = 16000;
+const LONGFORM_PLANNER_DEFAULT_SAFETY_MARGIN_TOKENS = 1000;
+const LONGFORM_PLANNER_CONSTRAINED_TOTAL_TOKEN_BUDGET = 7600;
+const LONGFORM_PLANNER_CONSTRAINED_SAFETY_MARGIN_TOKENS = 700;
+const LONGFORM_PLANNER_GEMINI_FLASH_TOTAL_TOKEN_BUDGET = 30000;
+const LONGFORM_PLANNER_GROQ_GPT_OSS_TOKENS_PER_MINUTE = 8000;
+const LONGFORM_PLANNER_RATE_LIMIT_MAX_RETRIES = 2;
+const LONGFORM_PLANNER_RATE_LIMIT_DEFAULT_WAIT_MS = 15000;
+const LONGFORM_PLANNER_RATE_LIMIT_MAX_WAIT_MS = 90000;
 const MEDIA_COMPOSITION_TRANSITION_CATEGORY_BY_ID = new Map(
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES.map((category) => [String(category.id || '').trim(), category]),
 );
@@ -2075,13 +2095,176 @@ function getLongformPlannerDurationSeconds(packet = {}, segments = getLongformTr
     || 0;
 }
 
-function shouldUseChunkedLongformPlanner(schemaId, packet = {}) {
+function estimatePlannerTokensFromCharacters(characters) {
+  return Math.max(0, Math.ceil((Number(characters || 0) || 0) / LONGFORM_APPROX_CHARS_PER_TOKEN));
+}
+
+function getPlannerBudgetMetadataNumber(source = {}, keys = []) {
+  const candidates = [
+    source,
+    source?.plannerBudget,
+    source?.plannerBudgetProfile,
+    source?.configuration,
+    source?.configuration?.plannerBudget,
+    source?.configuration?.plannerBudgetProfile,
+  ].filter((entry) => entry && typeof entry === 'object');
+  for (const candidate of candidates) {
+    for (const key of keys) {
+      const numeric = Number(candidate?.[key]);
+      if (Number.isFinite(numeric) && numeric > 0) {
+        return numeric;
+      }
+    }
+  }
+  return 0;
+}
+
+function resolveConfiguredPlannerBudgetOverride(providerMetadata = {}, model = '') {
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  const modelProfiles = [
+    providerMetadata?.plannerBudgetProfiles,
+    providerMetadata?.configuration?.plannerBudgetProfiles,
+    providerMetadata?.modelBudgetProfiles,
+    providerMetadata?.configuration?.modelBudgetProfiles,
+  ].filter((entry) => entry && typeof entry === 'object');
+  for (const profiles of modelProfiles) {
+    for (const [pattern, profile] of Object.entries(profiles)) {
+      const normalizedPattern = String(pattern || '').trim().toLowerCase();
+      if (!normalizedPattern || !profile || typeof profile !== 'object') {
+        continue;
+      }
+      const patternMatches = normalizedModel === normalizedPattern
+        || normalizedModel.includes(normalizedPattern)
+        || (profile.modelPattern && new RegExp(String(profile.modelPattern), 'i').test(normalizedModel));
+      if (patternMatches) {
+        return profile;
+      }
+    }
+  }
+  return null;
+}
+function resolveLongformPlannerBudgetProfile(providerId = '', model = '', providerMetadata = {}) {
+  const normalizedProviderId = String(providerId || '').trim().toLowerCase();
+  const normalizedModel = String(model || '').trim().toLowerCase();
+  const configuredOutputTokens = Number(providerMetadata?.configuration?.maxOutputTokens || providerMetadata?.maxOutputTokens || 0) || 0;
+  const configuredOverride = resolveConfiguredPlannerBudgetOverride(providerMetadata, model);
+  const configuredInputTokens = getPlannerBudgetMetadataNumber(configuredOverride || providerMetadata, ['maxInputTokens', 'inputTokens', 'requestTokens']);
+  const configuredTotalTokens = getPlannerBudgetMetadataNumber(configuredOverride || providerMetadata, ['maxTotalTokens', 'contextWindowTokens', 'contextTokens', 'contextWindow', 'tokenBudget']);
+  const configuredSafetyMarginTokens = getPlannerBudgetMetadataNumber(configuredOverride || providerMetadata, ['safetyMarginTokens', 'safetyTokens']);
+  const configuredTokensPerMinute = getPlannerBudgetMetadataNumber(configuredOverride || providerMetadata, ['tokensPerMinute', 'tpmLimit', 'tpm', 'minuteTokenLimit']);
+  const baseProfile = {
+    adaptiveChunkingEnabled: true,
+    configuredInputTokens,
+    configuredOutputTokens: configuredOutputTokens > 0 ? configuredOutputTokens : 0,
+    maxInputTokens: configuredInputTokens || 0,
+    maxTotalTokens: configuredTotalTokens || LONGFORM_PLANNER_DEFAULT_TOTAL_TOKEN_BUDGET,
+    model: String(model || '').trim(),
+    profileId: configuredTotalTokens ? 'metadata-configured' : 'default-conservative',
+    providerId: String(providerId || '').trim(),
+    safetyMarginTokens: configuredSafetyMarginTokens || LONGFORM_PLANNER_DEFAULT_SAFETY_MARGIN_TOKENS,
+    tokenEstimateMethod: 'characters/4 plus output budget and safety margin',
+    tokensPerMinute: configuredTokensPerMinute || 0,
+  };
+
+  if (configuredOverride || configuredTotalTokens || configuredInputTokens) {
+    return {
+      ...baseProfile,
+      capabilitySource: configuredOverride ? 'model-budget-metadata' : 'provider-budget-metadata',
+      profileId: String(configuredOverride?.profileId || baseProfile.profileId || 'metadata-configured').trim() || 'metadata-configured',
+    };
+  }
+
+  if (normalizedProviderId === 'groq' && /(?:^|\/)gpt-oss(?:[-_/]120b|.*120b)|openai\/gpt-oss-120b/.test(normalizedModel)) {
+    return {
+      ...baseProfile,
+      maxTotalTokens: LONGFORM_PLANNER_CONSTRAINED_TOTAL_TOKEN_BUDGET,
+      profileId: 'groq-gpt-oss-120b-constrained',
+      safetyMarginTokens: LONGFORM_PLANNER_CONSTRAINED_SAFETY_MARGIN_TOKENS,
+      tokensPerMinute: LONGFORM_PLANNER_GROQ_GPT_OSS_TOKENS_PER_MINUTE,
+    };
+  }
+
+  if (normalizedProviderId === 'groq') {
+    return {
+      ...baseProfile,
+      maxTotalTokens: 10000,
+      profileId: 'groq-conservative',
+      safetyMarginTokens: 800,
+      tokensPerMinute: 10000,
+    };
+  }
+
+  if (normalizedProviderId === 'google' && /gemini-2\.5-flash/.test(normalizedModel)) {
+    return {
+      ...baseProfile,
+      maxTotalTokens: LONGFORM_PLANNER_GEMINI_FLASH_TOTAL_TOKEN_BUDGET,
+      profileId: 'gemini-2.5-flash-large',
+      safetyMarginTokens: 1500,
+    };
+  }
+
+  if (normalizedProviderId === 'google') {
+    return {
+      ...baseProfile,
+      maxTotalTokens: 24000,
+      profileId: 'gemini-conservative',
+      safetyMarginTokens: 1500,
+    };
+  }
+
+  if (!normalizedProviderId) {
+    return {
+      ...baseProfile,
+      maxTotalTokens: 12000,
+      profileId: 'local-ollama-conservative',
+      safetyMarginTokens: 1000,
+    };
+  }
+
+  return baseProfile;
+}
+
+function estimatePlannerChunkRequestBudget(request, chunkMinimumImageCount, budgetProfile = {}, components = {}) {
+  const requestCharacters = Number(request?.promptStats?.requestCharacters || 0) || 0;
+  const inputTokens = estimatePlannerTokensFromCharacters(requestCharacters);
+  const expectedOutputTokens = estimateChunkPlannerMaxOutputTokens(chunkMinimumImageCount);
+  const safetyMarginTokens = Math.max(0, Number(budgetProfile?.safetyMarginTokens || 0) || 0);
+  const maxTotalTokens = Math.max(1, Number(budgetProfile?.maxTotalTokens || LONGFORM_PLANNER_DEFAULT_TOTAL_TOKEN_BUDGET) || LONGFORM_PLANNER_DEFAULT_TOTAL_TOKEN_BUDGET);
+  const maxInputTokens = Math.max(0, Number(budgetProfile?.maxInputTokens || 0) || 0);
+  const estimatedTotalTokens = inputTokens + expectedOutputTokens + safetyMarginTokens;
+  const componentCharacters = components && typeof components === 'object' ? components : {};
+  const componentTokens = Object.fromEntries(Object.entries(componentCharacters)
+    .filter(([, value]) => Number(value || 0) > 0)
+    .map(([key, value]) => [key.replace(/Characters$/, 'Tokens'), estimatePlannerTokensFromCharacters(value)]));
+  return {
+    ...componentCharacters,
+    ...componentTokens,
+    estimatedInputTokens: inputTokens,
+    estimatedOutputTokens: expectedOutputTokens,
+    estimatedTotalTokens,
+    maxInputTokens,
+    maxTotalTokens,
+    requestCharacters,
+    safetyMarginTokens,
+    underBudget: estimatedTotalTokens <= maxTotalTokens && (!maxInputTokens || inputTokens <= maxInputTokens),
+  };
+}
+
+function shouldUseChunkedLongformPlanner(schemaId, packet = {}, options = {}) {
   if (String(schemaId || '').trim() !== LONGFORM_SCENE_PLAN_SCHEMA_ID) {
     return false;
   }
   const segments = getLongformTranscriptSegments(packet);
+  if (!segments.length) {
+    return false;
+  }
   const durationSeconds = getLongformPlannerDurationSeconds(packet, segments);
-  return durationSeconds > LONGFORM_CHUNKED_PLANNER_THRESHOLD_SECONDS && segments.length > 0;
+  if (durationSeconds > LONGFORM_CHUNKED_PLANNER_THRESHOLD_SECONDS) {
+    return true;
+  }
+
+  const requestBudget = options.requestBudget || null;
+  return Boolean(requestBudget && requestBudget.estimatedTotalTokens > requestBudget.maxTotalTokens);
 }
 
 function normalizeGlobalSummaryList(entries = [], limit = 5) {
@@ -2150,11 +2333,144 @@ function splitLongformTranscriptChunks(segments = [], totalDurationSeconds = 0, 
   return chunks.filter((chunk) => chunk.segments.length);
 }
 
+function renumberLongformChunks(chunks = []) {
+  return (Array.isArray(chunks) ? chunks : []).map((chunk, index) => ({
+    ...chunk,
+    index,
+  }));
+}
+
+function getLongformChunkSplitSeconds(chunk = {}, minDurationSeconds = LONGFORM_CHUNK_MIN_DURATION_SECONDS) {
+  const startSeconds = Number(chunk.startSeconds || 0) || 0;
+  const endSeconds = Number(chunk.endSeconds || 0) || 0;
+  const durationSeconds = Math.max(0, endSeconds - startSeconds);
+  if (durationSeconds <= Math.max(1, minDurationSeconds)) {
+    return null;
+  }
+
+  const midpoint = startSeconds + (durationSeconds / 2);
+  const boundaryCandidates = (Array.isArray(chunk.segments) ? chunk.segments : [])
+    .flatMap((segment) => [Number(segment.startSeconds || 0), Number(segment.endSeconds || 0)])
+    .filter((value) => value > startSeconds + minDurationSeconds && value < endSeconds - minDurationSeconds)
+    .sort((left, right) => Math.abs(left - midpoint) - Math.abs(right - midpoint));
+
+  return normalizePlannerSeconds(boundaryCandidates[0] || midpoint);
+}
+
+function splitLongformChunk(chunk = {}, options = {}) {
+  const minDurationSeconds = Math.max(1, Number(options.minDurationSeconds || LONGFORM_CHUNK_MIN_DURATION_SECONDS) || LONGFORM_CHUNK_MIN_DURATION_SECONDS);
+  const splitSeconds = getLongformChunkSplitSeconds(chunk, minDurationSeconds);
+  if (!Number.isFinite(splitSeconds) || splitSeconds <= chunk.startSeconds || splitSeconds >= chunk.endSeconds) {
+    return [];
+  }
+
+  const beforeSegments = (Array.isArray(chunk.segments) ? chunk.segments : []).filter((segment) => segment.startSeconds < splitSeconds && segment.endSeconds > chunk.startSeconds);
+  const afterSegments = (Array.isArray(chunk.segments) ? chunk.segments : []).filter((segment) => segment.startSeconds < chunk.endSeconds && segment.endSeconds > splitSeconds);
+  const replacement = [
+    {
+      ...chunk,
+      durationSeconds: normalizePlannerSeconds(splitSeconds - chunk.startSeconds) || (splitSeconds - chunk.startSeconds),
+      endSeconds: splitSeconds,
+      segments: beforeSegments,
+      splitReason: options.reason || chunk.splitReason || '',
+    },
+    {
+      ...chunk,
+      contextSegments: beforeSegments.filter((segment) => segment.endSeconds <= splitSeconds).slice(-1),
+      durationSeconds: normalizePlannerSeconds(chunk.endSeconds - splitSeconds) || (chunk.endSeconds - splitSeconds),
+      endSeconds: chunk.endSeconds,
+      segments: afterSegments,
+      splitReason: options.reason || chunk.splitReason || '',
+      startSeconds: splitSeconds,
+    },
+  ].filter((entry) => entry.durationSeconds > 0 && entry.segments.length);
+
+  return replacement.length > 1 ? replacement : [];
+}
+
+function canSplitLongformChunk(chunk = {}, minDurationSeconds = LONGFORM_CHUNK_MIN_DURATION_SECONDS) {
+  return Boolean(
+    chunk
+    && Number(chunk.durationSeconds || 0) > Math.max(1, Number(minDurationSeconds || 0) || 0)
+    && Array.isArray(chunk.segments)
+    && chunk.segments.length > 1
+    && splitLongformChunk(chunk, { minDurationSeconds }).length > 1
+  );
+}
 function getChunkMinimumImageCount(chunk, fallbackSecondsPerImage) {
   const fallback = Number(fallbackSecondsPerImage || 0) > 0 ? Number(fallbackSecondsPerImage) : 8;
   return Math.max(1, Math.ceil((Number(chunk?.durationSeconds || 0) || 0) / fallback));
 }
 
+function getLongformContextProfile(profileId = 'normal') {
+  return LONGFORM_CHUNK_CONTEXT_PROFILES[String(profileId || '').trim()] || LONGFORM_CHUNK_CONTEXT_PROFILES.normal;
+}
+
+function trimLongformContextText(value, limit) {
+  const numericLimit = Number(limit);
+  if (Number.isFinite(numericLimit) && numericLimit <= 0) {
+    return '';
+  }
+  return trimPreviewText(String(value || '').replace(/\s+/g, ' ').trim(), Math.max(20, Number(limit || 0) || 120));
+}
+
+function compactLongformGlobalSummaryForChunk(globalSummary = {}, mode = 'normal') {
+  const source = globalSummary && typeof globalSummary === 'object' ? globalSummary : {};
+  if (mode === 'minimal') {
+    return {
+      overallSubject: trimLongformContextText(source.overallSubject, 160),
+      toneStyle: trimLongformContextText(source.toneStyle, 120),
+      continuityNotes: normalizeGlobalSummaryList(source.continuityNotes, 2),
+    };
+  }
+  if (mode === 'reduced') {
+    return {
+      overallSubject: trimLongformContextText(source.overallSubject, 180),
+      toneStyle: trimLongformContextText(source.toneStyle, 140),
+      recurringCharactersEntities: normalizeGlobalSummaryList(source.recurringCharactersEntities, 3),
+      recurringLocationsSettings: normalizeGlobalSummaryList(source.recurringLocationsSettings, 3),
+      visualMotifs: normalizeGlobalSummaryList(source.visualMotifs, 3),
+      continuityNotes: normalizeGlobalSummaryList(source.continuityNotes, 3),
+      desiredVisualStyle: trimLongformContextText(source.desiredVisualStyle, 160),
+    };
+  }
+  return {
+    ...source,
+    overallSubject: trimLongformContextText(source.overallSubject, 220),
+    toneStyle: trimLongformContextText(source.toneStyle, 220),
+    recurringCharactersEntities: normalizeGlobalSummaryList(source.recurringCharactersEntities, 6),
+    recurringLocationsSettings: normalizeGlobalSummaryList(source.recurringLocationsSettings, 6),
+    visualMotifs: normalizeGlobalSummaryList(source.visualMotifs, 6),
+    continuityNotes: normalizeGlobalSummaryList(source.continuityNotes, 4),
+    desiredVisualStyle: trimLongformContextText(source.desiredVisualStyle, 260),
+  };
+}
+
+function normalizeRecentImagePromptContext(prompts = [], profile = getLongformContextProfile('normal')) {
+  return (Array.isArray(prompts) ? prompts : [])
+    .map((prompt) => trimLongformContextText(prompt, profile.promptChars))
+    .filter(Boolean)
+    .slice(-Math.max(0, Number(profile.promptCount || 0) || 0));
+}
+
+function buildLongformChunkContextStats(details = {}) {
+  const transcriptCharacters = String(details.transcriptText || '').length;
+  const globalSummaryCharacters = String(details.globalSummaryText || '').length;
+  const previousChunkSummaryCharacters = String(details.previousChunkSummary || '').length;
+  const previousPromptCharacters = (Array.isArray(details.recentImagePrompts) ? details.recentImagePrompts : []).reduce((total, prompt) => total + String(prompt || '').length, 0);
+  const previousContextSegmentCharacters = (Array.isArray(details.contextSegments) ? details.contextSegments : []).reduce((total, segment) => total + String(segment?.text || '').length, 0);
+  const rollingContextCharacters = previousChunkSummaryCharacters + previousPromptCharacters + previousContextSegmentCharacters;
+  const workingNotesCharacters = String(details.workingNotes || '').length;
+  return {
+    globalSummaryCharacters,
+    previousChunkSummaryCharacters,
+    previousContextSegmentCharacters,
+    previousPromptCharacters,
+    rollingContextCharacters,
+    transcriptCharacters,
+    workingNotesCharacters,
+  };
+}
 function buildChunkPacket(packet, chunk, options = {}) {
   const fallbackSecondsPerImage = options.fallbackSecondsPerImage || getPlannerFallbackSecondsPerImage(packet);
   const chunkMinimumImageCount = getChunkMinimumImageCount(chunk, fallbackSecondsPerImage);
@@ -2170,27 +2486,33 @@ function buildChunkPacket(packet, chunk, options = {}) {
     originalEndSeconds: segment.endSeconds,
     text: trimPreviewText(segment.text, 220),
   }));
-  const previousChunkSummary = options.previousChunkSummary || null;
-  const recentImagePrompts = normalizeGlobalSummaryList(options.recentImagePrompts, LONGFORM_CHUNK_RECENT_PROMPT_COUNT);
-  const globalSummary = options.globalSummary || {};
+  const contextProfile = getLongformContextProfile(options.contextProfileId || chunk.contextProfileId || 'normal');
+  const previousChunkSummary = trimLongformContextText(options.previousChunkSummary || '', contextProfile.previousSummaryChars) || null;
+  const recentImagePrompts = normalizeRecentImagePromptContext(options.recentImagePrompts, contextProfile);
+  const globalSummary = compactLongformGlobalSummaryForChunk(options.globalSummary || {}, contextProfile.globalSummaryMode);
+  const boundedContextSegments = contextSegments.slice(-Math.max(0, Number(contextProfile.contextSegmentLimit || 0) || 0));
+  const transcriptText = relativeSegments.map((segment) => segment.text).join(' ');
+  const globalSummaryText = JSON.stringify(globalSummary);
   const chunkNotes = {
     chunkIndex: chunk.index + 1,
     chunkStartSeconds: chunk.startSeconds,
     chunkEndSeconds: chunk.endSeconds,
     chunkDurationSeconds: chunk.durationSeconds,
     chunkMinimumImageCount,
+    contextProfileId: options.contextProfileId || chunk.contextProfileId || 'normal',
     timingInstruction: 'Return scene startSeconds and endSeconds relative to this chunk: 0 through ' + chunk.durationSeconds + '. Local AI Hub will offset them back to the full narration timeline.',
-    previousContextOnlySegments: contextSegments,
+    previousContextOnlySegments: boundedContextSegments,
     previousChunkSummary,
     recentImagePrompts,
   };
-  return {
+  const workingNotes = 'Chunk planning packet:\n' + JSON.stringify(chunkNotes);
+  const chunkPacket = {
     ...clonePlannerValue(packet),
-    sourceSummary: 'Compact global summary / visual continuity packet:\n' + JSON.stringify(globalSummary),
+    sourceSummary: 'Compact global summary / visual continuity packet:\n' + globalSummaryText,
     sourceArtifacts: [{
       displayName: 'Chunk ' + String(chunk.index + 1) + ' timed transcript',
       kind: 'text',
-      textExcerpt: relativeSegments.map((segment) => segment.text).join(' '),
+      textExcerpt: transcriptText,
       transcription: {
         durationSeconds: chunk.durationSeconds,
         segmentCount: relativeSegments.length,
@@ -2205,8 +2527,20 @@ function buildChunkPacket(packet, chunk, options = {}) {
         'This is chunk ' + String(chunk.index + 1) + '. Return at least chunkMinimumImageCount=' + String(chunkMinimumImageCount) + ' scenes for this chunk only.',
       ].filter(Boolean).join('\n'),
     },
-    workingNotes: 'Chunk planning packet:\n' + JSON.stringify(chunkNotes),
+    workingNotes,
   };
+  Object.defineProperty(chunkPacket, '__contextStats', {
+    enumerable: false,
+    value: buildLongformChunkContextStats({
+      contextSegments: boundedContextSegments,
+      globalSummaryText,
+      previousChunkSummary,
+      recentImagePrompts,
+      transcriptText,
+      workingNotes,
+    }),
+  });
+  return chunkPacket;
 }
 
 function buildChunkPlannerGuidance(chunk, chunkMinimumImageCount, fallbackSecondsPerImage) {
@@ -2223,6 +2557,145 @@ function buildChunkPlannerGuidance(chunk, chunkMinimumImageCount, fallbackSecond
   ].join('\n');
 }
 
+function buildLongformChunkPlanningRequest(options = {}) {
+  const {
+    buildPromptMessages,
+    chunk,
+    fallbackSecondsPerImage,
+    globalSummary,
+    packet,
+    plannerGuidance,
+    previousChunkSummary = null,
+    recentImagePrompts = [],
+    budgetProfile = {},
+    contextProfileId = chunk?.contextProfileId || 'normal',
+  } = options;
+  const chunkMinimumImageCount = getChunkMinimumImageCount(chunk, fallbackSecondsPerImage);
+  const chunkPacket = buildChunkPacket(packet, chunk, {
+    contextProfileId,
+    fallbackSecondsPerImage,
+    globalSummary,
+    previousChunkSummary,
+    recentImagePrompts,
+  });
+  const chunkGuidance = [
+    plannerGuidance,
+    buildChunkPlannerGuidance(chunk, chunkMinimumImageCount, fallbackSecondsPerImage),
+  ].filter(Boolean).join('\n\n');
+  const request = buildPromptMessages(chunkPacket, chunkGuidance);
+  const contextStats = chunkPacket.__contextStats || {};
+  const instructionSchemaCharacters = Math.max(0, (Number(request?.promptStats?.requestCharacters || 0) || 0)
+    - Number(contextStats.transcriptCharacters || 0)
+    - Number(contextStats.globalSummaryCharacters || 0)
+    - Number(contextStats.rollingContextCharacters || 0));
+  const budgetEstimate = estimatePlannerChunkRequestBudget(request, chunkMinimumImageCount, budgetProfile, {
+    ...contextStats,
+    instructionSchemaCharacters,
+  });
+  return {
+    budgetEstimate,
+    chunkGuidance,
+    chunkMinimumImageCount,
+    contextProfileId,
+    chunkPacket,
+    request,
+  };
+}
+
+function buildBudgetedLongformChunkPlanningRequest(options = {}) {
+  const preferredProfileId = String(options.contextProfileId || options.chunk?.contextProfileId || 'normal').trim() || 'normal';
+  const profileOrder = [
+    preferredProfileId,
+    ...LONGFORM_CHUNK_CONTEXT_PROFILE_ORDER,
+  ].filter((profileId, index, entries) => LONGFORM_CHUNK_CONTEXT_PROFILES[profileId] && entries.indexOf(profileId) === index);
+  let bestRequest = null;
+  for (const contextProfileId of profileOrder) {
+    const candidate = buildLongformChunkPlanningRequest({
+      ...options,
+      contextProfileId,
+    });
+    bestRequest = candidate;
+    if (candidate.budgetEstimate.underBudget) {
+      return candidate;
+    }
+  }
+  return bestRequest;
+}
+
+function getLongformWorstCaseRollingContext() {
+  return {
+    previousChunkSummary: 'Previous chunk summary placeholder describing continuity, subjects, visual treatment, and the last planned narration beat for bounded budget estimation.',
+    recentImagePrompts: Array.from({ length: LONGFORM_CHUNK_CONTEXT_PROFILES.normal.promptCount }, (_entry, index) => (
+      'Prior clean image prompt ' + String(index + 1) + ' placeholder with subject, setting, lighting, composition, and continuity details.'
+    )),
+  };
+}
+function chooseAdaptiveLongformChunks(options = {}) {
+  const {
+    buildPromptMessages,
+    fallbackSecondsPerImage,
+    globalSummary,
+    packet,
+    plannerGuidance,
+    budgetProfile,
+    segments,
+    totalDurationSeconds,
+  } = options;
+  const normalChunks = splitLongformTranscriptChunks(segments, totalDurationSeconds, LONGFORM_CHUNK_TARGET_DURATION_SECONDS);
+  const worstCaseContext = getLongformWorstCaseRollingContext();
+  const candidateDurations = LONGFORM_ADAPTIVE_CHUNK_DURATIONS_SECONDS.filter((duration, index, entries) => (
+    duration <= LONGFORM_CHUNK_TARGET_DURATION_SECONDS && entries.indexOf(duration) === index
+  ));
+  const attempts = [];
+  let selectedChunks = normalChunks;
+  let selectedEstimates = [];
+  let selectedTargetDurationSeconds = LONGFORM_CHUNK_TARGET_DURATION_SECONDS;
+
+  for (const targetDurationSeconds of candidateDurations) {
+    const chunks = splitLongformTranscriptChunks(segments, totalDurationSeconds, targetDurationSeconds)
+      .map((chunk) => ({
+        ...chunk,
+        adaptiveTargetDurationSeconds: targetDurationSeconds,
+      }));
+    const estimates = chunks.map((chunk) => buildBudgetedLongformChunkPlanningRequest({
+      buildPromptMessages,
+      budgetProfile,
+      chunk,
+      fallbackSecondsPerImage,
+      globalSummary,
+      packet,
+      plannerGuidance,
+      previousChunkSummary: worstCaseContext.previousChunkSummary,
+      recentImagePrompts: worstCaseContext.recentImagePrompts,
+    }).budgetEstimate);
+    const oversizedCount = estimates.filter((estimate) => !estimate.underBudget).length;
+    attempts.push({
+      chunkCount: chunks.length,
+      maxEstimatedTotalTokens: Math.max(0, ...estimates.map((estimate) => estimate.estimatedTotalTokens)),
+      oversizedCount,
+      targetDurationSeconds,
+    });
+    selectedChunks = chunks;
+    selectedEstimates = estimates;
+    selectedTargetDurationSeconds = targetDurationSeconds;
+    if (!oversizedCount) {
+      break;
+    }
+  }
+
+  return {
+    adaptiveChunkingEnabled: true,
+    attempts,
+    chunks: renumberLongformChunks(selectedChunks.map((chunk, index) => ({
+      ...chunk,
+      initialBudgetEstimate: selectedEstimates[index] || null,
+    }))),
+    chunksSplitDueToBudget: selectedTargetDurationSeconds < LONGFORM_CHUNK_TARGET_DURATION_SECONDS
+      ? Math.max(0, selectedChunks.length - normalChunks.length)
+      : 0,
+    selectedTargetDurationSeconds,
+  };
+}
 function summarizeChunkPlan(plan) {
   const scenes = Array.isArray(plan?.scenes) ? plan.scenes : [];
   return trimPreviewText(scenes.map((scene) => scene.sceneConcept || scene.narrationExcerpt || scene.imagePrompt || '').filter(Boolean).join(' | '), 480);
@@ -2285,19 +2758,90 @@ function reconcileMergedLongformScenes(scenes = [], totalDurationSeconds = 0) {
   });
 }
 
+function parseProviderRetryAfterMs(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return 0;
+  }
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.ceil(seconds * 1000);
+  }
+  const dateMs = Date.parse(raw);
+  return Number.isFinite(dateMs) && dateMs > Date.now() ? Math.ceil(dateMs - Date.now()) : 0;
+}
+
+function parsePlannerWaitMsFromMessage(message = '') {
+  const text = String(message || '').toLowerCase();
+  const tryAgainMatch = text.match(/try again in\s+((?:(?:\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?\s*)?(?:(?:\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?)?)/i);
+  const source = tryAgainMatch?.[1] || '';
+  let waitMs = 0;
+  for (const match of source.matchAll(/(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?/gi)) {
+    waitMs += Number(match[1]) * 60000;
+  }
+  for (const match of source.matchAll(/(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/gi)) {
+    waitMs += Number(match[1]) * 1000;
+  }
+  if (waitMs > 0) {
+    return Math.ceil(waitMs);
+  }
+  const plainSeconds = text.match(/(?:retry|again|available).*?(\d+(?:\.\d+)?)\s*(?:s|sec|seconds)/i);
+  return plainSeconds ? Math.ceil(Number(plainSeconds[1]) * 1000) : 0;
+}
+
+function getPlannerTpmNumbers(message = '') {
+  const text = String(message || '');
+  const limitMatch = text.match(/(?:tpm\s*)?limit\s*[:=]?\s*(\d+)/i);
+  const requestedMatch = text.match(/requested\s*[:=]?\s*(\d+)/i);
+  const usedMatch = text.match(/used\s*[:=]?\s*(\d+)/i);
+  return {
+    limit: Number(limitMatch?.[1] || 0) || 0,
+    requested: Number(requestedMatch?.[1] || 0) || 0,
+    used: Number(usedMatch?.[1] || 0) || 0,
+  };
+}
+
+function isPlannerTpmSingleRequestTooLarge(message = '') {
+  const numbers = getPlannerTpmNumbers(message);
+  return numbers.limit > 0 && numbers.requested > numbers.limit && numbers.used <= 0;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms || 0) || 0)));
+}
+
+function getPlannerRateLimitWaitMs(error, classified = {}, options = {}) {
+  const retryAfterMs = parseProviderRetryAfterMs(error?.providerRetryAfter);
+  const messageWaitMs = parsePlannerWaitMsFromMessage(error?.message || error?.userMessage || '');
+  const fallbackMs = Number(options.defaultWaitMs || LONGFORM_PLANNER_RATE_LIMIT_DEFAULT_WAIT_MS) || LONGFORM_PLANNER_RATE_LIMIT_DEFAULT_WAIT_MS;
+  const waitMs = retryAfterMs || messageWaitMs || fallbackMs;
+  return Math.max(0, Math.min(waitMs, Number(options.maxWaitMs || LONGFORM_PLANNER_RATE_LIMIT_MAX_WAIT_MS) || LONGFORM_PLANNER_RATE_LIMIT_MAX_WAIT_MS));
+}
 function classifyPlannerFailure(error) {
   const rawMessage = String(error?.userMessage || error?.message || error || '').trim();
   const lower = rawMessage.toLowerCase();
-  if (/request too large|too large|context length|context.?window|maximum context|token limit|tpm limit|requested \d+|reduce the length|input is too long/.test(lower)) {
-    return {
-      failureReason: 'request-too-large',
-      userMessage: 'The planner request was too large for the selected provider or model.',
-    };
-  }
-  if (/rate.?limit|too many requests|429|tpm|tokens per minute|requests per minute/.test(lower)) {
+  if (/tpm|tokens per minute|requests per minute|rate.?limit|too many requests|429/.test(lower)) {
+    if (isPlannerTpmSingleRequestTooLarge(rawMessage)) {
+      return {
+        failureReason: 'request-too-large',
+        providerStatus: error?.providerStatus || null,
+        retryAfterMs: getPlannerRateLimitWaitMs(error),
+        userMessage: 'The planner request asked for more tokens than the selected provider allows in one minute.',
+      };
+    }
     return {
       failureReason: 'rate-limit',
+      providerStatus: error?.providerStatus || null,
+      retryAfterMs: getPlannerRateLimitWaitMs(error),
       userMessage: 'The provider rate-limited this planner request.',
+    };
+  }
+  if (/request too large|too large|context length|context.?window|maximum context|token limit|requested \d+|reduce the length|input is too long/.test(lower)) {
+    return {
+      failureReason: 'request-too-large',
+      providerStatus: error?.providerStatus || null,
+      retryAfterMs: parseProviderRetryAfterMs(error?.providerRetryAfter),
+      userMessage: 'The planner request was too large for the selected provider or model.',
     };
   }
   if (/quota|billing|credit|insufficient|payment/.test(lower)) {
@@ -2625,7 +3169,11 @@ async function executeChunkedLongformPlanner(options = {}) {
     plannerGuidance,
     providerId,
     providerLabel,
+    providerMetadata,
     reportProgress,
+    rateLimitBackoffMaxRetries = LONGFORM_PLANNER_RATE_LIMIT_MAX_RETRIES,
+    rateLimitBackoffMsOverride = 0,
+    enablePlannerRateLimitBackoff = false,
     schema,
     schemaId,
     sendPlannerRequest,
@@ -2633,7 +3181,20 @@ async function executeChunkedLongformPlanner(options = {}) {
   const segments = getLongformTranscriptSegments(packet);
   const totalDurationSeconds = getLongformPlannerDurationSeconds(packet, segments);
   const globalSummary = buildLongformGlobalSummary(packet, segments, totalDurationSeconds);
-  let chunks = splitLongformTranscriptChunks(segments, totalDurationSeconds);
+  const budgetProfile = resolveLongformPlannerBudgetProfile(providerId, model, providerMetadata);
+  const adaptiveChunking = chooseAdaptiveLongformChunks({
+    buildPromptMessages,
+    budgetProfile,
+    fallbackSecondsPerImage,
+    globalSummary,
+    packet,
+    plannerGuidance,
+    segments,
+    totalDurationSeconds,
+  });
+  let chunks = adaptiveChunking.chunks;
+  let chunksSplitDueToBudget = Number(adaptiveChunking.chunksSplitDueToBudget || 0) || 0;
+  let chunksSplitAfterRequestTooLarge = 0;
   const chunkPlans = [];
   const chunkFailures = [];
   const chunkDiagnostics = [];
@@ -2642,45 +3203,45 @@ async function executeChunkedLongformPlanner(options = {}) {
   let retryAttempted = false;
   let jsonRepairAttempted = false;
   let deterministicFallbackUsed = false;
+  let totalRateLimitWaitMs = 0;
+  const rateLimitWaits = [];
 
   for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
     const chunk = chunks[chunkIndex];
-    const chunkMinimumImageCount = getChunkMinimumImageCount(chunk, fallbackSecondsPerImage);
-    const chunkPacket = buildChunkPacket(packet, chunk, {
+    const {
+      budgetEstimate,
+      chunkGuidance,
+      chunkMinimumImageCount,
+      chunkPacket,
+      request,
+      contextProfileId,
+    } = buildBudgetedLongformChunkPlanningRequest({
+      buildPromptMessages,
+      budgetProfile,
+      chunk,
       fallbackSecondsPerImage,
       globalSummary,
+      packet,
+      plannerGuidance,
       previousChunkSummary,
       recentImagePrompts,
     });
-    const chunkGuidance = [
-      plannerGuidance,
-      buildChunkPlannerGuidance(chunk, chunkMinimumImageCount, fallbackSecondsPerImage),
-    ].filter(Boolean).join('\n\n');
-    const request = buildPromptMessages(chunkPacket, chunkGuidance);
     const chunkLabel = 'chunk ' + String(chunk.index + 1) + ' of ' + String(chunks.length);
 
-    if (request.promptStats.requestCharacters > LONGFORM_CHUNK_MAX_REQUEST_CHARACTERS && chunk.durationSeconds > 20 && chunk.segments.length > 1) {
-      const midpoint = normalizePlannerSeconds(chunk.startSeconds + (chunk.durationSeconds / 2)) || ((chunk.startSeconds + chunk.endSeconds) / 2);
-      const replacement = [
-        {
-          contextSegments: chunk.contextSegments,
-          durationSeconds: normalizePlannerSeconds(midpoint - chunk.startSeconds) || (midpoint - chunk.startSeconds),
-          endSeconds: midpoint,
-          index: chunk.index,
-          segments: chunk.segments.filter((segment) => segment.startSeconds < midpoint && segment.endSeconds > chunk.startSeconds),
-          startSeconds: chunk.startSeconds,
-        },
-        {
-          contextSegments: chunk.segments.filter((segment) => segment.endSeconds <= midpoint).slice(-1),
-          durationSeconds: normalizePlannerSeconds(chunk.endSeconds - midpoint) || (chunk.endSeconds - midpoint),
-          endSeconds: chunk.endSeconds,
-          index: chunk.index + 1,
-          segments: chunk.segments.filter((segment) => segment.startSeconds < chunk.endSeconds && segment.endSeconds > midpoint),
-          startSeconds: midpoint,
-        },
-      ].filter((entry) => entry.durationSeconds > 0 && entry.segments.length);
+    if ((!budgetEstimate.underBudget || request.promptStats.requestCharacters > LONGFORM_CHUNK_MAX_REQUEST_CHARACTERS)
+      && canSplitLongformChunk(chunk, LONGFORM_CHUNK_MIN_DURATION_SECONDS)) {
+      const replacement = splitLongformChunk(chunk, {
+        minDurationSeconds: LONGFORM_CHUNK_MIN_DURATION_SECONDS,
+        reason: budgetEstimate.underBudget ? 'request-character-budget' : 'estimated-token-budget',
+      }).map((entry) => ({
+        ...entry,
+        adaptiveTargetDurationSeconds: Math.min(Number(chunk.adaptiveTargetDurationSeconds || LONGFORM_CHUNK_TARGET_DURATION_SECONDS) || LONGFORM_CHUNK_TARGET_DURATION_SECONDS, Math.max(LONGFORM_CHUNK_MIN_DURATION_SECONDS, Math.ceil(Number(entry.durationSeconds || 0) || LONGFORM_CHUNK_MIN_DURATION_SECONDS))),
+        contextProfileId,
+      }));
       if (replacement.length > 1) {
         chunks.splice(chunkIndex, 1, ...replacement);
+        chunks = renumberLongformChunks(chunks);
+        chunksSplitDueToBudget += 1;
         chunkIndex -= 1;
         continue;
       }
@@ -2688,6 +3249,8 @@ async function executeChunkedLongformPlanner(options = {}) {
 
     let parsed = null;
     let fallbackReason = '';
+    let actualProviderErrorCategory = '';
+    let chunkRetryAttempted = false;
     try {
       reportProgress?.('Planning ' + chunkLabel + ' with the compact global summary.', 'Running ' + node.label + ' with ' + providerLabel + '...');
       const reply = await sendPlannerRequest(request.messages, false, {
@@ -2698,12 +3261,80 @@ async function executeChunkedLongformPlanner(options = {}) {
       parsed = parsePlannerReplyDetailed(schemaId, reply, { sourcePacket: chunkPacket });
       jsonRepairAttempted = jsonRepairAttempted || parsed.jsonRepairAttempted;
     } catch (error) {
-      const classified = classifyPlannerFailure(error);
+      let classified = classifyPlannerFailure(error);
+      actualProviderErrorCategory = classified.failureReason;
       fallbackReason = classified.userMessage || classified.failureReason;
-      const shouldRetry = classified.failureReason !== 'request-too-large'
+
+      if (classified.failureReason === 'rate-limit' && enablePlannerRateLimitBackoff) {
+        const maxRetries = Math.max(0, Math.min(3, Number(rateLimitBackoffMaxRetries || 0) || 0));
+        for (let rateRetryIndex = 0; rateRetryIndex < maxRetries && !parsed; rateRetryIndex += 1) {
+          const waitMs = rateLimitBackoffMsOverride > 0
+            ? Number(rateLimitBackoffMsOverride)
+            : getPlannerRateLimitWaitMs(error, classified);
+          retryAttempted = true;
+          chunkRetryAttempted = true;
+          totalRateLimitWaitMs += waitMs;
+          rateLimitWaits.push({
+            chunkIndex: chunk.index,
+            retryAttempt: rateRetryIndex + 1,
+            waitMs,
+          });
+          reportProgress?.('The provider rate-limited ' + chunkLabel + ', so Local AI Hub is waiting before retrying.', 'Waiting for planner rate limit.');
+          await sleep(waitMs);
+          try {
+            const retryReply = await sendPlannerRequest(request.messages, true, {
+              chunkLabel,
+              maxOutputTokens: estimateChunkPlannerMaxOutputTokens(chunkMinimumImageCount),
+              statusMessage: 'Retrying ' + chunkLabel + ' after provider rate limiting in ' + providerLabel + '.',
+            });
+            parsed = parsePlannerReplyDetailed(schemaId, retryReply, { sourcePacket: chunkPacket });
+            jsonRepairAttempted = jsonRepairAttempted || parsed.jsonRepairAttempted;
+            fallbackReason = '';
+            actualProviderErrorCategory = '';
+          } catch (rateRetryError) {
+            error = rateRetryError;
+            classified = classifyPlannerFailure(rateRetryError);
+            actualProviderErrorCategory = classified.failureReason || actualProviderErrorCategory;
+            fallbackReason = classified.userMessage || classified.failureReason;
+            if (classified.failureReason !== 'rate-limit') {
+              break;
+            }
+          }
+        }
+      }
+
+      if (!parsed && classified.failureReason === 'request-too-large') {
+        const replacement = !chunk.requestTooLargeSplitAttempted && canSplitLongformChunk(chunk, LONGFORM_CHUNK_ABSOLUTE_MIN_DURATION_SECONDS)
+          ? splitLongformChunk(chunk, {
+              minDurationSeconds: LONGFORM_CHUNK_ABSOLUTE_MIN_DURATION_SECONDS,
+              reason: 'provider-request-too-large',
+            }).map((entry) => ({
+              ...entry,
+              contextProfileId: 'minimal',
+              requestTooLargeSplitAttempted: true,
+            }))
+          : [];
+        if (replacement.length > 1) {
+          chunks.splice(chunkIndex, 1, ...replacement);
+          chunks = renumberLongformChunks(chunks);
+          chunksSplitAfterRequestTooLarge += 1;
+          retryAttempted = true;
+          reportProgress?.('The planner request was too large, so Local AI Hub split ' + chunkLabel + ' into smaller chunks.', 'Splitting oversized planner chunk.');
+          chunkIndex -= 1;
+          continue;
+        }
+        if (chunk.requestTooLargeSplitAttempted) {
+          fallbackReason = 'The planner request was too large even after Local AI Hub split it into a smaller chunk.';
+        }
+      }
+
+      const shouldRetry = !parsed
+        && classified.failureReason !== 'request-too-large'
+        && classified.failureReason !== 'rate-limit'
         && request.promptStats.requestCharacters <= LONGFORM_CHUNK_MAX_REQUEST_CHARACTERS;
       if (shouldRetry) {
         retryAttempted = true;
+        chunkRetryAttempted = true;
         const retryGuidance = [
           chunkGuidance,
           'Retry repair: the previous chunk planner attempt failed because ' + fallbackReason,
@@ -2719,8 +3350,10 @@ async function executeChunkedLongformPlanner(options = {}) {
           parsed = parsePlannerReplyDetailed(schemaId, retryReply, { sourcePacket: chunkPacket });
           jsonRepairAttempted = jsonRepairAttempted || parsed.jsonRepairAttempted;
           fallbackReason = '';
+          actualProviderErrorCategory = '';
         } catch (retryError) {
           const retryClassified = classifyPlannerFailure(retryError);
+          actualProviderErrorCategory = retryClassified.failureReason || actualProviderErrorCategory;
           fallbackReason = retryClassified.userMessage || retryClassified.failureReason;
         }
       }
@@ -2754,15 +3387,51 @@ async function executeChunkedLongformPlanner(options = {}) {
     while (recentImagePrompts.length > LONGFORM_CHUNK_RECENT_PROMPT_COUNT) {
       recentImagePrompts.shift();
     }
+    const chunkRateLimitWaitMs = rateLimitWaits
+      .filter((entry) => entry.chunkIndex === chunk.index)
+      .reduce((total, entry) => total + (Number(entry.waitMs || 0) || 0), 0);
     chunkDiagnostics.push({
+      actualProviderErrorCategory,
+      adaptiveTargetDurationSeconds: chunk.adaptiveTargetDurationSeconds || null,
+      budgetProfileId: budgetProfile.profileId,
+      chunkDurationSeconds: chunk.durationSeconds,
+      chunkEndSeconds: chunk.endSeconds,
       chunkIndex: chunk.index,
       chunkMinimumImageCount,
       chunkStartSeconds: chunk.startSeconds,
-      chunkEndSeconds: chunk.endSeconds,
+      contextProfileId,
       deterministicFallbackUsed: !parsed,
+      estimatedInputTokens: budgetEstimate.estimatedInputTokens,
+      estimatedOutputTokens: budgetEstimate.estimatedOutputTokens,
+      estimatedTotalTokens: budgetEstimate.estimatedTotalTokens,
+      estimatedUnderBudget: budgetEstimate.underBudget,
+      fallbackReason: !parsed ? (fallbackReason || 'chunk-planner-failed') : '',
+      globalSummaryCharacters: budgetEstimate.globalSummaryCharacters || 0,
+      globalSummaryTokens: budgetEstimate.globalSummaryTokens || 0,
+      previousChunkSummaryCharacters: budgetEstimate.previousChunkSummaryCharacters || 0,
+      previousChunkSummaryTokens: budgetEstimate.previousChunkSummaryTokens || 0,
+      previousContextSegmentCharacters: budgetEstimate.previousContextSegmentCharacters || 0,
+      previousContextSegmentTokens: budgetEstimate.previousContextSegmentTokens || 0,
+      previousPromptCharacters: budgetEstimate.previousPromptCharacters || 0,
+      previousPromptTokens: budgetEstimate.previousPromptTokens || 0,
+      instructionSchemaCharacters: budgetEstimate.instructionSchemaCharacters || 0,
+      instructionSchemaTokens: budgetEstimate.instructionSchemaTokens || 0,
       jsonRepairAttempted: Boolean(parsed?.jsonRepairAttempted),
+      plannerBudgetTokens: budgetEstimate.maxTotalTokens,
+      plannerMaxInputTokens: budgetEstimate.maxInputTokens,
+      requestedOutputTokens: budgetEstimate.estimatedOutputTokens,
       requestCharacters: request.promptStats.requestCharacters,
+      requestTooLargeSplitAttempted: Boolean(chunk.requestTooLargeSplitAttempted),
+      rateLimitWaitMs: chunkRateLimitWaitMs,
+      retryAttempted: chunkRetryAttempted || Boolean(chunk.requestTooLargeSplitAttempted),
+      retryChunkDurationSeconds: chunk.requestTooLargeSplitAttempted ? chunk.durationSeconds : null,
       returnedSceneCount: offsetScenes.length,
+      rollingContextCharacters: budgetEstimate.rollingContextCharacters || 0,
+      rollingContextTokens: budgetEstimate.rollingContextTokens || 0,
+      safetyMarginTokens: budgetEstimate.safetyMarginTokens || 0,
+      splitReason: chunk.splitReason || '',
+      transcriptCharacters: budgetEstimate.transcriptCharacters || 0,
+      transcriptTokens: budgetEstimate.transcriptTokens || 0,
       tooFewScenesRepaired: repairedTooFewScenes,
     });
   }
@@ -2799,16 +3468,25 @@ async function executeChunkedLongformPlanner(options = {}) {
 
   return {
     diagnostics: {
+      adaptiveChunkingAttempts: adaptiveChunking.attempts,
+      adaptiveChunkingEnabled: true,
+      chosenChunkDurationsSeconds: chunkDiagnostics.map((entry) => entry.chunkDurationSeconds),
       chunkDiagnostics,
       chunkFailures,
       chunksPlanned: chunks.length,
+      chunksSplitAfterRequestTooLarge,
+      chunksSplitDueToBudget,
       deterministicFallbackUsed,
       failureReason: chunkFailures.length ? 'chunk-fallback-used' : '',
       fallbackReason: chunkFailures.length ? chunkFailures.map((entry) => entry.failureReason).filter(Boolean).join(' | ') : '',
       globalSummary,
       jsonRepairAttempted,
+      plannerBudgetProfile: budgetProfile,
+      rateLimitWaits,
+      totalRateLimitWaitMs,
       plannerMode: 'chunked',
       retryAttempted,
+      selectedTargetDurationSeconds: adaptiveChunking.selectedTargetDurationSeconds,
     },
     firstRequestCharacters: chunkDiagnostics[0]?.requestCharacters || 0,
     normalizedPlan: validation.value,
@@ -2840,6 +3518,7 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
 
   let providerId = '';
   let providerLabel = 'Cloud provider';
+  let providerMetadata = null;
   const plannerMaxOutputTokens = estimatePlannerMaxOutputTokens(schemaId, packetValidation.value);
 
   if (executionMode !== 'ollama') {
@@ -2922,20 +3601,26 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
     return String(result?.message?.content || '').trim();
   };
 
+  const plannerBudgetProfile = resolveLongformPlannerBudgetProfile(providerId, model, providerMetadata);
   let normalizedPlan = null;
   let plannerDiagnostics = {
+    adaptiveChunkingEnabled: false,
     chunkFailures: [],
     chunksPlanned: 0,
+    chunksSplitAfterRequestTooLarge: 0,
+    chunksSplitDueToBudget: 0,
     deterministicFallbackUsed: false,
     failureReason: '',
     fallbackReason: '',
     jsonRepairAttempted: false,
+    plannerBudgetProfile,
     plannerMode: 'singleShot',
     retryAttempted: false,
   };
-  let firstRequest = null;
+  let firstRequest = buildMessages();
+  const firstRequestBudget = estimatePlannerChunkRequestBudget(firstRequest, estimatePlannerSceneCount(packetValidation.value), plannerBudgetProfile);
 
-  if (shouldUseChunkedLongformPlanner(schemaId, packetValidation.value)) {
+  if (shouldUseChunkedLongformPlanner(schemaId, packetValidation.value, { requestBudget: firstRequestBudget })) {
     const chunkedResult = await executeChunkedLongformPlanner({
       buildPromptMessages,
       fallbackSecondsPerImage,
@@ -2945,7 +3630,9 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       plannerGuidance,
       providerId,
       providerLabel,
+      providerMetadata,
       reportProgress,
+      enablePlannerRateLimitBackoff: true,
       schema,
       schemaId,
       sendPlannerRequest,
@@ -2961,7 +3648,6 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       },
     };
   } else {
-    firstRequest = buildMessages();
     let reply = '';
     let plannerFallbackReason = '';
     try {
@@ -3022,6 +3708,10 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       providerId,
       providerLabel,
       requestCharacters: firstRequest.promptStats.requestCharacters,
+      requestEstimatedInputTokens: firstRequestBudget.estimatedInputTokens,
+      requestEstimatedOutputTokens: firstRequestBudget.estimatedOutputTokens,
+      requestEstimatedTotalTokens: firstRequestBudget.estimatedTotalTokens,
+      requestPlannerBudgetTokens: firstRequestBudget.maxTotalTokens,
       schemaId,
       schemaLabel: String(schema?.label || 'Plan').trim() || 'Plan',
       plannerMode: plannerDiagnostics.plannerMode,
@@ -3031,22 +3721,39 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       retryAttempted: Boolean(plannerDiagnostics.retryAttempted),
       deterministicFallbackUsed: Boolean(plannerDiagnostics.deterministicFallbackUsed),
       usedDeterministicFallback: Boolean(plannerDiagnostics.deterministicFallbackUsed),
+      adaptiveChunkingAttempts: plannerDiagnostics.adaptiveChunkingAttempts || [],
+      adaptiveChunkingEnabled: Boolean(plannerDiagnostics.adaptiveChunkingEnabled),
+      chosenChunkDurationsSeconds: plannerDiagnostics.chosenChunkDurationsSeconds || [],
       chunksPlanned: Number(plannerDiagnostics.chunksPlanned || 0) || 0,
+      chunksSplitAfterRequestTooLarge: Number(plannerDiagnostics.chunksSplitAfterRequestTooLarge || 0) || 0,
+      chunksSplitDueToBudget: Number(plannerDiagnostics.chunksSplitDueToBudget || 0) || 0,
+      rateLimitWaits: plannerDiagnostics.rateLimitWaits || [],
+      totalRateLimitWaitMs: Number(plannerDiagnostics.totalRateLimitWaitMs || 0) || 0,
       chunkFailures: plannerDiagnostics.chunkFailures || [],
       chunkDiagnostics: plannerDiagnostics.chunkDiagnostics || [],
       globalSummary: plannerDiagnostics.globalSummary || null,
+      plannerBudgetProfile: plannerDiagnostics.plannerBudgetProfile || plannerBudgetProfile,
+      selectedTargetDurationSeconds: plannerDiagnostics.selectedTargetDurationSeconds || null,
     },
     role: 'generated',
     sourcePacket: packetValidation.value,
   });
   const planItemCount = Number(planArtifact.sceneCount || planArtifact.sectionCount || planArtifact.clipCount || normalizedPlan.scenes?.length || normalizedPlan.sections?.length || normalizedPlan.clips?.length || 0) || 0;
-  const plannerResultMessage = plannerDiagnostics.deterministicFallbackUsed
+  let plannerResultMessage = plannerDiagnostics.deterministicFallbackUsed
     ? plannerDiagnostics.plannerMode === 'chunked'
       ? providerLabel + ' planned the longform scene plan in ' + Number(plannerDiagnostics.chunksPlanned || 0) + ' chunk(s); Local AI Hub used deterministic fallback for ' + Number(plannerDiagnostics.chunkFailures?.length || 0) + ' chunk(s) and merged ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.'
       : 'The planner could not return a usable structured plan, so Local AI Hub built a timing-aware deterministic fallback with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.'
     : plannerDiagnostics.plannerMode === 'chunked'
       ? providerLabel + ' returned a chunked structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + ' across ' + Number(plannerDiagnostics.chunksPlanned || 0) + ' chunk(s).'
       : providerLabel + ' returned a structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.';
+  const requestTooLargeFallbackCount = (plannerDiagnostics.chunkFailures || []).filter((entry) => /too large/i.test(String(entry?.failureReason || ''))).length;
+  if (Number(plannerDiagnostics.chunksSplitAfterRequestTooLarge || 0) > 0 && requestTooLargeFallbackCount === 0) {
+    plannerResultMessage += ' A too-large planner request was split into smaller chunks before retrying.';
+  } else if (requestTooLargeFallbackCount > 0) {
+    plannerResultMessage += ' A planner request was too large even after splitting, so that chunk used deterministic fallback.';
+  } else if (plannerDiagnostics.deterministicFallbackUsed && /invalid json|not valid json|malformed-json/i.test(String(plannerDiagnostics.fallbackReason || ''))) {
+    plannerResultMessage += ' The fallback reason was invalid planner JSON.';
+  }
 
   return {
     message: plannerResultMessage,

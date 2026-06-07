@@ -76,7 +76,7 @@ function getMessageText(messages = []) {
 
 function loadPlannerExecutionInternals() {
   const source = fs.readFileSync(PIPELINE_EXECUTION_SERVICE_PATH, 'utf8')
-    + '\nmodule.exports.__longformPlannerTest = { executeChunkedLongformPlanner };';
+    + '\nmodule.exports.__longformPlannerTest = { executeChunkedLongformPlanner, resolveLongformPlannerBudgetProfile, estimatePlannerChunkRequestBudget, shouldUseChunkedLongformPlanner, classifyPlannerFailure, getPlannerRateLimitWaitMs };';
   const testModule = new Module(PIPELINE_EXECUTION_SERVICE_PATH + '.longform-test', module);
   testModule.filename = PIPELINE_EXECUTION_SERVICE_PATH;
   testModule.paths = Module._nodeModulePaths(path.dirname(PIPELINE_EXECUTION_SERVICE_PATH));
@@ -152,6 +152,67 @@ function buildTranscriptPacket(segmentCount, durationSeconds, options = {}) {
   return validation.value;
 }
 
+function buildDenseTranscriptPacket(segmentCount, durationSeconds, options = {}) {
+  const segmentDuration = durationSeconds / segmentCount;
+  const wordsPerSegment = Math.max(8, Number(options.wordsPerSegment || 36) || 36);
+  const segments = Array.from({ length: segmentCount }, (_entry, index) => {
+    const start = Number((segmentDuration * index).toFixed(3));
+    const end = index === segmentCount - 1
+      ? durationSeconds
+      : Number((segmentDuration * (index + 1)).toFixed(3));
+    return {
+      id: 'dense-seg-' + String(index + 1),
+      start,
+      end,
+      text: 'Narration segment ' + String(index + 1) + ' explains ' + buildSyntheticNarration(wordsPerSegment) + '.',
+    };
+  });
+  const packet = buildPlanningPacketDocument({
+    desiredOutputNotes: 'Return scenes with startSeconds, endSeconds, durationSeconds, narrationExcerpt, sourceTranscriptSegmentIds, and clean imagePrompt. Use fallback ' + String(options.fallbackSecondsPerImage || 8) + ' seconds per image.',
+    goal: 'Create a timing-aware longform slideshow scene plan from a dense voiceover transcript.',
+    schemaId: 'longformMedia.scenePlan.v1',
+    stylePolicyText: 'Keep visuals grounded and easy to inspect.',
+  }, [{
+    displayName: 'Dense synthetic transcript',
+    kind: 'text',
+    text: segments.map((segment) => segment.text).join(' '),
+    transcription: {
+      durationSeconds,
+      segments,
+    },
+  }]);
+  const validation = validatePlanningPacketShape(packet);
+  assert.strictEqual(validation.ok, true, validation.errors[0] || 'Expected dense transcript packet to validate.');
+  return validation.value;
+}
+
+function buildMockPromptMessages(promptPacket, guidance = '') {
+  const plannerPrompt = buildPlannerPrompt('longformMedia.scenePlan.v1', promptPacket, {
+    compact: true,
+    guidance,
+  });
+  const messages = [
+    { role: 'system', content: plannerPrompt.systemPrompt },
+    { role: 'user', content: plannerPrompt.userPrompt },
+  ];
+  return {
+    messages,
+    promptStats: {
+      ...plannerPrompt.promptStats,
+      requestCharacters: getMessageText(messages).length,
+    },
+  };
+}
+
+function getChunkDurationFromMessageText(messageText) {
+  const match = String(messageText || '').match(/\\?"chunkDurationSeconds\\?":\s*(\d+(?:\.\d+)?)/);
+  return match ? Number(match[1]) : 60;
+}
+
+function getChunkMinimumFromMessageText(messageText) {
+  const match = String(messageText || '').match(/chunkMinimumImageCount=(\d+)/);
+  return match ? Number(match[1]) : 1;
+}
 function verifyPromptCompaction() {
   const packet = buildTranscriptPacket(180, 300);
   const compactPrompt = buildPlannerPrompt('longformMedia.scenePlan.v1', packet, { compact: true });
@@ -360,6 +421,15 @@ function verifyChunkedPlannerSource() {
   assert(/retryAttempted/.test(executionSource), 'Expected planner metadata to record retry attempts.');
   assert(/deterministicFallbackUsed/.test(executionSource), 'Expected planner metadata to record deterministic fallback usage.');
   assert(/chunksPlanned/.test(executionSource), 'Expected planner metadata to record planned chunk count.');
+  assert(/adaptiveChunkingEnabled/.test(executionSource), 'Expected planner metadata to record adaptive chunking enablement.');
+  assert(/plannerBudgetProfile/.test(executionSource), 'Expected planner metadata to record the provider\/model budget profile.');
+  assert(/chosenChunkDurationsSeconds/.test(executionSource), 'Expected planner metadata to record chosen chunk durations.');
+  assert(/chunksSplitDueToBudget/.test(executionSource), 'Expected planner metadata to record budget-driven splits.');
+  assert(/chunksSplitAfterRequestTooLarge/.test(executionSource), 'Expected planner metadata to record request-too-large splits.');
+  assert(/rollingContextCharacters/.test(executionSource), 'Expected planner metadata to record rolling context size.');
+  assert(/instructionSchemaCharacters/.test(executionSource), 'Expected planner metadata to record instruction and schema size.');
+  assert(/actualProviderErrorCategory/.test(executionSource), 'Expected planner metadata to record provider error categories.');
+  assert(/contextProfileId/.test(executionSource), 'Expected planner metadata to record context compaction profile.');
   assert(/request-too-large/.test(executionSource), 'Expected planner diagnostics to distinguish oversized requests.');
   assert(/provider-overload/.test(executionSource), 'Expected planner diagnostics to distinguish provider overload or high demand.');
   assert(/rate-limit/.test(executionSource), 'Expected planner diagnostics to distinguish rate limits.');
@@ -436,6 +506,7 @@ async function verifyChunkedPlannerWithMockedProvider() {
     schema,
     schemaId: 'longformMedia.scenePlan.v1',
     sendPlannerRequest,
+
   });
 
   assert(providerCalls.length >= 3, 'Expected first chunk plus failed second chunk retry calls.');
@@ -450,6 +521,269 @@ async function verifyChunkedPlannerWithMockedProvider() {
   assert(result.normalizedPlan.scenes.some((scene) => /Narration segment 13/i.test(scene.imagePrompt)), 'Expected failed second chunk fallback to derive prompts from its own transcript range.');
 }
 
+async function runAdaptivePlannerMock(options = {}) {
+  const { executeChunkedLongformPlanner } = loadPlannerExecutionInternals();
+  const packet = options.packet || buildTranscriptPacket(24, 120, { fallbackSecondsPerImage: 8 });
+  const schema = getPlanningSchemaDefinition('longformMedia.scenePlan.v1');
+  const providerCalls = [];
+  const sendPlannerRequest = options.sendPlannerRequest || (async (messages, retry = false) => {
+    const messageText = getMessageText(messages);
+    providerCalls.push({ messageText, retry });
+    const duration = getChunkDurationFromMessageText(messageText);
+    const minimum = getChunkMinimumFromMessageText(messageText);
+    return buildChunkModelReply(minimum, duration, options.promptPrefix || 'adaptive chunk model');
+  });
+  const result = await executeChunkedLongformPlanner({
+    buildPromptMessages: buildMockPromptMessages,
+    fallbackSecondsPerImage: 8,
+    model: options.model || 'mock-longform-planner',
+    node: { id: 'planner-node', label: 'Mock adaptive planner' },
+    packet,
+    plannerGuidance: 'Mocked adaptive provider chunk planning test.',
+    providerId: options.providerId || 'mock',
+    providerLabel: options.providerLabel || 'Mock Provider',
+    providerMetadata: options.providerMetadata || null,
+    reportProgress: () => {},
+    enablePlannerRateLimitBackoff: Boolean(options.enablePlannerRateLimitBackoff),
+    rateLimitBackoffMsOverride: Number(options.rateLimitBackoffMsOverride || 0) || 0,
+    rateLimitBackoffMaxRetries: Number(options.rateLimitBackoffMaxRetries || 0) || undefined,
+    schema,
+    schemaId: 'longformMedia.scenePlan.v1',
+    sendPlannerRequest,
+
+  });
+  return { providerCalls, result };
+}
+
+async function verifyAdaptiveChunkSizingBudgets() {
+  const packet = buildDenseTranscriptPacket(48, 120, { fallbackSecondsPerImage: 8, wordsPerSegment: 26 });
+  const gemini = await runAdaptivePlannerMock({
+    packet,
+    providerId: 'google',
+    providerLabel: 'Google',
+    model: 'models/gemini-2.5-flash',
+    promptPrefix: 'gemini adaptive model',
+  });
+  assert.strictEqual(gemini.result.diagnostics.plannerBudgetProfile.profileId, 'gemini-2.5-flash-large', 'Expected Gemini Flash to use the larger planner budget profile.');
+  assert.strictEqual(gemini.result.diagnostics.selectedTargetDurationSeconds, 60, 'Expected Gemini-like planner to keep normal 60 second chunks.');
+  assert(gemini.result.diagnostics.chosenChunkDurationsSeconds.every((duration) => duration <= 60), 'Expected Gemini chunk durations to stay at or below the normal target.');
+
+  const groq = await runAdaptivePlannerMock({
+    packet,
+    providerId: 'groq',
+    providerLabel: 'Groq',
+    model: 'openai/gpt-oss-120b',
+    promptPrefix: 'groq adaptive model',
+  });
+  assert.strictEqual(groq.result.diagnostics.plannerBudgetProfile.profileId, 'groq-gpt-oss-120b-constrained', 'Expected Groq GPT-OSS-120B to use the constrained budget profile.');
+  assert(groq.result.diagnostics.selectedTargetDurationSeconds < 60, 'Expected constrained Groq-like planner to choose smaller chunks for the same transcript.');
+  assert(groq.result.diagnostics.chunksPlanned > gemini.result.diagnostics.chunksPlanned, 'Expected Groq-like chunking to produce more chunks than Gemini for the same transcript.');
+  assert(groq.result.diagnostics.chunkDiagnostics.every((entry) => entry.estimatedTotalTokens <= entry.plannerBudgetTokens), 'Expected estimated Groq chunk requests to stay under the modeled budget.');
+  assert(groq.result.diagnostics.chunksSplitDueToBudget > 0, 'Expected metadata to record budget-driven chunk splitting.');
+  assert(Array.isArray(groq.result.diagnostics.adaptiveChunkingAttempts) && groq.result.diagnostics.adaptiveChunkingAttempts.length > 1, 'Expected metadata to record adaptive chunking attempts.');
+}
+
+async function verifyRollingContextBoundedAcrossLaterChunks() {
+  const packet = buildDenseTranscriptPacket(48, 120, { fallbackSecondsPerImage: 8, wordsPerSegment: 26 });
+  const { result } = await runAdaptivePlannerMock({
+    packet,
+    providerId: 'groq',
+    providerLabel: 'Groq',
+    model: 'openai/gpt-oss-120b',
+    promptPrefix: 'bounded rolling context model',
+  });
+  const laterChunks = result.diagnostics.chunkDiagnostics.slice(1);
+  assert(laterChunks.length > 1, 'Expected multiple later chunks for bounded context verification.');
+  assert(laterChunks.every((entry) => entry.previousPromptCharacters <= 3 * 160), 'Expected later chunks to keep only the bounded last three image prompts.');
+  assert(laterChunks.every((entry) => entry.previousChunkSummaryCharacters <= 320), 'Expected previous chunk summaries to stay compact.');
+  assert(laterChunks.every((entry) => entry.estimatedTotalTokens <= entry.plannerBudgetTokens), 'Expected later chunks with rolling context to remain under budget.');
+  assert(laterChunks.some((entry) => entry.rollingContextCharacters > 0), 'Expected later chunk estimates to include rolling context.');
+}
+
+function verifyChunkBudgetArithmeticIncludesContextAndOutput() {
+  const {
+    estimatePlannerChunkRequestBudget,
+    resolveLongformPlannerBudgetProfile,
+  } = loadPlannerExecutionInternals();
+  const profile = resolveLongformPlannerBudgetProfile('unknown-provider', 'unknown-model');
+  assert.strictEqual(profile.profileId, 'default-conservative', 'Expected unknown providers to use conservative defaults.');
+  const estimate = estimatePlannerChunkRequestBudget({ promptStats: { requestCharacters: 4000 } }, 3, profile, {
+    globalSummaryCharacters: 400,
+    instructionSchemaCharacters: 1200,
+    rollingContextCharacters: 600,
+    transcriptCharacters: 1800,
+  });
+  assert.strictEqual(estimate.estimatedInputTokens, 1000, 'Expected input token estimate to use characters / 4.');
+  assert.strictEqual(estimate.estimatedTotalTokens, estimate.estimatedInputTokens + estimate.estimatedOutputTokens + estimate.safetyMarginTokens, 'Expected total estimate to include input, output, and safety margin.');
+  assert.strictEqual(estimate.rollingContextTokens, 150, 'Expected rolling context token estimate to be recorded.');
+  assert.strictEqual(estimate.transcriptTokens, 450, 'Expected transcript token estimate to be recorded.');
+}
+
+async function verifyLaterChunksSimilarSizeStayUnderBudget() {
+  const packet = buildDenseTranscriptPacket(60, 120, { fallbackSecondsPerImage: 8, wordsPerSegment: 22 });
+  const { result } = await runAdaptivePlannerMock({
+    packet,
+    providerId: 'groq',
+    providerLabel: 'Groq',
+    model: 'openai/gpt-oss-120b',
+    promptPrefix: 'later chunk budget model',
+  });
+  const diagnostics = result.diagnostics.chunkDiagnostics;
+  assert(diagnostics.length >= 4, 'Expected constrained planner to use several chunks.');
+  assert(diagnostics.every((entry) => entry.estimatedTotalTokens <= entry.plannerBudgetTokens), 'Expected every similar-sized chunk to remain under budget.');
+  assert.strictEqual(result.diagnostics.chunkFailures.length, 0, 'Expected similar later chunks to avoid fallback when provider replies are valid.');
+}
+async function verifyRateLimitBackoffRetrySucceeds() {
+  const packet = buildTranscriptPacket(24, 120, { fallbackSecondsPerImage: 8 });
+  let calls = 0;
+  const sendPlannerRequest = async (messages) => {
+    calls += 1;
+    const messageText = getMessageText(messages);
+    const duration = getChunkDurationFromMessageText(messageText);
+    if (calls === 2) {
+      const error = new Error('Rate limit reached for model openai/gpt-oss-120b in organization test on tokens per minute (TPM): Limit 8000, Used 7400, Requested 900. Please try again in 1.2s.');
+      error.providerStatus = 429;
+      throw error;
+    }
+    return buildChunkModelReply(getChunkMinimumFromMessageText(messageText), duration, 'rate limit retry model');
+  };
+  const { result } = await runAdaptivePlannerMock({
+    packet,
+    providerId: 'groq',
+    providerLabel: 'Groq',
+    model: 'openai/gpt-oss-120b',
+    sendPlannerRequest,
+    enablePlannerRateLimitBackoff: true,
+    rateLimitBackoffMsOverride: 1,
+    rateLimitBackoffMaxRetries: 1,
+  });
+  assert.strictEqual(result.diagnostics.deterministicFallbackUsed, false, 'Expected rate-limit retry to avoid fallback when retry succeeds.');
+  assert(result.diagnostics.totalRateLimitWaitMs >= 1, 'Expected rate-limit wait metadata to be recorded.');
+  assert(result.diagnostics.rateLimitWaits.length >= 1, 'Expected per-wait rate-limit diagnostics.');
+  assert(result.diagnostics.chunkDiagnostics.some((entry) => entry.rateLimitWaitMs >= 1), 'Expected chunk diagnostics to record rate-limit wait time.');
+}
+
+function verifyRetryAfterParsingAndTpmClassification() {
+  const { classifyPlannerFailure, getPlannerRateLimitWaitMs } = loadPlannerExecutionInternals();
+  const retryAfterError = new Error('Provider returned 429.');
+  retryAfterError.providerStatus = 429;
+  retryAfterError.providerRetryAfter = '2';
+  assert.strictEqual(getPlannerRateLimitWaitMs(retryAfterError), 2000, 'Expected Retry-After seconds to be respected.');
+  const cumulative = classifyPlannerFailure(new Error('TPM Limit 8000, Used 7400, Requested 900. Please try again in 1.2s.'));
+  assert.strictEqual(cumulative.failureReason, 'rate-limit', 'Expected cumulative TPM window exhaustion to classify as rate-limit.');
+  const singleRequest = classifyPlannerFailure(new Error('TPM Limit 8000, Requested 9224.'));
+  assert.strictEqual(singleRequest.failureReason, 'request-too-large', 'Expected one request above TPM budget to classify as request-too-large.');
+}
+
+async function verifyBareContextOmitsPriorPromptsWhenOverBudget() {
+  const packet = buildDenseTranscriptPacket(32, 120, { fallbackSecondsPerImage: 8, wordsPerSegment: 18 });
+  const providerCalls = [];
+  const sendPlannerRequest = async (messages) => {
+    const messageText = getMessageText(messages);
+    providerCalls.push(messageText);
+    const duration = getChunkDurationFromMessageText(messageText);
+    return buildChunkModelReply(getChunkMinimumFromMessageText(messageText), duration, 'bare context model');
+  };
+  await runAdaptivePlannerMock({
+    packet,
+    providerId: 'mock-tight',
+    providerLabel: 'Mock Tight Provider',
+    model: 'mock-tight-model',
+    providerMetadata: {
+      plannerBudgetProfile: {
+        maxTotalTokens: 2500,
+        safetyMarginTokens: 500,
+      },
+    },
+    sendPlannerRequest,
+  });
+  const bareCalls = providerCalls.filter((messageText) => /contextProfileId\\?":\\?"bare|contextProfileId.{0,20}bare/.test(messageText));
+  assert(bareCalls.length > 0, 'Expected tight budget to use bare context profile.');
+  assert(bareCalls.every((messageText) => !/Prior clean image prompt|recentImagePrompts\\?":\[\s*"/.test(messageText)), 'Expected bare context to omit prior image prompts.');
+}
+async function verifyRequestTooLargeSplitRetrySucceeds() {
+  const packet = buildTranscriptPacket(24, 120, { fallbackSecondsPerImage: 8 });
+  const providerCalls = [];
+  let oversizedThrown = false;
+  const sendPlannerRequest = async (messages, retry = false) => {
+    const messageText = getMessageText(messages);
+    providerCalls.push({ messageText, retry });
+    const duration = getChunkDurationFromMessageText(messageText);
+    if (!oversizedThrown && duration >= 60) {
+      oversizedThrown = true;
+      throw new Error('Request too large. TPM Limit 8000, Requested 9224.');
+    }
+    return buildChunkModelReply(getChunkMinimumFromMessageText(messageText), duration, 'request split success');
+  };
+  const { result } = await runAdaptivePlannerMock({
+    packet,
+    providerId: 'google',
+    providerLabel: 'Google',
+    model: 'models/gemini-2.5-flash',
+    sendPlannerRequest,
+
+  });
+  assert.strictEqual(result.diagnostics.chunksSplitAfterRequestTooLarge, 1, 'Expected request-too-large provider error to split a chunk once.');
+  assert.strictEqual(result.diagnostics.deterministicFallbackUsed, false, 'Expected successful subchunk retry to avoid deterministic fallback.');
+  assert.strictEqual(result.diagnostics.chunkFailures.length, 0, 'Expected no chunk fallback when split retry succeeds.');
+  assert(providerCalls.length > 2, 'Expected provider calls to include the original oversized chunk and smaller retried chunks.');
+  assert(providerCalls.slice(1).some((call) => getChunkDurationFromMessageText(call.messageText) < 60), 'Expected request-too-large retry to reduce transcript chunk duration.');
+  assert(providerCalls.slice(1).some((call) => /contextProfileId\\?":\\?"minimal|contextProfileId.{0,20}minimal/.test(call.messageText)), 'Expected request-too-large retry to simplify rolling context.');
+}
+
+async function verifyRequestTooLargeSplitRetryFallbackIsLocal() {
+  const packet = buildTranscriptPacket(24, 120, { fallbackSecondsPerImage: 8 });
+  let oversizedThrown = false;
+  let repeatedOversizedThrown = false;
+  const sendPlannerRequest = async (messages) => {
+    const messageText = getMessageText(messages);
+    const duration = getChunkDurationFromMessageText(messageText);
+    if (!oversizedThrown && duration >= 60) {
+      oversizedThrown = true;
+      throw new Error('Request too large. TPM Limit 8000, Requested 9224.');
+    }
+    if (!repeatedOversizedThrown && oversizedThrown && duration < 60) {
+      repeatedOversizedThrown = true;
+      throw new Error('Request too large even after split.');
+    }
+    return buildChunkModelReply(getChunkMinimumFromMessageText(messageText), duration, 'request split partial success');
+  };
+  const { result } = await runAdaptivePlannerMock({
+    packet,
+    providerId: 'google',
+    providerLabel: 'Google',
+    model: 'models/gemini-2.5-flash',
+    sendPlannerRequest,
+
+  });
+  assert.strictEqual(result.diagnostics.chunksSplitAfterRequestTooLarge, 1, 'Expected provider request-too-large split metadata to be recorded.');
+  assert.strictEqual(result.diagnostics.chunkFailures.length, 1, 'Expected only the repeatedly oversized subchunk to fall back.');
+  assert.strictEqual(result.diagnostics.deterministicFallbackUsed, true, 'Expected deterministic fallback to be recorded for the failed subchunk.');
+  assert(/too large even after/i.test(result.diagnostics.chunkFailures[0].failureReason), 'Expected fallback reason to explain request-too-large after splitting.');
+  assert(result.normalizedPlan.scenes.some((scene) => /request split partial success/i.test(scene.imagePrompt)), 'Expected successful sibling subchunks to keep model-planned scenes.');
+  assert(result.normalizedPlan.scenes.some((scene) => /Narration segment 1/i.test(scene.imagePrompt)), 'Expected failed subchunk fallback to stay local to its transcript range.');
+}
+
+function verifyShortTranscriptBudgetDecision() {
+  const {
+    estimatePlannerChunkRequestBudget,
+    resolveLongformPlannerBudgetProfile,
+    shouldUseChunkedLongformPlanner,
+  } = loadPlannerExecutionInternals();
+  const packet = buildTranscriptPacket(6, 30, { fallbackSecondsPerImage: 8 });
+  const request = buildMockPromptMessages(packet, 'Short transcript planner test.');
+  const normalProfile = resolveLongformPlannerBudgetProfile('google', 'models/gemini-2.5-flash');
+  const normalBudget = estimatePlannerChunkRequestBudget(request, Math.ceil(30 / 8), normalProfile);
+  assert.strictEqual(shouldUseChunkedLongformPlanner('longformMedia.scenePlan.v1', packet, { requestBudget: normalBudget }), false, 'Expected 30 second transcript to stay single-shot under normal budget.');
+
+  const tinyBudget = {
+    ...normalProfile,
+    maxTotalTokens: Math.max(1, normalBudget.estimatedTotalTokens - 1),
+    profileId: 'test-tiny-budget',
+  };
+  const constrainedBudget = estimatePlannerChunkRequestBudget(request, Math.ceil(30 / 8), tinyBudget);
+  assert.strictEqual(shouldUseChunkedLongformPlanner('longformMedia.scenePlan.v1', packet, { requestBudget: constrainedBudget }), true, 'Expected 30 second transcript to chunk when the modeled budget requires it.');
+}
 async function main() {
   const packet = buildPlanningPacketDocument({
     goal: 'Verify longform planner reliability.',
@@ -468,7 +802,17 @@ async function main() {
   verifyExecutionFallbackAndRepairSource();
   verifyChunkedPlannerSource();
   await verifyChunkedPlannerWithMockedProvider();
-  console.log('Verified longform planner chunking thresholds, compact global summary, diagnostics, deterministic fallback, minimum image repair, timing metadata, and provider JSON-mode safeguards.');
+  await verifyAdaptiveChunkSizingBudgets();
+  await verifyRollingContextBoundedAcrossLaterChunks();
+  verifyChunkBudgetArithmeticIncludesContextAndOutput();
+  await verifyLaterChunksSimilarSizeStayUnderBudget();
+  await verifyRateLimitBackoffRetrySucceeds();
+  verifyRetryAfterParsingAndTpmClassification();
+  await verifyBareContextOmitsPriorPromptsWhenOverBudget();
+  await verifyRequestTooLargeSplitRetrySucceeds();
+  await verifyRequestTooLargeSplitRetryFallbackIsLocal();
+  verifyShortTranscriptBudgetDecision();
+  console.log('Verified longform planner adaptive chunk sizing, compact global summary, diagnostics, deterministic fallback, request-too-large splitting, minimum image repair, timing metadata, and provider JSON-mode safeguards.');
 }
 
 main().catch((error) => {

@@ -163,7 +163,12 @@ async function requestProviderJson(provider, apiKey, endpoint, options = {}) {
         payload?.detail ||
         payload?.rawText ||
         `${provider.name} returned ${response.status}.`;
-      throw new Error(redactSensitiveText(String(responseMessage).trim(), { additionalSecrets: [apiKey] }));
+      const providerError = new Error(redactSensitiveText(String(responseMessage).trim(), { additionalSecrets: [apiKey] }));
+      providerError.providerStatus = response.status;
+      providerError.providerStatusText = response.statusText || '';
+      providerError.providerRetryAfter = response.headers.get('retry-after') || '';
+      providerError.providerErrorType = payload?.error?.type || payload?.error?.code || payload?.code || '';
+      throw providerError;
     }
 
     return payload;
@@ -2470,8 +2475,14 @@ async function chatWithProvider(providerId, payload = {}) {
     const message = humanizeError(error, 'Local AI Hub could not send that message to ' + provider.name + '.');
     await logger.warn('Provider chat request failed.', {
       message,
+      providerStatus: error?.providerStatus || null,
+      providerErrorType: error?.providerErrorType || '',
     });
-    throw new Error(message);
+    const providerError = new Error(message);
+    providerError.providerStatus = error?.providerStatus || null;
+    providerError.providerRetryAfter = error?.providerRetryAfter || '';
+    providerError.providerErrorType = error?.providerErrorType || '';
+    throw providerError;
   }
 }
 

@@ -175,8 +175,88 @@ async function main() {
     installerTesting.buildUnverifiedExternalUpdateMessage(opencodeManifest, '9.9.9').includes('detected the official app afterward'),
     'Guided official updater version gaps should be reported as a nonfatal detection warning.',
   );
+  assert.strictEqual(
+    installerTesting.officialDesktopUpdateStateIsApproved(opencodeManifest, {
+      source: 'external',
+      installDir: officialOpenCodeRoot,
+      appDir: officialOpenCodeRoot,
+      detectedPath: officialOpenCodeExe,
+      launchProfile: { kind: 'binary', executable: officialOpenCodeExe },
+    }),
+    true,
+    'OpenCode official update verification should approve the manifest-listed desktop executable outside Local AI Hub tools.',
+  );
+  const arbitraryOpenCodeRoot = path.join(TEST_STORAGE_ROOT, 'arbitrary', 'OpenCode');
+  const arbitraryOpenCodeExe = path.join(arbitraryOpenCodeRoot, 'OpenCode.exe');
+  touch(arbitraryOpenCodeExe);
+  assert.strictEqual(
+    installerTesting.officialDesktopUpdateStateIsApproved(opencodeManifest, {
+      source: 'external',
+      installDir: arbitraryOpenCodeRoot,
+      appDir: arbitraryOpenCodeRoot,
+      detectedPath: arbitraryOpenCodeExe,
+      launchProfile: { kind: 'binary', executable: arbitraryOpenCodeExe },
+    }),
+    false,
+    'OpenCode official update verification should reject arbitrary external executables.',
+  );
+  assert.strictEqual(
+    installerTesting.officialDesktopUpdateStateIsApproved(opencodeManifest, {
+      source: 'external',
+      installDir: arbitraryOpenCodeRoot,
+      appDir: arbitraryOpenCodeRoot,
+      detectedPath: arbitraryOpenCodeExe,
+      launchProfile: { kind: 'binary', executable: arbitraryOpenCodeExe },
+      windowsUninstallDetected: true,
+    }),
+    true,
+    'OpenCode official update verification should approve Windows uninstall metadata detections even when the app is outside tools.',
+  );
+  const fakeOfficialUpdateLogger = { info: async () => {}, warn: async () => {} };
+  let delayedOfficialDetectionAttempts = 0;
+  const delayedOfficialDetection = await installerTesting.detectOfficialDesktopUpdateToolState(
+    opencodeManifest,
+    path.join(TEST_STORAGE_ROOT, 'downloads', 'opencode-desktop-win-x64.exe'),
+    fakeOfficialUpdateLogger,
+    {
+      timeoutMs: 100,
+      pollMs: 1,
+      sleep: async () => {},
+      discoverTools: async () => {
+        delayedOfficialDetectionAttempts += 1;
+        if (delayedOfficialDetectionAttempts < 3) return {};
+        return {
+          opencode: {
+            source: 'external',
+            installDir: officialOpenCodeRoot,
+            appDir: officialOpenCodeRoot,
+            detectedPath: officialOpenCodeExe,
+            displayPath: officialOpenCodeExe,
+            launchProfile: { kind: 'binary', executable: officialOpenCodeExe },
+            launchSupported: true,
+          },
+        };
+      },
+    },
+  );
+  assert(delayedOfficialDetection, 'Official desktop update detection should poll briefly for delayed post-update discovery.');
+  assert.strictEqual(delayedOfficialDetection.detectedPath, officialOpenCodeExe, 'Delayed official detection should refresh stale pre-update state without an app relaunch.');
+  assert(delayedOfficialDetectionAttempts >= 3, 'Official desktop update detection should retry before reporting failure.');
+  const missingOfficialDetection = await installerTesting.detectOfficialDesktopUpdateToolState(
+    opencodeManifest,
+    path.join(TEST_STORAGE_ROOT, 'downloads', 'missing-opencode.exe'),
+    fakeOfficialUpdateLogger,
+    { timeoutMs: 0, pollMs: 0, sleep: async () => {}, discoverTools: async () => ({}) },
+  );
+  assert.strictEqual(missingOfficialDetection, null, 'Official desktop update detection should stop after bounded retries.');
+  assert(
+    installerTesting.buildOfficialDesktopUpdateVerificationLagMessage(opencodeManifest).includes('could not verify the updated desktop app yet'),
+    'Official desktop update failures should use the verification-lag message, not the managed tools folder guard.',
+  );
   const opencodeUpdateInstallerSource = fs.readFileSync(path.join(process.cwd(), 'electron/services/installerService.js'), 'utf8');
   assert(opencodeUpdateInstallerSource.includes('usesGuidedOfficialInstaller && !isManagedInstall'), 'OpenCode guided updates should bypass managed-install validation.');
+  assert(opencodeUpdateInstallerSource.includes('useOfficialDesktopDetection'), 'Post-update guided official apps should use official desktop detection before managed install validation.');
+  assert(opencodeUpdateInstallerSource.includes('buildOfficialDesktopUpdateVerificationLagMessage'), 'Post-update guided official detection lag should not surface managed-folder guard errors.');
   assert(opencodeUpdateInstallerSource.includes('const discoveredTools = await syncDiscoveredTools({ force: true });'), 'Guided official updates should refresh Library detection after installer completion.');
   assert(opencodeUpdateInstallerSource.includes('lastError: null'), 'Successful guided official updates should clear stale update errors.');
   const opencodeDiscoverySource = fs.readFileSync(path.join(process.cwd(), 'electron/services/toolDiscoveryService.js'), 'utf8');

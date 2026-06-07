@@ -37,6 +37,8 @@ const ZIP_HEADER = Buffer.from([0x50, 0x4b]);
 const INSTALLER_MATERIALIZATION_TIMEOUT_MS = 180000;
 const INSTALLER_MATERIALIZATION_POLL_MS = 1000;
 const GUIDED_INSTALLER_LAUNCH_SETTLE_MS = 1500;
+const OFFICIAL_DESKTOP_UPDATE_DETECTION_TIMEOUT_MS = 30000;
+const OFFICIAL_DESKTOP_UPDATE_DETECTION_POLL_MS = 1000;
 const OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS = 45000;
 const OFFICIAL_UNINSTALL_SETTLE_POLL_MS = 1000;
 const MANAGED_CUDA_PYTORCH_INSTALL_TOOL_IDS = new Set(['comfyui']);
@@ -484,6 +486,110 @@ function buildUnverifiedExternalUpdateMessage(manifest, expectedVersion) {
     : `Local AI Hub ran the ${manifest.name} updater and detected the official app afterward, but Windows did not expose a version number.`;
 }
 
+function buildOfficialDesktopUpdateVerificationLagMessage(manifest) {
+  return `Updater finished, but Local AI Hub could not verify the updated desktop app yet. Relaunch or use Detect/Refresh.`;
+}
+
+function getEnvValueInsensitive(name) {
+  const key = Object.keys(process.env).find((entry) => entry.toLowerCase() === String(name || '').toLowerCase());
+  return key ? process.env[key] : '';
+}
+
+function expandManifestDetectionPath(template) {
+  return String(template || '').replace(/%([^%]+)%/g, (_match, name) => getEnvValueInsensitive(name) || '');
+}
+
+function normalizePathKey(targetPath) {
+  try {
+    return path.resolve(String(targetPath || '')).replace(/[\\/]+$/, '').toLowerCase();
+  } catch {
+    return String(targetPath || '').trim().toLowerCase();
+  }
+}
+
+function officialDesktopPathMatchesManifest(manifest, toolState) {
+  const candidates = [
+    toolState?.detectedPath,
+    toolState?.displayPath,
+    toolState?.executablePath,
+    toolState?.launchProfile?.executable,
+    toolState?.installDir,
+    toolState?.appDir,
+  ]
+    .map(normalizePathKey)
+    .filter(Boolean);
+  if (!candidates.length) {
+    return false;
+  }
+
+  return (manifest?.detectionPaths || [])
+    .filter((entry) => !String(entry || '').startsWith('PATH:'))
+    .map((entry) => expandManifestDetectionPath(entry))
+    .filter(Boolean)
+    .some((expandedPath) => {
+      const manifestPath = normalizePathKey(expandedPath);
+      const manifestDir = normalizePathKey(path.dirname(expandedPath));
+      return candidates.some((candidate) => candidate === manifestPath || candidate === manifestDir);
+    });
+}
+
+function officialDesktopUpdateStateIsApproved(manifest, toolState) {
+  if (!toolState) {
+    return false;
+  }
+
+  return Boolean(toolState.windowsUninstallDetected) || officialDesktopPathMatchesManifest(manifest, toolState);
+}
+
+async function detectOfficialDesktopUpdateToolState(manifest, archivePath, logger, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.max(0, options.timeoutMs)
+    : OFFICIAL_DESKTOP_UPDATE_DETECTION_TIMEOUT_MS;
+  const pollMs = Number.isFinite(options.pollMs)
+    ? Math.max(0, options.pollMs)
+    : OFFICIAL_DESKTOP_UPDATE_DETECTION_POLL_MS;
+  const discoverTools = typeof options.discoverTools === 'function'
+    ? options.discoverTools
+    : () => syncDiscoveredTools({ force: true });
+  const wait = typeof options.sleep === 'function' ? options.sleep : sleep;
+  const deadline = Date.now() + timeoutMs;
+  let attempts = 0;
+
+  while (true) {
+    attempts += 1;
+    const discoveredTools = await discoverTools();
+    const detectedTool = discoveredTools?.[manifest.id];
+
+    if (await toolIsAvailable(detectedTool)) {
+      if (!officialDesktopUpdateStateIsApproved(manifest, detectedTool)) {
+        await logger.warn('Official desktop updater found an external app, but it was not approved by manifest paths or Windows uninstall metadata.', {
+          detectedPath: detectedTool.displayPath || detectedTool.installDir || detectedTool.detectedPath || null,
+          toolId: manifest.id,
+        });
+      } else {
+        const normalizedDetectedTool = normalizeToolLifecycle({
+          ...detectedTool,
+          downloadCachePath: archivePath,
+          lastError: null,
+          status: detectedTool.status === 'running' ? 'running' : 'stopped',
+        }, manifest);
+        const trackedToolState = await attachWindowsUninstallMetadata(normalizedDetectedTool, manifest, { refresh: true });
+        await logger.info('Official desktop updater verified the detected app through startup discovery rules.', {
+          attempts,
+          detectedPath: trackedToolState.displayPath || trackedToolState.installDir || trackedToolState.detectedPath || null,
+          windowsUninstallDetected: Boolean(trackedToolState.windowsUninstallDetected),
+        });
+        return trackedToolState;
+      }
+    }
+
+    if (Date.now() >= deadline) {
+      return null;
+    }
+
+    await wait(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+  }
+}
 function isGuidedOfficialInstallerManifest(manifest) {
   return manifest?.installContract?.destinationControl === INSTALL_DESTINATION_CONTROL.GUIDED
     && manifest?.installContract?.lifecycleMode === 'official-installer'
@@ -3171,6 +3277,9 @@ async function runInstallerExecutableFile(installerPath, installerArgs, logger, 
 }
 
 async function resolveInstalledExecutableToolState(manifest, installDir, appDir, venvDir, archivePath, logger, options = {}) {
+  if (options.useOfficialDesktopDetection) {
+    return detectOfficialDesktopUpdateToolState(manifest, archivePath, logger, options.officialDesktopDetection || {});
+  }
   let toolState = createManagedToolState(manifest, installDir, appDir, venvDir, archivePath, null);
   if (await toolIsAvailable(toolState)) {
     return ensureManagedToolStatePaths(toolState);
@@ -3513,6 +3622,7 @@ async function updateExecutableInstallerTool(manifest, paths, options = {}) {
     }
   }
 
+  const useOfficialDesktopDetection = !expectManagedInstall && isGuidedOfficialInstallerManifest(manifest);
   const toolState = await resolveInstalledExecutableToolState(
     manifest,
     installDir,
@@ -3522,17 +3632,21 @@ async function updateExecutableInstallerTool(manifest, paths, options = {}) {
     options.logger,
     {
       allowExternalResult: !expectManagedInstall,
+      useOfficialDesktopDetection,
     },
   );
 
   if (!toolState) {
+    if (useOfficialDesktopDetection) {
+      throw new Error(buildOfficialDesktopUpdateVerificationLagMessage(manifest));
+    }
+
     if (!expectManagedInstall) {
       throw new Error(`Local AI Hub launched the ${manifest.name} updater, but it closed without leaving a detectable install in the expected external locations.`);
     }
 
     throw new Error(buildManagedPlacementFailureMessage(manifest, installDir));
   }
-
   const detectedVersion = await readInstalledBinaryVersion(toolState);
   let detectionWarning = '';
   if (expectedVersion) {
@@ -5933,8 +6047,11 @@ module.exports = {
     capabilitiesShareInstallPath,
     buildFilteredRequirementsPath,
     buildIncompleteUpdateVersionMessage,
+    buildOfficialDesktopUpdateVerificationLagMessage,
     buildUnverifiedExternalUpdateMessage,
+    detectOfficialDesktopUpdateToolState,
     ensureManagedToolStatePaths,
+    officialDesktopUpdateStateIsApproved,
     collectManagedModelAssetRootsForUninstall,
     collectRepairPreservedModelAssetRoots,
     normalizeDualCapabilityId,
