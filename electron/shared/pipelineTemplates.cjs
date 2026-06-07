@@ -332,7 +332,7 @@ function voiceoverSlideshowVideo(template, contextMaps) {
     stylePolicyText: 'Keep visual continuity across the slideshow. A Prompt Style preset can be selected later on the image map for stronger consistency.',
     availableToolsText: 'Whisper transcription, a configurable image generation backend, ordered collection mapping, and slideshow media composition with the original voiceover audio.',
     readinessNotesText: 'Select the voiceover audio file, configure the planner provider/model, and configure the image backend/checkpoint before running. Slide timing uses transcript timing when Whisper provides timestamped segments, with fixed seconds-per-image still available as a fallback.',
-    desiredOutputNotes: 'Return ordered scenes/slides. Each scene must include visualPromptDraft, sourceSpanLabel, narrationExcerpt, sourceTranscriptSegmentIds, startSeconds, endSeconds, and durationSeconds when transcript timing is available. Cover the full narration duration without accidental gaps or overlaps.',
+    desiredOutputNotes: 'Return ordered scenes/slides. Each scene must include imagePrompt, sourceSpanLabel, narrationExcerpt, sourceTranscriptSegmentIds, startSeconds, endSeconds, and durationSeconds when transcript timing is available. imagePrompt must be clean text-to-image prompt text only. Cover the full narration duration without accidental gaps or overlaps.',
     riskNotesText: 'Do not invent visuals that contradict the transcript. Keep any unclear source moments visible as risk notes or open questions.',
   }, 'Build scene packet');
   const planner = node('planner', 3, {
@@ -340,7 +340,7 @@ function voiceoverSlideshowVideo(template, contextMaps) {
     providerId: plannerTarget.executionMode === 'cloud' ? plannerTarget.providerId || '' : '',
     model: plannerTarget.model || '',
     schemaId: DEFAULT_PLANNING_SCHEMA_ID,
-    instruction: 'Create a structured longform scene plan for a slideshow video. Preserve ordering from the transcript, write practical visualPromptDraft values for each slide, and use timestamped transcript metadata to assign startSeconds, endSeconds, durationSeconds, narrationExcerpt, and sourceTranscriptSegmentIds to every visual scene when available. Cover the full narration duration.',
+    instruction: 'Create a structured longform scene plan for a slideshow video. Preserve ordering from the transcript, write practical clean imagePrompt values for each slide, and use timestamped transcript metadata to assign startSeconds, endSeconds, durationSeconds, narrationExcerpt, and sourceTranscriptSegmentIds to every visual scene when available. Cover the full narration duration.',
     systemPrompt: '',
   }, 'Plan slideshow scenes');
   const prompts = node('planScenes', 4, {}, 'Image prompt collection');

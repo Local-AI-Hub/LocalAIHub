@@ -1,3 +1,32 @@
+// Manual live/provider-backed verifier only.
+// Uses saved live provider credentials and may consume provider quota or hit rate limits.
+// Run manually only when explicitly validating Pipeline Wizard provider behavior.
+const LIVE_VALIDATION_FLAG = '--live-provider-validation';
+
+function printUsage() {
+  console.log([
+    'Pipeline Wizard live provider validation is an opt-in manual verifier.',
+    '',
+    'This script uses saved live provider credentials and may consume provider quota or hit rate limits.',
+    'It is not part of normal release, push, npm verify, or CI-style validation.',
+    '',
+    'Manual usage:',
+    '  npm run verify:wizard-live',
+    '  node scripts/verify-pipeline-wizard-live-validation.js --live-provider-validation',
+  ].join('\n'));
+}
+
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  printUsage();
+  process.exit(0);
+}
+
+if (!process.argv.includes(LIVE_VALIDATION_FLAG)) {
+  printUsage();
+  console.error('\nRefusing to run live provider validation without ' + LIVE_VALIDATION_FLAG + '.');
+  process.exit(1);
+}
+
 const assert = require('assert');
 
 const {

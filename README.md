@@ -18,7 +18,11 @@ Some antivirus tools may block the download, quarantine the installer, or interr
 
 These warnings are expected for unsigned apps and do not mean Local AI Hub is malware, but you should only continue if you trust the release source.
 
-## Untested Features as of v0.41.0
+## Manual Live Provider Validation
+
+`npm run verify:wizard-live` runs the Pipeline Wizard live provider verifier. This is an opt-in manual check only: it uses saved live provider credentials and may consume quota or hit provider rate limits. Keep normal release, push, npm verify, and CI-style validation on mocked/offline wizard verifiers such as `node scripts/verify-pipeline-wizard.js` and `node scripts/verify-pipeline-wizard-lifecycle.js`.
+
+## Untested Features as of v0.42.0
 
 The following features are implemented and covered by automated verification where practical, but have not yet been validated with real-world hardware, local model assets, or live cloud-provider accounts. Treat them as experimental until they are manually tested.
 

@@ -29,7 +29,8 @@
     "verify:model-download-plans": "node scripts/verify-model-download-plans.js",
     "verify:provider-credential-security": "node scripts/verify-provider-credential-security.js",
     "verify:aider-ollama-lifecycle": "node scripts/verify-aider-ollama-lifecycle.js",
-    "verify:statistics-index": "node scripts/verify-statistics-index.js"
+    "verify:statistics-index": "node scripts/verify-statistics-index.js",
+    "verify:wizard-live": "node scripts/verify-pipeline-wizard-live-validation.js --live-provider-validation"
   },
   "dependencies": {
     "7zip-bin": "^5.2.0",

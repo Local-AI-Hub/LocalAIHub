@@ -288,7 +288,7 @@ assert(hasVoiceoverEdge(voiceoverExport, 'video', voiceoverOutput, 'video'), 'Me
 assert.strictEqual(voiceoverComposition.config.imageTimingMode, 'dynamicFromImageMetadata', 'Voiceover slideshow should match narration/transcript timing by default.');
 assert.strictEqual(voiceoverComposition.config.secondsPerItem, 4, 'Voiceover slideshow should retain fixed secondsPerItem as the fallback setting.');
 assert(/timestamped segments/i.test(voiceoverWhisper.config.instruction), 'Whisper step should request timestamped segment preservation.');
-assert(/visualPromptDraft/i.test(voiceoverPacket.config.desiredOutputNotes), 'Planning packet should request scene image prompt drafts.');
+assert(/imagePrompt/i.test(voiceoverPacket.config.desiredOutputNotes), 'Planning packet should request clean scene image prompts.');
 assert(/startSeconds|durationSeconds|endSeconds/i.test(voiceoverPacket.config.desiredOutputNotes), 'Planning packet should request scene timing metadata.');
 
 const timestampPacket = buildPlanningPacketDocument(voiceoverPacket.config, [{

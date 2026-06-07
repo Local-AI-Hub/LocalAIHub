@@ -493,6 +493,7 @@ async function detectInstalledVersion(tool, manifest) {
 
   const candidateReaders = [
     () => Promise.resolve(normalizeVersion(tool?.installedVersion || '')),
+    () => Promise.resolve(normalizeVersion(tool?.windowsUninstallDisplayName || '')),
     () => readPipShowVersion(pythonPath, pipPackageName),
     () => readExecutableVersion(tool?.launchProfile?.executable || tool?.executablePath || ''),
     () => readExecutableVersion(tool?.installDir ? path.join(tool.installDir, path.basename(tool.launchProfile?.executable || tool.executablePath || '')) : ''),

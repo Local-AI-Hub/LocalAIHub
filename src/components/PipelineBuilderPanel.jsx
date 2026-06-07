@@ -89,6 +89,8 @@ const {
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
+  DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
   MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
   MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
@@ -161,6 +163,11 @@ function normalizeSoundEffectsSpacing(value, fallback = 4) {
   }
   return Math.max(0, Math.round(numeric * 10) / 10);
 }
+
+function normalizeSoundEffectsGlobalMaxSimultaneous(value) {
+  return Math.max(1, Math.min(8, Math.floor(Number(value || 0) || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS)));
+}
+
 function createMediaCompositionSoundEffectsLayer(libraries = [], index = 0) {
   const layerNumber = Math.max(1, Number(index || 0) + 1);
   return {
@@ -306,6 +313,19 @@ function normalizeRetryBackgroundOpacity(value, fallback = 50) {
   return [25, 50, 75, 100].includes(numeric) ? numeric : fallback;
 }
 
+function normalizeRetrySoundEffectsLayers(layers = []) {
+  return (Array.isArray(layers) ? layers : []).map((layer, index) => ({
+    ...layer,
+    id: String(layer?.id || layer?.layerId || `sfx-layer-${index + 1}`).trim() || `sfx-layer-${index + 1}`,
+    name: String(layer?.name || layer?.layerName || `Layer ${index + 1}`).trim() || `Layer ${index + 1}`,
+    volume: normalizeVolumeGain(layer?.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
+  }));
+}
+
+function normalizeRetryImageTimingMode(value) {
+  return value === 'dynamicFromImageMetadata' ? 'dynamicFromImageMetadata' : 'fixedDurationPerImage';
+}
+
 function getPendingMediaCompositionRetryDefaults(pendingValidation) {
   const control = pendingValidation?.retryControls?.mediaComposition || null;
   if (!control) {
@@ -314,7 +334,20 @@ function getPendingMediaCompositionRetryDefaults(pendingValidation) {
 
   return {
     backgroundMusicVolume: normalizeVolumeGain(control.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    imageTimingMode: normalizeRetryImageTimingMode(control.imageTimingMode),
     narrationVolume: normalizeVolumeGain(control.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+    sceneTransitionCategory: getMediaCompositionTransitionCategory(control.sceneTransitionCategory),
+    sceneTransitionDurationSeconds: normalizeRetryNumber(control.sceneTransitionDurationSeconds, 0.5, 0.1),
+    sceneTransitionMode: getMediaCompositionTransitionMode(control.sceneTransitionMode),
+    sceneTransitionName: String(control.sceneTransitionName || 'fade').trim() || 'fade',
+    secondsPerItem: normalizeRetryNumber(control.secondsPerItem, 4, 0.1),
+    soundEffectsEnabled: control.soundEffectsEnabled === true,
+    soundEffectsGlobalGuardEnabled: control.soundEffectsGlobalGuardEnabled === true,
+    soundEffectsGlobalMaxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(control.soundEffectsGlobalMaxSimultaneous || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS) || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS))),
+    soundEffectsGlobalMinSpacingSeconds: normalizeRetryNumber(control.soundEffectsGlobalMinSpacingSeconds, DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS, 0),
+    soundEffectsLayers: normalizeRetrySoundEffectsLayers(control.soundEffectsLayers),
+    soundEffectsGlobalVolume: normalizeVolumeGain(control.soundEffectsGlobalVolume, 1),
+    soundEffectsVolume: normalizeVolumeGain(control.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
   };
 }
 
@@ -325,10 +358,22 @@ function getMediaCompositionRetryPayload(retryOverrides) {
 
   return {
     backgroundMusicVolume: normalizeVolumeGain(retryOverrides.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    imageTimingMode: normalizeRetryImageTimingMode(retryOverrides.imageTimingMode),
     narrationVolume: normalizeVolumeGain(retryOverrides.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+    sceneTransitionCategory: getMediaCompositionTransitionCategory(retryOverrides.sceneTransitionCategory),
+    sceneTransitionDurationSeconds: normalizeRetryNumber(retryOverrides.sceneTransitionDurationSeconds, 0.5, 0.1),
+    sceneTransitionMode: getMediaCompositionTransitionMode(retryOverrides.sceneTransitionMode),
+    sceneTransitionName: String(retryOverrides.sceneTransitionName || 'fade').trim() || 'fade',
+    secondsPerItem: normalizeRetryNumber(retryOverrides.secondsPerItem, 4, 0.1),
+    soundEffectsEnabled: retryOverrides.soundEffectsEnabled === true,
+    soundEffectsGlobalGuardEnabled: retryOverrides.soundEffectsGlobalGuardEnabled === true,
+    soundEffectsGlobalMaxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(retryOverrides.soundEffectsGlobalMaxSimultaneous || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS) || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS))),
+    soundEffectsGlobalMinSpacingSeconds: normalizeRetryNumber(retryOverrides.soundEffectsGlobalMinSpacingSeconds, DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS, 0),
+    soundEffectsLayers: normalizeRetrySoundEffectsLayers(retryOverrides.soundEffectsLayers),
+    soundEffectsGlobalVolume: normalizeVolumeGain(retryOverrides.soundEffectsGlobalVolume, 1),
+    soundEffectsVolume: normalizeVolumeGain(retryOverrides.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
   };
 }
-
 function getPendingBurnSubtitlesRetryDefaults(pendingValidation) {
   const settings = pendingValidation?.retryControls?.burnSubtitles?.settings || null;
   if (!settings) {
@@ -1812,7 +1857,7 @@ function ArtifactPreview({ artifact, className = '', compact = false }) {
               <PlanningTextBlock title="Treatment / Approach" value={scene.treatmentApproach} />
             </div>
             {scene.narrationDraft ? <PlanningTextBlock title="Narration Draft" value={scene.narrationDraft} /> : null}
-            {scene.visualPromptDraft ? <textarea className="store-input mt-3 min-h-[120px] resize-none" readOnly value={scene.visualPromptDraft} /> : null}
+            {scene.imagePrompt || scene.visualPromptDraft ? <textarea className="store-input mt-3 min-h-[120px] resize-none" readOnly value={scene.imagePrompt || scene.visualPromptDraft} /> : null}
             <PlanningListBlock title="Scene Risk Notes" items={scene.riskNotes} />
           </div>
         ))}
@@ -2526,7 +2571,7 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
             </div>
             <span className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-violet-100/80">Temporary</span>
           </div>
-          <p className="mt-3 text-xs leading-5 text-violet-50/80">These levels apply only if you choose Fail to retry the next export. The saved pipeline stays unchanged.</p>
+          <p className="mt-3 text-xs leading-5 text-violet-50/80">These settings apply only if you choose Fail to retry the next export. The saved pipeline stays unchanged.</p>
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             <div>
               <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-narration-volume">Narration volume</label>
@@ -2543,6 +2588,77 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
               </div>
             </div>
           </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-sfx-enabled">SFX enabled</label>
+              <label className="mt-3 flex items-center gap-3 text-sm text-violet-50/90" htmlFor="validation-media-composition-sfx-enabled"><input checked={mediaCompositionRetryValues.soundEffectsEnabled === true} className="h-4 w-4 accent-cyan-300" disabled={busy} id="validation-media-composition-sfx-enabled" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { soundEffectsEnabled: event.target.checked })} type="checkbox" />Use scheduled SFX</label>
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-sfx-global-volume">Global SFX volume</label>
+              <div className="mt-3 flex items-center gap-3">
+                <input className="min-w-0 flex-1 accent-cyan-300" disabled={busy} id="validation-media-composition-sfx-global-volume" max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { soundEffectsGlobalVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, 1) })} step="1" type="range" value={formatVolumePercent(mediaCompositionRetryValues.soundEffectsGlobalVolume, 1)} />
+                <input className="store-input w-24" disabled={busy} max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { soundEffectsGlobalVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, 1) })} step="1" type="number" value={formatVolumePercent(mediaCompositionRetryValues.soundEffectsGlobalVolume, 1)} />
+              </div>
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-image-timing">Image timing</label>
+              <select className="store-input mt-3" disabled={busy} id="validation-media-composition-image-timing" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { imageTimingMode: event.target.value })} value={mediaCompositionRetryValues.imageTimingMode || 'fixedDurationPerImage'}>
+                <option value="fixedDurationPerImage">Fixed seconds per image</option>
+                <option value="dynamicFromImageMetadata">Dynamic from metadata</option>
+              </select>
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-seconds-per-item">Fallback seconds per image</label>
+              <input className="store-input mt-3" disabled={busy} id="validation-media-composition-seconds-per-item" min="0.1" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { secondsPerItem: normalizeRetryNumber(event.target.value, 4, 0.1) })} step="0.1" type="number" value={mediaCompositionRetryValues.secondsPerItem ?? 4} />
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-transition-mode">Transition mode</label>
+              <select className="store-input mt-3" disabled={busy} id="validation-media-composition-transition-mode" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { sceneTransitionMode: event.target.value })} value={mediaCompositionRetryValues.sceneTransitionMode || 'off'}>
+                {MEDIA_COMPOSITION_TRANSITION_MODE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-transition-duration">Transition duration</label>
+              <input className="store-input mt-3" disabled={busy} id="validation-media-composition-transition-duration" max="2" min="0.1" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { sceneTransitionDurationSeconds: normalizeRetryNumber(event.target.value, 0.5, 0.1) })} step="0.1" type="number" value={mediaCompositionRetryValues.sceneTransitionDurationSeconds ?? 0.5} />
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-transition-name">Transition</label>
+              <select className="store-input mt-3" disabled={busy} id="validation-media-composition-transition-name" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { sceneTransitionName: event.target.value })} value={mediaCompositionRetryValues.sceneTransitionName || 'fade'}>
+                {MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS.flatMap((category) => category.transitions || []).map((transitionName) => <option key={transitionName} value={transitionName}>{formatMediaCompositionTransitionLabel(transitionName)}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-transition-category">Transition category</label>
+              <select className="store-input mt-3" disabled={busy} id="validation-media-composition-transition-category" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { sceneTransitionCategory: event.target.value })} value={mediaCompositionRetryValues.sceneTransitionCategory || 'fades'}>
+                {MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS.map((category) => <option key={category.id} value={category.id}>{category.label}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-sfx-global-guard">Global SFX guard</label>
+              <label className="mt-3 flex items-center gap-3 text-sm text-violet-50/90" htmlFor="validation-media-composition-sfx-global-guard"><input checked={mediaCompositionRetryValues.soundEffectsGlobalGuardEnabled === true} className="h-4 w-4 accent-cyan-300" disabled={busy} id="validation-media-composition-sfx-global-guard" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { soundEffectsGlobalGuardEnabled: event.target.checked })} type="checkbox" />Prevent overlaps</label>
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-sfx-global-spacing">Global SFX min spacing</label>
+              <input className="store-input mt-3" disabled={busy} id="validation-media-composition-sfx-global-spacing" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { soundEffectsGlobalMinSpacingSeconds: normalizeRetryNumber(event.target.value, DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS, 0) })} step="0.1" type="number" value={mediaCompositionRetryValues.soundEffectsGlobalMinSpacingSeconds ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS} />
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-sfx-global-simultaneous">Global max simultaneous</label>
+              <input className="store-input mt-3" disabled={busy} id="validation-media-composition-sfx-global-simultaneous" max="8" min="1" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { soundEffectsGlobalMaxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(event.target.value || 0) || 1))) })} step="1" type="number" value={mediaCompositionRetryValues.soundEffectsGlobalMaxSimultaneous ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS} />
+            </div>
+          </div>
+          {mediaCompositionRetryValues.soundEffectsLayers?.length ? (
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              {mediaCompositionRetryValues.soundEffectsLayers.map((layer, index) => (
+                <div key={layer.id || index}>
+                  <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor={`validation-media-composition-sfx-layer-volume-${index}`}>{layer.name || `SFX layer ${index + 1}`} volume</label>
+                  <div className="mt-3 flex items-center gap-3">
+                    <input className="min-w-0 flex-1 accent-cyan-300" disabled={busy} id={`validation-media-composition-sfx-layer-volume-${index}`} max="200" min="0" onChange={(event) => { const nextLayers = mediaCompositionRetryValues.soundEffectsLayers.map((entry, entryIndex) => entryIndex === index ? { ...entry, volume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME) } : entry); onChangeRetryOverride?.('mediaComposition', { soundEffectsLayers: nextLayers }); }} step="1" type="range" value={formatVolumePercent(layer.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME)} />
+                    <input className="store-input w-24" disabled={busy} max="200" min="0" onChange={(event) => { const nextLayers = mediaCompositionRetryValues.soundEffectsLayers.map((entry, entryIndex) => entryIndex === index ? { ...entry, volume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME) } : entry); onChangeRetryOverride?.('mediaComposition', { soundEffectsLayers: nextLayers }); }} step="1" type="number" value={formatVolumePercent(layer.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME)} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
       {burnSubtitlesRetryControl && burnSubtitlesRetryValues ? (
@@ -7588,6 +7704,38 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       {selectedNode.config?.soundEffectsEnabled === true ? (
                         <div className="space-y-3">
                           {!soundEffectLibraries.length ? <p className="text-xs leading-5 text-slate-400">Create a Sound Effects library in Settings &gt; Asset Libraries.</p> : null}
+                          <div className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3">
+                            <label className="flex items-center gap-3 text-sm text-slate-300" htmlFor="media-composition-sfx-global-guard">
+                              <input
+                                checked={selectedNode.config?.soundEffectsGlobalGuardEnabled === true}
+                                className="h-4 w-4 accent-cyan-300"
+                                id="media-composition-sfx-global-guard"
+                                onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                                  ...currentNode,
+                                  config: {
+                                    ...currentNode.config,
+                                    soundEffectsGlobalGuardEnabled: event.target.checked,
+                                    soundEffectsGlobalMaxSimultaneous: currentNode.config?.soundEffectsGlobalMaxSimultaneous ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
+                                    soundEffectsGlobalMinSpacingSeconds: currentNode.config?.soundEffectsGlobalMinSpacingSeconds ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
+                                  },
+                                }))}
+                                type="checkbox"
+                              />
+                              <span>Prevent SFX from overlapping across layers</span>
+                            </label>
+                            {selectedNode.config?.soundEffectsGlobalGuardEnabled === true ? (
+                              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                                <div>
+                                  <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-sfx-global-spacing">Minimum seconds across layers</label>
+                                  <input className="store-input mt-3" id="media-composition-sfx-global-spacing" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, soundEffectsGlobalMinSpacingSeconds: normalizeSoundEffectsSpacing(event.target.value, DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS) } }))} step="0.1" type="number" value={selectedNode.config?.soundEffectsGlobalMinSpacingSeconds ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS} />
+                                </div>
+                                <div>
+                                  <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-sfx-global-simultaneous">Max simultaneous across layers</label>
+                                  <input className="store-input mt-3" id="media-composition-sfx-global-simultaneous" min="1" max="8" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, soundEffectsGlobalMaxSimultaneous: normalizeSoundEffectsGlobalMaxSimultaneous(event.target.value) } }))} step="1" type="number" value={selectedNode.config?.soundEffectsGlobalMaxSimultaneous ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS} />
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
                           {selectedSoundEffectsLayers.length ? selectedSoundEffectsLayers.map((layer, index) => {
                             const updateLayer = (patch) => updateNode(selectedNode.id, (currentNode) => {
                               const currentLayers = getMediaCompositionSoundEffectsLayersForUi(currentNode.config || {}, soundEffectLibraries);

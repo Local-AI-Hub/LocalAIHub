@@ -36,6 +36,7 @@ function buildMockPlanReply() {
         startSeconds: 0,
         endSeconds: 3.25,
         durationSeconds: 3.25,
+        imagePrompt: 'Cinematic interior, grounded lived-in details, protagonist at the center, soft morning light, practical realism, high continuity.',
         visualPromptDraft: 'Cinematic interior, grounded lived-in details, protagonist at the center, soft morning light, practical realism, high continuity.',
         riskNotes: ['Avoid inventing props or wardrobe details not supported by the source.'],
       },
@@ -52,6 +53,7 @@ function buildMockPlanReply() {
         startSeconds: 3.25,
         endSeconds: 8.5,
         durationSeconds: 5.25,
+        imagePrompt: 'Character-driven turning point, visible hesitation, then decisive action, grounded cinematic realism, continuity with prior scene.',
         visualPromptDraft: 'Character-driven turning point, visible hesitation, then decisive action, grounded cinematic realism, continuity with prior scene.',
         riskNotes: ['Leave room for later generation passes to refine exact blocking.'],
       },
@@ -146,6 +148,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
           assert(payload.responseFormat?.schema?.properties?.scenes, 'Expected planner structured output request to include the longform scene JSON schema.');
           assert(payload.responseFormat?.schema?.properties?.timing, 'Expected planner structured output request to include longform timing metadata.');
           assert(payload.responseFormat?.schema?.properties?.scenes?.items?.properties?.startSeconds, 'Expected longform scene JSON schema to include startSeconds.');
+          assert(payload.responseFormat?.schema?.properties?.scenes?.items?.properties?.imagePrompt, 'Expected longform scene JSON schema to include clean imagePrompt.');
           assert(/cover the entire narration|no overlaps|no accidental gaps/i.test(messageText), 'Expected planner prompt to request full-duration timestamp coverage.');
           return {
             message: {
@@ -434,12 +437,13 @@ async function main() {
   assert.strictEqual(sceneCollection.kind, 'collection', 'Expected Plan Scenes output to stay a collection artifact.');
   assert.strictEqual(sceneCollection.itemKind, 'text', 'Expected Plan Scenes to produce a text collection.');
   assert.strictEqual(sceneCollection.items.length, 2, 'Expected Plan Scenes to produce one text item per scene.');
-  assert(/Visual prompt draft:/i.test(sceneCollection.items[0].artifact.text), 'Expected scene text items to carry prompt draft content.');
+  assert.strictEqual(sceneCollection.items[0].artifact.text, sceneCollection.items[0].metadata?.imagePrompt, 'Expected scene text items to contain only the clean image prompt.');
+  assert(!/Visual prompt draft:|Meaning\s*\/\s*intent:|Narration excerpt:/i.test(sceneCollection.items[0].artifact.text), 'Expected scene text items not to serialize scene-plan metadata into prompt text.');
   assert.strictEqual(sceneCollection.metadata?.timing?.timingMode, 'dynamicFromPlanTiming', 'Expected Plan Scenes collection metadata to opt into dynamic plan timing.');
   assert.strictEqual(sceneCollection.metadata?.timing?.totalPlannedDurationSeconds, 8.5, 'Expected Plan Scenes collection metadata to preserve planned duration.');
   assert.strictEqual(sceneCollection.items[1].metadata?.startSeconds, 3.25, 'Expected Plan Scenes item metadata to preserve startSeconds.');
   assert.strictEqual(sceneCollection.items[1].metadata?.durationSeconds, 5.25, 'Expected Plan Scenes item metadata to preserve durationSeconds.');
-  assert(/Narration excerpt:/i.test(sceneCollection.items[0].artifact.text), 'Expected scene text items to carry narration excerpt context.');
+  assert(/determined protagonist wakes before sunrise/i.test(sceneCollection.items[0].metadata?.narrationExcerpt || ''), 'Expected narration excerpt context to stay in item metadata.');
 
   const collectionResult = completedRun.terminalResults?.find((entry) => entry.kind === 'collection') || null;
   assert(collectionResult, 'Expected a terminal collection result from Plan Scenes.');

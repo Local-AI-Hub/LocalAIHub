@@ -462,6 +462,7 @@ async function readExecutableProductVersion(targetPath) {
 
 async function readInstalledBinaryVersion(toolState) {
   return normalizeVersionText(toolState?.installedVersion || '')
+    || normalizeVersionText(toolState?.windowsUninstallDisplayName || '')
     || await readExecutableProductVersion(toolState?.launchProfile?.executable || toolState?.executablePath || '');
 }
 
@@ -475,6 +476,18 @@ function buildIncompleteUpdateVersionMessage(manifest, expectedVersion, detected
   }
 
   return `Local AI Hub ran the ${manifest.name} updater, but it could not verify that version ${expectedVersion} was installed.`;
+}
+
+function buildUnverifiedExternalUpdateMessage(manifest, expectedVersion) {
+  return expectedVersion
+    ? `Local AI Hub ran the ${manifest.name} updater and detected the official app afterward, but Windows did not expose a version number for ${expectedVersion}.`
+    : `Local AI Hub ran the ${manifest.name} updater and detected the official app afterward, but Windows did not expose a version number.`;
+}
+
+function isGuidedOfficialInstallerManifest(manifest) {
+  return manifest?.installContract?.destinationControl === INSTALL_DESTINATION_CONTROL.GUIDED
+    && manifest?.installContract?.lifecycleMode === 'official-installer'
+    && manifest?.installInstructions?.kind === 'installer-exe';
 }
 function assertSafePipInstallTarget(value) {
   const target = String(value || '').trim();
@@ -3521,18 +3534,28 @@ async function updateExecutableInstallerTool(manifest, paths, options = {}) {
   }
 
   const detectedVersion = await readInstalledBinaryVersion(toolState);
+  let detectionWarning = '';
   if (expectedVersion) {
     if (detectedVersion) {
       if (compareVersionText(detectedVersion, expectedVersion) < 0) {
         throw new Error(buildIncompleteUpdateVersionMessage(manifest, expectedVersion, detectedVersion, previousVersion));
       }
     } else if (previousVersion && compareVersionText(previousVersion, expectedVersion) < 0) {
-      throw new Error(buildIncompleteUpdateVersionMessage(manifest, expectedVersion, '', previousVersion));
+      if (expectManagedInstall) {
+        throw new Error(buildIncompleteUpdateVersionMessage(manifest, expectedVersion, '', previousVersion));
+      }
+      detectionWarning = buildUnverifiedExternalUpdateMessage(manifest, expectedVersion);
+      await options.logger.warn('The official updater finished and the app was detected, but version verification was unavailable.', {
+        detectedPath: toolState.displayPath || toolState.installDir || toolState.detectedPath || null,
+        expectedVersion,
+        previousVersion,
+      });
     }
   }
 
   return {
     detectedVersion,
+    detectionWarning,
     toolState,
   };
 }
@@ -5643,7 +5666,8 @@ async function updateToolInstallation(toolState, options = {}) {
     const installKind = manifest.installInstructions.kind || 'zip';
     const runtimeKind = getToolRuntime(manifest);
     const managedPaths = buildManagedPaths(manifest, { installRoot });
-    const isManagedInstall = toolState.source === 'managed';
+    const usesGuidedOfficialInstaller = isGuidedOfficialInstallerManifest(manifest);
+    const isManagedInstall = toolState.source === 'managed' && !usesGuidedOfficialInstaller;
     const safeToolState = isManagedInstall ? ensureManagedToolStatePaths(toolState) : { ...toolState };
     let updateEntry = await getCachedToolUpdateEntry(toolState.id).catch(() => null);
 
@@ -5732,7 +5756,21 @@ async function updateToolInstallation(toolState, options = {}) {
         ...materializedUpdate.toolState,
         downloadCachePath,
       };
+      if (usesGuidedOfficialInstaller && !isManagedInstall) {
+        const discoveredTools = await syncDiscoveredTools({ force: true });
+        const detectedTool = discoveredTools[manifest.id];
+        if (detectedTool) {
+          updatedState = {
+            ...updatedState,
+            ...detectedTool,
+            downloadCachePath,
+          };
+        }
+      }
       resolvedInstalledVersion = normalizeVersionText(materializedUpdate.detectedVersion || updatedState.installedVersion || '');
+      if (materializedUpdate.detectionWarning) {
+        updatedState.lastUpdateMessage = materializedUpdate.detectionWarning;
+      }
     } else if (installKind === 'pip-package') {
       const pythonResolution = await resolveManagedPythonRuntime(
         safeToolState.appDir || managedPaths.appDir,
@@ -5894,11 +5932,15 @@ module.exports = {
     buildWebuiOnlyPreservedState,
     capabilitiesShareInstallPath,
     buildFilteredRequirementsPath,
+    buildIncompleteUpdateVersionMessage,
+    buildUnverifiedExternalUpdateMessage,
+    ensureManagedToolStatePaths,
     collectManagedModelAssetRootsForUninstall,
     collectRepairPreservedModelAssetRoots,
     normalizeDualCapabilityId,
     preserveModelManagerAssetsForAction,
     removeManagedModelManagerAssets,
     selectManagedCudaPyTorchBuild,
+    isGuidedOfficialInstallerManifest,
   },
 };

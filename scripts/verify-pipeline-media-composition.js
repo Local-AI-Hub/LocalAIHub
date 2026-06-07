@@ -76,6 +76,8 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
 };
 
 const {
+  DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
+  DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
   DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS,
@@ -196,6 +198,7 @@ function buildMediaCompositionPipeline(assetPaths, options = {}) {
     label: 'Compose scenes',
     config: {
       secondsPerItem: Number(options.secondsPerItem || 0) || 1.5,
+      ...(options.imageTimingMode ? { imageTimingMode: options.imageTimingMode } : {}),
       ...(options.narrationVolume !== undefined ? { narrationVolume: options.narrationVolume } : {}),
       ...(options.backgroundMusicVolume !== undefined ? { backgroundMusicVolume: options.backgroundMusicVolume } : {}),
       ...(options.transitionConfig && typeof options.transitionConfig === 'object' ? options.transitionConfig : {}),
@@ -346,8 +349,13 @@ function buildMediaCompositionValidationRetryPipeline(assetPaths, options = {}) 
   const pipeline = buildMediaCompositionPipeline(assetPaths, {
     includeBackgroundMusic: true,
     includeNarration: true,
+    includeThirdImage: options.includeThirdImage === true,
+    imageTimingMode: options.imageTimingMode,
     outputTitle: options.outputTitle || 'Storyboard retry final',
+    secondsPerItem: options.secondsPerItem,
+    soundEffectsConfig: options.soundEffectsConfig,
     title: options.title || 'Storyboard retry export',
+    transitionConfig: options.transitionConfig,
   });
   const validation = createNode('validation', {
     id: 'review-export',
@@ -402,17 +410,20 @@ async function prepareAssets() {
   return { backgroundMusic, imageOne, imageThree, imageTwo, narration };
 }
 
-async function prepareSoundEffectsLibrary(assetPaths, name = 'Verify SFX', filenames = ['impact.wav', 'swell.wav']) {
+async function prepareSoundEffectsLibrary(assetPaths, name = 'Verify SFX', filenames = ['impact.wav', 'swell.wav'], durations = [0.75, 2.5]) {
   const existing = await listAssetLibraries('soundEffects');
-  const reusable = existing.find((library) => String(library.name || '') === name && Array.isArray(library.items) && library.items.length >= 2);
+  const shouldReuse = arguments.length < 4;
+  const reusable = shouldReuse
+    ? existing.find((library) => String(library.name || '') === name && Array.isArray(library.items) && library.items.length >= 2)
+    : null;
   if (reusable) {
     return reusable;
   }
   const created = await createAssetLibrary('soundEffects', name);
   const sourceOne = path.join(path.dirname(assetPaths.narration), filenames[0] || 'impact.wav');
   const sourceTwo = path.join(path.dirname(assetPaths.narration), filenames[1] || 'swell.wav');
-  fs.writeFileSync(sourceOne, createWaveBuffer(0.75));
-  fs.writeFileSync(sourceTwo, createWaveBuffer(2.5));
+  fs.writeFileSync(sourceOne, createWaveBuffer(Array.isArray(durations) ? durations[0] ?? 0.75 : 0.75));
+  fs.writeFileSync(sourceTwo, createWaveBuffer(Array.isArray(durations) ? durations[1] ?? 2.5 : 2.5));
   const imported = await importAssetLibraryItems('soundEffects', created.library.id, [sourceOne, sourceTwo]);
   return imported.library;
 }
@@ -486,15 +497,20 @@ async function verifyMediaCompositionWithBackgroundMusic() {
   assert.strictEqual(exportArtifact.compositionExport.audioMix?.mode, 'mixed-with-background-music', 'Expected the export metadata to record the mixed-audio mode.');
   assert.strictEqual(exportArtifact.compositionExport.audioMix?.narrationVolume, 1, 'Expected the export metadata to record the default narration level.');
   assert.strictEqual(exportArtifact.compositionExport.audioMix?.backgroundMusicVolume, 0.22, 'Expected the export metadata to record the default background music level.');
+  assert.strictEqual(exportArtifact.compositionExport.audioMix?.effectiveGains?.narration, 1, 'Expected export metadata to record unity narration gain at 100%.');
+  assert.strictEqual(exportArtifact.compositionExport.audioMix?.effectiveGains?.backgroundMusic, 0.22, 'Expected export metadata to record source-relative background music gain.');
+  assert.strictEqual(exportArtifact.compositionExport.audioMix?.amixNormalize, false, 'Expected export metadata to record that amix normalization is disabled.');
+  assert.strictEqual(exportArtifact.compositionExport.audioMix?.limiterApplied, false, 'Expected export metadata to record no hidden limiter.');
+  assert.strictEqual(exportArtifact.compositionExport.audioMix?.clippingPreventionApplied, false, 'Expected export metadata to record no hidden clipping prevention.');
 }
 
 async function verifyMediaCompositionCustomMixLevels() {
   const assetPaths = await prepareAssets();
   const pipeline = buildMediaCompositionPipeline(assetPaths, {
-    backgroundMusicVolume: 0.18,
+    backgroundMusicVolume: 0.22,
     includeBackgroundMusic: true,
     includeNarration: true,
-    narrationVolume: 0.73,
+    narrationVolume: 1.8,
     outputTitle: 'Storyboard export custom mix final',
     title: 'Storyboard export custom mix',
   });
@@ -502,13 +518,17 @@ async function verifyMediaCompositionCustomMixLevels() {
   verifyCompletedRun(completedRun);
 
   const compositionResult = completedRun.resultsByNodeId?.['compose-scenes']?.outputs?.composition || null;
-  assert.strictEqual(compositionResult?.composition?.audioMix?.narrationVolume, 0.73, 'Expected composition metadata to preserve selected narration level.');
-  assert.strictEqual(compositionResult?.composition?.audioMix?.backgroundMusicVolume, 0.18, 'Expected composition metadata to preserve selected background music level.');
+  assert.strictEqual(compositionResult?.composition?.audioMix?.narrationVolume, 1.8, 'Expected composition metadata to preserve selected narration level.');
+  assert.strictEqual(compositionResult?.composition?.audioMix?.backgroundMusicVolume, 0.22, 'Expected composition metadata to preserve selected background music level.');
+  assert.strictEqual(compositionResult?.composition?.audioMix?.gainStaging?.effectiveGains?.narration, 1.8, 'Expected composition metadata to record 180% as 1.8x source gain.');
+  assert.strictEqual(compositionResult?.composition?.audioMix?.gainStaging?.effectiveGains?.backgroundMusic, 0.22, 'Expected composition metadata to record 22% as 0.22x source gain.');
 
   const exportArtifact = completedRun.resultsByNodeId?.['export-scenes']?.outputs?.video || null;
-  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.narrationVolume, 0.73, 'Expected export metadata to preserve selected narration level.');
-  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.backgroundMusicVolume, 0.18, 'Expected export metadata to preserve selected background music level.');
-  assert(/background music at 18% and narration at 73%/.test(completedRun.nodeStates?.['export-scenes']?.message || ''), 'Expected export status message to reflect selected mix levels.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.narrationVolume, 1.8, 'Expected export metadata to preserve selected narration level.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.backgroundMusicVolume, 0.22, 'Expected export metadata to preserve selected background music level.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.effectiveGains?.narration, 1.8, 'Expected export metadata to record 180% as 1.8x source gain.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.effectiveGains?.backgroundMusic, 0.22, 'Expected export metadata to record 22% as 0.22x source gain.');
+  assert(/background music at 22% and narration at 180%/.test(completedRun.nodeStates?.['export-scenes']?.message || ''), 'Expected export status message to reflect selected mix levels.');
 }
 
 function buildDirectCompositionValidationPipeline(assetPaths, options = {}) {
@@ -576,15 +596,51 @@ async function verifyDirectMediaCompositionValidationDoesNotExposeRetryControls(
 
 async function verifyMediaCompositionRetryOverrides() {
   const assetPaths = await prepareAssets();
+  const library = await prepareSoundEffectsLibrary(assetPaths, 'Verify Retry SFX ' + Date.now(), ['retry-hit.wav', 'retry-swell.wav'], [0.4, 0.4]);
+  const savedLayer = {
+    avoidRepeats: true,
+    density: 'sparse',
+    fadeSeconds: 0.05,
+    id: 'retry-layer',
+    libraryId: library.id,
+    maxSimultaneous: 1,
+    minSpacingSeconds: 0.25,
+    name: 'Retry layer',
+    schedulingMode: 'sceneAligned',
+    seed: 'verify-retry-sfx',
+    volume: 0.4,
+  };
   const pipeline = buildMediaCompositionValidationRetryPipeline(assetPaths, {
     id: 'verify-pipeline-media-composition-retry-overrides',
+    includeThirdImage: true,
+    imageTimingMode: 'fixedDurationPerImage',
     name: 'Verify Pipeline Media Composition Retry Overrides',
     outputTitle: 'Storyboard retry override final',
+    secondsPerItem: 1.5,
+    soundEffectsConfig: {
+      soundEffectsEnabled: true,
+      soundEffectsGlobalGuardEnabled: false,
+      soundEffectsGlobalMaxSimultaneous: 2,
+      soundEffectsGlobalMinSpacingSeconds: 0.25,
+      soundEffectsGlobalVolume: 1,
+      soundEffectsLayers: [savedLayer],
+      soundEffectsVolume: 0.4,
+    },
     title: 'Storyboard retry override export',
+    transitionConfig: {
+      sceneTransitionCategory: 'fades',
+      sceneTransitionDurationSeconds: 0.5,
+      sceneTransitionMode: 'off',
+      sceneTransitionName: 'fade',
+    },
   });
   const savedCompositionNode = pipeline.nodes.find((node) => node.id === 'compose-scenes');
   assert.strictEqual(savedCompositionNode?.config?.narrationVolume, 1, 'Expected the saved pipeline to start with default narration volume.');
   assert.strictEqual(savedCompositionNode?.config?.backgroundMusicVolume, 0.22, 'Expected the saved pipeline to start with default background music volume.');
+  assert.strictEqual(savedCompositionNode.config.secondsPerItem, 1.5, 'Expected saved fallback seconds per image to start unchanged.');
+  assert.strictEqual(savedCompositionNode.config.sceneTransitionMode, 'off', 'Expected saved transition mode to start off.');
+  assert.strictEqual(savedCompositionNode.config.soundEffectsGlobalVolume, 1, 'Expected saved global SFX gain to start at source volume.');
+  assert.strictEqual(savedCompositionNode.config.soundEffectsLayers[0].volume, 0.4, 'Expected saved SFX layer gain to start at 40%.');
 
   const analysis = analyzePipeline(pipeline, {
     hardware: null,
@@ -604,9 +660,18 @@ async function verifyMediaCompositionRetryOverrides() {
   assert.strictEqual(firstPause.pendingValidation?.artifact?.kind, 'video', 'Expected validation to review the previewable Media Export video.');
   assert.strictEqual(firstPause.pendingValidation?.artifact?.compositionExport?.pipelineTrace?.mediaCompositionNodeId, 'compose-scenes', 'Expected Media Export metadata to trace the upstream Media Composition node.');
   assert.strictEqual(firstPause.pendingValidation?.artifact?.compositionExport?.pipelineTrace?.mediaExportNodeId, 'export-scenes', 'Expected Media Export metadata to trace the export node.');
-  assert.strictEqual(firstPause.pendingValidation?.retryControls?.mediaComposition?.nodeId, 'compose-scenes', 'Expected Media Export validation to expose upstream Media Composition retry controls.');
-  assert.strictEqual(firstPause.pendingValidation.retryControls.mediaComposition.narrationVolume, 1, 'Expected retry controls to start from the effective narration volume.');
-  assert.strictEqual(firstPause.pendingValidation.retryControls.mediaComposition.backgroundMusicVolume, 0.22, 'Expected retry controls to start from the effective background volume.');
+  const firstControls = firstPause.pendingValidation?.retryControls?.mediaComposition || null;
+  assert.strictEqual(firstControls?.nodeId, 'compose-scenes', 'Expected Media Export validation to expose upstream Media Composition retry controls.');
+  assert.strictEqual(firstControls.narrationVolume, 1, 'Expected retry controls to start from the effective narration volume.');
+  assert.strictEqual(firstControls.backgroundMusicVolume, 0.22, 'Expected retry controls to start from the effective background volume.');
+  assert.strictEqual(firstControls.secondsPerItem, 1.5, 'Expected retry controls to expose fallback seconds per image.');
+  assert.strictEqual(firstControls.sceneTransitionMode, 'off', 'Expected retry controls to expose transition mode.');
+  assert.strictEqual(firstControls.soundEffectsEnabled, true, 'Expected retry controls to expose SFX enabled.');
+  assert.strictEqual(firstControls.soundEffectsGlobalGuardEnabled, false, 'Expected retry controls to expose global SFX guard.');
+  assert.strictEqual(firstControls.soundEffectsGlobalMinSpacingSeconds, 0.25, 'Expected retry controls to expose global SFX spacing.');
+  assert.strictEqual(firstControls.soundEffectsGlobalMaxSimultaneous, 2, 'Expected retry controls to expose global max simultaneous SFX.');
+  assert.strictEqual(firstControls.soundEffectsGlobalVolume, 1, 'Expected retry controls to expose global SFX gain.');
+  assert.strictEqual(firstControls.soundEffectsLayers?.[0]?.volume, 0.4, 'Expected retry controls to expose per-layer SFX gain.');
 
   resumePipelineValidation(firstPause.runId, {
     decision: 'fail',
@@ -615,7 +680,19 @@ async function verifyMediaCompositionRetryOverrides() {
     retryOverrides: {
       mediaComposition: {
         backgroundMusicVolume: 0.11,
+        imageTimingMode: 'fixedDurationPerImage',
         narrationVolume: 0.55,
+        sceneTransitionCategory: 'fades',
+        sceneTransitionDurationSeconds: 0.3,
+        sceneTransitionMode: 'single',
+        sceneTransitionName: 'fade',
+        secondsPerItem: 2.25,
+        soundEffectsEnabled: true,
+        soundEffectsGlobalGuardEnabled: true,
+        soundEffectsGlobalMaxSimultaneous: 1,
+        soundEffectsGlobalMinSpacingSeconds: 0.75,
+        soundEffectsGlobalVolume: 0.5,
+        soundEffectsLayers: firstControls.soundEffectsLayers.map((layer) => ({ ...layer, volume: 0.3 })),
       },
     },
   });
@@ -627,18 +704,44 @@ async function verifyMediaCompositionRetryOverrides() {
   assert.strictEqual(secondPause.pendingValidation?.artifact?.kind, 'video', 'Expected retry validation to review the newly exported video.');
   assert.strictEqual(secondPause.nodeStates?.['compose-scenes']?.runCount, 2, 'Expected Media Composition to rerun after validation failure.');
   assert.strictEqual(secondPause.nodeStates?.['export-scenes']?.runCount, 2, 'Expected Media Export to rerun after validation failure.');
-  assert.strictEqual(secondPause.nodeStates?.['compose-scenes']?.outputs?.composition?.composition?.audioMix?.narrationVolume, 0.55, 'Expected retry override narration volume to affect the retried composition artifact.');
-  assert.strictEqual(secondPause.nodeStates?.['compose-scenes']?.outputs?.composition?.composition?.audioMix?.backgroundMusicVolume, 0.11, 'Expected retry override background music volume to affect the retried composition artifact.');
-  assert.strictEqual(secondPause.nodeStates?.['export-scenes']?.outputs?.video?.compositionExport?.audioMix?.narrationVolume, 0.55, 'Expected retry override narration volume to affect the retried export artifact.');
-  assert.strictEqual(secondPause.nodeStates?.['export-scenes']?.outputs?.video?.compositionExport?.audioMix?.backgroundMusicVolume, 0.11, 'Expected retry override background music volume to affect the retried export artifact.');
+  const retriedComposition = secondPause.nodeStates?.['compose-scenes']?.outputs?.composition?.composition || null;
+  const retriedVisualTrack = retriedComposition?.tracks?.find((track) => track.role === 'primary-visual') || null;
+  const retriedSoundEffects = retriedComposition?.soundEffects || null;
+  const retriedExport = secondPause.nodeStates?.['export-scenes']?.outputs?.video?.compositionExport || null;
+  assert.strictEqual(retriedComposition?.audioMix?.narrationVolume, 0.55, 'Expected retry override narration volume to affect the retried composition artifact.');
+  assert.strictEqual(retriedComposition?.audioMix?.backgroundMusicVolume, 0.11, 'Expected retry override background music volume to affect the retried composition artifact.');
+  assert.strictEqual(retriedComposition?.audioMix?.soundEffectsVolume, 0.5, 'Expected retry override global SFX gain to affect the retried composition artifact.');
+  assert.strictEqual(retriedSoundEffects?.layers?.[0]?.volume, 0.3, 'Expected retry override per-layer SFX gain to affect the retried composition artifact.');
+  assert.strictEqual(retriedSoundEffects?.globalGuard?.enabled, true, 'Expected retry override global SFX guard to affect the retried composition artifact.');
+  assert.strictEqual(retriedSoundEffects?.globalGuard?.minSpacingSeconds, 0.75, 'Expected retry override global SFX spacing to affect the retried composition artifact.');
+  assert.strictEqual(retriedSoundEffects?.globalGuard?.maxSimultaneous, 1, 'Expected retry override global SFX max simultaneous to affect the retried composition artifact.');
+  assert.strictEqual(retriedVisualTrack?.timing?.fixedDurationSeconds, 2.25, 'Expected retry override fallback seconds per image to affect the retried composition artifact.');
+  assert.strictEqual(retriedVisualTrack?.sceneTransitions?.enabled, true, 'Expected retry override transition mode to enable transitions for the retried composition artifact.');
+  assert.strictEqual(retriedVisualTrack?.sceneTransitions?.boundaries?.[0]?.selectedTransition, 'fade', 'Expected retry override transition name to affect the retried composition artifact.');
+  assert.strictEqual(retriedVisualTrack?.sceneTransitions?.boundaries?.[0]?.effectiveDurationSeconds, 0.3, 'Expected retry override transition duration to affect the retried composition artifact.');
+  assert.strictEqual(retriedExport?.audioMix?.narrationVolume, 0.55, 'Expected retry override narration volume to affect the retried export artifact.');
+  assert.strictEqual(retriedExport?.audioMix?.backgroundMusicVolume, 0.11, 'Expected retry override background music volume to affect the retried export artifact.');
+  assert.strictEqual(retriedExport?.audioMix?.soundEffectsGlobalVolume, 0.5, 'Expected retry override global SFX gain to affect export metadata.');
+  assert.strictEqual(retriedExport?.soundEffects?.layers?.[0]?.volume, 0.3, 'Expected retry override per-layer SFX gain to affect export metadata.');
+  assert.strictEqual(retriedExport?.soundEffects?.scheduledEvents?.[0]?.effectiveGain, 0.15, 'Expected export metadata to record global times layer SFX effective gain.');
   assert.strictEqual(secondPause.pendingValidation?.artifact?.compositionExport?.audioMix?.narrationVolume, 0.55, 'Expected validation preview artifact to carry retried narration volume.');
   assert.strictEqual(secondPause.pendingValidation?.artifact?.compositionExport?.audioMix?.backgroundMusicVolume, 0.11, 'Expected validation preview artifact to carry retried background volume.');
-  assert.strictEqual(secondPause.pendingValidation?.retryControls?.mediaComposition?.narrationVolume, 0.55, 'Expected second review controls to show the retried narration volume.');
-  assert.strictEqual(secondPause.pendingValidation?.retryControls?.mediaComposition?.backgroundMusicVolume, 0.11, 'Expected second review controls to show the retried background volume.');
+  const secondControls = secondPause.pendingValidation?.retryControls?.mediaComposition || null;
+  assert.strictEqual(secondControls?.narrationVolume, 0.55, 'Expected second review controls to show the retried narration volume.');
+  assert.strictEqual(secondControls?.backgroundMusicVolume, 0.11, 'Expected second review controls to show the retried background volume.');
+  assert.strictEqual(secondControls?.secondsPerItem, 2.25, 'Expected second review controls to show retried fallback seconds per image.');
+  assert.strictEqual(secondControls?.sceneTransitionMode, 'single', 'Expected second review controls to show retried transition mode.');
+  assert.strictEqual(secondControls?.soundEffectsGlobalVolume, 0.5, 'Expected second review controls to show retried global SFX gain.');
+  assert.strictEqual(secondControls?.soundEffectsLayers?.[0]?.volume, 0.3, 'Expected second review controls to show retried per-layer SFX gain.');
   assert(/primary narration at 55% and background music at 11%/.test(secondPause.nodeStates?.['compose-scenes']?.message || ''), 'Expected composition status to show effective retry override values.');
   assert(/background music at 11% and narration at 55%/.test(secondPause.nodeStates?.['export-scenes']?.message || ''), 'Expected export status to show effective retry override values.');
   assert.strictEqual(savedCompositionNode.config.narrationVolume, 1, 'Expected retry override not to mutate saved narration volume.');
   assert.strictEqual(savedCompositionNode.config.backgroundMusicVolume, 0.22, 'Expected retry override not to mutate saved background music volume.');
+  assert.strictEqual(savedCompositionNode.config.secondsPerItem, 1.5, 'Expected retry override not to mutate saved fallback seconds per image.');
+  assert.strictEqual(savedCompositionNode.config.sceneTransitionMode, 'off', 'Expected retry override not to mutate saved transition mode.');
+  assert.strictEqual(savedCompositionNode.config.soundEffectsGlobalGuardEnabled, false, 'Expected retry override not to mutate saved global SFX guard.');
+  assert.strictEqual(savedCompositionNode.config.soundEffectsGlobalVolume, 1, 'Expected retry override not to mutate saved global SFX gain.');
+  assert.strictEqual(savedCompositionNode.config.soundEffectsLayers[0].volume, 0.4, 'Expected retry override not to mutate saved SFX layer gain.');
 
   resumePipelineValidation(secondPause.runId, {
     decision: 'pass',
@@ -655,18 +758,24 @@ async function verifyMediaCompositionRetryOverrides() {
   const compositionResult = completedRun.resultsByNodeId?.['compose-scenes']?.outputs?.composition || null;
   assert.strictEqual(compositionResult?.composition?.audioMix?.narrationVolume, 0.55, 'Expected final composition metadata to record the effective retry narration volume.');
   assert.strictEqual(compositionResult?.composition?.audioMix?.backgroundMusicVolume, 0.11, 'Expected final composition metadata to record the effective retry background volume.');
+  assert.strictEqual(compositionResult?.composition?.audioMix?.soundEffectsVolume, 0.5, 'Expected final composition metadata to record effective retry global SFX gain.');
   const compositionManifest = JSON.parse(fs.readFileSync(compositionResult.manifestPath, 'utf8'));
   assert.strictEqual(compositionManifest.composition?.audioMix?.narrationVolume, 0.55, 'Expected composition sidecar to record effective retry narration volume.');
   assert.strictEqual(compositionManifest.composition?.audioMix?.backgroundMusicVolume, 0.11, 'Expected composition sidecar to record effective retry background volume.');
+  assert.strictEqual(compositionManifest.composition?.audioMix?.soundEffectsVolume, 0.5, 'Expected composition sidecar to record effective retry global SFX gain.');
   const exportArtifact = completedRun.resultsByNodeId?.['export-scenes']?.outputs?.video || null;
   assert.strictEqual(exportArtifact?.compositionExport?.pipelineTrace?.mediaCompositionNodeId, 'compose-scenes', 'Expected export metadata to keep the upstream Media Composition node id.');
   assert.strictEqual(exportArtifact?.compositionExport?.pipelineTrace?.mediaExportNodeId, 'export-scenes', 'Expected export metadata to keep the Media Export node id.');
   assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.narrationVolume, 0.55, 'Expected export metadata to carry retry override narration volume.');
   assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.backgroundMusicVolume, 0.11, 'Expected export metadata to carry retry override background volume.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsGlobalVolume, 0.5, 'Expected export metadata to carry retry override global SFX gain.');
+  assert.strictEqual(exportArtifact?.compositionExport?.soundEffects?.scheduledEvents?.[0]?.effectiveGain, 0.15, 'Expected final export metadata to carry effective retry SFX gain.');
   const exportSidecar = JSON.parse(fs.readFileSync(exportArtifact.metadataPaths[0], 'utf8'));
   assert.strictEqual(exportSidecar.pipelineTrace?.mediaCompositionNodeId, 'compose-scenes', 'Expected export sidecar to keep the upstream Media Composition node id.');
   assert.strictEqual(exportSidecar.audioMix?.narrationVolume, 0.55, 'Expected export sidecar to record effective retry narration volume.');
   assert.strictEqual(exportSidecar.audioMix?.backgroundMusicVolume, 0.11, 'Expected export sidecar to record effective retry background volume.');
+  assert.strictEqual(exportSidecar.audioMix?.soundEffectsGlobalVolume, 0.5, 'Expected export sidecar to record effective retry global SFX gain.');
+  assert.strictEqual(exportSidecar.soundEffects?.scheduledEvents?.[0]?.effectiveGain, 0.15, 'Expected export sidecar to record effective retry SFX gain.');
   assert(/background music at 11% and narration at 55%/.test(completedRun.nodeStates?.['export-scenes']?.message || ''), 'Expected export summary to show effective retry override values.');
 }
 
@@ -1023,14 +1132,41 @@ function verifyMediaCompositionSoundEffectsDefaultsAndUi() {
   assert.strictEqual(definition.configDefaults.soundEffectsLayers.length, 0, 'Media Composition should default to no SFX layers.');
   assert.strictEqual(definition.configDefaults.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME, 'Media Composition should default sound effects volume conservatively.');
   assert.strictEqual(definition.configDefaults.soundEffectsSchedulingMode, 'randomInterval', 'Media Composition should default to random interval SFX scheduling.');
+  assert.strictEqual(definition.configDefaults.soundEffectsGlobalGuardEnabled, false, 'Media Composition should keep cross-layer SFX guards off by default for saved-project compatibility.');
+  assert.strictEqual(definition.configDefaults.soundEffectsGlobalMinSpacingSeconds, DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS, 'Media Composition should default global SFX spacing conservatively when enabled.');
+  assert.strictEqual(definition.configDefaults.soundEffectsGlobalMaxSimultaneous, DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS, 'Media Composition should default global SFX max simultaneous conservatively when enabled.');
   const uiSource = fs.readFileSync(PIPELINE_BUILDER_PANEL_PATH, 'utf8');
   assert(/media-composition-sfx-enabled/.test(uiSource), 'Expected the Media Composition inspector to expose the SFX enable control.');
+  assert(/media-composition-sfx-global-guard/.test(uiSource), 'Expected the Media Composition inspector to expose the global SFX guard control.');
+  assert(/media-composition-sfx-global-spacing/.test(uiSource), 'Expected the Media Composition inspector to expose global SFX spacing.');
+  assert(/media-composition-sfx-global-simultaneous/.test(uiSource), 'Expected the Media Composition inspector to expose global SFX max simultaneous control.');
+  assert(/validation-media-composition-sfx-global-volume/.test(uiSource), 'Expected retry UI to expose global SFX volume.');
+  assert(/validation-media-composition-sfx-layer-volume/.test(uiSource), 'Expected retry UI to expose per-layer SFX volumes.');
+  assert(/validation-media-composition-image-timing/.test(uiSource), 'Expected retry UI to expose image timing mode.');
+  assert(/validation-media-composition-seconds-per-item/.test(uiSource), 'Expected retry UI to expose fallback seconds per image.');
+  assert(/validation-media-composition-transition-mode/.test(uiSource), 'Expected retry UI to expose transition settings.');
+  assert(/validation-media-composition-sfx-global-spacing/.test(uiSource), 'Expected retry UI to expose global SFX spacing.');
   assert(/Add SFX layer/.test(uiSource), 'Expected the Media Composition inspector to add SFX layers.');
   assert(/soundEffectsLayers/.test(uiSource), 'Expected the Media Composition inspector to write layered SFX config.');
   assert(/media-composition-sfx-library/.test(uiSource), 'Expected the Media Composition inspector to expose the SFX library dropdown.');
   assert(/Settings &gt; Asset Libraries/.test(uiSource), 'Expected the Media Composition inspector to point empty SFX libraries to Settings > Asset Libraries.');
   assert(/listAssetLibraries\?\.\('soundEffects'\)/.test(uiSource), 'Expected the Media Composition inspector to use Asset Library listing IPC.');
   assert(!/soundEffectsFilePath/.test(uiSource), 'Expected SFX controls not to accept arbitrary file paths.');
+}
+
+function verifyMediaExportAudioMixVolumeSemantics() {
+  const mediaCompositionSource = fs.readFileSync(MEDIA_COMPOSITION_SERVICE_PATH, 'utf8');
+  assert(/const MEDIA_COMPOSITION_AMIX_NORMALIZE = 0/.test(mediaCompositionSource), 'Expected Media Export to define amix normalization as disabled.');
+  assert(/volume=\$\{formatVolumeFilterValue\(audioPlan\.narrationVolume\)\}\[primary\]/.test(mediaCompositionSource), 'Expected narration volume to map directly to the FFmpeg source gain.');
+  assert(/volume=\$\{formatVolumeFilterValue\(audioPlan\.backgroundMusicVolume\)\}\[music\]/.test(mediaCompositionSource), 'Expected background music volume to map directly to the FFmpeg source gain.');
+  assert(/volume=\$\{formatVolumeFilterValue\(volume\)\}`/.test(mediaCompositionSource), 'Expected SFX layer volume to map directly to the FFmpeg source gain.');
+  assert(/getSoundEffectEffectiveGain\(event, audioPlan\.soundEffectsVolume\)/.test(mediaCompositionSource), 'Expected SFX export filters to use global times layer effective gain.');
+  assert(/normalizeAudioVolume\(globalVolume, 1\)/.test(mediaCompositionSource), 'Expected missing global SFX gain to default to source volume.');
+  assert(/audioMix\.soundEffectsVolume \?\? primaryConfigured\?\.globalVolume \?\? 1/.test(mediaCompositionSource), 'Expected export audio plan to avoid legacy layer gain as global gain.');
+  assert(/amix=inputs=\$\{audioMixLabels\.length\}:duration=longest:dropout_transition=2:normalize=\$\{MEDIA_COMPOSITION_AMIX_NORMALIZE\}/.test(mediaCompositionSource), 'Expected amix normalization to be explicit and disabled.');
+  assert(/amixNormalizeExplicit: true/.test(mediaCompositionSource), 'Expected export metadata to record explicit amix normalization behavior.');
+  assert(/sourceRelative: true/.test(mediaCompositionSource), 'Expected export metadata to record source-relative gain staging.');
+  assert(/limiterApplied: false/.test(mediaCompositionSource), 'Expected export metadata to avoid hidden limiter behavior.');
 }
 
 function assertSoundEffectSpacing(events, minSpacingSeconds) {
@@ -1042,6 +1178,24 @@ function assertSoundEffectSpacing(events, minSpacingSeconds) {
 function assertNoImmediateSoundEffectRepeats(events) {
   for (let index = 1; index < events.length; index += 1) {
     assert.notStrictEqual(events[index].itemId, events[index - 1].itemId, 'Expected sound effect scheduling to avoid immediate repeats when possible.');
+  }
+}
+
+function getSoundEffectDurationSeconds(event) {
+  return Math.max(0.05, Number(event?.durationSeconds || 0) || 0.5);
+}
+
+function assertNoSoundEffectOverlaps(events) {
+  for (let leftIndex = 0; leftIndex < events.length; leftIndex += 1) {
+    const left = events[leftIndex];
+    const leftStart = Number(left.timeSeconds || 0) || 0;
+    const leftEnd = leftStart + getSoundEffectDurationSeconds(left);
+    for (let rightIndex = leftIndex + 1; rightIndex < events.length; rightIndex += 1) {
+      const right = events[rightIndex];
+      const rightStart = Number(right.timeSeconds || 0) || 0;
+      const rightEnd = rightStart + getSoundEffectDurationSeconds(right);
+      assert(leftEnd <= rightStart + 0.001 || rightEnd <= leftStart + 0.001, 'Expected global SFX guard to prevent cross-layer overlaps.');
+    }
   }
 }
 
@@ -1066,7 +1220,7 @@ async function verifySoundEffectsSchedulingAndExportMetadata() {
       soundEffectsMinSpacingSeconds: 0.5,
       soundEffectsSchedulingMode: 'both',
       soundEffectsSeed: 'verify-sfx-both',
-      soundEffectsVolume: 0.25,
+      soundEffectsVolume: 0.3,
     },
   });
   const completedRun = await runAndWaitForPipeline(pipeline);
@@ -1079,7 +1233,7 @@ async function verifySoundEffectsSchedulingAndExportMetadata() {
   assert.strictEqual(soundEffects.layers?.[0]?.libraryId, library.id, 'Expected the selected Sound Effects library id in layer metadata.');
   assert.strictEqual(soundEffects.layers?.[0]?.libraryName, library.name, 'Expected the selected Sound Effects library name in layer metadata.');
   assert.strictEqual(soundEffects.layers?.[0]?.schedulingMode, 'both', 'Expected both scheduling mode in layer metadata.');
-  assert.strictEqual(soundEffects.layers?.[0]?.volume, 0.25, 'Expected sound effects volume in layer metadata.');
+  assert.strictEqual(soundEffects.layers?.[0]?.volume, 0.3, 'Expected 30% legacy SFX volume to normalize as layer gain.');
   assert(soundEffects.scheduledEvents.length >= 2, 'Expected scheduled SFX events.');
   assert(soundEffects.scheduledEvents.every((event) => event.layerId && Number(event.layerIndex) === 0), 'Expected scheduled SFX events to record layer identity.');
   assert(soundEffects.scheduledEvents.some((event) => event.reason === 'sceneAligned'), 'Expected a scene-aligned SFX event.');
@@ -1088,14 +1242,23 @@ async function verifySoundEffectsSchedulingAndExportMetadata() {
   assert(soundEffects.scheduledEvents.every((event) => !event.filePath), 'Expected composition metadata not to expose managed file paths.');
   assertSoundEffectSpacing(soundEffects.scheduledEvents, 0.5);
   assertNoImmediateSoundEffectRepeats(soundEffects.scheduledEvents);
-  assert.strictEqual(compositionResult.composition.audioMix.soundEffectsVolume, 0.25, 'Expected composition audio mix to include SFX volume.');
+  assert.strictEqual(compositionResult.composition.audioMix.soundEffectsVolume, 1, 'Expected composition audio mix to keep global SFX gain at source volume by default.');
+  assert.strictEqual(soundEffects.globalGuard?.enabled, false, 'Expected legacy single-layer SFX behavior to leave the global guard disabled.');
 
   const exportArtifact = getExportArtifact(completedRun);
-  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsVolume, 0.25, 'Expected Media Export metadata to carry SFX volume.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsVolume, 1, 'Expected Media Export metadata to carry global SFX gain at source volume by default.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.effectiveGains?.soundEffects, 1, 'Expected Media Export metadata to record global SFX source-relative gain.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsGlobalVolume, 1, 'Expected Media Export metadata to separate global SFX gain.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.effectiveGains?.soundEffectsEvents?.[0]?.effectiveGain, 0.3, 'Expected 30% SFX layer volume to map to 0.3 effective source gain.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.effectiveGains?.soundEffectsEvents?.[0]?.layerGain, 0.3, 'Expected SFX event gain metadata to record layer gain.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.effectiveGains?.soundEffectsEvents?.[0]?.globalGain, 1, 'Expected SFX event gain metadata to record global gain.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsGlobalGuardEnabled, false, 'Expected Media Export metadata to record disabled global SFX guard.');
   assert.strictEqual(exportArtifact.compositionExport.audioMix.soundEffectsEventCount, soundEffects.scheduledEvents.length, 'Expected Media Export audio mix to count scheduled SFX events.');
   assert.strictEqual(exportArtifact.compositionExport.audioMix.soundEffectsLayerCount, 1, 'Expected Media Export audio mix to count SFX layers.');
   assert.strictEqual(exportArtifact.compositionExport.soundEffects?.enabled, true, 'Expected Media Export metadata to carry SFX summary.');
   assert.strictEqual(exportArtifact.compositionExport.soundEffects.layers?.length, 1, 'Expected Media Export metadata to carry per-layer SFX summary.');
+  assert.strictEqual(exportArtifact.compositionExport.soundEffects.layers?.[0]?.effectiveVolume, 0.3, 'Expected SFX layer metadata to record effective gain.');
+  assert.strictEqual(exportArtifact.compositionExport.soundEffects.scheduledEvents?.[0]?.effectiveGain, 0.3, 'Expected SFX event metadata to record effective gain.');
   assert(exportArtifact.compositionExport.soundEffects.scheduledEvents.every((event) => !event.filePath), 'Expected Media Export metadata not to expose managed file paths.');
   const exportSidecar = JSON.parse(fs.readFileSync(exportArtifact.metadataPaths[0], 'utf8'));
   assert.strictEqual(exportSidecar.soundEffects?.scheduledEvents?.length, soundEffects.scheduledEvents.length, 'Expected export sidecar to record the SFX schedule.');
@@ -1124,6 +1287,7 @@ async function verifyMultipleSoundEffectsLayers() {
     outputTitle: 'Layered sound effects final',
     soundEffectsConfig: {
       soundEffectsEnabled: true,
+      soundEffectsGlobalVolume: 0.5,
       soundEffectsLayers: [
         {
           avoidRepeats: true,
@@ -1170,11 +1334,90 @@ async function verifyMultipleSoundEffectsLayers() {
 
   const exportArtifact = getExportArtifact(completedRun);
   const exportedSoundEffects = exportArtifact?.compositionExport?.soundEffects || null;
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsGlobalVolume, 0.5, 'Expected layered SFX export metadata to record global SFX gain.');
   assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsLayerCount, 2, 'Expected Media Export audio mix to record both SFX layers.');
   assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsInputCount, soundEffects.scheduledEvents.length, 'Expected each scheduled SFX event to become one FFmpeg audio input.');
   assert.strictEqual(exportedSoundEffects?.layers?.length, 2, 'Expected Media Export metadata to carry both SFX layers.');
   assert(exportedSoundEffects.layers.every((layer) => Array.isArray(layer.scheduledEvents)), 'Expected Media Export metadata to preserve per-layer schedules.');
+  const environmentalEvent = exportedSoundEffects.scheduledEvents.find((event) => event.layerId === 'environment-layer');
+  const accentEvent = exportedSoundEffects.scheduledEvents.find((event) => event.layerId === 'accent-layer');
+  assert.strictEqual(environmentalEvent?.gain?.globalGain, 0.5, 'Expected layered SFX metadata to record global gain.');
+  assert.strictEqual(environmentalEvent?.gain?.layerGain, 0.2, 'Expected layered SFX metadata to record layer gain.');
+  assert.strictEqual(environmentalEvent?.effectiveGain, 0.1, 'Expected layered SFX effective gain to equal global times layer gain.');
+  assert.strictEqual(accentEvent?.effectiveGain, 0.125, 'Expected second layered SFX effective gain to equal global times layer gain.');
   assert(exportedSoundEffects.scheduledEvents.every((event) => !event.filePath), 'Expected layered export metadata not to expose managed file paths.');
+}
+
+async function verifyGlobalSoundEffectsGuard() {
+  const assetPaths = await prepareAssets();
+  const sceneLibrary = await prepareSoundEffectsLibrary(assetPaths, 'Verify Scene Guard SFX ' + Date.now(), ['scene-hit.wav', 'scene-snap.wav'], [0.4, 0.4]);
+  const randomLibrary = await prepareSoundEffectsLibrary(assetPaths, 'Verify Random Guard SFX ' + Date.now(), ['ambience-one.wav', 'ambience-two.wav'], [0.75, 0.75]);
+  const pipeline = buildMediaCompositionPipeline(assetPaths, {
+    includeBackgroundMusic: false,
+    includeNarration: false,
+    includeThirdImage: true,
+    secondsPerItem: 2,
+    stopMode: 'visuals',
+    title: 'Guarded layered sound effects export',
+    outputTitle: 'Guarded layered sound effects final',
+    soundEffectsConfig: {
+      soundEffectsEnabled: true,
+      soundEffectsGlobalGuardEnabled: true,
+      soundEffectsGlobalMaxSimultaneous: 1,
+      soundEffectsGlobalMinSpacingSeconds: 0.5,
+      soundEffectsLayers: [
+        {
+          avoidRepeats: false,
+          density: 'dense',
+          fadeSeconds: 0.05,
+          id: 'scene-priority-layer',
+          libraryId: sceneLibrary.id,
+          maxSimultaneous: 8,
+          minSpacingSeconds: 0,
+          name: 'Scene Priority',
+          schedulingMode: 'sceneAligned',
+          seed: 'scene-priority-fixed',
+          volume: 0.3,
+        },
+        {
+          avoidRepeats: false,
+          density: 'dense',
+          fadeSeconds: 0.05,
+          id: 'random-ambience-layer',
+          libraryId: randomLibrary.id,
+          maxSimultaneous: 8,
+          minSpacingSeconds: 0,
+          name: 'Random Ambience',
+          schedulingMode: 'randomInterval',
+          seed: 'short-4',
+          volume: 0.2,
+        },
+      ],
+    },
+  });
+  const completedRun = await runAndWaitForPipeline(pipeline);
+  verifyCompletedRun(completedRun);
+
+  const compositionResult = completedRun.resultsByNodeId?.['compose-scenes']?.outputs?.composition || null;
+  const soundEffects = compositionResult?.composition?.soundEffects || null;
+  assert.strictEqual(soundEffects?.enabled, true, 'Expected guarded SFX to be enabled.');
+  assert.strictEqual(soundEffects.globalGuard?.enabled, true, 'Expected composition metadata to record enabled global SFX guard.');
+  assert.strictEqual(soundEffects.globalGuard?.minSpacingSeconds, 0.5, 'Expected composition metadata to record global SFX spacing.');
+  assert.strictEqual(soundEffects.globalGuard?.maxSimultaneous, 1, 'Expected composition metadata to record global SFX max simultaneous.');
+  assert(soundEffects.scheduledEvents.some((event) => event.layerId === 'scene-priority-layer' && event.reason === 'sceneAligned'), 'Expected scene-aligned events to survive the global guard.');
+  assert(soundEffects.scheduledEvents.some((event) => event.layerId === 'random-ambience-layer' && event.reason === 'randomInterval') || Number(soundEffects.globalGuard?.skippedEventCount || 0) > 0, 'Expected random events to be moved or skipped by the global guard.');
+  assert(Number(soundEffects.globalGuard?.movedEventCount || 0) + Number(soundEffects.globalGuard?.skippedEventCount || 0) >= 1, 'Expected the forced random/scene collision to produce global guard metadata.');
+  assert(soundEffects.globalGuard.collisionNotes?.some((note) => note.reason === 'randomInterval' && ['moved', 'skipped'].includes(note.action)), 'Expected global guard collision notes for random SFX.');
+  assert(soundEffects.scheduledEvents.some((event) => event.layerId === 'scene-priority-layer' && Math.abs(Number(event.timeSeconds || 0) - 4) < 0.001 && !event.movedByGlobalGuard), 'Expected scene-aligned SFX at the transition to keep priority.');
+  assertSoundEffectSpacing(soundEffects.scheduledEvents, 0.5);
+  assertNoSoundEffectOverlaps(soundEffects.scheduledEvents);
+
+  const exportArtifact = getExportArtifact(completedRun);
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsGlobalGuardEnabled, true, 'Expected export metadata to record enabled global SFX guard.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsGlobalMovedEventCount, soundEffects.globalGuard.movedEventCount, 'Expected export audio mix to record moved SFX count.');
+  assert.strictEqual(exportArtifact?.compositionExport?.audioMix?.soundEffectsGlobalSkippedEventCount, soundEffects.globalGuard.skippedEventCount, 'Expected export audio mix to record skipped SFX count.');
+  assert.strictEqual(exportArtifact?.compositionExport?.soundEffects?.globalGuard?.enabled, true, 'Expected export soundEffects metadata to carry the global guard.');
+  assertNoSoundEffectOverlaps(exportArtifact.compositionExport.soundEffects.scheduledEvents || []);
 }
 async function verifySoundEffectsTrimNearEnd() {
   const assetPaths = await prepareAssets();
@@ -1239,6 +1482,7 @@ async function main() {
   verifyMediaCompositionInspectorFallbackField();
   verifyMediaCompositionTransitionDefaults();
   verifyMediaCompositionSoundEffectsDefaultsAndUi();
+  verifyMediaExportAudioMixVolumeSemantics();
   verifyMediaExportTransitionRenderGuards();
   verifySoundEffectsPathSafetyImplementation();
   verifyFailedRunXfadeFallbackCoverage();
@@ -1274,6 +1518,8 @@ async function main() {
   await verifySoundEffectsSchedulingAndExportMetadata();
   await cleanupActiveRun();
   await verifyMultipleSoundEffectsLayers();
+  await cleanupActiveRun();
+  await verifyGlobalSoundEffectsGuard();
   await cleanupActiveRun();
   await verifySoundEffectsTrimNearEnd();
   await cleanupActiveRun();

@@ -758,6 +758,25 @@ function buildOpenAiResponseFormat(payload = {}) {
   };
 }
 
+function buildOpenAiCompatibleResponseFormat(provider, payload = {}) {
+  const responseFormat = normalizeStructuredResponseFormat(payload.responseFormat);
+  if (!responseFormat) {
+    return null;
+  }
+
+  if (provider.id === 'openai') {
+    return buildOpenAiResponseFormat(payload);
+  }
+
+  if (provider.id === 'groq') {
+    return {
+      type: 'json_object',
+    };
+  }
+
+  return null;
+}
+
 function extractTextParts(value) {
   if (typeof value === 'string') {
     return value.trim();
@@ -853,7 +872,7 @@ function toGoogleContentParts(parts = []) {
 }
 
 async function sendOpenAICompatibleChat(provider, apiKey, payload) {
-  const structuredResponseFormat = provider.id === 'openai' ? buildOpenAiResponseFormat(payload) : null;
+  const structuredResponseFormat = buildOpenAiCompatibleResponseFormat(provider, payload);
   const response = await requestProviderJson(provider, apiKey, provider.configuration?.chatEndpoint || '/chat/completions', {
     method: 'POST',
     body: JSON.stringify({

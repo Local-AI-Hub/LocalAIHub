@@ -53,6 +53,7 @@ async function main() {
   const manifestTools = readManifest();
   const byId = (toolId) => manifestTools.find((tool) => tool.id === toolId);
   const { buildLaunchModeState, getToolCatalog, getToolManifest, initializeToolRegistry } = require('../electron/services/toolRegistry');
+  const { _test: installerTesting } = require('../electron/services/installerService');
   const { __testing } = require('../electron/services/processService');
 
   await initializeToolRegistry();
@@ -142,6 +143,45 @@ async function main() {
     /does not expose that launch mode/,
     'OpenCode should reject CLI launch mode requests while CLI/TUI is future work.',
   );
+  const officialOpenCodeRoot = path.join(process.env.LOCALAPPDATA, 'Programs', '@opencode-aidesktop');
+  const officialOpenCodeExe = path.join(officialOpenCodeRoot, 'OpenCode.exe');
+  touch(officialOpenCodeExe);
+  const officialOpenCodeModes = buildLaunchModeState(
+    {
+      ...opencodeState,
+      installDir: officialOpenCodeRoot,
+      appDir: officialOpenCodeRoot,
+      detectedPath: officialOpenCodeExe,
+    },
+    opencodeManifest,
+    {
+      detectedPath: officialOpenCodeExe,
+      source: 'external',
+    },
+  );
+  assert.strictEqual(officialOpenCodeModes.launchModeProfiles.desktop.executable, officialOpenCodeExe, 'OpenCode should approve the official scoped desktop app path outside Local AI Hub tools.');
+  assert.strictEqual(installerTesting.isGuidedOfficialInstallerManifest(opencodeManifest), true, 'OpenCode updates should use guided official desktop installer rules.');
+  assert.throws(
+    () => installerTesting.ensureManagedToolStatePaths({
+      id: 'opencode',
+      source: 'managed',
+      installDir: officialOpenCodeRoot,
+      appDir: officialOpenCodeRoot,
+    }),
+    /outside its tools folder/,
+    'Managed-folder validation should still reject arbitrary external OpenCode paths.',
+  );
+  assert(
+    installerTesting.buildUnverifiedExternalUpdateMessage(opencodeManifest, '9.9.9').includes('detected the official app afterward'),
+    'Guided official updater version gaps should be reported as a nonfatal detection warning.',
+  );
+  const opencodeUpdateInstallerSource = fs.readFileSync(path.join(process.cwd(), 'electron/services/installerService.js'), 'utf8');
+  assert(opencodeUpdateInstallerSource.includes('usesGuidedOfficialInstaller && !isManagedInstall'), 'OpenCode guided updates should bypass managed-install validation.');
+  assert(opencodeUpdateInstallerSource.includes('const discoveredTools = await syncDiscoveredTools({ force: true });'), 'Guided official updates should refresh Library detection after installer completion.');
+  assert(opencodeUpdateInstallerSource.includes('lastError: null'), 'Successful guided official updates should clear stale update errors.');
+  const opencodeDiscoverySource = fs.readFileSync(path.join(process.cwd(), 'electron/services/toolDiscoveryService.js'), 'utf8');
+  assert(opencodeDiscoverySource.includes("discoverOfficialInstallerFromWindowsUninstall(manifest, logger)"), 'OpenCode official desktop detection should consult verified Windows uninstall metadata.');
+  assert(opencodeDiscoverySource.includes("!['manifest-path', 'windows-uninstall'].includes(detected.reason)"), 'Guided official desktop detection should reject arbitrary external executable locations.');
 
   const comfyRaw = byId('comfyui');
   const comfyRequirementsInstall = comfyRaw.installInstructions?.pipInstalls?.find((entry) => entry.kind === 'requirements' && entry.value === 'requirements.txt');

@@ -465,6 +465,7 @@ async function discoverInstallLocation(manifest, existingTool, logger) {
   const discoverySteps = [
     () => discoverFromTrackedPaths(manifest, existingTool, logger),
     () => discoverFromManifestPaths(manifest, logger),
+    () => discoverOfficialInstallerFromWindowsUninstall(manifest, logger),
     () => discoverFromPathExecutables(manifest, logger),
     () => discoverFromPythonModules(manifest, logger),
     () => discoverFromCommonRoots(manifest, logger),
@@ -512,6 +513,70 @@ function companionUninstallEntryMatches(entry, baseManifest, companionManifest) 
   return expectedTokens.some((token) => entryText.includes(token));
 }
 
+function officialInstallerUninstallEntryMatches(entry, manifest) {
+  const expectedTokens = [
+    manifest?.id,
+    manifest?.name,
+    manifest?.installInstructions?.expectedDisplayName,
+    manifest?.installInstructions?.expectedVendor,
+  ]
+    .map(normalizeCompanionMatchToken)
+    .filter((token) => token && token.length >= 4);
+  if (!expectedTokens.length) {
+    return false;
+  }
+
+  const entryText = [
+    entry?.displayName,
+    entry?.publisher,
+    entry?.displayIcon,
+    entry?.installLocation,
+    entry?.uninstallString,
+    entry?.quietUninstallString,
+    entry?.keyPath,
+  ].map(normalizeCompanionMatchToken).join(' ');
+
+  return expectedTokens.some((token) => entryText.includes(token));
+}
+
+async function discoverOfficialInstallerFromWindowsUninstall(manifest, logger) {
+  const entries = await listWindowsUninstallEntries({ refresh: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!officialInstallerUninstallEntryMatches(entry, manifest)) {
+      continue;
+    }
+
+    const entryCandidates = uniquePaths([
+      entry.displayIcon,
+      entry.installLocation,
+      ...collectEntryPaths(entry),
+    ].filter(Boolean));
+    for (const candidatePath of entryCandidates) {
+      const resolved = await resolveFilesystemCandidate(candidatePath, {
+        reason: 'windows-uninstall',
+      });
+      if (!resolved) {
+        continue;
+      }
+
+      await logger.info('Official desktop app detected from verified Windows uninstall metadata.', {
+        toolId: manifest.id,
+        detectedPath: resolved.detectedPath,
+        displayName: entry.displayName || null,
+        publisher: entry.publisher || null,
+      });
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function usesGuidedOfficialInstallerDiscovery(manifest) {
+  return manifest?.installContract?.destinationControl === 'guided'
+    && manifest?.installContract?.lifecycleMode === 'official-installer'
+    && manifest?.installInstructions?.kind === 'installer-exe';
+}
 async function discoverCompanionFromWindowsUninstall(baseManifest, companionManifest, logger) {
   const entries = await listWindowsUninstallEntries({ refresh: true }).catch(() => []);
   for (const entry of entries) {
@@ -809,6 +874,10 @@ function detectedLocationIsManaged(manifest, detected, existingTool = null) {
 
 async function selectExternalInstallCandidate(manifest, detected, existingTool = null) {
   if (!detected || detectedLocationIsManaged(manifest, detected, existingTool)) {
+    return null;
+  }
+
+  if (usesGuidedOfficialInstallerDiscovery(manifest) && !['manifest-path', 'windows-uninstall'].includes(detected.reason)) {
     return null;
   }
 

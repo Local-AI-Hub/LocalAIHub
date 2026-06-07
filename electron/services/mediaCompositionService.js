@@ -28,6 +28,8 @@ const {
   PORT_KIND_VIDEO,
 } = require('../shared/pipelineSchema.cjs');
 
+const MEDIA_COMPOSITION_AMIX_NORMALIZE = 0;
+
 function normalizeAudioVolume(value, fallback) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
@@ -51,7 +53,7 @@ function resolveCompositionAudioMix(compositionArtifact) {
   return {
     backgroundMusicVolume: normalizeAudioVolume(mix.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
     narrationVolume: normalizeAudioVolume(mix.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
-    soundEffectsVolume: normalizeAudioVolume(mix.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
+    soundEffectsVolume: normalizeAudioVolume(mix.soundEffectsVolume, 1),
   };
 }
 
@@ -350,7 +352,7 @@ function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visua
     soundEffectsEvents: soundEffectEvents,
     soundEffectsFadeSeconds: Math.max(0, Math.min(2, Number(primaryConfigured?.fadeSeconds ?? soundEffectsPlan?.fadeSeconds ?? 0) || 0)),
     soundEffectsMetadata: buildSoundEffectsExportMetadata(soundEffectsPlan, soundEffectsExport),
-    soundEffectsVolume: normalizeAudioVolume(audioMix.soundEffectsVolume ?? primaryConfigured?.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
+    soundEffectsVolume: normalizeAudioVolume(audioMix.soundEffectsVolume ?? primaryConfigured?.globalVolume ?? 1, 1),
     hasBackgroundMusic,
     hasPrimaryAudio,
     hasSoundEffects,
@@ -365,12 +367,55 @@ function buildAudioPlan(primaryAudioTrack, backgroundMusicTrack, stopMode, visua
 }
 function buildAudioMixMetadata(audioPlan) {
   const soundEffectsLayers = Array.isArray(audioPlan.soundEffectsMetadata?.layers) ? audioPlan.soundEffectsMetadata.layers : [];
+  const soundEffectsGlobalGuard = audioPlan.soundEffectsMetadata?.globalGuard && typeof audioPlan.soundEffectsMetadata.globalGuard === 'object'
+    ? audioPlan.soundEffectsMetadata.globalGuard
+    : null;
+  const amixInputCount = [
+    audioPlan.hasPrimaryAudio,
+    audioPlan.hasBackgroundMusic,
+    ...audioPlan.soundEffectsEvents.map(() => true),
+  ].filter(Boolean).length;
+  const soundEffectsEffectiveGains = audioPlan.soundEffectsEvents.map((event, index) => ({
+    effectiveGain: getSoundEffectEffectiveGain(event, audioPlan.soundEffectsVolume),
+    eventIndex: index,
+    itemId: String(event?.itemId || '').trim(),
+    layerGain: normalizeAudioVolume(event?.volume ?? 1, 1),
+    layerId: String(event?.layerId || '').trim(),
+    layerIndex: Number.isFinite(Number(event?.layerIndex)) ? Number(event.layerIndex) : null,
+    globalGain: audioPlan.soundEffectsVolume,
+  }));
+  const effectiveGains = {
+    backgroundMusic: audioPlan.hasBackgroundMusic ? audioPlan.backgroundMusicVolume : null,
+    narration: audioPlan.hasPrimaryAudio ? audioPlan.narrationVolume : null,
+    soundEffects: audioPlan.hasSoundEffects ? audioPlan.soundEffectsVolume : null,
+    soundEffectsEvents: soundEffectsEffectiveGains,
+  };
   return {
+    amixInputCount,
+    amixNormalize: false,
+    amixNormalizeExplicit: true,
     backgroundMusicLooping: audioPlan.hasBackgroundMusic ? audioPlan.shouldLoopBackgroundMusic : false,
     backgroundMusicVolume: audioPlan.backgroundMusicVolume,
+    clippingPreventionApplied: false,
+    effectiveGains,
+    gainStaging: {
+      amixNormalize: false,
+      amixNormalizeExplicit: true,
+      clippingPreventionApplied: false,
+      effectiveGains,
+      limiterApplied: false,
+      sourceRelative: true,
+    },
+    limiterApplied: false,
     narrationVolume: audioPlan.narrationVolume,
     soundEffectsEnabled: audioPlan.soundEffectsEnabled,
     soundEffectsEventCount: audioPlan.soundEffectsEvents.length,
+    soundEffectsGlobalGuardEnabled: Boolean(soundEffectsGlobalGuard?.enabled),
+    soundEffectsGlobalMaxSimultaneous: soundEffectsGlobalGuard?.maxSimultaneous ?? null,
+    soundEffectsGlobalMinSpacingSeconds: soundEffectsGlobalGuard?.minSpacingSeconds ?? null,
+    soundEffectsGlobalVolume: audioPlan.soundEffectsVolume,
+    soundEffectsGlobalMovedEventCount: Number(soundEffectsGlobalGuard?.movedEventCount || 0) || 0,
+    soundEffectsGlobalSkippedEventCount: Number(soundEffectsGlobalGuard?.skippedEventCount || 0) || 0,
     soundEffectsInputCount: audioPlan.soundEffectsEvents.length,
     soundEffectsLayerCount: soundEffectsLayers.length,
     soundEffectsVolume: audioPlan.soundEffectsVolume,
@@ -434,9 +479,23 @@ async function resolveSoundEffectEventsForExport(soundEffectsPlan, visualDuratio
 
 function buildSoundEffectsExportMetadata(soundEffectsPlan, soundEffectsExport) {
   const enabled = soundEffectsPlan?.enabled === true;
+  const globalGain = normalizeAudioVolume(soundEffectsPlan?.volume ?? soundEffectsPlan?.requested?.globalVolume ?? 1, 1);
   const safeEvents = (soundEffectsExport?.events || []).map((event) => {
     const { filePath, ...safeEvent } = event || {};
-    return serializeArtifactForUi(safeEvent);
+    const layerGain = normalizeAudioVolume(event?.volume ?? 1, 1);
+    const effectiveGain = getSoundEffectEffectiveGain(event, globalGain);
+    return serializeArtifactForUi({
+      ...safeEvent,
+      effectiveGain,
+      gain: {
+        effectiveGain,
+        globalGain,
+        layerGain,
+        sourceRelative: true,
+      },
+      globalVolume: globalGain,
+      layerVolume: layerGain,
+    });
   });
   const layers = Array.isArray(soundEffectsPlan?.layers)
     ? soundEffectsPlan.layers.map((layer, index) => {
@@ -450,6 +509,8 @@ function buildSoundEffectsExportMetadata(soundEffectsPlan, soundEffectsExport) {
       });
       return serializeArtifactForUi({
         ...(layer || {}),
+        effectiveVolume: normalizeAudioVolume(layer?.volume ?? 1, 1) * globalGain,
+        globalVolume: globalGain,
         scheduledEventCount: scheduledEvents.length,
         scheduledEvents,
       });
@@ -477,6 +538,12 @@ function getSoundEffectsAudioMode(baseMode, hasSoundEffects) {
 
 function formatDelayMilliseconds(value) {
   return String(Math.max(0, Math.round((Number(value || 0) || 0) * 1000)));
+}
+
+function getSoundEffectEffectiveGain(event, globalVolume) {
+  const layerGain = normalizeAudioVolume(event?.volume ?? 1, 1);
+  const globalGain = normalizeAudioVolume(globalVolume, 1);
+  return Math.round(layerGain * globalGain * 1000) / 1000;
 }
 
 function buildSoundEffectFilterChain(inputIndex, event, index, volume, fadeSeconds) {
@@ -716,11 +783,11 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     audioMixLabels.push('[music]');
   }
   audioPlan.soundEffectsEvents.forEach((event, index) => {
-    audioFilters.push(buildSoundEffectFilterChain(firstSoundEffectInputIndex + index, event, index, event.volume ?? audioPlan.soundEffectsVolume, event.fadeSeconds ?? audioPlan.soundEffectsFadeSeconds));
+    audioFilters.push(buildSoundEffectFilterChain(firstSoundEffectInputIndex + index, event, index, getSoundEffectEffectiveGain(event, audioPlan.soundEffectsVolume), event.fadeSeconds ?? audioPlan.soundEffectsFadeSeconds));
     audioMixLabels.push(`[sfx${index}]`);
   });
   if (audioMixLabels.length > 1) {
-    audioFilters.push(`${audioMixLabels.join('')}amix=inputs=${audioMixLabels.length}:duration=longest:dropout_transition=2[aout]`);
+    audioFilters.push(`${audioMixLabels.join('')}amix=inputs=${audioMixLabels.length}:duration=longest:dropout_transition=2:normalize=${MEDIA_COMPOSITION_AMIX_NORMALIZE}[aout]`);
     audioMapTarget = '[aout]';
   } else if (audioMixLabels.length === 1) {
     audioFilters.push(`${audioMixLabels[0]}anull[aout]`);
@@ -828,7 +895,7 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
   artifact.summary = summarizeArtifact(artifact);
 
   const soundEffectsSummary = audioPlan.hasSoundEffects
-    ? ` Sound effects: ${audioPlan.soundEffectsEvents.length} scheduled at ${formatVolumePercent(audioPlan.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME)}%.`
+    ? ` Sound effects: ${audioPlan.soundEffectsEvents.length} scheduled at ${formatVolumePercent(audioPlan.soundEffectsVolume, 1)}%.`
     : '';
   const baseMessage = audioPlan.hasPrimaryAudio && audioPlan.hasBackgroundMusic
     ? `Media Export rendered a video from ${visualItems.length} images with background music at ${formatVolumePercent(audioPlan.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME)}% and narration at ${formatVolumePercent(audioPlan.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME)}%.`

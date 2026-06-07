@@ -36,8 +36,10 @@ const {
 } = require('./pipelineArtifactService');
 const {
   DEFAULT_PLANNING_SCHEMA_ID,
+  LONGFORM_SCENE_PLAN_SCHEMA_ID,
   buildPlanReviewDocument,
   buildPlanTextCollectionItems,
+  buildDeterministicPlanFromPacket,
   buildPlanningPacketDocument,
   buildPlanningSchemaStructuredOutputRequest,
   buildPlannerPrompt,
@@ -88,6 +90,8 @@ const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationS
 const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
+  DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
@@ -140,6 +144,12 @@ let activeRunAbortController = null;
 let pendingValidationControl = null;
 
 const PLANNER_PROVIDER_TIMEOUT_MS = 60000;
+const LONGFORM_CHUNKED_PLANNER_THRESHOLD_SECONDS = 60;
+const LONGFORM_CHUNK_TARGET_DURATION_SECONDS = 60;
+const LONGFORM_CHUNK_MAX_DURATION_SECONDS = 90;
+const LONGFORM_CHUNK_CONTEXT_OVERLAP_SECONDS = 5;
+const LONGFORM_CHUNK_RECENT_PROMPT_COUNT = 5;
+const LONGFORM_CHUNK_MAX_REQUEST_CHARACTERS = 14000;
 const MEDIA_COMPOSITION_TRANSITION_CATEGORY_BY_ID = new Map(
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES.map((category) => [String(category.id || '').trim(), category]),
 );
@@ -157,20 +167,104 @@ function formatMediaCompositionVolumePercent(value, fallback) {
   return Math.round(normalizeMediaCompositionVolume(value, fallback) * 100);
 }
 
+function buildMediaCompositionAudioMixConfig(effectiveConfig, soundEffectsPlan) {
+  const backgroundMusicVolume = normalizeMediaCompositionVolume(effectiveConfig.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME);
+  const narrationVolume = normalizeMediaCompositionVolume(effectiveConfig.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME);
+  const soundEffectsVolume = normalizeMediaCompositionVolume(effectiveConfig.soundEffectsGlobalVolume ?? soundEffectsPlan.volume, 1);
+  return {
+    backgroundMusicVolume,
+    narrationVolume,
+    soundEffectsVolume,
+    gainStaging: {
+      amixNormalize: false,
+      clippingPreventionApplied: false,
+      effectiveGains: {
+        backgroundMusic: backgroundMusicVolume,
+        narration: narrationVolume,
+        soundEffects: soundEffectsVolume,
+      },
+      limiterApplied: false,
+      sourceRelative: true,
+    },
+  };
+}
+
+function normalizeMediaCompositionBoolean(value) {
+  return value === true || value === 'true' || value === 1 || value === '1';
+}
+
+function normalizeMediaCompositionSeconds(value, fallback, minValue = 0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.round(Math.max(minValue, numeric) * 1000) / 1000;
+}
+
+function normalizeMediaCompositionSoundEffectsRetryLayers(value, fallbackLayers = []) {
+  const sourceLayers = Array.isArray(value) ? value : [];
+  const fallbackByIndex = Array.isArray(fallbackLayers) ? fallbackLayers : [];
+  return sourceLayers.map((layer, index) => {
+    const fallback = fallbackByIndex[index] && typeof fallbackByIndex[index] === 'object' ? fallbackByIndex[index] : {};
+    const source = layer && typeof layer === 'object' ? layer : {};
+    return {
+      ...fallback,
+      ...source,
+      volume: normalizeMediaCompositionVolume(source.volume ?? fallback.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
+    };
+  });
+}
+
 function buildMediaCompositionRetryOverrideConfig(value) {
   const source = value && typeof value === 'object' ? value : {};
-  const hasNarrationVolume = Object.prototype.hasOwnProperty.call(source, 'narrationVolume');
-  const hasBackgroundMusicVolume = Object.prototype.hasOwnProperty.call(source, 'backgroundMusicVolume');
   const config = {};
-  if (hasNarrationVolume) {
+  if (Object.prototype.hasOwnProperty.call(source, 'narrationVolume')) {
     config.narrationVolume = normalizeMediaCompositionVolume(source.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME);
   }
-  if (hasBackgroundMusicVolume) {
+  if (Object.prototype.hasOwnProperty.call(source, 'backgroundMusicVolume')) {
     config.backgroundMusicVolume = normalizeMediaCompositionVolume(source.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'soundEffectsEnabled')) {
+    config.soundEffectsEnabled = normalizeMediaCompositionBoolean(source.soundEffectsEnabled);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'soundEffectsVolume')) {
+    config.soundEffectsVolume = normalizeMediaCompositionVolume(source.soundEffectsVolume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'soundEffectsGlobalVolume')) {
+    config.soundEffectsGlobalVolume = normalizeMediaCompositionVolume(source.soundEffectsGlobalVolume, 1);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'soundEffectsLayers')) {
+    config.soundEffectsLayers = normalizeMediaCompositionSoundEffectsRetryLayers(source.soundEffectsLayers);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'soundEffectsGlobalGuardEnabled')) {
+    config.soundEffectsGlobalGuardEnabled = normalizeMediaCompositionBoolean(source.soundEffectsGlobalGuardEnabled);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'soundEffectsGlobalMinSpacingSeconds')) {
+    config.soundEffectsGlobalMinSpacingSeconds = normalizeMediaCompositionSeconds(source.soundEffectsGlobalMinSpacingSeconds, DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS, 0);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'soundEffectsGlobalMaxSimultaneous')) {
+    config.soundEffectsGlobalMaxSimultaneous = Math.max(1, Math.min(8, Math.floor(Number(source.soundEffectsGlobalMaxSimultaneous || 1) || 1)));
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'sceneTransitionMode')) {
+    config.sceneTransitionMode = normalizeMediaCompositionTransitionMode(source.sceneTransitionMode);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'sceneTransitionName')) {
+    config.sceneTransitionName = normalizeMediaCompositionTransitionName(source.sceneTransitionName);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'sceneTransitionCategory')) {
+    config.sceneTransitionCategory = normalizeMediaCompositionTransitionCategory(source.sceneTransitionCategory);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'sceneTransitionDurationSeconds')) {
+    config.sceneTransitionDurationSeconds = normalizeMediaCompositionTransitionDuration(source.sceneTransitionDurationSeconds);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'imageTimingMode')) {
+    config.imageTimingMode = normalizeMediaCompositionImageTimingMode(source.imageTimingMode);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'secondsPerItem')) {
+    config.secondsPerItem = normalizeMediaCompositionSeconds(source.secondsPerItem, 4, 0.1);
   }
   return Object.keys(config).length ? config : null;
 }
-
 function getMediaCompositionEffectiveConfig(node, run) {
   const retryOverride = run?.retryOverridesByNodeId?.[node.id]?.mediaComposition || null;
   const retryConfig = buildMediaCompositionRetryOverrideConfig(retryOverride);
@@ -187,6 +281,7 @@ function getCompositionAudioMixForRetryControls(artifact) {
   return {
     narrationVolume: normalizeMediaCompositionVolume(audioMix?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
     backgroundMusicVolume: normalizeMediaCompositionVolume(audioMix?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    soundEffectsGlobalVolume: normalizeMediaCompositionVolume(audioMix?.soundEffectsVolume, 1),
   };
 }
 
@@ -1764,12 +1859,15 @@ function collectStructuredReplyCandidates(replyText) {
   }
 
   const candidates = [];
-  const pushCandidate = (value) => {
+  const pushCandidate = (value, repaired = false) => {
     const normalized = String(value || '').trim();
-    if (!normalized || candidates.includes(normalized)) {
+    if (!normalized || candidates.some((candidate) => candidate.text === normalized)) {
       return;
     }
-    candidates.push(normalized);
+    candidates.push({
+      repaired,
+      text: normalized,
+    });
   };
 
   pushCandidate(raw);
@@ -1783,35 +1881,463 @@ function collectStructuredReplyCandidates(replyText) {
     pushCandidate(objectMatch[0]);
   }
 
+  const firstObjectIndex = raw.indexOf('{');
+  const lastObjectIndex = raw.lastIndexOf('}');
+  if (firstObjectIndex >= 0 && lastObjectIndex > firstObjectIndex) {
+    pushCandidate(raw.slice(firstObjectIndex, lastObjectIndex + 1));
+  }
+
+  for (const candidate of [...candidates]) {
+    pushCandidate(candidate.text.replace(/,\s*([}\]])/g, '$1'), true);
+  }
+
   return candidates;
 }
 
-function parsePlannerReply(schemaId, replyText) {
+function classifyPlannerValidationFailure(errors = []) {
+  const text = (Array.isArray(errors) ? errors : []).join(' ').toLowerCase();
+  if (/image prompt|imageprompt/.test(text)) {
+    return 'missing-image-prompt';
+  }
+  if (/startseconds|endseconds|durationseconds|timing|duration|start|end/.test(text)) {
+    return 'missing-timing-fields';
+  }
+  if (/scene|scenes|minimum|at least|too few/.test(text)) {
+    return 'too-few-scenes';
+  }
+  return 'schema-invalid';
+}
+
+function parsePlannerReplyDetailed(schemaId, replyText, options = {}) {
   const raw = String(replyText || '').trim();
   if (!raw) {
-    throw new Error('The planner returned an empty reply.');
+    const error = new Error('The planner returned an empty reply.');
+    error.failureReason = 'empty-response';
+    error.userMessage = 'The planner returned an empty reply.';
+    throw error;
   }
 
   let schemaError = '';
+  let schemaFailureReason = 'schema-invalid';
+  let parsedJson = false;
   for (const candidate of collectStructuredReplyCandidates(raw)) {
     try {
-      const parsed = JSON.parse(candidate);
-      const validation = validatePlanAgainstSchema(schemaId, parsed);
+      const parsed = JSON.parse(candidate.text);
+      parsedJson = true;
+      const validation = validatePlanAgainstSchema(schemaId, parsed, options);
       if (validation.ok) {
-        return validation.value;
+        return {
+          jsonRepairAttempted: Boolean(candidate.repaired),
+          plan: validation.value,
+          rawPlan: parsed,
+          repairedBySchema: Array.isArray(parsed.scenes) && Array.isArray(validation.value?.scenes)
+            ? validation.value.scenes.length > parsed.scenes.length
+            : false,
+        };
       }
 
       schemaError = validation.errors[0] || 'The planner reply did not match the expected plan shape.';
+      schemaFailureReason = classifyPlannerValidationFailure(validation.errors);
     } catch {
       continue;
     }
   }
 
   if (schemaError) {
-    throw new Error(schemaError);
+    const error = new Error(schemaError);
+    error.failureReason = schemaFailureReason;
+    error.userMessage = schemaFailureReason === 'missing-image-prompt'
+      ? 'The planner returned JSON, but one or more scenes were missing clean image prompts.'
+      : schemaFailureReason === 'missing-timing-fields'
+        ? 'The planner returned JSON, but one or more scenes were missing usable timing fields.'
+        : 'The planner returned JSON, but it did not match the required plan schema.';
+    throw error;
   }
 
-  throw new Error('The planner reply was not valid JSON. Ask the model to return JSON only for this planner step.');
+  const error = new Error('The planner reply was not valid JSON. Ask the model to return JSON only for this planner step.');
+  error.failureReason = parsedJson ? 'malformed-json' : 'invalid-json';
+  error.userMessage = 'The planner reply was not valid JSON.';
+  throw error;
+}
+
+function parsePlannerReply(schemaId, replyText, options = {}) {
+  return parsePlannerReplyDetailed(schemaId, replyText, options).plan;
+}
+
+function getPlannerRequestTextLength(messages = []) {
+  return (Array.isArray(messages) ? messages : []).reduce((total, message) => {
+    const content = message?.content;
+    if (Array.isArray(content)) {
+      return total + content.reduce((innerTotal, part) => innerTotal + String(part?.text || '').length, 0);
+    }
+
+    return total + String(content || '').length;
+  }, 0);
+}
+
+function getPacketTranscriptDurationSeconds(packet = {}) {
+  const sourceArtifacts = Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts : [];
+  const candidates = sourceArtifacts
+    .map((artifact) => Number(artifact?.transcription?.durationSeconds || 0) || 0)
+    .filter((duration) => duration > 0);
+  if (candidates.length) {
+    return Math.max(...candidates);
+  }
+
+  const segmentEnds = sourceArtifacts.flatMap((artifact) => (
+    Array.isArray(artifact?.transcription?.segments)
+      ? artifact.transcription.segments.map((segment) => Number(segment?.end ?? segment?.endSeconds ?? 0) || 0)
+      : []
+  )).filter((duration) => duration > 0);
+  return segmentEnds.length ? Math.max(...segmentEnds) : 0;
+}
+
+function estimatePlannerSceneCount(packet = {}) {
+  const durationSeconds = getPacketTranscriptDurationSeconds(packet);
+  if (durationSeconds > 0) {
+    return Math.max(1, Math.min(90, Math.ceil(durationSeconds / 8)));
+  }
+
+  const sourceText = [
+    packet.sourceSummary,
+    ...(Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts : []).map((artifact) => artifact?.textExcerpt || artifact?.summary || ''),
+    packet.workingNotes,
+  ].join(' ');
+  const wordCount = sourceText.split(/\s+/).filter(Boolean).length;
+  return Math.max(1, Math.min(90, Math.ceil(Math.max(1, wordCount) / 70)));
+}
+
+function estimatePlannerMaxOutputTokens(schemaId, packet = {}) {
+  if (String(schemaId || '').trim() !== DEFAULT_PLANNING_SCHEMA_ID && String(packet?.schemaId || '').trim() !== DEFAULT_PLANNING_SCHEMA_ID) {
+    return 4096;
+  }
+
+  const sceneCount = estimatePlannerSceneCount(packet);
+  return Math.max(4096, Math.min(8192, 1600 + (sceneCount * 420)));
+}
+
+function clonePlannerValue(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+function normalizePlannerSeconds(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.round(numeric * 1000) / 1000 : null;
+}
+
+function getPlannerFallbackSecondsPerImage(packet = {}) {
+  const notes = [
+    packet?.desiredOutput?.notes,
+    packet?.workingNotes,
+    packet?.goal,
+  ].map((entry) => String(entry || '')).join(' ');
+  const match = notes.match(/fallback\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)?\s*(?:per|\/)?\s*(?:image|item|scene)/i);
+  const numeric = Number(packet?.desiredOutput?.fallbackSecondsPerImage || packet?.fallbackSecondsPerImage || match?.[1]);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric * 1000) / 1000 : 8;
+}
+
+function getLongformTranscriptSegments(packet = {}) {
+  const segments = [];
+  (Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts : []).forEach((artifact) => {
+    const transcription = artifact?.transcription && typeof artifact.transcription === 'object'
+      ? artifact.transcription
+      : null;
+    if (!transcription) {
+      return;
+    }
+
+    (Array.isArray(transcription.segments) ? transcription.segments : []).forEach((segment, index) => {
+      const text = String(segment?.text || '').replace(/\s+/g, ' ').trim();
+      if (!text) {
+        return;
+      }
+      const startSeconds = normalizePlannerSeconds(segment?.start ?? segment?.startSeconds) ?? 0;
+      const endSeconds = normalizePlannerSeconds(segment?.end ?? segment?.endSeconds) ?? startSeconds;
+      segments.push({
+        artifactDisplayName: String(artifact.displayName || artifact.fileName || artifact.kind || 'Transcript').trim(),
+        endSeconds,
+        id: String(segment?.id || segment?.segmentId || segment?.index || index).trim() || String(index),
+        index: segments.length,
+        startSeconds,
+        text,
+      });
+    });
+  });
+
+  return segments
+    .filter((segment) => segment.endSeconds > segment.startSeconds)
+    .sort((left, right) => left.startSeconds - right.startSeconds);
+}
+
+function getLongformPlannerDurationSeconds(packet = {}, segments = getLongformTranscriptSegments(packet)) {
+  return normalizePlannerSeconds(getPacketTranscriptDurationSeconds(packet))
+    || normalizePlannerSeconds(Math.max(0, ...segments.map((segment) => segment.endSeconds)))
+    || 0;
+}
+
+function shouldUseChunkedLongformPlanner(schemaId, packet = {}) {
+  if (String(schemaId || '').trim() !== LONGFORM_SCENE_PLAN_SCHEMA_ID) {
+    return false;
+  }
+  const segments = getLongformTranscriptSegments(packet);
+  const durationSeconds = getLongformPlannerDurationSeconds(packet, segments);
+  return durationSeconds > LONGFORM_CHUNKED_PLANNER_THRESHOLD_SECONDS && segments.length > 0;
+}
+
+function normalizeGlobalSummaryList(entries = [], limit = 5) {
+  return [...new Set((Array.isArray(entries) ? entries : [])
+    .map((entry) => String(entry || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean))]
+    .slice(0, limit);
+}
+
+function extractCapitalizedPlannerEntities(text, limit = 6) {
+  const counts = new Map();
+  for (const match of String(text || '').matchAll(/\b[A-Z][a-zA-Z0-9'-]{2,}(?:\s+[A-Z][a-zA-Z0-9'-]{2,}){0,2}\b/g)) {
+    const value = match[0].trim();
+    if (/^(The|This|That|Local AI Hub|Windows)$/.test(value)) {
+      continue;
+    }
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1])
+    .map(([value]) => value)
+    .slice(0, limit);
+}
+
+function buildLongformGlobalSummary(packet = {}, segments = [], totalDurationSeconds = 0) {
+  const transcriptPreview = trimPreviewText(segments.map((segment) => segment.text).join(' '), 900);
+  const goal = String(packet.goal || '').trim();
+  const sourceSummary = String(packet.sourceSummary || '').trim();
+  const stylePolicy = normalizeGlobalSummaryList(packet.stylePolicy, 4);
+  const constraints = normalizeGlobalSummaryList(packet.constraints, 4);
+  const workingNotes = String(packet.workingNotes || '').trim();
+  const allText = [goal, sourceSummary, transcriptPreview, workingNotes].filter(Boolean).join(' ');
+  return {
+    overallSubject: trimPreviewText(goal || sourceSummary || transcriptPreview || 'Longform narration slideshow', 220),
+    toneStyle: trimPreviewText(stylePolicy.join(' | ') || constraints.join(' | ') || 'Clear, grounded, timing-aware slideshow visuals.', 220),
+    recurringCharactersEntities: extractCapitalizedPlannerEntities(allText, 6),
+    recurringLocationsSettings: normalizeGlobalSummaryList((allText.match(/\b(?:forest|city|room|studio|street|home|office|lab|school|kitchen|porch|gate|path|garden|workshop|market|beach|mountain|village)\b/gi) || []), 6),
+    visualMotifs: normalizeGlobalSummaryList((allText.match(/\b(?:light|shadow|window|camera|screen|map|hands|portrait|night|sunrise|rain|smoke|candle|moon|machine|tool)\b/gi) || []), 6),
+    continuityNotes: [
+      'Keep recurring subjects visually consistent across chunks.',
+      'Use previous chunk context only for continuity; do not duplicate planned time.',
+      'Total narration duration is ' + String(totalDurationSeconds) + ' seconds.',
+    ],
+    desiredVisualStyle: trimPreviewText([stylePolicy.join(' | '), constraints.join(' | '), packet?.desiredOutput?.notes].filter(Boolean).join(' | '), 260),
+  };
+}
+
+function splitLongformTranscriptChunks(segments = [], totalDurationSeconds = 0, targetDurationSeconds = LONGFORM_CHUNK_TARGET_DURATION_SECONDS) {
+  const durationSeconds = normalizePlannerSeconds(totalDurationSeconds) || normalizePlannerSeconds(Math.max(0, ...segments.map((segment) => segment.endSeconds))) || 0;
+  const chunks = [];
+  let chunkStart = 0;
+  while (chunkStart < durationSeconds - 0.001) {
+    const chunkEnd = Math.min(durationSeconds, chunkStart + Math.min(targetDurationSeconds, LONGFORM_CHUNK_MAX_DURATION_SECONDS));
+    const currentSegments = segments.filter((segment) => segment.startSeconds < chunkEnd && segment.endSeconds > chunkStart);
+    const contextSegments = segments.filter((segment) => segment.endSeconds <= chunkStart && segment.endSeconds >= chunkStart - LONGFORM_CHUNK_CONTEXT_OVERLAP_SECONDS).slice(-1);
+    chunks.push({
+      contextSegments,
+      durationSeconds: normalizePlannerSeconds(chunkEnd - chunkStart) || (chunkEnd - chunkStart),
+      endSeconds: normalizePlannerSeconds(chunkEnd) || chunkEnd,
+      index: chunks.length,
+      segments: currentSegments,
+      startSeconds: normalizePlannerSeconds(chunkStart) || 0,
+    });
+    chunkStart = chunkEnd;
+  }
+  return chunks.filter((chunk) => chunk.segments.length);
+}
+
+function getChunkMinimumImageCount(chunk, fallbackSecondsPerImage) {
+  const fallback = Number(fallbackSecondsPerImage || 0) > 0 ? Number(fallbackSecondsPerImage) : 8;
+  return Math.max(1, Math.ceil((Number(chunk?.durationSeconds || 0) || 0) / fallback));
+}
+
+function buildChunkPacket(packet, chunk, options = {}) {
+  const fallbackSecondsPerImage = options.fallbackSecondsPerImage || getPlannerFallbackSecondsPerImage(packet);
+  const chunkMinimumImageCount = getChunkMinimumImageCount(chunk, fallbackSecondsPerImage);
+  const relativeSegments = (Array.isArray(chunk.segments) ? chunk.segments : []).map((segment) => ({
+    id: segment.id,
+    start: normalizePlannerSeconds(Math.max(0, segment.startSeconds - chunk.startSeconds)) ?? 0,
+    end: normalizePlannerSeconds(Math.min(chunk.durationSeconds, segment.endSeconds - chunk.startSeconds)) ?? chunk.durationSeconds,
+    text: segment.text,
+  })).filter((segment) => segment.end > segment.start);
+  const contextSegments = (Array.isArray(chunk.contextSegments) ? chunk.contextSegments : []).map((segment) => ({
+    id: segment.id,
+    originalStartSeconds: segment.startSeconds,
+    originalEndSeconds: segment.endSeconds,
+    text: trimPreviewText(segment.text, 220),
+  }));
+  const previousChunkSummary = options.previousChunkSummary || null;
+  const recentImagePrompts = normalizeGlobalSummaryList(options.recentImagePrompts, LONGFORM_CHUNK_RECENT_PROMPT_COUNT);
+  const globalSummary = options.globalSummary || {};
+  const chunkNotes = {
+    chunkIndex: chunk.index + 1,
+    chunkStartSeconds: chunk.startSeconds,
+    chunkEndSeconds: chunk.endSeconds,
+    chunkDurationSeconds: chunk.durationSeconds,
+    chunkMinimumImageCount,
+    timingInstruction: 'Return scene startSeconds and endSeconds relative to this chunk: 0 through ' + chunk.durationSeconds + '. Local AI Hub will offset them back to the full narration timeline.',
+    previousContextOnlySegments: contextSegments,
+    previousChunkSummary,
+    recentImagePrompts,
+  };
+  return {
+    ...clonePlannerValue(packet),
+    sourceSummary: 'Compact global summary / visual continuity packet:\n' + JSON.stringify(globalSummary),
+    sourceArtifacts: [{
+      displayName: 'Chunk ' + String(chunk.index + 1) + ' timed transcript',
+      kind: 'text',
+      textExcerpt: relativeSegments.map((segment) => segment.text).join(' '),
+      transcription: {
+        durationSeconds: chunk.durationSeconds,
+        segmentCount: relativeSegments.length,
+        segments: relativeSegments,
+      },
+    }],
+    desiredOutput: {
+      ...(packet.desiredOutput || {}),
+      fallbackSecondsPerImage,
+      notes: [
+        packet?.desiredOutput?.notes,
+        'This is chunk ' + String(chunk.index + 1) + '. Return at least chunkMinimumImageCount=' + String(chunkMinimumImageCount) + ' scenes for this chunk only.',
+      ].filter(Boolean).join('\n'),
+    },
+    workingNotes: 'Chunk planning packet:\n' + JSON.stringify(chunkNotes),
+  };
+}
+
+function buildChunkPlannerGuidance(chunk, chunkMinimumImageCount, fallbackSecondsPerImage) {
+  return [
+    'Chunked longform planner instructions:',
+    'Plan only this chunk. Do not plan before chunkStartSeconds or after chunkEndSeconds.',
+    'Return at least chunkMinimumImageCount scenes for this chunk: ' + String(chunkMinimumImageCount) + '.',
+    'fallbackSecondsPerImage for this chunk is ' + String(fallbackSecondsPerImage) + '.',
+    'Use previous context only for visual continuity. Do not duplicate overlap/context segments as output scenes.',
+    'Every scene must include imagePrompt, startSeconds, endSeconds, durationSeconds, narrationExcerpt, and sourceTranscriptSegmentIds.',
+    'Scene timing must be relative to the chunk packet transcript, from 0 to ' + String(chunk.durationSeconds) + ' seconds.',
+    'Keep imagePrompt clean: no labels, timing metadata, transcript ids, or narrative-analysis fields.',
+    'Return JSON only.',
+  ].join('\n');
+}
+
+function summarizeChunkPlan(plan) {
+  const scenes = Array.isArray(plan?.scenes) ? plan.scenes : [];
+  return trimPreviewText(scenes.map((scene) => scene.sceneConcept || scene.narrationExcerpt || scene.imagePrompt || '').filter(Boolean).join(' | '), 480);
+}
+
+function offsetChunkScenes(plan, chunk) {
+  return (Array.isArray(plan?.scenes) ? plan.scenes : []).map((scene, index) => {
+    const relativeStart = normalizePlannerSeconds(scene.startSeconds) ?? 0;
+    const relativeEnd = normalizePlannerSeconds(scene.endSeconds) ?? normalizePlannerSeconds(relativeStart + (scene.durationSeconds || 0.1)) ?? relativeStart + 0.1;
+    const startSeconds = normalizePlannerSeconds(Math.max(chunk.startSeconds, Math.min(chunk.endSeconds, chunk.startSeconds + relativeStart))) ?? chunk.startSeconds;
+    const endSeconds = normalizePlannerSeconds(Math.max(startSeconds + 0.1, Math.min(chunk.endSeconds, chunk.startSeconds + relativeEnd))) ?? (startSeconds + 0.1);
+    return {
+      ...scene,
+      sceneId: 'chunk-' + String(chunk.index + 1) + '-scene-' + String(index + 1),
+      startSeconds,
+      endSeconds,
+      durationSeconds: normalizePlannerSeconds(endSeconds - startSeconds) || 0.1,
+    };
+  });
+}
+
+function reconcileMergedLongformScenes(scenes = [], totalDurationSeconds = 0) {
+  const durationSeconds = normalizePlannerSeconds(totalDurationSeconds) || Math.max(0, ...scenes.map((scene) => Number(scene.endSeconds || 0) || 0));
+  const sortedScenes = (Array.isArray(scenes) ? scenes : [])
+    .filter((scene) => scene && typeof scene === 'object')
+    .sort((left, right) => (Number(left.startSeconds || 0) || 0) - (Number(right.startSeconds || 0) || 0));
+  let cursor = 0;
+  return sortedScenes.map((scene, index) => {
+    let startSeconds = normalizePlannerSeconds(scene.startSeconds) ?? cursor;
+    let endSeconds = normalizePlannerSeconds(scene.endSeconds) ?? normalizePlannerSeconds(startSeconds + (scene.durationSeconds || 0.1)) ?? startSeconds + 0.1;
+    if (index === 0) {
+      startSeconds = 0;
+    } else if (Math.abs(startSeconds - cursor) > 0.001) {
+      startSeconds = cursor;
+    }
+    if (endSeconds <= startSeconds) {
+      endSeconds = normalizePlannerSeconds(startSeconds + 0.1) ?? (startSeconds + 0.1);
+    }
+    if (durationSeconds && endSeconds > durationSeconds) {
+      endSeconds = durationSeconds;
+    }
+    cursor = endSeconds;
+    return {
+      ...scene,
+      sceneId: 'scene-' + String(index + 1),
+      startSeconds,
+      endSeconds,
+      durationSeconds: normalizePlannerSeconds(Math.max(0.1, endSeconds - startSeconds)) || 0.1,
+    };
+  }).map((scene, index, entries) => {
+    if (index === entries.length - 1 && durationSeconds && scene.endSeconds !== durationSeconds) {
+      const endSeconds = durationSeconds;
+      return {
+        ...scene,
+        endSeconds,
+        durationSeconds: normalizePlannerSeconds(Math.max(0.1, endSeconds - scene.startSeconds)) || scene.durationSeconds,
+      };
+    }
+    return scene;
+  });
+}
+
+function classifyPlannerFailure(error) {
+  const rawMessage = String(error?.userMessage || error?.message || error || '').trim();
+  const lower = rawMessage.toLowerCase();
+  if (/request too large|too large|context length|context.?window|maximum context|token limit|tpm limit|requested \d+|reduce the length|input is too long/.test(lower)) {
+    return {
+      failureReason: 'request-too-large',
+      userMessage: 'The planner request was too large for the selected provider or model.',
+    };
+  }
+  if (/rate.?limit|too many requests|429|tpm|tokens per minute|requests per minute/.test(lower)) {
+    return {
+      failureReason: 'rate-limit',
+      userMessage: 'The provider rate-limited this planner request.',
+    };
+  }
+  if (/quota|billing|credit|insufficient|payment/.test(lower)) {
+    return {
+      failureReason: 'quota',
+      userMessage: 'The provider reported a quota or billing limit for this planner request.',
+    };
+  }
+  if (/overload|high demand|capacity|temporarily unavailable|503|unavailable|busy/.test(lower)) {
+    return {
+      failureReason: 'provider-overload',
+      userMessage: 'The provider reported high demand or temporary overload for this planner request.',
+    };
+  }
+  if (/max.?output|max_tokens|output token|finish_reason|length/.test(lower)) {
+    return {
+      failureReason: 'output-token-limit',
+      userMessage: 'The planner response hit the model output limit before a complete plan was returned.',
+    };
+  }
+  if (/schema|response.?format|json schema|json mode|unsupported/.test(lower)) {
+    return {
+      failureReason: 'provider-schema-unsupported',
+      userMessage: 'The selected provider or model did not accept the requested JSON/schema planner mode.',
+    };
+  }
+  if (error?.failureReason) {
+    return {
+      failureReason: error.failureReason,
+      userMessage: error.userMessage || rawMessage,
+    };
+  }
+  return {
+    failureReason: 'planner-error',
+    userMessage: rawMessage || 'The planner could not complete this request.',
+  };
+}
+
+function estimateChunkPlannerMaxOutputTokens(chunkMinimumImageCount) {
+  return Math.max(2048, Math.min(8192, 1400 + (Math.max(1, chunkMinimumImageCount) * 520)));
 }
 
 function buildPlanValidationReview(artifact) {
@@ -2089,6 +2615,206 @@ function executePlanningPacketNode(node, graph, run, contextMaps) {
   };
 }
 
+async function executeChunkedLongformPlanner(options = {}) {
+  const {
+    buildPromptMessages,
+    fallbackSecondsPerImage,
+    model,
+    node,
+    packet,
+    plannerGuidance,
+    providerId,
+    providerLabel,
+    reportProgress,
+    schema,
+    schemaId,
+    sendPlannerRequest,
+  } = options;
+  const segments = getLongformTranscriptSegments(packet);
+  const totalDurationSeconds = getLongformPlannerDurationSeconds(packet, segments);
+  const globalSummary = buildLongformGlobalSummary(packet, segments, totalDurationSeconds);
+  let chunks = splitLongformTranscriptChunks(segments, totalDurationSeconds);
+  const chunkPlans = [];
+  const chunkFailures = [];
+  const chunkDiagnostics = [];
+  const recentImagePrompts = [];
+  let previousChunkSummary = null;
+  let retryAttempted = false;
+  let jsonRepairAttempted = false;
+  let deterministicFallbackUsed = false;
+
+  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+    const chunk = chunks[chunkIndex];
+    const chunkMinimumImageCount = getChunkMinimumImageCount(chunk, fallbackSecondsPerImage);
+    const chunkPacket = buildChunkPacket(packet, chunk, {
+      fallbackSecondsPerImage,
+      globalSummary,
+      previousChunkSummary,
+      recentImagePrompts,
+    });
+    const chunkGuidance = [
+      plannerGuidance,
+      buildChunkPlannerGuidance(chunk, chunkMinimumImageCount, fallbackSecondsPerImage),
+    ].filter(Boolean).join('\n\n');
+    const request = buildPromptMessages(chunkPacket, chunkGuidance);
+    const chunkLabel = 'chunk ' + String(chunk.index + 1) + ' of ' + String(chunks.length);
+
+    if (request.promptStats.requestCharacters > LONGFORM_CHUNK_MAX_REQUEST_CHARACTERS && chunk.durationSeconds > 20 && chunk.segments.length > 1) {
+      const midpoint = normalizePlannerSeconds(chunk.startSeconds + (chunk.durationSeconds / 2)) || ((chunk.startSeconds + chunk.endSeconds) / 2);
+      const replacement = [
+        {
+          contextSegments: chunk.contextSegments,
+          durationSeconds: normalizePlannerSeconds(midpoint - chunk.startSeconds) || (midpoint - chunk.startSeconds),
+          endSeconds: midpoint,
+          index: chunk.index,
+          segments: chunk.segments.filter((segment) => segment.startSeconds < midpoint && segment.endSeconds > chunk.startSeconds),
+          startSeconds: chunk.startSeconds,
+        },
+        {
+          contextSegments: chunk.segments.filter((segment) => segment.endSeconds <= midpoint).slice(-1),
+          durationSeconds: normalizePlannerSeconds(chunk.endSeconds - midpoint) || (chunk.endSeconds - midpoint),
+          endSeconds: chunk.endSeconds,
+          index: chunk.index + 1,
+          segments: chunk.segments.filter((segment) => segment.startSeconds < chunk.endSeconds && segment.endSeconds > midpoint),
+          startSeconds: midpoint,
+        },
+      ].filter((entry) => entry.durationSeconds > 0 && entry.segments.length);
+      if (replacement.length > 1) {
+        chunks.splice(chunkIndex, 1, ...replacement);
+        chunkIndex -= 1;
+        continue;
+      }
+    }
+
+    let parsed = null;
+    let fallbackReason = '';
+    try {
+      reportProgress?.('Planning ' + chunkLabel + ' with the compact global summary.', 'Running ' + node.label + ' with ' + providerLabel + '...');
+      const reply = await sendPlannerRequest(request.messages, false, {
+        chunkLabel,
+        maxOutputTokens: estimateChunkPlannerMaxOutputTokens(chunkMinimumImageCount),
+        statusMessage: 'Planning ' + chunkLabel + ' with ' + providerLabel + '.',
+      });
+      parsed = parsePlannerReplyDetailed(schemaId, reply, { sourcePacket: chunkPacket });
+      jsonRepairAttempted = jsonRepairAttempted || parsed.jsonRepairAttempted;
+    } catch (error) {
+      const classified = classifyPlannerFailure(error);
+      fallbackReason = classified.userMessage || classified.failureReason;
+      const shouldRetry = classified.failureReason !== 'request-too-large'
+        && request.promptStats.requestCharacters <= LONGFORM_CHUNK_MAX_REQUEST_CHARACTERS;
+      if (shouldRetry) {
+        retryAttempted = true;
+        const retryGuidance = [
+          chunkGuidance,
+          'Retry repair: the previous chunk planner attempt failed because ' + fallbackReason,
+          'Return one valid JSON object only for this chunk. Keep scenes concise and satisfy chunkMinimumImageCount.',
+        ].join('\n\n');
+        const retryRequest = buildPromptMessages(chunkPacket, retryGuidance);
+        try {
+          const retryReply = await sendPlannerRequest(retryRequest.messages, true, {
+            chunkLabel,
+            maxOutputTokens: estimateChunkPlannerMaxOutputTokens(chunkMinimumImageCount),
+            statusMessage: 'Retrying ' + chunkLabel + ' with stricter JSON-only guidance in ' + providerLabel + '.',
+          });
+          parsed = parsePlannerReplyDetailed(schemaId, retryReply, { sourcePacket: chunkPacket });
+          jsonRepairAttempted = jsonRepairAttempted || parsed.jsonRepairAttempted;
+          fallbackReason = '';
+        } catch (retryError) {
+          const retryClassified = classifyPlannerFailure(retryError);
+          fallbackReason = retryClassified.userMessage || retryClassified.failureReason;
+        }
+      }
+    }
+
+    let chunkPlan = parsed?.plan || null;
+    const rawSceneCount = Array.isArray(parsed?.rawPlan?.scenes) ? parsed.rawPlan.scenes.length : null;
+    const repairedTooFewScenes = Boolean(parsed?.repairedBySchema) || (rawSceneCount !== null && rawSceneCount < chunkMinimumImageCount);
+    if (!chunkPlan) {
+      deterministicFallbackUsed = true;
+      chunkFailures.push({
+        chunkIndex: chunk.index,
+        chunkStartSeconds: chunk.startSeconds,
+        chunkEndSeconds: chunk.endSeconds,
+        failureReason: fallbackReason || 'chunk-planner-failed',
+      });
+      chunkPlan = buildDeterministicPlanFromPacket(schemaId, chunkPacket, {
+        reason: fallbackReason || 'The planner could not produce a usable JSON plan for this chunk.',
+      });
+      reportProgress?.('Local AI Hub built a fallback plan for ' + chunkLabel + ' only.', 'Built fallback chunk plan.');
+    }
+
+    const offsetScenes = offsetChunkScenes(chunkPlan, chunk);
+    chunkPlans.push({
+      chunk,
+      chunkPlan,
+      scenes: offsetScenes,
+    });
+    previousChunkSummary = summarizeChunkPlan(chunkPlan);
+    recentImagePrompts.push(...offsetScenes.map((scene) => scene.imagePrompt).filter(Boolean));
+    while (recentImagePrompts.length > LONGFORM_CHUNK_RECENT_PROMPT_COUNT) {
+      recentImagePrompts.shift();
+    }
+    chunkDiagnostics.push({
+      chunkIndex: chunk.index,
+      chunkMinimumImageCount,
+      chunkStartSeconds: chunk.startSeconds,
+      chunkEndSeconds: chunk.endSeconds,
+      deterministicFallbackUsed: !parsed,
+      jsonRepairAttempted: Boolean(parsed?.jsonRepairAttempted),
+      requestCharacters: request.promptStats.requestCharacters,
+      returnedSceneCount: offsetScenes.length,
+      tooFewScenesRepaired: repairedTooFewScenes,
+    });
+  }
+
+  const mergedScenes = reconcileMergedLongformScenes(chunkPlans.flatMap((entry) => entry.scenes), totalDurationSeconds);
+  const mergedPlan = {
+    schemaId,
+    title: String(packet.title || schema?.label || 'Plan').replace(/\s+packet$/i, '').trim() || (schema?.label || 'Plan'),
+    timing: {
+      timingMode: 'transcriptSegments',
+      totalDurationSeconds,
+      fallbackSecondsPerImage,
+      minimumImageCount: Math.max(1, Math.ceil(totalDurationSeconds / fallbackSecondsPerImage)),
+      source: 'Chunked transcript planner',
+      coverageNotes: 'Chunked planner merged ' + String(chunks.length) + ' non-overlapping chunk plan(s) and reconciled the timeline from 0 to ' + String(totalDurationSeconds) + ' seconds.',
+    },
+    overview: {
+      meaningIntent: globalSummary.overallSubject || 'Create a usable longform scene plan from the narration.',
+      viewerTakeaway: globalSummary.overallSubject || 'The viewer should follow the narration beat by beat.',
+      narrativeArc: 'Follow the narration in source order across chunked planner passes.',
+      toneStrategy: globalSummary.toneStyle || 'Use grounded, clear slideshow visuals.',
+      continuityNotes: normalizeGlobalSummaryList(globalSummary.continuityNotes, 8),
+      riskNotes: chunkFailures.length
+        ? ['One or more chunks used deterministic fallback while the rest of the plan kept model-planned chunks.']
+        : ['Chunked planner used compact global context to preserve continuity without repeating the full transcript.'],
+    },
+    scenes: mergedScenes,
+    openQuestions: [],
+  };
+  const validation = validatePlanAgainstSchema(schemaId, mergedPlan, { sourcePacket: packet });
+  if (!validation.ok) {
+    throw new Error(validation.errors[0] || 'Local AI Hub could not merge the chunked scene plan.');
+  }
+
+  return {
+    diagnostics: {
+      chunkDiagnostics,
+      chunkFailures,
+      chunksPlanned: chunks.length,
+      deterministicFallbackUsed,
+      failureReason: chunkFailures.length ? 'chunk-fallback-used' : '',
+      fallbackReason: chunkFailures.length ? chunkFailures.map((entry) => entry.failureReason).filter(Boolean).join(' | ') : '',
+      globalSummary,
+      jsonRepairAttempted,
+      plannerMode: 'chunked',
+      retryAttempted,
+    },
+    firstRequestCharacters: chunkDiagnostics[0]?.requestCharacters || 0,
+    normalizedPlan: validation.value,
+  };
+}
+
 async function executePlannerNode(node, graph, run, contextMaps, reportProgress) {
   const packetArtifact = getNodeInputArtifact(node.id, 'packet', graph, run.resultsByNodeId, run);
   if (!packetArtifact || String(packetArtifact.kind || '').trim() !== PORT_KIND_PLANNING_PACKET) {
@@ -2110,42 +2836,13 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
   const schema = getPlanningSchemaDefinition(schemaId);
   const plannerRevisionGuidance = buildPlannerRevisionGuidance(getRetryCorrectionArtifactsForNode(node.id, graph, run));
   const plannerGuidance = [node.config?.instruction, plannerRevisionGuidance].map((entry) => String(entry || '').trim()).filter(Boolean).join('\n\n');
-  const plannerPrompt = buildPlannerPrompt(schemaId, packetValidation.value, {
-    guidance: plannerGuidance,
-    systemPrompt: node.config?.systemPrompt,
-  });
   const plannerResponseFormat = buildPlanningSchemaStructuredOutputRequest(schemaId);
-  const messages = [];
-  if (plannerPrompt.systemPrompt) {
-    messages.push({
-      role: 'system',
-      content: plannerPrompt.systemPrompt,
-    });
-  }
-  messages.push({
-    role: 'user',
-    content: plannerPrompt.userPrompt,
-  });
 
   let providerId = '';
   let providerLabel = 'Cloud provider';
-  let reply = '';
+  const plannerMaxOutputTokens = estimatePlannerMaxOutputTokens(schemaId, packetValidation.value);
 
-  if (executionMode === 'ollama') {
-    const ollamaTool = await getInstalledToolOrThrow(
-      contextMaps,
-      'ollama',
-      'Install Ollama before using a local Planner step in a pipeline.',
-    );
-    reportProgress?.('Sending the planning packet to Ollama for structured planning.', 'Running ' + node.label + ' with Ollama...');
-    const result = await chatWithOllama(ollamaTool, {
-      messages,
-      model,
-      ...(plannerResponseFormat ? { format: 'json' } : {}),
-    });
-    reply = String(result?.message?.content || '').trim();
-    providerLabel = 'Ollama';
-  } else {
+  if (executionMode !== 'ollama') {
     providerId = String(node.config?.providerId || '').trim();
     if (!providerId) {
       throw new Error('Choose a connected cloud provider before running this Planner step.');
@@ -2157,19 +2854,160 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
     }
 
     providerLabel = String(provider.name || providerId).trim() || providerId;
-    reportProgress?.('Sending the planning packet to ' + providerLabel + ' for structured planning.', 'Running ' + node.label + ' with ' + providerLabel + '...');
+  } else {
+    providerLabel = 'Ollama';
+  }
+
+  const fallbackSecondsPerImage = getPlannerFallbackSecondsPerImage(packetValidation.value);
+  const buildPromptMessages = (promptPacket, extraGuidance = '') => {
+    const guidance = [extraGuidance].map((entry) => String(entry || '').trim()).filter(Boolean).join('\n\n');
+    const plannerPrompt = buildPlannerPrompt(schemaId, promptPacket, {
+      compact: true,
+      guidance,
+      systemPrompt: node.config?.systemPrompt,
+    });
+    const messages = [];
+    if (plannerPrompt.systemPrompt) {
+      messages.push({
+        role: 'system',
+        content: plannerPrompt.systemPrompt,
+      });
+    }
+    messages.push({
+      role: 'user',
+      content: plannerPrompt.userPrompt,
+    });
+    return {
+      messages,
+      promptStats: {
+        ...plannerPrompt.promptStats,
+        requestCharacters: getPlannerRequestTextLength(messages),
+      },
+    };
+  };
+
+  const buildMessages = (extraGuidance = '') => buildPromptMessages(packetValidation.value, [plannerGuidance, extraGuidance].filter(Boolean).join('\n\n'));
+
+  const sendPlannerRequest = async (messages, retry = false, requestOptions = {}) => {
+    if (executionMode === 'ollama') {
+      const ollamaTool = await getInstalledToolOrThrow(
+        contextMaps,
+        'ollama',
+        'Install Ollama before using a local Planner step in a pipeline.',
+      );
+      reportProgress?.(
+        requestOptions.statusMessage || (retry ? 'Retrying the planner with stricter JSON-only guidance in Ollama.' : 'Sending the planning packet to Ollama for structured planning.'),
+        'Running ' + node.label + ' with Ollama...',
+      );
+      const result = await chatWithOllama(ollamaTool, {
+        messages,
+        model,
+        ...(plannerResponseFormat ? { format: 'json' } : {}),
+      });
+      return String(result?.message?.content || '').trim();
+    }
+
+    reportProgress?.(
+      requestOptions.statusMessage || (retry ? 'Retrying the planner with stricter JSON-only guidance in ' + providerLabel + '.' : 'Sending the planning packet to ' + providerLabel + ' for structured planning.'),
+      'Running ' + node.label + ' with ' + providerLabel + '...',
+    );
     const result = await chatWithProvider(providerId, {
       messages,
       model,
       timeoutMessage: providerLabel + ' took too long to answer this planner request. Try again or simplify the planning packet if the delay continues.',
       timeoutMs: PLANNER_PROVIDER_TIMEOUT_MS,
-      maxOutputTokens: 4096,
+      maxOutputTokens: requestOptions.maxOutputTokens || plannerMaxOutputTokens,
       ...(plannerResponseFormat ? { responseFormat: plannerResponseFormat } : {}),
     });
-    reply = String(result?.message?.content || '').trim();
+    return String(result?.message?.content || '').trim();
+  };
+
+  let normalizedPlan = null;
+  let plannerDiagnostics = {
+    chunkFailures: [],
+    chunksPlanned: 0,
+    deterministicFallbackUsed: false,
+    failureReason: '',
+    fallbackReason: '',
+    jsonRepairAttempted: false,
+    plannerMode: 'singleShot',
+    retryAttempted: false,
+  };
+  let firstRequest = null;
+
+  if (shouldUseChunkedLongformPlanner(schemaId, packetValidation.value)) {
+    const chunkedResult = await executeChunkedLongformPlanner({
+      buildPromptMessages,
+      fallbackSecondsPerImage,
+      model,
+      node,
+      packet: packetValidation.value,
+      plannerGuidance,
+      providerId,
+      providerLabel,
+      reportProgress,
+      schema,
+      schemaId,
+      sendPlannerRequest,
+    });
+    normalizedPlan = chunkedResult.normalizedPlan;
+    plannerDiagnostics = {
+      ...plannerDiagnostics,
+      ...chunkedResult.diagnostics,
+    };
+    firstRequest = {
+      promptStats: {
+        requestCharacters: chunkedResult.firstRequestCharacters,
+      },
+    };
+  } else {
+    firstRequest = buildMessages();
+    let reply = '';
+    let plannerFallbackReason = '';
+    try {
+      reply = await sendPlannerRequest(firstRequest.messages, false);
+    } catch (error) {
+      const classified = classifyPlannerFailure(error);
+      plannerDiagnostics.failureReason = classified.failureReason;
+      throw new Error(classified.userMessage || error?.message || 'The planner request failed.');
+    }
+    try {
+      const parsed = parsePlannerReplyDetailed(schemaId, reply, { sourcePacket: packetValidation.value });
+      normalizedPlan = parsed.plan;
+      plannerDiagnostics.jsonRepairAttempted = parsed.jsonRepairAttempted;
+    } catch (error) {
+      const firstErrorMessage = error?.message || 'The planner reply was not usable JSON.';
+      plannerDiagnostics.failureReason = error?.failureReason || classifyPlannerFailure(error).failureReason;
+      const retryGuidance = [
+        'The previous planner reply was not accepted: ' + firstErrorMessage,
+        'Return one complete JSON object only. Do not include Markdown, comments, explanations, or partial JSON.',
+        'Keep every scene concise, but preserve startSeconds, endSeconds, durationSeconds, narrationExcerpt, sourceTranscriptSegmentIds, and imagePrompt. imagePrompt must be clean prompt text only.',
+      ].join('\n');
+      const retryRequest = buildMessages(retryGuidance);
+      try {
+        plannerDiagnostics.retryAttempted = true;
+        reply = await sendPlannerRequest(retryRequest.messages, true);
+        const parsed = parsePlannerReplyDetailed(schemaId, reply, { sourcePacket: packetValidation.value });
+        normalizedPlan = parsed.plan;
+        plannerDiagnostics.jsonRepairAttempted = plannerDiagnostics.jsonRepairAttempted || parsed.jsonRepairAttempted;
+      } catch (retryError) {
+        const retryClassified = classifyPlannerFailure(retryError);
+        plannerFallbackReason = retryError?.message || firstErrorMessage;
+        plannerDiagnostics.failureReason = retryClassified.failureReason || plannerDiagnostics.failureReason;
+        plannerDiagnostics.fallbackReason = plannerFallbackReason;
+        const fallbackPlan = buildDeterministicPlanFromPacket(schemaId, packetValidation.value, {
+          reason: plannerFallbackReason,
+        });
+        if (!fallbackPlan) {
+          throw retryError;
+        }
+        normalizedPlan = fallbackPlan;
+        plannerDiagnostics.deterministicFallbackUsed = true;
+        reportProgress?.('The planner reply was not usable JSON, so Local AI Hub built a timing-aware fallback plan from the transcript.', 'Built fallback scene plan.');
+      }
+    }
   }
 
-  const normalizedPlan = parsePlannerReply(schemaId, reply);
   if (!String(normalizedPlan.title || '').trim() || String(normalizedPlan.title || '').trim().toLowerCase() === 'scene plan') {
     normalizedPlan.title = String(packetValidation.value.title || schema?.label || 'Plan').replace(/\s+packet$/i, '').trim() || (schema?.label || 'Plan');
   }
@@ -2183,16 +3021,35 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       nodeLabel: node.label,
       providerId,
       providerLabel,
+      requestCharacters: firstRequest.promptStats.requestCharacters,
       schemaId,
       schemaLabel: String(schema?.label || 'Plan').trim() || 'Plan',
+      plannerMode: plannerDiagnostics.plannerMode,
+      failureReason: plannerDiagnostics.failureReason,
+      fallbackReason: plannerDiagnostics.fallbackReason,
+      jsonRepairAttempted: Boolean(plannerDiagnostics.jsonRepairAttempted),
+      retryAttempted: Boolean(plannerDiagnostics.retryAttempted),
+      deterministicFallbackUsed: Boolean(plannerDiagnostics.deterministicFallbackUsed),
+      usedDeterministicFallback: Boolean(plannerDiagnostics.deterministicFallbackUsed),
+      chunksPlanned: Number(plannerDiagnostics.chunksPlanned || 0) || 0,
+      chunkFailures: plannerDiagnostics.chunkFailures || [],
+      chunkDiagnostics: plannerDiagnostics.chunkDiagnostics || [],
+      globalSummary: plannerDiagnostics.globalSummary || null,
     },
     role: 'generated',
     sourcePacket: packetValidation.value,
   });
   const planItemCount = Number(planArtifact.sceneCount || planArtifact.sectionCount || planArtifact.clipCount || normalizedPlan.scenes?.length || normalizedPlan.sections?.length || normalizedPlan.clips?.length || 0) || 0;
+  const plannerResultMessage = plannerDiagnostics.deterministicFallbackUsed
+    ? plannerDiagnostics.plannerMode === 'chunked'
+      ? providerLabel + ' planned the longform scene plan in ' + Number(plannerDiagnostics.chunksPlanned || 0) + ' chunk(s); Local AI Hub used deterministic fallback for ' + Number(plannerDiagnostics.chunkFailures?.length || 0) + ' chunk(s) and merged ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.'
+      : 'The planner could not return a usable structured plan, so Local AI Hub built a timing-aware deterministic fallback with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.'
+    : plannerDiagnostics.plannerMode === 'chunked'
+      ? providerLabel + ' returned a chunked structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + ' across ' + Number(plannerDiagnostics.chunksPlanned || 0) + ' chunk(s).'
+      : providerLabel + ' returned a structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.';
 
   return {
-    message: providerLabel + ' returned a structured ' + (schema?.label || 'plan').toLowerCase() + ' with ' + planItemCount + ' item' + (planItemCount === 1 ? '' : 's') + '.',
+    message: plannerResultMessage,
     outputs: {
       plan: planArtifact,
     },
@@ -4960,17 +5817,37 @@ function buildMediaCompositionRetryControls(graph, validationNode, run, artifact
   }
 
   const audioMix = getCompositionAudioMixForRetryControls(artifact);
+  const effectiveConfig = getMediaCompositionEffectiveConfig(targetNode, run);
+  const soundEffectsPlan = artifact?.compositionExport?.soundEffects && typeof artifact.compositionExport.soundEffects === 'object'
+    ? artifact.compositionExport.soundEffects
+    : null;
+  const visualTrack = artifact?.compositionExport?.visualTrack && typeof artifact.compositionExport.visualTrack === 'object'
+    ? artifact.compositionExport.visualTrack
+    : null;
   return {
     mediaComposition: {
       backgroundMusicVolume: audioMix.backgroundMusicVolume,
+      imageTimingMode: normalizeMediaCompositionImageTimingMode(effectiveConfig.imageTimingMode || visualTrack?.imageTimingMode),
+      nodeConfig: serializeArtifactForUi(effectiveConfig),
       nodeId: targetNode.id,
       nodeLabel: targetNode.label || 'Media Composition',
       narrationVolume: audioMix.narrationVolume,
+      sceneTransitionCategory: normalizeMediaCompositionTransitionCategory(effectiveConfig.sceneTransitionCategory || visualTrack?.sceneTransitions?.category),
+      sceneTransitionDurationSeconds: normalizeMediaCompositionTransitionDuration(effectiveConfig.sceneTransitionDurationSeconds || visualTrack?.sceneTransitions?.configuredDurationSeconds),
+      sceneTransitionMode: normalizeMediaCompositionTransitionMode(effectiveConfig.sceneTransitionMode || visualTrack?.sceneTransitions?.mode),
+      sceneTransitionName: normalizeMediaCompositionTransitionName(effectiveConfig.sceneTransitionName || visualTrack?.sceneTransitions?.singleTransition),
+      secondsPerItem: normalizeMediaCompositionSeconds(effectiveConfig.secondsPerItem ?? visualTrack?.timing?.fixedDurationSeconds, 4, 0.1),
+      soundEffectsEnabled: effectiveConfig.soundEffectsEnabled === true || soundEffectsPlan?.enabled === true,
+      soundEffectsGlobalGuardEnabled: effectiveConfig.soundEffectsGlobalGuardEnabled === true || soundEffectsPlan?.globalGuard?.enabled === true,
+      soundEffectsGlobalMaxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(effectiveConfig.soundEffectsGlobalMaxSimultaneous ?? soundEffectsPlan?.globalGuard?.maxSimultaneous ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS) || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS))),
+      soundEffectsGlobalMinSpacingSeconds: normalizeMediaCompositionSeconds(effectiveConfig.soundEffectsGlobalMinSpacingSeconds ?? soundEffectsPlan?.globalGuard?.minSpacingSeconds, DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS, 0),
+      soundEffectsGlobalVolume: audioMix.soundEffectsGlobalVolume,
+      soundEffectsLayers: normalizeMediaCompositionSoundEffectsRetryLayers(effectiveConfig.soundEffectsLayers || soundEffectsPlan?.layers || [], soundEffectsPlan?.layers || []),
+      soundEffectsVolume: normalizeMediaCompositionVolume(effectiveConfig.soundEffectsVolume ?? soundEffectsPlan?.layers?.[0]?.volume, DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME),
       temporary: true,
     },
   };
 }
-
 function applyMediaCompositionRetryOverride(run, pendingValidation, payload) {
   const mediaCompositionControl = pendingValidation?.retryControls?.mediaComposition || null;
   if (!mediaCompositionControl?.nodeId) {
@@ -6359,9 +7236,29 @@ function getMediaCompositionSoundEffectsLayers(config = {}) {
 function normalizeMediaCompositionSoundEffectsConfig(config = {}) {
   const enabled = config.soundEffectsEnabled === true || config.soundEffects?.enabled === true;
   const layers = enabled ? getMediaCompositionSoundEffectsLayers(config) : [];
+  const nestedGlobalGuard = config.soundEffects?.globalGuard && typeof config.soundEffects.globalGuard === 'object'
+    ? config.soundEffects.globalGuard
+    : {};
+  const globalGuardEnabled = config.soundEffectsGlobalGuardEnabled === true
+    || config.enableGlobalSoundEffectSpacing === true
+    || nestedGlobalGuard.enabled === true;
   return {
     enabled,
+    globalGuard: {
+      enabled: globalGuardEnabled,
+      maxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(
+        config.soundEffectsGlobalMaxSimultaneous
+        ?? nestedGlobalGuard.maxSimultaneous
+        ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
+      ) || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS))),
+      minSpacingSeconds: normalizeTimelineSeconds(Math.max(0, Number(
+        config.soundEffectsGlobalMinSpacingSeconds
+        ?? nestedGlobalGuard.minSpacingSeconds
+        ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
+      ) || 0)) ?? DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
+    },
     layers,
+    globalVolume: normalizeMediaCompositionVolume(config.soundEffectsGlobalVolume ?? config.soundEffects?.globalVolume, 1),
     legacy: {
       avoidRepeats: config.soundEffectsAvoidRepeats !== false,
       density: normalizeMediaCompositionSoundEffectsDensity(config.soundEffectsDensity),
@@ -6471,6 +7368,156 @@ function addDeterministicSoundEffectEvent(events, items, library, timeSeconds, m
     }
   }
   return null;
+}
+
+function getSoundEffectEventPriority(event) {
+  return String(event?.reason || '').trim() === 'sceneAligned' ? 2 : 1;
+}
+
+function getSoundEffectEventDurationSeconds(event) {
+  return Math.max(0.05, Number(event?.durationSeconds || 0) || 0.5);
+}
+
+function doSoundEffectEventsOverlap(left, right) {
+  const leftStart = Number(left?.timeSeconds || 0) || 0;
+  const rightStart = Number(right?.timeSeconds || 0) || 0;
+  const leftEnd = leftStart + getSoundEffectEventDurationSeconds(left);
+  const rightEnd = rightStart + getSoundEffectEventDurationSeconds(right);
+  return leftStart < rightEnd - 0.001 && rightStart < leftEnd - 0.001;
+}
+
+function canPlaceGlobalSoundEffectEvent(events, candidate, timeSeconds, globalGuard) {
+  if (!globalGuard?.enabled) {
+    return true;
+  }
+  const normalizedTime = normalizeTimelineSeconds(Math.max(0, Number(timeSeconds || 0) || 0)) || 0;
+  const candidateAtTime = { ...candidate, timeSeconds: normalizedTime };
+  const minSpacingSeconds = Math.max(0, Number(globalGuard.minSpacingSeconds || 0) || 0);
+  if (minSpacingSeconds > 0 && events.some((event) => Math.abs(Number(event.timeSeconds || 0) - normalizedTime) < minSpacingSeconds - 0.001)) {
+    return false;
+  }
+  const maxSimultaneous = Math.max(1, Math.floor(Number(globalGuard.maxSimultaneous || 1) || 1));
+  const overlappingCount = events.filter((event) => doSoundEffectEventsOverlap(event, candidateAtTime)).length;
+  return overlappingCount < maxSimultaneous;
+}
+
+function findNearestGlobalSoundEffectSlot(candidate, placedEvents, globalGuard, totalDurationSeconds) {
+  const safeEndSeconds = Math.max(0.1, Number(totalDurationSeconds || 0) - 0.1);
+  const originalTimeSeconds = normalizeTimelineSeconds(Math.min(Math.max(0.1, Number(candidate?.timeSeconds || 0) || 0.1), safeEndSeconds)) || 0.1;
+  const stepSeconds = 0.1;
+  const maxSteps = Math.max(1, Math.ceil(safeEndSeconds / stepSeconds));
+  for (let step = 0; step <= maxSteps; step += 1) {
+    const offset = normalizeTimelineSeconds(step * stepSeconds) || 0;
+    const candidates = step === 0
+      ? [originalTimeSeconds]
+      : [originalTimeSeconds - offset, originalTimeSeconds + offset];
+    for (const candidateTime of candidates) {
+      if (candidateTime < 0.1 || candidateTime > safeEndSeconds) {
+        continue;
+      }
+      const normalizedTime = normalizeTimelineSeconds(candidateTime) || 0.1;
+      if (canPlaceGlobalSoundEffectEvent(placedEvents, candidate, normalizedTime, globalGuard)) {
+        return normalizedTime;
+      }
+    }
+  }
+  return null;
+}
+
+function applyGlobalSoundEffectsGuard(events, config, totalDurationSeconds) {
+  const globalGuard = {
+    ...(config?.globalGuard || {}),
+    collisionNotes: [],
+    movedEventCount: 0,
+    skippedEventCount: 0,
+  };
+  if (!globalGuard.enabled) {
+    return {
+      events: [...events].sort((left, right) => Number(left.timeSeconds || 0) - Number(right.timeSeconds || 0)),
+      globalGuard,
+    };
+  }
+
+  const orderedCandidates = [...events]
+    .map((event, originalIndex) => ({ ...event, originalIndex }))
+    .sort((left, right) => {
+      const priorityDelta = getSoundEffectEventPriority(right) - getSoundEffectEventPriority(left);
+      if (priorityDelta) {
+        return priorityDelta;
+      }
+      const timeDelta = Number(left.timeSeconds || 0) - Number(right.timeSeconds || 0);
+      return Math.abs(timeDelta) > 0.001 ? timeDelta : Number(left.originalIndex || 0) - Number(right.originalIndex || 0);
+    });
+  const placedEvents = [];
+  for (const candidate of orderedCandidates) {
+    const originalTimeSeconds = normalizeTimelineSeconds(candidate.timeSeconds) || 0;
+    if (canPlaceGlobalSoundEffectEvent(placedEvents, candidate, originalTimeSeconds, globalGuard)) {
+      placedEvents.push(candidate);
+      continue;
+    }
+
+    const canMove = String(candidate.reason || '').trim() === 'randomInterval';
+    const movedTimeSeconds = canMove
+      ? findNearestGlobalSoundEffectSlot(candidate, placedEvents, globalGuard, totalDurationSeconds)
+      : null;
+    if (movedTimeSeconds !== null) {
+      const movedEvent = {
+        ...candidate,
+        movedByGlobalGuard: true,
+        notes: [
+          ...(Array.isArray(candidate.notes) ? candidate.notes : []),
+          `Moved by the global SFX guard from ${originalTimeSeconds}s to ${movedTimeSeconds}s.`,
+        ],
+        originalTimeSeconds,
+        timeSeconds: movedTimeSeconds,
+      };
+      placedEvents.push(movedEvent);
+      globalGuard.movedEventCount += 1;
+      globalGuard.collisionNotes.push({
+        action: 'moved',
+        fromSeconds: originalTimeSeconds,
+        itemName: candidate.itemName || candidate.itemId || 'Sound effect',
+        layerId: candidate.layerId,
+        layerName: candidate.layerName,
+        reason: candidate.reason,
+        toSeconds: movedTimeSeconds,
+      });
+      continue;
+    }
+
+    globalGuard.skippedEventCount += 1;
+    globalGuard.collisionNotes.push({
+      action: 'skipped',
+      itemName: candidate.itemName || candidate.itemId || 'Sound effect',
+      layerId: candidate.layerId,
+      layerName: candidate.layerName,
+      reason: candidate.reason,
+      timeSeconds: originalTimeSeconds,
+    });
+  }
+
+  return {
+    events: placedEvents
+      .map(({ originalIndex, ...event }) => event)
+      .sort((left, right) => {
+        const timeDelta = Number(left.timeSeconds || 0) - Number(right.timeSeconds || 0);
+        return Math.abs(timeDelta) > 0.001 ? timeDelta : Number(left.layerIndex || 0) - Number(right.layerIndex || 0);
+      }),
+    globalGuard,
+  };
+}
+
+function applyFinalSoundEffectsScheduleToLayers(layers, finalEvents) {
+  for (const layerPlan of layers) {
+    const layerEvents = finalEvents.filter((event) => {
+      if (String(event.layerId || '').trim() && String(layerPlan.layerId || '').trim()) {
+        return String(event.layerId || '').trim() === String(layerPlan.layerId || '').trim();
+      }
+      return Number(event.layerIndex ?? -1) === Number(layerPlan.layerIndex ?? -2);
+    });
+    layerPlan.scheduledEvents = layerEvents;
+    layerPlan.scheduledEventCount = layerEvents.length;
+  }
 }
 
 async function resolveManagedSoundEffectItems(library, notes) {
@@ -6583,13 +7630,19 @@ async function buildSoundEffectsSchedule(visualItems, effectiveConfig, timingPla
   const totalDurationSeconds = normalizeTimelineSeconds(timingPlan.totalVisualDurationSeconds) || 0;
   const plan = {
     enabled: config.enabled,
+    globalGuard: {
+      ...config.globalGuard,
+      collisionNotes: [],
+      movedEventCount: 0,
+      skippedEventCount: 0,
+    },
     layerCount: config.layers.length,
     layers: [],
     notes: [],
     requested: config,
     scheduledEvents: [],
     totalDurationSeconds,
-    volume: config.layers[0]?.volume ?? config.legacy.volume,
+    volume: config.globalVolume,
   };
   if (!config.enabled) {
     plan.notes.push('Sound effects are off.');
@@ -6608,9 +7661,15 @@ async function buildSoundEffectsSchedule(visualItems, effectiveConfig, timingPla
     plan.notes.push(...(layerPlan.notes || []).map((note) => `${layerPlan.layerName}: ${note}`));
     plan.scheduledEvents.push(...(layerPlan.scheduledEvents || []));
   }
-  plan.scheduledEvents.sort((left, right) => Number(left.timeSeconds || 0) - Number(right.timeSeconds || 0));
+  const guardedSchedule = applyGlobalSoundEffectsGuard(plan.scheduledEvents, config, totalDurationSeconds);
+  plan.scheduledEvents = guardedSchedule.events;
+  plan.globalGuard = guardedSchedule.globalGuard;
+  applyFinalSoundEffectsScheduleToLayers(plan.layers, plan.scheduledEvents);
   plan.layerCount = plan.layers.length;
   plan.scheduledEventCount = plan.scheduledEvents.length;
+  if (plan.globalGuard.enabled && (plan.globalGuard.movedEventCount || plan.globalGuard.skippedEventCount)) {
+    plan.notes.push(`Global SFX guard moved ${plan.globalGuard.movedEventCount} event(s) and skipped ${plan.globalGuard.skippedEventCount} event(s).`);
+  }
   if (!plan.scheduledEvents.length) {
     plan.notes.push('No sound effects were scheduled across enabled layers.');
   }
@@ -6893,11 +7952,7 @@ async function executeMediaCompositionNode(node, graph, run) {
   const soundEffectsPlan = await buildSoundEffectsSchedule(visualItems, effectiveConfig, timingPlan);
 
   const composition = createCompositionArtifact({
-    audioMix: {
-      backgroundMusicVolume: normalizeMediaCompositionVolume(effectiveConfig.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
-      narrationVolume: normalizeMediaCompositionVolume(effectiveConfig.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
-      soundEffectsVolume: soundEffectsPlan.volume,
-    },
+    audioMix: buildMediaCompositionAudioMixConfig(effectiveConfig, soundEffectsPlan),
     soundEffects: soundEffectsPlan,
     displayName: node.label,
     exportKind: PORT_KIND_VIDEO,

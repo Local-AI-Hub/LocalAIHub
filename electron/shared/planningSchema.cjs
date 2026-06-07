@@ -10,6 +10,7 @@ const {
   LONGFORM_MEDIA_SCHEMA_FAMILY_ID,
   LONGFORM_SCENE_PLAN_ADAPTER,
   LONGFORM_SCENE_PLAN_SCHEMA_ID,
+  getLongformMinimumImageCount,
 } = require('./planningSchemas/longformScenePlan.cjs');
 const {
   AUDIO_PROMPT_PLAN_ADAPTER,
@@ -25,6 +26,10 @@ const {
 const PLANNING_SCHEMA_VERSION = 1;
 const PLANNING_REVIEW_VERSION = 1;
 const DEFAULT_PLANNING_SCHEMA_ID = LONGFORM_SCENE_PLAN_SCHEMA_ID;
+const LONGFORM_PLANNER_DIRECT_SEGMENT_LIMIT = 80;
+const LONGFORM_PLANNER_COMPACT_SEGMENT_LIMIT = 48;
+const LONGFORM_PLANNER_SEGMENT_TEXT_LIMIT = 140;
+const LONGFORM_PLANNER_GROUP_TEXT_LIMIT = 220;
 
 const PLANNING_SCHEMA_FAMILY_IDS = Object.freeze({
   AUDIO_PROMPT: AUDIO_PROMPT_SCHEMA_FAMILY_ID,
@@ -122,6 +127,7 @@ function summarizeTranscriptionSource(artifact) {
   const segments = (Array.isArray(transcription.segments) ? transcription.segments : [])
     .map((segment, index) => ({
       end: Number.isFinite(Number(segment?.end)) ? Math.round(Number(segment.end) * 100) / 100 : null,
+      id: normalizeString(segment?.id || segment?.segmentId || segment?.index, String(index)),
       index,
       start: Number.isFinite(Number(segment?.start)) ? Math.round(Number(segment.start) * 100) / 100 : null,
       text: normalizeTextBlock(segment?.text),
@@ -166,6 +172,195 @@ function normalizeDesiredOutput(schema, config = {}) {
     schemaLabel: normalizeString(schema?.label, 'Plan'),
     shapeSummary: normalizeString(schema?.shapeSummary),
   };
+}
+
+function roundPlannerSeconds(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.round(numeric * 100) / 100 : null;
+}
+
+function trimPlannerText(value, limit) {
+  return trimPreviewText(normalizeTextBlock(value), Math.max(20, Number(limit || 0) || 180));
+}
+
+function normalizePlannerTimingSeconds(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric * 100) / 100 : null;
+}
+
+function getPacketFallbackSecondsPerImage(packet = {}) {
+  const notes = [
+    packet?.desiredOutput?.notes,
+    packet?.workingNotes,
+    packet?.goal,
+  ].map((entry) => String(entry || '')).join(' ');
+  const match = notes.match(/fallback\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)?\s*(?:per|\/)?\s*(?:image|item|scene)/i);
+  return normalizePlannerTimingSeconds(packet?.desiredOutput?.fallbackSecondsPerImage || packet?.fallbackSecondsPerImage || match?.[1]) || 8;
+}
+
+function getPacketTranscriptDurationSeconds(packet = {}) {
+  const durations = [];
+  const sourceArtifacts = Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts : [];
+  sourceArtifacts.forEach((artifact) => {
+    const transcription = artifact?.transcription && typeof artifact.transcription === 'object' ? artifact.transcription : null;
+    const duration = normalizePlannerTimingSeconds(transcription?.durationSeconds);
+    if (duration) {
+      durations.push(duration);
+    }
+    const segmentEnd = Math.max(0, ...(Array.isArray(transcription?.segments) ? transcription.segments : []).map((segment) => Number(segment?.end ?? segment?.endSeconds ?? 0) || 0));
+    const normalizedSegmentEnd = normalizePlannerTimingSeconds(segmentEnd);
+    if (normalizedSegmentEnd) {
+      durations.push(normalizedSegmentEnd);
+    }
+  });
+  return durations.length ? Math.max(...durations) : null;
+}
+
+function buildLongformMinimumCountGuidance(schemaId, packet = {}) {
+  if (String(schemaId || '').trim() !== LONGFORM_SCENE_PLAN_SCHEMA_ID) {
+    return '';
+  }
+
+  const totalDurationSeconds = getPacketTranscriptDurationSeconds(packet);
+  const fallbackSecondsPerImage = getPacketFallbackSecondsPerImage(packet);
+  const minimumImageCount = getLongformMinimumImageCount(totalDurationSeconds, fallbackSecondsPerImage);
+  if (!totalDurationSeconds || !minimumImageCount) {
+    return '';
+  }
+
+  return [
+    'Longform timing requirements:',
+    'totalNarrationDurationSeconds: ' + totalDurationSeconds,
+    'fallbackSecondsPerImage: ' + fallbackSecondsPerImage,
+    'minimumImageCount: ' + minimumImageCount,
+    'You must return at least minimumImageCount scenes. If the transcript is too coarse, split transcript segments by their timed content so every scene keeps startSeconds, endSeconds, durationSeconds, narrationExcerpt, sourceTranscriptSegmentIds, and a clean imagePrompt aligned to that time range.',
+    'Only imagePrompt is sent to image generation; keep meaningIntent, viewerTakeaway, timing, transcript ids, and risk notes out of imagePrompt.',
+  ].join('\n');
+}
+
+function normalizePlannerSegment(segment, index, textLimit = LONGFORM_PLANNER_SEGMENT_TEXT_LIMIT) {
+  const text = trimPlannerText(segment?.text, textLimit);
+  if (!text) {
+    return null;
+  }
+
+  const id = normalizeString(segment?.id || segment?.segmentId || segment?.index, String(index));
+  return {
+    id,
+    end: roundPlannerSeconds(segment?.end),
+    index,
+    start: roundPlannerSeconds(segment?.start),
+    text,
+  };
+}
+
+function compactPlannerSegmentGroup(segments, groupIndex) {
+  const normalizedSegments = segments
+    .map((segment, index) => normalizePlannerSegment(segment, index, LONGFORM_PLANNER_SEGMENT_TEXT_LIMIT))
+    .filter(Boolean);
+  if (!normalizedSegments.length) {
+    return null;
+  }
+
+  const first = normalizedSegments[0];
+  const last = normalizedSegments[normalizedSegments.length - 1];
+  return {
+    id: first.id === last.id ? first.id : first.id + '-' + last.id,
+    end: last.end,
+    index: groupIndex,
+    sourceTranscriptSegmentIds: normalizedSegments.map((segment) => segment.id),
+    start: first.start,
+    text: trimPlannerText(normalizedSegments.map((segment) => segment.text).join(' '), LONGFORM_PLANNER_GROUP_TEXT_LIMIT),
+  };
+}
+
+function compactPlannerTranscript(transcription = {}) {
+  const sourceSegments = Array.isArray(transcription?.segments) ? transcription.segments : [];
+  const normalizedDirectSegments = sourceSegments
+    .map((segment, index) => normalizePlannerSegment(segment, index))
+    .filter(Boolean);
+  let compactedSegments = normalizedDirectSegments;
+  let compacted = false;
+
+  if (normalizedDirectSegments.length > LONGFORM_PLANNER_DIRECT_SEGMENT_LIMIT) {
+    compacted = true;
+    const groupSize = Math.max(2, Math.ceil(normalizedDirectSegments.length / LONGFORM_PLANNER_COMPACT_SEGMENT_LIMIT));
+    compactedSegments = [];
+    for (let index = 0; index < sourceSegments.length; index += groupSize) {
+      const group = compactPlannerSegmentGroup(sourceSegments.slice(index, index + groupSize), compactedSegments.length);
+      if (group) {
+        compactedSegments.push(group);
+      }
+    }
+  }
+
+  return {
+    durationSeconds: roundPlannerSeconds(transcription?.durationSeconds),
+    language: normalizeString(transcription?.language),
+    model: normalizeString(transcription?.model),
+    segmentCount: Number(transcription?.segmentCount || sourceSegments.length) || sourceSegments.length,
+    segments: compactedSegments,
+    ...(compacted ? {
+      plannerCompaction: {
+        originalSegmentCount: normalizedDirectSegments.length,
+        strategy: 'grouped-adjacent-transcript-segments',
+      },
+    } : {}),
+  };
+}
+
+function compactPlannerSourceArtifact(artifact = {}, schemaId = DEFAULT_PLANNING_SCHEMA_ID) {
+  const compacted = {
+    displayName: normalizeString(artifact.displayName || artifact.fileName || artifact.kind, 'Artifact'),
+    kind: normalizeString(artifact.kind),
+    summary: trimPlannerText(artifact.summary, 600),
+    textExcerpt: trimPlannerText(artifact.textExcerpt || artifact.text || artifact.previewText || '', schemaId === LONGFORM_SCENE_PLAN_SCHEMA_ID ? 900 : 1200),
+  };
+
+  if (schemaId === LONGFORM_SCENE_PLAN_SCHEMA_ID && artifact?.transcription && typeof artifact.transcription === 'object') {
+    compacted.transcription = compactPlannerTranscript(artifact.transcription);
+  }
+
+  return Object.fromEntries(Object.entries(compacted).filter(([, value]) => {
+    if (Array.isArray(value)) return value.length > 0;
+    if (value && typeof value === 'object') return Object.keys(value).length > 0;
+    return Boolean(value);
+  }));
+}
+
+function compactPlanningPacketForPlanner(packet, schemaId = DEFAULT_PLANNING_SCHEMA_ID) {
+  const normalizedSchemaId = normalizeString(schemaId || packet?.schemaId || packet?.desiredOutput?.schemaId, DEFAULT_PLANNING_SCHEMA_ID);
+  const compacted = {
+    schemaVersion: packet.schemaVersion,
+    title: normalizeString(packet.title),
+    schemaFamilyId: normalizeString(packet.schemaFamilyId),
+    schemaId: normalizeString(packet.schemaId),
+    schemaLabel: normalizeString(packet.schemaLabel),
+    goal: trimPlannerText(packet.goal, 700),
+    sourceSummary: trimPlannerText(packet.sourceSummary, 900),
+    sourceArtifacts: (Array.isArray(packet.sourceArtifacts) ? packet.sourceArtifacts : [])
+      .map((artifact) => compactPlannerSourceArtifact(artifact, normalizedSchemaId))
+      .filter(Boolean),
+    constraints: normalizeStringList(packet.constraints).map((entry) => trimPlannerText(entry, 320)).slice(0, 16),
+    stylePolicy: normalizeStringList(packet.stylePolicy).map((entry) => trimPlannerText(entry, 320)).slice(0, 12),
+    availableTools: normalizeStringList(packet.availableTools).map((entry) => trimPlannerText(entry, 260)).slice(0, 12),
+    readiness: {
+      hardwareSummary: trimPlannerText(packet?.readiness?.hardwareSummary, 320),
+      notes: normalizeStringList(packet?.readiness?.notes).map((entry) => trimPlannerText(entry, 260)).slice(0, 8),
+    },
+    desiredOutput: {
+      notes: trimPlannerText(packet?.desiredOutput?.notes, 900),
+      schemaFamilyId: normalizeString(packet?.desiredOutput?.schemaFamilyId),
+      schemaId: normalizeString(packet?.desiredOutput?.schemaId),
+      schemaLabel: normalizeString(packet?.desiredOutput?.schemaLabel),
+      shapeSummary: trimPlannerText(packet?.desiredOutput?.shapeSummary, 700),
+    },
+    riskNotes: normalizeStringList(packet.riskNotes).map((entry) => trimPlannerText(entry, 260)).slice(0, 10),
+    uncertaintyFlags: normalizeStringList(packet.uncertaintyFlags).map((entry) => trimPlannerText(entry, 220)).slice(0, 10),
+    workingNotes: trimPlannerText(packet.workingNotes, 700),
+  };
+
+  return compacted;
 }
 
 function buildPlanningPacketDocument(config = {}, sourceArtifacts = [], options = {}) {
@@ -267,7 +462,7 @@ function validatePlanningPacketShape(value) {
   };
 }
 
-function validatePlanAgainstSchema(schemaId, value) {
+function validatePlanAgainstSchema(schemaId, value, options = {}) {
   const adapter = getPlanningSchemaAdapter(schemaId || value?.schemaId || DEFAULT_PLANNING_SCHEMA_ID, { allowDefault: false });
   if (!adapter?.validatePlan) {
     return {
@@ -279,7 +474,17 @@ function validatePlanAgainstSchema(schemaId, value) {
 
   return adapter.validatePlan(value, {
     schemaVersion: PLANNING_SCHEMA_VERSION,
+    ...options,
   });
+}
+
+function buildDeterministicPlanFromPacket(schemaId, packet, options = {}) {
+  const adapter = getPlanningSchemaAdapter(schemaId || packet?.schemaId || DEFAULT_PLANNING_SCHEMA_ID, { allowDefault: false });
+  if (!adapter?.buildDeterministicPlan) {
+    return null;
+  }
+
+  return adapter.buildDeterministicPlan(packet, options);
 }
 
 function buildPlanPreviewDocument(planValue, options = {}) {
@@ -322,25 +527,39 @@ function buildPlannerPrompt(schemaId, packet, options = {}) {
   }
 
   const guidance = normalizeTextBlock(options.guidance);
+  const promptPacket = options.compact === false
+    ? packetValidation.value
+    : compactPlanningPacketForPlanner(packetValidation.value, schema.id);
+  const jsonIndent = options.compact === false ? 2 : 0;
   const sections = [
     'Planning schema:',
     schema.promptSummary,
     '',
+    buildLongformMinimumCountGuidance(schema.id, packetValidation.value),
+    '',
     'Required JSON shape example:',
-    JSON.stringify(schema.responseShapeExample, null, 2),
+    JSON.stringify(schema.responseShapeExample, null, jsonIndent),
     '',
     'Planning packet:',
-    JSON.stringify(packetValidation.value, null, 2),
+    JSON.stringify(promptPacket, null, jsonIndent),
     guidance ? '\nPlanner guidance:\n' + guidance : '',
     '',
     'Return JSON only. Keep uncertainty visible in riskNotes or openQuestions instead of pretending missing source detail is certain.',
   ].filter(Boolean);
 
+  const userPrompt = sections.join('\n');
+  const systemPrompt = [normalizeTextBlock(options.systemPrompt), schema.systemPrompt].filter(Boolean).join('\n\n').trim();
   return {
     packet: packetValidation.value,
+    promptPacket,
+    promptStats: {
+      compacted: options.compact !== false,
+      systemPromptCharacters: systemPrompt.length,
+      userPromptCharacters: userPrompt.length,
+    },
     schema,
-    systemPrompt: [normalizeTextBlock(options.systemPrompt), schema.systemPrompt].filter(Boolean).join('\n\n').trim(),
-    userPrompt: sections.join('\n'),
+    systemPrompt,
+    userPrompt,
   };
 }
 
@@ -349,6 +568,7 @@ const buildPlanAuditDocument = buildPlanReviewDocument;
 module.exports = {
   AUDIO_PROMPT_PLAN_SCHEMA_ID,
   DEFAULT_PLANNING_SCHEMA_ID,
+  LONGFORM_SCENE_PLAN_SCHEMA_ID,
   VIDEO_PROMPT_PLAN_SCHEMA_ID,
   PLANNING_REVIEW_VERSION,
   PLANNING_SCHEMA_FAMILY_IDS,
@@ -357,6 +577,7 @@ module.exports = {
   buildPlanPreviewDocument,
   buildPlanReviewDocument,
   buildPlanTextCollectionItems,
+  buildDeterministicPlanFromPacket,
   buildPlanningPacketDocument,
   buildPlanningSchemaStructuredOutputRequest,
   buildPlannerPrompt,

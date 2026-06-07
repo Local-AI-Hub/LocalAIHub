@@ -2770,7 +2770,7 @@ async function describeArtifactForLlm(artifact) {
       scenes.length ? 'Scenes:' : '',
       ...scenes.slice(0, 8).map((scene, index) => {
         const sceneLabel = String(scene?.sourceSpanLabel || scene?.sceneId || ('Scene ' + (index + 1))).trim() || ('Scene ' + (index + 1));
-        const sceneSummary = [scene?.sceneConcept, scene?.treatmentApproach, scene?.visualPromptDraft ? 'Prompt: ' + scene.visualPromptDraft : '']
+        const sceneSummary = [scene?.sceneConcept, scene?.treatmentApproach, scene?.imagePrompt ? 'Prompt: ' + scene.imagePrompt : scene?.visualPromptDraft ? 'Prompt: ' + scene.visualPromptDraft : '']
           .filter(Boolean)
           .join(' | ');
         return (index + 1) + '. ' + sceneLabel + (sceneSummary ? ' | ' + sceneSummary : '');
