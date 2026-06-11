@@ -248,6 +248,13 @@ h3 {
   box-shadow: var(--shadow);
 }
 
+.hero-shot img,
+.screenshot-grid img {
+  width: 100%;
+  height: auto;
+  object-fit: contain;
+}
+
 .hero-shot img {
   border-radius: 11px;
 }
