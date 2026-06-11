@@ -425,13 +425,23 @@ async function listPipelineOutputs() {
   });
 }
 
-function resolvePipelineOutputRoot(targetPath, pipelineRunsRoot) {
+function resolvePipelineOutputContext(targetPath, pipelineRunsRoot) {
   let currentPath = normalizePath(targetPath);
   const normalizedRunsRoot = normalizePath(pipelineRunsRoot);
 
   while (isPathInside(normalizedRunsRoot, currentPath)) {
     if (path.basename(currentPath).toLowerCase() === 'outputs') {
-      return currentPath;
+      const runDirectory = path.dirname(currentPath);
+      if (path.dirname(runDirectory).toLowerCase() !== normalizedRunsRoot.toLowerCase()) {
+        return null;
+      }
+
+      return {
+        artifactsRoot: path.join(runDirectory, 'artifacts'),
+        outputsRoot: currentPath,
+        runDirectory,
+        runId: path.basename(runDirectory),
+      };
     }
 
     const parentPath = path.dirname(currentPath);
@@ -441,12 +451,72 @@ function resolvePipelineOutputRoot(targetPath, pipelineRunsRoot) {
     currentPath = parentPath;
   }
 
-  return '';
+  return null;
+}
+
+function resolvePipelineOutputRoot(targetPath, pipelineRunsRoot) {
+  return resolvePipelineOutputContext(targetPath, pipelineRunsRoot)?.outputsRoot || '';
 }
 
 function getAdjacentMetadataSidecarPaths(filePath) {
   const basePath = path.join(path.dirname(filePath), path.basename(filePath, path.extname(filePath)));
   return METADATA_SUFFIXES.map((suffix) => `${basePath}${suffix}`);
+}
+
+async function assertPathHasNoLinks(rootPath, candidatePath) {
+  const normalizedRoot = normalizePath(rootPath);
+  const normalizedCandidate = normalizePath(candidatePath);
+  if (!isPathInside(normalizedRoot, normalizedCandidate)) {
+    throw new Error('Local AI Hub refused to inspect a pipeline cleanup path outside its owning run folder.');
+  }
+
+  const relativePath = path.relative(normalizedRoot, normalizedCandidate);
+  const segments = relativePath ? relativePath.split(path.sep).filter(Boolean) : [];
+  let currentPath = normalizedRoot;
+  for (const segment of segments) {
+    currentPath = path.join(currentPath, segment);
+    if (!(await fs.pathExists(currentPath))) {
+      continue;
+    }
+    const stat = await fs.lstat(currentPath);
+    if (stat.isSymbolicLink()) {
+      throw new Error('Local AI Hub refused to delete a pipeline path that uses a link or reparse point.');
+    }
+  }
+}
+
+async function inspectDeletionPath(targetPath, owningRoot) {
+  const normalizedTarget = normalizePath(targetPath);
+  await assertPathHasNoLinks(owningRoot, normalizedTarget);
+  const stat = await fs.lstat(normalizedTarget);
+  if (stat.isSymbolicLink()) {
+    throw new Error('Local AI Hub refused to delete a pipeline path that uses a link or reparse point.');
+  }
+
+  if (stat.isFile()) {
+    return { bytes: Number(stat.size || 0) || 0, directories: 0, files: 1 };
+  }
+  if (!stat.isDirectory()) {
+    throw new Error('Local AI Hub can only delete regular pipeline output files or folders.');
+  }
+
+  const summary = { bytes: 0, directories: 1, files: 0 };
+  const entries = await fs.readdir(normalizedTarget);
+  for (const entry of entries) {
+    const childSummary = await inspectDeletionPath(path.join(normalizedTarget, entry), owningRoot);
+    summary.bytes += childSummary.bytes;
+    summary.directories += childSummary.directories;
+    summary.files += childSummary.files;
+  }
+  return summary;
+}
+
+function combinePathSummaries(summaries) {
+  return summaries.reduce((total, summary) => ({
+    bytes: total.bytes + Number(summary?.bytes || 0),
+    directories: total.directories + Number(summary?.directories || 0),
+    files: total.files + Number(summary?.files || 0),
+  }), { bytes: 0, directories: 0, files: 0 });
 }
 
 function assertDeletablePipelineOutputPath(candidatePath, outputsRoot) {
@@ -462,19 +532,22 @@ function assertDeletablePipelineOutputPath(candidatePath, outputsRoot) {
   return normalizedCandidate;
 }
 
-async function buildPipelineOutputDeletionSet(targetPath, outputsRoot) {
+async function buildPipelineOutputDeletionSet(targetPath, outputsRoot, runDirectory = path.dirname(outputsRoot)) {
   const normalizedTargetPath = assertDeletablePipelineOutputPath(targetPath, outputsRoot);
+  await assertPathHasNoLinks(runDirectory, normalizedTargetPath);
   let stat = null;
   try {
-    stat = await fs.stat(normalizedTargetPath);
+    stat = await fs.lstat(normalizedTargetPath);
   } catch {
     throw new Error('Local AI Hub could not find that pipeline output anymore.');
   }
 
+  if (stat.isSymbolicLink()) {
+    throw new Error('Local AI Hub refused to delete a pipeline output that uses a link or reparse point.');
+  }
   if (stat.isDirectory()) {
     return [normalizedTargetPath];
   }
-
   if (!stat.isFile()) {
     throw new Error('Choose a saved pipeline output file or folder to delete.');
   }
@@ -487,6 +560,7 @@ async function buildPipelineOutputDeletionSet(targetPath, outputsRoot) {
     }
 
     if (await fs.pathExists(normalizedSidecarPath)) {
+      await assertPathHasNoLinks(runDirectory, normalizedSidecarPath);
       deletionSet.push(normalizedSidecarPath);
     }
   }
@@ -497,6 +571,111 @@ async function buildPipelineOutputDeletionSet(targetPath, outputsRoot) {
 
 function normalizeDeletionMode(options = {}) {
   return options.deleteMode === 'permanent' || options.useTrash === false ? 'permanent' : 'trash';
+}
+
+async function listRemainingOutputEntries(outputsRoot, deletionSet) {
+  if (!(await fs.pathExists(outputsRoot))) {
+    return [];
+  }
+  const deletedKeys = new Set(deletionSet.map((entry) => normalizePath(entry).toLowerCase()));
+  const entries = await fs.readdir(outputsRoot);
+  return entries
+    .map((entry) => path.join(outputsRoot, entry))
+    .filter((entryPath) => !deletedKeys.has(normalizePath(entryPath).toLowerCase()));
+}
+
+async function canDeleteWholeRun(context, deletionSet) {
+  const remainingOutputEntries = await listRemainingOutputEntries(context.outputsRoot, deletionSet);
+  if (remainingOutputEntries.length > 0) {
+    return false;
+  }
+
+  await assertPathHasNoLinks(path.dirname(context.runDirectory), context.runDirectory);
+  const runEntries = await fs.readdir(context.runDirectory);
+  const allowedNames = new Set(['artifacts', 'outputs']);
+  return runEntries.every((entry) => allowedNames.has(String(entry || '').toLowerCase()));
+}
+
+async function buildPipelineOutputDeletionPreview(outputPath, options = {}) {
+  const targetPath = normalizePath(outputPath);
+  if (!String(outputPath || '').trim()) {
+    throw new Error('Choose a pipeline output to delete first.');
+  }
+
+  await ensureStorage();
+  const pipelineRunsRoot = path.join(getAppPaths().runtimesRoot, 'pipeline-runs');
+  const context = resolvePipelineOutputContext(targetPath, pipelineRunsRoot);
+  if (!context) {
+    throw new Error('Local AI Hub can only delete files from known pipeline output folders.');
+  }
+
+  const selectedPaths = await buildPipelineOutputDeletionSet(targetPath, context.outputsRoot, context.runDirectory);
+  const selectedSummary = combinePathSummaries(await Promise.all(selectedPaths.map((entry) => inspectDeletionPath(entry, context.runDirectory))));
+  const artifactsExist = await fs.pathExists(context.artifactsRoot);
+  let artifactSummary = { bytes: 0, directories: 0, files: 0 };
+  let artifactInspectionError = '';
+  if (artifactsExist) {
+    try {
+      artifactSummary = await inspectDeletionPath(context.artifactsRoot, context.runDirectory);
+    } catch (error) {
+      artifactInspectionError = String(error?.message || error).trim();
+    }
+  }
+  const activeRunId = String(options.activeRunId || '').trim();
+  const activeRunBlocked = Boolean(activeRunId && activeRunId === context.runId);
+  const intermediateCleanupBlocked = activeRunBlocked || Boolean(artifactInspectionError);
+  const intermediateCleanupBlockedReason = activeRunBlocked
+    ? 'Local AI Hub will not delete intermediate files from the pipeline run that is currently active.'
+    : artifactInspectionError;
+  const wholeRunSafe = !intermediateCleanupBlocked && await canDeleteWholeRun(context, selectedPaths);
+
+  return {
+    artifactSummary,
+    artifactsExist,
+    canDeleteWholeRun: wholeRunSafe,
+    deletionMode: normalizeDeletionMode(options),
+    intermediateCleanupBlocked,
+    intermediateCleanupBlockedReason,
+    outputPath: targetPath,
+    outputsRoot: context.outputsRoot,
+    runDirectory: context.runDirectory,
+    runId: context.runId,
+    selectedPaths,
+    selectedSummary,
+  };
+}
+
+async function buildPipelineOutputDeletionPlan(outputPath, options = {}) {
+  const preview = await buildPipelineOutputDeletionPreview(outputPath, options);
+  const includeIntermediates = options.includeIntermediates === true;
+  if (includeIntermediates && preview.intermediateCleanupBlocked) {
+    throw new Error(preview.intermediateCleanupBlockedReason || 'Local AI Hub could not safely delete intermediate files from this run.');
+  }
+
+  let deletionPaths = [...preview.selectedPaths];
+  let deletesWholeRun = false;
+  if (includeIntermediates && preview.artifactsExist) {
+    if (preview.canDeleteWholeRun) {
+      deletionPaths = [preview.runDirectory];
+      deletesWholeRun = true;
+    } else {
+      deletionPaths.push(path.join(preview.runDirectory, 'artifacts'));
+    }
+  }
+
+  for (const candidatePath of deletionPaths) {
+    if (!isPathInside(preview.runDirectory, candidatePath)) {
+      throw new Error('Local AI Hub refused to delete a pipeline cleanup path outside its owning run folder.');
+    }
+    await assertPathHasNoLinks(preview.runDirectory, candidatePath);
+  }
+
+  return {
+    ...preview,
+    deletionPaths: [...new Map(deletionPaths.map((entry) => [normalizePath(entry).toLowerCase(), normalizePath(entry)])).values()],
+    deletesWholeRun,
+    includeIntermediates,
+  };
 }
 
 async function removePipelineOutputPath(targetPath, options = {}) {
@@ -511,49 +690,63 @@ async function removePipelineOutputPath(targetPath, options = {}) {
 
   try {
     await options.trashItem(targetPath);
-  } catch (error) {
-    throw new Error('Local AI Hub could not move that output to the Recycle Bin. Disable "Move deleted pipeline outputs to Recycle Bin" in Settings if you want to permanently delete it instead.');
+  } catch {
+    throw new Error('Local AI Hub could not move that output or its generated run files to the Recycle Bin. Disable "Move deleted pipeline outputs to Recycle Bin" in Settings if you want to permanently delete them instead.');
   }
 }
 
 async function deletePipelineOutput(outputPath, options = {}) {
-  const targetPath = normalizePath(outputPath);
-  if (!String(outputPath || '').trim()) {
-    throw new Error('Choose a pipeline output to delete first.');
+  const plan = await buildPipelineOutputDeletionPlan(outputPath, options);
+  const completedPaths = [];
+  for (const deletionPath of plan.deletionPaths) {
+    try {
+      await removePipelineOutputPath(deletionPath, { ...options, deleteMode: plan.deletionMode });
+      completedPaths.push(deletionPath);
+    } catch (error) {
+      const remainingCount = plan.deletionPaths.length - completedPaths.length;
+      const partialMessage = completedPaths.length
+        ? `Local AI Hub deleted ${completedPaths.length} cleanup item${completedPaths.length === 1 ? '' : 's'}, but could not finish the remaining ${remainingCount}. ${error.message}`
+        : error.message;
+      const partialError = new Error(partialMessage);
+      partialError.completedPaths = completedPaths;
+      partialError.failedPath = deletionPath;
+      throw partialError;
+    }
   }
 
-  await ensureStorage();
-  const pipelineRunsRoot = path.join(getAppPaths().runtimesRoot, 'pipeline-runs');
-  const outputsRoot = resolvePipelineOutputRoot(targetPath, pipelineRunsRoot);
-  if (!outputsRoot) {
-    throw new Error('Local AI Hub can only delete files from known pipeline output folders in this pass.');
-  }
-
-  const deletionSet = await buildPipelineOutputDeletionSet(targetPath, outputsRoot);
-  const deletionMode = normalizeDeletionMode(options);
-  for (const deletionPath of deletionSet) {
-    await removePipelineOutputPath(deletionPath, { ...options, deleteMode: deletionMode });
-  }
-
-  const label = path.basename(targetPath);
+  const label = path.basename(plan.outputPath);
+  const cleanupLabel = plan.includeIntermediates && plan.artifactsExist
+    ? plan.deletesWholeRun
+      ? ' The now-empty pipeline run and its generated intermediate files were removed too.'
+      : ' Generated intermediate files from the same run were removed too.'
+    : '';
   return {
-    deletedPath: targetPath,
-    deletedPaths: deletionSet,
-    deletionMode,
-    message: deletionMode === 'permanent'
-      ? `${label} was permanently deleted from Local AI Hub's pipeline outputs.`
-      : `${label} was moved to the Recycle Bin from Local AI Hub's pipeline outputs.`,
+    deletedPath: plan.outputPath,
+    deletedPaths: completedPaths,
+    deletionMode: plan.deletionMode,
+    deletedIntermediates: plan.includeIntermediates && plan.artifactsExist,
+    deletedWholeRun: plan.deletesWholeRun,
+    message: plan.deletionMode === 'permanent'
+      ? `${label} was permanently deleted from Local AI Hub's pipeline outputs.${cleanupLabel}`
+      : `${label} was moved to the Recycle Bin from Local AI Hub's pipeline outputs.${cleanupLabel}`,
+    runId: plan.runId,
   };
 }
 
 module.exports = {
+  buildPipelineOutputDeletionPreview,
   deletePipelineOutput,
   listPipelineOutputs,
   _test: {
+    assertPathHasNoLinks,
+    buildPipelineOutputDeletionPlan,
     buildPipelineOutputDeletionSet,
+    canDeleteWholeRun,
     getAdjacentMetadataSidecarPaths,
+    inspectDeletionPath,
     isMetadataSidecar,
     normalizeDeletionMode,
+    resolvePipelineOutputContext,
     resolvePipelineOutputRoot,
   },
 };

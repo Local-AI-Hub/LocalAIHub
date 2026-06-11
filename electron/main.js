@@ -104,7 +104,7 @@ const { configureAutoUpdates, isUpdateReady, restartToInstallUpdate } = require(
 const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
 const { cancelPipelineRun, getActiveRunSnapshot, resumePipelineValidation, runPipeline, setPipelineEventSink } = require('./services/pipelineExecutionService');
 const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./services/pipelineStoreService');
-const { deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
+const { buildPipelineOutputDeletionPreview, deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
 const { redactSensitiveText } = require('./services/redactionService');
 const { appendLog } = require('./services/logService');
 
@@ -2112,12 +2112,28 @@ function registerIpcHandlers() {
     }), 'Local AI Hub could not load the saved pipeline outputs.'),
   );
 
+  ipcMain.handle('pipelines:get-output-deletion-preview', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const config = await readConfig();
+      const activeRun = getActiveRunSnapshot();
+      const activeRunId = ['running', 'paused'].includes(activeRun?.status) ? activeRun.runId : '';
+      return buildPipelineOutputDeletionPreview(payload?.path, {
+        activeRunId,
+        deleteMode: config.moveDeletedPipelineOutputsToRecycleBin !== false ? 'trash' : 'permanent',
+      });
+    }, 'Local AI Hub could not prepare that pipeline output cleanup preview.'),
+  );
+
   ipcMain.handle('pipelines:delete-output', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const config = await readConfig();
       const useTrash = config.moveDeletedPipelineOutputsToRecycleBin !== false;
+      const activeRun = getActiveRunSnapshot();
+      const activeRunId = ['running', 'paused'].includes(activeRun?.status) ? activeRun.runId : '';
       const result = await deletePipelineOutput(payload?.path, {
+        activeRunId,
         deleteMode: useTrash ? 'trash' : 'permanent',
+        includeIntermediates: payload?.includeIntermediates === true,
         trashItem: (targetPath) => shell.trashItem(targetPath),
       });
       await invalidateStatisticsIndexSections(['storage'], 'pipeline-output-deleted').catch(() => null);

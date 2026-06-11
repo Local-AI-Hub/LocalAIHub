@@ -1,4 +1,6 @@
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 
 const {
   BUILT_IN_PIPELINE_TEMPLATES,
@@ -34,12 +36,40 @@ const allReadyContext = {
     workflowFormat: 'comfyui-api',
     workflowText: '{}',
   }],
-  tools: ['ollama', 'forge', 'automatic1111', 'whisper', 'audiocraft-webui', 'upscayl', 'comfyui', 'wan21-webui'].map((id) => tool(id)),
+  tools: ['ollama', 'forge', 'automatic1111', 'whisper', 'audiocraft-webui', 'chatterbox-tts', 'rvc', 'upscayl', 'facefusion', 'comfyui', 'wan21-webui'].map((id) => tool(id)),
 };
 
 assert(BUILT_IN_PIPELINE_TEMPLATES.length >= 10, 'Expected a useful starter template set.');
 const ids = BUILT_IN_PIPELINE_TEMPLATES.map((template) => template.id);
 assert.strictEqual(new Set(ids).size, ids.length, 'Template IDs must be unique.');
+const removedTemplateIds = [
+  'image-collection-upscale',
+  'audio-idea-to-prompt-collection',
+  'script-to-video-prompt-collection',
+  'export-subtitles-from-video',
+  'validated-prompt-collection-to-images',
+];
+for (const removedId of removedTemplateIds) {
+  assert(!ids.includes(removedId), `${removedId} should no longer be listed as a built-in template.`);
+  assert.strictEqual(instantiatePipelineTemplate(removedId, allReadyContext).ok, false, `${removedId} should no longer instantiate as a built-in template.`);
+}
+for (const retainedId of [
+  'image-upscale',
+  'audio-idea-to-generated-song',
+  'video-idea-to-generated-video',
+  'generate-subtitled-video-from-video',
+  'prompt-collection-to-images',
+]) {
+  assert(ids.includes(retainedId), `${retainedId} should remain available.`);
+}
+const allowedCategories = ['Text', 'Image', 'Audio', 'Video'];
+const categoryCounts = BUILT_IN_PIPELINE_TEMPLATES.reduce((counts, template) => {
+  assert(allowedCategories.includes(template.category), `${template.id} must use one of the four output categories.`);
+  counts.set(template.category, (counts.get(template.category) || 0) + 1);
+  return counts;
+}, new Map());
+assert.deepStrictEqual([...categoryCounts.keys()].sort(), [...allowedCategories].sort(), 'Templates must use exactly Text, Image, Audio, and Video categories.');
+for (const category of allowedCategories) assert(categoryCounts.get(category) > 0, `Template category ${category} should not be empty.`);
 
 for (const template of BUILT_IN_PIPELINE_TEMPLATES) {
   assert(template.id && template.name && template.category && template.outputType, `Template ${template.id || '<missing>'} must include user-facing metadata.`);
@@ -67,10 +97,6 @@ const collectionMap = collectionTemplate.nodes.find((node) => node.type === 'col
 assert(collectionMap, 'Prompt collection template must use collectionMap.');
 assert.strictEqual(getCollectionMapMapping(collectionMap)?.id, 'textToImage', 'Prompt collection map should be textToImage.');
 
-const validatedMap = instantiatePipelineTemplate('validated-prompt-collection-to-images', allReadyContext).pipeline.nodes.find((node) => node.type === 'collectionMap');
-assert.strictEqual(validatedMap.config.perItemValidation.enabled, true, 'Validated prompt collection template should enable per-item validation.');
-assert.strictEqual(validatedMap.config.perItemValidation.mode, 'user', 'Validated prompt collection template should use user validation.');
-assert.strictEqual(validatedMap.config.failureMode, 'partial', 'Validated prompt collection template should keep partial successes.');
 
 const continuationStep = instantiatePipelineTemplate('audiocraft-continuation', allReadyContext).pipeline.nodes.find((node) => node.type === 'llmPrompt');
 assert.strictEqual(getModelStepOperationId(continuationStep), PIPELINE_OPERATION_IDS.AUDIO_GENERATE, 'AudioCraft continuation should use the current Model Step audio operation.');
@@ -86,28 +112,50 @@ function hasEdge(pipeline, source, sourcePort, target, targetPort) {
   return pipeline.edges.some((edge) => edge.source?.nodeId === source.id && edge.source?.portId === sourcePort && edge.target?.nodeId === target.id && edge.target?.portId === targetPort);
 }
 
-const exportSubsResult = instantiatePipelineTemplate('export-subtitles-from-video', allReadyContext);
-assert(exportSubsResult.ok, 'Export subtitles from video template should instantiate.');
-const exportSubs = exportSubsResult.pipeline;
-const exportSubsVideo = nodeByType(exportSubs, 'videoInput', 'Export subtitles template should include Video Input.');
-const exportSubsAudio = nodeByType(exportSubs, 'extractAudio', 'Export subtitles template should include Extract Audio.');
-const exportSubsWhisper = exportSubs.nodes.find((entry) => entry.type === 'llmPrompt' && getModelStepOperationId(entry) === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE);
-assert(exportSubsWhisper, 'Export subtitles template should include a Whisper Model Step.');
-const exportSubsNode = nodeByType(exportSubs, 'exportSubtitles', 'Export subtitles template should include Export Subtitles.');
-const exportSubsOutput = nodeByType(exportSubs, 'fileOutput', 'Export subtitles template should include File Output.');
-assert(hasEdge(exportSubs, exportSubsVideo, 'video', exportSubsAudio, 'video'), 'Video Input should feed Extract Audio.');
-assert(hasEdge(exportSubs, exportSubsAudio, 'audio', exportSubsWhisper, 'prompt'), 'Extract Audio should feed Whisper.');
-assert(hasEdge(exportSubs, exportSubsWhisper, 'text', exportSubsNode, 'captions'), 'Whisper transcript should feed Export Subtitles captions.');
-assert(hasEdge(exportSubs, exportSubsNode, 'subtitles', exportSubsOutput, 'file'), 'Export Subtitles should feed File Output.');
-assert.strictEqual(exportSubsNode.config.outputFormat, 'srt', 'Export subtitles template should default Export Subtitles to SRT.');
-assert(['auto', 'transcriptSegments'].includes(exportSubsNode.config.captionMode), 'Export subtitles template should use transcript-aware subtitle timing.');
-assert(/standalone subtitle file/i.test(exportSubs.description), 'Export subtitles template notes should explain standalone subtitle output.');
-assert(/Whisper timestamped segments/i.test(exportSubs.description), 'Export subtitles template notes should explain Whisper timing.');
-const missingWhisperExportSubs = getPipelineTemplateReadiness('export-subtitles-from-video', { ...allReadyContext, tools: allReadyContext.tools.filter((entry) => entry.id !== 'whisper') });
-assert.strictEqual(missingWhisperExportSubs.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Export subtitles template should report missing Whisper.');
-assert(missingWhisperExportSubs.missingTools.some((entry) => /whisper/i.test(entry)), 'Export subtitles readiness should explain the missing Whisper requirement.');
-const configurableExportSubs = getPipelineTemplateReadiness('export-subtitles-from-video', allReadyContext);
-assert.strictEqual(configurableExportSubs.status, TEMPLATE_STATUS.CONFIGURABLE, 'Export subtitles template should remain configurable for source video and Whisper settings.');
+const chatterboxTemplate = BUILT_IN_PIPELINE_TEMPLATES.find((template) => template.id === 'voice-cloning-with-chatterbox');
+assert(chatterboxTemplate, 'Voice cloning with Chatterbox template should exist.');
+assert.strictEqual(chatterboxTemplate.category, 'Audio', 'Chatterbox voice cloning template should be categorized as Audio.');
+const chatterboxResult = instantiatePipelineTemplate(chatterboxTemplate.id, allReadyContext);
+assert(chatterboxResult.ok, 'Chatterbox voice cloning template should instantiate.');
+const chatterboxPipeline = chatterboxResult.pipeline;
+const chatterboxText = chatterboxPipeline.nodes.find((node) => node.type === 'textInput' && /text to speak/i.test(node.label));
+const chatterboxReference = chatterboxPipeline.nodes.find((node) => node.type === 'audioInput' && /reference voice/i.test(node.label));
+const chatterboxStep = chatterboxPipeline.nodes.find((node) => node.type === 'llmPrompt' && node.config?.toolId === 'chatterbox-tts');
+const chatterboxOutput = chatterboxPipeline.nodes.find((node) => node.type === 'audioOutput');
+assert(chatterboxText, 'Chatterbox template should clearly label the text input.');
+assert(chatterboxReference, 'Chatterbox template should clearly label the reference voice audio input.');
+assert(chatterboxStep, 'Chatterbox template should use the existing Chatterbox Model Step contract.');
+assert.strictEqual(chatterboxStep.config.executionMode, 'localTool', 'Chatterbox template should use local tool execution.');
+assert.strictEqual(chatterboxStep.config.operationId, PIPELINE_OPERATION_IDS.AUDIO_GENERATE, 'Chatterbox template should use audio generation.');
+assert.strictEqual(chatterboxStep.config.audioMode, 'referenceVoiceTts', 'Chatterbox template should use Reference Voice TTS mode.');
+assert(chatterboxOutput, 'Chatterbox template should include Audio Output.');
+assert(hasEdge(chatterboxPipeline, chatterboxText, 'text', chatterboxStep, 'prompt'), 'Text to speak should feed Chatterbox.');
+assert(hasEdge(chatterboxPipeline, chatterboxReference, 'audio', chatterboxStep, 'referenceAudio'), 'Reference voice audio should feed Chatterbox Reference Audio.');
+assert(hasEdge(chatterboxPipeline, chatterboxStep, 'audio', chatterboxOutput, 'audio'), 'Chatterbox should feed Audio Output.');
+const noProviderChatterbox = getPipelineTemplateReadiness(chatterboxTemplate.id, { tools: [tool('chatterbox-tts')], providers: [] });
+assert.notStrictEqual(noProviderChatterbox.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Chatterbox template should not require a cloud provider.');
+
+const faceFusionTemplate = BUILT_IN_PIPELINE_TEMPLATES.find((template) => template.id === 'face-swap-with-facefusion');
+assert(faceFusionTemplate, 'Face swap with FaceFusion template should exist.');
+assert.strictEqual(faceFusionTemplate.category, 'Image', 'FaceFusion image-output template should be categorized as Image.');
+const faceFusionResult = instantiatePipelineTemplate(faceFusionTemplate.id, allReadyContext);
+assert(faceFusionResult.ok, 'FaceFusion face swap template should instantiate.');
+const faceFusionPipeline = faceFusionResult.pipeline;
+const sourceFace = faceFusionPipeline.nodes.find((node) => node.type === 'imageInput' && /source face/i.test(node.label));
+const targetImage = faceFusionPipeline.nodes.find((node) => node.type === 'imageInput' && /target image/i.test(node.label));
+const faceFusionStep = faceFusionPipeline.nodes.find((node) => node.type === 'llmPrompt' && node.config?.toolId === 'facefusion');
+const faceFusionOutput = faceFusionPipeline.nodes.find((node) => node.type === 'imageOutput');
+assert(sourceFace, 'FaceFusion template should clearly label the source face input.');
+assert(targetImage, 'FaceFusion template should clearly label the target image input.');
+assert(faceFusionStep, 'FaceFusion template should use the existing FaceFusion Model Step contract.');
+assert.strictEqual(faceFusionStep.config.executionMode, 'localTool', 'FaceFusion template should use local tool execution.');
+assert.strictEqual(faceFusionStep.config.operationId, PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM, 'FaceFusion template should use image transform.');
+assert.strictEqual(faceFusionStep.config.transformSubtype, 'face-swap', 'FaceFusion template should use the supported face-swap subtype.');
+assert(faceFusionOutput, 'FaceFusion template should include Image Output.');
+assert(hasEdge(faceFusionPipeline, targetImage, 'image', faceFusionStep, 'prompt'), 'Target image should feed the main FaceFusion input.');
+assert(hasEdge(faceFusionPipeline, sourceFace, 'image', faceFusionStep, 'referenceImage'), 'Source face should feed FaceFusion Reference Image.');
+assert(hasEdge(faceFusionPipeline, faceFusionStep, 'image', faceFusionOutput, 'image'), 'FaceFusion should feed Image Output.');
+
 
 const subtitledVideoResult = instantiatePipelineTemplate('generate-subtitled-video-from-video', allReadyContext);
 assert(subtitledVideoResult.ok, 'Generate subtitled video template should instantiate.');
@@ -125,7 +173,7 @@ assert(hasEdge(subtitledVideo, subtitledWhisper, 'text', subtitledBurn, 'caption
 assert(hasEdge(subtitledVideo, subtitledBurn, 'video', subtitledOutput, 'video'), 'Burn Subtitles should feed Video Output.');
 assert(['auto', 'transcriptSegments'].includes(subtitledBurn.config.captionMode), 'Subtitled video template should use transcript-aware burn timing.');
 assert(/burns captions directly into the video/i.test(subtitledVideo.description), 'Subtitled video template notes should explain burned captions.');
-assert(/Export subtitles from video/i.test(subtitledVideo.description), 'Subtitled video template notes should point users to reusable subtitle export.');
+assert(/Export Subtitles \/ Captions/i.test(subtitledVideo.description), 'Subtitled video template notes should point users to the reusable subtitle export node.');
 assert(!subtitledVideo.nodes.some((entry) => entry.type === 'exportSubtitles'), 'Subtitled video template should not require Export Subtitles.');
 const missingWhisperSubtitledVideo = getPipelineTemplateReadiness('generate-subtitled-video-from-video', { ...allReadyContext, tools: allReadyContext.tools.filter((entry) => entry.id !== 'whisper') });
 assert.strictEqual(missingWhisperSubtitledVideo.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Subtitled video template should report missing Whisper.');
@@ -133,51 +181,7 @@ assert(missingWhisperSubtitledVideo.missingTools.some((entry) => /whisper/i.test
 const configurableSubtitledVideo = getPipelineTemplateReadiness('generate-subtitled-video-from-video', allReadyContext);
 assert.strictEqual(configurableSubtitledVideo.status, TEMPLATE_STATUS.CONFIGURABLE, 'Subtitled video template should remain configurable for source video and Whisper settings.');
 
-const audioPlanResult = instantiatePipelineTemplate('audio-idea-to-prompt-collection', allReadyContext);
-assert(audioPlanResult.ok, 'Audio idea planning template should instantiate.');
-const audioPlanPipeline = audioPlanResult.pipeline;
-const audioPacket = audioPlanPipeline.nodes.find((node) => node.type === 'planningPacket');
-const audioPlanner = audioPlanPipeline.nodes.find((node) => node.type === 'planner');
-const audioPlanBridge = audioPlanPipeline.nodes.find((node) => node.type === 'planScenes');
-const audioCollectionOutput = audioPlanPipeline.nodes.find((node) => node.type === 'collectionOutput');
-assert(audioPacket, 'Audio planning template should include a Planning Packet.');
-assert(audioPlanner, 'Audio planning template should include a Planner.');
-assert(audioPlanBridge, 'Audio planning template should include the plan-to-text collection bridge.');
-assert(audioCollectionOutput, 'Audio planning template should include a Collection Output.');
-assert.strictEqual(audioPacket.config.schemaId, 'audioPromptPlan.v1', 'Audio planning packet should request audioPromptPlan.');
-assert.strictEqual(audioPlanner.config.schemaId, 'audioPromptPlan.v1', 'Audio planner should request audioPromptPlan.');
-assert(/AudioCraft is not required/i.test(audioPacket.config.readinessNotesText), 'Audio planning template should not require AudioCraft.');
-assert(!audioPlanPipeline.nodes.some((node) => node.type === 'llmPrompt' && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.AUDIO_GENERATE), 'Audio planning template should not execute audio generation.');
-assert(audioPlanPipeline.edges.some((edge) => edge.source.nodeId === audioPlanner.id && edge.target.nodeId === audioPlanBridge.id), 'Audio plan should feed the text collection bridge.');
-const missingAudioCraftAudioPlan = getPipelineTemplateReadiness('audio-idea-to-prompt-collection', {
-  ...allReadyContext,
-  tools: allReadyContext.tools.filter((entry) => entry.id !== 'audiocraft-webui'),
-});
-assert.notStrictEqual(missingAudioCraftAudioPlan.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Audio prompt planning should not require AudioCraft when a planning provider is available.');
 
-const videoPromptPlanResult = instantiatePipelineTemplate('script-to-video-prompt-collection', allReadyContext);
-assert(videoPromptPlanResult.ok, 'Script to video prompt collection template should instantiate.');
-const videoPromptPlanPipeline = videoPromptPlanResult.pipeline;
-const videoPacket = videoPromptPlanPipeline.nodes.find((node) => node.type === 'planningPacket');
-const videoPlanner = videoPromptPlanPipeline.nodes.find((node) => node.type === 'planner');
-const videoPlanBridge = videoPromptPlanPipeline.nodes.find((node) => node.type === 'planScenes');
-const videoCollectionOutput = videoPromptPlanPipeline.nodes.find((node) => node.type === 'collectionOutput');
-assert(videoPacket, 'Video prompt planning template should include a Planning Packet.');
-assert(videoPlanner, 'Video prompt planning template should include a Planner.');
-assert(videoPlanBridge, 'Video prompt planning template should include the plan-to-text collection bridge.');
-assert(videoCollectionOutput, 'Video prompt planning template should include a Collection Output.');
-assert.strictEqual(videoPacket.config.schemaId, 'videoPromptPlan.v1', 'Video prompt planning packet should request videoPromptPlan.');
-assert.strictEqual(videoPlanner.config.schemaId, 'videoPromptPlan.v1', 'Video planner should request videoPromptPlan.');
-assert(/not required/i.test(videoPacket.config.readinessNotesText) && /Wan/i.test(videoPacket.config.readinessNotesText), 'Video prompt planning template should not require Wan.');
-assert(/referenceMode/i.test(videoPacket.config.desiredOutputNotes) && /referenceFrameRole/i.test(videoPacket.config.desiredOutputNotes), 'Video prompt planning packet should request reference-frame metadata.');
-assert(!videoPromptPlanPipeline.nodes.some((node) => node.type === 'collectionMap'), 'Video prompt planning template should not add collectionMap text-to-video.');
-assert(!videoPromptPlanPipeline.nodes.some((node) => node.type === 'llmPrompt' && getModelStepOperationId(node) === PIPELINE_OPERATION_IDS.VIDEO_GENERATE), 'Video prompt planning template should not execute video generation.');
-assert(videoPromptPlanPipeline.edges.some((edge) => edge.source.nodeId === videoPlanner.id && edge.target.nodeId === videoPlanBridge.id), 'Video plan should feed the text collection bridge.');
-const missingVideoToolVideoPlan = getPipelineTemplateReadiness('script-to-video-prompt-collection', {
-  ...allReadyContext,
-  tools: allReadyContext.tools.filter((entry) => !/wan|video/i.test(entry.id)),
-});
-assert.notStrictEqual(missingVideoToolVideoPlan.status, TEMPLATE_STATUS.MISSING_REQUIREMENTS, 'Video prompt planning should not require a video generation tool when a planning provider is available.');
 
 const generatedVideoResult = instantiatePipelineTemplate('video-idea-to-generated-video', allReadyContext);
 assert(generatedVideoResult.ok, 'Video idea generated video template should instantiate.');
@@ -263,7 +267,12 @@ function firstVoiceoverNode(type) {
 function hasVoiceoverEdge(source, sourcePort, target, targetPort) {
   return voiceover.edges.some((edge) => edge.source?.nodeId === source.id && edge.source?.portId === sourcePort && edge.target?.nodeId === target.id && edge.target?.portId === targetPort);
 }
-const voiceoverAudio = firstVoiceoverNode('audioInput');
+const voiceoverAudioInputs = voiceoverNodesByType.get('audioInput') || [];
+assert.strictEqual(voiceoverAudioInputs.length, 2, 'Voiceover slideshow template should include voiceover and background music audio inputs.');
+const voiceoverAudio = voiceoverAudioInputs.find((entry) => entry.label === 'Voiceover audio');
+const voiceoverBackgroundMusic = voiceoverAudioInputs.find((entry) => entry.label === 'Background music');
+assert(voiceoverAudio, 'Voiceover slideshow template should include the Voiceover audio input.');
+assert(voiceoverBackgroundMusic, 'Voiceover slideshow template should include the Background music input.');
 const voiceoverWhisper = voiceover.nodes.find((entry) => entry.type === 'llmPrompt' && getModelStepOperationId(entry) === PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE);
 assert(voiceoverWhisper, 'Voiceover slideshow template should transcribe with the current Whisper Model Step operation.');
 const voiceoverPacket = firstVoiceoverNode('planningPacket');
@@ -272,6 +281,8 @@ const voiceoverScenes = firstVoiceoverNode('planScenes');
 const voiceoverMap = firstVoiceoverNode('collectionMap');
 const voiceoverComposition = firstVoiceoverNode('mediaComposition');
 const voiceoverExport = firstVoiceoverNode('mediaExport');
+const voiceoverValidation = firstVoiceoverNode('validation');
+const voiceoverRetry = firstVoiceoverNode('retryLoop');
 const voiceoverOutput = firstVoiceoverNode('videoOutput');
 assert(hasVoiceoverEdge(voiceoverAudio, 'audio', voiceoverWhisper, 'prompt'), 'Voiceover audio should feed Whisper.');
 assert(hasVoiceoverEdge(voiceoverWhisper, 'text', voiceoverPacket, 'source'), 'Whisper transcript should feed the planning packet.');
@@ -283,8 +294,13 @@ assert.strictEqual(voiceoverMap.config.perItemValidation.enabled, true, 'Voiceov
 assert.strictEqual(voiceoverMap.config.failureMode, 'partial', 'Voiceover slideshow should keep partial image successes.');
 assert(hasVoiceoverEdge(voiceoverMap, 'collection', voiceoverComposition, 'visuals'), 'Generated image collection should feed media composition visuals.');
 assert(hasVoiceoverEdge(voiceoverAudio, 'audio', voiceoverComposition, 'audio'), 'Original voiceover audio should feed media composition primary audio.');
+assert(hasVoiceoverEdge(voiceoverBackgroundMusic, 'audio', voiceoverComposition, 'backgroundMusic'), 'Background music audio should feed Media Composition background music.');
 assert(hasVoiceoverEdge(voiceoverComposition, 'composition', voiceoverExport, 'composition'), 'Media composition should feed media export.');
-assert(hasVoiceoverEdge(voiceoverExport, 'video', voiceoverOutput, 'video'), 'Media export should feed Video Output.');
+assert(hasVoiceoverEdge(voiceoverExport, 'video', voiceoverValidation, 'input'), 'Media Export should feed Validation.');
+assert(hasVoiceoverEdge(voiceoverValidation, 'pass', voiceoverRetry, 'complete'), 'Validation pass should feed Retry Loop complete.');
+assert(hasVoiceoverEdge(voiceoverValidation, 'fail', voiceoverRetry, 'retry'), 'Validation fail should feed Retry Loop retry.');
+assert(hasVoiceoverEdge(voiceoverRetry, 'result', voiceoverOutput, 'video'), 'Retry Loop should feed Video Output.');
+assert.strictEqual(voiceoverRetry.config.retryTargetNodeId, voiceoverComposition.id, 'Voiceover slideshow retry should use the existing Media Composition retry pattern.');
 assert.strictEqual(voiceoverComposition.config.imageTimingMode, 'dynamicFromImageMetadata', 'Voiceover slideshow should match narration/transcript timing by default.');
 assert.strictEqual(voiceoverComposition.config.secondsPerItem, 4, 'Voiceover slideshow should retain fixed secondsPerItem as the fallback setting.');
 assert(/timestamped segments/i.test(voiceoverWhisper.config.instruction), 'Whisper step should request timestamped segment preservation.');
@@ -325,4 +341,11 @@ assert(missingImageRuntimeVoiceover.missingTools.length || missingImageRuntimeVo
 const configurableVoiceover = getPipelineTemplateReadiness('voiceover-to-slideshow-video', allReadyContext);
 assert.strictEqual(configurableVoiceover.status, TEMPLATE_STATUS.CONFIGURABLE, 'Voiceover slideshow should be configurable even when dependencies exist because model/input selections are still required.');
 assert(configurableVoiceover.missingModels.length, 'Voiceover slideshow should remind the user to choose a planner/image model before running.');
+const panelSource = fs.readFileSync(path.resolve(__dirname, '../src/components/PipelineBuilderPanel.jsx'), 'utf8');
+assert(panelSource.includes("const PIPELINE_TEMPLATE_CATEGORIES = Object.freeze(['Text', 'Image', 'Audio', 'Video']);"), 'Template UI should define exactly four output category headings.');
+assert(panelSource.includes('const [templateSearch, setTemplateSearch] = useState'), 'Template UI should keep local search state.');
+assert(panelSource.includes('templateCards.filter((template)'), 'Template search should filter the visible template cards.');
+assert(panelSource.includes('.filter((group) => group.templates.length > 0)'), 'Template UI should hide category headings with no visible templates.');
+assert(panelSource.includes('templateGroups.map((group)'), 'Template UI should render grouped template sections.');
+
 console.log(`Verified ${BUILT_IN_PIPELINE_TEMPLATES.length} built-in pipeline templates.`);

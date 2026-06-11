@@ -35,6 +35,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   getModelSettings: () => invoke('models:get-settings'),
   getKoboldCppSetup: (payload) => invoke('koboldcpp:get-setup', payload),
   getPipeline: (pipelineId) => invoke('pipelines:get', pipelineId),
+  getPipelineOutputDeletionPreview: (payload) => invoke('pipelines:get-output-deletion-preview', payload),
   getRepairPreview: (toolId) => invoke('tools:get-repair-preview', toolId),
   getStatistics: (payload) => invoke('settings:get-statistics', payload),
   getStatisticsCore: () => invoke('settings:get-statistics-core'),

@@ -25,6 +25,7 @@ import {
 } from '../lib/pipeline-ui';
 import collectionInputState from '../lib/pipeline-collection-input-state.cjs';
 import { expectNextPrintableKeyDiagnostic, isEditableTarget, logRendererActionDiagnostic } from '../lib/focus-guard';
+import { formatBytes } from '../lib/formatters';
 
 const {
   buildPipelineWizardContext,
@@ -121,6 +122,7 @@ const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
 const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ? getPlanningSchemaOptions() : [];
 const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
 const EMPTY_GRAPH_WORKFLOW_PRESETS = Object.freeze([]);
+const PIPELINE_TEMPLATE_CATEGORIES = Object.freeze(['Text', 'Image', 'Audio', 'Video']);
 const MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS = Array.isArray(MEDIA_COMPOSITION_TRANSITION_CATEGORIES) ? MEDIA_COMPOSITION_TRANSITION_CATEGORIES : [];
 const MEDIA_COMPOSITION_TRANSITION_MODE_OPTIONS = Object.freeze([
   ['off', 'Off'],
@@ -2377,6 +2379,78 @@ function PathButtons({ path, onOpenPath, onRevealPath }) {
   );
 }
 
+function PipelineOutputDeletionDialog({ busy, dialog, onClose, onConfirm, onToggleIntermediates }) {
+  if (!dialog) {
+    return null;
+  }
+
+  const { includeIntermediates, output, preview } = dialog;
+  const outputLabel = output?.outputLabel || output?.fileName || 'Pipeline output';
+  const modeLabel = preview?.deletionMode === 'permanent' ? 'Permanently delete from disk' : 'Move to Recycle Bin';
+  const artifactFiles = Number(preview?.artifactSummary?.files || 0);
+  const artifactDirectories = Number(preview?.artifactSummary?.directories || 0);
+  const canCleanIntermediates = Boolean(preview?.artifactsExist) && !preview?.intermediateCleanupBlocked;
+
+  return (
+    <div aria-modal="true" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 px-4 py-8 backdrop-blur-sm" role="dialog">
+      <div className="w-full max-w-2xl rounded-2xl border border-white/10 bg-slate-950 p-6 shadow-soft">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Delete pipeline output</p>
+            <h2 className="mt-2 text-xl font-semibold text-white">{outputLabel}</h2>
+          </div>
+          <button className="ghost-button px-3 py-1.5 text-xs" disabled={busy} onClick={onClose} type="button">Close</button>
+        </div>
+
+        <div className="mt-5 border-y border-white/10 py-4 text-sm text-slate-300">
+          <div className="flex flex-wrap justify-between gap-3">
+            <span>Selected saved output</span>
+            <span>{Number(preview?.selectedSummary?.files || 0)} files, {formatBytes(Number(preview?.selectedSummary?.bytes || 0))}</span>
+          </div>
+          <p className="mt-2 break-all text-xs leading-5 text-slate-500">{preview?.outputPath}</p>
+          <div className="mt-4 flex flex-wrap justify-between gap-3">
+            <span>Deletion mode</span>
+            <span>{modeLabel}</span>
+          </div>
+        </div>
+
+        <label className={`mt-5 flex items-start gap-3 border p-4 ${includeIntermediates ? 'border-cyan-300/35 bg-cyan-300/10' : 'border-white/10 bg-white/5'} ${canCleanIntermediates ? 'cursor-pointer' : 'opacity-70'}`}>
+          <input
+            checked={includeIntermediates}
+            className="mt-1 h-4 w-4 accent-cyan-300"
+            disabled={!canCleanIntermediates || busy}
+            onChange={(event) => onToggleIntermediates(event.target.checked)}
+            type="checkbox"
+          />
+          <span>
+            <span className="block text-sm font-semibold text-white">Also delete intermediate generated files from this run</span>
+            <span className="mt-2 block text-xs leading-5 text-slate-300">
+              Removes generated images, audio, plan collections, media compositions, media exports, manifests, and sidecars stored inside this run. User-provided input files, asset libraries, models, and files outside the run are not deleted.
+            </span>
+            <span className="mt-2 block text-xs text-slate-400">
+              {preview?.intermediateCleanupBlocked
+                ? (preview?.intermediateCleanupBlockedReason || 'Intermediate cleanup is unavailable for this run.')
+                : preview?.artifactsExist
+                  ? `${artifactFiles} generated files in ${artifactDirectories} folders, ${formatBytes(Number(preview?.artifactSummary?.bytes || 0))}`
+                  : 'No intermediate generated files were found for this run.'}
+            </span>
+          </span>
+        </label>
+
+        <p className="mt-4 text-xs leading-5 text-slate-400">
+          Leaving the checkbox off deletes only the visible saved output and its adjacent metadata sidecars. Other saved outputs from this run are always preserved.
+        </p>
+
+        <div className="mt-6 flex justify-end gap-3">
+          <button className="ghost-button" disabled={busy} onClick={onClose} type="button">Cancel</button>
+          <button className="primary-button" disabled={busy} onClick={onConfirm} type="button">
+            {busy ? 'Deleting...' : modeLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 function PipelineOutputRow({ busy, onDelete, onOpenPath, onRevealPath, output }) {
   const artifact = output?.artifact || null;
   const outputPath = output?.outputPath || getArtifactStoragePath(artifact);
@@ -3420,7 +3494,9 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const [pipelineOutputs, setPipelineOutputs] = useState([]);
   const [outputsLoading, setOutputsLoading] = useState(false);
   const [outputsBusyPath, setOutputsBusyPath] = useState('');
+  const [outputDeletionDialog, setOutputDeletionDialog] = useState(null);
   const [pipelineOutputsExpanded, setPipelineOutputsExpanded] = useState(false);
+  const [templateSearch, setTemplateSearch] = useState('');
   const [sectionVisibility, setSectionVisibility] = useState(() => {
     if (typeof window === 'undefined') {
       return DEFAULT_PIPELINE_SECTION_VISIBILITY;
@@ -3490,6 +3566,22 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     })),
     [graphWorkflowPresets, hardware, manifests, pipelineTools, promptStyles, providers],
   );
+  const templateGroups = useMemo(() => {
+    const query = templateSearch.trim().toLowerCase();
+    const visibleTemplates = query
+      ? templateCards.filter((template) => [
+          template.name,
+          template.description,
+          template.category,
+          template.outputType,
+          ...(template.tags || []),
+          ...(template.requirements || []),
+        ].some((value) => String(value || '').toLowerCase().includes(query)))
+      : templateCards;
+    return PIPELINE_TEMPLATE_CATEGORIES
+      .map((category) => ({ category, templates: visibleTemplates.filter((template) => template.category === category) }))
+      .filter((group) => group.templates.length > 0);
+  }, [templateCards, templateSearch]);
   const graph = useMemo(() => buildPipelineGraph(draft), [draft]);
   const selectedNode = useMemo(() => draft.nodes.find((node) => node.id === selectedNodeId) || null, [draft.nodes, selectedNodeId]);
   const selectedEdge = useMemo(() => draft.edges.find((edge) => edge.id === selectedEdgeId) || null, [draft.edges, selectedEdgeId]);
@@ -4176,27 +4268,39 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       return;
     }
 
-    const outputLabel = output?.outputLabel || output?.fileName || 'this pipeline output';
-    const deleteActionLabel = moveDeletedPipelineOutputsToRecycleBin
-      ? 'Move this output to the Recycle Bin?'
-      : 'Permanently delete this output from disk?';
-    const deleteModeDetails = moveDeletedPipelineOutputsToRecycleBin
-      ? 'Related metadata sidecars will be moved with it when present.'
-      : 'Related metadata sidecars will be permanently deleted too. This cannot be easily undone.';
-    const confirmed = window.confirm(`${deleteActionLabel}\n\n${outputLabel}\n${outputPath}\n\n${deleteModeDetails}`);
-    if (!confirmed) {
+    const result = await window.localAIHub.getPipelineOutputDeletionPreview({ path: outputPath });
+    if (!result?.ok) {
+      onToast(result?.message || 'Local AI Hub could not prepare that pipeline output cleanup preview.', 'error');
       return;
     }
 
+    setOutputDeletionDialog({ includeIntermediates: false, output, preview: result.data });
+  }
+
+  async function confirmDeleteOutput() {
+    const dialog = outputDeletionDialog;
+    const output = dialog?.output;
+    const outputPath = output?.outputPath || getArtifactStoragePath(output?.artifact || null);
+    if (!dialog || !outputPath) {
+      return;
+    }
+
+    const outputLabel = output?.outputLabel || output?.fileName || 'this pipeline output';
     setOutputsBusyPath(outputPath);
-    logRendererActionDiagnostic('pipeline-output-delete', 'start', { hasOutputPath: Boolean(outputPath), outputId: String(output?.id || '') });
+    logRendererActionDiagnostic('pipeline-output-delete', 'start', {
+      hasOutputPath: Boolean(outputPath),
+      includeIntermediates: dialog.includeIntermediates,
+      outputId: String(output?.id || ''),
+    });
     try {
-      const result = await window.localAIHub.deletePipelineOutput({ path: outputPath });
+      const result = await window.localAIHub.deletePipelineOutput({ includeIntermediates: dialog.includeIntermediates, path: outputPath });
       if (!result?.ok) {
         onToast(result?.message || 'Local AI Hub could not delete that pipeline output.', 'error');
+        await loadPipelineOutputs({ silent: true });
         return;
       }
 
+      setOutputDeletionDialog(null);
       setPipelineOutputs((current) => current.filter((entry) => entry.id !== output.id));
       logRendererActionDiagnostic('pipeline-output-delete', 'success', { outputId: String(output?.id || '') });
       onToast(result.data?.message || `${outputLabel} was deleted.`, 'success');
@@ -4204,12 +4308,12 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     } catch (error) {
       logRendererActionDiagnostic('pipeline-output-delete', 'failure', { message: String(error?.message || '') }, 'warn');
       onToast(error?.message || 'Local AI Hub could not delete that pipeline output.', 'error');
+      await loadPipelineOutputs({ silent: true });
     } finally {
       setOutputsBusyPath('');
       expectNextPrintableKeyDiagnostic('pipeline-output-delete', { outputId: String(output?.id || '') });
     }
   }
-
   useEffect(() => {
     let disposed = false;
     const unsubscribe = window.localAIHub.onPipelineRunUpdate((payload) => {
@@ -5593,43 +5697,64 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
             </div>
 
             {sectionVisibility.starterTemplates ? (
-              <div className="mt-4 grid gap-3 xl:grid-cols-2">
-                {templateCards.map((template) => {
-                  const readiness = template.readiness || {};
-                  const detailLines = getTemplateDetailLines(readiness);
-                  const unavailable = readiness.status === TEMPLATE_STATUS.UNAVAILABLE;
-                  return (
-                    <div className={`rounded-2xl border p-3 ${unavailable ? 'border-white/10 bg-white/[0.025] opacity-70' : 'border-white/10 bg-slate-950/35'}`} key={template.id}>
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <p className="text-sm font-semibold text-white">{template.name}</p>
-                            <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${toneToClassName(getTemplateStatusTone(readiness))}`}>{getTemplateStatusLabel(readiness)}</span>
-                          </div>
-                          <p className="mt-2 text-xs leading-5 text-slate-400">{template.description}</p>
-                        </div>
-                        <button className={unavailable ? 'ghost-button px-3 py-1.5 text-xs opacity-70' : 'primary-button px-3 py-1.5 text-xs'} disabled={unavailable} onClick={() => createPipelineFromTemplate(template.id)} type="button">
-                          {getTemplateActionLabel(readiness)}
-                        </button>
-                      </div>
-                      <div className="mt-3 flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-[0.16em] text-slate-400">
-                        <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">{template.category}</span>
-                        <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">{template.outputType}</span>
-                        <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">{template.complexity}</span>
-                      </div>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {(template.requirements || []).slice(0, 4).map((requirement) => (
-                          <span className="rounded-full border border-white/10 bg-slate-950/40 px-2 py-1 text-[11px] text-slate-300" key={requirement}>{requirement}</span>
-                        ))}
-                      </div>
-                      {detailLines.length ? (
-                        <div className="mt-3 space-y-1 text-xs leading-5 text-amber-100">
-                          {detailLines.slice(0, 3).map((line) => <p key={line}>{line}</p>)}
-                        </div>
-                      ) : null}
+              <div className="mt-4 space-y-5">
+                <label className="block">
+                  <span className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Search templates</span>
+                  <input
+                    className="store-input mt-2"
+                    onChange={(event) => setTemplateSearch(event.target.value)}
+                    placeholder="Search by name, output, tool, or requirement"
+                    type="search"
+                    value={templateSearch}
+                  />
+                </label>
+                {templateGroups.length ? templateGroups.map((group) => (
+                  <section key={group.category}>
+                    <div className="mb-3 flex items-center gap-3">
+                      <h3 className="text-sm font-semibold text-white">{group.category}</h3>
+                      <span className="rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] text-slate-400">{group.templates.length}</span>
                     </div>
-                  );
-                })}
+                    <div className="grid gap-3 xl:grid-cols-2">
+                      {group.templates.map((template) => {
+                        const readiness = template.readiness || {};
+                        const detailLines = getTemplateDetailLines(readiness);
+                        const unavailable = readiness.status === TEMPLATE_STATUS.UNAVAILABLE;
+                        return (
+                          <div className={`rounded-2xl border p-3 ${unavailable ? 'border-white/10 bg-white/[0.025] opacity-70' : 'border-white/10 bg-slate-950/35'}`} key={template.id}>
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <p className="text-sm font-semibold text-white">{template.name}</p>
+                                  <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${toneToClassName(getTemplateStatusTone(readiness))}`}>{getTemplateStatusLabel(readiness)}</span>
+                                </div>
+                                <p className="mt-2 text-xs leading-5 text-slate-400">{template.description}</p>
+                              </div>
+                              <button className={unavailable ? 'ghost-button px-3 py-1.5 text-xs opacity-70' : 'primary-button px-3 py-1.5 text-xs'} disabled={unavailable} onClick={() => createPipelineFromTemplate(template.id)} type="button">
+                                {getTemplateActionLabel(readiness)}
+                              </button>
+                            </div>
+                            <div className="mt-3 flex flex-wrap items-center gap-2 text-[10px] uppercase tracking-[0.16em] text-slate-400">
+                              <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">{template.outputType}</span>
+                              <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1">{template.complexity}</span>
+                            </div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {(template.requirements || []).slice(0, 4).map((requirement) => (
+                                <span className="rounded-full border border-white/10 bg-slate-950/40 px-2 py-1 text-[11px] text-slate-300" key={requirement}>{requirement}</span>
+                              ))}
+                            </div>
+                            {detailLines.length ? (
+                              <div className="mt-3 space-y-1 text-xs leading-5 text-amber-100">
+                                {detailLines.slice(0, 3).map((line) => <p key={line}>{line}</p>)}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )) : (
+                  <p className="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-5 text-sm text-slate-400">No templates match that search.</p>
+                )}
               </div>
             ) : null}
           </div>
@@ -8149,6 +8274,13 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
             ) : null}
           </div>
 
+          <PipelineOutputDeletionDialog
+            busy={Boolean(outputsBusyPath)}
+            dialog={outputDeletionDialog}
+            onClose={() => setOutputDeletionDialog(null)}
+            onConfirm={confirmDeleteOutput}
+            onToggleIntermediates={(checked) => setOutputDeletionDialog((current) => current ? { ...current, includeIntermediates: checked } : current)}
+          />
           <PipelineOutputsPanel
             className={pipelineOutputsExpanded ? 'xl:col-span-2 2xl:col-span-3' : ''}
             busyPath={outputsBusyPath}
