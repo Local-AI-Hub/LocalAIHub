@@ -19,6 +19,7 @@ function Sidebar({
   onOpenLogs,
   logsBusy,
   pipelineRunStatus,
+  recordingStatus,
   storeCount,
 }) {
   return (
@@ -37,6 +38,7 @@ function Sidebar({
           <NavButton active={activeTab === 'library'} count={installedCount} label="Library" onClick={() => onChangeTab('library')} />
           <NavButton active={activeTab === 'store'} count={storeCount} label="Store" onClick={() => onChangeTab('store')} />
           <NavButton active={activeTab === 'models'} count={modelManagerCount} label="Model Manager" onClick={() => onChangeTab('models')} />
+          <NavButton active={activeTab === 'recorder'} count={null} detail={recordingStatus} label="Recorder" onClick={() => onChangeTab('recorder')} />
           <NavButton active={activeTab === 'pipelines'} count={null} detail={pipelineRunStatus} label="Pipelines" onClick={() => onChangeTab('pipelines')} />
           <NavButton active={activeTab === 'statistics'} count={null} label="Statistics" onClick={() => onChangeTab('statistics')} />
           <NavButton active={activeTab === 'settings'} count={null} label="Settings" onClick={() => onChangeTab('settings')} />
@@ -73,6 +75,7 @@ function areSidebarPropsEqual(prevProps, nextProps) {
     prevProps.installedCount === nextProps.installedCount &&
     prevProps.modelManagerCount === nextProps.modelManagerCount &&
     prevProps.pipelineRunStatus === nextProps.pipelineRunStatus &&
+    prevProps.recordingStatus === nextProps.recordingStatus &&
     prevProps.storeCount === nextProps.storeCount &&
     prevProps.logsBusy === nextProps.logsBusy
   );

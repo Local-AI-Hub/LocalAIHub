@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   renameAssetLibrary: (payload) => invoke('asset-libraries:rename', payload),
   updateColorPaletteItem: (payload) => invoke('asset-libraries:update-color', payload),
   cancelPipelineRun: (runId) => invoke('pipelines:cancel-run', runId),
+  cancelRecording: () => invoke('recordings:cancel'),
   chatWithOllama: (payload) => invoke('ollama:chat', payload),
   chatWithProvider: (payload) => invoke('providers:chat', payload),
   completeFirstLaunch: () => invoke('app:complete-first-launch'),
@@ -29,6 +30,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   dismissLegacyMigration: (sourceRoot) => invoke('settings:dismiss-legacy-migration', sourceRoot),
   downloadModel: (payload) => invoke('models:download', payload),
   getActivePipelineRun: () => invoke('pipelines:get-active-run'),
+  getActiveRecording: () => invoke('recordings:get-active'),
   getCleanupPreview: () => invoke('settings:get-cleanup-preview'),
   getLiveResources: (payload) => invoke('app:get-live-resources', payload),
   getModelDownloadPreflight: (payload) => invoke('models:get-download-preflight', payload),
@@ -57,8 +59,14 @@ contextBridge.exposeInMainWorld('localAIHub', {
   listGraphWorkflowPresets: () => invoke('graph-workflow-presets:list'),
   listProviders: () => invoke('providers:list'),
   listSnapshots: (toolId) => invoke('snapshots:list', toolId),
+  listRecordingDevices: (forceRefresh = false) => invoke('recordings:list-devices', { forceRefresh }),
+  listRecordingDisplays: () => invoke('recordings:list-displays'),
+  selectRecordingRegion: (displayId) => invoke('recordings:select-region', { displayId }),
+  listRecordings: () => invoke('recordings:list'),
   logRendererEvent: (payload) => invoke('app:log-renderer-event', payload),
   openLogsFolder: () => invoke('app:open-logs-folder'),
+  openRecording: (id) => invoke('recordings:open', { id }),
+  openRecordingsFolder: () => invoke('recordings:open-folder'),
   openPath: (payload) => invoke('app:open-path', payload),
   openToolFolder: (toolId) => invoke('tools:open-folder', toolId),
   inspectAiderProject: (projectDir) => invoke('aider:inspect-project', projectDir),
@@ -70,7 +78,9 @@ contextBridge.exposeInMainWorld('localAIHub', {
   pickWhisperAudioFile: () => invoke('whisper:pick-audio-file'),
   refresh: () => invoke('app:refresh'),
   repairTool: (payload) => invoke('tools:repair', payload),
+  revealRecording: (id) => invoke('recordings:reveal', { id }),
   restartToUpdate: () => invoke('app:restart-to-update'),
+  deleteRecording: (id) => invoke('recordings:delete', { id }),
   restoreSnapshot: (payload) => invoke('snapshots:restore', payload),
   resumePipelineValidation: (payload) => invoke('pipelines:resume-validation', payload),
   runCleanup: () => invoke('settings:run-cleanup'),
@@ -88,6 +98,8 @@ contextBridge.exposeInMainWorld('localAIHub', {
   saveSnapshot: (toolId) => invoke('snapshots:save', toolId),
   sendToolInput: (payload) => invoke('tools:send-input', payload),
   setStorageLocation: (payload) => invoke('settings:set-storage-location', payload),
+  startRecording: (payload) => invoke('recordings:start', payload),
+  stopRecording: () => invoke('recordings:stop'),
   stopTool: (toolId) => invoke('tools:stop', toolId),
   testProviderConnection: (providerId) => invoke('providers:test', providerId),
   transcribeWithWhisper: (payload) => invoke('whisper:transcribe', payload),
@@ -117,6 +129,11 @@ contextBridge.exposeInMainWorld('localAIHub', {
     const listener = (_event, payload) => handler(payload);
     ipcRenderer.on('pipelines:run-update', listener);
     return () => ipcRenderer.removeListener('pipelines:run-update', listener);
+  },
+  onRecordingStatus: (handler) => {
+    const listener = (_event, payload) => handler(payload);
+    ipcRenderer.on('recordings:status-update', listener);
+    return () => ipcRenderer.removeListener('recordings:status-update', listener);
   },
   onRuntimeOutput: (handler) => {
     const listener = (_event, payload) => handler(payload);

@@ -50,6 +50,10 @@
   ${if} $R5 != ""
     StrCpy $R4 "1"
   ${endIf}
+  ReadINIStr $R5 "$APPDATA\LocalAIHub\uninstall-cleanup.ini" "cleanup" "RecordingsRoot"
+  ${if} $R5 != ""
+    StrCpy $R4 "1"
+  ${endIf}
   ReadINIStr $R5 "$APPDATA\LocalAIHub\uninstall-cleanup.ini" "cleanup" "DownloadsRoot"
   ${if} $R5 != ""
     StrCpy $R4 "1"
@@ -77,7 +81,7 @@
   ${if} $R4 == "1"
     ${if} $R3 != "1"
       ${ifNot} ${Silent}
-        MessageBox MB_YESNO|MB_ICONQUESTION "Also delete Local AI Hub data stored outside this app folder? This includes managed tools, downloaded models, snapshots, logs, and settings in AppData." IDYES enableExternalCleanup IDNO cleanupPromptDone
+        MessageBox MB_YESNO|MB_ICONQUESTION "Also delete Local AI Hub data stored outside this app folder? This includes managed tools, downloaded models, recordings, snapshots, logs, and settings in AppData." IDYES enableExternalCleanup IDNO cleanupPromptDone
         enableExternalCleanup:
           StrCpy $R3 "1"
       ${endIf}
@@ -94,6 +98,10 @@
       RMDir /r "$R4"
     ${endIf}
     ReadINIStr $R4 "$APPDATA\LocalAIHub\uninstall-cleanup.ini" "cleanup" "ModelsRoot"
+    ${if} $R4 != ""
+      RMDir /r "$R4"
+    ${endIf}
+    ReadINIStr $R4 "$APPDATA\LocalAIHub\uninstall-cleanup.ini" "cleanup" "RecordingsRoot"
     ${if} $R4 != ""
       RMDir /r "$R4"
     ${endIf}

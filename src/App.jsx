@@ -20,6 +20,7 @@ import { formatBytes, formatUsage } from './lib/formatters';
 import { evaluateCompatibility, toolSearchText } from './lib/tool-ui';
 
 const PipelineBuilderPanel = lazy(() => import('./components/PipelineBuilderPanel'));
+const RecorderPanel = lazy(() => import('./components/RecorderPanel'));
 
 const EMPTY_STATE = {
   appDataPath: '',
@@ -186,6 +187,7 @@ export default function App() {
   const [toasts, setToasts] = useState([]);
   const [activeTab, setActiveTab] = useState('library');
   const [activePipelineRun, setActivePipelineRun] = useState(null);
+  const [activeRecording, setActiveRecording] = useState(null);
   const [storeSearch, setStoreSearch] = useState('');
   const [storeCategory, setStoreCategory] = useState('All categories');
   const [libraryPage, setLibraryPage] = useState(1);
@@ -1673,6 +1675,12 @@ export default function App() {
       }
     });
 
+    window.localAIHub.getActiveRecording().then((result) => {
+      if (result?.ok) {
+        setActiveRecording(result.data?.recording || null);
+      }
+    });
+
     const unsubscribeInstallProgress = window.localAIHub.onInstallProgress((progress) => {
       if (!progress?.toolId) {
         return;
@@ -1736,6 +1744,10 @@ export default function App() {
       if (payload?.run) {
         setActivePipelineRun(payload.run);
       }
+    });
+
+    const unsubscribeRecordingStatus = window.localAIHub.onRecordingStatus((payload) => {
+      setActiveRecording(payload?.active || null);
     });
 
     const unsubscribeRuntimeOutput = window.localAIHub.onRuntimeOutput((payload) => {
@@ -1817,6 +1829,7 @@ export default function App() {
       unsubscribeAppStateUpdated();
       unsubscribeLaunchProgress();
       unsubscribePipelineRunUpdate();
+      unsubscribeRecordingStatus();
       unsubscribeRuntimeOutput();
       unsubscribeToolState();
       unsubscribeUnexpectedStop();
@@ -2071,7 +2084,7 @@ export default function App() {
     );
   }
 
-  const containedTab = ['library', 'store', 'models', 'pipelines', 'statistics', 'settings'].includes(activeTab);
+  const containedTab = ['library', 'store', 'models', 'recorder', 'pipelines', 'statistics', 'settings'].includes(activeTab);
   const shellGridClassName = `mx-auto grid ${CONTAINED_CONTENT_MAX_WIDTH_CLASS} gap-5 xl:grid-cols-[280px,minmax(0,1fr)] ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`;
   const appShellClassName = containedTab
     ? `min-h-screen bg-shell ${CONTAINED_SHELL_PADDING_CLASS} text-white ${CONTAINED_SHELL_HEIGHT_CLASS}`
@@ -2090,6 +2103,7 @@ export default function App() {
           onChangeTab={setActiveTab}
           onOpenLogs={() => runAction('open-logs', () => window.localAIHub.openLogsFolder())}
           pipelineRunStatus={pipelineRunStatus}
+          recordingStatus={activeRecording ? 'Recording' : ''}
           storeCount={availableStoreTools.length}
         />
 
@@ -2370,6 +2384,10 @@ export default function App() {
             </section>
           ) : activeTab === 'models' ? (
             <ModelManager onToast={pushToast} tools={tools} />
+          ) : activeTab === 'recorder' ? (
+            <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-slate-300">Loading Recorder...</div>}>
+              <RecorderPanel activeRecording={activeRecording} onActiveRecordingChange={setActiveRecording} onToast={pushToast} />
+            </Suspense>
           ) : activeTab === 'pipelines' ? (
             <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-slate-300">Loading Pipelines...</div>}>
               <PipelineBuilderPanel

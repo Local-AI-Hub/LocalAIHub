@@ -4,10 +4,13 @@ const {
   app,
   BrowserWindow,
   dialog,
+  desktopCapturer,
   ipcMain,
   Menu,
   Notification,
   protocol,
+  screen,
+  session,
   Tray,
   nativeImage,
   shell,
@@ -107,6 +110,83 @@ const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./
 const { buildPipelineOutputDeletionPreview, deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
 const { redactSensitiveText } = require('./services/redactionService');
 const { appendLog } = require('./services/logService');
+const {
+  cancelRecording: cancelFfmpegRecording,
+  deleteRecording: deleteStoredRecording,
+  disposeRecording: disposeFfmpegRecording,
+  getActiveRecording: getActiveFfmpegRecording,
+  listRecordingDevices,
+  listRecentRecordings,
+  openRecording,
+  openRecordingsFolder,
+  revealRecording,
+  setRecordingEventSink: setFfmpegRecordingEventSink,
+  startRecording: startFfmpegRecording,
+  stopRecording: stopFfmpegRecording,
+} = require('./services/recordingService');
+const { createSystemAudioRecordingService } = require('./services/systemAudioRecordingService');
+const { createSystemAudioCaptureAdapter } = require('./services/systemAudioCaptureAdapter');
+const { normalizeOverlaySelection } = require('./services/regionSelectionService');
+const { buildTrayMenuTemplate, getTrayTooltip } = require('./services/trayMenuService');
+
+const systemAudioCaptureAdapter = createSystemAudioCaptureAdapter({
+  BrowserWindow,
+  desktopCapturer,
+  ipcMain,
+  session,
+});
+const systemAudioRecordingService = createSystemAudioRecordingService({ captureAdapter: systemAudioCaptureAdapter });
+let recordingStartInProgress = false;
+
+function isSystemAudioRecordingRequest(payload = {}) {
+  return payload?.systemAudio === true || payload?.mode === 'systemAudio';
+}
+
+function getActiveRecording() {
+  return systemAudioRecordingService.getActiveRecording() || getActiveFfmpegRecording();
+}
+
+function setRecordingEventSink(sink) {
+  setFfmpegRecordingEventSink(sink);
+  systemAudioRecordingService.setRecordingEventSink(sink);
+}
+
+async function startRecording(payload = {}, context = {}) {
+  if (recordingStartInProgress || getActiveRecording()) {
+    throw new Error('A recording is already active. Stop or cancel it before starting another one.');
+  }
+  recordingStartInProgress = true;
+  try {
+    if (isSystemAudioRecordingRequest(payload)) {
+      return await systemAudioRecordingService.startRecording(payload, context);
+    }
+    return await startFfmpegRecording(payload, context);
+  } finally {
+    recordingStartInProgress = false;
+  }
+}
+
+async function stopRecording() {
+  if (systemAudioRecordingService.getActiveRecording()) return systemAudioRecordingService.stopRecording();
+  return stopFfmpegRecording();
+}
+
+async function cancelRecording() {
+  if (systemAudioRecordingService.getActiveRecording()) return systemAudioRecordingService.cancelRecording();
+  return cancelFfmpegRecording();
+}
+
+async function disposeRecording() {
+  if (systemAudioRecordingService.getActiveRecording()) return systemAudioRecordingService.disposeRecording();
+  return disposeFfmpegRecording();
+}
+
+async function deleteRecording(id, options) {
+  if (getActiveRecording()?.id === String(id || '').trim()) {
+    throw new Error('Stop or cancel the active recording before deleting it.');
+  }
+  return deleteStoredRecording(id, options);
+}
 
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
@@ -130,6 +210,14 @@ try {
 
 let mainWindow = null;
 let tray = null;
+let cachedTrayToolItems = [];
+let trayToolRefreshPromise = null;
+let trayRecordingStopPromise = null;
+let regionSelectionWindow = null;
+let regionSelectionDisplay = null;
+let regionSelectionPromise = null;
+let regionSelectionResolve = null;
+let regionSelectionReject = null;
 let isQuitting = false;
 let closeBehaviorPreference = 'exit';
 let pendingUpdateInstall = false;
@@ -258,6 +346,8 @@ async function shutdownOwnedResources() {
     toolUpdateInterval = null;
   }
 
+  cancelRecordingRegionSelection();
+  await disposeRecording().catch(() => null);
   await disposeAllRuntimes().catch(() => null);
   await disposeBackgroundTasks().catch(() => null);
 }
@@ -610,57 +700,243 @@ function showWindow() {
   mainWindow.focus();
 }
 
-async function updateTrayMenu() {
+function serializeRecordingDisplay(display, index, primaryId) {
+  const bounds = {
+    x: Math.trunc(Number(display.bounds?.x) || 0),
+    y: Math.trunc(Number(display.bounds?.y) || 0),
+    width: Math.trunc(Number(display.bounds?.width) || 0),
+    height: Math.trunc(Number(display.bounds?.height) || 0),
+  };
+  const captureRect = screen.dipToScreenRect(null, bounds);
+  return {
+    id: String(display.id),
+    name: String(display.label || '').trim() || (String(display.id) === primaryId ? 'Primary display' : `Display ${index + 1}`),
+    primary: String(display.id) === primaryId,
+    bounds,
+    captureBounds: {
+      x: Math.trunc(Number(captureRect?.x) || 0),
+      y: Math.trunc(Number(captureRect?.y) || 0),
+      width: Math.trunc(Number(captureRect?.width) || 0),
+      height: Math.trunc(Number(captureRect?.height) || 0),
+    },
+    scaleFactor: Number(display.scaleFactor) || 1,
+  };
+}
+
+function listRecordingDisplays() {
+  const primaryId = String(screen.getPrimaryDisplay()?.id ?? '');
+  return screen.getAllDisplays().map((display, index) => serializeRecordingDisplay(display, index, primaryId));
+}
+
+function settleRecordingRegionSelection(result, error = null) {
+  const selectionWindow = regionSelectionWindow;
+  const resolve = regionSelectionResolve;
+  const reject = regionSelectionReject;
+  regionSelectionWindow = null;
+  regionSelectionDisplay = null;
+  regionSelectionPromise = null;
+  regionSelectionResolve = null;
+  regionSelectionReject = null;
+
+  if (selectionWindow && !selectionWindow.isDestroyed()) {
+    selectionWindow.destroy();
+  }
+  if (error) {
+    reject?.(error);
+  } else {
+    resolve?.(result);
+  }
+  if (!isQuitting && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
+  }
+}
+
+function cancelRecordingRegionSelection() {
+  if (!regionSelectionPromise) {
+    return false;
+  }
+  settleRecordingRegionSelection({ canceled: true, region: null });
+  return true;
+}
+
+async function selectRecordingRegion(displayId) {
+  if (regionSelectionPromise) {
+    regionSelectionWindow?.focus();
+    throw new Error('A region selection is already open. Finish or cancel it first.');
+  }
+
+  const rawDisplays = screen.getAllDisplays();
+  const rawDisplay = rawDisplays.find((display) => String(display.id) === String(displayId || ''));
+  if (!rawDisplay) {
+    throw new Error('Choose an available display before selecting a region.');
+  }
+  const primaryId = String(screen.getPrimaryDisplay()?.id ?? '');
+  const displayIndex = rawDisplays.indexOf(rawDisplay);
+  regionSelectionDisplay = serializeRecordingDisplay(rawDisplay, displayIndex, primaryId);
+  regionSelectionWindow = new BrowserWindow({
+    x: regionSelectionDisplay.bounds.x,
+    y: regionSelectionDisplay.bounds.y,
+    width: regionSelectionDisplay.bounds.width,
+    height: regionSelectionDisplay.bounds.height,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    hasShadow: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'regionSelectionPreload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  regionSelectionWindow.setAlwaysOnTop(true, 'screen-saver');
+  try {
+    regionSelectionWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  } catch {
+    // The selector remains always-on-top when this workspace hint is unavailable.
+  }
+  regionSelectionWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  regionSelectionWindow.webContents.on('will-navigate', (event) => event.preventDefault());
+  regionSelectionWindow.once('closed', () => {
+    if (regionSelectionPromise) {
+      settleRecordingRegionSelection({ canceled: true, region: null });
+    }
+  });
+
+  regionSelectionPromise = new Promise((resolve, reject) => {
+    regionSelectionResolve = resolve;
+    regionSelectionReject = reject;
+  });
+  const selectionPromise = regionSelectionPromise;
+  try {
+    await regionSelectionWindow.loadFile(path.join(__dirname, 'region-selection.html'));
+    if (!regionSelectionWindow || regionSelectionWindow.isDestroyed()) {
+      throw new Error('The region selector closed before it was ready.');
+    }
+    regionSelectionWindow.show();
+    regionSelectionWindow.focus();
+  } catch (error) {
+    settleRecordingRegionSelection(null, error);
+  }
+  return selectionPromise;
+}
+
+function submitRecordingRegionSelection(event, selection) {
+  if (!regionSelectionWindow || event.sender !== regionSelectionWindow.webContents || !regionSelectionDisplay) {
+    throw new Error('Local AI Hub refused a region selection from an unexpected window.');
+  }
+  const region = normalizeOverlaySelection(
+    selection,
+    regionSelectionDisplay,
+    (dipRect) => screen.dipToScreenRect(regionSelectionWindow, dipRect),
+  );
+  settleRecordingRegionSelection({ canceled: false, region });
+  return { accepted: true };
+}
+
+function buildTrayToolItems(tools = []) {
+  return tools.length > 0
+    ? tools.map((tool) => ({
+        label: tool.status === 'running' ? `Stop ${tool.name}` : `Launch ${tool.name}`,
+        click: async () => {
+          try {
+            if (tool.status === 'running') {
+              await stopTool(tool);
+              await maybeNotifyStoppedTool(tool);
+            } else if (tool.launchSupported === false) {
+              await shell.openPath(tool.installDir);
+            } else {
+              await launchToolFromExplicitUserAction(tool, {
+                launchContext: 'tray-menu',
+              });
+            }
+            await updateTrayMenu();
+          } catch {
+            return null;
+          }
+        },
+      }))
+    : [{ label: 'No tools installed yet', enabled: false }];
+}
+
+async function refreshTrayToolItems() {
+  if (!trayToolRefreshPromise) {
+    trayToolRefreshPromise = (async () => {
+      await initializeToolRegistry();
+      const tools = await buildMergedToolStateList({
+        includeSnapshots: false,
+        resolveStatuses: false,
+      });
+      cachedTrayToolItems = buildTrayToolItems(tools);
+    })().finally(() => {
+      trayToolRefreshPromise = null;
+    });
+  }
+
+  await trayToolRefreshPromise;
+}
+
+function stopActiveRecordingFromTray() {
+  if (trayRecordingStopPromise || !getActiveRecording()) {
+    return trayRecordingStopPromise;
+  }
+
+  trayRecordingStopPromise = stopRecording()
+    .then(() => invalidateStatisticsIndexSections(['storage'], 'recording-stopped').catch(() => null))
+    .catch(() => null)
+    .finally(() => {
+      trayRecordingStopPromise = null;
+      updateTrayMenu({ refreshTools: false }).catch(() => null);
+    });
+  return trayRecordingStopPromise;
+}
+
+function applyTrayMenu() {
   if (!tray) {
     return;
   }
 
-  await initializeToolRegistry();
-  const tools = await buildMergedToolStateList({
-    includeSnapshots: false,
-    resolveStatuses: false,
-  });
-  const toolItems =
-    tools.length > 0
-      ? tools.map((tool) => ({
-          label: tool.status === 'running' ? `Stop ${tool.name}` : `Launch ${tool.name}`,
-          click: async () => {
-            try {
-              if (tool.status === 'running') {
-                await stopTool(tool);
-                await maybeNotifyStoppedTool(tool);
-              } else if (tool.launchSupported === false) {
-                await shell.openPath(tool.installDir);
-              } else {
-                await launchToolFromExplicitUserAction(tool, {
-                  launchContext: 'tray-menu',
-                });
-              }
-              await updateTrayMenu();
-            } catch {
-              return null;
-            }
-          },
-        }))
-      : [{ label: 'No tools installed yet', enabled: false }];
-
-  const menu = Menu.buildFromTemplate([
-    { label: 'Open Local AI Hub', click: showWindow },
-    { type: 'separator' },
-    ...toolItems,
-    { type: 'separator' },
-    {
-      label: 'Quit',
-      click: () => {
-        requestAppQuit().catch((error) => reportShutdownError(error, { phase: 'tray-quit' }));
-      },
+  const activeRecording = getActiveRecording();
+  const template = buildTrayMenuTemplate({
+    activeRecording,
+    quit: () => {
+      requestAppQuit().catch((error) => reportShutdownError(error, { phase: 'tray-quit' }));
     },
-  ]);
-
-  tray.setToolTip('Local AI Hub');
-  tray.setContextMenu(menu);
+    showWindow,
+    stopRecording: stopActiveRecordingFromTray,
+    toolItems: cachedTrayToolItems,
+  });
+  tray.setToolTip(getTrayTooltip(activeRecording));
+  tray.setContextMenu(Menu.buildFromTemplate(template));
 }
 
+async function updateTrayMenu(options = {}) {
+  applyTrayMenu();
+  if (options.refreshTools === false) {
+    return;
+  }
+
+  await refreshTrayToolItems();
+  applyTrayMenu();
+}
+
+function handleTrayClick() {
+  if (getActiveRecording()) {
+    tray?.popUpContextMenu();
+    return;
+  }
+
+  showWindow();
+}
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -922,11 +1198,16 @@ async function registerAssetLibraryPreviewProtocol() {
   registerAssetLibraryPreviewProtocol.registered = true;
 }
 registerAssetLibraryPreviewProtocol.registered = false;
-async function withPlainEnglishErrors(handler, fallbackMessage) {
+async function withPlainEnglishErrors(handler, fallbackMessage, options = {}) {
   try {
     const data = await handler();
-    await updateHealthMonitor().catch(() => null);
-    await updateTrayMenu();
+    if (options.refreshMode === 'deferred') {
+      updateHealthMonitor().catch(() => null);
+      updateTrayMenu({ refreshTools: false }).catch(() => null);
+    } else if (options.refreshMode !== 'none') {
+      await updateHealthMonitor().catch(() => null);
+      await updateTrayMenu();
+    }
     return { ok: true, data };
   } catch (error) {
     return {
@@ -1029,6 +1310,74 @@ function registerIpcHandlers() {
         message: 'Local AI Hub opened that file or folder.',
       };
     }, 'Local AI Hub could not open that file or folder.'),
+  );
+
+  ipcMain.handle('recordings:select-region', (_event, payload) =>
+    withPlainEnglishErrors(() => selectRecordingRegion(payload?.displayId), 'Local AI Hub could not open the region selector.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('recordings:region-selection-submit', (event, payload) =>
+    withPlainEnglishErrors(async () => submitRecordingRegionSelection(event, payload), 'Local AI Hub could not use that selected region.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('recordings:region-selection-cancel', (event) =>
+    withPlainEnglishErrors(async () => {
+      if (!regionSelectionWindow || event.sender !== regionSelectionWindow.webContents) {
+        throw new Error('Local AI Hub refused a region cancellation from an unexpected window.');
+      }
+      cancelRecordingRegionSelection();
+      return { canceled: true };
+    }, 'Local AI Hub could not close the region selector.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('recordings:list-displays', () =>
+    withPlainEnglishErrors(async () => ({ displays: listRecordingDisplays() }), 'Local AI Hub could not read the available displays.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('recordings:list-devices', (_event, payload) =>
+    withPlainEnglishErrors(() => listRecordingDevices({ forceRefresh: Boolean(payload?.forceRefresh) }), 'Local AI Hub could not refresh recording devices.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('recordings:get-active', () =>
+    withPlainEnglishErrors(async () => ({ recording: getActiveRecording() }), 'Local AI Hub could not read the active recording.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('recordings:list', () =>
+    withPlainEnglishErrors(async () => ({ recordings: await listRecentRecordings() }), 'Local AI Hub could not load recent recordings.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('recordings:start', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const recording = await startRecording(payload || {}, { displays: listRecordingDisplays() });
+      return { recording, message: 'Recording started.' };
+    }, 'Local AI Hub could not start that recording.', { refreshMode: 'deferred' }),
+  );
+  ipcMain.handle('recordings:stop', () =>
+    withPlainEnglishErrors(async () => {
+      const recording = await stopRecording();
+      invalidateStatisticsIndexSections(['storage'], 'recording-stopped').catch(() => null);
+      return { recording, message: recording?.status === 'completed' ? 'Recording saved.' : 'Recording stopped before clean finalization.' };
+    }, 'Local AI Hub could not stop that recording cleanly.', { refreshMode: 'deferred' }),
+  );
+  ipcMain.handle('recordings:cancel', () =>
+    withPlainEnglishErrors(async () => {
+      const recording = await cancelRecording();
+      invalidateStatisticsIndexSections(['storage'], 'recording-canceled').catch(() => null);
+      return { recording, message: recording?.status === 'canceled' ? 'Recording canceled.' : 'Recording was interrupted while canceling.' };
+    }, 'Local AI Hub could not cancel that recording.', { refreshMode: 'deferred' }),
+  );
+  ipcMain.handle('recordings:open', (_event, payload) =>
+    withPlainEnglishErrors(() => openRecording(payload?.id, (targetPath) => shell.openPath(targetPath)), 'Local AI Hub could not open that recording.'),
+  );
+  ipcMain.handle('recordings:reveal', (_event, payload) =>
+    withPlainEnglishErrors(() => revealRecording(payload?.id, (targetPath) => shell.showItemInFolder(targetPath)), 'Local AI Hub could not reveal that recording.'),
+  );
+  ipcMain.handle('recordings:open-folder', () =>
+    withPlainEnglishErrors(() => openRecordingsFolder((targetPath) => shell.openPath(targetPath)), 'Local AI Hub could not open the recordings folder.'),
+  );
+  ipcMain.handle('recordings:delete', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const config = await readConfig();
+      const result = await deleteRecording(payload?.id, {
+        deleteMode: config.moveDeletedPipelineOutputsToRecycleBin !== false ? 'trash' : 'permanent',
+        trashItem: (targetPath) => shell.trashItem(targetPath),
+      });
+      await invalidateStatisticsIndexSections(['storage'], 'recording-deleted').catch(() => null);
+      return result;
+    }, 'Local AI Hub could not delete that recording.'),
   );
 
   ipcMain.handle('app:restart-to-update', () =>
@@ -2149,6 +2498,13 @@ async function startApplication() {
   const initialConfig = await readConfig();
   setCloseBehaviorPreference(initialConfig.closeBehavior);
   createWindow();
+  setRecordingEventSink((payload) => {
+    mainWindow?.webContents.send('recordings:status-update', payload);
+    if (payload?.recording?.status && payload.recording.status !== 'recording') {
+      invalidateStatisticsIndexSections(['storage'], `recording-${payload.recording.status}`).catch(() => null);
+    }
+    updateTrayMenu({ refreshTools: false }).catch(() => null);
+  });
   setRuntimeEventSink((payload) => {
     if (payload?.type === 'launch-progress') {
       mainWindow?.webContents.send('tools:launch-progress', payload);
@@ -2191,7 +2547,7 @@ async function startApplication() {
     });
   });
   tray = new Tray(createTrayIcon());
-  tray.on('click', showWindow);
+  tray.on('click', handleTrayClick);
   registerIpcHandlers();
   configureAutoUpdates({ onUpdateReady: sendUpdateReadyNotification });
   await initializeToolRegistry();

@@ -1,0 +1,20 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; media-src 'self' blob:; connect-src 'none'; img-src 'none'" />
+  <title>Starting system audio recording</title>
+  <link rel="stylesheet" href="system-audio-capture.css" />
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Local AI Hub Recorder</p>
+    <h1>Starting system audio capture</h1>
+    <p>Windows audio stays on this computer. This window closes when capture is ready.</p>
+    <button id="start-capture" type="button">Start local capture</button>
+    <p id="status" role="status">Preparing the secure Electron capture backend...</p>
+  </main>
+  <script src="system-audio-capture.js"></script>
+</body>
+</html>

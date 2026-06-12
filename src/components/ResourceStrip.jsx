@@ -19,8 +19,10 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
         ? 'Store'
         : activeTab === 'models'
           ? 'Model Manager'
-          : activeTab === 'pipelines'
-            ? 'Pipeline Builder'
+          : activeTab === 'recorder'
+            ? 'Recorder'
+            : activeTab === 'pipelines'
+              ? 'Pipeline Builder'
             : activeTab === 'statistics'
               ? 'Statistics'
               : 'Settings';
@@ -31,8 +33,10 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
         ? 'Browse installable local AI tools'
         : activeTab === 'models'
           ? 'Manage the models behind your tools'
-          : activeTab === 'pipelines'
-            ? 'Chain tools and providers into guided workflows'
+          : activeTab === 'recorder'
+            ? 'Capture screen, microphone, and camera locally'
+            : activeTab === 'pipelines'
+              ? 'Chain tools and providers into guided workflows'
             : activeTab === 'statistics'
               ? 'See what Local AI Hub is using on this PC'
               : 'Control storage, cleanup, and connections';
@@ -43,8 +47,10 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
         ? 'Pick a tool, check whether this hardware is a good fit, and let Local AI Hub handle the setup locally.'
         : activeTab === 'models'
           ? 'Search remote catalogs, download models into the right folders, and remove what you no longer need.'
-          : activeTab === 'pipelines'
-            ? 'Design node-based workflows, review machine suitability, and execute supported steps one at a time.'
+          : activeTab === 'recorder'
+            ? 'Create local MKV and WAV recordings, manage recent captures, and keep every file on this PC.'
+            : activeTab === 'pipelines'
+              ? 'Design node-based workflows, review machine suitability, and execute supported steps one at a time.'
             : activeTab === 'statistics'
               ? 'Review launch counts, disk growth, live VRAM history, and how much space Local AI Hub is using locally.'
               : 'Choose a storage drive, manage cloud API keys, migrate older installs off C:, and safely remove leftover files.';
@@ -53,7 +59,7 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
     : storage?.managedRoot
       ? 'Managed storage drive'
       : 'Storage drive';
-  const compact = ['library', 'store', 'models', 'pipelines', 'statistics', 'settings'].includes(activeTab);
+  const compact = ['library', 'store', 'models', 'recorder', 'pipelines', 'statistics', 'settings'].includes(activeTab);
   const metrics = [
     { accent: 'text-slate-400', detail: 'Installed now', label: 'Tools', value: String(installedCount) },
     { accent: 'text-emerald-300', detail: 'Active right now', label: 'Running', value: String(runningCount) },
