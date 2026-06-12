@@ -55,6 +55,7 @@ const {
   buildStableDiffusionCheckpointOption,
 } = toolAssetSelectionShared;
 const {
+  applyRecordInputModeChange,
   arePortsCompatible,
   buildGraphWorkflowConfigFromPreset,
   buildPipelineGraph,
@@ -92,6 +93,8 @@ const {
   DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
+  RECORD_INPUT_MODE_IDS,
+  RECORD_INPUT_MODE_OPTIONS,
   MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
   MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
@@ -100,6 +103,10 @@ const {
   normalizePipelineRunSettings,
   DEFAULT_PLANNING_SCHEMA_ID,
   getPlanningSchemaOptions,
+  getRecordInputFormatLabel,
+  getRecordInputModeDefinition,
+  getRecordInputModeLabel,
+  getRecordInputOutputKind,
 } = pipelineShared;
 const CANVAS_MIN_WIDTH = 1280;
 const CANVAS_MIN_HEIGHT = 820;
@@ -140,6 +147,29 @@ const MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITY_OPTIONS = Object.freeze([
   ['normal', 'Normal'],
   ['dense', 'Dense'],
 ]);
+
+function buildDefaultRecordInputRegion(display) {
+  const bounds = display?.captureBounds || display?.bounds || { x: 0, y: 0, width: 1280, height: 720 };
+  const width = Math.max(64, Math.floor(Math.min(1280, Number(bounds.width) || 1280) / 2) * 2);
+  const height = Math.max(64, Math.floor(Math.min(720, Number(bounds.height) || 720) / 2) * 2);
+  return {
+    displayId: String(display?.id || ''),
+    height,
+    type: 'region',
+    width,
+    x: (Number(bounds.x) || 0) + Math.max(0, Math.floor(((Number(bounds.width) || width) - width) / 2)),
+    y: (Number(bounds.y) || 0) + Math.max(0, Math.floor(((Number(bounds.height) || height) - height) / 2)),
+  };
+}
+
+function formatRecordInputElapsed(startedAt, now) {
+  const started = new Date(startedAt || 0).getTime();
+  if (!Number.isFinite(started) || started <= 0) {
+    return '00:00';
+  }
+  const seconds = Math.max(0, Math.floor((now - started) / 1000));
+  return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+}
 
 function formatMediaCompositionTransitionLabel(value) {
   return String(value || '')
@@ -441,10 +471,40 @@ function getBurnSubtitlesRetryPayload(retryOverrides) {
   };
 }
 
+function getPendingRecordInputRetryDefaults(pendingValidation) {
+  const settings = pendingValidation?.retryControls?.recordInput?.settings;
+  if (!settings || typeof settings !== 'object') {
+    return null;
+  }
+  return {
+    ...settings,
+    captureTarget: settings.captureTarget && typeof settings.captureTarget === 'object'
+      ? { ...settings.captureTarget }
+      : { type: 'desktop' },
+  };
+}
+
+function getRecordInputRetryPayload(retryOverrides) {
+  if (!retryOverrides || typeof retryOverrides !== 'object') {
+    return null;
+  }
+  return {
+    captureTarget: retryOverrides.captureTarget && typeof retryOverrides.captureTarget === 'object'
+      ? { ...retryOverrides.captureTarget }
+      : undefined,
+    displayId: String(retryOverrides.displayId || '').trim(),
+    fps: Number(retryOverrides.fps),
+    microphoneId: String(retryOverrides.microphoneId || '').trim(),
+    mode: String(retryOverrides.mode || '').trim(),
+    webcamId: String(retryOverrides.webcamId || '').trim(),
+  };
+}
+
 function getPendingValidationRetryDefaults(pendingValidation) {
   return {
     mediaComposition: getPendingMediaCompositionRetryDefaults(pendingValidation),
     burnSubtitles: getPendingBurnSubtitlesRetryDefaults(pendingValidation),
+    recordInput: getPendingRecordInputRetryDefaults(pendingValidation),
   };
 }
 
@@ -2587,7 +2647,7 @@ function ResultCard({ result, onOpenPath, onRevealPath }) {
     </div>
   );
 }
-function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fontLibraries = [], colorPaletteLibraries = [], onChangeComment, onChangeRetryOverride, onDecide, onOpenPath, onRevealPath, busy }) {
+function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fontLibraries = [], colorPaletteLibraries = [], recordingDevices = { microphones: [], webcams: [] }, recordingDisplays = [], recordingDevicesBusy = false, recordingDisplaysBusy = false, onChangeComment, onChangeRetryOverride, onDecide, onOpenPath, onRefreshRecordingDevices, onRefreshRecordingDisplays, onRevealPath, onSelectRecordInputRegion, busy }) {
   if (!pendingValidation) {
     return null;
   }
@@ -2601,6 +2661,11 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
   const collectionMapLabel = collectionMapContext
     ? 'Map item ' + String(Number(collectionMapContext.itemIndex || 0) + 1) + ' of ' + collectionMapContext.itemCount + (collectionMapContext.itemId ? ' (' + collectionMapContext.itemId + ')' : '')
     : '';
+  const recordInputRetryControl = pendingValidation.retryControls?.recordInput || null;
+  const recordInputRetryValues = retryOverrides?.recordInput || getPendingRecordInputRetryDefaults(pendingValidation);
+  const recordInputRetryMode = getRecordInputModeDefinition(recordInputRetryControl?.mode || recordInputRetryValues?.mode);
+  const recordInputCaptureTargetType = String(recordInputRetryValues?.captureTarget?.type || 'desktop') === 'region' ? 'region' : 'desktop';
+  const recordInputSelectedDisplay = recordingDisplays.find((display) => String(display.id) === String(recordInputRetryValues?.displayId || recordInputRetryValues?.captureTarget?.displayId || '')) || null;
   const mediaCompositionRetryControl = pendingValidation.retryControls?.mediaComposition || null;
   const mediaCompositionRetryValues = retryOverrides?.mediaComposition || getPendingMediaCompositionRetryDefaults(pendingValidation);
   const burnSubtitlesRetryControl = pendingValidation.retryControls?.burnSubtitles || null;
@@ -2636,6 +2701,85 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
       <PlanReviewEvidence planReview={pendingValidation.planReview || pendingValidation.reviewContext?.planReview} />
       {artifactPath ? <input className="store-input mt-4" readOnly value={artifactPath} /> : null}
       <PathButtons onOpenPath={onOpenPath} onRevealPath={onRevealPath} path={artifactPath} />
+      {recordInputRetryControl && recordInputRetryValues && recordInputRetryMode ? (
+        <div className="mt-4 border-t border-violet-200/20 pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.18em] text-violet-100/80">Retry recording settings</p>
+              <p className="mt-2 text-sm font-semibold text-white">{recordInputRetryControl.nodeLabel || 'Record Input'}</p>
+            </div>
+            <span className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-violet-100/80">Temporary</span>
+          </div>
+          <p className="mt-3 text-xs leading-5 text-violet-50/80">These settings apply only to the fresh recording requested when you choose Fail. The recording mode and {recordInputRetryControl.outputKind} graph output stay locked for this run.</p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-record-input-mode">Recording mode</label>
+              <input className="store-input mt-3" id="validation-record-input-mode" readOnly value={recordInputRetryControl.modeLabel || recordInputRetryMode.label} />
+            </div>
+            <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-record-input-output">Output contract</label>
+              <input className="store-input mt-3" id="validation-record-input-output" readOnly value={`${recordInputRetryControl.outputKind} | ${recordInputRetryControl.formatLabel}`} />
+            </div>
+          </div>
+          {recordInputRetryMode.needsScreen || recordInputRetryMode.needsSystemAudio ? <div className="mt-4 rounded-2xl border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-xs leading-5 text-amber-100">Screen and system-audio capture can include notifications, passwords, private conversations, meeting audio, browser sounds, and confidential work. Retry recording still waits for an explicit Start Recording action.</div> : null}
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            {recordInputRetryControl.adjustable?.fps ? (
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-record-input-fps">Frame rate</label>
+                <select className="store-input mt-3" disabled={busy} id="validation-record-input-fps" onChange={(event) => onChangeRetryOverride?.('recordInput', { fps: Number(event.target.value) })} value={Number(recordInputRetryValues.fps || 15)}>
+                  {[10, 15, 24, 30, 60].map((fps) => <option key={fps} value={fps}>{fps} FPS</option>)}
+                </select>
+              </div>
+            ) : null}
+            {recordInputRetryMode.needsScreen ? (
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-record-input-target">Capture target</label>
+                <select className="store-input mt-3" disabled={busy} id="validation-record-input-target" onChange={(event) => { const nextType = event.target.value === 'region' ? 'region' : 'desktop'; onChangeRetryOverride?.('recordInput', { captureTarget: nextType === 'region' ? buildDefaultRecordInputRegion(recordInputSelectedDisplay || recordingDisplays.find((display) => display.primary) || recordingDisplays[0]) : { type: 'desktop' } }); }} value={recordInputCaptureTargetType}>
+                  <option value="desktop">{recordInputRetryMode.needsSystemAudio ? 'Selected display' : 'Full desktop'}</option>
+                  <option value="region">Region</option>
+                </select>
+              </div>
+            ) : null}
+            {(recordInputRetryMode.needsDisplay || recordInputCaptureTargetType === 'region') ? (
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-record-input-display">Display</label>
+                <select className="store-input mt-3" disabled={busy || recordingDisplaysBusy || !recordingDisplays.length} id="validation-record-input-display" onChange={(event) => { const display = recordingDisplays.find((entry) => String(entry.id) === event.target.value) || null; onChangeRetryOverride?.('recordInput', { displayId: event.target.value, captureTarget: recordInputCaptureTargetType === 'region' ? buildDefaultRecordInputRegion(display) : recordInputRetryValues.captureTarget }); }} value={recordInputRetryValues.displayId || ''}>
+                  <option value="">Choose display</option>
+                  {recordingDisplays.map((display) => <option key={display.id} value={display.id}>{display.name}{display.primary ? ' (primary)' : ''}</option>)}
+                </select>
+              </div>
+            ) : null}
+            {recordInputRetryControl.adjustable?.microphone ? (
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-record-input-microphone">Microphone</label>
+                <select className="store-input mt-3" disabled={busy || recordingDevicesBusy || !recordingDevices.microphones.length} id="validation-record-input-microphone" onChange={(event) => onChangeRetryOverride?.('recordInput', { microphoneId: event.target.value })} value={recordInputRetryValues.microphoneId || ''}>
+                  <option value="">Choose microphone</option>
+                  {recordingDevices.microphones.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
+                </select>
+              </div>
+            ) : null}
+            {recordInputRetryControl.adjustable?.webcam ? (
+              <div>
+                <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-record-input-webcam">Webcam</label>
+                <select className="store-input mt-3" disabled={busy || recordingDevicesBusy || !recordingDevices.webcams.length} id="validation-record-input-webcam" onChange={(event) => onChangeRetryOverride?.('recordInput', { webcamId: event.target.value })} value={recordInputRetryValues.webcamId || ''}>
+                  <option value="">Choose webcam</option>
+                  {recordingDevices.webcams.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
+                </select>
+              </div>
+            ) : null}
+          </div>
+          {recordInputCaptureTargetType === 'region' ? (
+            <div className="mt-4 grid gap-3 sm:grid-cols-4">
+              {['x', 'y', 'width', 'height'].map((key) => <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" key={key}>{key}<input className="store-input mt-3" disabled={busy} min={key === 'width' || key === 'height' ? 64 : undefined} onChange={(event) => onChangeRetryOverride?.('recordInput', { captureTarget: { ...(recordInputRetryValues.captureTarget || {}), displayId: recordInputRetryValues.displayId || '', [key]: Number(event.target.value), type: 'region' } })} step={key === 'width' || key === 'height' ? 2 : 1} type="number" value={recordInputRetryValues.captureTarget?.[key] ?? 0} /></label>)}
+            </div>
+          ) : null}
+          <div className="mt-4 flex flex-wrap gap-3">
+            {(recordInputRetryMode.needsDisplay || recordInputCaptureTargetType === 'region') ? <button className="ghost-button" disabled={busy || recordingDisplaysBusy} onClick={onRefreshRecordingDisplays} type="button">{recordingDisplaysBusy ? 'Refreshing...' : 'Refresh displays'}</button> : null}
+            {(recordInputRetryMode.needsMicrophone || recordInputRetryMode.needsWebcam) ? <button className="ghost-button" disabled={busy || recordingDevicesBusy} onClick={onRefreshRecordingDevices} type="button">{recordingDevicesBusy ? 'Scanning devices...' : 'Refresh devices'}</button> : null}
+            {recordInputCaptureTargetType === 'region' ? <button className="ghost-button" disabled={busy || !recordInputRetryValues.displayId} onClick={() => onSelectRecordInputRegion?.(recordInputRetryControl, recordInputRetryValues)} type="button">Select region</button> : null}
+          </div>
+        </div>
+      ) : null}
       {mediaCompositionRetryControl && mediaCompositionRetryValues ? (
         <div className="mt-4 border-t border-violet-200/20 pt-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -2902,7 +3046,59 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
   );
 }
 
-function PipelineTimeline({ draft, runState, validationComment, validationRetryOverrides, fontLibraries = [], colorPaletteLibraries = [], onChangeValidationComment, onChangeValidationRetryOverride, onDecideValidation, onOpenPath, onRevealPath, validationBusy }) {
+function RecordInputDecisionCard({ busy, onCancel, onStart, onStop, pendingRecordInput }) {
+  const [now, setNow] = useState(Date.now());
+  const status = String(pendingRecordInput?.status || 'waiting').trim();
+  const isRecording = status === 'recording';
+  const isBusy = Boolean(busy) || ['starting', 'finalizing', 'canceling'].includes(status);
+
+  useEffect(() => {
+    if (!isRecording) {
+      setNow(Date.now());
+      return undefined;
+    }
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isRecording, pendingRecordInput?.requestId]);
+
+  if (!pendingRecordInput) {
+    return null;
+  }
+
+  return (
+    <div className="rounded-[26px] border border-rose-400/35 bg-rose-400/10 p-5 text-rose-50">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <p className="text-xs uppercase tracking-[0.22em] text-rose-100/75">Record Input pending</p>
+          <p className="mt-2 text-lg font-semibold text-white">{pendingRecordInput.nodeLabel}</p>
+          <p className="mt-2 text-sm leading-6 text-rose-50/90">{pendingRecordInput.modeLabel} | {pendingRecordInput.formatLabel} | {pendingRecordInput.outputKind}</p>
+        </div>
+        <span className="rounded-full border border-rose-200/20 bg-slate-950/30 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-rose-50">
+          {status === 'waiting' ? 'Waiting to start' : status}
+        </span>
+      </div>
+
+      <div className="mt-4 rounded-2xl border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-100">
+        Screen and system-audio recording may capture notifications, private conversations, browser audio, passwords, or confidential content. Recording never starts automatically.
+      </div>
+
+      {isRecording ? (
+        <p className="mt-4 text-3xl font-semibold tabular-nums text-white">
+          {formatRecordInputElapsed(pendingRecordInput.startedAt || pendingRecordInput.recording?.startedAt, now)}
+        </p>
+      ) : null}
+      {status === 'finalizing' ? <p className="mt-4 text-sm leading-6 text-rose-50/85">Finalizing the local file. The pipeline will continue only after the main-process recorder confirms a usable artifact.</p> : null}
+
+      <div className="mt-4 flex flex-wrap gap-3">
+        {status === 'waiting' ? <button className="primary-button" disabled={isBusy} onClick={onStart} type="button">{busy === 'start' ? 'Starting...' : 'Start Recording'}</button> : null}
+        {status === 'recording' ? <button className="primary-button" disabled={isBusy} onClick={onStop} type="button">{busy === 'stop' ? 'Finalizing...' : 'Stop Recording'}</button> : null}
+        {status === 'waiting' || status === 'recording' ? <button className="ghost-button" disabled={isBusy} onClick={onCancel} type="button">{busy === 'cancel' ? 'Canceling...' : 'Cancel / Fail'}</button> : null}
+      </div>
+    </div>
+  );
+}
+
+function PipelineTimeline({ draft, runState, recordInputBusy, validationComment, validationRetryOverrides, fontLibraries = [], colorPaletteLibraries = [], recordingDevices = { microphones: [], webcams: [] }, recordingDisplays = [], recordingDevicesBusy = false, recordingDisplaysBusy = false, onCancelRecordInput, onChangeValidationComment, onChangeValidationRetryOverride, onDecideValidation, onOpenPath, onRefreshRecordingDevices, onRefreshRecordingDisplays, onRevealPath, onSelectRecordInputRegion, onStartRecordInput, onStopRecordInput, validationBusy }) {
   const activeNodeState = runState?.currentNodeId ? runState.nodeStates?.[runState.currentNodeId] || null : null;
   const activeAttemptLabel = formatAttemptLabel(activeNodeState?.iteration, activeNodeState?.loopMaxAttempts);
   const loopStates = Object.values(runState?.loopStates || {});
@@ -2976,8 +3172,25 @@ function PipelineTimeline({ draft, runState, validationComment, validationRetryO
           onRevealPath={onRevealPath}
           pendingValidation={runState.pendingValidation}
           retryOverrides={validationRetryOverrides}
+          recordingDevices={recordingDevices}
+          recordingDisplays={recordingDisplays}
+          recordingDevicesBusy={recordingDevicesBusy}
+          recordingDisplaysBusy={recordingDisplaysBusy}
+          onRefreshRecordingDevices={onRefreshRecordingDevices}
+          onRefreshRecordingDisplays={onRefreshRecordingDisplays}
+          onSelectRecordInputRegion={onSelectRecordInputRegion}
           fontLibraries={fontLibraries}
           colorPaletteLibraries={colorPaletteLibraries}
+        />
+      ) : null}
+
+      {runState.pendingRecordInput ? (
+        <RecordInputDecisionCard
+          busy={recordInputBusy}
+          onCancel={onCancelRecordInput}
+          onStart={onStartRecordInput}
+          onStop={onStopRecordInput}
+          pendingRecordInput={runState.pendingRecordInput}
         />
       ) : null}
 
@@ -3478,6 +3691,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [runBusy, setRunBusy] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
+  const [recordInputBusy, setRecordInputBusy] = useState('');
   const [validationBusy, setValidationBusy] = useState(false);
   const [validationComment, setValidationComment] = useState('');
   const [validationRetryOverrides, setValidationRetryOverrides] = useState(null);
@@ -3487,6 +3701,10 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const [soundEffectLibraries, setSoundEffectLibraries] = useState([]);
   const [fontLibraries, setFontLibraries] = useState([]);
   const [colorPaletteLibraries, setColorPaletteLibraries] = useState([]);
+  const [recordingDevices, setRecordingDevices] = useState({ microphones: [], webcams: [] });
+  const [recordingDisplays, setRecordingDisplays] = useState([]);
+  const [recordingDevicesBusy, setRecordingDevicesBusy] = useState(false);
+  const [recordingDisplaysBusy, setRecordingDisplaysBusy] = useState(false);
   const [graphWorkflowPresetName, setGraphWorkflowPresetName] = useState('');
   const [graphWorkflowPresetStatus, setGraphWorkflowPresetStatus] = useState(null);
   const [graphWorkflowPresetBusy, setGraphWorkflowPresetBusy] = useState(false);
@@ -3646,6 +3864,19 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (selectedNode?.type !== 'recordInput') {
+      return;
+    }
+    if (!recordingDevices.microphones.length && !recordingDevices.webcams.length) {
+      loadRecordingDevices(false);
+    }
+    if (!recordingDisplays.length) {
+      loadRecordingDisplays();
+    }
+  }, [selectedNode?.id, selectedNode?.type]);
+
   const audioTools = useMemo(() => (tools || []).filter((tool) => AUDIO_WORKFLOW_TOOL_IDS.includes(tool.id) && !AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const audioTransformTools = useMemo(() => (tools || []).filter((tool) => AUDIO_TRANSFORM_TOOL_IDS.includes(tool.id)), [tools]);
   const imageTools = useMemo(() => (tools || []).filter((tool) => IMAGE_WORKFLOW_TOOL_IDS.includes(tool.id)), [tools]);
@@ -3895,6 +4126,29 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       nodes: current.nodes.map((node) => (node.id === nodeId ? updater(node) : node)),
     }));
     markDirty();
+  }
+
+  function changeRecordInputMode(node, nextMode) {
+    let change;
+    try {
+      change = applyRecordInputModeChange(draft, node.id, nextMode);
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not change that Record Input mode.', 'error');
+      return;
+    }
+    if (change.requiresConfirmation) {
+      const message = `Changing this recording mode will change the output from ${change.impact.oldOutputKind} to ${change.impact.newOutputKind} and remove incompatible connections.`;
+      if (!window.confirm(`${message}\n\nChange mode and remove incompatible connections?`)) {
+        return;
+      }
+    }
+    setDraft((current) => applyRecordInputModeChange(current, node.id, nextMode, {
+      removeIncompatibleConnections: change.requiresConfirmation,
+    }).pipeline);
+    markDirty();
+    if (change.requiresConfirmation) {
+      onToast('Record Input mode changed and incompatible outgoing connections were removed.', 'success');
+    }
   }
 
   function getDefaultCollectionMapLocalToolId(operationId) {
@@ -4199,6 +4453,34 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     return savedPipelines;
   }
 
+  async function loadRecordingDevices(forceRefresh = false) {
+    setRecordingDevicesBusy(true);
+    try {
+      const result = await window.localAIHub.listRecordingDevices(forceRefresh);
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not refresh recording devices.', 'error');
+        return;
+      }
+      setRecordingDevices(result.data || { microphones: [], webcams: [] });
+    } finally {
+      setRecordingDevicesBusy(false);
+    }
+  }
+
+  async function loadRecordingDisplays() {
+    setRecordingDisplaysBusy(true);
+    try {
+      const result = await window.localAIHub.listRecordingDisplays();
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not read the available displays.', 'error');
+        return;
+      }
+      setRecordingDisplays(result.data?.displays || []);
+    } finally {
+      setRecordingDisplaysBusy(false);
+    }
+  }
+
   async function loadPipelineOutputs(options = {}) {
     if (!options.silent) {
       setOutputsLoading(true);
@@ -4327,6 +4609,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       }
       if (payload.run.status !== 'running' && payload.run.status !== 'paused') {
         setCancelBusy(false);
+        setRecordInputBusy('');
         setValidationBusy(false);
       }
     });
@@ -5416,6 +5699,108 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     onToast(result.data?.message || 'Local AI Hub is stopping the active pipeline and will shut down any tool it started for the run.', 'success');
   }
 
+  async function selectRecordInputRegion(node) {
+    const displayId = String(node?.config?.displayId || node?.config?.captureTarget?.displayId || '').trim();
+    if (!displayId) {
+      onToast('Choose an available display before selecting a Record Input region.', 'error');
+      return;
+    }
+    setRecordInputBusy('region');
+    try {
+      const result = await window.localAIHub.selectRecordingRegion(displayId);
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not open the region selector.', 'error');
+        return;
+      }
+      const region = result.data?.region;
+      if (!result.data?.canceled && region) {
+        updateNode(node.id, (currentNode) => ({
+          ...currentNode,
+          config: {
+            ...currentNode.config,
+            displayId: region.displayId || displayId,
+            captureTarget: {
+              displayId: region.displayId || displayId,
+              height: region.height,
+              type: 'region',
+              width: region.width,
+              x: region.x,
+              y: region.y,
+            },
+          },
+        }));
+        onToast('Record Input region selected.', 'success');
+      }
+    } finally {
+      setRecordInputBusy('');
+    }
+  }
+
+  async function selectValidationRecordInputRegion(_control, values) {
+    const displayId = String(values?.displayId || values?.captureTarget?.displayId || '').trim();
+    if (!displayId) {
+      onToast('Choose an available display before selecting a retry region.', 'error');
+      return;
+    }
+    setRecordInputBusy('validation-region');
+    try {
+      const result = await window.localAIHub.selectRecordingRegion(displayId);
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not open the region selector.', 'error');
+        return;
+      }
+      const region = result.data?.region;
+      if (!result.data?.canceled && region) {
+        handleValidationRetryOverrideChange('recordInput', {
+          displayId: region.displayId || displayId,
+          captureTarget: {
+            displayId: region.displayId || displayId,
+            height: region.height,
+            type: 'region',
+            width: region.width,
+            x: region.x,
+            y: region.y,
+          },
+        });
+        onToast('Retry recording region selected.', 'success');
+      }
+    } finally {
+      setRecordInputBusy('');
+    }
+  }
+
+  async function runRecordInputAction(action) {
+    const pending = runState?.pendingRecordInput;
+    if (!runState?.runId || !pending?.nodeId || !pending?.requestId) {
+      return;
+    }
+    const api = action === 'start'
+      ? window.localAIHub.startPipelineRecordInput
+      : action === 'stop'
+        ? window.localAIHub.stopPipelineRecordInput
+        : window.localAIHub.cancelPipelineRecordInput;
+    setRecordInputBusy(action);
+    try {
+      const result = await api({
+        nodeId: pending.nodeId,
+        requestId: pending.requestId,
+        runId: runState.runId,
+      });
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not update that Record Input step.', 'error');
+        return;
+      }
+      if (result.data?.run) {
+        applyRunSnapshot(result.data.run);
+      }
+      onToast(result.data?.message || (action === 'start' ? 'Record Input started.' : action === 'stop' ? 'Record Input is finalizing.' : 'Record Input was canceled.'), action === 'cancel' ? 'error' : 'success');
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not update that Record Input step.', 'error');
+    } finally {
+      setRecordInputBusy('');
+    }
+  }
+
   function handleValidationRetryOverrideChange(section, patch) {
     setValidationRetryOverrides((current) => {
       const defaults = getPendingValidationRetryDefaults(runState?.pendingValidation);
@@ -5443,6 +5828,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
         ? {
             ...(pendingValidation.retryControls?.mediaComposition ? { mediaComposition: getMediaCompositionRetryPayload(validationRetryOverrides?.mediaComposition || retryDefaults.mediaComposition) } : {}),
             ...(pendingValidation.retryControls?.burnSubtitles ? { burnSubtitles: getBurnSubtitlesRetryPayload(validationRetryOverrides?.burnSubtitles || retryDefaults.burnSubtitles) } : {}),
+            ...(pendingValidation.retryControls?.recordInput ? { recordInput: getRecordInputRetryPayload(validationRetryOverrides?.recordInput || retryDefaults.recordInput) } : {}),
           }
         : null;
       const result = await window.localAIHub.resumePipelineValidation({
@@ -5472,7 +5858,16 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   }
 
   const paletteGroups = getNodePaletteGroups();
-  const graphEdges = draft.edges.filter((edge) => graph.nodeMap.has(edge.source.nodeId) && graph.nodeMap.has(edge.target.nodeId));
+  const graphEdges = draft.edges.filter((edge) => {
+    const sourceNode = graph.nodeMap.get(edge.source.nodeId) || null;
+    const targetNode = graph.nodeMap.get(edge.target.nodeId) || null;
+    return Boolean(
+      sourceNode
+      && targetNode
+      && getPortDefinition(sourceNode, 'output', edge.source.portId)
+      && getPortDefinition(targetNode, 'input', edge.target.portId)
+    );
+  });
 
   function measureRenderedPortCenters() {
     const graphSurface = graphSurfaceRef.current;
@@ -5995,6 +6390,182 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                 </div>
 
                 {selectedNode.type === 'textInput' ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="node-text-input">Text input</label><textarea className="store-input mt-3 min-h-[180px] resize-none" id="node-text-input" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, text: event.target.value } }))} placeholder="Write the initial text for this workflow." value={selectedNode.config?.text || ''} /></div> : null}
+
+                {selectedNode.type === 'recordInput' ? (() => {
+                  const mode = getRecordInputModeDefinition(selectedNode.config?.mode) || RECORD_INPUT_MODE_OPTIONS[0];
+                  const captureTargetType = String(selectedNode.config?.captureTarget?.type || 'desktop').trim() === 'region' ? 'region' : 'desktop';
+                  const selectedDisplay = recordingDisplays.find((display) => String(display.id) === String(selectedNode.config?.displayId || selectedNode.config?.captureTarget?.displayId || '')) || null;
+                  const showDisplay = mode.needsDisplay || captureTargetType === 'region';
+                  return (
+                    <div className="space-y-4">
+                      <div className="grid gap-4 lg:grid-cols-2">
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="record-input-mode">Capture source</label>
+                          <select
+                            className="store-input mt-3"
+                            id="record-input-mode"
+                            onChange={(event) => changeRecordInputMode(selectedNode, event.target.value)}
+                            value={selectedNode.config?.mode || RECORD_INPUT_MODE_IDS.SCREEN}
+                          >
+                            {RECORD_INPUT_MODE_OPTIONS.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="record-input-format">Output</label>
+                          <input className="store-input mt-3" id="record-input-format" readOnly value={`${getRecordInputOutputKind(selectedNode)} | ${getRecordInputFormatLabel(selectedNode)}`} />
+                        </div>
+                      </div>
+
+                      {mode.needsScreen ? (
+                        <div className="space-y-4 rounded-[20px] border border-white/10 bg-slate-950/30 p-4">
+                          <div>
+                            <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="record-input-target">Screen target</label>
+                            <select
+                              className="store-input mt-3"
+                              id="record-input-target"
+                              onChange={(event) => {
+                                const nextType = event.target.value === 'region' ? 'region' : 'desktop';
+                                updateNode(selectedNode.id, (currentNode) => ({
+                                  ...currentNode,
+                                  config: {
+                                    ...currentNode.config,
+                                    captureTarget: nextType === 'region'
+                                      ? buildDefaultRecordInputRegion(selectedDisplay || recordingDisplays.find((display) => display.primary) || recordingDisplays[0])
+                                      : { type: 'desktop' },
+                                  },
+                                }));
+                              }}
+                              value={captureTargetType}
+                            >
+                              <option value="desktop">{mode.needsSystemAudio ? 'Selected display' : 'Full desktop'}</option>
+                              <option value="region">Region</option>
+                            </select>
+                          </div>
+
+                          {showDisplay ? (
+                            <div>
+                              <div className="flex flex-wrap items-end gap-3">
+                                <label className="min-w-[240px] flex-1 text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="record-input-display">
+                                  Display
+                                  <select
+                                    className="store-input mt-3"
+                                    disabled={recordingDisplaysBusy || !recordingDisplays.length}
+                                    id="record-input-display"
+                                    onChange={(event) => {
+                                      const display = recordingDisplays.find((entry) => String(entry.id) === event.target.value) || null;
+                                      updateNode(selectedNode.id, (currentNode) => ({
+                                        ...currentNode,
+                                        config: {
+                                          ...currentNode.config,
+                                          displayId: event.target.value,
+                                          captureTarget: captureTargetType === 'region'
+                                            ? buildDefaultRecordInputRegion(display)
+                                            : currentNode.config?.captureTarget || { type: 'desktop' },
+                                        },
+                                      }));
+                                    }}
+                                    value={selectedNode.config?.displayId || ''}
+                                  >
+                                    <option value="">Choose display</option>
+                                    {recordingDisplays.map((display) => {
+                                      const bounds = display.captureBounds || display.bounds || {};
+                                      return <option key={display.id} value={display.id}>{display.name}{display.primary ? ' (primary)' : ''} - {bounds.width}x{bounds.height}</option>;
+                                    })}
+                                  </select>
+                                </label>
+                                <button className="ghost-button" disabled={recordingDisplaysBusy} onClick={loadRecordingDisplays} type="button">{recordingDisplaysBusy ? 'Refreshing...' : 'Refresh displays'}</button>
+                                {captureTargetType === 'region' ? <button className="ghost-button" disabled={!selectedNode.config?.displayId || recordInputBusy === 'region'} onClick={() => selectRecordInputRegion(selectedNode)} type="button">{recordInputBusy === 'region' ? 'Selecting...' : 'Select region'}</button> : null}
+                              </div>
+                            </div>
+                          ) : null}
+
+                          {captureTargetType === 'region' ? (
+                            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                              {[
+                                ['x', 'X'],
+                                ['y', 'Y'],
+                                ['width', 'Width'],
+                                ['height', 'Height'],
+                              ].map(([key, label]) => (
+                                <label className="text-xs uppercase tracking-[0.18em] text-slate-500" key={key}>
+                                  {label}
+                                  <input
+                                    className="store-input mt-3"
+                                    min={key === 'width' || key === 'height' ? 64 : undefined}
+                                    onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({
+                                      ...currentNode,
+                                      config: {
+                                        ...currentNode.config,
+                                        captureTarget: {
+                                          ...(currentNode.config?.captureTarget || { type: 'region' }),
+                                          [key]: Number(event.target.value),
+                                          displayId: currentNode.config?.displayId || '',
+                                          type: 'region',
+                                        },
+                                      },
+                                    }))}
+                                    step={key === 'width' || key === 'height' ? 2 : 1}
+                                    type="number"
+                                    value={selectedNode.config?.captureTarget?.[key] ?? 0}
+                                  />
+                                </label>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : mode.needsDisplay ? (
+                        <div className="flex flex-wrap items-end gap-3">
+                          <label className="min-w-[240px] flex-1 text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="record-input-audio-display">
+                            Display permission source
+                            <select className="store-input mt-3" disabled={recordingDisplaysBusy || !recordingDisplays.length} id="record-input-audio-display" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, displayId: event.target.value } }))} value={selectedNode.config?.displayId || ''}>
+                              <option value="">Choose display</option>
+                              {recordingDisplays.map((display) => <option key={display.id} value={display.id}>{display.name}{display.primary ? ' (primary)' : ''}</option>)}
+                            </select>
+                          </label>
+                          <button className="ghost-button" disabled={recordingDisplaysBusy} onClick={loadRecordingDisplays} type="button">{recordingDisplaysBusy ? 'Refreshing...' : 'Refresh displays'}</button>
+                        </div>
+                      ) : null}
+
+                      {mode.needsMicrophone ? (
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="record-input-microphone">Microphone</label>
+                          <select className="store-input mt-3" disabled={recordingDevicesBusy || !recordingDevices.microphones.length} id="record-input-microphone" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, microphoneId: event.target.value } }))} value={selectedNode.config?.microphoneId || ''}>
+                            <option value="">Choose microphone</option>
+                            {recordingDevices.microphones.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
+                          </select>
+                        </div>
+                      ) : null}
+
+                      {mode.needsWebcam ? (
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="record-input-webcam">Webcam</label>
+                          <select className="store-input mt-3" disabled={recordingDevicesBusy || !recordingDevices.webcams.length} id="record-input-webcam" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, webcamId: event.target.value } }))} value={selectedNode.config?.webcamId || ''}>
+                            <option value="">Choose webcam</option>
+                            {recordingDevices.webcams.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
+                          </select>
+                        </div>
+                      ) : null}
+
+                      {mode.needsMicrophone || mode.needsWebcam ? <button className="ghost-button" disabled={recordingDevicesBusy} onClick={() => loadRecordingDevices(true)} type="button">{recordingDevicesBusy ? 'Scanning devices...' : 'Refresh devices'}</button> : null}
+
+                      {mode.outputKind === 'video' ? (
+                        <div>
+                          <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="record-input-fps">Frame rate</label>
+                          <select className="store-input mt-3" id="record-input-fps" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, fps: Number(event.target.value) } }))} value={Number(selectedNode.config?.fps || 15)}>
+                            <option value={10}>10 FPS</option>
+                            <option value={15}>15 FPS (lower impact)</option>
+                            <option value={24}>24 FPS</option>
+                            <option value={30}>30 FPS</option>
+                            <option value={60}>60 FPS</option>
+                          </select>
+                        </div>
+                      ) : null}
+
+                      {mode.needsScreen || mode.needsSystemAudio ? <div className="rounded-[18px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-xs leading-5 text-amber-100">Screen and system-audio capture can include notifications, passwords, private conversations, meeting audio, browser sounds, and confidential work. The pipeline pauses and waits for an explicit Start Recording action.</div> : null}
+                      <div className="rounded-[18px] border border-white/10 bg-slate-950/35 px-4 py-3 text-xs leading-5 text-slate-400">Unsupported combinations stay unavailable: screen + webcam, window capture, system audio + microphone, webcam + system audio, and hardware encoder selection.</div>
+                    </div>
+                  );
+                })() : null}
 
                 {['imageInput', 'audioInput', 'videoInput', 'fileInput'].includes(selectedNode.type) ? (
                   <div className="space-y-3">
@@ -8258,15 +8829,26 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               <div className="mt-4">
                 <PipelineTimeline
                   draft={draft}
+                  onCancelRecordInput={() => runRecordInputAction('cancel')}
                   onChangeValidationComment={setValidationComment}
                   onChangeValidationRetryOverride={handleValidationRetryOverrideChange}
                   onDecideValidation={handleValidationDecision}
                   onOpenPath={openPath}
                   onRevealPath={(pathValue) => openPath(pathValue, true)}
+                  onStartRecordInput={() => runRecordInputAction('start')}
+                  onStopRecordInput={() => runRecordInputAction('stop')}
+                  recordInputBusy={recordInputBusy}
                   runState={runState}
                   validationBusy={validationBusy}
                   validationComment={validationComment}
                   validationRetryOverrides={validationRetryOverrides}
+                  recordingDevices={recordingDevices}
+                  recordingDisplays={recordingDisplays}
+                  recordingDevicesBusy={recordingDevicesBusy}
+                  recordingDisplaysBusy={recordingDisplaysBusy}
+                  onRefreshRecordingDevices={() => loadRecordingDevices(true)}
+                  onRefreshRecordingDisplays={loadRecordingDisplays}
+                  onSelectRecordInputRegion={selectValidationRecordInputRegion}
                   fontLibraries={fontLibraries}
                   colorPaletteLibraries={colorPaletteLibraries}
                 />

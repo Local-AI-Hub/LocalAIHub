@@ -244,10 +244,14 @@ export default function App() {
   });
   const [statisticsManualBusy, setStatisticsManualBusy] = useState(false);
   const statisticsSectionInFlightRef = useRef({
-    core: false,
-    storage: false,
+    core: null,
+    storage: null,
   });
   const statisticsSectionLoadedAtRef = useRef({
+    core: 0,
+    storage: 0,
+  });
+  const statisticsSectionRequestIdRef = useRef({
     core: 0,
     storage: 0,
   });
@@ -268,6 +272,8 @@ export default function App() {
   });
   const liveResourcesRef = useRef(null);
   const lastDiskRefreshAtRef = useRef(0);
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
 
   const applyLiveResources = useCallback((nextResources, options = {}) => {
     if (!nextResources) {
@@ -985,6 +991,36 @@ export default function App() {
     });
   }
 
+  function cancelStatisticsSection(section) {
+    statisticsSectionRequestIdRef.current = {
+      ...statisticsSectionRequestIdRef.current,
+      [section]: Number(statisticsSectionRequestIdRef.current[section] || 0) + 1,
+    };
+    statisticsSectionLoadedAtRef.current = {
+      ...statisticsSectionLoadedAtRef.current,
+      [section]: 0,
+    };
+    const ipcRequestId = statisticsSectionInFlightRef.current[section];
+    statisticsSectionInFlightRef.current = {
+      ...statisticsSectionInFlightRef.current,
+      [section]: null,
+    };
+    if (ipcRequestId) {
+      window.localAIHub.cancelStatisticsRequest(ipcRequestId).catch(() => null);
+    }
+  }
+
+  function cancelStatisticsLoads() {
+    cancelStatisticsSection('core');
+    cancelStatisticsSection('storage');
+    setStatisticsSectionStatus((current) => ({
+      ...current,
+      core: current.core === 'loading' ? 'idle' : current.core,
+      storage: current.storage === 'loading' ? 'idle' : current.storage,
+    }));
+    setStatisticsManualBusy(false);
+  }
+
   async function loadStatisticsSection(section, options = {}) {
     const manual = Boolean(options.manual);
     const silent = Boolean(options.silent);
@@ -1012,9 +1048,15 @@ export default function App() {
       return false;
     }
 
+    const requestGeneration = Number(statisticsSectionRequestIdRef.current[section] || 0) + 1;
+    statisticsSectionRequestIdRef.current = {
+      ...statisticsSectionRequestIdRef.current,
+      [section]: requestGeneration,
+    };
+    const ipcRequestId = `statistics-${section}-${Date.now()}-${requestGeneration}`;
     statisticsSectionInFlightRef.current = {
       ...statisticsSectionInFlightRef.current,
-      [section]: true,
+      [section]: ipcRequestId,
     };
     setStatisticsSectionStatus((current) => ({
       ...current,
@@ -1025,10 +1067,29 @@ export default function App() {
       [section]: '',
     }));
 
+    const requestIsCurrent = () => (
+      activeTabRef.current === 'statistics'
+      && statisticsSectionRequestIdRef.current[section] === requestGeneration
+      && statisticsSectionInFlightRef.current[section] === ipcRequestId
+    );
+
     try {
       const request = section === 'storage' ? window.localAIHub.getStatisticsStorage : window.localAIHub.getStatisticsCore;
-      const requestPayload = section === 'storage' ? { forceRefresh: manual } : undefined;
+      const requestPayload = {
+        requestId: ipcRequestId,
+        ...(section === 'storage' ? { forceRefresh: manual } : {}),
+      };
       const result = await request(requestPayload);
+      if (!requestIsCurrent()) {
+        return false;
+      }
+      if (result?.canceled) {
+        setStatisticsSectionStatus((current) => ({
+          ...current,
+          [section]: 'idle',
+        }));
+        return false;
+      }
       if (!result?.ok) {
         const fallback = section === 'storage'
           ? 'Local AI Hub could not load storage statistics right now.'
@@ -1063,6 +1124,9 @@ export default function App() {
       }));
       return true;
     } catch (error) {
+      if (!requestIsCurrent() || error?.name === 'AbortError') {
+        return false;
+      }
       const fallback = section === 'storage'
         ? 'Local AI Hub could not load storage statistics right now.'
         : 'Local AI Hub could not load the main statistics right now.';
@@ -1080,16 +1144,22 @@ export default function App() {
       }
       return false;
     } finally {
-      statisticsSectionInFlightRef.current = {
-        ...statisticsSectionInFlightRef.current,
-        [section]: false,
-      };
+      if (statisticsSectionInFlightRef.current[section] === ipcRequestId) {
+        statisticsSectionInFlightRef.current = {
+          ...statisticsSectionInFlightRef.current,
+          [section]: null,
+        };
+      }
     }
   }
 
   async function loadStatistics(options = {}) {
     const manual = Boolean(options.manual);
     const silent = Boolean(options.silent);
+
+    if (activeTabRef.current !== 'statistics') {
+      return false;
+    }
 
     if (manual) {
       setStatisticsManualBusy(true);
@@ -1102,7 +1172,7 @@ export default function App() {
       ]);
       return results.some((result) => result.status === 'fulfilled' && result.value);
     } finally {
-      if (manual) {
+      if (manual && activeTabRef.current === 'statistics') {
         setStatisticsManualBusy(false);
       }
     }
@@ -2047,11 +2117,16 @@ export default function App() {
   }, [applyLiveResources, appState.settings?.liveResourcePolling, windowActivity.focused, windowActivity.visible]);
 
   useEffect(() => {
-    if (activeTab !== 'statistics' || !windowActivity.focused || !windowActivity.visible) {
-      return;
+    if (activeTab !== 'statistics') {
+      cancelStatisticsLoads();
+      return undefined;
+    }
+    if (!windowActivity.focused || !windowActivity.visible) {
+      return undefined;
     }
 
     loadStatistics({ silent: true });
+    return () => cancelStatisticsLoads();
   }, [activeTab, windowActivity.focused, windowActivity.visible]);
 
   useEffect(() => {
@@ -2383,7 +2458,7 @@ export default function App() {
               </div>
             </section>
           ) : activeTab === 'models' ? (
-            <ModelManager onToast={pushToast} tools={tools} />
+            <ModelManager isActive={activeTab === 'models'} onToast={pushToast} tools={tools} />
           ) : activeTab === 'recorder' ? (
             <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-slate-300">Loading Recorder...</div>}>
               <RecorderPanel activeRecording={activeRecording} onActiveRecordingChange={setActiveRecording} onToast={pushToast} />

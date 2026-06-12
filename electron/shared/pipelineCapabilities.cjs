@@ -5,6 +5,40 @@ const MODALITY_VIDEO = 'video';
 const MODALITY_FILE = 'file';
 const MODALITY_PLAN = 'plan';
 
+const RECORD_INPUT_MODE_IDS = Object.freeze({
+  MICROPHONE: 'microphone',
+  SCREEN: 'screen',
+  SCREEN_MICROPHONE: 'screenMic',
+  WEBCAM: 'webcam',
+  WEBCAM_MICROPHONE: 'webcamMic',
+  SYSTEM_AUDIO: 'systemAudio',
+  SCREEN_SYSTEM_AUDIO: 'screenSystemAudio',
+});
+
+const RECORD_INPUT_MODE_OPTIONS = Object.freeze([
+  Object.freeze({ id: RECORD_INPUT_MODE_IDS.SCREEN, label: 'Screen only', outputKind: MODALITY_VIDEO, backend: 'ffmpeg', needsScreen: true }),
+  Object.freeze({ id: RECORD_INPUT_MODE_IDS.MICROPHONE, label: 'Microphone only', outputKind: MODALITY_AUDIO, backend: 'ffmpeg', needsMicrophone: true }),
+  Object.freeze({ id: RECORD_INPUT_MODE_IDS.SCREEN_MICROPHONE, label: 'Screen + microphone', outputKind: MODALITY_VIDEO, backend: 'ffmpeg', needsScreen: true, needsMicrophone: true }),
+  Object.freeze({ id: RECORD_INPUT_MODE_IDS.WEBCAM, label: 'Webcam only', outputKind: MODALITY_VIDEO, backend: 'ffmpeg', needsWebcam: true }),
+  Object.freeze({ id: RECORD_INPUT_MODE_IDS.WEBCAM_MICROPHONE, label: 'Webcam + microphone', outputKind: MODALITY_VIDEO, backend: 'ffmpeg', needsMicrophone: true, needsWebcam: true }),
+  Object.freeze({ id: RECORD_INPUT_MODE_IDS.SYSTEM_AUDIO, label: 'System audio only', outputKind: MODALITY_AUDIO, backend: 'electron', needsDisplay: true, needsSystemAudio: true }),
+  Object.freeze({ id: RECORD_INPUT_MODE_IDS.SCREEN_SYSTEM_AUDIO, label: 'Screen + system audio', outputKind: MODALITY_VIDEO, backend: 'electron', needsDisplay: true, needsScreen: true, needsSystemAudio: true }),
+]);
+
+const PIPELINE_RECORD_INPUT_CAPABILITY = Object.freeze({
+  inputKinds: Object.freeze([]),
+  outputKinds: Object.freeze([MODALITY_AUDIO, MODALITY_VIDEO]),
+  interactive: true,
+  autoStart: false,
+  modes: RECORD_INPUT_MODE_OPTIONS,
+  unsupportedCombinations: Object.freeze([
+    'screenWebcam',
+    'window',
+    'systemAudioMicrophone',
+    'webcamSystemAudio',
+  ]),
+});
+
 const PIPELINE_OPERATION_IDS = Object.freeze({
   GRAPH_WORKFLOW: 'graphWorkflow',
   IMAGE_ANALYZE: 'imageAnalyze',
@@ -710,7 +744,10 @@ module.exports = {
   MODALITY_IMAGE,
   MODALITY_TEXT,
   MODALITY_VIDEO,
+  PIPELINE_RECORD_INPUT_CAPABILITY,
   PIPELINE_OPERATION_IDS,
+  RECORD_INPUT_MODE_IDS,
+  RECORD_INPUT_MODE_OPTIONS,
   TOOL_PIPELINE_STRATEGY_IDS,
   doesProviderModelSupportOperation,
   doesProviderOperationRequireExplicitModel,

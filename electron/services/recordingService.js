@@ -6,6 +6,7 @@ const fs = require('fs-extra');
 const { ensureStorage, getAppPaths } = require('./configService');
 const { resolveFfmpegPath } = require('./mediaCompositionService');
 const { isPathInside } = require('./pathSafetyService');
+const { buildPipelineRecordingMetadata, resolvePipelineRecordingPaths } = require('./pipelineRecordingStorageService');
 
 const SUPPORTED_MODES = new Set(['screen', 'microphone', 'webcam', 'screenMic', 'webcamMic']);
 const VIDEO_MODES = new Set(['screen', 'webcam', 'screenMic', 'webcamMic']);
@@ -527,11 +528,19 @@ function createRecordingService(dependencies = {}) {
     const deviceResult = await listDevices({ forceRefresh: false });
     const allDevices = [...deviceResult.microphones, ...deviceResult.webcams];
     const options = normalizeRecordingOptions(input, allDevices, Array.isArray(context.displays) ? context.displays : []);
-    const { recordingsRoot } = await getRecordingRoots();
     const startedAtDate = now();
     const id = createRecordingId(startedAtDate);
-    const paths = buildRecordingPaths(recordingsRoot, startedAtDate, id, options.container);
+    const pipelineStorage = await resolvePipelineRecordingPaths({
+      context,
+      extension: options.container,
+      fs: fsApi,
+      getAppPaths: getAppPathsFn,
+      id,
+    });
+    const recordingsRoot = pipelineStorage?.artifactsRoot || (await getRecordingRoots()).recordingsRoot;
+    const paths = pipelineStorage || buildRecordingPaths(recordingsRoot, startedAtDate, id, options.container);
     await fsApi.ensureDir(paths.directoryPath);
+    const outputArtifactType = VIDEO_MODES.has(options.mode) ? 'video' : 'audio';
 
     const metadata = {
       schemaVersion: 2,
@@ -550,7 +559,7 @@ function createRecordingService(dependencies = {}) {
       systemAudio: false,
       microphone: options.microphone ? { displayName: options.microphone.name } : null,
       screenCaptureTarget: options.captureTarget ? { ...options.captureTarget } : null,
-      outputRelativePath: path.relative(recordingsRoot, paths.outputPath).replace(/\\/g, '/'),
+      outputRelativePath: pipelineStorage?.outputRelativePath || path.relative(recordingsRoot, paths.outputPath).replace(/\\/g, '/'),
       fileName: path.basename(paths.outputPath),
       container: options.container,
       format: options.format,
@@ -569,6 +578,7 @@ function createRecordingService(dependencies = {}) {
       ffmpegVersion: await getFfmpegVersion(),
       stopMethod: null,
       errorSummary: '',
+      ...buildPipelineRecordingMetadata(pipelineStorage, outputArtifactType),
     };
 
     await writeJsonAtomic(fsApi, paths.sidecarPath, metadata);
@@ -640,6 +650,10 @@ function createRecordingService(dependencies = {}) {
       throw new Error('There is no active recording to stop.');
     }
     if (recording.stopRequested) {
+      if (cancelRequested && !recording.cancelRequested) {
+        recording.cancelRequested = true;
+        await updateMetadata(recording, { stopMethod: recording.stopMethod || 'stdin-q' });
+      }
       return recording.closePromise;
     }
 

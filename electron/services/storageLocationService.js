@@ -59,9 +59,11 @@ function assertNonOverlappingRoots(sourceRoot, targetRoot) {
   }
 }
 
-async function calculatePathSize(targetPath) {
+async function calculatePathSize(targetPath, options = {}) {
   return runBackgroundTask('calculate-path-size', {
     targetPath,
+  }, {
+    signal: options.signal,
   });
 }
 

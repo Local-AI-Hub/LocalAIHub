@@ -4,6 +4,8 @@ const si = require('systeminformation');
 const { spawn } = require('child_process');
 const { parentPort } = require('worker_threads');
 
+const canceledRequestIds = new Set();
+
 const DRIVE_LETTERS = 'CDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
 const COMMON_LIBRARY_ROOTS = [
   '',
@@ -422,34 +424,45 @@ async function getLiveResourceUsageLocal(payload = {}) {
   };
 }
 
-async function calculatePathSizeLocal(targetPath) {
-  if (!(await fs.pathExists(targetPath))) {
-    return 0;
+function throwIfRequestCanceled(requestId) {
+  if (!canceledRequestIds.has(Number(requestId))) {
+    return;
   }
-
-  const stats = await fs.stat(targetPath).catch(() => null);
-  if (!stats) {
-    return 0;
-  }
-
-  if (stats.isFile()) {
-    return stats.size;
-  }
-
-  if (!stats.isDirectory()) {
-    return 0;
-  }
-
-  const entries = await fs.readdir(targetPath, {
-    withFileTypes: true,
-  }).catch(() => []);
-  const sizes = await Promise.all(
-    entries.map((entry) => calculatePathSizeLocal(path.join(targetPath, entry.name))),
-  );
-
-  return sizes.reduce((total, value) => total + value, 0);
+  const error = new Error('The background task was canceled.');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  throw error;
 }
 
+async function calculatePathSizeLocal(targetPath, requestId) {
+  let totalBytes = 0;
+  const pendingPaths = [targetPath];
+
+  while (pendingPaths.length) {
+    throwIfRequestCanceled(requestId);
+    const currentPath = pendingPaths.pop();
+    const stats = await fs.stat(currentPath).catch(() => null);
+    throwIfRequestCanceled(requestId);
+    if (!stats) {
+      continue;
+    }
+    if (stats.isFile()) {
+      totalBytes += Number(stats.size || 0);
+      continue;
+    }
+    if (!stats.isDirectory()) {
+      continue;
+    }
+
+    const entries = await fs.readdir(currentPath, { withFileTypes: true }).catch(() => []);
+    throwIfRequestCanceled(requestId);
+    for (const entry of entries) {
+      pendingPaths.push(path.join(currentPath, entry.name));
+    }
+  }
+
+  return totalBytes;
+}
 async function pathExists(targetPath) {
   try {
     await fs.access(targetPath);
@@ -1036,9 +1049,9 @@ async function discoverTools(payload = {}) {
   return results;
 }
 
-async function handleTask(task, payload) {
+async function handleTask(task, payload, requestId) {
   if (task === 'calculate-path-size') {
-    return calculatePathSizeLocal(payload?.targetPath);
+    return calculatePathSizeLocal(payload?.targetPath, requestId);
   }
 
   if (task === 'detect-hardware-snapshot') {
@@ -1065,16 +1078,24 @@ async function handleTask(task, payload) {
 }
 
 async function handleMessage(message) {
-  const requestId = Number(message?.requestId);
+  const cancelRequestId = Number(message?.cancelRequestId);
+  if (Number.isFinite(cancelRequestId) && cancelRequestId > 0) {
+    canceledRequestIds.add(cancelRequestId);
+    return;
+  }
 
+  const requestId = Number(message?.requestId);
   try {
-    const result = await handleTask(message?.task, message?.payload || {});
+    throwIfRequestCanceled(requestId);
+    const result = await handleTask(message?.task, message?.payload || {}, requestId);
+    throwIfRequestCanceled(requestId);
     sendResult(requestId, result);
   } catch (error) {
     sendError(requestId, error);
+  } finally {
+    canceledRequestIds.delete(requestId);
   }
 }
-
 if (parentPort) {
   parentPort.on('message', handleMessage);
 } else {

@@ -18,6 +18,26 @@ const MAX_INVALIDATION_REASONS = 12;
 
 const logger = createLogger('statistics');
 
+function createStatisticsAbortError() {
+  const error = new Error('Statistics loading was canceled.');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+function throwIfStatisticsCanceled(signal) {
+  if (signal?.aborted) {
+    throw createStatisticsAbortError();
+  }
+}
+
+function recoverStatisticsScanError(error, fallbackValue) {
+  if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
+    throw createStatisticsAbortError();
+  }
+  return fallbackValue;
+}
+
 let statisticsQueue = Promise.resolve();
 let storageIndexRebuildPromise = null;
 
@@ -355,15 +375,17 @@ function buildLaunchRanking(statistics, trackedTools = []) {
     .sort((left, right) => right.count - left.count || left.toolName.localeCompare(right.toolName));
 }
 
-async function getToolInstallSize(tool) {
+async function getToolInstallSize(tool, options = {}) {
+  throwIfStatisticsCanceled(options.signal);
   if (!tool?.installDir) {
     return 0;
   }
 
-  return calculatePathSize(tool.installDir).catch(() => 0);
+  return calculatePathSize(tool.installDir, { signal: options.signal }).catch((error) => recoverStatisticsScanError(error, 0));
 }
 
-async function getToolModelSummary(tool) {
+async function getToolModelSummary(tool, options = {}) {
+  throwIfStatisticsCanceled(options.signal);
   if (!supportsModelManager(tool)) {
     return {
       modelBytes: 0,
@@ -371,7 +393,8 @@ async function getToolModelSummary(tool) {
     };
   }
 
-  const models = await listDownloadedModels(tool).catch(() => []);
+  const models = await listDownloadedModels(tool, { signal: options.signal }).catch((error) => recoverStatisticsScanError(error, []));
+  throwIfStatisticsCanceled(options.signal);
   return {
     modelBytes: models.reduce((total, model) => total + Number(model.sizeBytes || 0), 0),
     modelCount: models.length,
@@ -478,12 +501,15 @@ function buildStorageSnapshotFromData(sectionData, section, trackedTools, storag
   };
 }
 
-async function scanStorageSectionData(trackedTools, trackedRoots, timings) {
+async function scanStorageSectionData(trackedTools, trackedRoots, timings, options = {}) {
+  throwIfStatisticsCanceled(options.signal);
   const [toolBreakdown, storageRoots] = await Promise.all([
     measureStatisticsSection(timings, 'toolBreakdownMs', () =>
       Promise.all(
         trackedTools.map(async (tool) => {
-          const [installBytes, modelSummary] = await Promise.all([getToolInstallSize(tool), getToolModelSummary(tool)]);
+          throwIfStatisticsCanceled(options.signal);
+          const [installBytes, modelSummary] = await Promise.all([getToolInstallSize(tool, options), getToolModelSummary(tool, options)]);
+          throwIfStatisticsCanceled(options.signal);
           return {
             toolId: tool.id,
             toolName: tool.name,
@@ -498,14 +524,18 @@ async function scanStorageSectionData(trackedTools, trackedRoots, timings) {
     ),
     measureStatisticsSection(timings, 'storageRootsMs', () =>
       Promise.all(
-        trackedRoots.map(async (rootPath) => ({
-          path: rootPath,
-          sizeBytes: await calculatePathSize(rootPath).catch(() => 0),
-        })),
+        trackedRoots.map(async (rootPath) => {
+          throwIfStatisticsCanceled(options.signal);
+          return {
+            path: rootPath,
+            sizeBytes: await calculatePathSize(rootPath, { signal: options.signal }).catch((error) => recoverStatisticsScanError(error, 0)),
+          };
+        }),
       ),
     ),
   ]);
 
+  throwIfStatisticsCanceled(options.signal);
   const sortedToolBreakdown = toolBreakdown.sort((left, right) => right.totalBytes - left.totalBytes || left.toolName.localeCompare(right.toolName));
   return {
     modelSummaries: sortedToolBreakdown.map((entry) => ({
@@ -523,16 +553,13 @@ async function scanStorageSectionData(trackedTools, trackedRoots, timings) {
 }
 
 async function rebuildStorageIndexSection(trackedTools, trackedRoots, signature, options = {}) {
-  if (storageIndexRebuildPromise && !options.forceRefresh) {
-    logger.info('Statistics storage index rebuild reused in-flight work.').catch(() => null);
-    return storageIndexRebuildPromise;
-  }
-
-  storageIndexRebuildPromise = (async () => {
+  const rebuild = async () => {
+    throwIfStatisticsCanceled(options.signal);
     const startedAt = process.hrtime.bigint();
     const timings = {};
     const indexedAt = new Date().toISOString();
-    const data = await scanStorageSectionData(trackedTools, trackedRoots, timings);
+    const data = await scanStorageSectionData(trackedTools, trackedRoots, timings, options);
+    throwIfStatisticsCanceled(options.signal);
     const section = {
       data,
       diagnostics: {
@@ -552,6 +579,7 @@ async function rebuildStorageIndexSection(trackedTools, trackedRoots, signature,
         [STORAGE_SECTION]: section,
       },
     }));
+    throwIfStatisticsCanceled(options.signal);
 
     logger.info('Statistics storage index rebuilt.', {
       reason: options.reason || 'miss',
@@ -562,16 +590,25 @@ async function rebuildStorageIndexSection(trackedTools, trackedRoots, signature,
     }).catch(() => null);
 
     return section;
-  })();
+  };
 
+  if (options.signal) {
+    return rebuild();
+  }
+  if (storageIndexRebuildPromise && !options.forceRefresh) {
+    logger.info('Statistics storage index rebuild reused in-flight work.').catch(() => null);
+    return storageIndexRebuildPromise;
+  }
+
+  storageIndexRebuildPromise = rebuild();
   try {
     return await storageIndexRebuildPromise;
   } finally {
     storageIndexRebuildPromise = null;
   }
 }
-
 async function getStatisticsCoreSnapshot(tools = null, options = {}) {
+  throwIfStatisticsCanceled(options.signal);
   const totalStartedAt = process.hrtime.bigint();
   const timings = {};
   const [statistics, trackedTools] = await measureStatisticsSection(timings, 'readStatisticsAndToolsMs', () =>
@@ -580,6 +617,7 @@ async function getStatisticsCoreSnapshot(tools = null, options = {}) {
   const paths = getAppPaths();
   const disks = await measureStatisticsSection(timings, 'detectStorageMs', () => detectStorageSnapshot().catch(() => []));
   const storageDrive = findDiskForPath(disks, paths.managedRoot) || findDiskForPath(disks, paths.appInstallDir);
+  throwIfStatisticsCanceled(options.signal);
   const generatedAt = new Date().toISOString();
   const snapshot = {
     generatedAt,
@@ -615,6 +653,7 @@ async function getStatisticsCoreSnapshot(tools = null, options = {}) {
 }
 
 async function getStatisticsStorageSnapshot(tools = null, options = {}) {
+  throwIfStatisticsCanceled(options.signal);
   const totalStartedAt = process.hrtime.bigint();
   const timings = {};
   const trackedTools = await measureStatisticsSection(timings, 'readToolsMs', () => getTrackedTools(tools));
@@ -627,6 +666,7 @@ async function getStatisticsStorageSnapshot(tools = null, options = {}) {
   const indexResult = await measureStatisticsSection(timings, 'indexLoadMs', () => readStatisticsIndex());
   const section = normalizeIndexSection(indexResult.index.sections?.[STORAGE_SECTION]);
   const missReason = getStorageIndexMissReason(section, signature, forceRefresh);
+  throwIfStatisticsCanceled(options.signal);
 
   if (!missReason) {
     const snapshot = buildStorageSnapshotFromData(section.data, section, trackedTools, storageDrive, 'index');
@@ -652,8 +692,10 @@ async function getStatisticsStorageSnapshot(tools = null, options = {}) {
     rebuildStorageIndexSection(trackedTools, trackedRoots, signature, {
       forceRefresh,
       reason: missReason,
+      signal: options.signal,
     }),
   );
+  throwIfStatisticsCanceled(options.signal);
   const snapshot = buildStorageSnapshotFromData(rebuiltSection.data, rebuiltSection, trackedTools, storageDrive, 'scan');
 
   logger.info('Statistics storage snapshot loaded.', {
@@ -669,11 +711,13 @@ async function getStatisticsStorageSnapshot(tools = null, options = {}) {
 }
 
 async function getStatisticsSnapshot(tools = null, options = {}) {
+  throwIfStatisticsCanceled(options.signal);
   const totalStartedAt = process.hrtime.bigint();
   const [core, storage] = await Promise.all([
     getStatisticsCoreSnapshot(tools, options),
     getStatisticsStorageSnapshot(tools, options),
   ]);
+  throwIfStatisticsCanceled(options.signal);
   const snapshot = {
     ...core,
     modelSummaries: storage.modelSummaries,

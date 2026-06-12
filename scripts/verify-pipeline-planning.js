@@ -191,6 +191,11 @@ const {
   createNode,
 } = require('../electron/shared/pipelineSchema.cjs');
 const {
+  buildPipelineWizardContext,
+  buildPipelineWizardDraft,
+  parsePipelineWizardPlan,
+} = require('../electron/shared/pipelineWizard.cjs');
+const {
   cancelPipelineRun,
   getActiveRunSnapshot,
   runPipeline,
@@ -377,6 +382,24 @@ function getNodeOutputArtifact(run, nodeId, portId) {
 }
 
 async function main() {
+  const wizardIntent = 'record a voiceover and make a slideshow video';
+  const wizardContext = buildPipelineWizardContext({ hardware: {}, manifests: [], providers: [], tools: [] });
+  const wizardDraft = buildPipelineWizardDraft({
+    context: wizardContext,
+    intent: wizardIntent,
+    modelPlan: parsePipelineWizardPlan('', { intent: wizardIntent }),
+    wizardTarget: { mode: 'cloud' },
+  });
+  const wizardGraph = require('../electron/shared/pipelineSchema.cjs').buildPipelineGraph(wizardDraft.pipeline);
+  assert.deepStrictEqual(wizardGraph.errors, [], 'Recorded voiceover planning draft should stay structurally valid.');
+  const recordNode = wizardDraft.pipeline.nodes.find((node) => node.type === 'recordInput');
+  const compositionNode = wizardDraft.pipeline.nodes.find((node) => node.type === 'mediaComposition');
+  assert(recordNode && recordNode.config.mode === 'microphone', 'Planning verifier should preserve recorded voiceover as microphone Record Input.');
+  assert(compositionNode, 'Planning verifier should lower recorded voiceover into Media Composition.');
+  assert(wizardDraft.pipeline.edges.some((edge) => edge.source.nodeId === recordNode.id && edge.source.portId === 'audio' && edge.target.nodeId === compositionNode.id && edge.target.portId === 'audio'), 'Recorded voiceover should wire to Media Composition narration audio.');
+  assert(wizardDraft.pipeline.nodes.some((node) => node.type === 'collectionInput'), 'Recorded voiceover slideshow should include an image collection placeholder.');
+  assert(wizardDraft.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Recorded voiceover slideshow should end in Video Output.');
+
   await cleanupActiveRun();
   fs.rmSync(TEST_STORAGE_ROOT, { force: true, recursive: true });
   fs.mkdirSync(TEST_STORAGE_ROOT, { recursive: true });

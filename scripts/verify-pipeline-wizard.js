@@ -1513,11 +1513,100 @@ function testMediaCompositionMalformedRepairReliability(context) {
   assert(missingMediaNode?.config.soundEffectsEnabled, 'Missing SFX libraries should not disable requested sound effects.');
   assert(missingLibraryResult.summary.gaps.some((gap) => /Sound Effects|asset library/i.test(gap)), 'Missing SFX library should be surfaced as an explicit assumption/gap.');
 }
+function testRecordInputWizardDrafts(context) {
+  const buildPromptDraft = (intent) => buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: parsePipelineWizardPlan('', { intent }),
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
+  });
+  const getRecordNode = (result) => result.pipeline.nodes.find((node) => node.type === 'recordInput') || null;
+  const hasEdge = (result, sourceNode, sourcePortId, targetNode, targetPortId) => result.pipeline.edges.some((edge) => (
+    edge.source.nodeId === sourceNode.id
+    && edge.source.portId === sourcePortId
+    && edge.target.nodeId === targetNode.id
+    && edge.target.portId === targetPortId
+  ));
+  const assertRecordDraft = (intent, expectedMode, expectedKind) => {
+    const result = buildPromptDraft(intent);
+    assertNoStructuralErrors(result.pipeline);
+    const recordNode = getRecordNode(result);
+    assert(recordNode, 'Expected Record Input for: ' + intent);
+    assert.strictEqual(recordNode.config.mode, expectedMode, 'Unexpected Record Input mode for: ' + intent);
+    assert.strictEqual(recordNode.config.outputKind, expectedKind, 'Unexpected Record Input output kind for: ' + intent);
+    assert.strictEqual(recordNode.config.microphoneId, '', 'Wizard must not invent a microphone id.');
+    assert.strictEqual(recordNode.config.webcamId, '', 'Wizard must not invent a webcam id.');
+    assert.strictEqual(recordNode.config.displayId, '', 'Wizard must not invent a display id.');
+    return { result, recordNode };
+  };
+
+  assert(context.recordInputCapability?.modes?.some((mode) => mode.id === 'microphone' && mode.outputKind === 'audio'), 'Wizard context should expose microphone Record Input capability.');
+  assert(context.recordInputCapability?.modes?.some((mode) => mode.id === 'screenSystemAudio' && mode.outputKind === 'video'), 'Wizard context should expose screen plus system-audio Record Input capability.');
+  const promptMessages = buildPipelineWizardMessages({ context, intent: 'record my microphone and transcribe it', wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' } });
+  assert(JSON.stringify(promptMessages).includes('recordInput'), 'Wizard prompt vocabulary should teach the planner about recorded sources.');
+
+  const microphoneAudio = assertRecordDraft('record my microphone and save the audio', 'microphone', 'audio');
+  const microphoneAudioOutput = microphoneAudio.result.pipeline.nodes.find((node) => node.type === 'audioOutput');
+  assert(microphoneAudioOutput && hasEdge(microphoneAudio.result, microphoneAudio.recordNode, 'audio', microphoneAudioOutput, 'audio'), 'Microphone Record Input should wire its audio port to Audio Output.');
+  assert(!microphoneAudio.result.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Audio-mode Record Input must not wire to Video Output.');
+
+  const microphoneTranscript = assertRecordDraft('record my microphone and transcribe it', 'microphone', 'audio');
+  const microphoneWhisper = microphoneTranscript.result.pipeline.nodes.find((node) => node.type === 'llmPrompt' && node.config?.operationId === 'whisperTranscribe');
+  assert(microphoneWhisper && hasEdge(microphoneTranscript.result, microphoneTranscript.recordNode, 'audio', microphoneWhisper, 'prompt'), 'Microphone Record Input should feed Whisper transcription.');
+  assert(microphoneTranscript.result.pipeline.nodes.some((node) => node.type === 'textOutput'), 'Microphone transcription should end in Text Output.');
+
+  const voiceoverSlideshow = assertRecordDraft('record a voiceover and make a slideshow video', 'microphone', 'audio');
+  const slideshowComposition = voiceoverSlideshow.result.pipeline.nodes.find((node) => node.type === 'mediaComposition');
+  assert(slideshowComposition, 'Recorded voiceover slideshow should include Media Composition.');
+  assert(voiceoverSlideshow.result.pipeline.nodes.some((node) => node.type === 'collectionInput'), 'Recorded voiceover slideshow should leave an image collection placeholder.');
+  assert(hasEdge(voiceoverSlideshow.result, voiceoverSlideshow.recordNode, 'audio', slideshowComposition, 'audio'), 'Recorded voiceover should wire to Media Composition narration audio.');
+  assert(voiceoverSlideshow.result.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Recorded voiceover slideshow should produce video output.');
+
+  const systemAudio = assertRecordDraft('record system audio and transcribe it', 'systemAudio', 'audio');
+  assert(systemAudio.result.pipeline.nodes.some((node) => node.type === 'llmPrompt' && node.config?.operationId === 'whisperTranscribe'), 'System audio recording should support transcription.');
+
+  const screen = assertRecordDraft('record my screen and save it as a video', 'screen', 'video');
+  assert(screen.result.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Screen recording should produce Video Output.');
+  assert(!screen.result.pipeline.nodes.some((node) => node.type === 'audioOutput'), 'Video-mode Record Input must not wire directly to Audio Output.');
+
+  assertRecordDraft('record screen with microphone and save as video', 'screenMic', 'video');
+  assertRecordDraft('record webcam with voice and save as video', 'webcamMic', 'video');
+  assertRecordDraft('record my screen with system audio and save as video', 'screenSystemAudio', 'video');
+
+  const region = assertRecordDraft('record a screen region and save it as a video', 'screen', 'video');
+  assert.deepStrictEqual(region.recordNode.config.captureTarget, { type: 'desktop' }, 'Unspecified region bounds should not become an invalid hardcoded region config.');
+  assert(region.result.summary.gaps.some((gap) => /region needs a display and bounds|choose the region/i.test(gap)), 'Region draft should explain the runtime region-selection assumption.');
+
+  const webcam = assertRecordDraft('record webcam video and burn subtitles', 'webcam', 'video');
+  const burnNode = webcam.result.pipeline.nodes.find((node) => node.type === 'burnSubtitles');
+  assert(burnNode && hasEdge(webcam.result, webcam.recordNode, 'video', burnNode, 'video'), 'Webcam Record Input should feed Burn Subtitles through its video port.');
+
+  const videoTranscript = assertRecordDraft('record my screen, transcribe it, and output the transcript as text', 'screen', 'video');
+  const extractNode = videoTranscript.result.pipeline.nodes.find((node) => node.type === 'extractAudio');
+  const videoWhisper = videoTranscript.result.pipeline.nodes.find((node) => node.type === 'llmPrompt' && node.config?.operationId === 'whisperTranscribe');
+  assert(extractNode && videoWhisper, 'Video recording transcription should insert Extract Audio before Whisper.');
+  assert(hasEdge(videoTranscript.result, videoTranscript.recordNode, 'video', extractNode, 'video'), 'Video Record Input should feed Extract Audio through the video port.');
+  assert(hasEdge(videoTranscript.result, extractNode, 'audio', videoWhisper, 'prompt'), 'Extracted audio should feed Whisper.');
+  assert(!videoTranscript.result.pipeline.nodes.some((node) => node.type === 'audioOutput'), 'Video transcription should not create a direct Audio Output.');
+
+  const unsupported = assertRecordDraft('record screen with microphone and system audio', 'screenMic', 'video');
+  assert(unsupported.result.summary.gaps.some((gap) => /not supported.*without system audio/i.test(gap)), 'Unsupported screen plus microphone plus system audio should produce a clear assumption.');
+
+  const reviewed = assertRecordDraft('record a voiceover, let me review it, then transcribe it', 'microphone', 'audio');
+  const validationNode = reviewed.result.pipeline.nodes.find((node) => node.type === 'validation');
+  const retryNode = reviewed.result.pipeline.nodes.find((node) => node.type === 'retryLoop');
+  const reviewedWhisper = reviewed.result.pipeline.nodes.find((node) => node.type === 'llmPrompt' && node.config?.operationId === 'whisperTranscribe');
+  assert(validationNode && retryNode && reviewedWhisper, 'Review request should place Validation and Retry before transcription.');
+  assert(hasEdge(reviewed.result, reviewed.recordNode, 'audio', validationNode, 'input'), 'Record Input should feed Validation first.');
+  assert(hasEdge(reviewed.result, retryNode, 'result', reviewedWhisper, 'prompt'), 'Approved/retried recording should feed transcription.');
+  assert.strictEqual(retryNode.config.retryTargetNodeId, reviewed.recordNode.id, 'Validation retry should target Record Input for a fresh recording.');
+}
 const context = buildPipelineWizardContext({ hardware, manifests: tools, providers, tools, assetLibraries });
 testWizardPromptBoundary(context);
 testLocalWizardPromptIsCompactAndGrounded(context);
 testConstrainedWizardPromptIsCompactAndBudgeted(context);
 testMediaCompositionMalformedRepairReliability(context);
+testRecordInputWizardDrafts(context);
 testTextToImageDraft(context);
 testIntentIrTextToImageDraft(context);
 testIntentIrPlanningValidationRetryDraft(context);

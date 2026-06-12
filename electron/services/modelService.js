@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs-extra');
 const { open } = require('node:fs/promises');
+const { AsyncLocalStorage } = require('node:async_hooks');
 const { version: APP_VERSION } = require('../../package.json');
 const { ensureStorage, getAppPaths, humanizeError, readConfig, saveHardwareDetection } = require('./configService');
 const {
@@ -25,6 +26,45 @@ const {
   getStableDiffusionCheckpointModels,
 } = require('../shared/toolAssetSelection.cjs');
 const APP_USER_AGENT = `LocalAIHub/${APP_VERSION}`;
+const MODEL_BROWSE_CONTEXT = new AsyncLocalStorage();
+
+function createModelBrowseAbortError() {
+  const error = new Error('Model catalog loading was canceled.');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+function getModelBrowseSignal() {
+  return MODEL_BROWSE_CONTEXT.getStore()?.signal || null;
+}
+
+function throwIfModelBrowseCanceled() {
+  if (getModelBrowseSignal()?.aborted) {
+    throw createModelBrowseAbortError();
+  }
+}
+
+function rethrowModelBrowseCancellation(error) {
+  if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR' || getModelBrowseSignal()?.aborted) {
+    throw createModelBrowseAbortError();
+  }
+}
+
+function withModelBrowseSignal(options = {}) {
+  const signal = getModelBrowseSignal();
+  return signal ? { ...options, signal } : options;
+}
+
+function throwIfSignalAborted(signal, message = 'Background loading was canceled.') {
+  if (!signal?.aborted) {
+    return;
+  }
+  const error = new Error(message);
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  throw error;
+}
 const MODEL_SETTINGS_FILE = 'model-manager.settings.json';
 const MODEL_DOWNLOAD_BUFFER_LIMIT = 10 * 1024 * 1024;
 const PACKAGE_METADATA_FILE = '.localaihub-package.json';
@@ -1070,18 +1110,21 @@ async function buildLocalPackageModel(tool, modelType, directory, manifestPath) 
     toolId: tool.id,
   };
 }
-async function listLocalFileModels(tool) {
+async function listLocalFileModels(tool, options = {}) {
+  throwIfSignalAborted(options.signal);
   const directories = getToolModelDirectories(tool);
   const localModels = [];
   for (const [modelType, directory] of Object.entries(directories)) {
+    throwIfSignalAborted(options.signal);
     if (!(await fs.pathExists(directory))) {
       continue;
     }
-    const files = await walkDirectoryFiles(directory);
+    const files = await walkDirectoryFiles(directory, options);
     const packageManifestPaths = files.filter(isPackageManifestPath);
     const packageFilePaths = new Set();
     const packageRootPaths = new Set();
     for (const manifestPath of packageManifestPaths) {
+      throwIfSignalAborted(options.signal);
       const packageModel = await buildLocalPackageModel(tool, modelType, directory, manifestPath);
       if (!packageModel) {
         continue;
@@ -1096,6 +1139,7 @@ async function listLocalFileModels(tool) {
       }
     }
     for (const fullPath of files) {
+      throwIfSignalAborted(options.signal);
       if (isPackageManifestPath(fullPath)) {
         continue;
       }
@@ -1133,13 +1177,15 @@ async function listLocalFileModels(tool) {
   }
   return localModels.sort((left, right) => left.name.localeCompare(right.name));
 }
-async function walkDirectoryFiles(directory) {
+async function walkDirectoryFiles(directory, options = {}) {
+  throwIfSignalAborted(options.signal);
   const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
   const files = [];
   for (const entry of entries) {
+    throwIfSignalAborted(options.signal);
     const fullPath = path.join(directory, entry.name);
     if (entry.isDirectory()) {
-      files.push(...(await walkDirectoryFiles(fullPath)));
+      files.push(...(await walkDirectoryFiles(fullPath, options)));
       continue;
     }
     if (entry.isFile()) {
@@ -1147,8 +1193,7 @@ async function walkDirectoryFiles(directory) {
     }
   }
   return files;
-}
-function normalizeRvcCompanionToken(value) {
+}function normalizeRvcCompanionToken(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
 }
 
@@ -1263,14 +1308,16 @@ function sumOllamaManifestSize(manifest = {}) {
     .filter(Boolean)
     .reduce((total, entry) => total + (Number(entry.size || 0) || 0), 0);
 }
-async function listLocalOllamaModelsFromFilesystem(tool) {
+async function listLocalOllamaModelsFromFilesystem(tool, options = {}) {
+  throwIfSignalAborted(options.signal);
   const manifestsRoot = path.join(getOllamaModelsRoot(tool), 'manifests');
   if (!(await fs.pathExists(manifestsRoot))) {
     return [];
   }
-  const manifestFiles = await walkDirectoryFiles(manifestsRoot);
+  const manifestFiles = await walkDirectoryFiles(manifestsRoot, options);
   const models = await Promise.all(
     manifestFiles.map(async (manifestPath) => {
+      throwIfSignalAborted(options.signal);
       const relativePath = path.relative(manifestsRoot, manifestPath);
       const name = buildOllamaModelNameFromManifestPath(relativePath);
       if (!name) {
@@ -1300,13 +1347,15 @@ async function listLocalOllamaModelsFromFilesystem(tool) {
   }
   return [...uniqueModels.values()].sort((left, right) => left.name.localeCompare(right.name));
 }
-async function listLocalOllamaModels(tool) {
+async function listLocalOllamaModels(tool, options = {}) {
+  throwIfSignalAborted(options.signal);
   if (String(tool?.status || '').trim().toLowerCase() !== 'running') {
-    return listLocalOllamaModelsFromFilesystem(tool);
+    return listLocalOllamaModelsFromFilesystem(tool, options);
   }
 
   try {
     const response = await listOllamaModels(tool);
+    throwIfSignalAborted(options.signal);
     return (response.models || []).map((model) => ({
       id: 'ollama:' + model.name,
       downloaded: true,
@@ -1320,25 +1369,26 @@ async function listLocalOllamaModels(tool) {
       modifiedAt: model.modifiedAt,
     }));
   } catch {
-    return listLocalOllamaModelsFromFilesystem(tool);
+    return listLocalOllamaModelsFromFilesystem(tool, options);
   }
 }
-async function listDownloadedModels(tool) {
+async function listDownloadedModels(tool, options = {}) {
+  throwIfSignalAborted(options.signal);
+  let models = [];
   if (tool?.id === 'rvc') {
-    return attachRvcIndexCompanionMetadata(tool, await listLocalFileModels(tool));
+    models = attachRvcIndexCompanionMetadata(tool, await listLocalFileModels(tool, options));
+  } else if (!supportsModelManager(tool)) {
+    models = [];
+  } else if (tool.id === 'ollama') {
+    models = await listLocalOllamaModels(tool, options);
+  } else if (tool.id === 'invokeai') {
+    models = await listInvokeAiModels(tool);
+  } else {
+    models = await listLocalFileModels(tool, options);
   }
-  if (!supportsModelManager(tool)) {
-    return [];
-  }
-  if (tool.id === 'ollama') {
-    return listLocalOllamaModels(tool);
-  }
-  if (tool.id === 'invokeai') {
-    return listInvokeAiModels(tool);
-  }
-  return listLocalFileModels(tool);
+  throwIfSignalAborted(options.signal);
+  return models;
 }
-
 function isStableDiffusionWebUiTool(tool) {
   const toolId = String(tool?.id || '').trim().toLowerCase();
   return toolId === 'automatic1111' || toolId === 'forge';
@@ -1928,6 +1978,7 @@ async function fetchHuggingFaceRepositoryTree(detail, logger) {
     HUGGING_FACE_TREE_CACHE.set(modelId, entries);
     return entries;
   } catch (error) {
+    rethrowModelBrowseCancellation(error);
     await logger.warn('A Hugging Face repository tree expansion failed.', { error, modelId }).catch(() => null);
     return [];
   }
@@ -2155,7 +2206,8 @@ function extractReadmeImageUrls(markdown) {
   return [...new Set(imageUrls.filter(Boolean))];
 }
 async function fetchJsonResponse(url, options = {}) {
-  const response = await fetch(url, options);
+  throwIfModelBrowseCanceled();
+  const response = await fetch(url, withModelBrowseSignal(options));
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const detail = String(payload?.error || payload?.message || '').trim();
@@ -2195,6 +2247,7 @@ async function fetchHuggingFaceDetails(results, logger) {
       }).then((payload) => payload.payload),
     ),
   );
+  throwIfModelBrowseCanceled();
   return detailResults
     .map((entry, index) => {
       if (entry.status === 'fulfilled') {
@@ -2236,26 +2289,28 @@ async function fetchHuggingFaceFileSize(modelId, filePath, logger) {
   const downloadUrl = buildHuggingFaceResolveUrl(modelId, filePath);
   let sizeBytes = 0;
   try {
-    let response = await fetch(downloadUrl, {
+    throwIfModelBrowseCanceled();
+    let response = await fetch(downloadUrl, withModelBrowseSignal({
       method: 'HEAD',
       headers: {
         'User-Agent': APP_USER_AGENT,
       },
-    });
+    }));
     sizeBytes = parseSizeHeader(response);
     if ((!response.ok || sizeBytes <= 0) && response.status !== 404) {
-      response = await fetch(downloadUrl, {
+      response = await fetch(downloadUrl, withModelBrowseSignal({
         headers: {
           Range: 'bytes=0-0',
           'User-Agent': APP_USER_AGENT,
         },
-      });
+      }));
       sizeBytes = parseSizeHeader(response);
       if (response.body && typeof response.body.cancel === 'function') {
         await response.body.cancel().catch(() => null);
       }
     }
   } catch (error) {
+    rethrowModelBrowseCancellation(error);
     await logger.warn('A Hugging Face file size lookup failed.', {
       downloadUrl,
       error,
@@ -2264,8 +2319,7 @@ async function fetchHuggingFaceFileSize(modelId, filePath, logger) {
   }
   HUGGING_FACE_FILE_SIZE_CACHE.set(cacheKey, sizeBytes || 0);
   return sizeBytes || 0;
-}
-async function resolveHuggingFaceDownloadFile(detail, selectedType, logger, tool = null) {
+}async function resolveHuggingFaceDownloadFile(detail, selectedType, logger, tool = null) {
   const planningDetail = await expandHuggingFaceDetailForPlanning(detail, selectedType, tool, logger);
   const downloadFile = pickHuggingFaceDownloadFile(planningDetail, selectedType, tool);
   if (!downloadFile) {
@@ -2296,11 +2350,11 @@ async function fetchHuggingFaceReadmePreview(detail, logger) {
     return null;
   }
   try {
-    const response = await fetch(buildHuggingFaceResolveUrl(detail.id, readmeEntry.rfilename), {
+    const response = await fetch(buildHuggingFaceResolveUrl(detail.id, readmeEntry.rfilename), withModelBrowseSignal({
       headers: {
         'User-Agent': APP_USER_AGENT,
       },
-    });
+    }));
     if (!response.ok) {
       return null;
     }
@@ -2312,6 +2366,7 @@ async function fetchHuggingFaceReadmePreview(detail, logger) {
       }
     }
   } catch (error) {
+    rethrowModelBrowseCancellation(error);
     await logger.warn('A Hugging Face README preview lookup failed.', {
       error,
       modelId: detail.id,
@@ -2648,6 +2703,7 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
   let rawCursor = browseOptions.cursor;
   let nextCursor = null;
   for (let scanCount = 0; scanCount < 3; scanCount += 1) {
+    throwIfModelBrowseCanceled();
     const existingItems = mergeCatalogSearchItems(getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), browseOptions.limit);
     if (existingItems.length >= browseOptions.limit) {
       break;
@@ -2663,6 +2719,7 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
       }
     }
     for (const detail of details) {
+      throwIfModelBrowseCanceled();
       const detailId = String(detail?.id || '').trim().toLowerCase();
       const isDefaultSeedDetail = defaultSeedModelIds.has(detailId);
       const previewUrl = await resolveHuggingFacePreview(detail, logger);
@@ -2932,6 +2989,7 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
   const modelItems = [];
   const artifactItems = [];
   for (const model of payload.items || []) {
+    throwIfModelBrowseCanceled();
     const candidateFiles = collectCivitaiVersionFiles(model, browseOptions.modelType, tool);
     const matchingFiles = derivedSearchQuery
       ? candidateFiles.filter((entry) =>
@@ -2968,64 +3026,71 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
     },
   };
 }
-async function browseRemoteModels(tool, options = {}) {
-  const browseOptions = normalizeBrowseOptions(options, tool);
-  const logger = createLogger('models', {
-    toolId: tool?.id,
-    mode: 'browse',
-    source: browseOptions.source,
+async function browseRemoteModels(tool, options = {}, context = {}) {
+  return MODEL_BROWSE_CONTEXT.run({ signal: context.signal || null }, async () => {
+    throwIfModelBrowseCanceled();
+    const browseOptions = normalizeBrowseOptions(options, tool);
+    const logger = createLogger('models', {
+      toolId: tool?.id,
+      mode: 'browse',
+      source: browseOptions.source,
+    });
+    if (!supportsModelManager(tool)) {
+      throw new Error('This tool does not have Model Manager browsing enabled yet.');
+    }
+    const settings = await readModelSettingsInternal();
+    const publicSettings = {
+      ...stripModelManagerSecrets(settings),
+      civitaiApiKey: '',
+      civitaiCredentialSource: settings.civitaiCredentialSource || 'missing',
+      civitaiEnvVarName: settings.civitaiEnvVarName || 'CIVITAI_API_KEY',
+      hasCivitaiApiKey: Boolean(settings.hasCivitaiApiKey),
+      hasSavedCivitaiApiKey: Boolean(settings.hasSavedCivitaiApiKey),
+    };
+    const localModels = await listDownloadedModels(tool, { signal: context.signal }).catch((error) => {
+      rethrowModelBrowseCancellation(error);
+      return [];
+    });
+    throwIfModelBrowseCanceled();
+    const downloadedLookup = buildDownloadedLookup(localModels);
+    const hardwareContext = await loadHardwareContext();
+    throwIfModelBrowseCanceled();
+    if (tool.id === 'ollama') {
+      const result = await searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwareContext, logger);
+      return {
+        items: result.items,
+        localModels,
+        pagination: result.pagination,
+        settings: publicSettings,
+      };
+    }
+    if (browseOptions.source === 'tabby') {
+      const result = await searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, hardwareContext, logger);
+      return {
+        items: result.items,
+        localModels,
+        pagination: result.pagination,
+        settings: publicSettings,
+      };
+    }
+    if (browseOptions.source === 'civitai') {
+      const result = await searchCivitaiModels(tool, browseOptions, downloadedLookup, settings, hardwareContext, logger);
+      return {
+        items: result.items,
+        localModels,
+        pagination: result.pagination,
+        settings: publicSettings,
+      };
+    }
+    const result = await searchHuggingFaceModels(tool, browseOptions, downloadedLookup, hardwareContext, logger);
+    return {
+      items: result.items,
+      localModels,
+      pagination: result.pagination,
+      settings: publicSettings,
+    };
   });
-  if (!supportsModelManager(tool)) {
-    throw new Error('This tool does not have Model Manager browsing enabled yet.');
-  }
-  const settings = await readModelSettingsInternal();
-  const publicSettings = {
-    ...stripModelManagerSecrets(settings),
-    civitaiApiKey: '',
-    civitaiCredentialSource: settings.civitaiCredentialSource || 'missing',
-    civitaiEnvVarName: settings.civitaiEnvVarName || 'CIVITAI_API_KEY',
-    hasCivitaiApiKey: Boolean(settings.hasCivitaiApiKey),
-    hasSavedCivitaiApiKey: Boolean(settings.hasSavedCivitaiApiKey),
-  };
-  const localModels = await listDownloadedModels(tool).catch(() => []);
-  const downloadedLookup = buildDownloadedLookup(localModels);
-  const hardwareContext = await loadHardwareContext();
-  if (tool.id === 'ollama') {
-    const result = await searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwareContext, logger);
-    return {
-      items: result.items,
-      localModels,
-      pagination: result.pagination,
-      settings: publicSettings,
-    };
-  }
-  if (browseOptions.source === 'tabby') {
-    const result = await searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, hardwareContext, logger);
-    return {
-      items: result.items,
-      localModels,
-      pagination: result.pagination,
-      settings: publicSettings,
-    };
-  }
-  if (browseOptions.source === 'civitai') {
-    const result = await searchCivitaiModels(tool, browseOptions, downloadedLookup, settings, hardwareContext, logger);
-    return {
-      items: result.items,
-      localModels,
-      pagination: result.pagination,
-      settings: publicSettings,
-    };
-  }
-  const result = await searchHuggingFaceModels(tool, browseOptions, downloadedLookup, hardwareContext, logger);
-  return {
-    items: result.items,
-    localModels,
-    pagination: result.pagination,
-    settings: publicSettings,
-  };
-}
-function parseOllamaCompactNumber(value) {
+}function parseOllamaCompactNumber(value) {
   const match = String(value || '').trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*([KMBT])?$/i);
   if (!match) {
     return 0;
@@ -3163,46 +3228,46 @@ async function fetchOllamaFamilyDetails(entry, logger) {
       variants: [],
     };
   }
-  if (!OLLAMA_FAMILY_CACHE.has(cacheKey)) {
-    OLLAMA_FAMILY_CACHE.set(
-      cacheKey,
-      (async () => {
-        const familyUrl = buildOllamaAbsoluteUrl(entry.libraryPath || `/library/${entry.slug || entry.name}`);
-        try {
-          const response = await fetch(familyUrl, {
-            headers: {
-              'User-Agent': APP_USER_AGENT,
-            },
-          });
-          if (!response.ok) {
-            throw new Error(`Request failed with status ${response.status}.`);
-          }
-          const html = await response.text();
-          return {
-            description: extractOllamaFamilyDescription(html, entry.description || `Ollama model ${entry.name}`),
-            previewUrl: extractOllamaFamilyPreviewUrl(html) || entry.previewUrl || null,
-            searchText: extractOllamaFamilySearchText(html),
-            variants: parseOllamaFamilyVariants(html, entry.name),
-          };
-        } catch (error) {
-          await logger.warn('An Ollama family page could not be loaded.', {
-            error,
-            family: entry.name,
-            url: familyUrl,
-          }).catch(() => null);
-          return {
-            description: entry.description || `Ollama model ${entry.name}`,
-            previewUrl: entry.previewUrl || null,
-            searchText: '',
-            variants: [],
-          };
-        }
-      })(),
-    );
+  if (OLLAMA_FAMILY_CACHE.has(cacheKey)) {
+    return OLLAMA_FAMILY_CACHE.get(cacheKey);
   }
-  return OLLAMA_FAMILY_CACHE.get(cacheKey);
-}
-function getOllamaDefaultVariant(familyDetails) {
+
+  const familyUrl = buildOllamaAbsoluteUrl(entry.libraryPath || `/library/${entry.slug || entry.name}`);
+  try {
+    throwIfModelBrowseCanceled();
+    const response = await fetch(familyUrl, withModelBrowseSignal({
+      headers: {
+        'User-Agent': APP_USER_AGENT,
+      },
+    }));
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}.`);
+    }
+    const html = await response.text();
+    throwIfModelBrowseCanceled();
+    const details = {
+      description: extractOllamaFamilyDescription(html, entry.description || `Ollama model ${entry.name}`),
+      previewUrl: extractOllamaFamilyPreviewUrl(html) || entry.previewUrl || null,
+      searchText: extractOllamaFamilySearchText(html),
+      variants: parseOllamaFamilyVariants(html, entry.name),
+    };
+    OLLAMA_FAMILY_CACHE.set(cacheKey, details);
+    return details;
+  } catch (error) {
+    rethrowModelBrowseCancellation(error);
+    await logger.warn('An Ollama family page could not be loaded.', {
+      error,
+      family: entry.name,
+      url: familyUrl,
+    }).catch(() => null);
+    return {
+      description: entry.description || `Ollama model ${entry.name}`,
+      previewUrl: entry.previewUrl || null,
+      searchText: '',
+      variants: [],
+    };
+  }
+}function getOllamaDefaultVariant(familyDetails) {
   const variants = familyDetails?.variants || [];
   return variants.find((variant) => variant.latest && !variant.isLatestAlias) || variants.find((variant) => variant.isLatestAlias) || variants.find((variant) => variant.latest) || variants[0] || null;
 }
@@ -3362,11 +3427,11 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
     sort: normalizedSort,
     url: searchUrl.toString(),
   });
-  const response = await fetch(searchUrl, {
+  const response = await fetch(searchUrl, withModelBrowseSignal({
     headers: {
       'User-Agent': APP_USER_AGENT,
     },
-  });
+  }));
   if (!response.ok) {
     throw new Error('Local AI Hub could not load the Ollama library list right now.');
   }
@@ -3485,11 +3550,11 @@ async function fetchTabbyRegistryHtml(logger) {
       await logger.info('Loading Tabby model registry.', {
         url: registryUrl,
       });
-      const response = await fetch(registryUrl, {
+      const response = await fetch(registryUrl, withModelBrowseSignal({
         headers: {
           'User-Agent': APP_USER_AGENT,
         },
-      });
+      }));
       if (!response.ok) {
         lastError = new Error(`Request failed with status ${response.status}.`);
         continue;
@@ -3499,6 +3564,7 @@ async function fetchTabbyRegistryHtml(logger) {
         return html;
       }
     } catch (error) {
+      rethrowModelBrowseCancellation(error);
       lastError = error;
     }
   }

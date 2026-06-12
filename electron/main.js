@@ -105,7 +105,18 @@ const { transcribeWithWhisper } = require('./services/whisperService');
 const { buildMergedToolStateList } = require('./services/toolStateService');
 const { configureAutoUpdates, isUpdateReady, restartToInstallUpdate } = require('./services/updateService');
 const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
-const { cancelPipelineRun, getActiveRunSnapshot, resumePipelineValidation, runPipeline, setPipelineEventSink } = require('./services/pipelineExecutionService');
+const {
+  cancelPipelineRecordInput,
+  cancelPipelineRun,
+  getActiveRunSnapshot,
+  handlePipelineRecordingStatus,
+  resumePipelineValidation,
+  runPipeline,
+  setPipelineEventSink,
+  setPipelineRecordingController,
+  startPipelineRecordInput,
+  stopPipelineRecordInput,
+} = require('./services/pipelineExecutionService');
 const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./services/pipelineStoreService');
 const { buildPipelineOutputDeletionPreview, deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
 const { redactSensitiveText } = require('./services/redactionService');
@@ -188,6 +199,21 @@ async function deleteRecording(id, options) {
   return deleteStoredRecording(id, options);
 }
 
+setPipelineRecordingController({
+  async start({ config, nodeId, runId }) {
+    return startRecording(config, {
+      displays: listRecordingDisplays(),
+      recordingContext: {
+        nodeId,
+        runId,
+        type: 'pipelineRun',
+      },
+    });
+  },
+  cancel: () => cancelRecording(),
+  stop: () => stopRecording(),
+});
+
 const APP_USER_MODEL_ID = 'com.localaihub.desktop';
 const TOOL_HEALTH_CHECK_INTERVAL_MS = 5000;
 const TOOL_UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -232,6 +258,10 @@ let liveResourceCache = {
   key: '',
   timestamp: 0,
   value: null,
+};
+const tabOwnedRequestControllers = {
+  modelCatalog: new Map(),
+  statistics: new Map(),
 };
 let fatalAppErrorHandled = false;
 let appStartupComplete = false;
@@ -347,7 +377,11 @@ async function shutdownOwnedResources() {
   }
 
   cancelRecordingRegionSelection();
-  await disposeRecording().catch(() => null);
+  if (getActiveRecording()?.recordingContext === 'pipelineRun') {
+    await cancelRecording().catch(() => null);
+  } else {
+    await disposeRecording().catch(() => null);
+  }
   await disposeAllRuntimes().catch(() => null);
   await disposeBackgroundTasks().catch(() => null);
 }
@@ -1198,6 +1232,53 @@ async function registerAssetLibraryPreviewProtocol() {
   registerAssetLibraryPreviewProtocol.registered = true;
 }
 registerAssetLibraryPreviewProtocol.registered = false;
+function isCancellationError(error) {
+  return error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
+}
+
+function getTabOwnedRequestKey(event, requestId) {
+  const normalizedRequestId = String(requestId || '').trim().slice(0, 180);
+  if (!normalizedRequestId) {
+    return '';
+  }
+  return `${event.sender.id}:${normalizedRequestId}`;
+}
+
+async function runTabOwnedRequest(event, payload, scope, handler) {
+  const requestKey = getTabOwnedRequestKey(event, payload?.requestId);
+  if (!requestKey) {
+    return handler(null);
+  }
+
+  const controllers = tabOwnedRequestControllers[scope];
+  const previousController = controllers.get(requestKey);
+  previousController?.abort();
+  const controller = new AbortController();
+  controllers.set(requestKey, controller);
+  const abortOnDestroyed = () => controller.abort();
+  event.sender.once('destroyed', abortOnDestroyed);
+
+  try {
+    return await handler(controller.signal);
+  } finally {
+    event.sender.removeListener('destroyed', abortOnDestroyed);
+    if (controllers.get(requestKey) === controller) {
+      controllers.delete(requestKey);
+    }
+  }
+}
+
+function cancelTabOwnedRequest(event, payload, scope) {
+  const requestKey = getTabOwnedRequestKey(event, payload?.requestId);
+  const controllers = tabOwnedRequestControllers[scope];
+  const controller = requestKey ? controllers.get(requestKey) : null;
+  if (!controller) {
+    return { canceled: false };
+  }
+  controller.abort();
+  controllers.delete(requestKey);
+  return { canceled: true };
+}
 async function withPlainEnglishErrors(handler, fallbackMessage, options = {}) {
   try {
     const data = await handler();
@@ -1210,6 +1291,12 @@ async function withPlainEnglishErrors(handler, fallbackMessage, options = {}) {
     }
     return { ok: true, data };
   } catch (error) {
+    if (options.allowCancellation && isCancellationError(error)) {
+      return {
+        canceled: true,
+        ok: false,
+      };
+    }
     return {
       ok: false,
       message: humanizeError(error, fallbackMessage),
@@ -1817,8 +1904,8 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not remove those leftover files.'),
   );
 
-  ipcMain.handle('settings:get-statistics-core', () =>
-    withPlainEnglishErrors(async () => {
+  ipcMain.handle('settings:get-statistics-core', (event, payload = {}) =>
+    withPlainEnglishErrors(() => runTabOwnedRequest(event, payload, 'statistics', async (signal) => {
       const startedAt = Date.now();
       const configStartedAt = Date.now();
       const config = await readConfig();
@@ -1831,7 +1918,7 @@ function registerIpcHandlers() {
       }
       const vramSampleMs = Date.now() - vramStartedAt;
       const snapshotStartedAt = Date.now();
-      const snapshot = await getStatisticsCoreSnapshot(tools);
+      const snapshot = await getStatisticsCoreSnapshot(tools, { signal });
       appendLog('statistics', 'info', 'Statistics core IPC request completed.', {
         totalMs: Date.now() - startedAt,
         configMs,
@@ -1841,11 +1928,11 @@ function registerIpcHandlers() {
         runningToolCount: runningTools.length,
       }).catch(() => null);
       return snapshot;
-    }, 'Local AI Hub could not load the main statistics right now.'),
+    }), 'Local AI Hub could not load the main statistics right now.', { allowCancellation: true }),
   );
 
-  ipcMain.handle('settings:get-statistics-storage', (_event, payload = {}) =>
-    withPlainEnglishErrors(async () => {
+  ipcMain.handle('settings:get-statistics-storage', (event, payload = {}) =>
+    withPlainEnglishErrors(() => runTabOwnedRequest(event, payload, 'statistics', async (signal) => {
       const startedAt = Date.now();
       const toolsStartedAt = Date.now();
       const tools = await buildMergedToolStateList({
@@ -1856,6 +1943,7 @@ function registerIpcHandlers() {
       const snapshotStartedAt = Date.now();
       const snapshot = await getStatisticsStorageSnapshot(tools, {
         forceRefresh: Boolean(payload?.forceRefresh || payload?.refresh || payload?.rebuildIndex),
+        signal,
       });
       appendLog('statistics', 'info', 'Statistics storage IPC request completed.', {
         totalMs: Date.now() - startedAt,
@@ -1864,11 +1952,11 @@ function registerIpcHandlers() {
         toolCount: tools.length,
       }).catch(() => null);
       return snapshot;
-    }, 'Local AI Hub could not load storage statistics right now.'),
+    }), 'Local AI Hub could not load storage statistics right now.', { allowCancellation: true }),
   );
 
-  ipcMain.handle('settings:get-statistics', (_event, payload = {}) =>
-    withPlainEnglishErrors(async () => {
+  ipcMain.handle('settings:get-statistics', (event, payload = {}) =>
+    withPlainEnglishErrors(() => runTabOwnedRequest(event, payload, 'statistics', async (signal) => {
       const startedAt = Date.now();
       const toolsStartedAt = Date.now();
       const tools = await buildMergedToolStateList({
@@ -1885,6 +1973,7 @@ function registerIpcHandlers() {
       const snapshotStartedAt = Date.now();
       const snapshot = await getStatisticsSnapshot(tools, {
         forceRefresh: Boolean(payload?.forceRefresh || payload?.refresh || payload?.rebuildIndex),
+        signal,
       });
       appendLog('statistics', 'info', 'Statistics full IPC request completed.', {
         totalMs: Date.now() - startedAt,
@@ -1895,7 +1984,11 @@ function registerIpcHandlers() {
         runningToolCount: runningTools.length,
       }).catch(() => null);
       return snapshot;
-    }, 'Local AI Hub could not load the statistics screen right now.'),
+    }), 'Local AI Hub could not load the statistics screen right now.', { allowCancellation: true }),
+  );
+
+  ipcMain.handle('settings:cancel-statistics-request', (event, payload = {}) =>
+    withPlainEnglishErrors(() => cancelTabOwnedRequest(event, payload, 'statistics'), 'Local AI Hub could not cancel that statistics request.', { refreshMode: 'none' }),
   );
   ipcMain.handle('providers:list', () =>
     withPlainEnglishErrors(async () => listProviderConnections(), 'Local AI Hub could not load the cloud provider list.'),
@@ -2012,20 +2105,24 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not save the Model Manager settings.'),
   );
 
-  ipcMain.handle('models:browse', (_event, payload) =>
-    withPlainEnglishErrors(async () => {
+  ipcMain.handle('models:browse', (event, payload = {}) =>
+    withPlainEnglishErrors(() => runTabOwnedRequest(event, payload, 'modelCatalog', async (signal) => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      return browseRemoteModels(tool, payload);
-    }, 'Local AI Hub could not load remote models right now.'),
+      return browseRemoteModels(tool, payload, { signal });
+    }), 'Local AI Hub could not load remote models right now.', { allowCancellation: true }),
   );
 
-  ipcMain.handle('models:list-local', (_event, payload) =>
-    withPlainEnglishErrors(async () => {
+  ipcMain.handle('models:cancel-browse', (event, payload = {}) =>
+    withPlainEnglishErrors(() => cancelTabOwnedRequest(event, payload, 'modelCatalog'), 'Local AI Hub could not cancel that catalog request.', { refreshMode: 'none' }),
+  );
+
+  ipcMain.handle('models:list-local', (event, payload = {}) =>
+    withPlainEnglishErrors(() => runTabOwnedRequest(event, payload, 'modelCatalog', async (signal) => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      return listDownloadedModels(tool);
-    }, 'Local AI Hub could not load the downloaded models for that tool.'),
+      return listDownloadedModels(tool, { signal });
+    }), 'Local AI Hub could not load the downloaded models for that tool.', { allowCancellation: true }),
   );
 
   ipcMain.handle('models:list-tool-assets', (_event, payload) =>
@@ -2448,6 +2545,27 @@ function registerIpcHandlers() {
     }), 'Local AI Hub could not cancel that pipeline run.'),
   );
 
+  ipcMain.handle('pipelines:start-record-input', (_event, payload) =>
+    withPlainEnglishErrors(async () => ({
+      message: 'Record Input started.',
+      run: await startPipelineRecordInput(payload?.runId, payload || {}),
+    }), 'Local AI Hub could not start that Record Input recording.', { refreshMode: 'none' }),
+  );
+
+  ipcMain.handle('pipelines:stop-record-input', (_event, payload) =>
+    withPlainEnglishErrors(async () => ({
+      message: 'Record Input is finalizing.',
+      run: await stopPipelineRecordInput(payload?.runId, payload || {}),
+    }), 'Local AI Hub could not stop that Record Input recording cleanly.', { refreshMode: 'none' }),
+  );
+
+  ipcMain.handle('pipelines:cancel-record-input', (_event, payload) =>
+    withPlainEnglishErrors(async () => ({
+      message: 'Record Input was canceled and this pipeline step will fail.',
+      run: await cancelPipelineRecordInput(payload?.runId, payload || {}),
+    }), 'Local AI Hub could not cancel that Record Input recording.', { refreshMode: 'none' }),
+  );
+
   ipcMain.handle('pipelines:resume-validation', (_event, payload) =>
     withPlainEnglishErrors(async () => ({
       message: 'Local AI Hub recorded your validation decision.',
@@ -2500,6 +2618,7 @@ async function startApplication() {
   createWindow();
   setRecordingEventSink((payload) => {
     mainWindow?.webContents.send('recordings:status-update', payload);
+    handlePipelineRecordingStatus(payload).catch(() => null);
     if (payload?.recording?.status && payload.recording.status !== 'recording') {
       invalidateStatisticsIndexSections(['storage'], `recording-${payload.recording.status}`).catch(() => null);
     }

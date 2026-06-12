@@ -1,5 +1,8 @@
 const {
   PIPELINE_OPERATION_IDS,
+  PIPELINE_RECORD_INPUT_CAPABILITY,
+  RECORD_INPUT_MODE_IDS,
+  RECORD_INPUT_MODE_OPTIONS,
   TOOL_PIPELINE_STRATEGY_IDS,
   getGraphWorkflowToolIds,
   getOperationDrivenToolIdsForPipelineOperation,
@@ -100,6 +103,7 @@ const PORT_COLLECTION_KIND_PREFIX = PORT_KIND_COLLECTION + ':';
 const PORT_KIND_ANY = 'any';
 const PORT_KIND_PASSTHROUGH = 'passthrough';
 const PORT_KIND_AUDIO_FILE = PORT_KIND_AUDIO;
+const RECORD_INPUT_MODE_BY_ID = new Map(RECORD_INPUT_MODE_OPTIONS.map((entry) => [entry.id, entry]));
 const COLLECTION_ITEM_PORT_KINDS = Object.freeze([
   PORT_KIND_TEXT,
   PORT_KIND_IMAGE,
@@ -342,6 +346,35 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       filePath: '',
+    },
+  }),
+  recordInput: Object.freeze({
+    type: 'recordInput',
+    label: 'Record Input',
+    category: 'Inputs',
+    description: 'Pauses the run for an explicit local audio or video recording, then emits the completed artifact.',
+    inputPorts: [],
+    outputPorts: [
+      {
+        id: 'audio',
+        kind: PORT_KIND_AUDIO,
+        label: 'Audio',
+      },
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Video',
+      },
+    ],
+    configDefaults: {
+      mode: RECORD_INPUT_MODE_IDS.SCREEN,
+      microphoneId: '',
+      webcamId: '',
+      displayId: '',
+      fps: 15,
+      captureTarget: {
+        type: 'desktop',
+      },
     },
   }),
   fileInput: Object.freeze({
@@ -2108,6 +2141,238 @@ function getDefaultNodeConfig(type) {
   return cloneValue(definition?.configDefaults || {});
 }
 
+function getRecordInputModeDefinition(value) {
+  return RECORD_INPUT_MODE_BY_ID.get(String(value || '').trim()) || null;
+}
+
+function getRecordInputOutputKind(nodeOrConfig) {
+  const config = nodeOrConfig?.config && typeof nodeOrConfig.config === 'object' ? nodeOrConfig.config : nodeOrConfig;
+  return getRecordInputModeDefinition(config?.mode)?.outputKind || '';
+}
+
+function getRecordInputFormatLabel(nodeOrConfig) {
+  const config = nodeOrConfig?.config && typeof nodeOrConfig.config === 'object' ? nodeOrConfig.config : nodeOrConfig;
+  const mode = getRecordInputModeDefinition(config?.mode);
+  if (!mode) {
+    return 'Unsupported recording mode';
+  }
+  if (mode.backend === 'electron') {
+    return mode.outputKind === PORT_KIND_AUDIO ? 'WebM (Opus audio)' : 'WebM (VP9/Opus)';
+  }
+  return mode.outputKind === PORT_KIND_AUDIO ? 'WAV (PCM)' : 'MKV (H.264)';
+}
+
+function getRecordInputModeLabel(nodeOrConfig) {
+  const config = nodeOrConfig?.config && typeof nodeOrConfig.config === 'object' ? nodeOrConfig.config : nodeOrConfig;
+  const mode = getRecordInputModeDefinition(config?.mode);
+  if (!mode) {
+    return 'Unsupported recording mode';
+  }
+  if (mode.needsScreen && config?.captureTarget?.type === 'region') {
+    return mode.label.replace(/^Screen/, 'Region');
+  }
+  return mode.label;
+}
+
+function buildRecordInputBackendRequest(nodeOrConfig) {
+  const config = nodeOrConfig?.config && typeof nodeOrConfig.config === 'object' ? nodeOrConfig.config : nodeOrConfig;
+  const mode = getRecordInputModeDefinition(config?.mode);
+  if (!mode) {
+    throw new Error('Choose a supported Record Input capture mode.');
+  }
+
+  const captureTarget = mode.needsScreen
+    ? config?.captureTarget?.type === 'region'
+      ? {
+          type: 'region',
+          displayId: String(config?.displayId || config?.captureTarget?.displayId || '').trim(),
+          x: Number(config?.captureTarget?.x),
+          y: Number(config?.captureTarget?.y),
+          width: Number(config?.captureTarget?.width),
+          height: Number(config?.captureTarget?.height),
+        }
+      : {
+          type: 'desktop',
+          displayId: String(config?.displayId || '').trim(),
+        }
+    : undefined;
+
+  return {
+    mode: mode.id === RECORD_INPUT_MODE_IDS.SCREEN_SYSTEM_AUDIO ? 'screen' : mode.id,
+    systemAudio: Boolean(mode.needsSystemAudio),
+    displayId: String(config?.displayId || '').trim(),
+    microphoneId: mode.needsMicrophone ? String(config?.microphoneId || '').trim() : undefined,
+    webcamId: mode.needsWebcam ? String(config?.webcamId || '').trim() : undefined,
+    fps: mode.outputKind === PORT_KIND_VIDEO ? Number(config?.fps) : undefined,
+    captureTarget,
+  };
+}
+
+function getRecordInputConfigValidationMessage(nodeOrConfig) {
+  const config = nodeOrConfig?.config && typeof nodeOrConfig.config === 'object' ? nodeOrConfig.config : nodeOrConfig;
+  const mode = getRecordInputModeDefinition(config?.mode);
+  if (!mode) {
+    return 'Choose a supported Record Input capture mode. Screen plus webcam, window capture, and system audio combined with microphone or webcam are not available.';
+  }
+  if (mode.needsMicrophone && !String(config?.microphoneId || '').trim()) {
+    return 'Choose an available microphone for this Record Input node.';
+  }
+  if (mode.needsWebcam && !String(config?.webcamId || '').trim()) {
+    return 'Choose an available webcam for this Record Input node.';
+  }
+  const captureTargetType = String(config?.captureTarget?.type || 'desktop').trim();
+  if (mode.needsScreen && !['desktop', 'region'].includes(captureTargetType)) {
+    return 'Choose Full desktop, Selected display, or Region for this Record Input node. Window capture is not available.';
+  }
+  if ((mode.needsDisplay || captureTargetType === 'region') && !String(config?.displayId || config?.captureTarget?.displayId || '').trim()) {
+    return 'Choose an available display for this Record Input node.';
+  }
+  if (captureTargetType === 'region') {
+    const values = ['x', 'y', 'width', 'height'].map((key) => Number(config?.captureTarget?.[key]));
+    if (!values.every(Number.isSafeInteger)) {
+      return 'Record Input region coordinates and dimensions must be whole numbers.';
+    }
+    const [, , width, height] = values;
+    if (width < 64 || height < 64) {
+      return 'Record Input region width and height must each be at least 64 pixels.';
+    }
+    if (width % 2 !== 0 || height % 2 !== 0) {
+      return 'Record Input region width and height must be even numbers.';
+    }
+  }
+  if (mode.outputKind === PORT_KIND_VIDEO) {
+    const fps = Number(config?.fps);
+    if (!Number.isInteger(fps) || fps < 10 || fps > 60) {
+      return 'Choose a Record Input frame rate between 10 and 60 FPS.';
+    }
+  }
+  return '';
+}
+
+function buildRecordInputRetryOverrideConfig(nodeOrConfig, value) {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const baseConfig = nodeOrConfig?.config && typeof nodeOrConfig.config === 'object' ? nodeOrConfig.config : nodeOrConfig;
+  const mode = getRecordInputModeDefinition(baseConfig?.mode);
+  if (!mode) {
+    throw new Error('Choose a supported Record Input capture mode before retrying.');
+  }
+
+  const requestedMode = Object.prototype.hasOwnProperty.call(value, 'mode') ? String(value.mode || '').trim() : mode.id;
+  if (requestedMode !== mode.id) {
+    throw new Error(`Validation retry cannot change Record Input from ${mode.outputKind} output to another recording mode. Change the graph node after this run instead.`);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'outputKind') && String(value.outputKind || '').trim() !== mode.outputKind) {
+    throw new Error(`Validation retry cannot change Record Input from ${mode.outputKind} output to another output type.`);
+  }
+  if (Object.prototype.hasOwnProperty.call(value, 'backend') && String(value.backend || '').trim() !== mode.backend) {
+    throw new Error('Validation retry cannot change the Record Input recording backend.');
+  }
+
+  const override = {};
+  if (mode.outputKind === PORT_KIND_VIDEO && Object.prototype.hasOwnProperty.call(value, 'fps')) {
+    override.fps = Number(value.fps);
+  }
+  if (mode.needsMicrophone && Object.prototype.hasOwnProperty.call(value, 'microphoneId')) {
+    override.microphoneId = String(value.microphoneId || '').trim();
+  }
+  if (mode.needsWebcam && Object.prototype.hasOwnProperty.call(value, 'webcamId')) {
+    override.webcamId = String(value.webcamId || '').trim();
+  }
+  if ((mode.needsDisplay || mode.needsScreen) && Object.prototype.hasOwnProperty.call(value, 'displayId')) {
+    override.displayId = String(value.displayId || '').trim();
+  }
+  if (mode.needsScreen && value.captureTarget && typeof value.captureTarget === 'object') {
+    const targetType = String(value.captureTarget.type || 'desktop').trim() === 'region' ? 'region' : 'desktop';
+    override.captureTarget = targetType === 'region'
+      ? {
+          type: 'region',
+          displayId: String(value.captureTarget.displayId || override.displayId || baseConfig?.displayId || '').trim(),
+          x: Number(value.captureTarget.x),
+          y: Number(value.captureTarget.y),
+          width: Number(value.captureTarget.width),
+          height: Number(value.captureTarget.height),
+        }
+      : { type: 'desktop' };
+    if (override.captureTarget.displayId && !override.displayId) {
+      override.displayId = override.captureTarget.displayId;
+    }
+  }
+
+  const effectiveConfig = {
+    ...(baseConfig || {}),
+    ...override,
+    mode: mode.id,
+  };
+  const validationMessage = getRecordInputConfigValidationMessage(effectiveConfig);
+  if (validationMessage) {
+    throw new Error(validationMessage);
+  }
+  return override;
+}
+
+function getRecordInputModeSwitchImpact(definition, nodeId, nextMode) {
+  const pipeline = definition && typeof definition === 'object' ? definition : {};
+  const node = (Array.isArray(pipeline.nodes) ? pipeline.nodes : []).find((entry) => entry?.id === nodeId) || null;
+  if (node?.type !== 'recordInput') {
+    throw new Error('Local AI Hub could not find that Record Input node.');
+  }
+  const oldMode = getRecordInputModeDefinition(node.config?.mode);
+  const newMode = getRecordInputModeDefinition(nextMode);
+  if (!oldMode || !newMode) {
+    throw new Error('Choose a supported Record Input capture mode.');
+  }
+  const outgoingEdgeIds = (Array.isArray(pipeline.edges) ? pipeline.edges : [])
+    .filter((edge) => edge?.source?.nodeId === nodeId)
+    .map((edge) => edge.id);
+  const changesOutputKind = oldMode.outputKind !== newMode.outputKind;
+  return {
+    changesOutputKind,
+    newOutputKind: newMode.outputKind,
+    oldOutputKind: oldMode.outputKind,
+    outgoingEdgeIds,
+    requiresConfirmation: changesOutputKind && outgoingEdgeIds.length > 0,
+  };
+}
+
+function applyRecordInputModeChange(definition, nodeId, nextMode, options = {}) {
+  const pipeline = cloneValue(definition && typeof definition === 'object' ? definition : {});
+  const impact = getRecordInputModeSwitchImpact(pipeline, nodeId, nextMode);
+  if (impact.requiresConfirmation && options.removeIncompatibleConnections !== true) {
+    return {
+      changed: false,
+      impact,
+      pipeline,
+      removedEdgeIds: [],
+      requiresConfirmation: true,
+    };
+  }
+
+  pipeline.nodes = (Array.isArray(pipeline.nodes) ? pipeline.nodes : []).map((node) => node.id === nodeId
+    ? {
+        ...node,
+        config: {
+          ...(node.config || {}),
+          mode: nextMode,
+        },
+      }
+    : node);
+  const removedEdgeIds = impact.changesOutputKind ? impact.outgoingEdgeIds : [];
+  if (removedEdgeIds.length) {
+    const removed = new Set(removedEdgeIds);
+    pipeline.edges = (Array.isArray(pipeline.edges) ? pipeline.edges : []).filter((edge) => !removed.has(edge.id));
+  }
+  return {
+    changed: true,
+    impact,
+    pipeline,
+    removedEdgeIds,
+    requiresConfirmation: false,
+  };
+}
+
 function normalizeNodeConfig(type, config) {
   const nextConfig = {
     ...getDefaultNodeConfig(type),
@@ -2277,6 +2542,10 @@ function getPipelineNodePorts(nodeOrType, direction) {
   const node = isPipelineNodeLike(nodeOrType) ? nodeOrType : null;
   const nodeType = node ? node.type : nodeOrType;
   const definition = getNodeTypeDefinition(nodeType);
+  if (node?.type === 'recordInput' && direction === 'output') {
+    const outputKind = getRecordInputOutputKind(node);
+    return (definition?.outputPorts || []).filter((port) => port.kind === outputKind);
+  }
   if (node?.type === 'graphWorkflow') {
     const contract = getGraphWorkflowContract(getGraphWorkflowToolId(node));
     const specs = direction === 'input' ? contract.inputPorts : contract.outputPorts;
@@ -3909,7 +4178,12 @@ function buildPipelineGraph(definition = {}) {
     const sourcePort = getPortDefinition(sourceNode, 'output', edge.source.portId);
     const targetPort = getPortDefinition(targetNode, 'input', edge.target.portId);
     if (!sourcePort || !targetPort) {
-      errors.push(`Local AI Hub found an invalid connection between "${sourceNode.label}" and "${targetNode.label}".`);
+      if (sourceNode.type === 'recordInput' && ['audio', 'video'].includes(String(edge.source.portId || ''))) {
+        const activeOutputKind = getRecordInputOutputKind(sourceNode) || 'supported';
+        errors.push(`"${sourceNode.label}" is configured for ${activeOutputKind} output, but a saved connection still uses its inactive ${edge.source.portId} port. Remove or reconnect that stale Record Input edge.`);
+      } else {
+        errors.push(`Local AI Hub found an invalid connection between "${sourceNode.label}" and "${targetNode.label}".`);
+      }
       continue;
     }
 
@@ -5261,6 +5535,22 @@ function analyzePipeline(definition = {}, context = {}) {
         issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
       }
 
+      if (node.type === 'recordInput') {
+        const validationMessage = getRecordInputConfigValidationMessage(node);
+        if (validationMessage) {
+          summary.readiness = {
+            tone: 'error',
+            message: validationMessage,
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'The run will pause here until you explicitly start and stop ' + getRecordInputModeLabel(node).toLowerCase() + '. Output: ' + getRecordInputFormatLabel(node) + '.',
+          };
+        }
+      }
+
       if (node.type === 'imageInput' || node.type === 'audioInput' || node.type === 'videoInput' || node.type === 'fileInput') {
         if (!analyzeInputFileNode(node, summary)) {
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
@@ -6557,6 +6847,7 @@ module.exports = {
   GRAPH_WORKFLOW_OPERATION_BACKEND_IDS,
   IMAGE_WORKFLOW_TOOL_IDS,
   PIPELINE_OPERATION_IDS,
+  PIPELINE_RECORD_INPUT_CAPABILITY,
   PIPELINE_PORT_KIND_LABELS,
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
   HEAVY_STEP_COOLDOWN_MAX_SECONDS,
@@ -6572,6 +6863,8 @@ module.exports = {
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_XFADE_TRANSITIONS,
   MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS,
+  RECORD_INPUT_MODE_IDS,
+  RECORD_INPUT_MODE_OPTIONS,
   AUDIO_WORKFLOW_TOOL_IDS,
   AUDIOCRAFT_AUDIO_MODE_OPTIONS,
   CHATTERBOX_AUDIO_MODE_OPTIONS,
@@ -6601,10 +6894,14 @@ module.exports = {
   VIDEO_WORKFLOW_TOOL_IDS,
   WHISPER_MODELS,
   analyzePipeline,
+  applyRecordInputModeChange,
   arePortsCompatible,
   buildContextMaps,
   buildGraphWorkflowConfigFromPreset,
-  buildPipelineGraph,  cloneValue,
+  buildRecordInputBackendRequest,
+  buildRecordInputRetryOverrideConfig,
+  buildPipelineGraph,
+  cloneValue,
   compareIssueSeverity,
   createEdge,
   createEmptyPipeline,
@@ -6646,6 +6943,12 @@ module.exports = {
   getNodeTypeDefinition,
   getPlanningSchemaDefinition,
   getPlanningSchemaOptions,
+  getRecordInputConfigValidationMessage,
+  getRecordInputFormatLabel,
+  getRecordInputModeDefinition,
+  getRecordInputModeLabel,
+  getRecordInputModeSwitchImpact,
+  getRecordInputOutputKind,
   getPortAllowedKinds,
   getPortDefinition,
   getSupportedPortKinds,

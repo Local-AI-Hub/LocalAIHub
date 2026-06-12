@@ -328,7 +328,7 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
     </article>
   );
 }
-export default function ModelManager({ tools, onToast }) {
+export default function ModelManager({ isActive = true, tools, onToast }) {
   const modelTools = useMemo(() => (tools || []).filter((tool) => getModelManagerConfig(tool)), [tools]);
   const [selectedToolId, setSelectedToolId] = useState(modelTools[0]?.id || '');
   const [selectedSource, setSelectedSource] = useState(getToolDefaults(modelTools[0]).source);
@@ -348,7 +348,11 @@ export default function ModelManager({ tools, onToast }) {
   const [sort, setSort] = useState('most-downloaded');
   const [taskType, setTaskType] = useState(getToolDefaults(modelTools[0]).taskType);
   const [deleteBusyId, setDeleteBusyId] = useState(null);
+  const activeRef = useRef(isActive);
+  const browseIpcRequestIdRef = useRef(null);
   const browseRequestIdRef = useRef(0);
+  const localIpcRequestIdRef = useRef(null);
+  const localRequestIdRef = useRef(0);
   const selectedTool = modelTools.find((tool) => tool.id === selectedToolId) || null;
   const sourceOptions = getModelManagerSources(selectedTool);
   const modelTypeOptions = getToolModelTypeOptions(selectedTool);
@@ -379,19 +383,45 @@ export default function ModelManager({ tools, onToast }) {
   }
   async function loadSettings() {
     const result = await window.localAIHub.getModelSettings();
+    if (!activeRef.current) {
+      return;
+    }
     if (result?.ok) {
       setSettings(result.data || { civitaiApiKey: '', civitaiCredentialSource: 'missing', civitaiEnvVarName: 'CIVITAI_API_KEY', hasCivitaiApiKey: false, hasSavedCivitaiApiKey: false });
       setCivitaiApiKeyDraft('');
     }
   }
   async function loadLocalModels(toolId = selectedToolId) {
+    if (!activeRef.current) {
+      return;
+    }
     if (!toolId) {
+      localRequestIdRef.current += 1;
+      const ipcRequestId = localIpcRequestIdRef.current;
+      localIpcRequestIdRef.current = null;
+      if (ipcRequestId) {
+        window.localAIHub.cancelModelBrowse(ipcRequestId).catch(() => null);
+      }
       setLocalModels([]);
       return;
     }
+    const requestId = localRequestIdRef.current + 1;
+    localRequestIdRef.current = requestId;
+    const previousIpcRequestId = localIpcRequestIdRef.current;
+    const ipcRequestId = `model-local-${Date.now()}-${requestId}`;
+    localIpcRequestIdRef.current = ipcRequestId;
+    if (previousIpcRequestId) {
+      window.localAIHub.cancelModelBrowse(previousIpcRequestId).catch(() => null);
+    }
     setLocalLoading(true);
     try {
-      const result = await window.localAIHub.listLocalModels(toolId);
+      const result = await window.localAIHub.listLocalModels({ requestId: ipcRequestId, toolId });
+      if (!activeRef.current || requestId !== localRequestIdRef.current) {
+        return;
+      }
+      if (result?.canceled) {
+        return;
+      }
       if (result?.ok) {
         setLocalModels(result.data || []);
       } else {
@@ -399,14 +429,24 @@ export default function ModelManager({ tools, onToast }) {
         setLocalModels([]);
       }
     } catch (error) {
+      if (!activeRef.current || requestId !== localRequestIdRef.current || error?.name === 'AbortError') {
+        return;
+      }
       onToast(error?.message || 'Local AI Hub could not load local models for that tool.', 'error');
       setLocalModels([]);
     } finally {
-      setLocalLoading(false);
+      if (localIpcRequestIdRef.current === ipcRequestId) {
+        localIpcRequestIdRef.current = null;
+      }
+      if (activeRef.current && requestId === localRequestIdRef.current) {
+        setLocalLoading(false);
+      }
     }
   }
-
   async function browse(options = {}) {
+    if (!activeRef.current) {
+      return;
+    }
     const toolId = options.toolId || selectedToolId;
     const source = options.source || selectedSource;
     const append = Boolean(options.append);
@@ -431,6 +471,12 @@ export default function ModelManager({ tools, onToast }) {
     }
     const requestId = browseRequestIdRef.current + 1;
     browseRequestIdRef.current = requestId;
+    const previousIpcRequestId = browseIpcRequestIdRef.current;
+    const ipcRequestId = `model-catalog-${Date.now()}-${requestId}`;
+    browseIpcRequestIdRef.current = ipcRequestId;
+    if (previousIpcRequestId) {
+      window.localAIHub.cancelModelBrowse(previousIpcRequestId).catch(() => null);
+    }
     logRendererActionDiagnostic('model-manager-search', 'start', { append, queryLength: String(query || '').trim().length, source, toolId });
     try {
       const result = await window.localAIHub.browseModels({
@@ -442,8 +488,12 @@ export default function ModelManager({ tools, onToast }) {
         source,
         taskType: effectiveTaskType,
         toolId,
+        requestId: ipcRequestId,
       });
-      if (requestId !== browseRequestIdRef.current) {
+      if (!activeRef.current || requestId !== browseRequestIdRef.current) {
+        return;
+      }
+      if (result?.canceled) {
         return;
       }
       if (!result?.ok) {
@@ -471,7 +521,7 @@ export default function ModelManager({ tools, onToast }) {
         setCivitaiApiKeyDraft('');
       }
     } catch (error) {
-      if (requestId !== browseRequestIdRef.current) {
+      if (!activeRef.current || requestId !== browseRequestIdRef.current || error?.name === 'AbortError') {
         return;
       }
       const message = error?.message || 'Local AI Hub could not load remote models right now.';
@@ -484,7 +534,10 @@ export default function ModelManager({ tools, onToast }) {
         setCatalogState({ error: message, query, source });
       }
     } finally {
-      if (requestId === browseRequestIdRef.current) {
+      if (browseIpcRequestIdRef.current === ipcRequestId) {
+        browseIpcRequestIdRef.current = null;
+      }
+      if (activeRef.current && requestId === browseRequestIdRef.current) {
         setBrowseLoading(false);
         setLoadingMore(false);
       }
@@ -502,6 +555,47 @@ export default function ModelManager({ tools, onToast }) {
     });
   }
   useEffect(() => {
+    activeRef.current = isActive;
+    if (!isActive) {
+      browseRequestIdRef.current += 1;
+      const ipcRequestId = browseIpcRequestIdRef.current;
+      const localIpcRequestId = localIpcRequestIdRef.current;
+      browseIpcRequestIdRef.current = null;
+      localIpcRequestIdRef.current = null;
+      localRequestIdRef.current += 1;
+      if (ipcRequestId) {
+        window.localAIHub.cancelModelBrowse(ipcRequestId).catch(() => null);
+      }
+      if (localIpcRequestId) {
+        window.localAIHub.cancelModelBrowse(localIpcRequestId).catch(() => null);
+      }
+      setBrowseLoading(false);
+      setLoadingMore(false);
+      setLocalLoading(false);
+      return undefined;
+    }
+
+    return () => {
+      activeRef.current = false;
+      browseRequestIdRef.current += 1;
+      const ipcRequestId = browseIpcRequestIdRef.current;
+      const localIpcRequestId = localIpcRequestIdRef.current;
+      browseIpcRequestIdRef.current = null;
+      localIpcRequestIdRef.current = null;
+      localRequestIdRef.current += 1;
+      if (ipcRequestId) {
+        window.localAIHub.cancelModelBrowse(ipcRequestId).catch(() => null);
+      }
+      if (localIpcRequestId) {
+        window.localAIHub.cancelModelBrowse(localIpcRequestId).catch(() => null);
+      }
+    };
+  }, [isActive]);
+
+  useEffect(() => {
+    if (!isActive) {
+      return undefined;
+    }
     loadSettings();
     const unsubscribe = window.localAIHub.onModelDownloadProgress((payload) => {
       setDownloadProgressMap((current) => ({
@@ -519,7 +613,7 @@ export default function ModelManager({ tools, onToast }) {
       }
     });
     return () => unsubscribe();
-  }, []);
+  }, [isActive]);
   useEffect(() => {
     setRemoteCatalogPage(1);
   }, [modelType, search, selectedSource, selectedToolId, sort, taskType]);
@@ -536,6 +630,9 @@ export default function ModelManager({ tools, onToast }) {
     }
   }, [modelTools, selectedToolId]);
   useEffect(() => {
+    if (!isActive) {
+      return;
+    }
     if (!selectedToolId || !selectedTool) {
       browseRequestIdRef.current += 1;
       setRemoteItems([]);
@@ -564,7 +661,7 @@ export default function ModelManager({ tools, onToast }) {
     }
     setPagination(EMPTY_PAGINATION);
     browse({ page: 1, cursor: null });
-  }, [selectedTool, selectedToolId, selectedSource, modelType, sort, taskType]);
+  }, [isActive, selectedTool, selectedToolId, selectedSource, modelType, sort, taskType]);
   async function handleDownload(item) {
     const subject = item?.name || item?.fileName || 'This model';
     const preflightResult = await window.localAIHub.getModelDownloadPreflight({

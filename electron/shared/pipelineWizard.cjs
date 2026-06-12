@@ -7,7 +7,10 @@ const {
   IMAGE_WORKFLOW_TOOL_IDS,
   NODE_TYPE_LIST,
   PIPELINE_OPERATION_IDS,
+  PIPELINE_RECORD_INPUT_CAPABILITY,
   PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
+  RECORD_INPUT_MODE_IDS,
+  RECORD_INPUT_MODE_OPTIONS,
   VIDEO_WORKFLOW_TOOL_IDS,
   analyzePipeline,
   buildContextMaps,
@@ -579,6 +582,60 @@ function inferWizardCollectionValidationIntent(intent = '') {
     wholeCollection: /\b(whole[-\s]?collection|entire collection|collection as a whole|final collection)\b/.test(text),
   };
 }
+
+function inferWizardRecordInputIntent(intent = '') {
+  const text = String(intent || '').toLowerCase();
+  const hasRecordingAction = /\b(record|capture)\b/.test(text) || /\b(screen|webcam|camera|microphone|audio|video) recording\b/.test(text);
+  const hasRegion = /\b(screen )?(region|area|portion|crop)\b|\b(region|area|portion) of (?:my |the )?screen\b/.test(text);
+  const hasWindow = /\b(window capture|record (?:a |the )?window|capture (?:a |the )?window)\b/.test(text);
+  const hasWebcam = /\b(webcam|web cam|camera recording|record (?:my |the )?camera)\b/.test(text);
+  const hasSystemAudio = /\b(system audio|computer audio|desktop audio|screen audio|app audio|application audio|browser audio|audio playing on (?:my |the )?(?:pc|computer))\b/.test(text);
+  const hasMicrophone = /\b(microphone|mic|voiceover|voice over|narration|commentary|record (?:my |the )?voice|record (?:my |the )?speech|with (?:my |the )?voice)\b/.test(text);
+  const hasScreen = hasRegion || hasWindow || /\b(screen recording|record (?:my |the |a )?screen|capture (?:my |the |a )?screen|desktop capture|record (?:my |the )?desktop|full display|display capture)\b/.test(text);
+  const genericAudio = /\b(record|capture)\b[^.]{0,30}\b(audio|sound|voice|speech)\b|\brecord audio\b/.test(text);
+  const requested = hasRecordingAction && (hasRegion || hasWindow || hasWebcam || hasSystemAudio || hasMicrophone || hasScreen || genericAudio || /\brecord video\b/.test(text));
+  if (!requested) {
+    return { requested: false, assumptions: [] };
+  }
+
+  const assumptions = [];
+  let mode = RECORD_INPUT_MODE_IDS.MICROPHONE;
+  if (hasWebcam) {
+    mode = hasMicrophone ? RECORD_INPUT_MODE_IDS.WEBCAM_MICROPHONE : RECORD_INPUT_MODE_IDS.WEBCAM;
+    if (hasSystemAudio) assumptions.push('Webcam plus system audio is not supported, so this draft records the webcam' + (hasMicrophone ? ' and microphone' : '') + ' without system audio.');
+    if (hasScreen) assumptions.push('Screen plus webcam is not supported, so this draft keeps the webcam source and leaves screen capture out.');
+  } else if (hasScreen || /\brecord video\b/.test(text)) {
+    if (hasMicrophone) {
+      mode = RECORD_INPUT_MODE_IDS.SCREEN_MICROPHONE;
+      if (hasSystemAudio) assumptions.push('Screen plus microphone plus system audio is not supported, so this draft records the screen and microphone without system audio.');
+    } else if (hasSystemAudio) {
+      mode = RECORD_INPUT_MODE_IDS.SCREEN_SYSTEM_AUDIO;
+    } else {
+      mode = RECORD_INPUT_MODE_IDS.SCREEN;
+    }
+  } else if (hasSystemAudio && !hasMicrophone) {
+    mode = RECORD_INPUT_MODE_IDS.SYSTEM_AUDIO;
+  } else {
+    mode = RECORD_INPUT_MODE_IDS.MICROPHONE;
+    if (hasSystemAudio) assumptions.push('Microphone plus system audio is not supported, so this draft records the microphone without system audio.');
+  }
+
+  const definition = RECORD_INPUT_MODE_OPTIONS.find((entry) => entry.id === mode) || RECORD_INPUT_MODE_OPTIONS[0];
+  if (hasWindow) assumptions.push('Window capture is not supported, so this draft uses full-screen capture.');
+  if (hasRegion) assumptions.push('A valid screen region needs a display and bounds selected before running, so this draft uses full-screen capture until you choose the region in Record Input settings.');
+  if (definition.needsMicrophone) assumptions.push('Choose the microphone in Record Input settings before running.');
+  if (definition.needsWebcam) assumptions.push('Choose the webcam in Record Input settings before running.');
+  if (definition.needsDisplay) assumptions.push('Choose the display in Record Input settings before running.');
+  if (/\b(hardware encoder|nvenc|quick sync|qsv|amf)\b/.test(text)) assumptions.push('Hardware encoder selection is not available in Record Input, so the recorder keeps its supported default encoder path.');
+
+  return {
+    requested: true,
+    mode: definition.id,
+    outputKind: definition.outputKind,
+    captureTarget: hasRegion ? 'region' : 'desktop',
+    assumptions: [...new Set(assumptions)],
+  };
+}
 function normalizeTone(value) {
   return String(value || '').trim().toLowerCase();
 }
@@ -650,9 +707,14 @@ function inferIntentFeatures(intent) {
   const wantsDeterministicUtility = utilityIntent.wantsTrimMedia || utilityIntent.wantsExtractAudio || utilityIntent.wantsExtractVideoFrame || utilityIntent.wantsExportSubtitles || utilityIntent.wantsAudioStitch || utilityIntent.wantsVideoStitch;
   const heavyCooldown = inferWizardHeavyCooldown(text);
   const collectionValidation = inferWizardCollectionValidationIntent(text);
+  const recordInput = inferWizardRecordInputIntent(text);
   const wantsMediaComposition = /\b(slideshow|slide show|sequence images?|image sequence|media composition|compose media|compose (?:an? )?(?:image )?(?:collection|sequence|slideshow|video)|compose\b[^.]{0,120}\b(images?|photos?|pictures?|image collection)\b[^.]{0,120}\b(video|slideshow|slide show)|turn .*images?.*video|images? .*to .*video|image collection .*into .*slideshow|image collection .*into .*video)\b/.test(text);
   const wantsNarrationSyncedTiming = /\b(sync(?:ed)? to narration|narration[-\s]?sync(?:ed)?|narration[-\s]?synced|match .*transcript timing|match .*narration timing|dynamic .*timing|transcript timing|voiceover timing|timed to (?:the )?(?:narration|transcript))\b/.test(text);
   return {
+    wantsRecordInput: recordInput.requested,
+    recordInput,
+    wantsTranscription: /\b(transcribe|transcription|speech to text|audio to text|make captions?|generate captions?|create captions?)\b/.test(text),
+    wantsFileInput: /\b(file input|input file|document input|uploaded file|document file|source document|uploaded document)\b/.test(text),
     wantsVoiceoverSource: /\b(voice\s*over|voiceover|script|narration|spoken)\b/.test(text),
     wantsImageInput: /\b(image input|input image|source image|image file|uploaded image|photo input)\b/.test(text),
     wantsDescription: /\b(describ\w*|description|caption|analy[sz]\w*|summari[sz]\w*)\b/.test(text),
@@ -678,7 +740,7 @@ function inferIntentFeatures(intent) {
     wantsNarrationSyncedTiming,
     wantsSceneTransitions: /\b(transitions?|crossfade|xfade|fade|dissolve|wipes?|slides?|cinematic transitions?|random transitions?|random wipes?|scene transitions?)\b/.test(text),
     wantsSoundEffects: /\b(sound effects?|sfx|ambience|ambient sounds?|environmental sounds?|spooky sounds?|halloween sounds?|transition sounds?)\b/.test(text),
-    wantsBurnSubtitles: /\b(burn(?:ed)? subtitles?|burn(?:ed)? captions?|hardcoded captions?|hardcoded subtitles?|caption burn|subtitle burn|subtitles? into the video|captions? into the video)\b/.test(text),
+    wantsBurnSubtitles: /\b(burn(?:ed)? subtitles?|burn(?:ed)? captions?|hardcoded captions?|hardcoded subtitles?|caption burn|subtitle burn|subtitles? into the video|captions? into the video|subtitled video|captioned video)\b/.test(text),
     wantsDeterministicUtility,
     wantsTrimMedia: utilityIntent.wantsTrimMedia,
     trimMediaKind: utilityIntent.trimMediaKind,
@@ -932,6 +994,7 @@ function buildPipelineWizardContext({ hardware = {}, manifests = [], providers =
     availableTools,
     assetLibraries: cloneValue(wizardAssetLibraries),
     toolOperationSupport,
+    recordInputCapability: cloneValue(PIPELINE_RECORD_INPUT_CAPABILITY),
     maturePlanningSchemas: getPlanningSchemaOptions().map((schema) => ({ id: schema.id, label: schema.label, family: schema.familyLabel })),
     nodeTypes: NODE_TYPE_LIST
       .map((definition) => definition ? {
@@ -1031,6 +1094,9 @@ function getWizardCompactRelevantNodeTypes(intent = '') {
     'llmPrompt', 'collectionMap',
   ]);
   const add = (...types) => types.forEach((type) => nodeTypes.add(type));
+  if (features.wantsRecordInput) {
+    add('recordInput');
+  }
   if (features.wantsPlanning || obligations.wantsPlanning || obligations.wantsPromptCollection) {
     add('planningPacket', 'planner', 'planScenes', 'planOutput');
   }
@@ -1065,7 +1131,7 @@ function filterWizardContextForIntent(context = {}, intent = '') {
     ...context,
     nodeTypes: (context.nodeTypes || []).filter((node) => relevantNodeTypes.has(node.type)),
     connectedProviders: (context.connectedProviders || []).filter((provider) => selectedProviderIds.has(normalizeId(provider.id))),
-    availableTools: (context.availableTools || []).filter((tool) => ['automatic1111', 'comfyui', 'ollama', 'audiocraft', 'chatterboxTurbo', 'chatterbox-turbo', 'wan', 'wan21', 'upscayl', 'facefusion'].includes(normalizeId(tool.id))),
+    availableTools: (context.availableTools || []).filter((tool) => ['automatic1111', 'comfyui', 'ollama', 'whisper', 'audiocraft', 'chatterboxTurbo', 'chatterbox-turbo', 'wan', 'wan21', 'upscayl', 'facefusion'].includes(normalizeId(tool.id))),
     assetLibraries: wantsAssetLibraries ? compactWizardAssetLibraries(context.assetLibraries) : {},
     maturePlanningSchemas: features.wantsPlanning ? (context.maturePlanningSchemas || []) : [],
   };
@@ -1149,6 +1215,16 @@ function buildPipelineWizardIntentIrJsonSchema() {
                 name: { type: 'string' },
                 modality: { type: 'string', enum: WIZARD_INTENT_SOURCE_MODALITIES },
                 role: { type: 'string' },
+                recordInput: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['mode', 'outputKind'],
+                  properties: {
+                    mode: { type: 'string', enum: RECORD_INPUT_MODE_OPTIONS.map((entry) => entry.id) },
+                    outputKind: { type: 'string', enum: ['audio', 'video'] },
+                    captureTarget: { type: 'string', enum: ['desktop', 'region'] },
+                  },
+                },
               },
             },
           },
@@ -1304,6 +1380,7 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         'Never copy the authoring request into runtime node defaults, labels, titles, rules, workflow text, or instructions.',
         'Leave runtime source content empty unless actual source content was supplied.',
         'Preserve requested modality, validation, retry, planning, collection, generation, transformation, composition, utility, and export intent.',
+        'When the user asks to record a source, use an audio or video source with recordInput {mode,outputKind,captureTarget}. Choose only a supported Record Input mode and do not invent device ids, display ids, or region coordinates.',
         'Use optional stage controls only when needed: operationSubtype, providerPreference, mappingMode, referenceAudio, previousLastFrameChaining, mediaComposition, burnSubtitles, normalizeMedia, collectionValidation.',
         'Cloud image providers are OpenAI, Google, and xAI. Cloud video providers are Google and xAI only; do not claim OpenAI/Sora video support.',
         'Use referenceVoiceTts with a referenceAudio source for Chatterbox-Turbo reference voice requests.',
@@ -1321,6 +1398,7 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         'Keep authoring-time requests separate from runtime pipeline content: do not copy the user request into runtime node defaults, input content, Planning Packet fields, validation rules, labels, output titles, workflow text, or runtime instructions.',
         'For runtime source nodes, leave content empty unless the user supplied actual source content rather than a request to build a pipeline.',
         'For complex requests, decompose into intentIr stages for transcription, planning, plan_scenes, validation, retry, generate_image, generate_audio, transform_audio, generate_video, transform_image, normalize_media, trim_media, extract_audio, extract_video_frame, export_subtitles, stitch_audio, stitch_video, compose_media, export, and outputs when requested.',
+        'For recorded sources, add recordInput to the source with a supported mode and matching audio/video outputKind. Runtime settings handle microphone, webcam, display, and region selection.',
         'Return JSON only. The JSON must be an object with: title, summary, intentIr, recipeId, gaps, userRefinementNotes. draftGraph is legacy fallback only.',
         'intentIr shape: {sources:[{name,modality,role}], artifacts:[{name,kind}], stages:[{id,kind,input,output,inputs,outputs,purpose,operationSubtype,providerPreference,mappingMode,referenceAudio,previousLastFrameChaining,mediaComposition,burnSubtitles,normalizeMedia,trimMedia,extractVideoFrame,exportSubtitles,mediaStitch,collectionValidation,validationMode,retryTarget,maxAttempts}], outputs:[{artifact,kind,title}], gaps, assumptions}.',
         'Cloud image generation is limited to OpenAI, Google, and xAI. Cloud video generation is limited to Google and xAI; never plan OpenAI/Sora video.',
@@ -1364,6 +1442,7 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         intentIrContract: {
           stageGuidance: {
             audioVoiceoverToVideo: ['audio source', 'transcribe_audio', 'plan', 'plan_scenes', 'validate', 'retry', 'generate_image', 'compose_media', 'export', 'video output'],
+            recordInput: 'Use source.recordInput with mode microphone/systemAudio for audio or screen/screenMic/webcam/webcamMic/screenSystemAudio for video. Match outputKind to the mode. Never invent device ids, display ids, or region coordinates.',
             collectionImageGeneration: 'Use generate_image with collection:text input; Local AI Hub compiles that to collectionMap. Use mappingMode cloudImageToImage for collection:image to collection:image cloud edits.',
             cloudImageProviders: 'Cloud image generation providers: openai, google, xai only.',
             cloudVideoProviders: 'Cloud video generation providers: google, xai only. Do not use OpenAI/Sora video.',
@@ -1514,6 +1593,20 @@ function normalizeIntentKind(value, fallback = 'text') {
   return fallback;
 }
 
+function normalizeWizardRecordInputSource(value, modality = '') {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!source) return null;
+  const mode = RECORD_INPUT_MODE_OPTIONS.find((entry) => entry.id === String(source.mode || '').trim()) || null;
+  if (!mode) return null;
+  const normalizedModality = normalizeIntentKind(modality, mode.outputKind);
+  if (normalizedModality !== mode.outputKind) return null;
+  return {
+    mode: mode.id,
+    outputKind: mode.outputKind,
+    captureTarget: String(source.captureTarget || '').trim() === 'region' ? 'region' : 'desktop',
+  };
+}
+
 function normalizeIntentStageKind(value) {
   const normalized = normalizeId(value).replace(/-/g, '_');
   if (['plan', 'planning', 'planner', 'scene_plan', 'storyboard'].includes(normalized)) return 'plan';
@@ -1556,10 +1649,13 @@ function normalizeWizardIntentIr(value, options = {}) {
     const name = normalizeArtifactRef(source?.name || source?.id || source?.role, 'source-' + String(index + 1));
     if (!name || seenSources.has(name)) return null;
     seenSources.add(name);
+    const modality = normalizeIntentKind(source?.modality || source?.type || source?.kind, 'text');
+    const recordInput = normalizeWizardRecordInputSource(source?.recordInput || source?.recording, modality);
     return {
       name,
-      modality: normalizeIntentKind(source?.modality || source?.type || source?.kind, 'text'),
+      modality,
       role: trimPreviewText(normalizeString(source?.role || source?.label || source?.description, name), 80),
+      ...(recordInput ? { recordInput } : {}),
     };
   }).filter((source) => source && WIZARD_INTENT_SOURCE_MODALITIES.includes(source.modality));
   const seenArtifacts = new Set();
@@ -1694,6 +1790,7 @@ function intentHasPattern(text, patterns = []) {
 
 function buildWizardSourceObligation(intent, features) {
   const text = String(intent || '');
+
   if (features.wantsTrimMedia) {
     const mediaKind = features.trimMediaKind === 'audio' ? 'audio' : 'video';
     return { name: 'source' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1), modality: mediaKind, role: 'Source ' + mediaKind, explicit: true };
@@ -1802,6 +1899,19 @@ function isVideoSourceAnalysisRequest(intent) {
 
 function buildWizardSourceObligation(intent, features) {
   const text = String(intent || '');
+  if (features.recordInput?.requested) {
+    return {
+      name: 'recorded' + features.recordInput.outputKind.charAt(0).toUpperCase() + features.recordInput.outputKind.slice(1),
+      modality: features.recordInput.outputKind,
+      role: features.recordInput.outputKind === 'audio' ? 'Recorded audio' : 'Recorded video',
+      explicit: true,
+      recordInput: {
+        mode: features.recordInput.mode,
+        outputKind: features.recordInput.outputKind,
+        captureTarget: features.recordInput.captureTarget || 'desktop',
+      },
+    };
+  }
   if (features.wantsTrimMedia) {
     const mediaKind = features.trimMediaKind === 'audio' ? 'audio' : 'video';
     return { name: 'source' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1), modality: mediaKind, role: 'Source ' + mediaKind, explicit: true };
@@ -1872,12 +1982,16 @@ function buildWizardOutputObligations(intent, features) {
   };
   const wantsScenePrompts = intentHasPattern(text, [/\b(scene prompts?|per[-\s]?scene prompts?|prompt collection|ordered collection|collection of prompts?)\b/])
     || (features.wantsPlanning && features.wantsPromptGeneration);
-  const wantsExplicitTextOutput = intentHasPattern(text, [
+  const wantsExplicitTextOutput = (features.wantsTranscription && !features.wantsBurnSubtitles) || intentHasPattern(text, [
     /\b(text output|output text|text result|approved text|approved description|approved transcript|transcript text)\b/,
     /\b(send|route|deliver|return|output)\b[^.]{0,100}\b(description|summary|transcript|text)\b/,
     /\b(send|route|deliver|return|output)\b[^.]{0,80}\b(description|summary|transcript|text)\b[^.]{0,40}\b(text output|text result|output)\b/,
     /\b(description|caption|summary|transcript)\b[^.]{0,40}\bto\b[^.]{0,30}\btext output\b/,
   ]);
+  if (features.recordInput?.requested && !features.wantsTranscription && !features.wantsMediaComposition && !features.wantsBurnSubtitles && !features.wantsNormalizeMedia && !features.wantsTrimMedia && !features.wantsExtractAudio && !features.wantsExtractVideoFrame) {
+    const outputKind = features.recordInput.outputKind;
+    add('recording', outputKind, outputKind === 'audio' ? 'Recorded audio' : 'Recorded video', true);
+  }
   if (features.wantsTrimMedia && !wantsExplicitTextOutput && !features.wantsNormalizeMedia && !features.wantsExtractAudio && !features.wantsExtractVideoFrame) {
     const mediaKind = features.trimMediaKind === 'audio' ? 'audio' : 'video';
     add('trimmed' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1), mediaKind, 'Trimmed ' + mediaKind, true);
@@ -2020,6 +2134,7 @@ function buildWizardValidationTargets(intent, features) {
     }
   };
 
+  if (features.recordInput?.requested && features.wantsValidation) add('source');
   if (intentHasPattern(text, [/\bvalidat\w*[^.]{0,60}\bplan\b/, /\bplan\b[^.]{0,60}\bvalidat\w*/])) add('plan');
   if (intentHasPattern(text, [/\bvalidat\w*[^.]{0,60}\b(prompt|scene prompts?|prompt collection)\b/, /\b(prompt|scene prompts?|prompt collection)\b[^.]{0,60}\bvalidat\w*/])) add('plan_scenes');
   if (features.wantsPromptGeneration && intentHasPattern(text, [/\b(validat\w*|review|check)\b[^.]{0,80}\b(each|each one|them|prompts?)\b/, /\bprompts?\b[^.]{0,80}\b(validat\w*|review|check)\b/])) add('plan_scenes');
@@ -2055,7 +2170,8 @@ function extractWizardRequestObligations(intent = '') {
   const wantsComposition = !wantsVideoGeneration && (features.wantsMediaComposition || features.wantsNarrationSyncedTiming || features.wantsSoundEffects || ((wantsVideoOutput && wantsImageGeneration)
     || intentHasPattern(normalizedIntent, [/\b(sequence|sequenc\w+|compose|composition|slideshow|timeline)\b/])));
   const wantsExport = !features.wantsExportSubtitles && !features.wantsBurnSubtitles && !wantsVideoGeneration && features.wantsVideo && source.modality !== 'video' && !isVideoSourceAnalysisRequest(normalizedIntent);
-  const transformKind = (source.modality === 'audio' || (source.modality === 'video' && features.wantsExtractAudio)) && (wantsTextLikeOutput || features.wantsPlanning || intentHasPattern(normalizedIntent, [/\btranscrib\w*|speech to text|audio to text\b/]))
+  const wantsExtractAudio = Boolean(features.wantsExtractAudio || (source.recordInput && source.modality === 'video' && features.wantsTranscription));
+  const transformKind = (source.modality === 'audio' || (source.modality === 'video' && wantsExtractAudio)) && (wantsTextLikeOutput || features.wantsPlanning || features.wantsTranscription || intentHasPattern(normalizedIntent, [/\btranscrib\w*|speech to text|audio to text\b/]))
     ? 'transcribe_audio'
     : source.modality !== 'text' && (features.wantsDescription || wantsTextLikeOutput) && !features.wantsPlanning && !features.wantsBurnSubtitles && !wantsImageGeneration && !wantsVideoGeneration && !wantsAudioGeneration
       ? 'llm_generate_text'
@@ -2069,12 +2185,12 @@ function extractWizardRequestObligations(intent = '') {
     wantsPromptCollection,
     wantsTextCollectionSource,
     wantsValidation: Boolean(features.wantsValidation),
-    wantsRetry: Boolean(features.wantsRetry),
+    wantsRetry: Boolean(features.wantsRetry || (source.recordInput && features.wantsValidation)),
     wantsImageGeneration,
     wantsTrimMedia: Boolean(features.wantsTrimMedia),
     trimMediaKind: features.trimMediaKind === 'audio' ? 'audio' : 'video',
     trimMediaOptions: normalizeWizardTrimMediaOptions(features.trimMediaOptions || {}),
-    wantsExtractAudio: Boolean(features.wantsExtractAudio),
+    wantsExtractAudio,
     wantsExtractVideoFrame: Boolean(features.wantsExtractVideoFrame),
     extractVideoFrameOptions: normalizeWizardExtractVideoFrameOptions(features.extractVideoFrameOptions || {}),
     wantsExportSubtitles: Boolean(features.wantsExportSubtitles),
@@ -2083,6 +2199,7 @@ function extractWizardRequestObligations(intent = '') {
     wantsVideoStitch: Boolean(features.wantsVideoStitch),
     mediaStitchOptions: normalizeWizardMediaStitchOptions(features.mediaStitchOptions || {}),
     utilityAssumptions: [
+      ...(features.recordInput?.assumptions || []),
       features.trimMediaOptions?.assumedTiming && !/\b(to|first|last|from|until|through)\b[^.]{0,40}\b\d/i.test(normalizedIntent) ? 'Trim Media uses a conservative 5 second duration because the request did not specify a complete time range.' : '',
       features.wantsAudioGeneration && source.modality === 'audio' && wantsTextLikeOutput ? 'The request mentions text-to-speech, but it starts from audio and asks for text output, so the wizard drafts transcription and leaves speech generation out.' : '',
       features.extractVideoFrameOptions?.assumedFrame ? 'Extract Video Frame defaults to the first frame because the request did not specify a timestamp or first/last frame.' : '',
@@ -2098,7 +2215,7 @@ function extractWizardRequestObligations(intent = '') {
     wantsImageTransform,
     wantsComposition,
     wantsBurnSubtitles: Boolean(features.wantsBurnSubtitles),
-    collectionValidationOptions: buildWizardPerItemValidationOptions(features, features.wantsRetry),
+    collectionValidationOptions: buildWizardPerItemValidationOptions(features, features.wantsRetry || (source.recordInput && features.wantsValidation)),
     wantsHeavyStepCooldown: Boolean(features.wantsHeavyStepCooldown),
     heavyStepCooldownSeconds: features.heavyStepCooldownSeconds || 30,
     mediaCompositionOptions: buildWizardMediaCompositionOptions(normalizedIntent, features),
@@ -2109,7 +2226,8 @@ function extractWizardRequestObligations(intent = '') {
     extraSources: [
       ...(features.wantsFaceFusionTransform ? [{ name: 'referenceFaceImage', modality: 'image', role: 'Reference face image', explicit: true }] : []),
       ...(features.wantsReferenceVoiceTts ? [{ name: 'referenceVoiceAudio', modality: 'audio', role: 'Reference voice audio', explicit: true }] : []),
-      ...(features.wantsBurnSubtitles ? [{ name: 'captionText', modality: 'text', role: 'Caption text', explicit: true }] : []),
+      ...(features.wantsBurnSubtitles && !features.wantsTranscription ? [{ name: 'captionText', modality: 'text', role: 'Caption text', explicit: true }] : []),
+      ...(wantsComposition && source.recordInput && source.modality === 'audio' ? [{ name: 'sourceImages', modality: 'collection:image', role: 'Slideshow images', explicit: true }] : []),
       ...(wantsComposition && features.wantsVoiceoverSource && source.modality !== 'audio' ? [{ name: 'narrationAudio', modality: 'audio', role: 'Narration audio', explicit: true }] : []),
       ...(wantsComposition && /\b(background music|music bed|music track)\b/i.test(normalizedIntent) ? [{ name: 'backgroundMusic', modality: 'audio', role: 'Background music', explicit: true }] : []),
     ],
@@ -2164,6 +2282,7 @@ function buildRequiredObligationStageKinds(obligations = {}) {
     addValidationPair(target);
   };
 
+  addValidationPair('source');
   if (obligations.wantsTrimMedia) add('trim_media');
   if (obligations.wantsExtractAudio) add('extract_audio');
   if (obligations.wantsExtractVideoFrame) add('extract_video_frame');
@@ -2205,6 +2324,9 @@ function doesIntentIrCoverObligations(intentIr, obligations) {
   const normalizedIr = normalizeWizardIntentIr(intentIr);
   if (obligations.source?.explicit && !normalizedIr.sources.some((source) => source.modality === obligations.source.modality)) {
     reasons.push('source:' + obligations.source.modality);
+  }
+  if (obligations.source?.recordInput && !normalizedIr.sources.some((source) => source.modality === obligations.source.modality && source.recordInput?.mode === obligations.source.recordInput.mode)) {
+    reasons.push('source:recordInput:' + obligations.source.recordInput.mode);
   }
   for (const extraSource of obligations.extraSources || []) {
     if (extraSource?.modality && !normalizedIr.sources.some((source) => source.name === extraSource.name || (source.modality === extraSource.modality && source.role === extraSource.role))) {
@@ -2259,6 +2381,7 @@ function applySimpleObligationRepairs(intentIr, obligations, options = {}) {
       name: normalizeArtifactRef(obligations.source.name, 'runtimeSource'),
       modality: obligations.source.modality,
       role: trimPreviewText(normalizeString(obligations.source.role || obligations.source.name), 80),
+      ...(obligations.source.recordInput ? { recordInput: cloneValue(obligations.source.recordInput) } : {}),
     });
   }
   for (const extraSource of obligations.extraSources || []) {
@@ -2494,6 +2617,9 @@ function getWizardStagePurpose(kind, obligations) {
   return '';
 }
 function getWizardValidationPurpose(targetKind, artifactKind) {
+  if (targetKind === 'source') {
+    return 'Review the fresh recording and pass it only when it is ready for the next stage.';
+  }
   if (targetKind === 'plan') {
     return 'Pass only if the plan is ordered, specific, and ready for downstream scene derivation.';
   }
@@ -2536,6 +2662,7 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
   let fileArtifactName = '';
   let sourceArtifactName = '';
   let referenceImageArtifactName = '';
+  let visualSourceArtifactName = '';
 
   const takeBorrowedStage = (kind) => {
     const list = borrowedStages.get(kind) || [];
@@ -2547,6 +2674,7 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
       name: normalizeArtifactRef(entry?.name || 'runtimeSource', 'runtimeSource'),
       modality: normalizeIntentKind(entry?.modality, 'text'),
       role: trimPreviewText(normalizeString(entry?.role || entry?.name || 'Runtime source'), 80),
+      ...(normalizeWizardRecordInputSource(entry?.recordInput, entry?.modality) ? { recordInput: normalizeWizardRecordInputSource(entry.recordInput, entry.modality) } : {}),
     };
     if (!sources.some((source) => source.name === sourceEntry.name)) {
       sources.push(sourceEntry);
@@ -2586,15 +2714,22 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
     });
   };
 
-  const source = addSource(normalizedIr.sources[0] || obligations.source || { name: 'runtimeSource', modality: 'text', role: 'Runtime source' });
+  const source = addSource(obligations.source?.recordInput ? obligations.source : normalizedIr.sources[0] || obligations.source || { name: 'runtimeSource', modality: 'text', role: 'Runtime source' });
   addArtifact(source.name, source.modality, source.role);
   sourceArtifactName = source.name;
   currentArtifact = { name: source.name, kind: source.modality };
+  if (source.modality === 'audio') audioArtifactName = source.name;
+  if (source.modality === 'video') videoArtifactName = source.name;
+  if (source.modality === 'image') imageArtifactName = source.name;
+  if (source.modality === 'text') textArtifactName = source.name;
   for (const extraSource of obligations.extraSources || []) {
     const addedExtraSource = addSource(extraSource);
     addArtifact(addedExtraSource.name, addedExtraSource.modality, addedExtraSource.role);
     if (addedExtraSource.modality === 'image' && !referenceImageArtifactName) {
       referenceImageArtifactName = addedExtraSource.name;
+    }
+    if (addedExtraSource.modality === 'collection:image' && !visualSourceArtifactName) {
+      visualSourceArtifactName = addedExtraSource.name;
     }
   }
   const collectionSourceInputNames = [];
@@ -2687,6 +2822,10 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
       });
     }
   };
+
+  if (remainingValidationTargets.has('source') && !bridgeBroken && currentArtifact) {
+    addValidationPair('source', null, 'reviewedRecording', 'approvedRecording');
+  }
 
   if (obligations.wantsTrimMedia && !bridgeBroken) {
     const mediaKind = currentArtifact?.kind === 'audio' || obligations.trimMediaKind === 'audio' ? 'audio' : 'video';
@@ -2915,6 +3054,8 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
   }
   if (obligations.wantsComposition && !bridgeBroken) {
     const compositionStage = addStage('compose_media', 'compose-media', 'mediaComposition', {
+      inputName: visualSourceArtifactName || currentArtifact?.name,
+      inputKind: visualSourceArtifactName ? 'collection:image' : currentArtifact?.kind,
       inputNames: [source.modality === 'audio' ? sourceArtifactName : '', 'narrationAudio', 'backgroundMusic'].filter(Boolean),
       mediaComposition: obligations.mediaCompositionOptions || {},
       purpose: getWizardStagePurpose('compose_media', obligations),
@@ -4030,6 +4171,20 @@ function sourceNodeConfigForKind(kind) {
   return kind === 'text' ? { text: '' } : {};
 }
 
+function buildWizardRecordInputConfig(recordInput) {
+  const normalized = normalizeWizardRecordInputSource(recordInput, recordInput?.outputKind);
+  if (!normalized) return null;
+  return {
+    mode: normalized.mode,
+    outputKind: normalized.outputKind,
+    fps: normalized.outputKind === 'video' ? 15 : undefined,
+    captureTarget: { type: 'desktop' },
+    microphoneId: '',
+    webcamId: '',
+    displayId: '',
+  };
+}
+
 function getWizardAssetLibraryEntries(context = {}, type = '') {
   const entries = context?.assetLibraries?.[type];
   return Array.isArray(entries) ? entries : [];
@@ -4340,8 +4495,11 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
     registerArtifact(artifactMap, artifact.name, { kind: artifact.kind || 'text', node: null, portId: '', label: artifact.role || artifact.name });
   }
   for (const source of intentIr.sources || []) {
-    const nodeType = sourceNodeTypeForKind(source.modality);
-    const node = makeNode(nodeType, nodes.length, sourceNodeConfigForKind(source.modality), sanitizeRuntimeLabel(source.role || source.name, intent, getNodeTypeDefinition(nodeType)?.label));
+    const obligationRecordInput = plan?.requestObligations?.source?.name === source.name ? plan.requestObligations.source.recordInput : null;
+    const recordInput = normalizeWizardRecordInputSource(source.recordInput || obligationRecordInput, source.modality);
+    const nodeType = recordInput ? 'recordInput' : sourceNodeTypeForKind(source.modality);
+    const nodeConfig = recordInput ? buildWizardRecordInputConfig(recordInput) : sourceNodeConfigForKind(source.modality);
+    const node = makeNode(nodeType, nodes.length, nodeConfig, sanitizeRuntimeLabel(source.role || source.name, intent, getNodeTypeDefinition(nodeType)?.label));
     nodes.push(node);
     lastArtifact = registerArtifact(artifactMap, source.name, { kind: source.modality, node, portId: sourcePortForKind(source.modality), label: source.role || source.name });
   }

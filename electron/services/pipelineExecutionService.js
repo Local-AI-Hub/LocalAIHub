@@ -87,6 +87,7 @@ const {
 } = require('./mediaUtilityService');
 const { runCommand } = require('./commandService');
 const { createPipelineToolOrchestrator } = require('./pipelineToolOrchestrationService');
+const { isPathInside } = require('./pathSafetyService');
 const { doesProviderOperationRequireExplicitModel, getProviderModelCapabilities, getProviderPipelineOperation, getToolPipelineOperation } = require('../shared/pipelineCapabilities.cjs');
 const {
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
@@ -111,6 +112,8 @@ const {
   PORT_KIND_TEXT,
   PORT_KIND_VIDEO,
   analyzePipeline,
+  buildRecordInputBackendRequest,
+  buildRecordInputRetryOverrideConfig,
   buildPipelineGraph,
   buildContextMaps,
   createUniqueId,
@@ -126,6 +129,10 @@ const {
   normalizeImageTransformSubtype,
   normalizePipelineRunSettings,
   getNodeTypeDefinition,
+  getRecordInputFormatLabel,
+  getRecordInputModeDefinition,
+  getRecordInputModeLabel,
+  getRecordInputOutputKind,
   getPortDefinition,
   trimPreviewText,
   selectLocalImageBackend,
@@ -142,6 +149,8 @@ let pipelineEventSink = null;
 let activeRun = null;
 let activeRunAbortController = null;
 let pendingValidationControl = null;
+let pendingRecordInputControl = null;
+let pipelineRecordingController = null;
 
 const PLANNER_PROVIDER_TIMEOUT_MS = 60000;
 const LONGFORM_CHUNKED_PLANNER_THRESHOLD_SECONDS = 60;
@@ -908,6 +917,7 @@ function createRunRecord(analysis, graph, runDirectories) {
     loopStates: createLoopStateRecords(graph),
     message: 'Local AI Hub is running the pipeline step by step and will launch local tools only when needed.',
     nodeStates: createInitialNodeStates(graph),
+    pendingRecordInput: null,
     pendingValidation: null,
     runSettings: normalizePipelineRunSettings(analysis.pipeline?.runSettings),
     cooldown: null,
@@ -6686,10 +6696,100 @@ function applyBurnSubtitlesRetryOverride(run, pendingValidation, payload) {
   return overrideConfig;
 }
 
+function getRecordInputEffectiveConfig(node, run) {
+  const retryOverride = run?.retryOverridesByNodeId?.[node.id]?.recordInput || null;
+  return {
+    ...(node?.config || {}),
+    ...(retryOverride || {}),
+    mode: node?.config?.mode,
+  };
+}
+
+function findRecordInputRetryTargetForValidation(graph, validationNode, run, artifact) {
+  const traceNodeId = String(artifact?.nodeId || artifact?.recording?.nodeId || '').trim();
+  if (traceNodeId) {
+    const traceNode = graph.nodeMap.get(traceNodeId) || null;
+    if (traceNode?.type === 'recordInput') {
+      return traceNode;
+    }
+  }
+
+  const directInput = getNodeInputArtifacts(validationNode.id, 'input', graph, run.resultsByNodeId, run)[0] || null;
+  const directSourceNode = directInput?.edge?.source?.nodeId ? graph.nodeMap.get(directInput.edge.source.nodeId) : null;
+  if (directSourceNode?.type === 'recordInput') {
+    return directSourceNode;
+  }
+
+  const artifactPath = String(artifact?.filePath || artifact?.destinationPath || '').trim();
+  for (const [nodeId, result] of Object.entries(run.resultsByNodeId || {})) {
+    const candidateNode = graph.nodeMap.get(nodeId) || null;
+    if (candidateNode?.type !== 'recordInput') {
+      continue;
+    }
+    const candidateArtifact = Object.values(result?.outputs || {}).find((entry) => {
+      const candidatePath = String(entry?.filePath || entry?.destinationPath || '').trim();
+      return entry && (!artifactPath || candidatePath === artifactPath);
+    });
+    if (candidateArtifact) {
+      return candidateNode;
+    }
+  }
+  return null;
+}
+
+function buildRecordInputRetryControls(graph, validationNode, run, artifact) {
+  const targetNode = findRecordInputRetryTargetForValidation(graph, validationNode, run, artifact);
+  if (!targetNode) {
+    return null;
+  }
+  const effectiveConfig = getRecordInputEffectiveConfig(targetNode, run);
+  const mode = getRecordInputModeDefinition(effectiveConfig.mode);
+  if (!mode) {
+    return null;
+  }
+  return {
+    recordInput: {
+      adjustable: {
+        captureTarget: mode.needsScreen === true,
+        display: mode.needsDisplay === true || mode.needsScreen === true,
+        fps: mode.outputKind === PORT_KIND_VIDEO,
+        microphone: mode.needsMicrophone === true,
+        webcam: mode.needsWebcam === true,
+      },
+      formatLabel: getRecordInputFormatLabel(effectiveConfig),
+      mode: mode.id,
+      modeLabel: getRecordInputModeLabel(effectiveConfig),
+      nodeId: targetNode.id,
+      nodeLabel: targetNode.label || 'Record Input',
+      outputKind: mode.outputKind,
+      settings: serializeArtifactForUi(effectiveConfig),
+      temporary: true,
+    },
+  };
+}
+
+function applyRecordInputRetryOverride(run, pendingValidation, payload) {
+  const control = pendingValidation?.retryControls?.recordInput || null;
+  const value = payload?.retryOverrides?.recordInput;
+  if (!control?.nodeId || !value || typeof value !== 'object') {
+    return null;
+  }
+  const overrideConfig = buildRecordInputRetryOverrideConfig(control.settings, value);
+  if (!run.retryOverridesByNodeId || typeof run.retryOverridesByNodeId !== 'object') {
+    run.retryOverridesByNodeId = {};
+  }
+  run.retryOverridesByNodeId[control.nodeId] = {
+    ...(run.retryOverridesByNodeId[control.nodeId] || {}),
+    recordInput: overrideConfig,
+  };
+  return overrideConfig;
+}
+
 function buildValidationRetryControls(graph, validationNode, run, artifact) {
   const controls = {
     ...(buildMediaCompositionRetryControls(graph, validationNode, run, artifact) || {}),
     ...(buildBurnSubtitlesRetryControls(graph, validationNode, run, artifact) || {}),
+    ...(buildRecordInputRetryControls(graph, validationNode, run, artifact) || {}),
   };
   return Object.keys(controls).length ? controls : null;
 }
@@ -6697,10 +6797,271 @@ function buildValidationRetryControls(graph, validationNode, run, artifact) {
 function applyValidationRetryOverrides(run, pendingValidation, payload) {
   const mediaComposition = applyMediaCompositionRetryOverride(run, pendingValidation, payload);
   const burnSubtitles = applyBurnSubtitlesRetryOverride(run, pendingValidation, payload);
+  const recordInput = applyRecordInputRetryOverride(run, pendingValidation, payload);
   return {
     ...(mediaComposition ? { mediaComposition } : {}),
     ...(burnSubtitles ? { burnSubtitles } : {}),
+    ...(recordInput ? { recordInput } : {}),
   };
+}
+
+function setPipelineRecordingController(controller) {
+  pipelineRecordingController = controller && typeof controller === 'object' ? controller : null;
+}
+
+function serializePendingRecording(recording) {
+  if (!recording || typeof recording !== 'object') {
+    return null;
+  }
+  return {
+    backend: String(recording.backend || '').trim(),
+    fileName: String(recording.fileName || '').trim(),
+    id: String(recording.id || '').trim(),
+    mode: String(recording.mode || '').trim(),
+    startedAt: recording.startedAt || null,
+    status: String(recording.status || '').trim(),
+  };
+}
+
+function getPendingRecordInputOrThrow(runId, payload = {}) {
+  if (!activeRun || activeRun.status !== 'paused' || !activeRun.pendingRecordInput || !pendingRecordInputControl) {
+    throw new Error('There is no paused Record Input step waiting right now.');
+  }
+  if (runId && activeRun.runId !== runId) {
+    throw new Error('Local AI Hub could not find that paused pipeline run.');
+  }
+
+  const pending = activeRun.pendingRecordInput;
+  const requestId = String(payload.requestId || '').trim();
+  const nodeId = String(payload.nodeId || '').trim();
+  if ((requestId && requestId !== pending.requestId) || (nodeId && nodeId !== pending.nodeId)) {
+    throw new Error('Local AI Hub could not find that paused Record Input step anymore.');
+  }
+  return pending;
+}
+
+function resolvePendingRecordInput(outcome) {
+  if (!pendingRecordInputControl?.resolve) {
+    return;
+  }
+  const resolve = pendingRecordInputControl.resolve;
+  pendingRecordInputControl = null;
+  resolve(outcome);
+}
+
+async function waitForRecordInput(run, node) {
+  if (pendingRecordInputControl || pendingValidationControl) {
+    throw new Error('Local AI Hub is already waiting on another interactive pipeline step.');
+  }
+  if (!pipelineRecordingController?.start || !pipelineRecordingController?.stop || !pipelineRecordingController?.cancel) {
+    throw new Error('The local recording backend is unavailable for this pipeline run.');
+  }
+
+  const nodeState = run.nodeStates[node.id];
+  const effectiveConfig = getRecordInputEffectiveConfig(node, run);
+  const outputKind = getRecordInputOutputKind(effectiveConfig);
+  const pendingRecordInput = {
+    backendRequest: buildRecordInputBackendRequest(effectiveConfig),
+    formatLabel: getRecordInputFormatLabel(effectiveConfig),
+    modeLabel: getRecordInputModeLabel(effectiveConfig),
+    nodeId: node.id,
+    nodeLabel: node.label,
+    outputKind,
+    recording: null,
+    requestId: createUniqueId('record-input'),
+    requestedAt: new Date().toISOString(),
+    retrySettingsApplied: Boolean(run?.retryOverridesByNodeId?.[node.id]?.recordInput),
+    startedAt: null,
+    status: 'waiting',
+  };
+
+  const outcome = await new Promise((resolve) => {
+    pendingRecordInputControl = {
+      nodeId: node.id,
+      requestId: pendingRecordInput.requestId,
+      resolve,
+      runId: run.runId,
+    };
+    run.pendingRecordInput = pendingRecordInput;
+    run.status = 'paused';
+    run.message = `Paused at ${node.label}. Start recording when you are ready.`;
+    nodeState.status = 'paused';
+    nodeState.message = 'Waiting for you to explicitly start recording.';
+    emitPipelineEvent();
+  });
+
+  run.pendingRecordInput = null;
+  if (outcome?.action === 'cancel') {
+    throw new PipelineCancelledError('Pipeline run cancelled during Record Input.');
+  }
+  if (outcome?.action !== 'complete' || !outcome.artifact) {
+    throw new Error(outcome?.message || 'Record Input ended without a usable recording.');
+  }
+
+  run.status = 'running';
+  run.message = `Continuing after ${node.label}.`;
+  nodeState.status = 'running';
+  nodeState.message = 'Recording finalized. Continuing the run.';
+  emitPipelineEvent();
+  return {
+    message: 'Recorded ' + getRecordInputModeLabel(effectiveConfig).toLowerCase() + ' and prepared the ' + outputKind + ' artifact.',
+    outputs: {
+      [outputKind]: outcome.artifact,
+    },
+    preview: summarizeArtifact(outcome.artifact),
+  };
+}
+
+async function startPipelineRecordInput(runId, payload = {}) {
+  const pending = getPendingRecordInputOrThrow(runId, payload);
+  if (pending.status !== 'waiting') {
+    throw new Error(pending.status === 'recording' || pending.status === 'finalizing'
+      ? 'This Record Input recording has already started.'
+      : 'This Record Input step is not ready to start.');
+  }
+
+  pending.status = 'starting';
+  activeRun.message = `Starting ${pending.nodeLabel}...`;
+  activeRun.nodeStates[pending.nodeId].message = 'Starting the local recording backend.';
+  emitPipelineEvent();
+
+  try {
+    const recording = await pipelineRecordingController.start({
+      config: pending.backendRequest,
+      nodeId: pending.nodeId,
+      runId: activeRun.runId,
+    });
+    if (activeRun?.pendingRecordInput?.requestId === pending.requestId) {
+      pending.status = 'recording';
+      pending.startedAt = recording?.startedAt || new Date().toISOString();
+      pending.recording = serializePendingRecording(recording);
+      activeRun.message = `${pending.nodeLabel} is recording. Stop it when the input is complete.`;
+      activeRun.nodeStates[pending.nodeId].message = 'Recording now. Stop and save when finished.';
+      emitPipelineEvent();
+    }
+    return getActiveRunSnapshot();
+  } catch (error) {
+    resolvePendingRecordInput({
+      action: 'fail',
+      message: error?.message || 'Local AI Hub could not start the Record Input recording.',
+    });
+    throw error;
+  }
+}
+
+async function stopPipelineRecordInput(runId, payload = {}) {
+  const pending = getPendingRecordInputOrThrow(runId, payload);
+  if (pending.status !== 'recording') {
+    throw new Error(pending.status === 'finalizing'
+      ? 'Local AI Hub is already finalizing this Record Input recording.'
+      : 'Start this Record Input recording before stopping it.');
+  }
+  pending.status = 'finalizing';
+  activeRun.message = `Finalizing ${pending.nodeLabel}...`;
+  activeRun.nodeStates[pending.nodeId].message = 'Finalizing the local recording file.';
+  emitPipelineEvent();
+  await pipelineRecordingController.stop();
+  return getActiveRunSnapshot();
+}
+
+async function cancelPipelineRecordInput(runId, payload = {}) {
+  const pending = getPendingRecordInputOrThrow(runId, payload);
+  if (pending.status === 'waiting') {
+    resolvePendingRecordInput({
+      action: 'fail',
+      message: 'Record Input was canceled before recording started.',
+    });
+    return getActiveRunSnapshot();
+  }
+  pending.status = 'canceling';
+  activeRun.message = `Canceling ${pending.nodeLabel}...`;
+  activeRun.nodeStates[pending.nodeId].message = 'Canceling the active recording and failing this step.';
+  emitPipelineEvent();
+  await pipelineRecordingController.cancel();
+  return getActiveRunSnapshot();
+}
+
+async function handlePipelineRecordingStatus(payload = {}) {
+  const recording = payload?.recording;
+  if (!recording || recording.recordingContext !== 'pipelineRun') {
+    return false;
+  }
+  if (
+    !activeRun
+    || !activeRun.pendingRecordInput
+    || !pendingRecordInputControl
+    || recording.runId !== activeRun.runId
+    || recording.nodeId !== activeRun.pendingRecordInput.nodeId
+  ) {
+    return false;
+  }
+
+  const pending = activeRun.pendingRecordInput;
+  pending.recording = serializePendingRecording(recording);
+  if (recording.status === 'recording') {
+    pending.status = 'recording';
+    pending.startedAt = recording.startedAt || pending.startedAt;
+    emitPipelineEvent();
+    return true;
+  }
+
+  if (recording.status === 'completed') {
+    const outputPath = path.resolve(String(recording.outputPath || '').trim());
+    if (!String(recording.outputPath || '').trim() || !isPathInside(activeRun.directories.artifactsDir, outputPath)) {
+      resolvePendingRecordInput({
+        action: 'fail',
+        message: 'Local AI Hub refused a Record Input file outside the current pipeline run.',
+      });
+      return true;
+    }
+
+    try {
+      const outputKind = pending.outputKind;
+      const artifact = await buildFileArtifact(outputPath, {
+        displayName: pending.nodeLabel,
+        kind: outputKind,
+        role: 'generated',
+      });
+      artifact.artifactRole = 'intermediate';
+      artifact.nodeId = pending.nodeId;
+      artifact.recording = {
+        backend: String(recording.backend || '').trim(),
+        captureTarget: recording.captureTarget ? serializeArtifactForUi(recording.captureTarget) : null,
+        mode: String(recording.mode || '').trim(),
+        outputArtifactType: outputKind,
+        recordingId: String(recording.id || '').trim(),
+        retrySettingsApplied: pending.retrySettingsApplied === true,
+        runId: activeRun.runId,
+      };
+      artifact.runId = activeRun.runId;
+      if (outputKind === PORT_KIND_AUDIO && path.extname(outputPath).toLowerCase() === '.webm') {
+        artifact.attachmentKind = 'file';
+        artifact.formatLabel = 'WebM audio';
+        artifact.mimeType = String(recording.mimeType || 'audio/webm').replace(/^video\//i, 'audio/');
+        artifact.previewKind = 'audio';
+      }
+      artifact.summary = summarizeArtifact(artifact);
+      pending.status = 'completed';
+      emitPipelineEvent();
+      resolvePendingRecordInput({ action: 'complete', artifact });
+    } catch (error) {
+      resolvePendingRecordInput({
+        action: 'fail',
+        message: error?.message || 'Local AI Hub could not prepare the completed Record Input artifact.',
+      });
+    }
+    return true;
+  }
+
+  const message = String(recording.errorSummary || payload?.message || '').trim()
+    || (recording.status === 'canceled'
+      ? 'Record Input was canceled and the pipeline step failed.'
+      : 'Record Input stopped before a usable file was finalized.');
+  resolvePendingRecordInput({
+    action: activeRun.cancelRequested ? 'cancel' : 'fail',
+    message,
+  });
+  return true;
 }
 
 async function waitForUserValidation(run, node, artifact, options = {}) {
@@ -8950,6 +9311,10 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     };
   }
 
+  if (node.type === 'recordInput') {
+    return waitForRecordInput(run, node);
+  }
+
   if (node.type === 'imageInput' || node.type === 'audioInput' || node.type === 'videoInput' || node.type === 'fileInput') {
     const filePath = path.resolve(String(node.config?.filePath || '').trim());
     if (!String(node.config?.filePath || '').trim()) {
@@ -9749,6 +10114,8 @@ async function executeActiveRun(graph, context) {
     }
 
     pendingValidationControl = null;
+    pendingRecordInputControl = null;
+    activeRun.pendingRecordInput = null;
     activeRun.pendingValidation = null;
     markRemainingNodes(activeRun, graph, isCancelled ? 'cancelled' : 'skipped', isCancelled ? 'Cancelled before this step started.' : 'Skipped because an earlier step failed.');
     activeRun.status = isCancelled ? 'cancelled' : 'failed';
@@ -9791,6 +10158,10 @@ function cancelPipelineRun(runId) {
   activeRun.cancelRequested = true;
   activeRunAbortController?.abort();
   activeRun.message = 'Local AI Hub is stopping this pipeline and will shut down any tool it started for the run.';
+  if (activeRun.status === 'paused' && activeRun.pendingRecordInput && pendingRecordInputControl?.resolve) {
+    pipelineRecordingController?.cancel?.().catch(() => null);
+    resolvePendingRecordInput({ action: 'cancel' });
+  }
   if (activeRun.status === 'paused' && pendingValidationControl?.resolve) {
     const resolve = pendingValidationControl.resolve;
     pendingValidationControl = null;
@@ -9856,10 +10227,15 @@ function resumePipelineValidation(runId, payload = {}) {
 
 module.exports = {
   analyzeWithCurrentContext,
+  cancelPipelineRecordInput,
   cancelPipelineRun,
   getActiveRunSnapshot,
+  handlePipelineRecordingStatus,
   resumePipelineValidation,
   runPipeline,
+  setPipelineRecordingController,
   setPipelineEventSink,
+  startPipelineRecordInput,
+  stopPipelineRecordInput,
 };
 

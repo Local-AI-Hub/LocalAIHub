@@ -23,10 +23,26 @@ function getWorkerBootstrapSource() {
   return `require(${JSON.stringify(getWorkerModulePath())});`;
 }
 
+function createBackgroundTaskAbortError() {
+  const error = new Error('The background task was canceled.');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  return error;
+}
+
+function settlePendingRequest(requestId, method, value) {
+  const handlers = pendingRequests.get(requestId);
+  if (!handlers) {
+    return;
+  }
+  pendingRequests.delete(requestId);
+  handlers.cleanup?.();
+  handlers[method](value);
+}
+
 function rejectPendingRequests(message) {
-  for (const [requestId, handlers] of pendingRequests.entries()) {
-    pendingRequests.delete(requestId);
-    handlers.reject(new Error(message));
+  for (const requestId of [...pendingRequests.keys()]) {
+    settlePendingRequest(requestId, 'reject', new Error(message));
   }
 }
 
@@ -36,15 +52,12 @@ function handleWorkerMessage(message) {
     return;
   }
 
-  const handlers = pendingRequests.get(requestId);
-  pendingRequests.delete(requestId);
-
   if (message?.ok) {
-    handlers.resolve(message.result);
+    settlePendingRequest(requestId, 'resolve', message.result);
     return;
   }
 
-  handlers.reject(new Error(message?.error || 'A Local AI Hub background task failed.'));
+  settlePendingRequest(requestId, 'reject', new Error(message?.error || 'A Local AI Hub background task failed.'));
 }
 
 function attachWorkerListeners(worker) {
@@ -97,7 +110,7 @@ function ensureWorkerThread() {
   return workerThread;
 }
 
-function runBackgroundTask(task, payload = {}) {
+function runBackgroundTask(task, payload = {}, options = {}) {
   return new Promise((resolve, reject) => {
     let worker = null;
     try {
@@ -109,10 +122,29 @@ function runBackgroundTask(task, payload = {}) {
 
     const requestId = nextRequestId + 1;
     nextRequestId = requestId;
+    const abortRequest = () => {
+      if (!pendingRequests.has(requestId)) {
+        return;
+      }
+      try {
+        worker.postMessage({ cancelRequestId: requestId });
+      } catch {
+        // The worker may already be shutting down.
+      }
+      settlePendingRequest(requestId, 'reject', createBackgroundTaskAbortError());
+    };
+    const cleanup = () => options.signal?.removeEventListener('abort', abortRequest);
     pendingRequests.set(requestId, {
+      cleanup,
       reject,
       resolve,
     });
+
+    if (options.signal?.aborted) {
+      abortRequest();
+      return;
+    }
+    options.signal?.addEventListener('abort', abortRequest, { once: true });
 
     try {
       worker.postMessage({
@@ -121,12 +153,10 @@ function runBackgroundTask(task, payload = {}) {
         task,
       });
     } catch (error) {
-      pendingRequests.delete(requestId);
-      reject(error);
+      settlePendingRequest(requestId, 'reject', error);
     }
   });
 }
-
 async function disposeBackgroundTasks() {
   if (!workerThread) {
     return;

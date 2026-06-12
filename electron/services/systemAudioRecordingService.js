@@ -4,6 +4,7 @@ const fs = require('fs-extra');
 
 const { ensureStorage, getAppPaths } = require('./configService');
 const { isPathInside } = require('./pathSafetyService');
+const { buildPipelineRecordingMetadata, resolvePipelineRecordingPaths } = require('./pipelineRecordingStorageService');
 
 const MIN_REGION_SIZE = 64;
 const MAX_REGION_DIMENSION = 16384;
@@ -249,13 +250,21 @@ function createSystemAudioRecordingService(dependencies = {}) {
     }
 
     const options = normalizeSystemAudioOptions(input, context.devices || [], context.displays || []);
-    const storage = await ensureStorageFn();
-    const recordingsRoot = path.resolve(storage?.recordingsRoot || getAppPathsFn().recordingsRoot);
-    await fsApi.ensureDir(recordingsRoot);
+    await ensureStorageFn();
     const startedAt = now();
     const id = createRecordingId(startedAt);
-    const paths = buildRecordingPaths(recordingsRoot, startedAt, id);
+    const pipelineStorage = await resolvePipelineRecordingPaths({
+      context,
+      extension: 'webm',
+      fs: fsApi,
+      getAppPaths: getAppPathsFn,
+      id,
+    });
+    const recordingsRoot = pipelineStorage?.artifactsRoot || path.resolve(getAppPathsFn().recordingsRoot);
+    await fsApi.ensureDir(recordingsRoot);
+    const paths = pipelineStorage || buildRecordingPaths(recordingsRoot, startedAt, id);
     await fsApi.ensureDir(paths.directoryPath);
+    const outputArtifactType = options.includeVideo ? 'video' : 'audio';
 
     const metadata = {
       schemaVersion: 2,
@@ -275,7 +284,7 @@ function createSystemAudioRecordingService(dependencies = {}) {
       microphone: null,
       screenCaptureTarget: options.captureTarget ? { ...options.captureTarget } : null,
       captureTarget: options.captureTarget ? { ...options.captureTarget } : null,
-      outputRelativePath: path.relative(recordingsRoot, paths.outputPath).replace(/\\/g, '/'),
+      outputRelativePath: pipelineStorage?.outputRelativePath || path.relative(recordingsRoot, paths.outputPath).replace(/\\/g, '/'),
       fileName: path.basename(paths.outputPath),
       container: 'webm',
       format: 'webm',
@@ -291,6 +300,7 @@ function createSystemAudioRecordingService(dependencies = {}) {
       sizeBytes: 0,
       stopMethod: null,
       errorSummary: '',
+      ...buildPipelineRecordingMetadata(pipelineStorage, outputArtifactType),
     };
 
     let resolveClose;
@@ -337,7 +347,14 @@ function createSystemAudioRecordingService(dependencies = {}) {
   async function requestStop(cancelRequested) {
     const recording = activeRecording;
     if (!recording) throw new Error('There is no active recording to stop.');
-    if (recording.stopRequested) return recording.closePromise;
+    if (recording.stopRequested) {
+      if (cancelRequested && !recording.cancelRequested) {
+        recording.cancelRequested = true;
+        recording.stopMethod = 'media-recorder-cancel';
+        await updateMetadata(recording, { stopMethod: recording.stopMethod });
+      }
+      return recording.closePromise;
+    }
     recording.stopRequested = true;
     recording.cancelRequested = cancelRequested;
     recording.stopMethod = cancelRequested ? 'media-recorder-cancel' : 'media-recorder-stop';
