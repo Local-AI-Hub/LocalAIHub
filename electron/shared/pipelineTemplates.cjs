@@ -293,7 +293,7 @@ function voiceoverSlideshowVideo(template, contextMaps) {
       failMode: 'partial',
     },
   }), 'Generate and review images');
-  const composition = node('mediaComposition', 6, { imageTimingMode: 'dynamicFromImageMetadata', secondsPerItem: 4 }, 'Compose slideshow');
+  const composition = node('mediaComposition', 6, { compositionMode: 'imageSlideshow', imageTimingMode: 'dynamicFromImageMetadata', secondsPerItem: 4 }, 'Compose slideshow');
   const exportNode = node('mediaExport', 7, { title: 'Voiceover slideshow video', width: 1280, height: 720, fps: 30, fitMode: 'contain', stopMode: 'shortest' }, 'Export slideshow video');
   const validation = node('validation', 8, { mode: 'user' }, 'Review exported video');
   const retry = node('retryLoop', 9, { maxAttempts: 2, retryTargetNodeId: composition.id, retryTerminationAction: 'fail', stopWhenRetryArtifactRepeats: false }, 'Retry slideshow export');

@@ -55,6 +55,7 @@ const {
   buildStableDiffusionCheckpointOption,
 } = toolAssetSelectionShared;
 const {
+  applyMediaCompositionModeChange,
   applyRecordInputModeChange,
   arePortsCompatible,
   buildGraphWorkflowConfigFromPreset,
@@ -81,6 +82,7 @@ const {
   AUDIO_TRANSFORM_TOOL_IDS,
   IMAGE_TRANSFORM_TOOL_IDS,
   getModelStepOperationId,
+  getMediaCompositionMode,
   getDefaultImageTransformSubtype,
   getImageTransformSubtypeOptions,
   PIPELINE_OPERATION_IDS,
@@ -90,6 +92,7 @@ const {
   DEFAULT_PIPELINE_RUN_SETTINGS,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
@@ -97,6 +100,7 @@ const {
   RECORD_INPUT_MODE_OPTIONS,
   MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
   MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES,
+  MEDIA_COMPOSITION_MODES,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_TRANSITION_MODES,
   normalizeAudioModeForLocalTool,
@@ -146,6 +150,11 @@ const MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITY_OPTIONS = Object.freeze([
   ['sparse', 'Sparse'],
   ['normal', 'Normal'],
   ['dense', 'Dense'],
+]);
+const MEDIA_COMPOSITION_MODE_OPTIONS = Object.freeze([
+  ['imageSlideshow', 'Image slideshow'],
+  ['videoSequence', 'Video sequence'],
+  ['singleVideoMix', 'Single video mix'],
 ]);
 
 function buildDefaultRecordInputRegion(display) {
@@ -366,8 +375,10 @@ function getPendingMediaCompositionRetryDefaults(pendingValidation) {
 
   return {
     backgroundMusicVolume: normalizeVolumeGain(control.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    compositionMode: getMediaCompositionMode(control),
     imageTimingMode: normalizeRetryImageTimingMode(control.imageTimingMode),
     narrationVolume: normalizeVolumeGain(control.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
+    sourceVideoVolume: normalizeVolumeGain(control.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME),
     sceneTransitionCategory: getMediaCompositionTransitionCategory(control.sceneTransitionCategory),
     sceneTransitionDurationSeconds: normalizeRetryNumber(control.sceneTransitionDurationSeconds, 0.5, 0.1),
     sceneTransitionMode: getMediaCompositionTransitionMode(control.sceneTransitionMode),
@@ -388,15 +399,24 @@ function getMediaCompositionRetryPayload(retryOverrides) {
     return null;
   }
 
+  const compositionMode = getMediaCompositionMode(retryOverrides);
   return {
     backgroundMusicVolume: normalizeVolumeGain(retryOverrides.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
-    imageTimingMode: normalizeRetryImageTimingMode(retryOverrides.imageTimingMode),
+    compositionMode,
+    ...(compositionMode === 'imageSlideshow' ? {
+      imageTimingMode: normalizeRetryImageTimingMode(retryOverrides.imageTimingMode),
+      secondsPerItem: normalizeRetryNumber(retryOverrides.secondsPerItem, 4, 0.1),
+    } : {}),
     narrationVolume: normalizeVolumeGain(retryOverrides.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
-    sceneTransitionCategory: getMediaCompositionTransitionCategory(retryOverrides.sceneTransitionCategory),
-    sceneTransitionDurationSeconds: normalizeRetryNumber(retryOverrides.sceneTransitionDurationSeconds, 0.5, 0.1),
-    sceneTransitionMode: getMediaCompositionTransitionMode(retryOverrides.sceneTransitionMode),
-    sceneTransitionName: String(retryOverrides.sceneTransitionName || 'fade').trim() || 'fade',
-    secondsPerItem: normalizeRetryNumber(retryOverrides.secondsPerItem, 4, 0.1),
+    ...(compositionMode !== MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? {
+      sourceVideoVolume: normalizeVolumeGain(retryOverrides.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME),
+    } : {}),
+    ...(compositionMode !== 'singleVideoMix' ? {
+      sceneTransitionCategory: getMediaCompositionTransitionCategory(retryOverrides.sceneTransitionCategory),
+      sceneTransitionDurationSeconds: normalizeRetryNumber(retryOverrides.sceneTransitionDurationSeconds, 0.5, 0.1),
+      sceneTransitionMode: getMediaCompositionTransitionMode(retryOverrides.sceneTransitionMode),
+      sceneTransitionName: String(retryOverrides.sceneTransitionName || 'fade').trim() || 'fade',
+    } : {}),
     soundEffectsEnabled: retryOverrides.soundEffectsEnabled === true,
     soundEffectsGlobalGuardEnabled: retryOverrides.soundEffectsGlobalGuardEnabled === true,
     soundEffectsGlobalMaxSimultaneous: Math.max(1, Math.min(8, Math.floor(Number(retryOverrides.soundEffectsGlobalMaxSimultaneous || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS) || DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS))),
@@ -1327,6 +1347,14 @@ function buildNodePreview(node, runState) {
   }
 
   if (node.type === 'mediaComposition') {
+    const compositionMode = getMediaCompositionMode(node);
+    if (compositionMode === 'videoSequence') {
+      const transitionMode = getMediaCompositionTransitionMode(node.config?.sceneTransitionMode);
+      return `video sequence${transitionMode === 'off' ? '' : ' | clip transitions'} | optional narration + music`;
+    }
+    if (compositionMode === 'singleVideoMix') {
+      return 'single video mix | optional narration + music';
+    }
     const timingMode = node.config?.imageTimingMode === 'dynamicFromImageMetadata' || node.config?.imageTimingMode === 'matchNarrationTiming' ? 'match narration timing' : `${Math.max(0.1, Number(node.config?.secondsPerItem || 0) || 4)}s per image`;
     const transitionMode = getMediaCompositionTransitionMode(node.config?.sceneTransitionMode);
     const transitionLabel = transitionMode === 'off' ? '' : ' | scene transitions';
@@ -2790,7 +2818,14 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
             <span className="rounded-full border border-white/10 bg-slate-950/50 px-3 py-1 text-[10px] uppercase tracking-[0.16em] text-violet-100/80">Temporary</span>
           </div>
           <p className="mt-3 text-xs leading-5 text-violet-50/80">These settings apply only if you choose Fail to retry the next export. The saved pipeline stays unchanged.</p>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {mediaCompositionRetryValues.compositionMode !== MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? <div>
+              <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-source-video-volume">Source video volume</label>
+              <div className="mt-3 flex items-center gap-3">
+                <input className="min-w-0 flex-1 accent-cyan-300" disabled={busy} id="validation-media-composition-source-video-volume" max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { sourceVideoVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME) })} step="1" type="range" value={formatVolumePercent(mediaCompositionRetryValues.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME)} />
+                <input className="store-input w-24" disabled={busy} max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { sourceVideoVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME) })} step="1" type="number" value={formatVolumePercent(mediaCompositionRetryValues.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME)} />
+              </div>
+            </div> : null}
             <div>
               <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-narration-volume">Narration volume</label>
               <div className="mt-3 flex items-center gap-3">
@@ -2818,6 +2853,7 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
                 <input className="store-input w-24" disabled={busy} max="200" min="0" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { soundEffectsGlobalVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, 1) })} step="1" type="number" value={formatVolumePercent(mediaCompositionRetryValues.soundEffectsGlobalVolume, 1)} />
               </div>
             </div>
+            {mediaCompositionRetryValues.compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? <>
             <div>
               <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-image-timing">Image timing</label>
               <select className="store-input mt-3" disabled={busy} id="validation-media-composition-image-timing" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { imageTimingMode: event.target.value })} value={mediaCompositionRetryValues.imageTimingMode || 'fixedDurationPerImage'}>
@@ -2829,6 +2865,8 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
               <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-seconds-per-item">Fallback seconds per image</label>
               <input className="store-input mt-3" disabled={busy} id="validation-media-composition-seconds-per-item" min="0.1" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { secondsPerItem: normalizeRetryNumber(event.target.value, 4, 0.1) })} step="0.1" type="number" value={mediaCompositionRetryValues.secondsPerItem ?? 4} />
             </div>
+            </> : null}
+            {mediaCompositionRetryValues.compositionMode !== MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX ? <>
             <div>
               <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-transition-mode">Transition mode</label>
               <select className="store-input mt-3" disabled={busy} id="validation-media-composition-transition-mode" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { sceneTransitionMode: event.target.value })} value={mediaCompositionRetryValues.sceneTransitionMode || 'off'}>
@@ -2851,6 +2889,7 @@ function ValidationDecisionCard({ pendingValidation, comment, retryOverrides, fo
                 {MEDIA_COMPOSITION_TRANSITION_CATEGORY_OPTIONS.map((category) => <option key={category.id} value={category.id}>{category.label}</option>)}
               </select>
             </div>
+            </> : null}
             <div>
               <label className="text-[11px] uppercase tracking-[0.16em] text-violet-100/75" htmlFor="validation-media-composition-sfx-global-guard">Global SFX guard</label>
               <label className="mt-3 flex items-center gap-3 text-sm text-violet-50/90" htmlFor="validation-media-composition-sfx-global-guard"><input checked={mediaCompositionRetryValues.soundEffectsGlobalGuardEnabled === true} className="h-4 w-4 accent-cyan-300" disabled={busy} id="validation-media-composition-sfx-global-guard" onChange={(event) => onChangeRetryOverride?.('mediaComposition', { soundEffectsGlobalGuardEnabled: event.target.checked })} type="checkbox" />Prevent overlaps</label>
@@ -4148,6 +4187,28 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     markDirty();
     if (change.requiresConfirmation) {
       onToast('Record Input mode changed and incompatible outgoing connections were removed.', 'success');
+    }
+  }
+
+  function changeMediaCompositionMode(node, nextMode) {
+    let change;
+    try {
+      change = applyMediaCompositionModeChange(draft, node.id, nextMode);
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not change that Media Composition mode.', 'error');
+      return;
+    }
+    if (change.requiresConfirmation) {
+      if (!window.confirm('Changing this composition mode will remove incompatible visual input connections.\n\nChange mode and remove those connections?')) {
+        return;
+      }
+    }
+    setDraft((current) => applyMediaCompositionModeChange(current, node.id, nextMode, {
+      removeIncompatibleConnections: change.requiresConfirmation,
+    }).pipeline);
+    markDirty();
+    if (change.requiresConfirmation) {
+      onToast('Media Composition mode changed and incompatible visual connections were removed.', 'success');
     }
   }
 
@@ -8186,6 +8247,14 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                 {selectedNode.type === 'mediaComposition' ? (
                   <div className="space-y-4">
                     <div>
+                      <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-mode">Composition mode</label>
+                      <select className="store-input mt-3" id="media-composition-mode" onChange={(event) => changeMediaCompositionMode(selectedNode, event.target.value)} value={getMediaCompositionMode(selectedNode)}>
+                        {MEDIA_COMPOSITION_MODE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                      </select>
+                    </div>
+                    {getMediaCompositionMode(selectedNode) === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? (
+                      <>
+                    <div>
                       <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-timing-mode">Image timing</label>
                       <select
                         className="store-input mt-3"
@@ -8233,6 +8302,15 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         Uses per-image timing from the longform plan/transcript when available.
                       </div>
                     ) : null}
+                      </>
+                    ) : (
+                      <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                        {getMediaCompositionMode(selectedNode) === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+                          ? 'Clip durations come from the connected videos. Image timing settings do not apply.'
+                          : 'The connected video supplies the timeline. Image timing and scene transition settings do not apply.'}
+                      </div>
+                    )}
+                    {getMediaCompositionMode(selectedNode) !== MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX ? (
                     <div className="space-y-3 border-t border-white/10 pt-4">
                       <div className="grid gap-3 sm:grid-cols-2">
                         <div>
@@ -8352,6 +8430,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         </label>
                       ) : null}
                     </div>
+                    ) : null}
                     <div className="space-y-3 border-t border-white/10 pt-4">
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <label className="flex items-center gap-3 text-sm font-medium text-slate-200" htmlFor="media-composition-sfx-enabled">
@@ -8488,9 +8567,10 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                                   </div>
                                   <div>
                                     <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-mode-${index}`}>Scheduling mode</label>
-                                    <select className="store-input mt-3" id={`media-composition-sfx-mode-${index}`} onChange={(event) => updateLayer({ schedulingMode: getMediaCompositionSoundEffectsMode(event.target.value) })} value={getMediaCompositionSoundEffectsMode(layer.schedulingMode)}>
-                                      {MEDIA_COMPOSITION_SOUND_EFFECTS_MODE_OPTIONS.map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
+                                    <select className="store-input mt-3" id={`media-composition-sfx-mode-${index}`} onChange={(event) => updateLayer({ schedulingMode: getMediaCompositionSoundEffectsMode(event.target.value) })} value={getMediaCompositionMode(selectedNode) === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX ? 'randomInterval' : getMediaCompositionSoundEffectsMode(layer.schedulingMode)}>
+                                      {MEDIA_COMPOSITION_SOUND_EFFECTS_MODE_OPTIONS.filter(([value]) => getMediaCompositionMode(selectedNode) !== MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX || value === 'randomInterval').map(([value, labelText]) => <option key={value} value={value}>{labelText}</option>)}
                                     </select>
+                                    {getMediaCompositionMode(selectedNode) === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX ? <p className="mt-2 text-xs leading-5 text-slate-400">Single video mix supports timeline-based random SFX timing only.</p> : null}
                                   </div>
                                   <div>
                                     <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor={`media-composition-sfx-density-${index}`}>Frequency</label>
@@ -8536,7 +8616,14 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                         </div>
                       ) : null}
                     </div>
-                    <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                      {getMediaCompositionMode(selectedNode) !== MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-source-video-volume">Source video volume</label>
+                        <div className="mt-3 flex items-center gap-3">
+                          <input className="min-w-0 flex-1 accent-cyan-300" id="media-composition-source-video-volume" max="200" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, sourceVideoVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME) } }))} step="1" type="range" value={formatVolumePercent(selectedNode.config?.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME)} />
+                          <input className="store-input w-24" max="200" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, sourceVideoVolume: normalizeVolumeGain(Number(event.target.value || 0) / 100, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME) } }))} step="1" type="number" value={formatVolumePercent(selectedNode.config?.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME)} />
+                        </div>
+                      </div> : null}
                       <div>
                         <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="media-composition-narration-volume">Narration volume</label>
                         <div className="mt-3 flex items-center gap-3">
@@ -8553,7 +8640,11 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       </div>
                     </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Connect an ordered image collection to the Visual Collection input and optionally add one primary audio artifact plus one background music artifact. Connecting or disconnecting the Background Music input is the explicit include control; export applies the selected narration, background music, and sound effects levels when those tracks are present.
+                      {getMediaCompositionMode(selectedNode) === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+                        ? 'Connect an ordered video collection. Export normalizes the clips, preserves available clip audio, applies optional transitions, and mixes connected narration, music, and sound effects.'
+                        : getMediaCompositionMode(selectedNode) === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+                          ? 'Connect one existing video. Export preserves its video and available source audio, then mixes connected narration, background music, and timeline-based sound effects.'
+                          : 'Connect an ordered image collection and optionally add narration plus background music. Export applies the selected timing, transition, and volume settings.'}
                     </div>
                   </div>
                 ) : null}
@@ -8594,7 +8685,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       </div>
                     </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      This first export recipe renders an ordered image track to MP4 and can use one primary narration track plus one optional background music track. Background music uses the level saved on the Media Composition node; narration uses its saved level too, so the result stays explicit without pretending to be a full audio mixer.
+                      Media Export renders image slideshows, normalized video sequences, or a single existing video to MP4. It preserves available source video audio and applies the narration, background music, and sound effect levels saved on Media Composition.
                     </div>
                   </div>
                 ) : null}

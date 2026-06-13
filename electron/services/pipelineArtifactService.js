@@ -1651,6 +1651,7 @@ function createCompositionArtifact(spec = {}, options = {}) {
 
   const composition = {
     schemaVersion: 1,
+    compositionMode: String(compositionSpec.compositionMode || 'imageSlideshow').trim() || 'imageSlideshow',
     audioMix: compositionSpec.audioMix && typeof compositionSpec.audioMix === 'object' ? serializeArtifactForUi(compositionSpec.audioMix) : null,
     soundEffects: compositionSpec.soundEffects && typeof compositionSpec.soundEffects === 'object' ? serializeArtifactForUi(compositionSpec.soundEffects) : null,
     exportKind: String(compositionSpec.exportKind || PORT_KIND_VIDEO).trim() || PORT_KIND_VIDEO,
@@ -2372,6 +2373,7 @@ async function persistCompositionArtifact(runDirectories, artifact, options = {}
 
   const manifestPath = path.join(directoryPath, 'manifest.json');
   const savedComposition = createCompositionArtifact({
+    compositionMode: artifact?.composition?.compositionMode,
     displayName: options.displayName || options.title || artifact?.displayName || 'Media Composition',
     exportKind: artifact?.composition?.exportKind,
     recipeId: artifact?.composition?.recipeId,

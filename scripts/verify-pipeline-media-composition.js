@@ -2,6 +2,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');
+const { execFileSync, spawnSync } = require('child_process');
 
 const TEST_STORAGE_ROOT = path.join(process.cwd(), 'temp', 'verify-pipeline-media-composition');
 const MEDIA_COMPOSITION_SERVICE_PATH = path.join(process.cwd(), 'electron', 'services', 'mediaCompositionService.js');
@@ -78,14 +79,18 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
 const {
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
+  DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_UNSTABLE_XFADE_TRANSITIONS,
   analyzePipeline,
+  applyMediaCompositionModeChange,
   createEdge,
   createEmptyPipeline,
   createNode,
+  getMediaCompositionMode,
   getNodeTypeDefinition,
+  getPipelineNodePorts,
 } = require('../electron/shared/pipelineSchema.cjs');
 const {
   cancelPipelineRun,
@@ -410,6 +415,268 @@ async function prepareAssets() {
   return { backgroundMusic, imageOne, imageThree, imageTwo, narration };
 }
 
+function createTestVideo(filePath, color, frequency, options = {}) {
+  const ffmpegPath = require('ffmpeg-static');
+  const durationSeconds = Math.max(0.25, Number(options.durationSeconds || 0) || 1);
+  const args = [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', `color=c=${color}:s=320x180:d=${durationSeconds}`,
+  ];
+  if (options.hasAudio !== false) {
+    args.push('-f', 'lavfi', '-i', `sine=frequency=${frequency}:duration=${durationSeconds}`, '-shortest');
+  }
+  args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p');
+  if (options.hasAudio !== false) {
+    args.push('-c:a', 'aac');
+  } else {
+    args.push('-an');
+  }
+  args.push(filePath);
+  execFileSync(ffmpegPath, args, { stdio: 'pipe' });
+}
+
+function probeGeneratedMedia(filePath) {
+  const ffmpegPath = require('ffmpeg-static');
+  const result = spawnSync(ffmpegPath, ['-hide_banner', '-i', filePath], {
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+    windowsHide: true,
+  });
+  const output = String(result.stderr || '') + '\n' + String(result.stdout || '');
+  const durationMatch = output.match(/Duration:\s*(\d+):(\d+):([0-9.]+)/i);
+  return {
+    audioPresent: /Audio:/i.test(output),
+    durationSeconds: durationMatch
+      ? (Number(durationMatch[1]) * 3600) + (Number(durationMatch[2]) * 60) + Number(durationMatch[3])
+      : 0,
+    videoPresent: /Video:/i.test(output),
+  };
+}
+
+async function prepareVideoAssets() {
+  const assets = await prepareAssets();
+  const videoOne = path.join(path.dirname(assets.imageOne), 'clip-one.mp4');
+  const videoTwo = path.join(path.dirname(assets.imageOne), 'clip-two.mp4');
+  const videoSilent = path.join(path.dirname(assets.imageOne), 'clip-silent.mp4');
+  createTestVideo(videoOne, 'blue', 440);
+  createTestVideo(videoTwo, 'red', 660);
+  createTestVideo(videoSilent, 'green', 0, { hasAudio: false });
+  return { ...assets, videoOne, videoSilent, videoTwo };
+}
+
+function buildVideoModePipeline(assetPaths, compositionMode, options = {}) {
+  const includeBackgroundMusic = options.includeBackgroundMusic !== false;
+  const includeNarration = options.includeNarration !== false;
+  const firstVideoPath = options.firstVideoPath || assetPaths.videoOne;
+  const secondVideoPath = options.secondVideoPath || assetPaths.videoTwo;
+  const firstVideo = createNode('videoInput', { id: 'video-one', label: 'Video one', config: { filePath: firstVideoPath } });
+  const secondVideo = createNode('videoInput', { id: 'video-two', label: 'Video two', config: { filePath: secondVideoPath } });
+  const music = createNode('audioInput', { id: 'video-mode-music', label: 'Music', config: { filePath: assetPaths.backgroundMusic } });
+  const narration = createNode('audioInput', { id: 'video-mode-narration', label: 'Narration', config: { filePath: assetPaths.narration } });
+  const collection = createNode('collectionBuilder', { id: 'video-collection', label: 'Video collection' });
+  const composition = createNode('mediaComposition', {
+    id: 'video-mode-composition',
+    label: 'Video mode composition',
+    config: {
+      compositionMode,
+      sceneTransitionMode: options.transitions ? 'single' : 'off',
+      sceneTransitionName: 'fade',
+      sceneTransitionDurationSeconds: 0.2,
+      ...(options.sourceVideoVolume !== undefined ? { sourceVideoVolume: options.sourceVideoVolume } : {}),
+    },
+  });
+  const exportNode = createNode('mediaExport', {
+    id: 'video-mode-export',
+    label: 'Video mode export',
+    config: { title: options.title || 'Video mode export', width: 320, height: 180, fps: 12, stopMode: options.stopMode || 'shortest' },
+  });
+  const output = createNode('videoOutput', { id: 'video-mode-output', label: 'Video mode output' });
+  const isSequence = compositionMode === 'videoSequence';
+  const nodes = [firstVideo, ...(isSequence ? [secondVideo, collection] : [])];
+  if (includeBackgroundMusic) nodes.push(music);
+  if (includeNarration) nodes.push(narration);
+  nodes.push(composition, exportNode, output);
+  const edges = [
+    ...(isSequence ? [
+      createEdge(firstVideo.id, 'video', collection.id, 'items'),
+      createEdge(secondVideo.id, 'video', collection.id, 'items'),
+      createEdge(collection.id, 'collection', composition.id, 'videos'),
+    ] : [createEdge(firstVideo.id, 'video', composition.id, 'video')]),
+    ...(includeBackgroundMusic ? [createEdge(music.id, 'audio', composition.id, 'backgroundMusic')] : []),
+    ...(includeNarration ? [createEdge(narration.id, 'audio', composition.id, 'audio')] : []),
+    createEdge(composition.id, 'composition', exportNode.id, 'composition'),
+    createEdge(exportNode.id, 'video', output.id, 'video'),
+  ];
+  return createEmptyPipeline({
+    id: `verify-${compositionMode}-${String(options.caseId || 'default')}`,
+    name: `Verify ${compositionMode} ${String(options.caseId || 'default')}`,
+    nodes,
+    edges,
+  });
+}
+
+function verifyMediaCompositionModesAndPorts() {
+  const defaultNode = createNode('mediaComposition', { id: 'default-composition' });
+  assert.strictEqual(getMediaCompositionMode(defaultNode), 'imageSlideshow', 'Missing compositionMode should default to imageSlideshow.');
+  assert.strictEqual(defaultNode.config.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME, 'Media Composition should default source video volume to 100%.');
+  assert.deepStrictEqual(getPipelineNodePorts(defaultNode, 'input').map((port) => port.id), ['visuals', 'audio', 'backgroundMusic']);
+
+  const sequenceNode = createNode('mediaComposition', { id: 'sequence-composition', config: { compositionMode: 'videoSequence' } });
+  assert.strictEqual(sequenceNode.config.sourceVideoVolume, 1, 'Video sequence should default source video volume to 100%.');
+  assert.deepStrictEqual(getPipelineNodePorts(sequenceNode, 'input').map((port) => port.id), ['videos', 'audio', 'backgroundMusic']);
+  const singleNode = createNode('mediaComposition', { id: 'single-composition', config: { compositionMode: 'singleVideoMix' } });
+  assert.strictEqual(singleNode.config.sourceVideoVolume, 1, 'Single video mix should default source video volume to 100%.');
+  assert.deepStrictEqual(getPipelineNodePorts(singleNode, 'input').map((port) => port.id), ['video', 'audio', 'backgroundMusic']);
+
+  const image = createNode('imageInput', { id: 'mode-image', config: { filePath: 'unused.gif' } });
+  const pipeline = createEmptyPipeline({
+    nodes: [image, defaultNode],
+    edges: [createEdge(image.id, 'image', defaultNode.id, 'visuals')],
+  });
+  const blocked = applyMediaCompositionModeChange(pipeline, defaultNode.id, 'singleVideoMix');
+  assert.strictEqual(blocked.requiresConfirmation, true, 'Mode switching should protect incompatible visual edges.');
+  const changed = applyMediaCompositionModeChange(pipeline, defaultNode.id, 'singleVideoMix', { removeIncompatibleConnections: true });
+  assert.strictEqual(changed.pipeline.edges.length, 0, 'Confirmed mode switching should remove incompatible visual edges.');
+  assert.strictEqual(changed.pipeline.nodes.find((node) => node.id === defaultNode.id).config.sceneTransitionMode, 'off');
+
+  const imageCollection = createNode('collectionInput', {
+    id: 'wrong-image-collection',
+    config: { itemType: 'image', items: [{ filePath: 'unused.gif' }] },
+  });
+  const wrongSequence = createEmptyPipeline({
+    nodes: [imageCollection, sequenceNode],
+    edges: [createEdge(imageCollection.id, 'collection', sequenceNode.id, 'videos')],
+  });
+  assert.strictEqual(analyzePipeline(wrongSequence).executable, false, 'Video sequence should reject an image-only collection.');
+  const wrongSingle = createEmptyPipeline({
+    nodes: [image, singleNode],
+    edges: [createEdge(image.id, 'image', singleNode.id, 'video')],
+  });
+  assert.strictEqual(analyzePipeline(wrongSingle).executable, false, 'Single video mix should reject an image input.');
+
+  const panelSource = fs.readFileSync(PIPELINE_BUILDER_PANEL_PATH, 'utf8');
+  assert(panelSource.includes('Image slideshow') && panelSource.includes('Video sequence') && panelSource.includes('Single video mix'));
+  assert(panelSource.includes('getMediaCompositionMode(selectedNode) === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW'));
+  assert(panelSource.includes('getMediaCompositionMode(selectedNode) !== MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX'));
+  assert(panelSource.includes('Single video mix supports timeline-based random SFX timing only.'));
+  assert(panelSource.includes('mediaCompositionRetryValues.compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW'));
+  assert(panelSource.includes('media-composition-source-video-volume'), 'Expected video modes to expose source video volume.');
+  assert(panelSource.includes('validation-media-composition-source-video-volume'), 'Expected retry controls to expose source video volume.');
+  assert(/source-video-volume" max="200" min="0"/.test(panelSource), 'Expected source video volume controls to support 0% through 200%.');
+  assert(/getMediaCompositionMode\(selectedNode\) !== MEDIA_COMPOSITION_MODES\.IMAGE_SLIDESHOW \? <div>\s*<label[^>]+media-composition-source-video-volume/.test(panelSource), 'Expected the inspector source volume control only in video modes.');
+  assert(/mediaCompositionRetryValues\.compositionMode !== MEDIA_COMPOSITION_MODES\.IMAGE_SLIDESHOW \? <div>\s*<label[^>]+validation-media-composition-source-video-volume/.test(panelSource), 'Expected retry source volume only in video modes.');
+}
+
+async function verifyVideoCompositionModes() {
+  const assets = await prepareVideoAssets();
+  const cases = [
+    { caseId: 'single-source-music', compositionMode: 'singleVideoMix', includeBackgroundMusic: true, includeNarration: false, expectedDuration: 1, sourceVideoVolume: 1 },
+    { caseId: 'single-muted-source-music', compositionMode: 'singleVideoMix', includeBackgroundMusic: true, includeNarration: false, expectedDuration: 1, sourceVideoVolume: 0 },
+    { caseId: 'single-clamped-low-source-music', compositionMode: 'singleVideoMix', includeBackgroundMusic: true, includeNarration: false, expectedDuration: 1, sourceVideoVolume: -1 },
+    { caseId: 'single-silent-source-music', compositionMode: 'singleVideoMix', firstVideoPath: assets.videoSilent, includeBackgroundMusic: true, includeNarration: false, expectedDuration: 1, sourceVideoVolume: 1, sourceAudioPresent: false },
+    { caseId: 'single-source-only', compositionMode: 'singleVideoMix', includeBackgroundMusic: false, includeNarration: false, expectedDuration: 1, sourceVideoVolume: 1 },
+    { caseId: 'sequence-source-only', compositionMode: 'videoSequence', includeBackgroundMusic: false, includeNarration: false, expectedDuration: 2, sourceVideoVolume: 1 },
+    { caseId: 'sequence-music-transition', compositionMode: 'videoSequence', includeBackgroundMusic: true, includeNarration: false, transitions: true, expectedDuration: 1.8, sourceVideoVolume: 3 },
+    { caseId: 'sequence-narration', compositionMode: 'videoSequence', includeBackgroundMusic: false, includeNarration: true, expectedDuration: 2, sourceVideoVolume: 1 },
+    { caseId: 'sequence-one-silent-clip', compositionMode: 'videoSequence', includeBackgroundMusic: false, includeNarration: false, secondVideoPath: assets.videoSilent, expectedDuration: 2, sourceVideoVolume: 1 },
+  ];
+
+  for (const testCase of cases) {
+    const pipeline = buildVideoModePipeline(assets, testCase.compositionMode, testCase);
+    const analysis = analyzePipeline(pipeline, { hardware: null, providers: [], toolCatalog: [], tools: [] });
+    assert.strictEqual(analysis.executable, true, analysis.primaryIssue?.message || `${testCase.caseId} should be executable.`);
+    const completedRun = await runAndWaitForPipeline(pipeline);
+    verifyCompletedRun(completedRun);
+    const composition = completedRun.resultsByNodeId?.['video-mode-composition']?.outputs?.composition;
+    const exported = completedRun.resultsByNodeId?.['video-mode-export']?.outputs?.video;
+    const outputProbe = probeGeneratedMedia(exported.filePath);
+    const expectedSourceVolume = Math.max(0, Math.min(2, Number(testCase.sourceVideoVolume ?? 1)));
+    const sourceAudioPresent = testCase.sourceAudioPresent !== false;
+
+    assert.strictEqual(composition?.composition?.compositionMode, testCase.compositionMode);
+    assert.strictEqual(composition?.composition?.tracks?.[0]?.itemKind, 'video');
+    assert.strictEqual(composition?.composition?.audioMix?.sourceVideoVolume, expectedSourceVolume, 'Expected composition metadata to preserve source video gain.');
+    assert.strictEqual(exported?.compositionExport?.visualTrack?.itemKind, 'video');
+    assert.strictEqual(exported?.compositionExport?.audioMix?.sourceVideoVolume, expectedSourceVolume, 'Expected export metadata to preserve source video gain.');
+    assert.strictEqual(exported?.compositionExport?.audioMix?.effectiveGains?.sourceVideoAudio, sourceAudioPresent ? expectedSourceVolume : null, 'Expected effective source gain metadata to reflect actual source audio.');
+    assert.strictEqual(exported?.compositionExport?.audioMix?.sourceVideoAudioPreserved, sourceAudioPresent && expectedSourceVolume > 0, 'Expected source audio preservation metadata to account for mute.');
+    assert.strictEqual(outputProbe.videoPresent, true, 'Expected the generated MP4 to contain video.');
+    assert.strictEqual(outputProbe.audioPresent, true, 'Expected the generated MP4 to contain the requested audio mix.');
+    assert(Math.abs(outputProbe.durationSeconds - testCase.expectedDuration) <= 0.08, `Expected ${testCase.caseId} duration near ${testCase.expectedDuration}s, got ${outputProbe.durationSeconds}s.`);
+    assert.strictEqual(exported?.compositionExport?.audioMix?.outputDurationSeconds, testCase.expectedDuration, 'Expected video-mode audio duration metadata to follow the visual timeline.');
+    assert(exported.metadataPaths?.[0] && fs.existsSync(exported.metadataPaths[0]), 'Expected video-mode export sidecar metadata.');
+    const sidecar = JSON.parse(fs.readFileSync(exported.metadataPaths[0], 'utf8'));
+    assert.strictEqual(sidecar.audioMix?.sourceVideoVolume, expectedSourceVolume, 'Expected sidecar metadata to preserve source video gain.');
+
+    if (testCase.compositionMode === 'singleVideoMix') {
+      assert.strictEqual(composition.composition.tracks[0].sceneTransitions.enabled, false);
+      assert.strictEqual(composition.composition.tracks[0].items.length, 1);
+    } else {
+      assert.strictEqual(composition.composition.tracks[0].items.length, 2);
+    }
+    await cleanupActiveRun();
+  }
+}
+async function verifyVideoCompositionRetryControls() {
+  const assets = await prepareVideoAssets();
+  const basePipeline = buildVideoModePipeline(assets, 'singleVideoMix', {
+    caseId: 'validation-retry',
+    includeBackgroundMusic: true,
+    includeNarration: false,
+    sourceVideoVolume: 1,
+  });
+  const validation = createNode('validation', { id: 'video-mode-review', label: 'Review video mode export', config: { mode: 'user' } });
+  const retry = createNode('retryLoop', {
+    id: 'video-mode-retry',
+    label: 'Retry video mode export',
+    config: { maxAttempts: 2, retryTargetNodeId: 'video-mode-composition', stopWhenRetryArtifactRepeats: false, terminationAction: 'fail' },
+  });
+  const pipeline = createEmptyPipeline({
+    id: 'verify-single-video-retry-controls',
+    name: 'Verify single video retry controls',
+    nodes: [
+      ...basePipeline.nodes.filter((node) => node.id !== 'video-mode-output'),
+      validation,
+      retry,
+      basePipeline.nodes.find((node) => node.id === 'video-mode-output'),
+    ].filter(Boolean),
+    edges: [
+      ...basePipeline.edges.filter((edge) => edge.target.nodeId !== 'video-mode-output'),
+      createEdge('video-mode-export', 'video', validation.id, 'input'),
+      createEdge(validation.id, 'pass', retry.id, 'complete'),
+      createEdge(validation.id, 'fail', retry.id, 'retry'),
+      createEdge(retry.id, 'result', 'video-mode-output', 'video'),
+    ],
+  });
+  const savedComposition = pipeline.nodes.find((node) => node.id === 'video-mode-composition');
+  const initialRun = await runPipeline(pipeline);
+  const firstPause = await waitFor('video-mode validation pause', () => {
+    const run = getActiveRunSnapshot();
+    return run?.runId === initialRun.runId && run.status === 'paused' ? run : null;
+  }, 45000);
+  const firstControls = firstPause.pendingValidation?.retryControls?.mediaComposition || null;
+  assert.strictEqual(firstControls?.compositionMode, 'singleVideoMix', 'Expected retry controls to retain single video mix mode.');
+  assert.strictEqual(firstControls?.sourceVideoVolume, 1, 'Expected video-mode retry controls to expose source video volume at 100%.');
+
+  resumePipelineValidation(firstPause.runId, {
+    decision: 'fail',
+    nodeId: firstPause.pendingValidation.nodeId,
+    requestId: firstPause.pendingValidation.requestId,
+    retryOverrides: { mediaComposition: { sourceVideoVolume: 3 } },
+  });
+  const secondPause = await waitFor('video-mode retry validation pause', () => {
+    const run = getActiveRunSnapshot();
+    return run?.runId === initialRun.runId && run.status === 'paused' && run.pendingValidation?.requestId !== firstPause.pendingValidation.requestId ? run : null;
+  }, 45000);
+  assert.strictEqual(secondPause.pendingValidation?.retryControls?.mediaComposition?.sourceVideoVolume, 2, 'Expected video-mode retry source volume to clamp to 200%.');
+  assert.strictEqual(secondPause.pendingValidation?.artifact?.compositionExport?.audioMix?.sourceVideoVolume, 2, 'Expected retried video export metadata to record the clamped source volume.');
+  assert.strictEqual(savedComposition.config.sourceVideoVolume, 1, 'Expected video retry override not to mutate the saved source volume.');
+  cancelPipelineRun(secondPause.runId);
+  await waitFor('the video-mode retry run to cancel', () => {
+    const run = getActiveRunSnapshot();
+    return !run || run.runId !== secondPause.runId || run.status === 'cancelled' ? true : null;
+  }, 15000);
+}
 async function prepareSoundEffectsLibrary(assetPaths, name = 'Verify SFX', filenames = ['impact.wav', 'swell.wav'], durations = [0.75, 2.5]) {
   const existing = await listAssetLibraries('soundEffects');
   const shouldReuse = arguments.length < 4;
@@ -445,7 +712,7 @@ function verifyCompletedRun(completedRun) {
   );
 
   const terminalResult = completedRun.terminalResults?.[0] || null;
-  assert(terminalResult, 'Expected the pipeline to produce a terminal video result.');
+  assert(terminalResult, 'Expected the pipeline to produce a terminal video result. Node states: ' + JSON.stringify(completedRun.nodeStates || {}));
   assert.strictEqual(terminalResult.kind, 'video', 'Expected the terminal result to stay video-typed.');
   assert(terminalResult.filePath && fs.existsSync(terminalResult.filePath), 'Expected the final saved video output to exist.');
   assert(Array.isArray(terminalResult.artifact?.metadataPaths) && terminalResult.artifact.metadataPaths.length, 'Expected the final video output to keep export metadata sidecars.');
@@ -502,6 +769,9 @@ async function verifyMediaCompositionWithBackgroundMusic() {
   assert.strictEqual(exportArtifact.compositionExport.audioMix?.amixNormalize, false, 'Expected export metadata to record that amix normalization is disabled.');
   assert.strictEqual(exportArtifact.compositionExport.audioMix?.limiterApplied, false, 'Expected export metadata to record no hidden limiter.');
   assert.strictEqual(exportArtifact.compositionExport.audioMix?.clippingPreventionApplied, false, 'Expected export metadata to record no hidden clipping prevention.');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(compositionResult.composition.audioMix, 'sourceVideoVolume'), false, 'Image slideshow composition metadata should not add source video volume.');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(exportArtifact.compositionExport.audioMix, 'sourceVideoVolume'), false, 'Image slideshow export metadata should not add source video volume.');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(exportArtifact.compositionExport.audioMix.effectiveGains, 'sourceVideoAudio'), false, 'Image slideshow gain metadata should remain unchanged.');
 }
 
 async function verifyMediaCompositionCustomMixLevels() {
@@ -664,6 +934,7 @@ async function verifyMediaCompositionRetryOverrides() {
   assert.strictEqual(firstControls?.nodeId, 'compose-scenes', 'Expected Media Export validation to expose upstream Media Composition retry controls.');
   assert.strictEqual(firstControls.narrationVolume, 1, 'Expected retry controls to start from the effective narration volume.');
   assert.strictEqual(firstControls.backgroundMusicVolume, 0.22, 'Expected retry controls to start from the effective background volume.');
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(firstControls, 'sourceVideoVolume'), false, 'Image slideshow retry controls should not expose source video volume.');
   assert.strictEqual(firstControls.secondsPerItem, 1.5, 'Expected retry controls to expose fallback seconds per image.');
   assert.strictEqual(firstControls.sceneTransitionMode, 'off', 'Expected retry controls to expose transition mode.');
   assert.strictEqual(firstControls.soundEffectsEnabled, true, 'Expected retry controls to expose SFX enabled.');
@@ -1163,7 +1434,12 @@ function verifyMediaExportAudioMixVolumeSemantics() {
   assert(/getSoundEffectEffectiveGain\(event, audioPlan\.soundEffectsVolume\)/.test(mediaCompositionSource), 'Expected SFX export filters to use global times layer effective gain.');
   assert(/normalizeAudioVolume\(globalVolume, 1\)/.test(mediaCompositionSource), 'Expected missing global SFX gain to default to source volume.');
   assert(/audioMix\.soundEffectsVolume \?\? primaryConfigured\?\.globalVolume \?\? 1/.test(mediaCompositionSource), 'Expected export audio plan to avoid legacy layer gain as global gain.');
-  assert(/amix=inputs=\$\{audioMixLabels\.length\}:duration=longest:dropout_transition=2:normalize=\$\{MEDIA_COMPOSITION_AMIX_NORMALIZE\}/.test(mediaCompositionSource), 'Expected amix normalization to be explicit and disabled.');
+  assert(/volume=\$\{formatVolumeFilterValue\(audioPlan\.sourceVideoVolume\)\}\[sourcevideo\]/.test(mediaCompositionSource), 'Expected source video volume to map directly to the FFmpeg source gain.');
+  assert(/duration=\$\{visualItemKind === 'video' \? 'first' : 'longest'\}/.test(mediaCompositionSource), 'Expected video mixes to use the finite source timeline while slideshow mixes retain longest-input behavior.');
+  assert(/amix=inputs=\$\{audioMixLabels\.length\}.*normalize=\$\{MEDIA_COMPOSITION_AMIX_NORMALIZE\}/.test(mediaCompositionSource), 'Expected amix normalization to be explicit and disabled.');
+  assert(/apad=whole_dur=\$\{formatFfmpegSeconds\(durationSeconds\)\}/.test(mediaCompositionSource), 'Expected source clip audio to be padded to each video timeline before sequencing.');
+  assert(/numeric > 0x7fffffff \? numeric - 0x100000000 : numeric/.test(mediaCompositionSource), 'Expected Windows unsigned FFmpeg exit codes to be normalized for diagnostics.');
+  assert(/code === -28/.test(mediaCompositionSource), 'Expected FFmpeg output-finalization failures to receive a plain-English hint.');
   assert(/amixNormalizeExplicit: true/.test(mediaCompositionSource), 'Expected export metadata to record explicit amix normalization behavior.');
   assert(/sourceRelative: true/.test(mediaCompositionSource), 'Expected export metadata to record source-relative gain staging.');
   assert(/limiterApplied: false/.test(mediaCompositionSource), 'Expected export metadata to avoid hidden limiter behavior.');
@@ -1479,6 +1755,7 @@ function verifySoundEffectsPathSafetyImplementation() {
 }
 
 async function main() {
+  verifyMediaCompositionModesAndPorts();
   verifyMediaCompositionInspectorFallbackField();
   verifyMediaCompositionTransitionDefaults();
   verifyMediaCompositionSoundEffectsDefaultsAndUi();
@@ -1524,6 +1801,10 @@ async function main() {
   await verifySoundEffectsTrimNearEnd();
   await cleanupActiveRun();
   await verifyMissingSoundEffectsLibrarySkipsClearly();
+  await cleanupActiveRun();
+  await verifyVideoCompositionModes();
+  await cleanupActiveRun();
+  await verifyVideoCompositionRetryControls();
   await cleanupActiveRun();
   console.log('Pipeline media composition verification passed.');
 }

@@ -44,7 +44,7 @@ const {
   isLikelySupportOnlyStableDiffusionModel,
 } = require('./toolAssetSelection.cjs');
 
-const PIPELINE_SCHEMA_VERSION = 17;
+const PIPELINE_SCHEMA_VERSION = 18;
 const PIPELINE_RETRY_LOOP_MAX_ATTEMPTS = 8;
 const HEAVY_STEP_COOLDOWN_MAX_SECONDS = 300;
 const DEFAULT_PIPELINE_RUN_SETTINGS = Object.freeze({
@@ -53,9 +53,15 @@ const DEFAULT_PIPELINE_RUN_SETTINGS = Object.freeze({
 });
 const DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME = 1;
 const DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME = 0.22;
+const DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME = 1;
 const DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME = 0.25;
 const DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS = 0.5;
 const DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS = 1;
+const MEDIA_COMPOSITION_MODES = Object.freeze({
+  IMAGE_SLIDESHOW: 'imageSlideshow',
+  VIDEO_SEQUENCE: 'videoSequence',
+  SINGLE_VIDEO_MIX: 'singleVideoMix',
+});
 const MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES = Object.freeze({
   RANDOM_INTERVAL: 'randomInterval',
   SCENE_ALIGNED: 'sceneAligned',
@@ -1249,13 +1255,26 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     type: 'mediaComposition',
     label: 'Media Composition',
     category: 'Deterministic Media Operations',
-    description: 'Builds a reusable media composition from an ordered image collection with optional narration and optional background music.',
+    description: 'Builds a reusable composition from images, a video collection, or one existing video with optional narration and background music.',
     inputPorts: [
       {
         id: 'visuals',
         kind: PORT_KIND_IMAGE,
         collectionBehavior: 'only',
         label: 'Visual Collection',
+        required: true,
+      },
+      {
+        id: 'videos',
+        kind: PORT_KIND_VIDEO,
+        collectionBehavior: 'only',
+        label: 'Video Collection',
+        required: true,
+      },
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'Single Video',
         required: true,
       },
       {
@@ -1277,6 +1296,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       },
     ],
     configDefaults: {
+      compositionMode: MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW,
       imageTimingMode: 'fixedDurationPerImage',
       secondsPerItem: 4,
       sceneTransitionMode: MEDIA_COMPOSITION_TRANSITION_MODES.OFF,
@@ -1287,6 +1307,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       sceneTransitionAvoidRepeats: true,
       narrationVolume: DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
       backgroundMusicVolume: DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+      sourceVideoVolume: DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME,
       soundEffectsEnabled: false,
       soundEffectsLibraryId: '',
       soundEffectsSchedulingMode: MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.RANDOM_INTERVAL,
@@ -2136,6 +2157,12 @@ function getNodeTypeDefinition(type) {
   return PIPELINE_NODE_TYPES[type] || null;
 }
 
+function getMediaCompositionMode(nodeOrConfig) {
+  const config = nodeOrConfig?.config && typeof nodeOrConfig.config === 'object' ? nodeOrConfig.config : nodeOrConfig;
+  const mode = String(config?.compositionMode || MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW).trim();
+  return Object.values(MEDIA_COMPOSITION_MODES).includes(mode) ? mode : MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW;
+}
+
 function getDefaultNodeConfig(type) {
   const definition = getNodeTypeDefinition(type);
   return cloneValue(definition?.configDefaults || {});
@@ -2373,6 +2400,56 @@ function applyRecordInputModeChange(definition, nodeId, nextMode, options = {}) 
   };
 }
 
+function getMediaCompositionModeSwitchImpact(definition, nodeId, nextMode) {
+  const pipeline = definition && typeof definition === 'object' ? definition : {};
+  const node = (Array.isArray(pipeline.nodes) ? pipeline.nodes : []).find((entry) => entry?.id === nodeId) || null;
+  if (node?.type !== 'mediaComposition') {
+    throw new Error('Local AI Hub could not find that Media Composition node.');
+  }
+  const oldMode = getMediaCompositionMode(node);
+  const newMode = getMediaCompositionMode({ compositionMode: nextMode });
+  const activePortByMode = {
+    [MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW]: 'visuals',
+    [MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE]: 'videos',
+    [MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX]: 'video',
+  };
+  const activeVisualPortId = activePortByMode[newMode];
+  const incompatibleEdgeIds = (Array.isArray(pipeline.edges) ? pipeline.edges : [])
+    .filter((edge) => edge?.target?.nodeId === nodeId && ['visuals', 'videos', 'video'].includes(edge?.target?.portId) && edge.target.portId !== activeVisualPortId)
+    .map((edge) => edge.id);
+  return {
+    activeVisualPortId,
+    incompatibleEdgeIds,
+    newMode,
+    oldMode,
+    requiresConfirmation: oldMode !== newMode && incompatibleEdgeIds.length > 0,
+  };
+}
+
+function applyMediaCompositionModeChange(definition, nodeId, nextMode, options = {}) {
+  const pipeline = cloneValue(definition && typeof definition === 'object' ? definition : {});
+  const impact = getMediaCompositionModeSwitchImpact(pipeline, nodeId, nextMode);
+  if (impact.requiresConfirmation && options.removeIncompatibleConnections !== true) {
+    return { changed: false, impact, pipeline, removedEdgeIds: [], requiresConfirmation: true };
+  }
+  pipeline.nodes = (Array.isArray(pipeline.nodes) ? pipeline.nodes : []).map((node) => node.id === nodeId
+    ? {
+        ...node,
+        config: {
+          ...(node.config || {}),
+          compositionMode: impact.newMode,
+          ...(impact.newMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX ? { sceneTransitionMode: MEDIA_COMPOSITION_TRANSITION_MODES.OFF } : {}),
+        },
+      }
+    : node);
+  const removedEdgeIds = impact.oldMode !== impact.newMode ? impact.incompatibleEdgeIds : [];
+  if (removedEdgeIds.length) {
+    const removed = new Set(removedEdgeIds);
+    pipeline.edges = (Array.isArray(pipeline.edges) ? pipeline.edges : []).filter((edge) => !removed.has(edge.id));
+  }
+  return { changed: true, impact, pipeline, removedEdgeIds };
+}
+
 function normalizeNodeConfig(type, config) {
   const nextConfig = {
     ...getDefaultNodeConfig(type),
@@ -2545,6 +2622,15 @@ function getPipelineNodePorts(nodeOrType, direction) {
   if (node?.type === 'recordInput' && direction === 'output') {
     const outputKind = getRecordInputOutputKind(node);
     return (definition?.outputPorts || []).filter((port) => port.kind === outputKind);
+  }
+  if (node?.type === 'mediaComposition' && direction === 'input') {
+    const mode = getMediaCompositionMode(node);
+    const activeVisualPortId = mode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+      ? 'videos'
+      : mode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+        ? 'video'
+        : 'visuals';
+    return (definition?.inputPorts || []).filter((port) => !['visuals', 'videos', 'video'].includes(port.id) || port.id === activeVisualPortId);
   }
   if (node?.type === 'graphWorkflow') {
     const contract = getGraphWorkflowContract(getGraphWorkflowToolId(node));
@@ -4181,6 +4267,8 @@ function buildPipelineGraph(definition = {}) {
       if (sourceNode.type === 'recordInput' && ['audio', 'video'].includes(String(edge.source.portId || ''))) {
         const activeOutputKind = getRecordInputOutputKind(sourceNode) || 'supported';
         errors.push(`"${sourceNode.label}" is configured for ${activeOutputKind} output, but a saved connection still uses its inactive ${edge.source.portId} port. Remove or reconnect that stale Record Input edge.`);
+      } else if (targetNode.type === 'mediaComposition' && ['visuals', 'videos', 'video'].includes(String(edge.target.portId || ''))) {
+        errors.push(`"${targetNode.label}" has a saved connection on an inactive Media Composition input. Change the composition mode back or remove that stale connection.`);
       } else {
         errors.push(`Local AI Hub found an invalid connection between "${sourceNode.label}" and "${targetNode.label}".`);
       }
@@ -4374,7 +4462,7 @@ function buildPipelineGraph(definition = {}) {
       continue;
     }
 
-    for (const port of definitionEntry.inputPorts || []) {
+    for (const port of getPipelineNodePorts(node, 'input')) {
       const targetKey = `${node.id}:${port.id}`;
       const incomingEdges = incomingEdgesByPortKey.get(targetKey) || [];
       if (port.required && !incomingEdges.length) {
@@ -6728,14 +6816,24 @@ function analyzePipeline(definition = {}, context = {}) {
       }
 
       if (node.type === 'mediaComposition') {
-        const visualKinds = getIncomingKindsForNodePort(node, 'visuals', graph);
+        const compositionMode = getMediaCompositionMode(node);
+        const visualPortId = compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+          ? 'videos'
+          : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+            ? 'video'
+            : 'visuals';
+        const visualKinds = getIncomingKindsForNodePort(node, visualPortId, graph);
         if (!visualKinds.length) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect an ordered image collection before building this media composition.',
+            message: compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+              ? 'Connect an ordered video collection before building this media composition.'
+              : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+                ? 'Connect one video before building this media composition.'
+                : 'Connect an ordered image collection before building this media composition.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (!['fixedDurationPerImage', 'dynamicFromImageMetadata', 'matchNarrationTiming'].includes(String(node.config?.imageTimingMode || 'fixedDurationPerImage').trim())) {
+        } else if (compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW && !['fixedDurationPerImage', 'dynamicFromImageMetadata', 'matchNarrationTiming'].includes(String(node.config?.imageTimingMode || 'fixedDurationPerImage').trim())) {
           summary.readiness = {
             tone: 'error',
             message: 'Choose a supported image timing mode before building this media composition.',
@@ -6745,7 +6843,11 @@ function analyzePipeline(definition = {}, context = {}) {
           const timingMode = String(node.config?.imageTimingMode || 'fixedDurationPerImage').trim();
           summary.readiness = {
             tone: 'info',
-            message: timingMode === 'dynamicFromImageMetadata' || timingMode === 'matchNarrationTiming'
+            message: compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+              ? 'Media Composition will normalize and join the ordered video clips, with optional narration, music, transitions, and sound effects.'
+              : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+                ? 'Media Composition will preserve the connected video timeline and mix optional narration, music, and timeline-based sound effects.'
+                : timingMode === 'dynamicFromImageMetadata' || timingMode === 'matchNarrationTiming'
               ? 'Media Composition will use per-image timing metadata from the connected collection when available, with a fixed-duration fallback.'
               : 'This step keeps the visual collection order explicit and can attach one primary audio track plus one optional background music track before export.',
           };
@@ -6854,11 +6956,13 @@ module.exports = {
   DEFAULT_PIPELINE_RUN_SETTINGS,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
   MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES,
   MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
+  MEDIA_COMPOSITION_MODES,
   MEDIA_COMPOSITION_TRANSITION_MODES,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_XFADE_TRANSITIONS,
@@ -6894,6 +6998,7 @@ module.exports = {
   VIDEO_WORKFLOW_TOOL_IDS,
   WHISPER_MODELS,
   analyzePipeline,
+  applyMediaCompositionModeChange,
   applyRecordInputModeChange,
   arePortsCompatible,
   buildContextMaps,
@@ -6923,6 +7028,7 @@ module.exports = {
   getGraphWorkflowToolId,
   isGraphWorkflowPresetCompatibleWithOperation,
   getImageToolIdForNode,
+  getMediaCompositionMode,
   getCollectionMapInputKind,
   getCollectionMapMapping,
   getCollectionMapOperationId,

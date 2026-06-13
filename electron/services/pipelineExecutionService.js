@@ -81,6 +81,7 @@ const {
   normalizeAudioCollectionArtifact,
   normalizeImageArtifact,
   normalizeVideoCollectionArtifact,
+  probeVideoFile,
   trimMediaArtifact,
   burnSubtitlesIntoVideoArtifact,
   exportSubtitlesArtifact,
@@ -94,9 +95,11 @@ const {
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MAX_SIMULTANEOUS,
   DEFAULT_MEDIA_COMPOSITION_GLOBAL_SOUND_EFFECTS_MIN_SPACING_SECONDS,
   DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME,
+  DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME,
   DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
   MEDIA_COMPOSITION_SOUND_EFFECTS_DENSITIES,
   MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES,
+  MEDIA_COMPOSITION_MODES,
   MEDIA_COMPOSITION_TRANSITION_CATEGORIES,
   MEDIA_COMPOSITION_TRANSITION_MODES,
   MEDIA_COMPOSITION_XFADE_TRANSITIONS,
@@ -123,12 +126,14 @@ const {
   getCollectionMapOperationId,
   getCollectionMapOutputKind,
   getLocalImageBackendOperationId,
+  getMediaCompositionMode,
   getModelStepExecutionMode,
   getModelStepLocalToolId,
   getModelStepOperationId,
   normalizeImageTransformSubtype,
   normalizePipelineRunSettings,
   getNodeTypeDefinition,
+  getPipelineNodePorts,
   getRecordInputFormatLabel,
   getRecordInputModeDefinition,
   getRecordInputModeLabel,
@@ -196,13 +201,16 @@ function formatMediaCompositionVolumePercent(value, fallback) {
   return Math.round(normalizeMediaCompositionVolume(value, fallback) * 100);
 }
 
-function buildMediaCompositionAudioMixConfig(effectiveConfig, soundEffectsPlan) {
+function buildMediaCompositionAudioMixConfig(effectiveConfig, soundEffectsPlan, compositionMode) {
   const backgroundMusicVolume = normalizeMediaCompositionVolume(effectiveConfig.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME);
   const narrationVolume = normalizeMediaCompositionVolume(effectiveConfig.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME);
+  const sourceVideoVolume = normalizeMediaCompositionVolume(effectiveConfig.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME);
   const soundEffectsVolume = normalizeMediaCompositionVolume(effectiveConfig.soundEffectsGlobalVolume ?? soundEffectsPlan.volume, 1);
+  const hasSourceVideo = compositionMode !== MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW;
   return {
     backgroundMusicVolume,
     narrationVolume,
+    ...(hasSourceVideo ? { sourceVideoVolume } : {}),
     soundEffectsVolume,
     gainStaging: {
       amixNormalize: false,
@@ -210,6 +218,7 @@ function buildMediaCompositionAudioMixConfig(effectiveConfig, soundEffectsPlan) 
       effectiveGains: {
         backgroundMusic: backgroundMusicVolume,
         narration: narrationVolume,
+        ...(hasSourceVideo ? { sourceVideoAudio: sourceVideoVolume } : {}),
         soundEffects: soundEffectsVolume,
       },
       limiterApplied: false,
@@ -252,6 +261,9 @@ function buildMediaCompositionRetryOverrideConfig(value) {
   }
   if (Object.prototype.hasOwnProperty.call(source, 'backgroundMusicVolume')) {
     config.backgroundMusicVolume = normalizeMediaCompositionVolume(source.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME);
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'sourceVideoVolume')) {
+    config.sourceVideoVolume = normalizeMediaCompositionVolume(source.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME);
   }
   if (Object.prototype.hasOwnProperty.call(source, 'soundEffectsEnabled')) {
     config.soundEffectsEnabled = normalizeMediaCompositionBoolean(source.soundEffectsEnabled);
@@ -310,6 +322,7 @@ function getCompositionAudioMixForRetryControls(artifact) {
   return {
     narrationVolume: normalizeMediaCompositionVolume(audioMix?.narrationVolume, DEFAULT_MEDIA_COMPOSITION_NARRATION_VOLUME),
     backgroundMusicVolume: normalizeMediaCompositionVolume(audioMix?.backgroundMusicVolume, DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME),
+    sourceVideoVolume: normalizeMediaCompositionVolume(audioMix?.sourceVideoVolume, DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME),
     soundEffectsGlobalVolume: normalizeMediaCompositionVolume(audioMix?.soundEffectsVolume, 1),
   };
 }
@@ -1596,7 +1609,7 @@ function getMissingRequiredInputs(node, graph, resultsByNodeId, run = null) {
     return [];
   }
 
-  return (definition.inputPorts || [])
+  return getPipelineNodePorts(node, 'input')
     .filter((port) => port.required)
     .filter((port) => getNodeInputArtifacts(node.id, port.id, graph, resultsByNodeId, run).length === 0)
     .map((port) => port.label);
@@ -6541,14 +6554,17 @@ function buildMediaCompositionRetryControls(graph, validationNode, run, artifact
   const visualTrack = artifact?.compositionExport?.visualTrack && typeof artifact.compositionExport.visualTrack === 'object'
     ? artifact.compositionExport.visualTrack
     : null;
+  const compositionMode = getMediaCompositionMode(effectiveConfig);
   return {
     mediaComposition: {
       backgroundMusicVolume: audioMix.backgroundMusicVolume,
+      compositionMode,
       imageTimingMode: normalizeMediaCompositionImageTimingMode(effectiveConfig.imageTimingMode || visualTrack?.imageTimingMode),
       nodeConfig: serializeArtifactForUi(effectiveConfig),
       nodeId: targetNode.id,
       nodeLabel: targetNode.label || 'Media Composition',
       narrationVolume: audioMix.narrationVolume,
+      ...(compositionMode !== MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? { sourceVideoVolume: audioMix.sourceVideoVolume } : {}),
       sceneTransitionCategory: normalizeMediaCompositionTransitionCategory(effectiveConfig.sceneTransitionCategory || visualTrack?.sceneTransitions?.category),
       sceneTransitionDurationSeconds: normalizeMediaCompositionTransitionDuration(effectiveConfig.sceneTransitionDurationSeconds || visualTrack?.sceneTransitions?.configuredDurationSeconds),
       sceneTransitionMode: normalizeMediaCompositionTransitionMode(effectiveConfig.sceneTransitionMode || visualTrack?.sceneTransitions?.mode),
@@ -8362,7 +8378,9 @@ function getSceneBoundarySeconds(visualItems) {
   for (let index = 0; index < visualItems.length - 1; index += 1) {
     const item = visualItems[index];
     const nextItem = visualItems[index + 1];
-    const boundarySeconds = Number.isFinite(Number(item?.endSeconds))
+    const boundarySeconds = Number.isFinite(Number(item?.renderedBoundarySeconds))
+      ? Number(item.renderedBoundarySeconds)
+      : Number.isFinite(Number(item?.endSeconds))
       ? Number(item.endSeconds)
       : cursorSeconds + (Number(item?.durationSeconds || 0) || 0);
     cursorSeconds = boundarySeconds;
@@ -8436,6 +8454,25 @@ function addDeterministicSoundEffectEvent(events, items, library, timeSeconds, m
     }
   }
   return null;
+}
+
+function applyVideoTransitionTiming(visualItems, timingPlan, sceneTransitionPlan) {
+  if (!sceneTransitionPlan?.enabled || !Array.isArray(sceneTransitionPlan.boundaries) || !sceneTransitionPlan.boundaries.length) {
+    return;
+  }
+  let renderedDurationSeconds = Math.max(0, Number(visualItems[0]?.durationSeconds || 0) || 0);
+  sceneTransitionPlan.boundaries.forEach((boundary, index) => {
+    const transitionDurationSeconds = Math.max(0, Number(boundary.effectiveDurationSeconds || 0) || 0);
+    const offsetSeconds = normalizeTimelineSeconds(Math.max(0, renderedDurationSeconds - transitionDurationSeconds)) || 0;
+    boundary.offsetSeconds = offsetSeconds;
+    boundary.boundarySeconds = offsetSeconds;
+    visualItems[index].renderedBoundarySeconds = offsetSeconds;
+    renderedDurationSeconds = renderedDurationSeconds
+      + Math.max(0, Number(visualItems[index + 1]?.durationSeconds || 0) || 0)
+      - transitionDurationSeconds;
+  });
+  sceneTransitionPlan.totalVisualDurationSeconds = normalizeTimelineSeconds(renderedDurationSeconds) || renderedDurationSeconds;
+  timingPlan.totalVisualDurationSeconds = sceneTransitionPlan.totalVisualDurationSeconds;
 }
 
 function getSoundEffectEventPriority(event) {
@@ -8991,14 +9028,110 @@ function buildVisualTimingPlan(visualCollection, effectiveConfig, primaryAudioAr
     visualItems,
   };
 }
+
+function getVideoArtifactDurationCandidate(artifact) {
+  const candidates = [
+    artifact?.mediaTrim?.durationSeconds,
+    artifact?.videoGeneration?.durationSeconds,
+    artifact?.videoGeneration?.video?.durationSeconds,
+    artifact?.videoStitch?.totalDurationSeconds,
+    artifact?.compositionExport?.visualTrack?.totalVisualDurationSeconds,
+  ];
+  for (const candidate of candidates) {
+    const durationSeconds = normalizeTimelineSeconds(candidate);
+    if (durationSeconds && durationSeconds > 0) {
+      return durationSeconds;
+    }
+  }
+  return null;
+}
+
+async function buildVideoTimingPlan(sourceEntries) {
+  let cursorSeconds = 0;
+  const visualItems = [];
+  for (let index = 0; index < sourceEntries.length; index += 1) {
+    const entry = sourceEntries[index] || {};
+    const artifact = entry.artifact || null;
+    const filePath = String(artifact?.filePath || '').trim();
+    if (!artifact || String(artifact.kind || '').trim() !== PORT_KIND_VIDEO || !filePath) {
+      continue;
+    }
+    const probed = getVideoArtifactDurationCandidate(artifact) ? null : await probeVideoFile(filePath);
+    const durationSeconds = getVideoArtifactDurationCandidate(artifact) || normalizeTimelineSeconds(probed?.durationSeconds);
+    if (!durationSeconds || durationSeconds <= 0) {
+      throw new Error(`Media Composition could not read the duration of video clip ${index + 1}. Normalize or regenerate that clip, then try again.`);
+    }
+    const startSeconds = normalizeTimelineSeconds(cursorSeconds) || 0;
+    const endSeconds = normalizeTimelineSeconds(startSeconds + durationSeconds) || (startSeconds + durationSeconds);
+    visualItems.push({
+      artifact,
+      durationSeconds,
+      endSeconds,
+      itemId: String(entry.itemId || '').trim() || `video-${index + 1}`,
+      lineage: entry.lineage || null,
+      metadata: entry.metadata || null,
+      startSeconds,
+      summary: String(entry.summary || summarizeArtifact(artifact)).trim(),
+    });
+    cursorSeconds = endSeconds;
+  }
+  const totalVisualDurationSeconds = normalizeTimelineSeconds(cursorSeconds) || 0;
+  return {
+    effectiveMode: 'sourceVideoDuration',
+    fixedDurationSeconds: null,
+    requestedMode: 'sourceVideoDuration',
+    timingMetadataUsed: true,
+    totalVisualDurationSeconds,
+    visualItems,
+  };
+}
+
+function getModeAwareSoundEffectsConfig(effectiveConfig, compositionMode) {
+  if (compositionMode !== MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX) {
+    return { config: effectiveConfig, convertedLayerCount: 0 };
+  }
+  let convertedLayerCount = 0;
+  const convertMode = (value) => {
+    const mode = normalizeMediaCompositionSoundEffectsMode(value);
+    if (mode !== MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.RANDOM_INTERVAL) {
+      convertedLayerCount += 1;
+    }
+    return MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.RANDOM_INTERVAL;
+  };
+  return {
+    config: {
+      ...effectiveConfig,
+      soundEffectsSchedulingMode: convertMode(effectiveConfig.soundEffectsSchedulingMode),
+      soundEffectsLayers: Array.isArray(effectiveConfig.soundEffectsLayers)
+        ? effectiveConfig.soundEffectsLayers.map((layer) => ({ ...layer, schedulingMode: convertMode(layer?.schedulingMode || layer?.mode) }))
+        : effectiveConfig.soundEffectsLayers,
+    },
+    convertedLayerCount,
+  };
+}
+
 async function executeMediaCompositionNode(node, graph, run) {
   const effectiveConfig = getMediaCompositionEffectiveConfig(node, run);
-  const visualCollection = getNodeInputArtifact(node.id, 'visuals', graph, run.resultsByNodeId, run);
-  if (!isArtifactCollection(visualCollection)) {
-    throw new Error('This media composition step needs an ordered image collection on the Visual Collection input.');
-  }
-  if (String(visualCollection.itemKind || '').trim() !== PORT_KIND_IMAGE) {
-    throw new Error('This first media composition pass only accepts ordered image collections as the visual track input.');
+  const compositionMode = getMediaCompositionMode(effectiveConfig);
+  const visualPortId = compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+    ? 'videos'
+    : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+      ? 'video'
+      : 'visuals';
+  const visualInput = getNodeInputArtifact(node.id, visualPortId, graph, run.resultsByNodeId, run);
+  let visualCollection = null;
+  if (compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW) {
+    visualCollection = visualInput;
+    if (!isArtifactCollection(visualCollection) || String(visualCollection.itemKind || '').trim() !== PORT_KIND_IMAGE) {
+      throw new Error('Image slideshow mode needs an ordered image collection on the Image Collection input.');
+    }
+  } else if (compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE) {
+    visualCollection = visualInput;
+    if (!isArtifactCollection(visualCollection) || String(visualCollection.itemKind || '').trim() !== PORT_KIND_VIDEO) {
+      throw new Error('Video sequence mode needs an ordered video collection on the Video Collection input.');
+    }
+  } else if (!visualInput || String(visualInput.kind || '').trim() !== PORT_KIND_VIDEO) {
+    throw new Error('Single video mix mode needs one video on the Single Video input.');
   }
 
   const audioArtifact = getNodeInputArtifact(node.id, 'audio', graph, run.resultsByNodeId, run);
@@ -9011,39 +9144,56 @@ async function executeMediaCompositionNode(node, graph, run) {
     throw new Error('The Background Music input needs one audio artifact when it is connected.');
   }
 
-  const timingPlan = buildVisualTimingPlan(visualCollection, effectiveConfig, audioArtifact, backgroundMusicArtifact);
+  const timingPlan = compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW
+    ? buildVisualTimingPlan(visualCollection, effectiveConfig, audioArtifact, backgroundMusicArtifact)
+    : await buildVideoTimingPlan(
+        compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+          ? (visualCollection.items || [])
+          : [{ artifact: visualInput, itemId: 'single-video', summary: summarizeArtifact(visualInput) }],
+      );
   const visualItems = timingPlan.visualItems;
-  const sceneTransitionPlan = buildSceneTransitionPlan(visualItems, effectiveConfig, timingPlan);
-  if (!visualItems.length) {
-    throw new Error('This media composition does not have any saved images to assemble yet.');
+  const sceneTransitionPlan = compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+    ? buildSceneTransitionPlan(visualItems, { ...effectiveConfig, sceneTransitionMode: MEDIA_COMPOSITION_TRANSITION_MODES.OFF }, timingPlan)
+    : buildSceneTransitionPlan(visualItems, effectiveConfig, timingPlan);
+  if (compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE) {
+    applyVideoTransitionTiming(visualItems, timingPlan, sceneTransitionPlan);
   }
-  const soundEffectsPlan = await buildSoundEffectsSchedule(visualItems, effectiveConfig, timingPlan);
+  if (!visualItems.length) {
+    throw new Error('This media composition does not have any saved visual media to assemble yet.');
+  }
+  const soundEffectsConfig = getModeAwareSoundEffectsConfig(effectiveConfig, compositionMode);
+  const soundEffectsPlan = await buildSoundEffectsSchedule(visualItems, soundEffectsConfig.config, timingPlan);
+  if (soundEffectsConfig.convertedLayerCount > 0) {
+    soundEffectsPlan.notes.push('Single video mix uses timeline-based SFX timing, so scene-aligned SFX settings were converted to random intervals.');
+    soundEffectsPlan.convertedSceneAlignedLayerCount = soundEffectsConfig.convertedLayerCount;
+  }
 
   const composition = createCompositionArtifact({
-    audioMix: buildMediaCompositionAudioMixConfig(effectiveConfig, soundEffectsPlan),
+    compositionMode,
+    audioMix: buildMediaCompositionAudioMixConfig(effectiveConfig, soundEffectsPlan, compositionMode),
     soundEffects: soundEffectsPlan,
     displayName: node.label,
     exportKind: PORT_KIND_VIDEO,
-    recipeId: 'image-sequence-optional-audio-bed',
-    recipeLabel: 'Image sequence with optional narration, background music, and sound effects',
+    recipeId: compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? 'image-sequence-optional-audio-bed' : compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE ? 'video-sequence-optional-audio-bed' : 'single-video-audio-mix',
+    recipeLabel: compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? 'Image sequence with optional narration, background music, and sound effects' : compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE ? 'Video sequence with optional narration, background music, and sound effects' : 'Single video with optional narration, background music, and sound effects',
     tracks: [
       {
         id: 'visual-track',
-        imageTimingMode: timingPlan.effectiveMode,
+        imageTimingMode: compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? timingPlan.effectiveMode : '',
         itemDurationSeconds: timingPlan.fixedDurationSeconds,
-        itemKind: PORT_KIND_IMAGE,
+        itemKind: compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? PORT_KIND_IMAGE : PORT_KIND_VIDEO,
         items: visualItems,
         kind: 'visual-sequence',
         role: 'primary-visual',
         sceneTransitions: sceneTransitionPlan,
         sourceCollection: {
-          directoryPath: String(visualCollection.directoryPath || '').trim(),
-          displayName: String(visualCollection.displayName || '').trim(),
-          itemCount: Number(visualCollection.itemCount || visualItems.length) || visualItems.length,
-          itemKind: String(visualCollection.itemKind || '').trim() || PORT_KIND_IMAGE,
-          manifestPath: String(visualCollection.manifestPath || '').trim(),
-          metadata: visualCollection.metadata ? serializeArtifactForUi(visualCollection.metadata) : null,
-          summary: String(visualCollection.summary || '').trim(),
+          directoryPath: String(visualCollection?.directoryPath || '').trim(),
+          displayName: String(visualCollection?.displayName || visualInput?.displayName || '').trim(),
+          itemCount: Number(visualCollection?.itemCount || visualItems.length) || visualItems.length,
+          itemKind: String(visualCollection?.itemKind || visualInput?.kind || '').trim() || PORT_KIND_IMAGE,
+          manifestPath: String(visualCollection?.manifestPath || '').trim(),
+          metadata: visualCollection?.metadata ? serializeArtifactForUi(visualCollection.metadata) : null,
+          summary: String(visualCollection?.summary || summarizeArtifact(visualInput)).trim(),
         },
         timing: {
           effectiveMode: timingPlan.effectiveMode,
@@ -9052,7 +9202,7 @@ async function executeMediaCompositionNode(node, graph, run) {
           fallbackReason: timingPlan.fallbackReason,
           fixedDurationSeconds: timingPlan.fixedDurationSeconds,
           imageTimingMode: timingPlan.effectiveMode,
-          perImageDurations: timingPlan.perImageDurations,
+          perImageDurations: timingPlan.perImageDurations || [],
           requestedMode: timingPlan.requestedMode,
           targetBackgroundMusicDurationSeconds: timingPlan.targetBackgroundMusicDurationSeconds,
           targetNarrationDurationSeconds: timingPlan.targetNarrationDurationSeconds,
@@ -9086,6 +9236,15 @@ async function executeMediaCompositionNode(node, graph, run) {
     role: 'generated',
     target: 'artifacts',
   });
+
+  if (compositionMode !== MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW) {
+    const modeLabel = compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE ? `${visualItems.length} ordered video clip${visualItems.length === 1 ? '' : 's'}` : 'the existing video';
+    return {
+      message: `Media Composition prepared ${modeLabel} with optional narration, background music, original clip audio, and sound effects.${soundEffectsPlan.notes?.length ? ' ' + soundEffectsPlan.notes[0] : ''}`,
+      outputs: { composition: persistedComposition },
+      preview: summarizeArtifact(persistedComposition),
+    };
+  }
 
   const timingMessage = timingPlan.timingMetadataUsed
     ? ' using per-image timing metadata'

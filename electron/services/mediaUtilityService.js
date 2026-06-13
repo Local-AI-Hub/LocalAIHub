@@ -625,8 +625,13 @@ async function probeVideoFile(sourcePath) {
   const videoLine = text.split(/\r?\n/).find((line) => /Video:/i.test(line)) || '';
   const sizeMatch = videoLine.match(/(\d{2,5})x(\d{2,5})/);
   const fpsMatch = videoLine.match(/,\s*([0-9.]+)\s*fps/i);
+  const durationMatch = text.match(/Duration:\s*(\d+):(\d+):([0-9.]+)/i);
+  const durationSeconds = durationMatch
+    ? (Number(durationMatch[1]) * 3600) + (Number(durationMatch[2]) * 60) + Number(durationMatch[3])
+    : 0;
   return {
     audioPresent: /Audio:/i.test(text),
+    durationSeconds: Math.round(Math.max(0, durationSeconds) * 1000) / 1000,
     fps: fpsMatch ? Number(fpsMatch[1]) || 0 : 0,
     height: sizeMatch ? Number(sizeMatch[2]) || 0 : 0,
     width: sizeMatch ? Number(sizeMatch[1]) || 0 : 0,
@@ -1840,6 +1845,7 @@ module.exports = {
   normalizeAudioCollectionArtifact,
   normalizeImageArtifact,
   normalizeVideoCollectionArtifact,
+  probeVideoFile,
   trimMediaArtifact,
   burnSubtitlesIntoVideoArtifact,
   exportSubtitlesArtifact,
