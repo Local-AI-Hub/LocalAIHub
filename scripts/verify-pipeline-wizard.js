@@ -1,9 +1,11 @@
 const assert = require('assert');
 
 const {
+  MEDIA_COMPOSITION_MODES,
   buildContextMaps,
   buildPipelineGraph,
   analyzePipeline,
+  getDefaultNodeConfig,
 } = require('../electron/shared/pipelineSchema.cjs');
 const {
   WIZARD_RECIPE_IDS,
@@ -129,6 +131,13 @@ function assertKnownNodeTypes(pipeline) {
   }
 }
 
+function assertConfigUsesDefaults(node, keys, messagePrefix = node?.type || 'Node') {
+  const defaults = getDefaultNodeConfig(node?.type);
+  for (const key of keys) {
+    assert.deepStrictEqual(node?.config?.[key], defaults[key], messagePrefix + ' should keep the schema default for ' + key + '.');
+  }
+}
+
 function assertRuntimeConfigsDoNotContainIntent(pipeline, intent) {
   const normalizedIntent = String(intent || '').trim();
   const authoringPattern = /\b(build|create|make|draft|generate|design|compose|construct|set up|wire)\b.{0,80}\b(pipeline|workflow|graph|builder|wizard)\b/i;
@@ -235,6 +244,15 @@ function testWizardPromptBoundary(context) {
   assert(prompt.includes('supportedIntentStageKinds'), 'Wizard prompt should expose supported abstract stage kinds.');
   assert(prompt.includes('allowedNodeTypes'), 'Wizard prompt should expose allowed node types for flexible composition.');
   assert(prompt.includes('automatic1111'), 'Wizard prompt should expose real available tools.');
+  assert(prompt.includes('imageSlideshow'), 'Wizard prompt should teach image slideshow composition mode.');
+  assert(prompt.includes('videoSequence'), 'Wizard prompt should teach video sequence composition mode.');
+  assert(prompt.includes('singleVideoMix'), 'Wizard prompt should teach single-video mix composition mode.');
+  assert(prompt.includes('Do not emit detailed node settings such as timing, FPS, transitions, volume'), 'Wizard prompt should forbid detailed media and runtime tuning.');
+  const structuredSchemaText = JSON.stringify(buildPipelineWizardStructuredOutputRequest());
+  assert(structuredSchemaText.includes('"compositionMode"'), 'Wizard intent IR should expose the structural Media Composition mode.');
+  for (const forbiddenKey of ['timingMode', 'fallbackSecondsPerImage', 'transitionsEnabled', 'narrationVolume', 'fontLibraryRef', 'maxAttempts']) {
+    assert(!structuredSchemaText.includes('"' + forbiddenKey + '"'), 'Wizard intent IR should not expose detailed setting ' + forbiddenKey + '.');
+  }
 }
 
 function testLocalWizardPromptIsCompactAndGrounded(context) {
@@ -321,6 +339,8 @@ function testIntentIrPlanningValidationRetryDraft(context) {
     assert(result.pipeline.nodes.some((node) => node.type === expectedType), 'Expected IR planning graph to include ' + expectedType + '.');
   }
   assert(result.pipeline.nodes.some((node) => node.type === 'retryLoop' && node.config.retryTargetNodeId), 'Expected retry loop to target the planned stage.');
+  const retryNode = result.pipeline.nodes.find((node) => node.type === 'retryLoop');
+  assertConfigUsesDefaults(retryNode, ['maxAttempts', 'retryTerminationAction', 'stopWhenRetryArtifactRepeats'], 'Retry Loop');
   assertRuntimeConfigsDoNotContainIntent(result.pipeline, intent);
 }
 
@@ -522,7 +542,7 @@ function testPartialStoryboardDraftStaysFlexible(context) {
   assert.strictEqual(result.pipeline.nodes.filter((node) => node.type === 'mediaExport').length, 0, 'Fallback scaffold should not inject video export into a partial flexible graph.');
   assert.strictEqual(result.pipeline.nodes.find((node) => node.id === 'script').label, 'Text Input', 'Runtime-facing labels should not keep authoring instructions.');
   assert.strictEqual(result.pipeline.nodes.find((node) => node.id === 'script').config.text, '', 'Runtime input should stay empty.');
-  assert.strictEqual(result.pipeline.nodes.find((node) => node.id === 'prompt').config.notes, '', 'Generic runtime config fields should not keep copied wizard intent.');
+  assert.strictEqual(result.pipeline.nodes.find((node) => node.id === 'prompt').config.notes, undefined, 'Unknown runtime config fields should be removed.');
   const validationNode = result.pipeline.nodes.find((node) => node.id === 'check');
   assert.notStrictEqual(validationNode.config.ruleset, intent, 'Validation rules should not copy the wizard request.');
   assert(!/Build a pipeline/i.test(validationNode.config.systemPrompt), 'Validation system prompt should not keep authoring instructions.');
@@ -1109,6 +1129,7 @@ function testMediaCompositionPassTwoDrafts(context) {
           inputs: ['images', 'narrationAudio', 'backgroundMusic'],
           output: 'composition',
           mediaComposition: {
+            compositionMode: MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW,
             timingMode: 'dynamicFromImageMetadata',
             fallbackSecondsPerImage: 5,
             transitionsEnabled: true,
@@ -1131,69 +1152,135 @@ function testMediaCompositionPassTwoDrafts(context) {
   assertKnownNodeTypes(result.pipeline);
   const compositionNode = result.pipeline.nodes.find((node) => node.type === 'mediaComposition');
   assert(compositionNode, 'Expected Media Composition node from compose_media IR.');
-  assert.strictEqual(compositionNode.config.imageTimingMode, 'dynamicFromImageMetadata');
-  assert.strictEqual(compositionNode.config.secondsPerItem, 5);
-  assert.strictEqual(compositionNode.config.sceneTransitionMode, 'randomCategory');
-  assert.strictEqual(compositionNode.config.sceneTransitionCategory, 'wipes');
-  assert.strictEqual(compositionNode.config.narrationVolume, 0.82);
-  assert.strictEqual(compositionNode.config.backgroundMusicVolume, 0.2);
-  assert.strictEqual(compositionNode.config.soundEffectsEnabled, true);
-  assert.strictEqual(compositionNode.config.soundEffectsVolume, 0.31);
-  assert.strictEqual(compositionNode.config.soundEffectsLibraryId, 'sfx-halloween');
-  assert.deepStrictEqual(compositionNode.config.soundEffectsLayers.map((layer) => layer.libraryId), ['sfx-halloween', 'sfx-ambience']);
+  assert.strictEqual(compositionNode.config.compositionMode, MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW);
+  assertConfigUsesDefaults(compositionNode, [
+    'imageTimingMode',
+    'secondsPerItem',
+    'sceneTransitionMode',
+    'sceneTransitionCategory',
+    'narrationVolume',
+    'backgroundMusicVolume',
+    'sourceVideoVolume',
+    'soundEffectsEnabled',
+    'soundEffectsVolume',
+    'soundEffectsLibraryId',
+    'soundEffectsLayers',
+  ], 'Media Composition');
+  assert(result.pipeline.edges.some((edge) => edge.target.nodeId === compositionNode.id && edge.target.portId === 'visuals'), 'Expected image collection to connect to Media Composition visuals.');
   assert(result.pipeline.edges.some((edge) => edge.target.nodeId === compositionNode.id && edge.target.portId === 'audio'), 'Expected narration audio to connect to Media Composition primary audio.');
   assert(result.pipeline.edges.some((edge) => edge.target.nodeId === compositionNode.id && edge.target.portId === 'backgroundMusic'), 'Expected background music to connect to Media Composition backgroundMusic.');
+  const exportNode = result.pipeline.nodes.find((node) => node.type === 'mediaExport');
+  assert(exportNode, 'Expected Media Export after Media Composition.');
+  assertConfigUsesDefaults(exportNode, ['width', 'height', 'fps', 'fitMode', 'stopMode'], 'Media Export');
 }
 
 function testBurnSubtitlesPassTwoDrafts(context) {
-  const result = buildDirectIrDraft({
-    context,
-    intent: 'Burn large bold horror captions into a video using the Horror Fonts library and Horror Palette, validate it, and retry on failure.',
-    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
-    intentIr: {
-      sources: [
-        { name: 'sourceVideo', modality: 'video', role: 'Source video' },
-        { name: 'captionText', modality: 'text', role: 'Caption text' },
-      ],
-      stages: [
+  const intent = 'Burn captions into a source video and output the captioned video.';
+  const plan = parsePipelineWizardPlan(JSON.stringify({
+    title: 'Caption burn cleanup fixture',
+    draftGraph: {
+      nodes: [
+        { id: 'video', type: 'videoInput', config: { filePath: 'C:/invented/source.mp4' } },
+        { id: 'captions', type: 'textInput', config: { text: 'Invented runtime captions' } },
         {
-          id: 'burnCaptions',
-          kind: 'burn_subtitles',
-          input: 'sourceVideo',
-          inputs: ['sourceVideo', 'captionText'],
-          output: 'captionedVideo',
-          burnSubtitles: {
-            fontLibraryRef: 'Horror Fonts',
-            colorPaletteRef: 'Horror Palette',
-            position: 'bottomCenter',
-            styleIntent: 'large bold horror',
+          id: 'burn',
+          type: 'burnSubtitles',
+          config: {
+            captionMode: 'fixed',
+            durationPerCaptionSeconds: 9,
+            fontSize: 72,
+            fontSource: 'assetLibrary',
+            fontLibraryId: 'font-horror',
+            fontItemId: 'nosifer-regular',
+            colorSource: 'palette',
+            colorPaletteLibraryId: 'palette-horror',
+            position: 'topCenter',
+            bold: true,
+            outputFormat: 'webm',
           },
         },
-        { id: 'validateCaptions', kind: 'validate', input: 'captionedVideo', output: 'reviewedCaptionedVideo' },
-        { id: 'retryCaptions', kind: 'retry', input: 'reviewedCaptionedVideo', output: 'approvedCaptionedVideo', retryTarget: 'burnCaptions', maxAttempts: 4 },
+        { id: 'output', type: 'videoOutput', config: { title: 'Captioned video' } },
       ],
-      outputs: [{ artifact: 'approvedCaptionedVideo', kind: 'video', title: 'Captioned video' }],
+      edges: [
+        { sourceNodeId: 'video', sourcePortId: 'video', targetNodeId: 'burn', targetPortId: 'video' },
+        { sourceNodeId: 'captions', sourcePortId: 'text', targetNodeId: 'burn', targetPortId: 'captions' },
+        { sourceNodeId: 'burn', sourcePortId: 'video', targetNodeId: 'output', targetPortId: 'video' },
+      ],
     },
+  }), { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: plan,
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-4o-mini' },
   });
 
   assertNoStructuralErrors(result.pipeline);
   assertKnownNodeTypes(result.pipeline);
   const burnNode = result.pipeline.nodes.find((node) => node.type === 'burnSubtitles');
   assert(burnNode, 'Expected Burn Subtitles node from burn_subtitles IR.');
-  assert.strictEqual(burnNode.config.fontSource, 'assetLibrary');
-  assert.strictEqual(burnNode.config.fontLibraryId, 'font-horror');
-  assert.strictEqual(burnNode.config.fontItemId, 'nosifer-regular');
-  assert.strictEqual(burnNode.config.colorSource, 'palette');
-  assert.strictEqual(burnNode.config.colorPaletteLibraryId, 'palette-horror');
-  assert.strictEqual(burnNode.config.textColorPaletteItemId, 'blood-red');
-  assert.strictEqual(burnNode.config.outlineColorPaletteItemId, 'bone-white');
-  assert.strictEqual(burnNode.config.backgroundColorPaletteItemId, 'grave-black');
-  assert.strictEqual(burnNode.config.position, 'bottomCenter');
-  assert.strictEqual(burnNode.config.fontSize, 36);
-  assert.strictEqual(burnNode.config.bold, true);
-  const retryNode = result.pipeline.nodes.find((node) => node.type === 'retryLoop');
-  assert(retryNode, 'Expected retry loop after caption validation.');
-  assert.strictEqual(retryNode.config.retryTargetNodeId, burnNode.id, 'Expected caption retry to target Burn Subtitles.');
+  assertConfigUsesDefaults(burnNode, [
+    'captionMode',
+    'durationPerCaptionSeconds',
+    'fontSize',
+    'fontSource',
+    'fontLibraryId',
+    'fontItemId',
+    'colorSource',
+    'colorPaletteLibraryId',
+    'position',
+    'bold',
+    'outputFormat',
+  ], 'Burn Subtitles');
+  assert.strictEqual(result.pipeline.nodes.find((node) => node.type === 'videoInput').config.filePath, '', 'Wizard should not invent a source video path.');
+  assert.strictEqual(result.pipeline.nodes.find((node) => node.type === 'textInput').config.text, '', 'Wizard should not invent runtime caption text.');
+}
+
+function testWizardOverConfigurationCleanup(context) {
+  const intent = 'Generate an image from a runtime text prompt.';
+  const plan = parsePipelineWizardPlan(JSON.stringify({
+    title: 'Image generation cleanup fixture',
+    draftGraph: {
+      nodes: [
+        { id: 'prompt', type: 'textInput', config: { text: 'Invented runtime prompt' } },
+        {
+          id: 'generate',
+          type: 'llmPrompt',
+          config: {
+            executionMode: 'localTool',
+            operationId: 'imageGenerate',
+            toolId: 'automatic1111',
+            width: 2048,
+            height: 2048,
+            steps: 80,
+            cfgScale: 15,
+            seed: 42,
+            negativePrompt: 'Invented negative prompt',
+          },
+        },
+        { id: 'output', type: 'imageOutput', config: { title: 'Generated image' } },
+      ],
+      edges: [
+        { sourceNodeId: 'prompt', sourcePortId: 'text', targetNodeId: 'generate', targetPortId: 'prompt' },
+        { sourceNodeId: 'generate', sourcePortId: 'image', targetNodeId: 'output', targetPortId: 'image' },
+      ],
+    },
+  }), { intent });
+  const result = buildPipelineWizardDraft({
+    context,
+    intent,
+    modelPlan: plan,
+    wizardTarget: { mode: 'cloud', providerId: 'openai', model: 'gpt-image-1' },
+  });
+
+  assertNoStructuralErrors(result.pipeline);
+  const promptNode = result.pipeline.nodes.find((node) => node.type === 'textInput');
+  const generateNode = result.pipeline.nodes.find((node) => node.type === 'llmPrompt');
+  assert(promptNode && generateNode, 'Expected cleaned image-generation draft.');
+  assert.strictEqual(promptNode.config.text, '', 'Wizard should leave runtime model prompts empty.');
+  assert.strictEqual(generateNode.config.operationId, 'imageGenerate', 'Wizard should preserve the structural model operation.');
+  assert.strictEqual(generateNode.config.toolId, 'automatic1111', 'Wizard should preserve a grounded installed tool choice.');
+  assertConfigUsesDefaults(generateNode, ['width', 'height', 'steps', 'cfgScale', 'seed', 'negativePrompt'], 'Model Step');
 }
 function assertNormalizeDraft({ context, sourceKind, outputKind, nodeType, outputFormat, expectedFormat }) {
   const result = buildDirectIrDraft({
@@ -1277,7 +1364,9 @@ function testCollectionMapPerItemValidationPassThree(context) {
   assert(mapNode, 'Expected prompt collection image generation to lower to collectionMap.');
   assert.strictEqual(mapNode.config.perItemValidation?.enabled, true, 'Per-item validation should be enabled for each generated item review.');
   assert.strictEqual(mapNode.config.perItemValidation?.mode, 'user');
-  assert.strictEqual(mapNode.config.perItemValidation?.maxAttempts, 3, 'Retry failed items should raise per-item attempts.');
+  assert.strictEqual(mapNode.config.perItemValidation?.maxAttempts, getDefaultNodeConfig('collectionMap').perItemValidation.maxAttempts, 'Per-item validation should keep the schema retry threshold.');
+  assert.strictEqual(mapNode.config.perItemValidation?.ruleset, '', 'Wizard should leave per-item validation rules to the node inspector.');
+  assert.strictEqual(mapNode.config.perItemValidation?.retryInstruction, '', 'Wizard should leave per-item retry instructions to the node inspector.');
   assert.strictEqual(mapNode.config.failureMode, 'fail-fast');
 }
 
@@ -1380,8 +1469,10 @@ function testDeterministicMediaUtilitiesFinalPass(context) {
 
   const stitchedVideo = buildPromptDraft('stitch these videos together');
   assertNoStructuralErrors(stitchedVideo.pipeline);
-  assert(stitchedVideo.pipeline.nodes.some((node) => node.type === 'videoStitch'), 'Video stitch prompt should lower to Video Stitch.');
-  assert(stitchedVideo.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Video stitch should output video.');
+  assert(stitchedVideo.pipeline.nodes.some((node) => node.type === 'mediaComposition' && node.config.compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE), 'Video stitch prompt should use video-sequence composition.');
+  assert(!stitchedVideo.pipeline.nodes.some((node) => node.type === 'videoStitch'), 'Video-sequence composition should not also lower to Video Stitch.');
+  assert(stitchedVideo.pipeline.nodes.some((node) => node.type === 'mediaExport'), 'Video-sequence composition should render through Media Export.');
+  assert(stitchedVideo.pipeline.nodes.some((node) => node.type === 'videoOutput'), 'Video-sequence composition should output video.');
 
   const slideshow = buildPromptDraft('turn these images into a slideshow video');
   assertNoStructuralErrors(slideshow.pipeline);
@@ -1462,7 +1553,7 @@ function testConstrainedWizardPromptIsCompactAndBudgeted(context) {
   const promptText = JSON.stringify(messages);
   const userPayload = JSON.parse(messages[1].content);
   assert.strictEqual(profile.compactMode, true, 'Groq GPT-OSS wizard requests should use compact mode.');
-  assert.strictEqual(profile.maxOutputTokens, 1024, 'Groq GPT-OSS wizard responses should stay within the constrained response budget.');
+  assert.strictEqual(profile.maxOutputTokens, 2048, 'Groq GPT-OSS wizard responses should have enough room for compact structured output and low-effort reasoning.');
   assert(promptText.includes('Using compact wizard mode for this model.'), 'Compact mode prompt should include the plain-English compact note.');
   assert(promptText.length < 14000, 'Compact constrained-model prompt should stay small enough to avoid the observed Groq TPM failure.');
   assert(userPayload.allowedNodeTypes.length < context.nodeTypes.length, 'Compact mode should filter node type context to the relevant surface.');
@@ -1476,42 +1567,56 @@ function testConstrainedWizardPromptIsCompactAndBudgeted(context) {
 }
 
 function testMediaCompositionMalformedRepairReliability(context) {
-  const intent = 'Compose an image collection into a narration-synced slideshow with fallback 8 seconds per image, random wipes, narration at 100%, quiet background music, and Halloween sound effects.';
-  const result = buildPipelineWizardDraft({
+  const buildPromptDraft = (intent) => buildPipelineWizardDraft({
     context,
     intent,
     modelPlan: parsePipelineWizardPlan('not valid json', { intent }),
     wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
   });
-  const nodeTypes = result.pipeline.nodes.map((node) => node.type);
-  for (const expectedType of ['collectionInput', 'audioInput', 'mediaComposition', 'mediaExport', 'videoOutput']) {
-    assert(nodeTypes.includes(expectedType), 'Malformed media composition repair should include ' + expectedType + '.');
-  }
-  assert.strictEqual(nodeTypes.filter((type) => type === 'audioInput').length, 2, 'Media composition repair should include narration and background music audio inputs.');
-  assert(!nodeTypes.includes('audioOutput'), 'Media composition repair should not recover into an audio output pipeline.');
-  const mediaNode = result.pipeline.nodes.find((node) => node.type === 'mediaComposition');
-  assert(mediaNode, 'Expected Media Composition node.');
-  assert.strictEqual(mediaNode.config.imageTimingMode, 'dynamicFromImageMetadata', 'Narration-synced slideshows should use dynamic image timing.');
-  assert.strictEqual(mediaNode.config.secondsPerItem, 8, 'Fallback seconds per image should be preserved from malformed-output repair.');
-  assert.strictEqual(mediaNode.config.sceneTransitionMode, 'randomCategory', 'Random wipes should use random transition category mode.');
-  assert.strictEqual(mediaNode.config.sceneTransitionCategory, 'wipes', 'Random wipes should preserve the wipes category.');
-  assert.strictEqual(mediaNode.config.narrationVolume, 1, 'Narration at 100% should preserve full narration volume.');
-  assert.strictEqual(mediaNode.config.backgroundMusicVolume, 0.18, 'Quiet background music should lower only the music mix level.');
-  assert.strictEqual(mediaNode.config.soundEffectsEnabled, true, 'Halloween sound effects should enable SFX layers.');
-  assert.strictEqual(mediaNode.config.soundEffectsLibraryId, 'sfx-halloween', 'Halloween SFX should resolve the matching asset library when available.');
-  assert.strictEqual(mediaNode.config.soundEffectsLayers.length, 1, 'Resolved SFX library should become a SFX layer.');
-  assert(!result.summary.gaps.some((gap) => /generatedAudio|audio output/i.test(gap)), 'Media repair should not leave an audio-output gap.');
+  const cases = [
+    { intent: 'make a slideshow from these images', mode: MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW, sourceType: 'collectionInput', sourceKind: 'image', portId: 'visuals' },
+    { intent: 'add narration to an image slideshow', mode: MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW, sourceType: 'collectionInput', sourceKind: 'image', portId: 'visuals', audioPortId: 'audio' },
+    { intent: 'combine several video clips into one video', mode: MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE, sourceType: 'collectionInput', sourceKind: 'video', portId: 'videos' },
+    { intent: 'add background music to a collection of videos', mode: MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE, sourceType: 'collectionInput', sourceKind: 'video', portId: 'videos', audioPortId: 'backgroundMusic' },
+    { intent: 'add background music to this existing video', mode: MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX, sourceType: 'videoInput', portId: 'video', audioPortId: 'backgroundMusic' },
+    { intent: 'add narration to one existing video', mode: MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX, sourceType: 'videoInput', portId: 'video', audioPortId: 'audio' },
+  ];
 
-  const noLibraryContext = buildPipelineWizardContext({ hardware, manifests: tools, providers, tools, assetLibraries: { soundEffects: [], fonts: [], colorPalettes: [] } });
-  const missingLibraryResult = buildPipelineWizardDraft({
-    context: noLibraryContext,
-    intent,
-    modelPlan: parsePipelineWizardPlan('', { intent }),
-    wizardTarget: { mode: 'cloud', providerId: 'google', model: 'gemini-2.5-flash' },
-  });
-  const missingMediaNode = missingLibraryResult.pipeline.nodes.find((node) => node.type === 'mediaComposition');
-  assert(missingMediaNode?.config.soundEffectsEnabled, 'Missing SFX libraries should not disable requested sound effects.');
-  assert(missingLibraryResult.summary.gaps.some((gap) => /Sound Effects|asset library/i.test(gap)), 'Missing SFX library should be surfaced as an explicit assumption/gap.');
+  for (const fixture of cases) {
+    const result = buildPromptDraft(fixture.intent);
+    assertNoStructuralErrors(result.pipeline);
+    const mediaNode = result.pipeline.nodes.find((node) => node.type === 'mediaComposition');
+    const sourceNode = result.pipeline.nodes.find((node) => node.type === fixture.sourceType && (!fixture.sourceKind || node.config?.itemType === fixture.sourceKind));
+    const exportNode = result.pipeline.nodes.find((node) => node.type === 'mediaExport');
+    const outputNode = result.pipeline.nodes.find((node) => node.type === 'videoOutput');
+    assert(mediaNode, 'Expected Media Composition for: ' + fixture.intent);
+    assert(sourceNode, 'Expected compatible visual source for: ' + fixture.intent);
+    assert(exportNode && outputNode, 'Expected Media Export and Video Output for: ' + fixture.intent);
+    assert.strictEqual(mediaNode.config.compositionMode, fixture.mode, 'Unexpected composition mode for: ' + fixture.intent);
+    assert(result.pipeline.edges.some((edge) => edge.source.nodeId === sourceNode.id && edge.target.nodeId === mediaNode.id && edge.target.portId === fixture.portId), 'Expected source wiring to ' + fixture.portId + ' for: ' + fixture.intent);
+    if (fixture.audioPortId) {
+      assert(result.pipeline.edges.some((edge) => edge.target.nodeId === mediaNode.id && edge.target.portId === fixture.audioPortId), 'Expected audio wiring to ' + fixture.audioPortId + ' for: ' + fixture.intent);
+    }
+    assert(result.pipeline.edges.some((edge) => edge.source.nodeId === mediaNode.id && edge.source.portId === 'composition' && edge.target.nodeId === exportNode.id && edge.target.portId === 'composition'), 'Media Composition should feed Media Export for: ' + fixture.intent);
+    assert(result.pipeline.edges.some((edge) => edge.source.nodeId === exportNode.id && edge.source.portId === 'video' && edge.target.nodeId === outputNode.id && edge.target.portId === 'video'), 'Media Export should feed Video Output for: ' + fixture.intent);
+    assertConfigUsesDefaults(mediaNode, [
+      'imageTimingMode',
+      'secondsPerItem',
+      'sceneTransitionMode',
+      'sceneTransitionDurationSeconds',
+      'narrationVolume',
+      'backgroundMusicVolume',
+      'sourceVideoVolume',
+      'soundEffectsEnabled',
+    ], 'Media Composition');
+    assertConfigUsesDefaults(exportNode, ['width', 'height', 'fps', 'fitMode', 'stopMode'], 'Media Export');
+  }
+
+  const ambiguous = buildPromptDraft('make a video from media');
+  const ambiguousMediaNode = ambiguous.pipeline.nodes.find((node) => node.type === 'mediaComposition');
+  assertNoStructuralErrors(ambiguous.pipeline);
+  assert.strictEqual(ambiguousMediaNode?.config.compositionMode, MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW, 'Ambiguous media composition should use the documented image-slideshow assumption.');
+  assert(ambiguous.summary.gaps.some((gap) => /assum|image slideshow|image collection/i.test(gap)), 'Ambiguous composition should surface its image-slideshow assumption.');
 }
 function testRecordInputWizardDrafts(context) {
   const buildPromptDraft = (intent) => buildPipelineWizardDraft({
@@ -1537,6 +1642,7 @@ function testRecordInputWizardDrafts(context) {
     assert.strictEqual(recordNode.config.microphoneId, '', 'Wizard must not invent a microphone id.');
     assert.strictEqual(recordNode.config.webcamId, '', 'Wizard must not invent a webcam id.');
     assert.strictEqual(recordNode.config.displayId, '', 'Wizard must not invent a display id.');
+    assertConfigUsesDefaults(recordNode, ['fps', 'captureTarget'], 'Record Input');
     return { result, recordNode };
   };
 
@@ -1553,6 +1659,7 @@ function testRecordInputWizardDrafts(context) {
   const microphoneTranscript = assertRecordDraft('record my microphone and transcribe it', 'microphone', 'audio');
   const microphoneWhisper = microphoneTranscript.result.pipeline.nodes.find((node) => node.type === 'llmPrompt' && node.config?.operationId === 'whisperTranscribe');
   assert(microphoneWhisper && hasEdge(microphoneTranscript.result, microphoneTranscript.recordNode, 'audio', microphoneWhisper, 'prompt'), 'Microphone Record Input should feed Whisper transcription.');
+  assert.strictEqual(microphoneWhisper.config.model, '', 'Whisper should use its runtime default model unless the user explicitly chooses one.');
   assert(microphoneTranscript.result.pipeline.nodes.some((node) => node.type === 'textOutput'), 'Microphone transcription should end in Text Output.');
 
   const voiceoverSlideshow = assertRecordDraft('record a voiceover and make a slideshow video', 'microphone', 'audio');
@@ -1600,12 +1707,16 @@ function testRecordInputWizardDrafts(context) {
   assert(hasEdge(reviewed.result, reviewed.recordNode, 'audio', validationNode, 'input'), 'Record Input should feed Validation first.');
   assert(hasEdge(reviewed.result, retryNode, 'result', reviewedWhisper, 'prompt'), 'Approved/retried recording should feed transcription.');
   assert.strictEqual(retryNode.config.retryTargetNodeId, reviewed.recordNode.id, 'Validation retry should target Record Input for a fresh recording.');
+  assertConfigUsesDefaults(retryNode, ['maxAttempts', 'retryTerminationAction', 'stopWhenRetryArtifactRepeats'], 'Retry Loop');
 }
 const context = buildPipelineWizardContext({ hardware, manifests: tools, providers, tools, assetLibraries });
 testWizardPromptBoundary(context);
 testLocalWizardPromptIsCompactAndGrounded(context);
 testConstrainedWizardPromptIsCompactAndBudgeted(context);
 testMediaCompositionMalformedRepairReliability(context);
+testMediaCompositionPassTwoDrafts(context);
+testBurnSubtitlesPassTwoDrafts(context);
+testWizardOverConfigurationCleanup(context);
 testRecordInputWizardDrafts(context);
 testTextToImageDraft(context);
 testIntentIrTextToImageDraft(context);

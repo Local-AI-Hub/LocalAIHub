@@ -1300,6 +1300,8 @@ async function withPlainEnglishErrors(handler, fallbackMessage, options = {}) {
     return {
       ok: false,
       message: humanizeError(error, fallbackMessage),
+      ...(error?.diagnosticCategory ? { diagnosticCategory: error.diagnosticCategory } : {}),
+      ...(error?.providerDiagnostics ? { providerDiagnostics: error.providerDiagnostics } : {}),
     };
   }
 }

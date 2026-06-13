@@ -5,10 +5,10 @@ const {
   GRAPH_WORKFLOW_TOOL_IDS,
   IMAGE_TRANSFORM_TOOL_IDS,
   IMAGE_WORKFLOW_TOOL_IDS,
+  MEDIA_COMPOSITION_MODES,
   NODE_TYPE_LIST,
   PIPELINE_OPERATION_IDS,
   PIPELINE_RECORD_INPUT_CAPABILITY,
-  PIPELINE_RETRY_LOOP_MAX_ATTEMPTS,
   RECORD_INPUT_MODE_IDS,
   RECORD_INPUT_MODE_OPTIONS,
   VIDEO_WORKFLOW_TOOL_IDS,
@@ -89,6 +89,7 @@ const WIZARD_CLOUD_IMAGE_PROVIDER_IDS = Object.freeze(['openai', 'google', 'xai'
 const WIZARD_CLOUD_VIDEO_PROVIDER_IDS = Object.freeze(['google', 'xai']);
 const WIZARD_OPERATION_SUBTYPES = Object.freeze(['textToImage', 'imageToImage', 'textToVideo', 'imageToVideo', 'referenceVoiceTts']);
 const WIZARD_COLLECTION_MAPPING_MODES = Object.freeze(['textToImage', 'cloudImageToImage', 'textToVideo', 'cloudImageToVideo', 'textToAudio']);
+const WIZARD_MEDIA_COMPOSITION_MODE_IDS = Object.freeze(Object.values(MEDIA_COMPOSITION_MODES));
 const WIZARD_NORMALIZE_MEDIA_KINDS = Object.freeze(['audio', 'video', 'image']);
 const WIZARD_NORMALIZE_FORMATS_BY_KIND = Object.freeze({
   audio: Object.freeze(['auto', 'normalized', 'wav', 'mp3', 'flac', 'ogg', 'm4a']),
@@ -199,88 +200,20 @@ function normalizeWizardCollectionMappingMode(value) {
   return '';
 }
 
-function normalizeWizardTimingMode(value) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
-  if (['dynamic', 'dynamicfromimagemetadata', 'matchnarration', 'matchnarrationtiming', 'transcripttiming', 'narrationtiming'].includes(normalized)) return 'dynamicFromImageMetadata';
-  if (['fixed', 'fixeddurationperimage', 'secondsperimage'].includes(normalized)) return 'fixedDurationPerImage';
-  return '';
-}
-
-function normalizeWizardTransitionMode(value, enabled = false) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
-  if (!normalized && enabled) return 'randomCategory';
-  if (['off', 'none', 'false'].includes(normalized)) return 'off';
-  if (['single', 'fade', 'fixed'].includes(normalized)) return 'single';
-  if (['random', 'randomcategory', 'category'].includes(normalized)) return 'randomCategory';
-  if (['randomselected', 'selected'].includes(normalized)) return 'randomSelected';
-  return enabled ? 'randomCategory' : '';
-}
-
-function normalizeWizardTransitionCategory(value) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
-  if (['wipe', 'wipes'].includes(normalized)) return 'wipes';
-  if (['slide', 'slides'].includes(normalized)) return 'slides';
-  if (['smoothwipe', 'smoothwipes'].includes(normalized)) return 'smoothWipes';
-  if (['shape', 'shapes', 'crop', 'crops', 'shapescrops'].includes(normalized)) return 'shapesCrops';
-  if (['open', 'close', 'openscloses'].includes(normalized)) return 'opensCloses';
-  if (['diagonal', 'diag'].includes(normalized)) return 'diagonal';
-  if (['slice', 'slices'].includes(normalized)) return 'slices';
-  if (['blur', 'pixel', 'pixelize', 'blurpixel'].includes(normalized)) return 'blurPixel';
-  if (['zoom', 'squeeze', 'squeezezoom'].includes(normalized)) return 'squeezeZoom';
-  if (['wind'].includes(normalized)) return 'wind';
-  if (['cover'].includes(normalized)) return 'cover';
-  if (['reveal'].includes(normalized)) return 'reveal';
-  if (['distance', 'radial', 'distanceradial'].includes(normalized)) return 'distanceRadial';
-  return 'fades';
-}
-
-function normalizeWizardVolume(value, fallback = null) {
-  if (value === undefined || value === null || value === '') return fallback;
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return fallback;
-  return Math.max(0, Math.min(2, Math.round(numeric * 100) / 100));
-}
-
-function normalizeWizardSeconds(value, fallback = null) {
-  if (value === undefined || value === null || value === '') return fallback;
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return fallback;
-  return Math.max(0.1, Math.min(60, Math.round(numeric * 10) / 10));
-}
-
-function normalizeWizardStringList(value) {
-  const entries = Array.isArray(value) ? value : String(value || '').split(/[,;|]/);
-  return entries.map((entry) => String(entry || '').trim()).filter(Boolean).slice(0, 6);
-}
-
 function normalizeWizardMediaCompositionOptions(value = {}) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  const transitionsEnabled = source.transitionsEnabled === true || source.transitions === true || source.sceneTransitions === true;
-  const soundEffectsEnabled = source.soundEffectsEnabled === true || source.soundEffects === true;
+  const compositionMode = String(source.compositionMode || source.mode || '').trim();
   return {
-    timingMode: normalizeWizardTimingMode(source.timingMode || source.imageTimingMode),
-    fallbackSecondsPerImage: normalizeWizardSeconds(source.fallbackSecondsPerImage ?? source.secondsPerImage ?? source.secondsPerItem),
-    fixedSecondsPerImage: normalizeWizardSeconds(source.fixedSecondsPerImage ?? source.secondsPerImage ?? source.secondsPerItem),
-    transitionsEnabled,
-    transitionMode: normalizeWizardTransitionMode(source.transitionMode || source.sceneTransitionMode, transitionsEnabled),
-    transitionCategory: normalizeWizardTransitionCategory(source.transitionCategory || source.sceneTransitionCategory),
-    narrationVolume: normalizeWizardVolume(source.narrationVolume),
-    backgroundMusicVolume: normalizeWizardVolume(source.backgroundMusicVolume),
-    soundEffectsEnabled,
-    soundEffectsVolume: normalizeWizardVolume(source.soundEffectsVolume),
-    soundEffectLibraryRefs: normalizeWizardStringList(source.soundEffectLibraryRefs || source.soundEffectsLibraryRefs || source.soundEffectsLibraries || source.soundEffectLibraries || source.soundEffectsLibrary || source.soundEffectLibraryRef),
+    compositionMode: WIZARD_MEDIA_COMPOSITION_MODE_IDS.includes(compositionMode)
+      ? compositionMode
+      : MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW,
   };
 }
 
 function normalizeWizardBurnSubtitlesOptions(value = {}) {
   const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
-  const position = String(source.position || '').trim();
   return {
     enabled: source.enabled !== false,
-    fontLibraryRef: String(source.fontLibraryRef || source.fontLibrary || source.font || '').trim(),
-    colorPaletteRef: String(source.colorPaletteRef || source.colorPalette || source.palette || '').trim(),
-    position: ['topLeft', 'topCenter', 'topRight', 'middleLeft', 'middleCenter', 'middleRight', 'bottomLeft', 'bottomCenter', 'bottomRight'].includes(position) ? position : '',
-    styleIntent: String(source.styleIntent || source.style || '').trim(),
   };
 }
 
@@ -337,11 +270,6 @@ function normalizeWizardCollectionValidationOptions(value = {}) {
   return {
     enabled,
     scope: enabled ? 'perItem' : rawScope === 'wholecollection' ? 'wholeCollection' : '',
-    mode: 'user',
-    ruleset: trimPreviewText(normalizeString(source.ruleset || source.rules || ''), 220),
-    retryInstruction: trimPreviewText(normalizeString(source.retryInstruction || source.retry || ''), 220),
-    maxAttempts: Math.max(1, Math.min(PIPELINE_RETRY_LOOP_MAX_ATTEMPTS, Number(source.maxAttempts || source.attempts || 2) || 2)),
-    failMode: normalizeId(source.failMode || source.failureMode) === 'partial' ? 'partial' : 'fail-fast',
   };
 }
 
@@ -488,9 +416,9 @@ function extractWizardDeterministicUtilityIntent(intent = '') {
     || /\bextract\b[^.]{0,40}\b\d+(?:\.\d+)?\s*(?:second|sec|s|minute|min)\b[^.]{0,30}\bclip\b/.test(text)
     || /\b(start at|end at|from)\b[^.]{0,80}\b(to|until|through|end at)\b/.test(text)
     || /\bremove (?:the )?(beginning|start|intro|ending|end|outro)\b/.test(text);
-  const wantsAudioStitch = /\b(stitch|combine|append|join|concatenate|merge)\b[^.]{0,80}\b(audio|sound|clips?|files?)\b/.test(text)
+  const wantsAudioStitch = /\b(stitch|combine|append|join|concatenate|merge)\b[^.]{0,80}\b(audio|sound)(?: clips?| files?)?\b/.test(text)
     || /\b(audio|sound)\b[^.]{0,80}\b(stitch|combine|append|join|concatenate|merge)\b/.test(text);
-  const wantsVideoStitch = !wantsAudioStitch && !/\b(slideshow|slide show|image sequence|images? to video|media composition)\b/.test(text)
+  const wantsVideoStitch = !wantsAudioStitch && !inferWizardMediaCompositionMode(text)
     && (/\b(stitch|combine|append|join|concatenate|merge)\b[^.]{0,80}\b(videos?|clips?|movies?)\b/.test(text)
       || /\b(videos?|clips?|movies?)\b[^.]{0,80}\b(stitch|combine|append|join|concatenate|merge)\b/.test(text));
 
@@ -585,7 +513,7 @@ function inferWizardCollectionValidationIntent(intent = '') {
 
 function inferWizardRecordInputIntent(intent = '') {
   const text = String(intent || '').toLowerCase();
-  const hasRecordingAction = /\b(record|capture)\b/.test(text) || /\b(screen|webcam|camera|microphone|audio|video) recording\b/.test(text);
+  const hasRecordingAction = /\b(?:record|capture)\s+(?:my|the|a|an|this|that|system|computer|desktop|screen|webcam|camera|microphone|mic|audio|video|voice|speech)\b/.test(text);
   const hasRegion = /\b(screen )?(region|area|portion|crop)\b|\b(region|area|portion) of (?:my |the )?screen\b/.test(text);
   const hasWindow = /\b(window capture|record (?:a |the )?window|capture (?:a |the )?window)\b/.test(text);
   const hasWebcam = /\b(webcam|web cam|camera recording|record (?:my |the )?camera)\b/.test(text);
@@ -700,15 +628,56 @@ function getDefaultValidationRuleset(kind = 'artifact') {
   return 'Review the connected runtime artifact and choose Pass only when it is ready for the next stage.';
 }
 
+function inferWizardMediaCompositionMode(intent = '') {
+  const text = String(intent || '').toLowerCase();
+  const asksForSingleImageVideoGeneration = !/\b(slideshow|slide show|collection|multiple|several|these images?)\b/.test(text)
+    && (/\b(image|photo|picture)[-\s]?to[-\s]?video\b/.test(text)
+      || /\b(turn|animate|convert)\b[^.]{0,60}\b(this|one|single|the|an?)\s+(image|photo|picture)\b[^.]{0,60}\b(video|animation|motion)\b/.test(text)
+      || /\b(generat\w*|creat\w*|mak\w*)\b[^.]{0,60}\b(video|animation|motion)\b[^.]{0,60}\bfrom\s+(this|one|single|the|an?)\s+(image|photo|picture)\b/.test(text));
+  if (asksForSingleImageVideoGeneration) return '';
+  const hasImageSource = /\b(images?|photos?|pictures?|visuals?|image collection|picture collection|scene images?)\b/.test(text);
+  const hasVideoCollection = /\b(video collection|collection of videos?|multiple videos?|several videos?|video clips?|multiple clips?|several clips?|video segments?)\b/.test(text);
+  const hasSingleVideo = /\b(this video|the video|one video|single video|existing video|source video|video file)\b/.test(text);
+  const asksForAudioMix = /\b(add|mix|put|layer|combine|replace)\b[^.]{0,80}\b(audio|music|background music|narration|voiceover|voice over|soundtrack)\b/.test(text)
+    || /\b(audio|music|background music|narration|voiceover|voice over|soundtrack)\b[^.]{0,80}\b(to|into|under|with)\b[^.]{0,50}\b(video|videos?|clips?|media)\b/.test(text);
+  const asksForImageVideo = /\b(slideshow|slide show|images? to video|image collection to video|picture slideshow|narrated image slideshow|scene images? composed into a video)\b/.test(text)
+    || /\b(turn|make|compose|sequence)\b[^.]{0,100}\b(images?|photos?|pictures?|visuals?|image collection)\b[^.]{0,100}\b(video|slideshow|slide show)\b/.test(text);
+  const asksForVideoSequence = /\b(combine|stitch|merge|join|compose|sequence)\b[^.]{0,100}\b(videos?|video clips?|clips?|video segments?)\b/.test(text)
+    || /\bmake\b[^.]{0,100}\b(?:multiple|several|collection of)\s+(?:videos?|video clips?|clips?)\b/.test(text)
+    || /\b(videos?|video clips?|clips?|video segments?)\b[^.]{0,100}\b(one video|single video|combine|stitch|merge|join|compose|sequence)\b/.test(text);
+  const asksForComposition = /\b(media composition|compose media|compose media into a video|make a video from media|add audio to media)\b/.test(text);
+
+  if (asksForImageVideo || (hasImageSource && /\b(slideshow|slide show|compose|sequence|narration|voiceover)\b/.test(text))) {
+    return MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW;
+  }
+  if (hasVideoCollection && (asksForVideoSequence || asksForAudioMix || /\bvideo\b/.test(text))) {
+    return MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE;
+  }
+  if (hasSingleVideo && asksForAudioMix) {
+    return MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX;
+  }
+  if (asksForVideoSequence) {
+    return MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE;
+  }
+  if (asksForComposition) {
+    if (/\b(images?|photos?|pictures?)\b/.test(text)) return MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW;
+    if (/\b(clips|videos|video collection)\b/.test(text)) return MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE;
+    if (/\b(one|single|existing|this|the|source)\s+video\b/.test(text)) return MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX;
+    return MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW;
+  }
+  return '';
+}
+
 function inferIntentFeatures(intent) {
   const text = String(intent || '').toLowerCase();
+  const mediaCompositionMode = inferWizardMediaCompositionMode(text);
   const normalizeMediaIntent = extractWizardNormalizeMediaIntent(text);
   const utilityIntent = extractWizardDeterministicUtilityIntent(text);
   const wantsDeterministicUtility = utilityIntent.wantsTrimMedia || utilityIntent.wantsExtractAudio || utilityIntent.wantsExtractVideoFrame || utilityIntent.wantsExportSubtitles || utilityIntent.wantsAudioStitch || utilityIntent.wantsVideoStitch;
   const heavyCooldown = inferWizardHeavyCooldown(text);
   const collectionValidation = inferWizardCollectionValidationIntent(text);
   const recordInput = inferWizardRecordInputIntent(text);
-  const wantsMediaComposition = /\b(slideshow|slide show|sequence images?|image sequence|media composition|compose media|compose (?:an? )?(?:image )?(?:collection|sequence|slideshow|video)|compose\b[^.]{0,120}\b(images?|photos?|pictures?|image collection)\b[^.]{0,120}\b(video|slideshow|slide show)|turn .*images?.*video|images? .*to .*video|image collection .*into .*slideshow|image collection .*into .*video)\b/.test(text);
+  const wantsMediaComposition = Boolean(mediaCompositionMode);
   const wantsNarrationSyncedTiming = /\b(sync(?:ed)? to narration|narration[-\s]?sync(?:ed)?|narration[-\s]?synced|match .*transcript timing|match .*narration timing|dynamic .*timing|transcript timing|voiceover timing|timed to (?:the )?(?:narration|transcript))\b/.test(text);
   return {
     wantsRecordInput: recordInput.requested,
@@ -737,6 +706,7 @@ function inferIntentFeatures(intent) {
       || /\b(voice lines?|tts clips?|speech clips?)\b[^.]{0,80}\b(many|multiple|several|batch|collection|list)\b/.test(text),
     wantsPreviousLastFrameChaining: /\b(previous[-\s]?last[-\s]?frame|last[-\s]?frame chain|chain(?:ing)? from (?:the )?previous|continuous scenes?|continuity|use (?:the )?previous frame|previous clip(?:'s)? last frame)\b/.test(text),
     wantsMediaComposition,
+    mediaCompositionMode,
     wantsNarrationSyncedTiming,
     wantsSceneTransitions: /\b(transitions?|crossfade|xfade|fade|dissolve|wipes?|slides?|cinematic transitions?|random transitions?|random wipes?|scene transitions?)\b/.test(text),
     wantsSoundEffects: /\b(sound effects?|sfx|ambience|ambient sounds?|environmental sounds?|spooky sounds?|halloween sounds?|transition sounds?)\b/.test(text),
@@ -761,7 +731,7 @@ function inferIntentFeatures(intent) {
     heavyStepCooldownSeconds: heavyCooldown.seconds,
     wantsPerItemCollectionValidation: collectionValidation.perItem,
     wantsWholeCollectionValidation: collectionValidation.wholeCollection,
-    wantsVideo: /\b(video|slideshow|slide show|sequence|sequencing|compose|composition|export|render|movie|clip|animation|animate)\b/.test(text),
+    wantsVideo: /\b(videos?|slideshow|slide show|sequence|sequencing|compose|composition|export|render|movies?|clips?|animation|animate)\b/.test(text),
   };
 }
 
@@ -936,23 +906,6 @@ function isProviderUsableForOperation(provider, operationId) {
   return Boolean(provider?.isConnected && getProviderPipelineOperation(provider.id, operationId));
 }
 
-function compactWizardAssetLibraries(assetLibraries = {}) {
-  const compact = (entries) => (Array.isArray(entries) ? entries : []).map((library) => ({
-    id: String(library?.id || '').trim(),
-    name: String(library?.name || library?.displayName || '').trim(),
-    items: (Array.isArray(library?.items) ? library.items : []).slice(0, 8).map((item) => ({
-      id: String(item?.id || '').trim(),
-      name: String(item?.name || item?.displayName || item?.fileName || '').trim(),
-      hex: String(item?.hex || item?.value || '').trim(),
-    })).filter((item) => item.id || item.name),
-  })).filter((library) => library.id || library.name);
-  return {
-    soundEffects: compact(assetLibraries.soundEffects),
-    fonts: compact(assetLibraries.fonts),
-    colorPalettes: compact(assetLibraries.colorPalettes),
-  };
-}
-
 function buildPipelineWizardContext({ hardware = {}, manifests = [], providers = [], tools = [], assetLibraries = {} } = {}) {
   const availableTools = buildAvailableToolEntries(tools, manifests, hardware);
   const connectedProviders = (Array.isArray(providers) ? providers : [])
@@ -1049,7 +1002,6 @@ function compactWizardContextForPrompt(context = {}) {
         message: tool.hardwareSuitability.message,
       } : null,
     })),
-    assetLibraries: compactWizardAssetLibraries(context.assetLibraries),
     maturePlanningSchemas: context.maturePlanningSchemas || [],
   };
 }
@@ -1076,7 +1028,6 @@ function compactWizardContextForLocalPrompt(context = {}) {
       tool.status,
       tool.hardwareSuitability?.tone || '',
     ].filter(Boolean).join('|')),
-    assetLibraries: compactWizardAssetLibraries(context.assetLibraries),
     toolOperationSupport: Object.fromEntries(Object.entries(context.toolOperationSupport || {}).map(([operationId, entries]) => [
       operationId,
       (entries || []).map((entry) => entry.id + (entry.hardwareSuitability?.tone ? ':' + entry.hardwareSuitability.tone : '')),
@@ -1126,13 +1077,12 @@ function filterWizardContextForIntent(context = {}, intent = '') {
   const selectedProviderIds = new Set(['openai', 'google', 'xai', 'groq']);
   const features = inferIntentFeatures(intent);
   const obligations = extractWizardRequestObligations(intent);
-  const wantsAssetLibraries = features.wantsSoundEffects || features.wantsBurnSubtitles || obligations.wantsComposition || obligations.wantsBurnSubtitles;
   return {
     ...context,
     nodeTypes: (context.nodeTypes || []).filter((node) => relevantNodeTypes.has(node.type)),
     connectedProviders: (context.connectedProviders || []).filter((provider) => selectedProviderIds.has(normalizeId(provider.id))),
     availableTools: (context.availableTools || []).filter((tool) => ['automatic1111', 'comfyui', 'ollama', 'whisper', 'audiocraft', 'chatterboxTurbo', 'chatterbox-turbo', 'wan', 'wan21', 'upscayl', 'facefusion'].includes(normalizeId(tool.id))),
-    assetLibraries: wantsAssetLibraries ? compactWizardAssetLibraries(context.assetLibraries) : {},
+    assetLibraries: {},
     maturePlanningSchemas: features.wantsPlanning ? (context.maturePlanningSchemas || []) : [],
   };
 }
@@ -1172,9 +1122,9 @@ function getPipelineWizardRequestProfile({ intent = '', context = {}, wizardTarg
   const maxOutputTokens = target.mode === 'ollama'
     ? 700
     : isGroqGptOss
-      ? 1024
+      ? 2048
       : isGeminiFlash
-        ? 1536
+        ? 2048
         : compactMode
           ? 2048
           : 4096;
@@ -1263,18 +1213,9 @@ function buildPipelineWizardIntentIrJsonSchema() {
                 mediaComposition: {
                   type: 'object',
                   additionalProperties: false,
+                  required: ['compositionMode'],
                   properties: {
-                    timingMode: { type: 'string', enum: ['', 'fixedDurationPerImage', 'dynamicFromImageMetadata'] },
-                    fallbackSecondsPerImage: { type: 'number' },
-                    fixedSecondsPerImage: { type: 'number' },
-                    transitionsEnabled: { type: 'boolean' },
-                    transitionMode: { type: 'string', enum: ['', 'off', 'single', 'randomCategory', 'randomSelected'] },
-                    transitionCategory: { type: 'string' },
-                    narrationVolume: { type: 'number' },
-                    backgroundMusicVolume: { type: 'number' },
-                    soundEffectsEnabled: { type: 'boolean' },
-                    soundEffectsVolume: { type: 'number' },
-                    soundEffectLibraryRefs: { type: 'array', items: { type: 'string' } },
+                    compositionMode: { type: 'string', enum: WIZARD_MEDIA_COMPOSITION_MODE_IDS },
                   },
                 },
                 burnSubtitles: {
@@ -1282,10 +1223,6 @@ function buildPipelineWizardIntentIrJsonSchema() {
                   additionalProperties: false,
                   properties: {
                     enabled: { type: 'boolean' },
-                    fontLibraryRef: { type: 'string' },
-                    colorPaletteRef: { type: 'string' },
-                    position: { type: 'string' },
-                    styleIntent: { type: 'string' },
                   },
                 },
                 normalizeMedia: {
@@ -1303,16 +1240,10 @@ function buildPipelineWizardIntentIrJsonSchema() {
                   properties: {
                     enabled: { type: 'boolean' },
                     scope: { type: 'string', enum: ['', 'perItem', 'wholeCollection'] },
-                    mode: { type: 'string', enum: ['', 'user', 'manual', 'approval'] },
-                    ruleset: { type: 'string' },
-                    retryInstruction: { type: 'string' },
-                    maxAttempts: { type: 'integer', minimum: 1, maximum: PIPELINE_RETRY_LOOP_MAX_ATTEMPTS },
-                    failMode: { type: 'string', enum: ['', 'fail-fast', 'partial'] },
                   },
                 },
                 validationMode: { type: 'string', enum: ['', 'llm', 'user', 'manual', 'approval'] },
                 retryTarget: { type: 'string' },
-                maxAttempts: { type: 'integer', minimum: 2, maximum: PIPELINE_RETRY_LOOP_MAX_ATTEMPTS },
               },
             },
           },
@@ -1381,7 +1312,11 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         'Leave runtime source content empty unless actual source content was supplied.',
         'Preserve requested modality, validation, retry, planning, collection, generation, transformation, composition, utility, and export intent.',
         'When the user asks to record a source, use an audio or video source with recordInput {mode,outputKind,captureTarget}. Choose only a supported Record Input mode and do not invent device ids, display ids, or region coordinates.',
-        'Use optional stage controls only when needed: operationSubtype, providerPreference, mappingMode, referenceAudio, previousLastFrameChaining, mediaComposition, burnSubtitles, normalizeMedia, collectionValidation.',
+        'Use optional stage controls only when needed for valid structure: operationSubtype, providerPreference, mappingMode, referenceAudio, previousLastFrameChaining, mediaComposition.compositionMode, normalizeMedia, collectionValidation.',
+        'Media Composition modes are imageSlideshow for image collections, videoSequence for video collections, and singleVideoMix for one existing video. Audio sources use audio or backgroundMusic inputs.',
+        'For every compose_media stage, include the visual source and every requested narration/music source in intentIr.sources and stage.inputs, then emit a composition artifact, an export stage, and a video output.',
+        'Treat add-music, music-bed, background-track, narration, or voiceover wording as an audio source placeholder unless the user explicitly asks to generate or create new audio.',
+        'Do not configure timing, FPS, transitions, volume, sound effects, device/display ids, region coordinates, generation tuning, retry thresholds, or export codecs/bitrates. Node defaults and the node inspector own those settings.',
         'Cloud image providers are OpenAI, Google, and xAI. Cloud video providers are Google and xAI only; do not claim OpenAI/Sora video support.',
         'Use referenceVoiceTts with a referenceAudio source for Chatterbox-Turbo reference voice requests.',
         'For deterministic utilities use trim_media, extract_audio, extract_video_frame, export_subtitles, stitch_audio, stitch_video, or normalize_media; do not use Model Step.',
@@ -1400,12 +1335,15 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
         'For complex requests, decompose into intentIr stages for transcription, planning, plan_scenes, validation, retry, generate_image, generate_audio, transform_audio, generate_video, transform_image, normalize_media, trim_media, extract_audio, extract_video_frame, export_subtitles, stitch_audio, stitch_video, compose_media, export, and outputs when requested.',
         'For recorded sources, add recordInput to the source with a supported mode and matching audio/video outputKind. Runtime settings handle microphone, webcam, display, and region selection.',
         'Return JSON only. The JSON must be an object with: title, summary, intentIr, recipeId, gaps, userRefinementNotes. draftGraph is legacy fallback only.',
-        'intentIr shape: {sources:[{name,modality,role}], artifacts:[{name,kind}], stages:[{id,kind,input,output,inputs,outputs,purpose,operationSubtype,providerPreference,mappingMode,referenceAudio,previousLastFrameChaining,mediaComposition,burnSubtitles,normalizeMedia,trimMedia,extractVideoFrame,exportSubtitles,mediaStitch,collectionValidation,validationMode,retryTarget,maxAttempts}], outputs:[{artifact,kind,title}], gaps, assumptions}.',
+        'intentIr shape: {sources:[{name,modality,role}], artifacts:[{name,kind}], stages:[{id,kind,input,output,inputs,outputs,purpose,operationSubtype,providerPreference,mappingMode,referenceAudio,previousLastFrameChaining,mediaComposition:{compositionMode},normalizeMedia,trimMedia,extractVideoFrame,exportSubtitles,mediaStitch,collectionValidation,validationMode,retryTarget}], outputs:[{artifact,kind,title}], gaps, assumptions}.',
         'Cloud image generation is limited to OpenAI, Google, and xAI. Cloud video generation is limited to Google and xAI; never plan OpenAI/Sora video.',
         'For cloud image/video collection maps, use mappingMode textToImage, cloudImageToImage, textToVideo, or cloudImageToVideo. Set previousLastFrameChaining only when the user asks for continuity/last-frame chaining.',
         'For Chatterbox-Turbo reference voice TTS, use operationSubtype referenceVoiceTts and include/connect a referenceAudio source. Paralinguistic tags stay inline in text.',
-        'For deterministic utilities, use trim_media, extract_audio, extract_video_frame, export_subtitles, stitch_audio, or stitch_video instead of Model Step. Export subtitles creates a file; Burn Subtitles renders captions into video. For narration-synced slideshows, use compose_media with mediaComposition.timingMode dynamicFromImageMetadata and fallbackSecondsPerImage. For transitions, set mediaComposition.transitionsEnabled with randomCategory unless a simple fade is requested.',
-        'For sound effects, set mediaComposition.soundEffectsEnabled and soundEffectLibraryRefs using only available asset library ids/names. For captions, use burn_subtitles with burnSubtitles font/color/position intent.',
+        'For deterministic utilities, use trim_media, extract_audio, extract_video_frame, export_subtitles, stitch_audio, or stitch_video instead of Model Step. Export subtitles creates a file; Burn Subtitles renders captions into video.',
+        'Use compose_media with mediaComposition.compositionMode imageSlideshow for collection:image, videoSequence for collection:video, or singleVideoMix for one video. Connect narration or other primary audio to audio and music beds to backgroundMusic.',
+        'Every compose_media workflow must declare its visual source and each requested audio source, include them in stage.inputs, produce a composition artifact, then use export and a video output. Treat an existing recording/capture as a video source unless the user explicitly asks to record or capture it now.',
+        'In composition requests, add-music, music-bed, background-track, narration, and voiceover wording means an audio source input unless the user explicitly asks to generate or create the audio.',
+        'Do not emit detailed node settings such as timing, FPS, transitions, volume, SFX scheduling, capture ids/coordinates, model tuning, retry thresholds, or export encoding settings.',
         'Use stage kinds only from supportedIntentStageKinds. Local AI Hub will choose exact nodes, ports, tools, providers, validation, and wiring.',
         'For collectionMap item generation, prefer collectionValidation.scope perItem when the user asks to validate/review every generated item or retry failed items. Use whole-collection validation only when explicitly requested.',
         'Local AI Hub will repair missing explicit source/output modality and requested planning/validation/retry/composition/export structure before graph compilation, so keep intentIr compact and honest.',
@@ -1448,9 +1386,8 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
             cloudVideoProviders: 'Cloud video generation providers: google, xai only. Do not use OpenAI/Sora video.',
             cloudVideoCollectionChaining: 'For requested continuity or previous-last-frame behavior, set previousLastFrameChaining true on textToVideo or cloudImageToVideo collection maps for google/xai.',
             referenceVoiceTts: 'Use generate_audio with operationSubtype referenceVoiceTts and referenceAudio for Chatterbox-Turbo. For many voice lines, use collection:text to collection:audio mappingMode textToAudio with shared reference audio.',
-            mediaComposition: 'Use compose_media for collection:image slideshows. For narration or transcript sync set mediaComposition.timingMode dynamicFromImageMetadata and fallbackSecondsPerImage. For transitions set transitionsEnabled true and transitionMode randomCategory or single.',
-            soundEffectsLibraries: 'For ambience/SFX, set mediaComposition.soundEffectsEnabled true and soundEffectLibraryRefs to existing Sound Effects library ids/names only. Multiple refs become multiple SFX layers.',
-            burnSubtitles: 'Use burn_subtitles after a video artifact and a text/file captions artifact. Set burnSubtitles fontLibraryRef, colorPaletteRef, position, and styleIntent only when requested and only from existing libraries.',
+            mediaComposition: 'Use compose_media with compositionMode imageSlideshow for collection:image, videoSequence for collection:video, or singleVideoMix for video. Declare the visual source and every requested narration/music source, include them in stage.inputs, route primary audio to audio and music beds to backgroundMusic, then produce composition -> export -> video output. Treat add-music/background-track wording as an audio input unless generation is explicit. Existing recordings/captures are video sources unless the user explicitly asks to record now. Leave detailed media settings to the node inspector.',
+            burnSubtitles: 'Use burn_subtitles after a video artifact and a text/file captions artifact. Leave caption styling to the node inspector.',
             localAudioGeneration: 'Use generate_audio for text-to-audio/music/sound requests; Local AI Hub prefers AudioCraft when installed or compatible provider speech where available.',
             localAudioTransform: 'Use transform_audio for RVC/voice-conversion requests with an audio source placeholder and manual voice-model selection.',
             localVideoGeneration: 'Use generate_video for text-to-video or image-to-video requests; image-to-video uses an image source placeholder and editable motion guidance.',
@@ -1466,13 +1403,21 @@ function buildPipelineWizardMessages({ intent = '', context = {}, wizardTarget =
   ];
 }
 
-function extractJsonObject(text) {
+function extractJsonObjectWithDiagnostics(text) {
   const raw = String(text || '').trim();
   if (!raw) {
-    return null;
+    return {
+      parsed: null,
+      category: 'provider_returned_empty',
+      extracted: false,
+    };
   }
   try {
-    return JSON.parse(raw);
+    return {
+      parsed: JSON.parse(raw),
+      category: '',
+      extracted: false,
+    };
   } catch {
     // Continue below and try to rescue the first JSON object from a chatty response.
   }
@@ -1480,13 +1425,101 @@ function extractJsonObject(text) {
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
   if (start < 0 || end <= start) {
-    return null;
+    return {
+      parsed: null,
+      category: 'json_parse_failed',
+      extracted: false,
+    };
   }
   try {
-    return JSON.parse(raw.slice(start, end + 1));
+    return {
+      parsed: JSON.parse(raw.slice(start, end + 1)),
+      category: 'json_wrapped_or_extracted',
+      extracted: true,
+    };
   } catch {
-    return null;
+    return {
+      parsed: null,
+      category: 'json_parse_failed',
+      extracted: false,
+    };
   }
+}
+
+function getWizardJsonValueType(value) {
+  if (Array.isArray(value)) return 'array';
+  if (value === null) return 'null';
+  if (Number.isInteger(value)) return 'integer';
+  return typeof value;
+}
+
+function validateWizardJsonSchemaValue(value, schema, path = '$', issues = []) {
+  if (!schema || typeof schema !== 'object') return issues;
+  const allowedTypes = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : [];
+  const actualType = getWizardJsonValueType(value);
+  if (allowedTypes.length && !allowedTypes.includes(actualType) && !(actualType === 'integer' && allowedTypes.includes('number'))) {
+    issues.push({
+      category: 'schema_validation_failed',
+      path,
+      message: path + ' must be ' + allowedTypes.join(' or ') + ', not ' + actualType + '.',
+    });
+    return issues;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    issues.push({
+      category: 'unsupported_enum',
+      path,
+      message: path + ' contains unsupported value "' + String(value) + '".',
+    });
+  }
+  if (actualType === 'object') {
+    const properties = schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+    for (const requiredKey of Array.isArray(schema.required) ? schema.required : []) {
+      if (!Object.prototype.hasOwnProperty.call(value, requiredKey)) {
+        issues.push({
+          category: 'missing_required_field',
+          path: path + '.' + requiredKey,
+          message: path + '.' + requiredKey + ' is required.',
+        });
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(value)) {
+        if (!Object.prototype.hasOwnProperty.call(properties, key)) {
+          issues.push({
+            category: 'schema_validation_failed',
+            path: path + '.' + key,
+            message: path + '.' + key + ' is not part of the Wizard Intent IR schema.',
+          });
+        }
+      }
+    }
+    for (const [key, childSchema] of Object.entries(properties)) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        validateWizardJsonSchemaValue(value[key], childSchema, path + '.' + key, issues);
+      }
+    }
+  }
+  if (actualType === 'array' && schema.items) {
+    value.forEach((entry, index) => validateWizardJsonSchemaValue(entry, schema.items, path + '[' + String(index) + ']', issues));
+  }
+  return issues;
+}
+
+function validatePipelineWizardStructuredOutput(value) {
+  const normalizedValue = value?.recipeId === null
+    ? Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'recipeId'))
+    : value;
+  const issues = validateWizardJsonSchemaValue(normalizedValue, buildPipelineWizardIntentIrJsonSchema());
+  const category = issues.find((issue) => issue.category === 'unsupported_enum')?.category
+    || issues.find((issue) => issue.category === 'missing_required_field')?.category
+    || issues[0]?.category
+    || '';
+  return {
+    category,
+    issues,
+    valid: issues.length === 0,
+  };
 }
 
 function inferRecipeIdFromIntent(intent) {
@@ -1693,24 +1726,10 @@ function normalizeWizardIntentIr(value, options = {}) {
       previousLastFrameChaining: stage?.previousLastFrameChaining === true || stage?.lastFrameChaining === true || stage?.chainPreviousLastFrame === true,
       mediaComposition: normalizeWizardMediaCompositionOptions({
         ...(stage?.mediaComposition && typeof stage.mediaComposition === 'object' ? stage.mediaComposition : {}),
-        timingMode: stage?.timingMode || stage?.imageTimingMode || stage?.mediaComposition?.timingMode,
-        fallbackSecondsPerImage: stage?.fallbackSecondsPerImage ?? stage?.mediaComposition?.fallbackSecondsPerImage,
-        fixedSecondsPerImage: stage?.fixedSecondsPerImage ?? stage?.mediaComposition?.fixedSecondsPerImage,
-        transitionsEnabled: stage?.transitionsEnabled ?? stage?.mediaComposition?.transitionsEnabled,
-        transitionMode: stage?.transitionMode || stage?.mediaComposition?.transitionMode,
-        transitionCategory: stage?.transitionCategory || stage?.mediaComposition?.transitionCategory,
-        narrationVolume: stage?.narrationVolume ?? stage?.mediaComposition?.narrationVolume,
-        backgroundMusicVolume: stage?.backgroundMusicVolume ?? stage?.mediaComposition?.backgroundMusicVolume,
-        soundEffectsEnabled: stage?.soundEffectsEnabled ?? stage?.mediaComposition?.soundEffectsEnabled,
-        soundEffectsVolume: stage?.soundEffectsVolume ?? stage?.mediaComposition?.soundEffectsVolume,
-        soundEffectLibraryRefs: stage?.soundEffectLibraryRefs || stage?.mediaComposition?.soundEffectLibraryRefs,
+        compositionMode: stage?.compositionMode || stage?.mediaComposition?.compositionMode || stage?.mode,
       }),
       burnSubtitles: normalizeWizardBurnSubtitlesOptions({
         ...(stage?.burnSubtitles && typeof stage.burnSubtitles === 'object' ? stage.burnSubtitles : {}),
-        fontLibraryRef: stage?.fontLibraryRef || stage?.burnSubtitles?.fontLibraryRef,
-        colorPaletteRef: stage?.colorPaletteRef || stage?.burnSubtitles?.colorPaletteRef,
-        position: stage?.position || stage?.burnSubtitles?.position,
-        styleIntent: stage?.styleIntent || stage?.burnSubtitles?.styleIntent,
       }),
       normalizeMedia: normalizeWizardNormalizeMediaOptions({
         ...(stage?.normalizeMedia && typeof stage.normalizeMedia === 'object' ? stage.normalizeMedia : {}),
@@ -1729,7 +1748,6 @@ function normalizeWizardIntentIr(value, options = {}) {
       }),
       validationMode: normalizeId(stage?.validationMode || stage?.mode),
       retryTarget: normalizeArtifactRef(stage?.retryTarget || stage?.targetStageId || stage?.target || stage?.retryTargetStageId),
-      maxAttempts: Math.max(2, Math.min(PIPELINE_RETRY_LOOP_MAX_ATTEMPTS, Number(stage?.maxAttempts || stage?.attempts || 3) || 3)),
     };
   }).filter(Boolean);
   const outputs = (Array.isArray(input.outputs) ? input.outputs : []).map((output, index) => {
@@ -1786,52 +1804,6 @@ function findIntentKeywordIndex(text, patterns = []) {
 
 function intentHasPattern(text, patterns = []) {
   return findIntentKeywordIndex(text, patterns) >= 0;
-}
-
-function buildWizardSourceObligation(intent, features) {
-  const text = String(intent || '');
-
-  if (features.wantsTrimMedia) {
-    const mediaKind = features.trimMediaKind === 'audio' ? 'audio' : 'video';
-    return { name: 'source' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1), modality: mediaKind, role: 'Source ' + mediaKind, explicit: true };
-  }
-  if (features.wantsExtractAudio || features.wantsExtractVideoFrame) {
-    return { name: 'sourceVideo', modality: 'video', role: 'Source video', explicit: true };
-  }
-  if (features.wantsBurnSubtitles) {
-    return { name: 'sourceVideo', modality: 'video', role: 'Source video', explicit: true };
-  }
-  if (features.wantsExportSubtitles) {
-    return { name: 'captionText', modality: 'text', role: 'Transcript or caption text', explicit: true };
-  }
-  if (features.wantsAudioStitch) {
-    return { name: 'sourceAudioCollection', modality: 'collection:audio', role: 'Source audio collection', explicit: true };
-  }
-  if (features.wantsVideoStitch) {
-    return { name: 'sourceVideoCollection', modality: 'collection:video', role: 'Source video collection', explicit: true };
-  }  if (features.wantsNormalizeMedia && features.normalizeMediaKind) {
-    const mediaKind = features.normalizeMediaKind;
-    const isCollection = features.wantsNormalizeMediaCollection === true;
-    const name = isCollection ? 'source' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1) + 'Collection' : 'source' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1);
-    const role = (isCollection ? 'Source ' + mediaKind + ' collection' : 'Source ' + mediaKind);
-    return { name, modality: isCollection ? 'collection:' + mediaKind : mediaKind, role, explicit: true };
-  }
-  if (features.wantsImageTransform || (features.wantsImageToVideo && !features.wantsPlanning) || intentHasPattern(text, [/\b(image input|input image|source image|image file|uploaded image|photo input|photo file)\b/])) {
-    return { name: 'sourceImage', modality: 'image', role: features.wantsFaceFusionTransform ? 'Target image' : 'Source image', explicit: true };
-  }
-  if (features.wantsAudioTransform || intentHasPattern(text, [/\b(audio input|input audio|audio file|source audio|uploaded audio|interview audio|recording|voice memo|voice note|podcast audio)\b/])) {
-    return { name: 'sourceAudio', modality: 'audio', role: 'Source audio', explicit: true };
-  }
-  if (intentHasPattern(text, [/\b(video input|input video|source video|video file|uploaded video|clip input)\b/])) {
-    return { name: 'sourceVideo', modality: 'video', role: 'Source video', explicit: true };
-  }
-  if (intentHasPattern(text, [/\b(file input|source file|uploaded file|document|pdf|spreadsheet|csv)\b/])) {
-    return { name: 'sourceFile', modality: 'file', role: 'Source file', explicit: true };
-  }
-  if (features.wantsVoiceoverSource) {
-    return { name: 'voiceoverScript', modality: 'text', role: 'Voiceover script', explicit: true };
-  }
-  return { name: 'runtimeSource', modality: 'text', role: getRuntimeSourceLabel(intent), explicit: false };
 }
 
 function isTextDescriptionGenerationRequest(intent) {
@@ -1930,7 +1902,23 @@ function buildWizardSourceObligation(intent, features) {
   }
   if (features.wantsVideoStitch) {
     return { name: 'sourceVideoCollection', modality: 'collection:video', role: 'Source video collection', explicit: true };
-  }  if (features.wantsNormalizeMedia && features.normalizeMediaKind) {
+  }
+  if (features.wantsMediaComposition && features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE) {
+    return { name: 'sourceVideos', modality: 'collection:video', role: 'Source video collection', explicit: true };
+  }
+  if (features.wantsMediaComposition && features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX) {
+    return { name: 'sourceVideo', modality: 'video', role: 'Source video', explicit: true };
+  }
+  if (features.wantsMediaComposition
+    && features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW
+    && !features.wantsPlanning
+    && !intentHasPattern(text, [
+      /\b(generat\w*|creat\w*|mak\w*|produc\w*)\b[^.]{0,80}\b(images?|photos?|pictures?|visuals?)\b/,
+      /\b(images?|photos?|pictures?|visuals?)\b[^.]{0,80}\b(generat\w*|creat\w*|produc\w*)\b/,
+    ])) {
+    return { name: 'sourceImages', modality: 'collection:image', role: 'Source image collection', explicit: true };
+  }
+  if (features.wantsNormalizeMedia && features.normalizeMediaKind) {
     const mediaKind = features.normalizeMediaKind;
     const isCollection = features.wantsNormalizeMediaCollection === true;
     const name = isCollection ? 'source' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1) + 'Collection' : 'source' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1);
@@ -2066,41 +2054,15 @@ function buildWizardOutputObligations(intent, features) {
   return outputs;
 }
 
-function buildWizardMediaCompositionOptions(intent, features = {}) {
-  const text = String(intent || '').toLowerCase();
-  const fallbackSecondsMatch = /\bfallback\s+(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)?\s*(?:per|\/)?\s*(?:image|slide|item)\b/.exec(text)
-    || /\b(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\s*(?:per|each)\s*(?:image|slide|item)\b/.exec(text);
-  const fallbackSeconds = fallbackSecondsMatch ? Number(fallbackSecondsMatch[1]) : null;
-  const narrationPercentMatch = /\bnarration\b[^.]{0,50}\b(\d{1,3})\s*%/.exec(text);
-  const narrationVolume = narrationPercentMatch ? Math.max(0, Math.min(2, Number(narrationPercentMatch[1]) / 100)) : (/narration[^.]{0,40}(quiet|soft|low)|quiet[^.]{0,40}narration/.test(text) ? 0.8 : 1);
-  const soundEffectLibraryRefs = [];
-  if (/\bhalloween\b/.test(text)) soundEffectLibraryRefs.push('Halloween Sounds');
-  if (/\b(spooky|horror)\b/.test(text)) soundEffectLibraryRefs.push('Spooky Sounds');
+function buildWizardMediaCompositionOptions(_intent, features = {}) {
   return normalizeWizardMediaCompositionOptions({
-    timingMode: features.wantsNarrationSyncedTiming ? 'dynamicFromImageMetadata' : '',
-    fallbackSecondsPerImage: features.wantsNarrationSyncedTiming ? (fallbackSeconds || 4) : fallbackSeconds,
-    fixedSecondsPerImage: features.wantsNarrationSyncedTiming ? null : (fallbackSeconds || 4),
-    transitionsEnabled: Boolean(features.wantsSceneTransitions),
-    transitionMode: features.wantsSceneTransitions ? (/\brandom\b/.test(text) ? 'randomCategory' : 'single') : '',
-    transitionCategory: /wipe/.test(text) ? 'wipes' : /slide/.test(text) ? 'slides' : /horror|spooky|halloween/.test(text) ? 'blurPixel' : 'fades',
-    narrationVolume,
-    backgroundMusicVolume: /background music|music/.test(text) ? (/quiet|quietly|beneath|under|low|soft/.test(text) ? 0.18 : 0.22) : null,
-    soundEffectsEnabled: Boolean(features.wantsSoundEffects),
-    soundEffectsVolume: features.wantsSoundEffects ? 0.35 : null,
-    soundEffectLibraryRefs,
+    compositionMode: features.mediaCompositionMode || MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW,
   });
 }
 
-function buildWizardBurnSubtitlesOptions(intent, features = {}) {
-  const text = String(intent || '').toLowerCase();
+function buildWizardBurnSubtitlesOptions(_intent, features = {}) {
   return normalizeWizardBurnSubtitlesOptions({
     enabled: Boolean(features.wantsBurnSubtitles),
-    position: /\btop\b/.test(text) ? 'topCenter' : /\bmiddle|center\b/.test(text) ? 'middleCenter' : 'bottomCenter',
-    styleIntent: [
-      /\blarge\b/.test(text) ? 'large' : '',
-      /\bhorror|spooky|halloween\b/.test(text) ? 'horror' : '',
-      /\bbold\b/.test(text) ? 'bold' : '',
-    ].filter(Boolean).join(' '),
   });
 }
 function buildWizardNormalizeMediaOptions(features = {}) {
@@ -2111,7 +2073,7 @@ function buildWizardNormalizeMediaOptions(features = {}) {
   });
 }
 
-function buildWizardPerItemValidationOptions(features = {}, wantsRetry = false) {
+function buildWizardPerItemValidationOptions(features = {}, _wantsRetry = false) {
   if (!features.wantsPerItemCollectionValidation || features.wantsWholeCollectionValidation) {
     return normalizeWizardCollectionValidationOptions({});
   }
@@ -2119,9 +2081,6 @@ function buildWizardPerItemValidationOptions(features = {}, wantsRetry = false) 
     enabled: true,
     scope: 'perItem',
     mode: 'user',
-    ruleset: 'Pass each mapped item only when it matches its source item and is usable for the next pipeline stage.',
-    retryInstruction: 'Regenerate only the failed item and preserve the accepted items in collection order.',
-    maxAttempts: wantsRetry ? 3 : 2,
     failMode: 'fail-fast',
   });
 }
@@ -2152,7 +2111,11 @@ function extractWizardRequestObligations(intent = '') {
   const features = inferIntentFeatures(normalizedIntent);
   const source = buildWizardSourceObligation(normalizedIntent, features);
   const outputs = buildWizardOutputObligations(normalizedIntent, features);
-  const rawWantsImageGeneration = hasExplicitImageGenerationRequest(normalizedIntent);
+  const rawWantsImageGeneration = hasExplicitImageGenerationRequest(normalizedIntent)
+    && !(features.wantsMediaComposition && source.modality === 'collection:image' && !intentHasPattern(normalizedIntent, [
+      /\b(prompts?|scene descriptions?|text)\b[^.]{0,80}\b(images?|visuals?)\b/,
+      /\b(generate|create|render|produce)\b[^.]{0,80}\b(each|per[-\s]?(scene|prompt)|from prompts?)\b/,
+    ]));
   const wantsNormalizeMedia = Boolean(features.wantsNormalizeMedia && features.normalizeMediaKind);
   const wantsVideoGeneration = Boolean(!wantsNormalizeMedia && (!features.wantsMediaComposition || features.wantsImageToVideo) && features.wantsVideoGeneration && !isVideoSourceAnalysisRequest(normalizedIntent) && !(features.wantsPlanning && rawWantsImageGeneration));
   const wantsCloudImageToImage = isCloudImageToImageRequest(normalizedIntent);
@@ -2169,7 +2132,7 @@ function extractWizardRequestObligations(intent = '') {
   const wantsVideoOutput = outputs.some((output) => output.kind === 'video') || intentHasPattern(normalizedIntent, [/\b(video output|output video|final video|storyboard video|export(?:ed)? video|render(?:ed)? video|final clip|captioned video|subtitled video)\b/]);
   const wantsComposition = !wantsVideoGeneration && (features.wantsMediaComposition || features.wantsNarrationSyncedTiming || features.wantsSoundEffects || ((wantsVideoOutput && wantsImageGeneration)
     || intentHasPattern(normalizedIntent, [/\b(sequence|sequenc\w+|compose|composition|slideshow|timeline)\b/])));
-  const wantsExport = !features.wantsExportSubtitles && !features.wantsBurnSubtitles && !wantsVideoGeneration && features.wantsVideo && source.modality !== 'video' && !isVideoSourceAnalysisRequest(normalizedIntent);
+  const wantsExport = !features.wantsExportSubtitles && !features.wantsBurnSubtitles && !wantsVideoGeneration && features.wantsVideo && (wantsComposition || source.modality !== 'video') && !isVideoSourceAnalysisRequest(normalizedIntent);
   const wantsExtractAudio = Boolean(features.wantsExtractAudio || (source.recordInput && source.modality === 'video' && features.wantsTranscription));
   const transformKind = (source.modality === 'audio' || (source.modality === 'video' && wantsExtractAudio)) && (wantsTextLikeOutput || features.wantsPlanning || features.wantsTranscription || intentHasPattern(normalizedIntent, [/\btranscrib\w*|speech to text|audio to text\b/]))
     ? 'transcribe_audio'
@@ -2203,6 +2166,9 @@ function extractWizardRequestObligations(intent = '') {
       features.trimMediaOptions?.assumedTiming && !/\b(to|first|last|from|until|through)\b[^.]{0,40}\b\d/i.test(normalizedIntent) ? 'Trim Media uses a conservative 5 second duration because the request did not specify a complete time range.' : '',
       features.wantsAudioGeneration && source.modality === 'audio' && wantsTextLikeOutput ? 'The request mentions text-to-speech, but it starts from audio and asks for text output, so the wizard drafts transcription and leaves speech generation out.' : '',
       features.extractVideoFrameOptions?.assumedFrame ? 'Extract Video Frame defaults to the first frame because the request did not specify a timestamp or first/last frame.' : '',
+      features.wantsMediaComposition && /\b(make a video from media|compose media into a video|add audio to media)\b/i.test(normalizedIntent) && !/\b(images?|photos?|pictures?|clips?|(?:collection of|several|multiple|these) videos?|one video|single video|existing video|this video|source video)\b/i.test(normalizedIntent)
+        ? 'The media source type was unclear, so the wizard used an image collection slideshow as the safest editable draft.'
+        : '',
     ].filter(Boolean),
     wantsNormalizeMedia,
     normalizeMediaOptions: buildWizardNormalizeMediaOptions(features),
@@ -2214,6 +2180,7 @@ function extractWizardRequestObligations(intent = '') {
     wantsVideoGeneration,
     wantsImageTransform,
     wantsComposition,
+    mediaCompositionMode: features.mediaCompositionMode || MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW,
     wantsBurnSubtitles: Boolean(features.wantsBurnSubtitles),
     collectionValidationOptions: buildWizardPerItemValidationOptions(features, features.wantsRetry || (source.recordInput && features.wantsValidation)),
     wantsHeavyStepCooldown: Boolean(features.wantsHeavyStepCooldown),
@@ -2227,7 +2194,12 @@ function extractWizardRequestObligations(intent = '') {
       ...(features.wantsFaceFusionTransform ? [{ name: 'referenceFaceImage', modality: 'image', role: 'Reference face image', explicit: true }] : []),
       ...(features.wantsReferenceVoiceTts ? [{ name: 'referenceVoiceAudio', modality: 'audio', role: 'Reference voice audio', explicit: true }] : []),
       ...(features.wantsBurnSubtitles && !features.wantsTranscription ? [{ name: 'captionText', modality: 'text', role: 'Caption text', explicit: true }] : []),
-      ...(wantsComposition && source.recordInput && source.modality === 'audio' ? [{ name: 'sourceImages', modality: 'collection:image', role: 'Slideshow images', explicit: true }] : []),
+      ...(wantsComposition && source.recordInput && source.modality === 'audio' ? [{
+        name: features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE ? 'sourceVideos' : features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX ? 'sourceVideo' : 'sourceImages',
+        modality: features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE ? 'collection:video' : features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX ? 'video' : 'collection:image',
+        role: features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE ? 'Source video collection' : features.mediaCompositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX ? 'Source video' : 'Slideshow images',
+        explicit: true,
+      }] : []),
       ...(wantsComposition && features.wantsVoiceoverSource && source.modality !== 'audio' ? [{ name: 'narrationAudio', modality: 'audio', role: 'Narration audio', explicit: true }] : []),
       ...(wantsComposition && /\b(background music|music bed|music track)\b/i.test(normalizedIntent) ? [{ name: 'backgroundMusic', modality: 'audio', role: 'Background music', explicit: true }] : []),
     ],
@@ -2344,6 +2316,12 @@ function doesIntentIrCoverObligations(intentIr, obligations) {
   }
 
   const stageKinds = normalizedIr.stages.map((stage) => stage.kind).filter(Boolean);
+  if (obligations.wantsComposition && !normalizedIr.stages.some((stage) => (
+    stage.kind === 'compose_media'
+    && stage.mediaComposition?.compositionMode === obligations.mediaCompositionMode
+  ))) {
+    reasons.push('stage:compose_media:' + obligations.mediaCompositionMode);
+  }
   let cursor = -1;
   for (const requiredKind of buildRequiredObligationStageKinds(obligations)) {
     const nextIndex = stageKinds.findIndex((kind, index) => index > cursor && kind === requiredKind);
@@ -2537,9 +2515,24 @@ function getWizardIntentStageSupport(kind, artifactKind, options = {}) {
     return { ok: false, message: 'Local AI Hub can only generate images from text prompts or image sources in this wizard pass.' };
   }
   if (kind === 'compose_media') {
-    return normalizedKind === 'image' || normalizedKind === 'collection:image'
+    const compositionMode = normalizeWizardMediaCompositionOptions({ compositionMode: options.compositionMode }).compositionMode;
+    const supportedKinds = {
+      [MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW]: ['image', 'collection:image'],
+      [MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE]: ['collection:video'],
+      [MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX]: ['video'],
+    };
+    return supportedKinds[compositionMode].includes(normalizedKind)
       ? { ok: true, outputKind: 'composition' }
-      : { ok: false, message: 'Local AI Hub needs an ordered image collection before media composition can be compiled.' };
+      : {
+          ok: false,
+          message: 'Local AI Hub needs '
+            + (compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+              ? 'an ordered video collection'
+              : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+                ? 'one video'
+                : 'an ordered image collection')
+            + ' for Media Composition ' + compositionMode + ' mode.',
+        };
   }
   if (kind === 'burn_subtitles') {
     return normalizedKind === 'video'
@@ -2606,7 +2599,7 @@ function getWizardStagePurpose(kind, obligations) {
     return 'Concatenate the ordered video collection into one video artifact.';
   }
   if (kind === 'compose_media') {
-    return 'Sequence the connected approved images into a reusable composition.';
+    return 'Compose the connected images or video source into a reusable video composition.';
   }
   if (kind === 'burn_subtitles') {
     return 'Render the connected captions into the connected video with editable caption styling.';
@@ -2750,6 +2743,7 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
     const support = getWizardIntentStageSupport(kind, inputKind, {
       hasValidation: extra.hasValidation || Boolean(lastValidationStage),
       operationSubtype: normalizeWizardOperationSubtype(extra.operationSubtype || borrowedStages.get(kind)?.[0]?.operationSubtype),
+      compositionMode: extra.mediaComposition?.compositionMode || borrowedStages.get(kind)?.[0]?.mediaComposition?.compositionMode,
     });
     if (!support.ok) {
       gaps.add(support.message);
@@ -2784,7 +2778,6 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
       burnSubtitles: normalizeWizardBurnSubtitlesOptions({ ...(borrowed?.burnSubtitles || {}), ...(extra.burnSubtitles || {}) }),
       validationMode: normalizeId(extra.validationMode || borrowed?.validationMode),
       retryTarget: normalizeArtifactRef(extra.retryTarget || borrowed?.retryTarget, ''),
-      maxAttempts: Math.max(2, Math.min(PIPELINE_RETRY_LOOP_MAX_ATTEMPTS, Number(extra.maxAttempts || borrowed?.maxAttempts || 3) || 3)),
     };
     stages.push(stage);
     currentArtifact = { name: outputArtifact.name, kind: outputArtifact.kind };
@@ -2817,7 +2810,6 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
         inputName: validationStage.output,
         inputKind: targetArtifact.kind,
         retryTarget: targetStage?.id || '',
-        maxAttempts: 3,
         hasValidation: true,
       });
     }
@@ -3053,11 +3045,19 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
     remainingValidationTargets.delete('latest');
   }
   if (obligations.wantsComposition && !bridgeBroken) {
+    const compositionMode = obligations.mediaCompositionMode || MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW;
+    const visualSource = sources.find((entry) => (
+      compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+        ? entry.modality === 'collection:video'
+        : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+          ? entry.modality === 'video'
+          : entry.modality === 'collection:image'
+    ));
     const compositionStage = addStage('compose_media', 'compose-media', 'mediaComposition', {
-      inputName: visualSourceArtifactName || currentArtifact?.name,
-      inputKind: visualSourceArtifactName ? 'collection:image' : currentArtifact?.kind,
+      inputName: visualSource?.name || visualSourceArtifactName || currentArtifact?.name,
+      inputKind: visualSource?.modality || (visualSourceArtifactName ? 'collection:image' : currentArtifact?.kind),
       inputNames: [source.modality === 'audio' ? sourceArtifactName : '', 'narrationAudio', 'backgroundMusic'].filter(Boolean),
-      mediaComposition: obligations.mediaCompositionOptions || {},
+      mediaComposition: { compositionMode },
       purpose: getWizardStagePurpose('compose_media', obligations),
     });
     if (compositionStage) {
@@ -3125,7 +3125,41 @@ function synthesizeIntentIrFromObligations(intentIr, obligations, options = {}) 
 }
 
 function repairPipelineWizardPlan(plan = {}, options = {}) {
-  const obligations = extractWizardRequestObligations(options.intent || '');
+  const inferredObligations = extractWizardRequestObligations(options.intent || '');
+  const normalizedIntentIr = normalizeWizardIntentIr(plan.intentIr, options);
+  const compositionStage = normalizedIntentIr.stages.find((stage) => stage.kind === 'compose_media');
+  const modelVideoOutputs = normalizedIntentIr.outputs.filter((output) => output.kind === 'video');
+  let obligations = inferredObligations;
+  if (compositionStage && modelVideoOutputs.length && (!inferredObligations.wantsComposition || (inferredObligations.wantsAudioGeneration && !inferredObligations.wantsVideoGeneration))) {
+    const compositionMode = normalizeWizardMediaCompositionOptions(compositionStage.mediaComposition || {}).compositionMode;
+    const visualKind = compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+      ? 'collection:video'
+      : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+        ? 'video'
+        : 'collection:image';
+    const visualSource = normalizedIntentIr.sources.find((source) => source.modality === visualKind) || null;
+    const modelAudioSources = normalizedIntentIr.sources.filter((source) => source.modality === 'audio');
+    const extraSourceKeys = new Set();
+    const extraSources = [...(inferredObligations.extraSources || []), ...modelAudioSources]
+      .filter((source) => {
+        const key = [source.name, source.modality].join(':');
+        if (!source.name || extraSourceKeys.has(key) || source.name === visualSource?.name) return false;
+        extraSourceKeys.add(key);
+        return true;
+      });
+    obligations = {
+      ...inferredObligations,
+      ...(visualSource ? { source: { ...visualSource, explicit: true } } : {}),
+      outputs: modelVideoOutputs.map((output) => ({ ...output, explicit: true })),
+      wantsAudioGeneration: false,
+      wantsVideoGeneration: false,
+      wantsComposition: true,
+      wantsExport: true,
+      mediaCompositionMode: compositionMode,
+      mediaCompositionOptions: { compositionMode },
+      extraSources,
+    };
+  }
   const hasDraftGraph = Array.isArray(plan?.draftGraph?.nodes) && plan.draftGraph.nodes.length > 0;
   if (hasDraftGraph || !hasStructuralRequestObligations(obligations)) {
     return {
@@ -3158,7 +3192,11 @@ function repairPipelineWizardPlan(plan = {}, options = {}) {
 }
 
 function parsePipelineWizardPlan(replyText, options = {}) {
-  const parsed = extractJsonObject(replyText);
+  const extraction = extractJsonObjectWithDiagnostics(replyText);
+  const parsed = extraction.parsed;
+  const schemaValidation = parsed
+    ? validatePipelineWizardStructuredOutput(parsed)
+    : { category: extraction.category, issues: [], valid: false };
   const allowedRecipeIds = new Set(WIZARD_RECIPE_OPTIONS.map((recipe) => recipe.id));
   const fallbackRecipeId = inferRecipeIdFromIntent(options.intent || '');
   const recipeId = allowedRecipeIds.has(String(parsed?.recipeId || '').trim())
@@ -3187,7 +3225,14 @@ function parsePipelineWizardPlan(replyText, options = {}) {
     userRefinementNotes: Array.isArray(parsed?.userRefinementNotes)
       ? parsed.userRefinementNotes.map((note) => trimPreviewText(normalizeString(note), 220)).filter(Boolean)
       : [],
-    usedFallback: !parsed || !allowedRecipeIds.has(String(parsed?.recipeId || '').trim()),
+    parseDiagnostics: {
+      category: extraction.category || schemaValidation.category,
+      extracted: extraction.extracted,
+      issues: schemaValidation.issues,
+      jsonParsed: Boolean(parsed),
+      schemaValid: schemaValidation.valid,
+    },
+    usedFallback: !parsed || extraction.extracted || !schemaValidation.valid,
   };
 }
 
@@ -3469,22 +3514,16 @@ function findReferenceAudioArtifact(stage = {}, artifactMap = {}, inputArtifact 
   return null;
 }
 
-function buildWizardCollectionMapPerItemValidationConfig(options = {}, outputKind = 'image') {
+function buildWizardCollectionMapPerItemValidationConfig(options = {}, _outputKind = 'image') {
   const normalized = normalizeWizardCollectionValidationOptions(options);
   if (!normalized.enabled || normalized.scope !== 'perItem') {
     return null;
   }
+  const defaults = cloneValue(getNodeTypeDefinition('collectionMap')?.configDefaults?.perItemValidation || {});
   return {
+    ...defaults,
     enabled: true,
     mode: 'user',
-    llmExecutionMode: 'cloud',
-    providerId: '',
-    model: '',
-    ruleset: normalized.ruleset || 'Pass each mapped ' + outputKind + ' item only when it matches its source item and is usable for the next pipeline stage.',
-    systemPrompt: '',
-    maxAttempts: normalized.maxAttempts || 2,
-    retryInstruction: normalized.retryInstruction || 'Regenerate only the failed item and preserve the accepted items in collection order.',
-    failMode: normalized.failMode || 'fail-fast',
   };
 }
 function makeCollectionMapOperationNode(index, operationId, inputKind, context, wizardTarget, intent, options = {}) {
@@ -3565,7 +3604,7 @@ function buildTranscriptionPipeline({ context }) {
   const nodes = [];
   const edges = [];
   const inputNode = makeNode('audioInput', 0, {}, 'Source audio');
-  const whisperNode = makeNode('llmPrompt', 1, buildLlmStepConfig(PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, { executionMode: 'localTool', toolId: 'whisper', model: 'base', providerId: '' }, '', {
+  const whisperNode = makeNode('llmPrompt', 1, buildLlmStepConfig(PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, { executionMode: 'localTool', toolId: 'whisper', model: '', providerId: '' }, '', {
     instruction: 'Transcribe the connected source audio into text.',
   }), 'Transcribe audio');
   const outputNode = makeOutputNode('text', 2, 'Transcript');
@@ -3575,7 +3614,7 @@ function buildTranscriptionPipeline({ context }) {
   return {
     nodes,
     edges,
-    target: { executionMode: 'localTool', toolId: 'whisper', model: 'base', providerId: '' },
+    target: { executionMode: 'localTool', toolId: 'whisper', model: '', providerId: '' },
     warnings: getToolEntry(context, 'whisper') ? [] : ['Install Whisper before this transcription draft can run.'],
   };
 }
@@ -3763,8 +3802,6 @@ function buildStoryboardVideoScaffoldPipeline({ intent, context, wizardTarget })
   const planValidationNode = add(makeNode('validation', 3, buildValidationConfig('plan', wizardTarget, 'Pass only if the plan has ordered scenes, clear visual intent, and enough detail to derive image prompts. Fail if scenes are missing, vague, or inconsistent with the runtime script.'), 'Validate plan'));
   const planLoopNode = add(makeNode('retryLoop', 4, {
     retryTargetNodeId: plannerNode.id,
-    maxAttempts: 3,
-    retryTerminationAction: 'fail',
   }, 'Retry plan until valid'));
   const planOutputNode = add(makeNode('planOutput', 5, { title: 'Approved scene plan' }, 'Approved plan'));
   planOutputNode.position.y -= 160;
@@ -3774,8 +3811,6 @@ function buildStoryboardVideoScaffoldPipeline({ intent, context, wizardTarget })
   promptValidationNode.position.y += 120;
   const promptLoopNode = add(makeNode('retryLoop', 7, {
     retryTargetNodeId: scenesNode.id,
-    maxAttempts: 3,
-    retryTerminationAction: 'fail',
   }, 'Retry prompts until valid'));
   promptLoopNode.position.y += 120;
   const promptOutputNode = add(makeNode('collectionOutput', 8, { title: 'Approved scene prompts' }, 'Approved prompts'));
@@ -3788,12 +3823,9 @@ function buildStoryboardVideoScaffoldPipeline({ intent, context, wizardTarget })
   imageValidationNode.position.y += 320;
   const imageLoopNode = add(makeNode('retryLoop', 10, {
     retryTargetNodeId: imageMapNode.id,
-    maxAttempts: 3,
-    retryTerminationAction: 'fail',
-    stopWhenRetryArtifactRepeats: true,
   }, 'Regenerate image collection until approved'));
   imageLoopNode.position.y += 320;
-  const compositionNode = add(makeNode('mediaComposition', 11, { secondsPerItem: 4 }, 'Sequence approved images'));
+  const compositionNode = add(makeNode('mediaComposition', 11, { compositionMode: MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW }, 'Sequence approved images'));
   compositionNode.position.y += 320;
   const exportNode = add(makeNode('mediaExport', 12, { title: 'Storyboard video' }, 'Export video'));
   exportNode.position.y += 320;
@@ -3887,8 +3919,6 @@ function buildImageDescriptionValidationPipeline({ intent, context, wizardTarget
   const validationNode = makeNode('validation', 2, buildValidationConfig('artifact', wizardTarget, 'Pass only if the image description is specific, accurate, and useful for the next pipeline stage. Fail if it is vague, empty, or does not describe the image.'), 'Validate description');
   const retryNode = makeNode('retryLoop', 3, {
     retryTargetNodeId: descriptionNode.id,
-    maxAttempts: 3,
-    retryTerminationAction: 'fail',
   }, 'Retry description until valid');
   const outputNode = makeOutputNode('text', 4, 'Approved description');
   nodes.push(sourceNode, descriptionNode, validationNode, retryNode, outputNode);
@@ -3957,9 +3987,46 @@ function getConfiguredOperationForNode(type, config = {}) {
   return '';
 }
 
+function pickWizardConfig(config = {}, keys = []) {
+  return Object.fromEntries(keys
+    .filter((key) => Object.prototype.hasOwnProperty.call(config, key))
+    .map((key) => [key, cloneValue(config[key])]));
+}
+
+function pruneWizardRequestedConfig(type, config = {}) {
+  if (['textInput', 'imageInput', 'audioInput', 'videoInput', 'fileInput'].includes(type)) return {};
+  if (type === 'recordInput') return pickWizardConfig(config, ['mode', 'outputKind']);
+  if (type === 'mediaComposition') return pickWizardConfig(config, ['compositionMode']);
+  if (type === 'mediaExport') return pickWizardConfig(config, ['title']);
+  if (type === 'burnSubtitles') return {};
+  if (type === 'retryLoop') return pickWizardConfig(config, ['retryTargetNodeId']);
+  if (type === 'collectionInput') return pickWizardConfig(config, ['itemType']);
+  if (type === 'normalizeAudioCollection' || type === 'normalizeVideoCollection' || type === 'normalizeImage') {
+    return pickWizardConfig(config, ['outputFormat']);
+  }
+  if (type === 'trimMedia') return pickWizardConfig(config, ['mode', 'startSeconds', 'durationSeconds', 'endSeconds']);
+  if (type === 'extractVideoFrame') return pickWizardConfig(config, ['framePosition', 'timestampSeconds', 'outputFormat']);
+  if (type === 'exportSubtitles') return pickWizardConfig(config, ['outputFormat', 'captionMode']);
+  if (type === 'audioStitch' || type === 'videoStitch') return pickWizardConfig(config, ['outputFormat']);
+  if (type === 'llmPrompt') {
+    return pickWizardConfig(config, ['executionMode', 'operationId', 'providerId', 'toolId', 'model', 'instruction', 'systemPrompt', 'audioMode', 'transformSubtype', 'analysisMode']);
+  }
+  if (type === 'collectionMap') {
+    return pickWizardConfig(config, ['mappingId', 'operationId', 'executionMode', 'providerId', 'toolId', 'graphWorkflowToolId', 'workflowText', 'inputBindings', 'outputBindings', 'workflowFormat', 'model', 'instruction', 'failureMode', 'audioMode', 'transformSubtype', 'analysisMode', 'videoItemMode']);
+  }
+  if (type === 'validation') {
+    return pickWizardConfig(config, ['mode', 'llmExecutionMode', 'providerId', 'model', 'ruleset', 'systemPrompt']);
+  }
+  if (type === 'graphWorkflow') {
+    return pickWizardConfig(config, ['graphContractVersion', 'toolId', 'workflowFormat', 'workflowText', 'inputBindings', 'outputBindings']);
+  }
+  if (type === 'imageGenerate') return pickWizardConfig(config, ['toolId']);
+  return config;
+}
+
 function buildFlexibleNodeConfig(type, proposedNode, intent, context, wizardTarget) {
   const rawConfig = proposedNode?.config && typeof proposedNode.config === 'object' ? cloneValue(proposedNode.config) : {};
-  const requestedConfig = sanitizeRuntimeConfigObject(rawConfig, intent);
+  const requestedConfig = pruneWizardRequestedConfig(type, sanitizeRuntimeConfigObject(rawConfig, intent));
   if (type === 'textInput') {
     return {
       ...requestedConfig,
@@ -4177,179 +4244,16 @@ function buildWizardRecordInputConfig(recordInput) {
   return {
     mode: normalized.mode,
     outputKind: normalized.outputKind,
-    fps: normalized.outputKind === 'video' ? 15 : undefined,
-    captureTarget: { type: 'desktop' },
-    microphoneId: '',
-    webcamId: '',
-    displayId: '',
   };
 }
 
-function getWizardAssetLibraryEntries(context = {}, type = '') {
-  const entries = context?.assetLibraries?.[type];
-  return Array.isArray(entries) ? entries : [];
-}
-
-function normalizeWizardAssetRef(value) {
-  return normalizeString(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-}
-
-function getWizardAssetLibraryItems(library = {}) {
-  const itemGroups = [library.items, library.assets, library.sounds, library.fonts, library.colors];
-  return itemGroups.flatMap((items) => (Array.isArray(items) ? items : [])).filter(Boolean);
-}
-
-function getWizardAssetItemId(library = {}, index = 0) {
-  const items = getWizardAssetLibraryItems(library);
-  const item = items[Math.max(0, Math.min(items.length - 1, index))] || items[0] || null;
-  return normalizeId(item?.id || item?.assetId || item?.fileId || item?.name || item?.displayName);
-}
-
-function findWizardAssetLibrary(context = {}, type = '', ref = '') {
-  const normalizedRef = normalizeWizardAssetRef(ref);
-  if (!normalizedRef) return null;
-  const libraries = getWizardAssetLibraryEntries(context, type);
-  return libraries.find((library) => normalizeWizardAssetRef(library?.id) === normalizedRef)
-    || libraries.find((library) => normalizeWizardAssetRef(library?.name || library?.displayName) === normalizedRef)
-    || libraries.find((library) => {
-      const libraryText = normalizeWizardAssetRef([library?.id, library?.name, library?.displayName].filter(Boolean).join(' '));
-      return libraryText && (libraryText.includes(normalizedRef) || normalizedRef.includes(libraryText));
-    })
-    || null;
-}
-
-function resolveWizardAssetLibraryRefs(context = {}, type = '', refs = [], warnings = [], label = 'asset') {
-  const libraries = [];
-  const seen = new Set();
-  for (const ref of normalizeWizardStringList(refs)) {
-    const library = findWizardAssetLibrary(context, type, ref);
-    if (!library) {
-      warnings.push('Could not resolve ' + label + ' library "' + ref + '". Choose an existing ' + label + ' library before running this wizard draft.');
-      continue;
-    }
-    const libraryId = normalizeId(library.id || library.name || library.displayName);
-    if (libraryId && !seen.has(libraryId)) {
-      seen.add(libraryId);
-      libraries.push({ ...library, id: libraryId });
-    }
-  }
-  return libraries;
-}
-
-function buildWizardMediaCompositionConfig(stage = {}, context = {}, warnings = []) {
+function buildWizardMediaCompositionConfig(stage = {}) {
   const options = normalizeWizardMediaCompositionOptions(stage.mediaComposition || {});
-  const secondsPerItem = normalizeWizardSeconds(options.fallbackSecondsPerImage || options.fixedSecondsPerImage, 4, { min: 0.25, max: 60 });
-  const config = {
-    imageTimingMode: options.timingMode || 'fixedDurationPerImage',
-    secondsPerItem,
-    sceneTransitionMode: 'off',
-    sceneTransitionDurationSeconds: 0.5,
-    sceneTransitionCategory: options.transitionCategory || 'fades',
-    sceneTransitionName: 'fade',
-    sceneTransitionSelected: ['fade', 'dissolve'],
-    sceneTransitionAvoidRepeats: true,
-    narrationVolume: options.narrationVolume == null ? 1 : options.narrationVolume,
-    backgroundMusicVolume: options.backgroundMusicVolume == null ? 0.22 : options.backgroundMusicVolume,
-    soundEffectsEnabled: false,
-    soundEffectsLibraryId: '',
-    soundEffectsSchedulingMode: 'randomInterval',
-    soundEffectsVolume: options.soundEffectsVolume == null ? 0.35 : options.soundEffectsVolume,
-    soundEffectsDensity: 'normal',
-    soundEffectsMinSpacingSeconds: 4,
-    soundEffectsMaxSimultaneous: 2,
-    soundEffectsAvoidRepeats: true,
-    soundEffectsFadeSeconds: 0.05,
-    soundEffectsSeed: '',
-    soundEffectsLayers: [],
-  };
-
-  if (options.timingMode === 'dynamicFromImageMetadata') {
-    config.imageTimingMode = 'dynamicFromImageMetadata';
-  }
-  if (options.transitionsEnabled) {
-    config.sceneTransitionMode = options.transitionMode && options.transitionMode !== 'off' ? options.transitionMode : 'randomCategory';
-  }
-  if (options.soundEffectsEnabled) {
-    const libraries = resolveWizardAssetLibraryRefs(context, 'soundEffects', options.soundEffectLibraryRefs, warnings, 'Sound Effects');
-    config.soundEffectsEnabled = true;
-    if (libraries.length) {
-      config.soundEffectsLibraryId = normalizeId(libraries[0].id);
-      config.soundEffectsLayers = libraries.map((library, index) => ({
-        id: 'wizard-sfx-layer-' + String(index + 1),
-        name: normalizeString(library.name || library.displayName || library.id, 'SFX layer ' + String(index + 1)),
-        libraryId: normalizeId(library.id),
-        schedulingMode: 'randomInterval',
-        volume: config.soundEffectsVolume,
-        density: 'normal',
-        minSpacingSeconds: 4,
-        maxSimultaneous: 2,
-        avoidRepeats: true,
-        fadeSeconds: 0.05,
-        seed: '',
-      }));
-    } else {
-      warnings.push(options.soundEffectLibraryRefs.length
-        ? 'Sound effects were requested, but no requested Sound Effects library could be resolved.'
-        : 'Sound effects were requested. Choose an existing Sound Effects asset library before running this wizard draft.');
-    }
-  }
-  return config;
+  return { compositionMode: options.compositionMode };
 }
 
-function buildWizardBurnSubtitlesConfig(stage = {}, context = {}, warnings = []) {
-  const options = normalizeWizardBurnSubtitlesOptions(stage.burnSubtitles || {});
-  const styleIntent = normalizeString(options.styleIntent).toLowerCase();
-  const config = {
-    captionMode: 'auto',
-    durationPerCaptionSeconds: 3,
-    fontSize: /\blarge\b/.test(styleIntent) ? 36 : 28,
-    outline: 2,
-    shadow: 1,
-    bottomMargin: 32,
-    textColor: 'white',
-    outlineColor: 'black',
-    backgroundColor: 'black',
-    fontPreset: 'arial',
-    fontSource: 'preset',
-    fontLibraryId: '',
-    fontItemId: '',
-    colorSource: 'manual',
-    colorPaletteLibraryId: '',
-    textColorPaletteItemId: '',
-    outlineColorPaletteItemId: '',
-    backgroundColorPaletteItemId: '',
-    bold: /\bbold\b/.test(styleIntent),
-    italic: /\bitalic\b/.test(styleIntent),
-    position: options.position || 'bottomCenter',
-    backgroundBox: /\b(box|background|horror|spooky|halloween)\b/.test(styleIntent),
-    backgroundOpacity: /\b(box|background|horror|spooky|halloween)\b/.test(styleIntent) ? 45 : 50,
-    outputFormat: 'mp4',
-  };
-
-  if (options.fontLibraryRef) {
-    const fontLibrary = findWizardAssetLibrary(context, 'fonts', options.fontLibraryRef);
-    config.fontSource = 'assetLibrary';
-    if (fontLibrary) {
-      config.fontLibraryId = normalizeId(fontLibrary.id || fontLibrary.name || fontLibrary.displayName);
-      config.fontItemId = getWizardAssetItemId(fontLibrary, 0);
-    } else {
-      warnings.push('Could not resolve Font library "' + options.fontLibraryRef + '". Choose an existing Font library before running this wizard draft.');
-    }
-  }
-
-  if (options.colorPaletteRef) {
-    const colorPalette = findWizardAssetLibrary(context, 'colorPalettes', options.colorPaletteRef);
-    config.colorSource = 'palette';
-    if (colorPalette) {
-      config.colorPaletteLibraryId = normalizeId(colorPalette.id || colorPalette.name || colorPalette.displayName);
-      config.textColorPaletteItemId = getWizardAssetItemId(colorPalette, 0);
-      config.outlineColorPaletteItemId = getWizardAssetItemId(colorPalette, 1) || config.textColorPaletteItemId;
-      config.backgroundColorPaletteItemId = getWizardAssetItemId(colorPalette, 2) || config.outlineColorPaletteItemId || config.textColorPaletteItemId;
-    } else {
-      warnings.push('Could not resolve Color Palette library "' + options.colorPaletteRef + '". Choose an existing Color Palette library before running this wizard draft.');
-    }
-  }
-  return config;
+function buildWizardBurnSubtitlesConfig() {
+  return {};
 }
 function buildWizardNormalizeMediaConfig(stage = {}, inputKind = '', warnings = []) {
   const itemKind = getIntentCollectionItemKind(inputKind) || inputKind;
@@ -4362,12 +4266,6 @@ function buildWizardNormalizeMediaConfig(stage = {}, inputKind = '', warnings = 
   const unsupportedFormat = options.unsupportedFormat || formatResult.unsupportedFormat;
   if (unsupportedFormat) {
     warnings.push('The requested .' + unsupportedFormat + ' format is not supported by Normalize ' + mediaKind.charAt(0).toUpperCase() + mediaKind.slice(1) + '. Local AI Hub left this as an editable normalized-format draft using ' + formatResult.outputFormat + '.');
-  }
-  if (mediaKind === 'audio') {
-    return { outputFormat: formatResult.outputFormat || 'auto', sampleRate: 44100, channels: 'stereo', pcmFormat: 'pcm_s16le' };
-  }
-  if (mediaKind === 'video') {
-    return { outputFormat: formatResult.outputFormat || 'auto', sizeMode: 'matchFirst', width: 1280, height: 720, fps: 30, videoCodec: 'libx264', audioCodec: 'aac', pixelFormat: 'yuv420p' };
   }
   return { outputFormat: formatResult.outputFormat || 'auto' };
 }
@@ -4907,11 +4805,11 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
         warnings.push('Skipped audio transcription because it needs an audio source artifact.');
         continue;
       }
-      const whisperNode = makeNode('llmPrompt', nodes.length, buildLlmStepConfig(PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, { executionMode: 'localTool', toolId: 'whisper', model: 'base', providerId: '' }, '', { instruction: 'Transcribe the connected source audio into text.' }), 'Transcribe audio');
+      const whisperNode = makeNode('llmPrompt', nodes.length, buildLlmStepConfig(PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, { executionMode: 'localTool', toolId: 'whisper', model: '', providerId: '' }, '', { instruction: 'Transcribe the connected source audio into text.' }), 'Transcribe audio');
       nodes.push(whisperNode);
       connect(edges, inputArtifact.node, inputArtifact.portId, whisperNode, 'prompt');
       stagePrimaryNodes.set(stage.id, whisperNode);
-      operationTargets.push({ nodeLabel: whisperNode.label, operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, target: { executionMode: 'localTool', toolId: 'whisper', model: 'base', providerId: '' } });
+      operationTargets.push({ nodeLabel: whisperNode.label, operationId: PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE, target: { executionMode: 'localTool', toolId: 'whisper', model: '', providerId: '' } });
       if (!getToolEntry(context, 'whisper')) warnings.push('Install Whisper before this transcription draft can run.');
       lastArtifact = registerArtifact(artifactMap, outputName, { kind: 'text', node: whisperNode, portId: 'text', label: stage.purpose || outputName });
       stageOutputArtifacts.set(stage.id, lastArtifact);
@@ -4941,8 +4839,6 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
       const retryTargetNode = stagePrimaryNodes.get(stage.retryTarget) || stagePrimaryNodes.get(validationMeta.stageId) || validationMeta.inputArtifact?.node || null;
       const retryNode = makeNode('retryLoop', nodes.length, {
         retryTargetNodeId: retryTargetNode?.id || '',
-        maxAttempts: stage.maxAttempts || 3,
-        retryTerminationAction: 'fail',
       }, 'Retry until valid');
       nodes.push(retryNode);
       connect(edges, validationMeta.node, 'pass', retryNode, 'complete');
@@ -4953,23 +4849,42 @@ function buildIntentIrPipeline({ intent, plan, context, wizardTarget }) {
       continue;
     }
     if (stage.kind === 'compose_media') {
-      let visualArtifact = inputArtifact;
-      if (visualArtifact.kind === 'image') {
+      const compositionMode = normalizeWizardMediaCompositionOptions(stage.mediaComposition || {}).compositionMode;
+      const compositionInputs = (Array.isArray(stage.inputs) && stage.inputs.length ? stage.inputs : [stage.input])
+        .map((inputName) => artifactMap.get(inputName))
+        .filter((artifact) => artifact?.node && artifact?.portId);
+      const requestedVisualKind = compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+        ? 'collection:video'
+        : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+          ? 'video'
+          : 'collection:image';
+      let visualArtifact = compositionInputs.find((artifact) => artifact.kind === requestedVisualKind)
+        || (compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW ? compositionInputs.find((artifact) => artifact.kind === 'image') : null)
+        || inputArtifact;
+      if (compositionMode === MEDIA_COMPOSITION_MODES.IMAGE_SLIDESHOW && visualArtifact.kind === 'image') {
         const collectionNode = makeNode('collectionBuilder', nodes.length, { insertionMode: 'append' }, 'Collect images');
         nodes.push(collectionNode);
         connect(edges, visualArtifact.node, visualArtifact.portId, collectionNode, 'items');
         visualArtifact = { kind: 'collection:image', node: collectionNode, portId: 'collection', label: 'Image collection' };
       }
-      if (visualArtifact.kind !== 'collection:image') {
-        warnings.push('Skipped media composition because it needs an ordered image collection.');
+      const expectedVisualKind = compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+        ? 'collection:video'
+        : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+          ? 'video'
+          : 'collection:image';
+      const visualPortId = compositionMode === MEDIA_COMPOSITION_MODES.VIDEO_SEQUENCE
+        ? 'videos'
+        : compositionMode === MEDIA_COMPOSITION_MODES.SINGLE_VIDEO_MIX
+          ? 'video'
+          : 'visuals';
+      if (visualArtifact.kind !== expectedVisualKind) {
+        warnings.push('Skipped media composition because ' + compositionMode + ' mode needs ' + (expectedVisualKind === 'collection:video' ? 'an ordered video collection.' : expectedVisualKind === 'video' ? 'one video.' : 'an ordered image collection.'));
         continue;
       }
-      const compositionNode = makeNode('mediaComposition', nodes.length, buildWizardMediaCompositionConfig(stage, context, warnings), 'Sequence media');
+      const compositionNode = makeNode('mediaComposition', nodes.length, buildWizardMediaCompositionConfig(stage), 'Compose media');
       nodes.push(compositionNode);
-      connect(edges, visualArtifact.node, visualArtifact.portId, compositionNode, 'visuals');
-      const stageInputArtifacts = (Array.isArray(stage.inputs) && stage.inputs.length ? stage.inputs : [stage.input])
-        .map((inputName) => artifactMap.get(inputName))
-        .filter((artifact) => artifact?.kind === 'audio' && artifact?.node && artifact?.portId);
+      connect(edges, visualArtifact.node, visualArtifact.portId, compositionNode, visualPortId);
+      const stageInputArtifacts = compositionInputs.filter((artifact) => artifact?.kind === 'audio');
       const allAudioArtifacts = [...stageInputArtifacts, ...[...artifactMap.values()].filter((artifact) => artifact?.kind === 'audio' && artifact?.node && artifact?.portId)];
       const seenAudio = new Set();
       const audioArtifacts = allAudioArtifacts.filter((artifact) => {

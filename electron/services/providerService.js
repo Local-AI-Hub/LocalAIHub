@@ -774,6 +774,16 @@ function buildOpenAiCompatibleResponseFormat(provider, payload = {}) {
   }
 
   if (provider.id === 'groq') {
+    if (/^(?:openai\/)?gpt-oss-(?:20b|120b)$/i.test(String(payload.model || '').trim())) {
+      return {
+        type: 'json_schema',
+        json_schema: {
+          name: responseFormat.name,
+          schema: responseFormat.schema,
+          strict: false,
+        },
+      };
+    }
     return {
       type: 'json_object',
     };
@@ -878,6 +888,9 @@ function toGoogleContentParts(parts = []) {
 
 async function sendOpenAICompatibleChat(provider, apiKey, payload) {
   const structuredResponseFormat = buildOpenAiCompatibleResponseFormat(provider, payload);
+  const groqStructuredGptOss = provider.id === 'groq'
+    && structuredResponseFormat?.type === 'json_schema'
+    && /^(?:openai\/)?gpt-oss-(?:20b|120b)$/i.test(String(payload.model || '').trim());
   const response = await requestProviderJson(provider, apiKey, provider.configuration?.chatEndpoint || '/chat/completions', {
     method: 'POST',
     body: JSON.stringify({
@@ -889,14 +902,28 @@ async function sendOpenAICompatibleChat(provider, apiKey, payload) {
       stream: false,
       ...(normalizeProviderMaxOutputTokens(payload.maxOutputTokens) ? { max_tokens: normalizeProviderMaxOutputTokens(payload.maxOutputTokens) } : {}),
       ...(structuredResponseFormat ? { response_format: structuredResponseFormat } : {}),
+      ...(groqStructuredGptOss ? { include_reasoning: false, reasoning_effort: 'low' } : {}),
     }),
     timeoutMessage: getProviderChatTimeoutMessage(provider, payload),
     timeoutMs: getProviderChatTimeoutMs(payload),
   });
 
-  const content = extractTextParts(response?.choices?.[0]?.message?.content || response?.choices?.[0]?.text || response?.output_text || '');
+  const choice = response?.choices?.[0] || {};
+  const finishReason = String(choice?.finish_reason || choice?.finishReason || '').trim();
+  const providerDiagnostics = {
+    finishReason,
+    outputTruncated: /length|max[_\s-]?tokens|token_limit/i.test(finishReason),
+    choiceCount: Array.isArray(response?.choices) ? response.choices.length : 0,
+    usage: response?.usage || null,
+  };
+  const content = extractTextParts(choice?.message?.content || choice?.text || response?.output_text || '');
   if (!content) {
-    throw new Error(provider.name + ' returned an empty reply.');
+    const error = new Error(providerDiagnostics.outputTruncated
+      ? provider.name + ' stopped at its output token limit before returning structured JSON.'
+      : provider.name + ' returned an empty reply.');
+    error.diagnosticCategory = providerDiagnostics.outputTruncated ? 'output_truncated' : 'provider_returned_empty';
+    error.providerDiagnostics = providerDiagnostics;
+    throw error;
   }
 
   return {
@@ -906,6 +933,7 @@ async function sendOpenAICompatibleChat(provider, apiKey, payload) {
       role: 'assistant',
       content,
     },
+    providerDiagnostics,
   };
 }
 
@@ -989,9 +1017,24 @@ async function sendGoogleChat(provider, apiKey, payload) {
     timeoutMs: getProviderChatTimeoutMs(payload),
   });
 
-  const content = extractTextParts(response?.candidates?.[0]?.content?.parts || '');
+  const candidate = response?.candidates?.[0] || {};
+  const finishReason = String(candidate?.finishReason || candidate?.finish_reason || '').trim();
+  const providerDiagnostics = {
+    finishReason,
+    outputTruncated: /max[_\s-]?tokens|length|token_limit/i.test(finishReason),
+    candidateCount: Array.isArray(response?.candidates) ? response.candidates.length : 0,
+    promptFeedback: response?.promptFeedback || response?.prompt_feedback || null,
+    safetyRatings: candidate?.safetyRatings || candidate?.safety_ratings || [],
+    usage: response?.usageMetadata || response?.usage_metadata || null,
+  };
+  const content = extractTextParts(candidate?.content?.parts || '');
   if (!content) {
-    throw new Error(provider.name + ' returned an empty reply.');
+    const error = new Error(providerDiagnostics.outputTruncated
+      ? provider.name + ' stopped at its output token limit before returning structured JSON.'
+      : provider.name + ' returned an empty reply with finish reason ' + (finishReason || 'unspecified') + '.');
+    error.diagnosticCategory = providerDiagnostics.outputTruncated ? 'output_truncated' : 'provider_returned_empty';
+    error.providerDiagnostics = providerDiagnostics;
+    throw error;
   }
 
   return {
@@ -1001,6 +1044,7 @@ async function sendGoogleChat(provider, apiKey, payload) {
       role: 'assistant',
       content,
     },
+    providerDiagnostics,
   };
 }
 
@@ -2469,16 +2513,28 @@ async function chatWithProvider(providerId, payload = {}) {
     }
 
     await recordProviderUsageSuccess(provider.id, model, PIPELINE_OPERATION_IDS.LLM_PROMPT);
+    await logger.info('Provider chat request completed.', {
+      finishReason: result?.providerDiagnostics?.finishReason || '',
+      outputTruncated: Boolean(result?.providerDiagnostics?.outputTruncated),
+      responseChars: String(result?.message?.content || '').length,
+      structuredOutputRequested: Boolean(normalizeStructuredResponseFormat(payload.responseFormat)),
+      usage: result?.providerDiagnostics?.usage || null,
+    });
 
     return result;
   } catch (error) {
     const message = humanizeError(error, 'Local AI Hub could not send that message to ' + provider.name + '.');
     await logger.warn('Provider chat request failed.', {
+      diagnosticCategory: error?.diagnosticCategory || '',
+      finishReason: error?.providerDiagnostics?.finishReason || '',
       message,
+      outputTruncated: Boolean(error?.providerDiagnostics?.outputTruncated),
       providerStatus: error?.providerStatus || null,
       providerErrorType: error?.providerErrorType || '',
     });
     const providerError = new Error(message);
+    providerError.diagnosticCategory = error?.diagnosticCategory || '';
+    providerError.providerDiagnostics = error?.providerDiagnostics || null;
     providerError.providerStatus = error?.providerStatus || null;
     providerError.providerRetryAfter = error?.providerRetryAfter || '';
     providerError.providerErrorType = error?.providerErrorType || '';
@@ -2539,6 +2595,7 @@ async function runProviderOperation(providerId, payload = {}) {
 
 module.exports = {
   buildGoogleGenerationConfig,
+  buildOpenAiCompatibleResponseFormat,
   buildOpenAiResponseFormat,
   chatWithProvider,
   disconnectProvider,

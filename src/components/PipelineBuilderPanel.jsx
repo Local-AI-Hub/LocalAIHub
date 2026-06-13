@@ -5544,6 +5544,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
         getReplyText: getAssistantReplyText,
         parsePlan: parsePipelineWizardPlan,
         buildDraft: buildPipelineWizardDraft,
+        onDiagnostic: (entry) => console.info('[Pipeline Wizard]', entry),
         requestModelDraft: () => wizardExecutionMode === 'ollama'
           ? window.localAIHub.chatWithOllama({
               messages,
@@ -5572,7 +5573,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
 
       if (!lifecycleResult?.ok || !lifecycleResult.draftResult?.pipeline) {
         const summary = lifecycleResult?.summary || buildWizardFailureSummary({
-          category: lifecycleResult?.diagnosticCategory || 'ui-ipc-failure',
+          category: lifecycleResult?.diagnosticCategory || 'provider_call_failed',
           message: 'Local AI Hub could not finish this wizard request.',
           targetLabel,
         });
@@ -5605,7 +5606,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       }
       const message = error?.message || 'Local AI Hub could not finish this wizard request.';
       const summary = buildWizardFailureSummary({
-        category: 'ui-ipc-failure',
+        category: 'provider_call_failed',
         message,
         targetLabel,
       });
