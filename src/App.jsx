@@ -52,6 +52,7 @@ const EMPTY_STATE = {
   settings: {
     checkForUpdatesOnLaunch: false,
     closeBehavior: 'exit',
+    screenMode: 'windowed',
     homeChecklistDismissed: false,
     liveResourcePolling: false,
     moveDeletedPipelineOutputsToRecycleBin: true,
@@ -216,6 +217,7 @@ export default function App() {
   const [visitedTabs, setVisitedTabs] = useState(() => new Set(['home']));
   const [visitedActions, setVisitedActions] = useState(() => new Set());
   const [pipelineEntryTarget, setPipelineEntryTarget] = useState('');
+  const [pipelineEntryRevision, setPipelineEntryRevision] = useState(0);
   const [settingsEntryTarget, setSettingsEntryTarget] = useState('');
   const [activePipelineRun, setActivePipelineRun] = useState(null);
   const [activeRecording, setActiveRecording] = useState(null);
@@ -297,6 +299,7 @@ export default function App() {
   const [providerKeyDrafts, setProviderKeyDrafts] = useState({});
   const [toolUpdateToastCount, setToolUpdateToastCount] = useState(0);
   const [liveResources, setLiveResources] = useState(null);
+  const [screenMode, setScreenMode] = useState('windowed');
   const [windowActivity, setWindowActivity] = useState({
     focused: true,
     visible: true,
@@ -501,6 +504,9 @@ export default function App() {
 
   function navigateToTab(tab, target = '') {
     setPipelineEntryTarget(tab === 'pipelines' ? target : '');
+    if (tab === 'pipelines') {
+      setPipelineEntryRevision((current) => current + 1);
+    }
     setSettingsEntryTarget(tab === 'settings' ? target : '');
     if (target) {
       setVisitedActions((current) => new Set([...current, target]));
@@ -1528,8 +1534,28 @@ export default function App() {
     await runAction('settings:save-preferred-install-root', () => window.localAIHub.savePreferredInstallRoot(targetPath));
   }
 
-  async function saveCloseBehaviorPreference() {
-    await runAction('settings:save-close-behavior', () => window.localAIHub.saveCloseBehavior(closeBehaviorDraft));
+  async function saveWindowSettings() {
+    await runAction('settings:save-window-settings', () => window.localAIHub.saveWindowSettings({
+      screenMode,
+      closeBehavior: closeBehaviorDraft,
+      liveResourcePolling: liveResourcePollingDraft,
+      moveDeletedPipelineOutputsToRecycleBin: pipelineOutputTrashDraft,
+    }));
+  }
+
+  async function changeScreenMode(nextMode) {
+    markBusy('window:set-screen-mode', true);
+    try {
+      const result = await window.localAIHub.setScreenMode(nextMode);
+      if (!result?.ok) {
+        throw new Error(result?.message || 'Local AI Hub could not change the screen mode.');
+      }
+      setScreenMode(result.data?.screenMode || nextMode);
+    } catch (error) {
+      pushToast(error?.message || 'Local AI Hub could not change the screen mode.', 'error');
+    } finally {
+      markBusy('window:set-screen-mode', false);
+    }
   }
 
   async function savePromptStyle(promptStyle) {
@@ -1538,18 +1564,6 @@ export default function App() {
 
   async function deletePromptStyle(promptStyleId) {
     return runAction('settings:delete-prompt-style', () => window.localAIHub.deletePromptStyle(promptStyleId));
-  }
-
-  async function saveLiveResourcePollingPreference() {
-    await runAction('settings:save-live-resource-polling', () =>
-      window.localAIHub.saveLiveResourcePolling(liveResourcePollingDraft),
-    );
-  }
-
-  async function savePipelineOutputTrashPreference() {
-    await runAction('settings:save-pipeline-output-trash', () =>
-      window.localAIHub.savePipelineOutputTrash(pipelineOutputTrashDraft),
-    );
   }
 
   async function migrateLegacyStorage() {
@@ -1810,6 +1824,11 @@ export default function App() {
         setWindowActivity(result.data);
       }
     });
+    window.localAIHub.getScreenMode().then((result) => {
+      if (result?.ok && result.data?.screenMode) {
+        setScreenMode(result.data.screenMode);
+      }
+    });
     window.localAIHub.getActivePipelineRun().then((result) => {
       if (result?.ok) {
         setActivePipelineRun(result.data?.run || null);
@@ -1846,6 +1865,12 @@ export default function App() {
     const unsubscribeWindowActivity = window.localAIHub.onWindowActivity((payload) => {
       if (payload) {
         setWindowActivity(payload);
+      }
+    });
+
+    const unsubscribeScreenMode = window.localAIHub.onScreenModeChanged((payload) => {
+      if (payload?.screenMode) {
+        setScreenMode(payload.screenMode);
       }
     });
 
@@ -1953,6 +1978,7 @@ export default function App() {
       unsubscribeInstallProgress();
       unsubscribeOpenToolUi();
       unsubscribeWindowActivity();
+      unsubscribeScreenMode();
       unsubscribeAppStateUpdated();
       unsubscribeLaunchProgress();
       unsubscribePipelineRunUpdate();
@@ -2238,6 +2264,7 @@ export default function App() {
           onCollapse={() => setSidebarCollapsed(true)}
           onExpand={() => setSidebarCollapsed(false)}
           onOpenLogs={() => runAction('open-logs', () => window.localAIHub.openLogsFolder())}
+          onRequestClose={() => window.localAIHub.requestClose()}
           pipelineRunStatus={pipelineRunStatus}
           recordingStatus={activeRecording ? 'Recording' : ''}
           storeCount={availableStoreTools.length}
@@ -2542,12 +2569,16 @@ export default function App() {
           ) : activeTab === 'pipelines' ? (
             <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-6 text-sm text-slate-300">Loading Pipelines...</div>}>
               <PipelineBuilderPanel
+                busyMap={busyMap}
                 graphWorkflowPresets={appState.graphWorkflowPresets}
                 hardware={appState.hardware}
                 initialFocus={pipelineEntryTarget}
+                navigationRequest={pipelineEntryRevision}
                 manifests={appState.manifests}
                 promptStyles={appState.promptStyles}
                 moveDeletedPipelineOutputsToRecycleBin={appState.settings?.moveDeletedPipelineOutputsToRecycleBin !== false}
+                onDeletePromptStyle={deletePromptStyle}
+                onSavePromptStyle={savePromptStyle}
                 onToast={pushToast}
                 providers={providers}
                 tools={tools}
@@ -2580,6 +2611,7 @@ export default function App() {
                 onChangeLiveResourcePolling={setLiveResourcePollingDraft}
                 onChangePipelineOutputTrash={setPipelineOutputTrashDraft}
                 onChangePreferredInstallRootDraft={setPreferredInstallRootDraft}
+                onChangeScreenMode={changeScreenMode}
                 onChangeStorageDraft={setStorageDraft}
                 onChoosePreferredInstallFolder={choosePreferredInstallFolder}
                 onChooseStorageFolder={chooseStorageFolder}
@@ -2588,15 +2620,12 @@ export default function App() {
                 onPreviewCleanup={() => previewCleanup()}
                 onRunCleanup={runCleanupNow}
                 onToast={pushToast}
-                onDeletePromptStyle={deletePromptStyle}
-                onSaveCloseBehavior={saveCloseBehaviorPreference}
-                onSavePromptStyle={savePromptStyle}
-                onSaveLiveResourcePolling={saveLiveResourcePollingPreference}
-                onSavePipelineOutputTrash={savePipelineOutputTrashPreference}
+                onSaveWindowSettings={saveWindowSettings}
                 onSavePreferredInstallRoot={savePreferredInstallRoot}
                 onSaveStorageLocation={() => saveStorageLocation()}
                 preferredInstallRootDraft={preferredInstallRootDraft}
-                promptStyles={appState.promptStyles}
+                screenMode={screenMode}
+                screenModeBusy={busyMap['window:set-screen-mode']}
                 storage={appState.storage}
                 storageDraft={storageDraft}
               />

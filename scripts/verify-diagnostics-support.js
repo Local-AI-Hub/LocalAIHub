@@ -26,6 +26,7 @@ function fakeDependencies(paths) {
     ensureStorage: async () => paths,
     readConfig: async () => ({
       closeBehavior: 'tray',
+      screenMode: 'fullscreen',
       firstLaunchCompleted: true,
       liveResourcePolling: false,
       managedDataRoot: paths.managedRoot,
@@ -118,6 +119,7 @@ async function main() {
     versions: { electron: '30.5.1', node: '20.19.0', chrome: '124.0.0.0' },
   }, deps);
   const systemInfo = buildSystemInfoText(data);
+  assert.strictEqual(data.configSummary.screenMode, 'fullscreen', 'Diagnostics should include the saved screen mode.');
   assert(systemInfo.includes('App version: 0.49.0'), 'System info should include the app version.');
   assert(systemInfo.includes('OS: Microsoft Windows 11 Pro'), 'System info should include the OS summary.');
   assert(systemInfo.includes('CPU: Test CPU'), 'System info should include the CPU summary.');

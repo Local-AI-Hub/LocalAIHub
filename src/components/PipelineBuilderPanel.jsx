@@ -4,7 +4,9 @@ import pipelineWizardShared from '../../electron/shared/pipelineWizard.cjs';
 import pipelineWizardLifecycleShared from '../../electron/shared/pipelineWizardLifecycle.cjs';
 import pipelineTemplatesShared from '../../electron/shared/pipelineTemplates.cjs';
 import toolAssetSelectionShared from '../../electron/shared/toolAssetSelection.cjs';
+import AssetLibraryManager from './AssetLibraryManager';
 import HoverRevealText from './HoverRevealText';
+import PromptStylePresetManager from './PromptStylePresetManager';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
   GRAPH_WORKFLOW_TOOL_IDS,
@@ -125,11 +127,27 @@ const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
   canvas: true,
   inspector: false,
   nodePalette: false,
-  pipelineWizard: false,
+  pipelineWizard: true,
   starterTemplates: false,
   runStatus: false,
   savedPipelines: false,
+  assetLibraries: true,
+  promptStyles: false,
+  pipelineOutputs: true,
 });
+const PIPELINE_WORKSPACE_SUBVIEWS = Object.freeze([
+  { id: 'get-started', label: 'Get Started' },
+  { id: 'build', label: 'Build' },
+  { id: 'resources', label: 'Resources' },
+  { id: 'outputs', label: 'Outputs' },
+]);
+
+function getPipelineSubviewForTarget(target) {
+  if (target === 'build') return 'build';
+  if (target === 'resources') return 'resources';
+  if (target === 'outputs') return 'outputs';
+  return 'get-started';
+}
 const PLANNING_SCHEMA_OPTIONS = typeof getPlanningSchemaOptions === 'function' ? getPlanningSchemaOptions() : [];
 const COLLECTION_MAP_TEXT_TO_IMAGE_DEFAULT_INSTRUCTION = 'Generate one image for each text item while preserving the source order.';
 const EMPTY_GRAPH_WORKFLOW_PRESETS = Object.freeze([]);
@@ -745,17 +763,20 @@ function normalizePipelineSectionVisibility(value) {
   }
 
   for (const key of Object.keys(normalized)) {
-    normalized[key] = false;
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      normalized[key] = value[key] === true;
+    }
   }
-
-  const firstOpenKey = Object.keys(DEFAULT_PIPELINE_SECTION_VISIBILITY).find((key) => value[key] === true) || 'canvas';
-  normalized[firstOpenKey] = true;
 
   return normalized;
 }
 
 function getPipelineSectionPanelClass(expanded) {
   return expanded ? 'panel p-4 xl:col-span-2 2xl:col-span-3' : 'panel p-3';
+}
+
+function getPipelineTwoColumnSectionPanelClass(expanded) {
+  return expanded ? 'panel p-4 xl:col-span-2' : 'panel p-3';
 }
 
 function getPlanningSchemaOptionById(schemaId) {
@@ -3717,7 +3738,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
     </>
   );
 }
-export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, initialFocus = '', manifests, moveDeletedPipelineOutputsToRecycleBin = true, onToast, promptStyles = [], providers, tools }) {
+export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, initialFocus = '', manifests, moveDeletedPipelineOutputsToRecycleBin = true, navigationRequest = 0, onDeletePromptStyle, onSavePromptStyle, onToast, promptStyles = [], providers, tools }) {
   const [pipelines, setPipelines] = useState([]);
   const [draft, setDraft] = useState(() => createEmptyPipeline());
   const [selectedNodeId, setSelectedNodeId] = useState('');
@@ -3752,8 +3773,8 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   const [outputsLoading, setOutputsLoading] = useState(false);
   const [outputsBusyPath, setOutputsBusyPath] = useState('');
   const [outputDeletionDialog, setOutputDeletionDialog] = useState(null);
-  const [pipelineOutputsExpanded, setPipelineOutputsExpanded] = useState(false);
   const [templateSearch, setTemplateSearch] = useState('');
+  const [activeSubview, setActiveSubview] = useState(() => getPipelineSubviewForTarget(initialFocus));
   const [sectionVisibility, setSectionVisibility] = useState(() => {
     if (typeof window === 'undefined') {
       return DEFAULT_PIPELINE_SECTION_VISIBILITY;
@@ -3869,21 +3890,35 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     [wizardModel, wizardModelOptions],
   );
   useEffect(() => {
-    if (!initialFocus) {
-      return undefined;
-    }
+    const nextSubview = getPipelineSubviewForTarget(initialFocus);
+    setActiveSubview(nextSubview);
+    setSectionVisibility((current) => ({
+      ...current,
+      ...(initialFocus === 'templates' ? { starterTemplates: true } : {}),
+      ...(nextSubview === 'build' ? { canvas: true } : {}),
+      ...(nextSubview === 'outputs' ? { pipelineOutputs: true } : {}),
+      ...(!initialFocus ? { pipelineWizard: true } : {}),
+      inspector: nextSubview === 'build' ? current.inspector : false,
+    }));
 
-    if (initialFocus === 'templates') {
-      setSectionVisibility((current) => ({ ...current, starterTemplates: true }));
-    } else if (initialFocus === 'outputs') {
-      setPipelineOutputsExpanded(true);
+    if (initialFocus !== 'templates' && initialFocus !== 'outputs') {
+      return undefined;
     }
 
     const timerId = window.setTimeout(() => {
       document.querySelector(`[data-pipeline-home-target="${initialFocus}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 0);
     return () => window.clearTimeout(timerId);
-  }, [initialFocus]);
+  }, [initialFocus, navigationRequest]);
+
+  useEffect(() => {
+    if (!sectionVisibility.inspector) return undefined;
+    function handleInspectorKeyDown(event) {
+      if (event.key === 'Escape') setSectionVisibility((current) => ({ ...current, inspector: false }));
+    }
+    window.addEventListener('keydown', handleInspectorKeyDown);
+    return () => window.removeEventListener('keydown', handleInspectorKeyDown);
+  }, [sectionVisibility.inspector]);
 
   useEffect(() => {
     if (Array.isArray(initialGraphWorkflowPresets)) {
@@ -4609,6 +4644,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     replaceDraft(result.data?.pipeline || createEmptyPipeline(), {
       dirty: false,
     });
+    selectPipelineSubview('build');
   }
 
   async function openPath(pathValue, reveal = false) {
@@ -4866,11 +4902,27 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   }, [canvasZoom]);
 
   function toggleSection(sectionKey) {
-    setSectionVisibility((current) => {
-      const next = Object.fromEntries(Object.keys(DEFAULT_PIPELINE_SECTION_VISIBILITY).map((key) => [key, false]));
-      next[sectionKey] = !current[sectionKey];
-      return next;
-    });
+    setSectionVisibility((current) => ({ ...current, [sectionKey]: !current[sectionKey] }));
+  }
+
+  function selectPipelineSubview(subviewId) {
+    setActiveSubview(subviewId);
+    setSectionVisibility((current) => ({
+      ...current,
+      ...(subviewId === 'outputs' ? { pipelineOutputs: true } : {}),
+      inspector: subviewId === 'build' ? current.inspector : false,
+    }));
+  }
+
+  function openNodeInspector(nodeId) {
+    setSelectedEdgeId('');
+    setSelectedNodeId(nodeId);
+    setActiveSubview('build');
+    setSectionVisibility((current) => ({ ...current, inspector: true }));
+  }
+
+  function closeNodeInspector() {
+    setSectionVisibility((current) => ({ ...current, inspector: false }));
   }
 
   function updatePipelineMetadata(field, value) {
@@ -5050,6 +5102,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
       selectedNodeId: result.pipeline?.nodes?.[0]?.id || '',
     });
     setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
+    setActiveSubview('build');
     setSectionVisibility((current) => ({
       ...current,
       canvas: true,
@@ -5093,7 +5146,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
   function startDrag(nodeId, event) {
     const node = draft.nodes.find((entry) => entry.id === nodeId);
     const pointer = getCanvasGraphPoint(event);
-    if (!node || !pointer || isEditableTarget(event.target)) {
+    if (event.button !== 0 || !node || !pointer || isEditableTarget(event.target)) {
       return;
     }
 
@@ -5605,6 +5658,8 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
         selectedNodeId: draftResult.pipeline.nodes[0]?.id || '',
       });
       setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
+      setActiveSubview('build');
+      setSectionVisibility((current) => ({ ...current, canvas: true, pipelineInfo: true, pipelineWizard: false }));
       setWizardSummary(draftResult.summary);
 
       const needsAttention = draftResult.summary?.graphErrorCount > 0 || draftResult.analysis?.primaryIssue?.tone === 'error';
@@ -6037,8 +6092,36 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
 
   return (
     <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+      <div className="panel flex flex-wrap items-center justify-between gap-3 p-3" data-pipeline-workspace-navigation="true">
+        <div>
+          <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline workspace</p>
+          <p className="mt-1 text-sm text-slate-300">Start from a guided workflow, build the graph, manage resources, or review outputs.</p>
+        </div>
+        <div aria-label="Pipeline workspace views" className="flex flex-wrap gap-1 rounded-2xl border border-white/10 bg-slate-950/45 p-1" role="tablist">
+          {PIPELINE_WORKSPACE_SUBVIEWS.map((subview) => (
+            <button
+              aria-controls={`pipeline-subview-${subview.id}`}
+              aria-selected={activeSubview === subview.id}
+              className={`rounded-xl px-4 py-2 text-sm font-semibold transition ${activeSubview === subview.id ? 'bg-cyan-300/15 text-cyan-50 shadow-sm' : 'text-slate-400 hover:bg-white/5 hover:text-white'}`}
+              data-pipeline-subview-tab={subview.id}
+              key={subview.id}
+              onClick={() => selectPipelineSubview(subview.id)}
+              role="tab"
+              type="button"
+            >
+              {subview.label}
+            </button>
+          ))}
+        </div>
+      </div>
       <div className="min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
-        <div className="grid gap-3 xl:grid-cols-2 2xl:grid-cols-3">
+        <div
+          className={activeSubview === 'get-started' || activeSubview === 'resources' ? 'grid gap-3 xl:grid-cols-2' : 'grid gap-3 xl:grid-cols-2 2xl:grid-cols-3'}
+          data-pipeline-subview={activeSubview}
+          id={`pipeline-subview-${activeSubview}`}
+          role="tabpanel"
+        >
+          {activeSubview === 'build' ? (
           <div className={getPipelineSectionPanelClass(sectionVisibility.pipelineInfo)}>
             <div className="flex flex-wrap items-start justify-between gap-3">
               <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('pipelineInfo')} type="button">
@@ -6054,7 +6137,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               <div className="flex flex-wrap items-center gap-2">
                 <button className="ghost-button px-3 py-1.5 text-xs" onClick={createNewPipeline} type="button">New pipeline</button>
                 <button className="ghost-button px-3 py-1.5 text-xs" disabled={copyBusy || !draft} onClick={handleCopyPipeline} type="button">{copyBusy ? 'Copying...' : 'Copy pipeline'}</button>
-                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('starterTemplates')} type="button">New from template</button>
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => { selectPipelineSubview('get-started'); setSectionVisibility((current) => ({ ...current, starterTemplates: true })); }} type="button">New from template</button>
                 <button className="ghost-button px-3 py-1.5 text-xs" disabled={!currentPipelineSaved || deleteBusy} onClick={handleDeletePipeline} type="button">
                   {deleteBusy ? 'Deleting...' : 'Delete'}
                 </button>
@@ -6155,7 +6238,11 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               </div>
             ) : null}
           </div>
-          <div className={getPipelineSectionPanelClass(sectionVisibility.starterTemplates)} data-pipeline-home-target="templates">
+          ) : null}
+
+          {activeSubview === 'get-started' ? (
+          <>
+          <div className={`panel order-2 ${sectionVisibility.starterTemplates ? 'p-4' : 'p-3'}`} data-pipeline-home-target="templates">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('starterTemplates')} type="button">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Starter templates</p>
@@ -6232,7 +6319,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               </div>
             ) : null}
           </div>
-          <div className={getPipelineSectionPanelClass(sectionVisibility.pipelineWizard)}>
+          <div className={`panel order-1 xl:col-span-2 ${sectionVisibility.pipelineWizard ? 'p-4' : 'p-3'}`}>
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline wizard</p>
@@ -6377,8 +6464,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
           </div>
         ) : null}
       </div>
-      <>
-          <div className={getPipelineSectionPanelClass(sectionVisibility.savedPipelines)}>
+          <div className={`panel order-3 ${sectionVisibility.savedPipelines ? 'p-4' : 'p-3'}`}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Saved pipelines</p>
@@ -6404,6 +6490,11 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
             ) : null}
           </div>
 
+          </>
+          ) : null}
+
+          {activeSubview === 'build' ? (
+          <>
           <div className={getPipelineSectionPanelClass(sectionVisibility.nodePalette)}>
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
@@ -6443,15 +6534,22 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
             ) : null}
           </div>
 
-          <div className={getPipelineSectionPanelClass(sectionVisibility.inspector)}>
+          {sectionVisibility.inspector ? (
+            <div
+              className="fixed inset-0 z-40 flex justify-end bg-slate-950/65 p-4 backdrop-blur-sm"
+              data-node-inspector-overlay="true"
+              onMouseDown={(event) => {
+                if (event.target === event.currentTarget) closeNodeInspector();
+              }}
+              role="presentation"
+            >
+              <div aria-label="Node Inspector" aria-modal="true" className="panel h-full w-full max-w-2xl overflow-y-auto p-4 shadow-2xl" role="dialog">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Node inspector</p>
                 <p className="mt-2 text-lg font-semibold text-white">{selectedNode ? selectedNode.label : 'Select a node'}</p>
               </div>
-              <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('inspector')} type="button">
-                {sectionVisibility.inspector ? 'Collapse' : 'Expand'}
-              </button>
+              <button className="ghost-button px-3 py-1.5 text-xs" onClick={closeNodeInspector} type="button">Close</button>
             </div>
             {sectionVisibility.inspector ? (selectedNode ? (
               <PipelineInspectorErrorBoundary nodeId={selectedNode.id} nodeType={selectedNode.type} onClearSelection={() => setSelectedNodeId('')} resetKey={selectedNode.id}>
@@ -8496,7 +8594,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                       </div>
                       {selectedNode.config?.soundEffectsEnabled === true ? (
                         <div className="space-y-3">
-                          {!soundEffectLibraries.length ? <p className="text-xs leading-5 text-slate-400">Create a Sound Effects library in Settings &gt; Asset Libraries.</p> : null}
+                          {!soundEffectLibraries.length ? <p className="text-xs leading-5 text-slate-400">Create a Sound Effects library in Pipelines &gt; Resources &gt; Asset Libraries.</p> : null}
                           <div className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3">
                             <label className="flex items-center gap-3 text-sm text-slate-300" htmlFor="media-composition-sfx-global-guard">
                               <input
@@ -8754,12 +8852,14 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               </PipelineInspectorErrorBoundary>
             ) : <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">Select a node on the canvas to edit its settings and inspect its connections.</div>) : null}
           </div>
+            </div>
+          ) : null}
 
           <div className={getPipelineSectionPanelClass(sectionVisibility.canvas)}>
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Canvas</p>
-                <p className="mt-2 text-lg font-semibold text-white">Navigate large pipeline graphs without losing node interaction</p>
+                <p className="mt-2 text-lg font-semibold text-white">Navigate large pipeline graphs without losing node interaction. Right-click or double-click a node to inspect it.</p>
               </div>
               <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
                 {sectionVisibility.canvas ? <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5">Blank space drags the viewport. The mouse wheel zooms while the cursor is over the canvas.</span> : null}
@@ -8840,6 +8940,8 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
                             data-pipeline-node-card="true"
                             key={node.id}
                             onClick={() => { setSelectedEdgeId(''); setSelectedNodeId(node.id); }}
+                            onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); openNodeInspector(node.id); }}
+                            onDoubleClick={(event) => { event.stopPropagation(); openNodeInspector(node.id); }}
                             style={{ left: `${node.position.x}px`, minHeight: `${getNodeCardHeight(node)}px`, top: `${node.position.y}px`, width: `${PIPELINE_NODE_WIDTH}px` }}
                           >
                             <div className="flex cursor-grab items-start justify-between gap-3 rounded-t-[28px] border-b border-white/10 px-4 py-4" onMouseDown={(event) => startDrag(node.id, event)} role="presentation">
@@ -8965,6 +9067,50 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
             ) : null}
           </div>
 
+          </>
+          ) : null}
+
+          {activeSubview === 'resources' ? (
+          <>
+            <div className={getPipelineTwoColumnSectionPanelClass(sectionVisibility.assetLibraries)} data-pipeline-resource-section="asset-libraries">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('assetLibraries')} type="button">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Asset Libraries</p>
+                  <p className="mt-2 text-lg font-semibold text-white">Sound effects, fonts, and color palettes</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-400">Manage local workflow assets in Local AI Hub managed storage.</p>
+                </button>
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('assetLibraries')} type="button">
+                  {sectionVisibility.assetLibraries ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
+              {sectionVisibility.assetLibraries ? <div className="mt-4"><AssetLibraryManager onToast={onToast} /></div> : null}
+            </div>
+
+            <div className={getPipelineTwoColumnSectionPanelClass(sectionVisibility.promptStyles)} data-pipeline-resource-section="prompt-styles">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('promptStyles')} type="button">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Prompt Style Presets</p>
+                  <p className="mt-2 text-lg font-semibold text-white">Reusable prompt rules for workflow steps</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-400">Create deterministic styles for image, audio, video, text, or any prompt-driven step.</p>
+                </button>
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('promptStyles')} type="button">
+                  {sectionVisibility.promptStyles ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
+              {sectionVisibility.promptStyles ? (
+                <div className="mt-4">
+                  <PromptStylePresetManager
+                    busyMap={busyMap}
+                    onDeletePromptStyle={onDeletePromptStyle}
+                    onSavePromptStyle={onSavePromptStyle}
+                    promptStyles={promptStyles}
+                  />
+                </div>
+              ) : null}
+            </div>
+          </>
+          ) : null}
+
           <PipelineOutputDeletionDialog
             busy={Boolean(outputsBusyPath)}
             dialog={outputDeletionDialog}
@@ -8972,24 +9118,23 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
             onConfirm={confirmDeleteOutput}
             onToggleIntermediates={(checked) => setOutputDeletionDialog((current) => current ? { ...current, includeIntermediates: checked } : current)}
           />
-          <div className={pipelineOutputsExpanded ? 'xl:col-span-2 2xl:col-span-3' : ''} data-pipeline-home-target="outputs">
-            <PipelineOutputsPanel
-              busyPath={outputsBusyPath}
-              expanded={pipelineOutputsExpanded}
-              loading={outputsLoading}
-              onDelete={handleDeleteOutput}
-              onOpenPath={openPath}
-              onRefresh={() => loadPipelineOutputs()}
-              onRevealPath={(pathValue) => openPath(pathValue, true)}
-              onToggleExpanded={() => setPipelineOutputsExpanded((current) => !current)}
-              outputs={pipelineOutputs}
-            />
-          </div>
-      </>
+          {activeSubview === 'outputs' ? (
+            <div className="col-span-full w-full" data-pipeline-home-target="outputs" data-pipeline-outputs-full-width="true">
+              <PipelineOutputsPanel
+                busyPath={outputsBusyPath}
+                expanded={sectionVisibility.pipelineOutputs}
+                loading={outputsLoading}
+                onDelete={handleDeleteOutput}
+                onOpenPath={openPath}
+                onRefresh={() => loadPipelineOutputs()}
+                onRevealPath={(pathValue) => openPath(pathValue, true)}
+                onToggleExpanded={() => toggleSection('pipelineOutputs')}
+                outputs={pipelineOutputs}
+              />
+            </div>
+          ) : null}
       </div>
         </div>
     </section>
   );
 }
-
-

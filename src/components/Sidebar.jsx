@@ -20,6 +20,7 @@ function Sidebar({
   onCollapse,
   onExpand,
   onOpenLogs,
+  onRequestClose,
   logsBusy,
   pipelineRunStatus,
   recordingStatus,
@@ -83,9 +84,19 @@ function Sidebar({
         </div>
       </div>
 
-      <button className="ghost-button mt-3 w-full shrink-0 justify-center" disabled={logsBusy} onClick={onOpenLogs} type="button">
-        {logsBusy ? 'Opening logs...' : 'Open logs folder'}
-      </button>
+      <div className="mt-3 grid shrink-0 gap-2">
+        <button className="ghost-button w-full justify-center" disabled={logsBusy} onClick={onOpenLogs} type="button">
+          {logsBusy ? 'Opening logs...' : 'Open logs folder'}
+        </button>
+        <button
+          className="inline-flex w-full items-center justify-center rounded-xl border border-rose-300/25 bg-rose-400/10 px-3 py-2 text-sm font-semibold text-rose-100 transition hover:border-rose-200/50 hover:bg-rose-400/20"
+          data-close-local-ai-hub="true"
+          onClick={onRequestClose}
+          type="button"
+        >
+          Close Local AI Hub
+        </button>
+      </div>
     </aside>
   );
 }

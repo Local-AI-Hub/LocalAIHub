@@ -3,6 +3,7 @@ const fs = require('fs-extra');
 const { app } = require('electron');
 
 const { sanitizeUserMessage } = require('./redactionService');
+const { normalizeScreenMode } = require('./windowModeService');
 const {
   normalizeGraphWorkflowPresetRecord,
   validateGraphWorkflowPresetConfig,
@@ -12,7 +13,7 @@ const {
   normalizePromptStylePresets,
 } = require('../shared/promptStyles.cjs');
 
-const CONFIG_VERSION = 6;
+const CONFIG_VERSION = 7;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
 const LEGACY_APP_DATA_DIR_NAMES = ['NestAI'];
 const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'recordings', 'runtimes', 'logs', 'temp', 'cache', 'libraries'];
@@ -317,6 +318,7 @@ function createDefaultConfig() {
     hardware: null,
     ignoredToolIds: [],
     closeBehavior: 'exit',
+    screenMode: 'windowed',
     checkForUpdatesOnLaunch: false,
     homeChecklistDismissed: false,
     lastSeenBlockmapAvailable: false,
@@ -377,6 +379,7 @@ function normalizeConfig(config, options = {}) {
       version: CONFIG_VERSION,
       ignoredToolIds: normalizeIgnoredToolIds(config?.ignoredToolIds),
       closeBehavior: normalizeCloseBehavior(config?.closeBehavior),
+      screenMode: normalizeScreenMode(config?.screenMode),
       checkForUpdatesOnLaunch: Boolean(config?.checkForUpdatesOnLaunch),
       homeChecklistDismissed: Boolean(config?.homeChecklistDismissed),
       lastSeenBlockmapAvailable: Boolean(config?.lastSeenBlockmapAvailable),

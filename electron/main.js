@@ -150,6 +150,12 @@ const { createSystemAudioRecordingService } = require('./services/systemAudioRec
 const { createSystemAudioCaptureAdapter } = require('./services/systemAudioCaptureAdapter');
 const { normalizeOverlaySelection } = require('./services/regionSelectionService');
 const { buildTrayMenuTemplate, getTrayTooltip } = require('./services/trayMenuService');
+const {
+  getScreenMode,
+  normalizeScreenMode,
+  setScreenMode,
+  toggleFullscreen,
+} = require('./services/windowModeService');
 
 const systemAudioCaptureAdapter = createSystemAudioCaptureAdapter({
   BrowserWindow,
@@ -257,6 +263,7 @@ let regionSelectionResolve = null;
 let regionSelectionReject = null;
 let isQuitting = false;
 let closeBehaviorPreference = 'exit';
+let screenModePreference = 'windowed';
 let shutdownComplete = false;
 let shutdownPromise = null;
 let backgroundHealthInterval = null;
@@ -370,6 +377,10 @@ function normalizeCloseBehavior(value) {
 
 function setCloseBehaviorPreference(value) {
   closeBehaviorPreference = normalizeCloseBehavior(value);
+}
+
+function setScreenModePreference(value) {
+  screenModePreference = normalizeScreenMode(value);
 }
 
 function shouldMinimizeToTrayOnClose() {
@@ -545,6 +556,19 @@ function broadcastWindowActivity(force = false) {
   return nextActivity;
 }
 
+function getScreenModePayload(screenMode = getScreenMode(mainWindow)) {
+  return {
+    isFullscreen: screenMode === 'fullscreen',
+    screenMode,
+  };
+}
+
+function broadcastScreenMode(screenMode = getScreenMode(mainWindow)) {
+  const payload = getScreenModePayload(screenMode);
+  mainWindow?.webContents.send('window:screen-mode-changed', payload);
+  return payload;
+}
+
 function focusMainWindowFromRenderer(reason = 'renderer-focus-request') {
   if (!mainWindow || mainWindow.isDestroyed()) {
     return getWindowActivityPayload();
@@ -707,6 +731,7 @@ async function buildAppState(options = {}) {
     settings: {
       checkForUpdatesOnLaunch: Boolean(latestConfig.checkForUpdatesOnLaunch),
       closeBehavior: normalizeCloseBehavior(latestConfig.closeBehavior),
+      screenMode: normalizeScreenMode(latestConfig.screenMode),
       homeChecklistDismissed: Boolean(latestConfig.homeChecklistDismissed),
       liveResourcePolling: Boolean(latestConfig.liveResourcePolling),
       moveDeletedPipelineOutputsToRecycleBin: latestConfig.moveDeletedPipelineOutputsToRecycleBin !== false,
@@ -991,6 +1016,40 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
     broadcastWindowActivity(true);
+    if (screenModePreference !== 'fullscreen') {
+      broadcastScreenMode('windowed');
+      return;
+    }
+
+    setImmediate(() => {
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        return;
+      }
+
+      try {
+        broadcastScreenMode(setScreenMode(mainWindow, screenModePreference));
+      } catch (error) {
+        appendLog('window', 'warn', 'Saved fullscreen mode could not be applied on launch.', {
+          message: error?.message || String(error),
+        }).catch(() => null);
+        broadcastScreenMode();
+      }
+    });
+  });
+
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && input.key === 'F11' && !input.alt && !input.control && !input.isAutoRepeat && !input.meta && !input.shift) {
+      event.preventDefault();
+      broadcastScreenMode(toggleFullscreen(mainWindow));
+    }
+  });
+
+  mainWindow.on('enter-full-screen', () => {
+    broadcastScreenMode('fullscreen');
+  });
+
+  mainWindow.on('leave-full-screen', () => {
+    broadcastScreenMode('windowed');
   });
 
   mainWindow.on('focus', () => {
@@ -1383,6 +1442,29 @@ function registerIpcHandlers() {
   ipcMain.handle('app:focus-window', (_event, payload) =>
     withPlainEnglishErrors(async () => focusMainWindowFromRenderer(payload?.reason), 'Local AI Hub could not restore app focus.'),
   );
+  ipcMain.handle('window:get-screen-mode', () =>
+    withPlainEnglishErrors(async () => getScreenModePayload(), 'Local AI Hub could not read the current screen mode.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('window:set-screen-mode', (_event, screenMode) =>
+    withPlainEnglishErrors(async () => {
+      const nextMode = setScreenMode(mainWindow, screenMode);
+      return {
+        ...broadcastScreenMode(nextMode),
+        message: nextMode === 'fullscreen' ? 'Fullscreen mode is on.' : 'Windowed mode is on.',
+      };
+    }, 'Local AI Hub could not change the screen mode.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('window:toggle-fullscreen', () =>
+    withPlainEnglishErrors(async () => {
+      const nextMode = toggleFullscreen(mainWindow);
+      return broadcastScreenMode(nextMode);
+    }, 'Local AI Hub could not toggle fullscreen mode.', { refreshMode: 'none' }),
+  );
+  ipcMain.on('window:request-close', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.close();
+    }
+  });
 
   ipcMain.handle('app:complete-first-launch', () =>
     withPlainEnglishErrors(async () => {
@@ -1850,6 +1932,30 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not update the migration reminder.'),
   );
 
+  ipcMain.handle('settings:save-window-settings', (_event, payload) =>
+    withPlainEnglishErrors(async () => {
+      const screenMode = normalizeScreenMode(payload?.screenMode);
+      const closeBehavior = normalizeCloseBehavior(payload?.closeBehavior);
+      const liveResourcePolling = Boolean(payload?.liveResourcePolling);
+      const moveDeletedPipelineOutputsToRecycleBin = payload?.moveDeletedPipelineOutputsToRecycleBin !== false;
+      await updateConfig((config) => ({
+        ...config,
+        screenMode,
+        closeBehavior,
+        liveResourcePolling,
+        moveDeletedPipelineOutputsToRecycleBin,
+      }));
+      setScreenModePreference(screenMode);
+      setCloseBehaviorPreference(closeBehavior);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        broadcastScreenMode(setScreenMode(mainWindow, screenMode));
+      }
+      return {
+        message: 'Window settings saved. Local AI Hub will use this screen mode the next time it starts.',
+        state: await buildAppState(),
+      };
+    }, 'Local AI Hub could not save the window settings.'),
+  );
   ipcMain.handle('settings:save-close-behavior', (_event, closeBehavior) =>
     withPlainEnglishErrors(async () => {
       const nextCloseBehavior = normalizeCloseBehavior(closeBehavior);
@@ -2679,6 +2785,7 @@ async function startApplication() {
   await registerAssetLibraryPreviewProtocol();
   const initialConfig = await readConfig();
   setCloseBehaviorPreference(initialConfig.closeBehavior);
+  setScreenModePreference(initialConfig.screenMode);
   createWindow();
   setRecordingEventSink((payload) => {
     mainWindow?.webContents.send('recordings:status-update', payload);

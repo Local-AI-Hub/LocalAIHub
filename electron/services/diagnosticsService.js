@@ -333,6 +333,7 @@ async function collectSupportData(context = {}, dependencies = {}) {
     },
     configSummary: {
       closeBehavior: String(config.closeBehavior || 'exit'),
+      screenMode: String(config.screenMode || 'windowed'),
       firstLaunchCompleted: Boolean(config.firstLaunchCompleted),
       liveResourcePolling: Boolean(config.liveResourcePolling),
       moveDeletedPipelineOutputsToRecycleBin: config.moveDeletedPipelineOutputsToRecycleBin !== false,

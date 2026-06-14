@@ -61,7 +61,7 @@ export default function HomePanel({
   const coreCount = checklistItems.filter((item) => !item.optional).length;
   const quickActions = [
     { description: 'Capture your screen, microphone, camera, or system audio locally.', label: 'Record something', tab: 'recorder' },
-    { description: 'Open the node-based workflow builder.', label: 'Build a pipeline', tab: 'pipelines' },
+    { description: 'Open the node-based workflow builder.', label: 'Build a pipeline', tab: 'pipelines', target: 'build' },
     { description: 'Jump to the built-in starter workflows.', label: 'Open starter templates', tab: 'pipelines', target: 'templates' },
     { description: 'Review saved pipeline results.', label: 'View outputs', tab: 'pipelines', target: 'outputs' },
     { description: 'Browse supported local AI tools.', label: 'Install tools', tab: 'store' },

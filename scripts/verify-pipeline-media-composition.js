@@ -1420,7 +1420,7 @@ function verifyMediaCompositionSoundEffectsDefaultsAndUi() {
   assert(/Add SFX layer/.test(uiSource), 'Expected the Media Composition inspector to add SFX layers.');
   assert(/soundEffectsLayers/.test(uiSource), 'Expected the Media Composition inspector to write layered SFX config.');
   assert(/media-composition-sfx-library/.test(uiSource), 'Expected the Media Composition inspector to expose the SFX library dropdown.');
-  assert(/Settings &gt; Asset Libraries/.test(uiSource), 'Expected the Media Composition inspector to point empty SFX libraries to Settings > Asset Libraries.');
+  assert(/Pipelines &gt; Resources &gt; Asset Libraries/.test(uiSource), 'Expected the Media Composition inspector to point empty SFX libraries to Pipelines > Resources > Asset Libraries.');
   assert(/listAssetLibraries\?\.\('soundEffects'\)/.test(uiSource), 'Expected the Media Composition inspector to use Asset Library listing IPC.');
   assert(!/soundEffectsFilePath/.test(uiSource), 'Expected SFX controls not to accept arbitrary file paths.');
 }

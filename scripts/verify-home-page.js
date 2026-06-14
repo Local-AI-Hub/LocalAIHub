@@ -54,17 +54,13 @@ function verifyQuickActionsAndOutputsLayout() {
   for (const [label, target] of expected) {
     assert(homeSource.includes(label) && homeSource.includes(target), `Quick action ${label} should target the existing area.`);
   }
-  assert(appSource.includes('initialFocus={pipelineEntryTarget}'), 'Home Pipeline actions should pass their target to the existing Pipeline Builder.');
-  assert(pipelineSource.includes("initialFocus === 'outputs'"), 'The Home Outputs action should expand the existing Outputs section.');
+  assert(appSource.includes('initialFocus={pipelineEntryTarget}'), 'Home Pipeline actions should pass their target to the Pipeline workspace.');
+  assert(appSource.includes('navigationRequest={pipelineEntryRevision}'), 'Repeated Pipeline navigation should reset the requested workspace subview.');
+  assert(homeSource.includes("label: 'Build a pipeline', tab: 'pipelines', target: 'build'"), 'Build pipeline should target the Build subview.');
+  assert(pipelineSource.includes("if (target === 'outputs') return 'outputs';"), 'The Home Outputs action should route to the Outputs subview.');
   assert(pipelineSource.includes('data-pipeline-home-target="templates"'), 'Template quick action should reveal the starter templates section.');
-  assert(
-    pipelineSource.includes("<div className={pipelineOutputsExpanded ? 'xl:col-span-2 2xl:col-span-3' : ''} data-pipeline-home-target=\"outputs\">"),
-    'The Outputs grid wrapper should span every Pipeline column when expanded.',
-  );
-  assert(
-    !pipelineSource.includes("className={pipelineOutputsExpanded ? 'xl:col-span-2 2xl:col-span-3' : ''}\n              busyPath={outputsBusyPath}"),
-    'The full-width class must not sit on the nested Outputs panel instead of the grid item.',
-  );
+  assert(pipelineSource.includes('data-pipeline-outputs-full-width="true"'), 'The Outputs subview should explicitly use the full available content width.');
+  assert(!pipelineSource.includes('pipelineOutputsExpanded'), 'Outputs should no longer rely on the previous mixed-grid expansion state.');
   assert(settingsSource.includes("initialSection = ''") && settingsSource.includes('setOpenSection(initialSection)'), 'Diagnostics quick action should open the existing Settings section.');
   assert(settingsSource.includes('cleanupPreview && !initialSection'), 'Cleanup preview should not steal focus from an explicit Home Settings target.');
 }

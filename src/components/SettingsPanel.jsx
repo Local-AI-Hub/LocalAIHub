@@ -1,59 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import AssetLibraryManager from './AssetLibraryManager';
 import { formatBytes, formatDiskAvailability } from '../lib/formatters';
-
-const PROMPT_STYLE_EMPTY_DRAFT = Object.freeze({
-  id: '',
-  name: '',
-  description: '',
-  targetKind: 'image',
-  positivePrefix: '',
-  requiredTermsText: '',
-  positiveSuffix: '',
-  negativePrompt: '',
-  placement: 'suffix',
-});
-
-function splitPromptStyleTerms(value) {
-  return String(value || '').split(/[\n,]+/).map((entry) => entry.trim()).filter(Boolean);
-}
-
-function promptStyleToDraft(style = null) {
-  if (!style) return { ...PROMPT_STYLE_EMPTY_DRAFT };
-  return {
-    id: style.id || '',
-    name: style.name || '',
-    description: style.description || '',
-    targetKind: Array.isArray(style.targetKinds) ? style.targetKinds[0] || style.targetKind || 'any' : style.targetKind || 'any',
-    positivePrefix: style.positivePrefix || '',
-    requiredTermsText: Array.isArray(style.requiredTerms) ? style.requiredTerms.join('\n') : '',
-    positiveSuffix: style.positiveSuffix || '',
-    negativePrompt: style.negativePrompt || '',
-    placement: style.placement || 'suffix',
-  };
-}
-
-function buildPromptStylePayload(draft) {
-  return {
-    id: draft.id || undefined,
-    name: draft.name,
-    description: draft.description,
-    targetKind: draft.targetKind || 'any',
-    targetKinds: [draft.targetKind || 'any'],
-    positivePrefix: draft.positivePrefix,
-    requiredTerms: splitPromptStyleTerms(draft.requiredTermsText),
-    positiveSuffix: draft.positiveSuffix,
-    negativePrompt: draft.negativePrompt,
-    placement: draft.placement || 'suffix',
-    dedupe: true,
-    lockRequiredTerms: true,
-  };
-}
-
-function formatPromptStyleTarget(style) {
-  const kinds = Array.isArray(style?.targetKinds) ? style.targetKinds : [style?.targetKind || 'any'];
-  return kinds.join(', ');
-}
 
 function buildSuggestedRoot(mount) {
   const normalizedMount = String(mount || '').replace(/[\\/]*$/, '\\');
@@ -128,6 +74,7 @@ export default function SettingsPanel({
   onChangeLiveResourcePolling,
   onChangePipelineOutputTrash,
   onChangePreferredInstallRootDraft,
+  onChangeScreenMode,
   onChangeStorageDraft,
   onChoosePreferredInstallFolder,
   onChooseStorageFolder,
@@ -136,20 +83,16 @@ export default function SettingsPanel({
   onPreviewCleanup,
   onRunCleanup,
   onToast,
-  onDeletePromptStyle,
-  onSaveCloseBehavior,
-  onSavePromptStyle,
-  onSaveLiveResourcePolling,
-  onSavePipelineOutputTrash,
+  onSaveWindowSettings,
   onSavePreferredInstallRoot,
   onSaveStorageLocation,
   preferredInstallRootDraft,
-  promptStyles = [],
+  screenMode = 'windowed',
+  screenModeBusy = false,
   storage,
   storageDraft,
 }) {
   const [openSection, setOpenSection] = useState(initialSection || 'storage');
-  const [promptStyleDraft, setPromptStyleDraft] = useState(() => promptStyleToDraft(null));
   const [diagnosticsBusy, setDiagnosticsBusy] = useState('');
   const [diagnosticsStatus, setDiagnosticsStatus] = useState('');
   const [diagnosticsPath, setDiagnosticsPath] = useState('');
@@ -306,23 +249,6 @@ export default function SettingsPanel({
     }
   }
 
-  async function savePromptStyleDraft() {
-    if (!promptStyleDraft.name.trim()) {
-      return;
-    }
-    const saved = await onSavePromptStyle?.(buildPromptStylePayload(promptStyleDraft));
-    if (saved) {
-      setPromptStyleDraft(promptStyleToDraft(null));
-    }
-  }
-
-  async function deletePromptStyle(id) {
-    const removed = await onDeletePromptStyle?.(id);
-    if (removed && promptStyleDraft.id === id) {
-      setPromptStyleDraft(promptStyleToDraft(null));
-    }
-  }
-
   return (
     <section className="space-y-3">
       <SettingsSection
@@ -430,16 +356,6 @@ export default function SettingsPanel({
       </SettingsSection>
 
       <SettingsSection
-        eyebrow="Libraries"
-        id="asset-libraries"
-        openSection={openSection}
-        setOpenSection={setOpenSection}
-        summary="Manage local Sound Effects, Fonts, and Color Palettes in Local AI Hub managed storage."
-        title="Asset Libraries"
-      >
-        <AssetLibraryManager onToast={onToast} />
-      </SettingsSection>
-      <SettingsSection
         action={(
           <button className="primary-button" disabled={Boolean(updateBusy)} onClick={checkForUpdates} type="button">
             {updateBusy === 'check' ? 'Checking...' : 'Check for updates'}
@@ -539,18 +455,55 @@ export default function SettingsPanel({
       </SettingsSection>
       <SettingsSection
         action={(
-          <button className="primary-button" disabled={busyMap['settings:save-close-behavior']} onClick={onSaveCloseBehavior} type="button">
-            {busyMap['settings:save-close-behavior'] ? 'Saving...' : 'Save close behavior'}
+          <button className="primary-button" disabled={busyMap['settings:save-window-settings']} onClick={onSaveWindowSettings} type="button">
+            {busyMap['settings:save-window-settings'] ? 'Saving...' : 'Save window settings'}
           </button>
         )}
         eyebrow="Window behavior"
         id="window"
         openSection={openSection}
         setOpenSection={setOpenSection}
-        summary="Choose whether closing the window hides Local AI Hub to the tray or exits and cleans up owned helpers."
-        title="Close button and background polling"
+        summary="Choose the screen mode, close-button behavior, background resource polling, and pipeline output deletion behavior."
+        title="Screen, close button, and background polling"
       >
-        <div className="grid gap-3 md:grid-cols-2">
+        <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Screen mode</p>
+              <p className="mt-2 text-sm leading-6 text-slate-300">Current mode: {screenMode === 'fullscreen' ? 'Fullscreen mode' : 'Windowed mode'}. Press F11 anywhere in Local AI Hub to toggle.</p>
+            </div>
+            <span className="status-pill border-white/10 bg-white/5 text-slate-200">
+              {screenMode === 'fullscreen' ? 'Fullscreen' : 'Windowed'}
+            </span>
+          </div>
+          <div aria-label="Screen mode" className="mt-3 grid gap-3 md:grid-cols-2" role="radiogroup">
+            <button
+              aria-checked={screenMode === 'windowed'}
+              className={`rounded-2xl border p-4 text-left transition ${screenMode === 'windowed' ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-white/5 hover:bg-white/10'}`}
+              disabled={screenModeBusy}
+              onClick={() => onChangeScreenMode('windowed')}
+              role="radio"
+              type="button"
+            >
+              <p className="text-base font-semibold text-white">Windowed mode</p>
+              <p className="mt-2 text-sm leading-6 text-slate-300">Use the normal Windows title bar, taskbar, and resize controls.</p>
+            </button>
+            <button
+              aria-checked={screenMode === 'fullscreen'}
+              className={`rounded-2xl border p-4 text-left transition ${screenMode === 'fullscreen' ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-white/5 hover:bg-white/10'}`}
+              disabled={screenModeBusy}
+              onClick={() => onChangeScreenMode('fullscreen')}
+              role="radio"
+              type="button"
+            >
+              <p className="text-base font-semibold text-white">Fullscreen mode</p>
+              <p className="mt-2 text-sm leading-6 text-slate-300">Hide the Windows title bar and taskbar while Local AI Hub is active.</p>
+            </button>
+          </div>
+          <p className="mt-3 text-xs leading-5 text-slate-500">Click Save window settings to use the selected mode on the next launch. F11 changes the current session until you save.</p>
+        </div>
+
+        <div className="mt-3 grid gap-3 md:grid-cols-2">
           <button className={`rounded-2xl border p-4 text-left transition ${closeBehaviorDraft === 'tray' ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`} onClick={() => onChangeCloseBehavior('tray')} type="button">
             <p className="text-base font-semibold text-white">Minimize to tray on close</p>
             <p className="mt-2 text-sm leading-6 text-slate-300">Clicking the X hides the window so your tools can keep running.</p>
@@ -567,9 +520,6 @@ export default function SettingsPanel({
               <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Live usage polling</p>
               <p className="mt-2 text-sm leading-6 text-slate-300">Continuous polling can wake heavier GPU telemetry on some PCs.</p>
             </div>
-            <button className="primary-button" disabled={busyMap['settings:save-live-resource-polling']} onClick={onSaveLiveResourcePolling} type="button">
-              {busyMap['settings:save-live-resource-polling'] ? 'Saving...' : 'Save live polling'}
-            </button>
           </div>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <button className={`rounded-2xl border p-4 text-left transition ${!liveResourcePollingDraft ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`} onClick={() => onChangeLiveResourcePolling(false)} type="button">
@@ -589,9 +539,6 @@ export default function SettingsPanel({
               <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Pipeline output deletion</p>
               <p className="mt-2 text-sm leading-6 text-slate-300">Recycle Bin mode is easier to undo. Permanent delete removes output files and metadata sidecars from disk.</p>
             </div>
-            <button className="primary-button" disabled={busyMap['settings:save-pipeline-output-trash']} onClick={onSavePipelineOutputTrash} type="button">
-              {busyMap['settings:save-pipeline-output-trash'] ? 'Saving...' : 'Save output deletion'}
-            </button>
           </div>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <button className={`rounded-2xl border p-4 text-left transition ${pipelineOutputTrashDraft ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-slate-950/35 hover:bg-white/5'}`} onClick={() => onChangePipelineOutputTrash(true)} type="button">
@@ -602,68 +549,6 @@ export default function SettingsPanel({
               <p className="text-base font-semibold text-white">Permanently delete from disk</p>
               <p className="mt-2 text-sm leading-6 text-slate-300">Aggressive cleanup. Deleted pipeline outputs cannot be easily restored.</p>
             </button>
-          </div>
-        </div>
-      </SettingsSection>
-
-      <SettingsSection
-        action={(
-          <button className="primary-button" disabled={busyMap['settings:save-prompt-style'] || !promptStyleDraft.name.trim()} onClick={savePromptStyleDraft} type="button">
-            {busyMap['settings:save-prompt-style'] ? 'Saving...' : promptStyleDraft.id ? 'Save style' : 'Create style'}
-          </button>
-        )}
-        eyebrow="Prompt rules"
-        id="prompt-styles"
-        openSection={openSection}
-        setOpenSection={setOpenSection}
-        summary="Create deterministic prompt style presets for image, audio, video, text, or any prompt-driven step."
-        title="Prompt Style Presets"
-      >
-        <div className="grid gap-3 xl:grid-cols-[0.9fr,1.1fr]">
-          <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Saved styles</p>
-              <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => setPromptStyleDraft(promptStyleToDraft(null))} type="button">New style</button>
-            </div>
-            <div className="mt-3 max-h-80 space-y-2 overflow-y-auto pr-1">
-              {promptStyles.length ? promptStyles.map((style) => (
-                <div className="rounded-2xl border border-white/10 bg-white/5 px-3 py-3" key={style.id}>
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div>
-                      <p className="text-sm font-medium text-white">{style.name}</p>
-                      <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-500">{formatPromptStyleTarget(style)}</p>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => setPromptStyleDraft(promptStyleToDraft(style))} type="button">Edit</button>
-                      <button className="ghost-button px-3 py-1.5 text-xs" disabled={busyMap['settings:delete-prompt-style']} onClick={() => deletePromptStyle(style.id)} type="button">Delete</button>
-                    </div>
-                  </div>
-                  {style.requiredTerms?.length ? <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-400">{style.requiredTerms.join(', ')}</p> : null}
-                </div>
-              )) : (
-                <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-4 text-sm leading-6 text-slate-400">No prompt styles saved yet.</div>
-              )}
-            </div>
-          </div>
-
-          <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="prompt-style-name">Name</label><input className="store-input mt-3" id="prompt-style-name" onChange={(event) => setPromptStyleDraft((draft) => ({ ...draft, name: event.target.value }))} value={promptStyleDraft.name} /></div>
-              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="prompt-style-target">Target</label><select className="store-input mt-3" id="prompt-style-target" onChange={(event) => setPromptStyleDraft((draft) => ({ ...draft, targetKind: event.target.value }))} value={promptStyleDraft.targetKind}><option value="image">Image</option><option value="audio">Audio</option><option value="video">Video</option><option value="text">Text</option><option value="any">Any</option></select></div>
-            </div>
-            <div className="mt-3"><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="prompt-style-description">Description</label><input className="store-input mt-3" id="prompt-style-description" onChange={(event) => setPromptStyleDraft((draft) => ({ ...draft, description: event.target.value }))} value={promptStyleDraft.description} /></div>
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="prompt-style-prefix">Positive prefix</label><textarea className="store-input mt-3 min-h-[84px] resize-none" id="prompt-style-prefix" onChange={(event) => setPromptStyleDraft((draft) => ({ ...draft, positivePrefix: event.target.value }))} value={promptStyleDraft.positivePrefix} /></div>
-              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="prompt-style-suffix">Positive suffix</label><textarea className="store-input mt-3 min-h-[84px] resize-none" id="prompt-style-suffix" onChange={(event) => setPromptStyleDraft((draft) => ({ ...draft, positiveSuffix: event.target.value }))} value={promptStyleDraft.positiveSuffix} /></div>
-            </div>
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="prompt-style-terms">Required terms</label><textarea className="store-input mt-3 min-h-[130px] resize-none" id="prompt-style-terms" onChange={(event) => setPromptStyleDraft((draft) => ({ ...draft, requiredTermsText: event.target.value }))} placeholder="anime film still\nhand-painted background" value={promptStyleDraft.requiredTermsText} /></div>
-              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="prompt-style-negative">Negative prompt</label><textarea className="store-input mt-3 min-h-[130px] resize-none" id="prompt-style-negative" onChange={(event) => setPromptStyleDraft((draft) => ({ ...draft, negativePrompt: event.target.value }))} placeholder="photorealistic, 3d render" value={promptStyleDraft.negativePrompt} /></div>
-            </div>
-            <div className="mt-3 grid gap-3 sm:grid-cols-2">
-              <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="prompt-style-placement">Required term placement</label><select className="store-input mt-3" id="prompt-style-placement" onChange={(event) => setPromptStyleDraft((draft) => ({ ...draft, placement: event.target.value }))} value={promptStyleDraft.placement}><option value="suffix">Suffix</option><option value="prefix">Prefix</option></select></div>
-              <div className="flex items-end gap-2"><button className="primary-button" disabled={busyMap['settings:save-prompt-style'] || !promptStyleDraft.name.trim()} onClick={savePromptStyleDraft} type="button">{busyMap['settings:save-prompt-style'] ? 'Saving...' : promptStyleDraft.id ? 'Save style' : 'Create style'}</button><button className="ghost-button" onClick={() => setPromptStyleDraft(promptStyleToDraft(null))} type="button">Clear</button></div>
-            </div>
           </div>
         </div>
       </SettingsSection>

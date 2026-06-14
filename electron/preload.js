@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   getToolInstallPreflight: (payload) => invoke('tools:get-install-preflight', payload),
   getToolRuntimeOutput: (toolId) => invoke('tools:get-runtime-output', toolId),
   getWindowActivity: () => invoke('app:get-window-activity'),
+  getScreenMode: () => invoke('window:get-screen-mode'),
   focusWindow: (payload) => invoke('app:focus-window', payload),
   showConfirmDialog: (payload) => ipcRenderer.sendSync('app:confirm-sync', payload),
   installTool: (payload) => invoke('tools:install', payload),
@@ -87,6 +88,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   pickWhisperAudioFile: () => invoke('whisper:pick-audio-file'),
   refresh: () => invoke('app:refresh'),
   repairTool: (payload) => invoke('tools:repair', payload),
+  requestClose: () => ipcRenderer.send('window:request-close'),
   revealRecording: (id) => invoke('recordings:reveal', { id }),
   deleteRecording: (id) => invoke('recordings:delete', { id }),
   restoreSnapshot: (payload) => invoke('snapshots:restore', payload),
@@ -94,6 +96,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   runCleanup: () => invoke('settings:run-cleanup'),
   runPipeline: (payload) => invoke('pipelines:run', payload),
   saveCloseBehavior: (closeBehavior) => invoke('settings:save-close-behavior', closeBehavior),
+  saveWindowSettings: (payload) => invoke('settings:save-window-settings', payload),
   saveHomeChecklistDismissed: (dismissed) => invoke('settings:save-home-checklist-dismissed', dismissed),
   saveCheckForUpdatesOnLaunch: (enabled) => invoke('updates:save-check-on-launch', enabled),
   saveLiveResourcePolling: (enabled) => invoke('settings:save-live-resource-polling', enabled),
@@ -108,12 +111,14 @@ contextBridge.exposeInMainWorld('localAIHub', {
   saveSnapshot: (toolId) => invoke('snapshots:save', toolId),
   sendToolInput: (payload) => invoke('tools:send-input', payload),
   setStorageLocation: (payload) => invoke('settings:set-storage-location', payload),
+  setScreenMode: (screenMode) => invoke('window:set-screen-mode', screenMode),
   startRecording: (payload) => invoke('recordings:start', payload),
   startPipelineRecordInput: (payload) => invoke('pipelines:start-record-input', payload),
   stopRecording: () => invoke('recordings:stop'),
   stopPipelineRecordInput: (payload) => invoke('pipelines:stop-record-input', payload),
   stopTool: (toolId) => invoke('tools:stop', toolId),
   testProviderConnection: (providerId) => invoke('providers:test', providerId),
+  toggleFullscreen: () => invoke('window:toggle-fullscreen'),
   transcribeWithWhisper: (payload) => invoke('whisper:transcribe', payload),
   uninstallTool: (payload) => invoke('tools:uninstall', payload),
   updateTool: (payload) => invoke('tools:update', payload),
@@ -181,5 +186,10 @@ contextBridge.exposeInMainWorld('localAIHub', {
     const listener = (_event, payload) => handler(payload);
     ipcRenderer.on('app:window-activity', listener);
     return () => ipcRenderer.removeListener('app:window-activity', listener);
+  },
+  onScreenModeChanged: (handler) => {
+    const listener = (_event, payload) => handler(payload);
+    ipcRenderer.on('window:screen-mode-changed', listener);
+    return () => ipcRenderer.removeListener('window:screen-mode-changed', listener);
   },
 });
