@@ -92,7 +92,7 @@ function verifyMainProcessContract() {
   }
 
   const saveStart = mainSource.indexOf("ipcMain.handle('settings:save-window-settings'");
-  const saveEnd = mainSource.indexOf("ipcMain.handle('settings:save-close-behavior'", saveStart);
+  const saveEnd = mainSource.indexOf("ipcMain.handle('settings:save-home-checklist-dismissed'", saveStart);
   const saveBlock = mainSource.slice(saveStart, saveEnd);
   for (const field of [
     'screenMode',
@@ -127,6 +127,14 @@ function verifyMainProcessContract() {
   assert(mainSource.includes('shouldMinimizeToTrayOnClose()'), 'Close-to-tray behavior should remain in the shared close handler.');
   assert(mainSource.includes("reportShutdownError(error, { phase: 'window-close' })"), 'Exit cleanup errors should remain on the shared close path.');
   assert(mainSource.includes("mainWindow?.webContents.send('window:screen-mode-changed'"), 'Screen-mode changes should be emitted to the renderer.');
+
+  for (const channel of [
+    'settings:save-close-behavior',
+    'settings:save-live-resource-polling',
+    'settings:save-pipeline-output-trash',
+  ]) {
+    assert(!mainSource.includes(channel), `Legacy Settings IPC channel should be removed: ${channel}`);
+  }
 }
 
 function verifyPreloadContract() {
@@ -143,6 +151,16 @@ function verifyPreloadContract() {
   }
   assert(!preloadSource.includes('executeWindowCommand'), 'Preload must not expose arbitrary window commands.');
   assert(!preloadSource.includes('window:open-url') && !preloadSource.includes('window:open-path'), 'Window controls must not expose arbitrary URLs or file paths.');
+  for (const method of ['saveCloseBehavior', 'saveLiveResourcePolling', 'savePipelineOutputTrash']) {
+    assert(!preloadSource.includes(method), `Legacy Settings preload method should be removed: ${method}`);
+  }
+  for (const channel of [
+    'settings:save-close-behavior',
+    'settings:save-live-resource-polling',
+    'settings:save-pipeline-output-trash',
+  ]) {
+    assert(!preloadSource.includes(channel), `Legacy Settings preload channel should be removed: ${channel}`);
+  }
 }
 
 function verifyRendererUx() {
@@ -161,6 +179,9 @@ function verifyRendererUx() {
   assert(appSource.includes("const SIDEBAR_COLLAPSED_STORAGE_KEY = 'local-ai-hub.sidebar-collapsed.v1';"), 'Sidebar collapse persistence should remain independent.');
   assert(appSource.includes('window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(sidebarCollapsed))'), 'Sidebar collapse state should still persist locally.');
   assert(appSource.includes("runAction('settings:save-window-settings'"), 'Renderer should use the unified save action.');
+  for (const method of ['saveCloseBehavior', 'saveLiveResourcePolling', 'savePipelineOutputTrash']) {
+    assert(!appSource.includes(`window.localAIHub.${method}`), `Renderer should not call legacy Settings method: ${method}`);
+  }
   for (const field of [
     'screenMode,',
     'closeBehavior: closeBehaviorDraft',

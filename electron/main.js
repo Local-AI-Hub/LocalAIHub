@@ -1956,24 +1956,6 @@ function registerIpcHandlers() {
       };
     }, 'Local AI Hub could not save the window settings.'),
   );
-  ipcMain.handle('settings:save-close-behavior', (_event, closeBehavior) =>
-    withPlainEnglishErrors(async () => {
-      const nextCloseBehavior = normalizeCloseBehavior(closeBehavior);
-      await updateConfig((config) => ({
-        ...config,
-        closeBehavior: nextCloseBehavior,
-      }));
-      setCloseBehaviorPreference(nextCloseBehavior);
-      return {
-        message:
-          nextCloseBehavior === 'exit'
-            ? 'Local AI Hub will fully exit when you click the close button.'
-            : 'Local AI Hub will hide to the tray when you click the close button.',
-        state: await buildAppState(),
-      };
-    }, 'Local AI Hub could not save that close-button setting.'),
-  );
-
   ipcMain.handle('settings:save-home-checklist-dismissed', (_event, dismissed) =>
     withPlainEnglishErrors(async () => {
       const homeChecklistDismissed = Boolean(dismissed);
@@ -1984,22 +1966,6 @@ function registerIpcHandlers() {
       sendAppStateUpdate({ settings: { homeChecklistDismissed } });
       return { homeChecklistDismissed };
     }, 'Local AI Hub could not save that Home checklist preference.', { refreshMode: 'none' }),
-  );
-
-  ipcMain.handle('settings:save-live-resource-polling', (_event, enabled) =>
-    withPlainEnglishErrors(async () => {
-      const liveResourcePolling = Boolean(enabled);
-      await updateConfig((config) => ({
-        ...config,
-        liveResourcePolling,
-      }));
-      return {
-        message: liveResourcePolling
-          ? 'Live RAM and VRAM polling is now on. Local AI Hub will refresh those readings more gently in the background.'
-          : 'Live RAM and VRAM polling is now off. Local AI Hub will keep a quieter snapshot instead of refreshing continuously.',
-        state: await buildAppState(),
-      };
-    }, 'Local AI Hub could not save the live usage polling setting.'),
   );
 
   ipcMain.handle('updates:check', () =>
@@ -2036,21 +2002,6 @@ function registerIpcHandlers() {
     ),
   );
 
-  ipcMain.handle('settings:save-pipeline-output-trash', (_event, enabled) =>
-    withPlainEnglishErrors(async () => {
-      const moveDeletedPipelineOutputsToRecycleBin = enabled !== false;
-      await updateConfig((config) => ({
-        ...config,
-        moveDeletedPipelineOutputsToRecycleBin,
-      }));
-      return {
-        message: moveDeletedPipelineOutputsToRecycleBin
-          ? 'Deleted pipeline outputs will move to the Recycle Bin when Windows allows it.'
-          : 'Deleted pipeline outputs will be permanently removed from disk. This cannot be easily undone.',
-        state: await buildAppState(),
-      };
-    }, 'Local AI Hub could not save the pipeline output deletion setting.'),
-  );
   ipcMain.handle('settings:get-cleanup-preview', () =>
     withPlainEnglishErrors(() => inspectCleanupTargets(), 'Local AI Hub could not scan the approved cleanup folders right now.'),
   );

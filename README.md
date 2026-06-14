@@ -27,6 +27,7 @@ Local AI Hub is intended for Windows users who want to explore local AI without 
 - **Library:** Control installed tools and provider connections from one dashboard.
 - **Store:** Browse supported tools and review hardware-fit guidance before installing.
 - **Model Manager:** Search supported model catalogs, download model assets, and manage local copies.
+- **Recorder:** Capture the screen, system audio, microphone, or camera directly to managed local storage.
 - **Pipelines:** Create reusable, guided workflows across supported text, image, audio, and video tools.
 - **Statistics:** Review local storage use, tool launches, and resource history.
 - **Settings:** Configure storage, cleanup, asset libraries, cloud provider keys, and window behavior.
@@ -35,17 +36,25 @@ Local AI Hub is intended for Windows users who want to explore local AI without 
 
 ## Screenshots
 
-| Library | Store |
+| Home | Library |
 | --- | --- |
-| [![Local AI Hub Library showing installed tools and system resources](docs/screenshots/library.png)](docs/screenshots/library.png) | [![Local AI Hub Store showing installable tools and hardware guidance](docs/screenshots/store.png)](docs/screenshots/store.png) |
+| [![Local AI Hub Home tab showing workspace status and quick actions](docs/screenshots/home.png)](docs/screenshots/home.png) | [![Local AI Hub Library showing installed tools and system resources](docs/screenshots/library.png)](docs/screenshots/library.png) |
 
-| Model Manager | Pipelines |
+| Store | Model Manager |
 | --- | --- |
-| [![Local AI Hub Model Manager showing model catalog results](docs/screenshots/model-manager.png)](docs/screenshots/model-manager.png) | [![Local AI Hub Pipelines showing a guided workflow graph](docs/screenshots/pipelines.png)](docs/screenshots/pipelines.png) |
+| [![Local AI Hub Store showing installable tools and hardware guidance](docs/screenshots/store.png)](docs/screenshots/store.png) | [![Local AI Hub Model Manager showing downloaded models and catalog results](docs/screenshots/model-manager.png)](docs/screenshots/model-manager.png) |
 
-| Statistics | Settings |
+| Recorder | Pipelines Build |
 | --- | --- |
-| [![Local AI Hub Statistics showing local storage and launch activity](docs/screenshots/statistics.png)](docs/screenshots/statistics.png) | [![Local AI Hub Settings showing storage, cleanup, and connection controls](docs/screenshots/settings.png)](docs/screenshots/settings.png) |
+| [![Local AI Hub Recorder showing local screen and audio capture controls](docs/screenshots/recorder.png)](docs/screenshots/recorder.png) | [![Local AI Hub Pipelines Build workspace showing a guided node workflow](docs/screenshots/pipelines-build.png)](docs/screenshots/pipelines-build.png) |
+
+| Pipelines Outputs | Statistics |
+| --- | --- |
+| [![Local AI Hub Pipelines Outputs workspace showing a saved video result](docs/screenshots/pipelines-outputs.png)](docs/screenshots/pipelines-outputs.png) | [![Local AI Hub Statistics showing local storage and launch activity](docs/screenshots/statistics.png)](docs/screenshots/statistics.png) |
+
+| Settings |
+| --- |
+| [![Local AI Hub Settings showing storage, cleanup, connections, and window controls](docs/screenshots/settings.png)](docs/screenshots/settings.png) |
 
 ## Quick Start
 
@@ -121,7 +130,7 @@ The full package build writes local artifacts to the ignored `release/` director
 
 `npm run verify:wizard-live` runs the Pipeline Wizard live provider verifier. This is an opt-in manual check only: it uses saved live provider credentials and may consume quota or hit provider rate limits. Keep normal release, push, npm verify, and CI-style validation on mocked/offline wizard verifiers such as `node scripts/verify-pipeline-wizard.js` and `node scripts/verify-pipeline-wizard-lifecycle.js`.
 
-## Untested Features as of v0.50.0
+## Untested Features as of v0.51.0
 
 The following features are implemented and covered by automated verification where practical, but have not yet been validated with real-world hardware, local model assets, or live cloud-provider accounts. Treat them as experimental until they are manually tested.
 
