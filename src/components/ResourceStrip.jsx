@@ -13,7 +13,9 @@ function MetricCard({ label, value, detail, accent, compact = false }) {
 
 function ResourceStrip({ resources, installedCount, runningCount, activeTab, storage, updateCount = 0 }) {
   const activeLabel =
-    activeTab === 'library'
+    activeTab === 'home'
+      ? 'Home'
+      : activeTab === 'library'
       ? 'Library'
       : activeTab === 'store'
         ? 'Store'
@@ -27,7 +29,9 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
               ? 'Statistics'
               : 'Settings';
   const heading =
-    activeTab === 'library'
+    activeTab === 'home'
+      ? 'Your local AI workspace'
+      : activeTab === 'library'
       ? 'Your local AI shelf'
       : activeTab === 'store'
         ? 'Browse installable local AI tools'
@@ -41,7 +45,9 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
               ? 'See what Local AI Hub is using on this PC'
               : 'Control storage, cleanup, and connections';
   const summary =
-    activeTab === 'library'
+    activeTab === 'home'
+      ? 'Start with a quick action, review local readiness, or pick up where you left off.'
+      : activeTab === 'library'
       ? 'Launch, stop, snapshot, repair, and update the tools already on this machine.'
       : activeTab === 'store'
         ? 'Pick a tool, check whether this hardware is a good fit, and let Local AI Hub handle the setup locally.'
@@ -59,7 +65,7 @@ function ResourceStrip({ resources, installedCount, runningCount, activeTab, sto
     : storage?.managedRoot
       ? 'Managed storage drive'
       : 'Storage drive';
-  const compact = ['library', 'store', 'models', 'recorder', 'pipelines', 'statistics', 'settings'].includes(activeTab);
+  const compact = ['home', 'library', 'store', 'models', 'recorder', 'pipelines', 'statistics', 'settings'].includes(activeTab);
   const metrics = [
     { accent: 'text-slate-400', detail: 'Installed now', label: 'Tools', value: String(installedCount) },
     { accent: 'text-emerald-300', detail: 'Active right now', label: 'Running', value: String(runningCount) },

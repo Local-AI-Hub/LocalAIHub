@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import AssetLibraryManager from './AssetLibraryManager';
 import { formatBytes, formatDiskAvailability } from '../lib/formatters';
 
@@ -60,6 +60,12 @@ function buildSuggestedRoot(mount) {
   return `${normalizedMount}LocalAIHub`;
 }
 
+function formatUpdateCheckedAt(value) {
+  if (!value) return 'Never';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 'Unknown' : date.toLocaleString();
+}
+
 function CategoryList({ category }) {
   return (
     <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
@@ -110,8 +116,11 @@ function SettingsSection({ id, openSection, setOpenSection, eyebrow, title, summ
 }
 
 export default function SettingsPanel({
+  appUpdate,
   busyMap,
+  checkForUpdatesOnLaunch,
   cleanupPreview,
+  initialSection = '',
   closeBehaviorDraft,
   liveResourcePollingDraft,
   pipelineOutputTrashDraft,
@@ -139,17 +148,163 @@ export default function SettingsPanel({
   storage,
   storageDraft,
 }) {
-  const [openSection, setOpenSection] = useState('storage');
+  const [openSection, setOpenSection] = useState(initialSection || 'storage');
   const [promptStyleDraft, setPromptStyleDraft] = useState(() => promptStyleToDraft(null));
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState('');
+  const [diagnosticsStatus, setDiagnosticsStatus] = useState('');
+  const [diagnosticsPath, setDiagnosticsPath] = useState('');
+  const [updateBusy, setUpdateBusy] = useState('');
+  const [updateState, setUpdateState] = useState(appUpdate || null);
+  const [checkOnLaunchDraft, setCheckOnLaunchDraft] = useState(Boolean(checkForUpdatesOnLaunch));
+  const updateRequestSequence = useRef(0);
   const legacyMigration = storage?.legacyMigration;
   const currentPreferredInstallRoot = storage?.preferredInstallRoot || storage?.managedRoot || '';
   const usingManagedStorageAsDefault = !storage?.customPreferredInstallRoot || currentPreferredInstallRoot === storage?.managedRoot;
 
   useEffect(() => {
-    if (cleanupPreview) {
+    if (initialSection) {
+      setOpenSection(initialSection);
+    }
+  }, [initialSection]);
+
+  useEffect(() => {
+    if (cleanupPreview && !initialSection) {
       setOpenSection('cleanup');
     }
-  }, [cleanupPreview]);
+  }, [cleanupPreview, initialSection]);
+
+  useEffect(() => {
+    setUpdateState(appUpdate || null);
+  }, [appUpdate]);
+
+  useEffect(() => {
+    setCheckOnLaunchDraft(Boolean(checkForUpdatesOnLaunch));
+  }, [checkForUpdatesOnLaunch]);
+
+  useEffect(() => () => {
+    updateRequestSequence.current += 1;
+    window.localAIHub.cancelUpdateCheck().catch(() => null);
+  }, []);
+
+  async function runDiagnosticsAction(action, operation, fallbackMessage) {
+    setDiagnosticsBusy(action);
+    setDiagnosticsStatus('');
+    try {
+      const result = await operation();
+      if (!result?.ok) {
+        const message = result?.message || fallbackMessage;
+        setDiagnosticsStatus(message);
+        onToast?.(message, 'error');
+        return null;
+      }
+      const message = result.data?.message || fallbackMessage;
+      setDiagnosticsStatus(message);
+      onToast?.(message, 'success');
+      return result.data;
+    } catch (error) {
+      const message = error?.message || fallbackMessage;
+      setDiagnosticsStatus(message);
+      onToast?.(message, 'error');
+      return null;
+    } finally {
+      setDiagnosticsBusy('');
+    }
+  }
+
+  async function copySystemInfo() {
+    await runDiagnosticsAction('copy', () => window.localAIHub.copySystemInfo(), 'Local AI Hub could not copy the system information.');
+  }
+
+  async function createDiagnostics() {
+    const data = await runDiagnosticsAction('create', () => window.localAIHub.createDiagnosticsBundle(), 'Local AI Hub could not create the diagnostics bundle.');
+    if (data?.bundlePath) setDiagnosticsPath(data.bundlePath);
+  }
+
+  async function openDiagnosticsFolder() {
+    await runDiagnosticsAction('open', () => window.localAIHub.openDiagnosticsFolder(), 'Local AI Hub could not open the diagnostics folder.');
+  }
+
+  async function checkForUpdates() {
+    const requestSequence = updateRequestSequence.current + 1;
+    updateRequestSequence.current = requestSequence;
+    setUpdateBusy('check');
+    setUpdateState((current) => ({
+      ...(current || {}),
+      message: 'Checking GitHub Releases...',
+      status: 'checking',
+    }));
+
+    try {
+      const result = await window.localAIHub.checkForUpdates();
+      if (requestSequence !== updateRequestSequence.current) return;
+      if (result?.ok && result.data) {
+        setUpdateState(result.data);
+      } else {
+        setUpdateState((current) => ({
+          ...(current || {}),
+          message: result?.message || 'Could not check for updates. Check your connection or try again later.',
+          status: 'error',
+        }));
+      }
+    } catch {
+      if (requestSequence !== updateRequestSequence.current) return;
+      setUpdateState((current) => ({
+        ...(current || {}),
+        message: 'Could not check for updates. Check your connection or try again later.',
+        status: 'error',
+      }));
+    } finally {
+      if (requestSequence === updateRequestSequence.current) setUpdateBusy('');
+    }
+  }
+
+  async function toggleCheckOnLaunch() {
+    const nextValue = !checkOnLaunchDraft;
+    setUpdateBusy('preference');
+    try {
+      const result = await window.localAIHub.saveCheckForUpdatesOnLaunch(nextValue);
+      if (result?.ok) {
+        setCheckOnLaunchDraft(Boolean(result.data?.checkForUpdatesOnLaunch));
+        if (result.data?.update) setUpdateState(result.data.update);
+      } else {
+        setUpdateState((current) => ({
+          ...(current || {}),
+          message: result?.message || 'Local AI Hub could not save that update-check setting.',
+          status: 'error',
+        }));
+      }
+    } catch {
+      setUpdateState((current) => ({
+        ...(current || {}),
+        message: 'Local AI Hub could not save that update-check setting.',
+        status: 'error',
+      }));
+    } finally {
+      setUpdateBusy('');
+    }
+  }
+
+  async function openUpdateTarget(target) {
+    setUpdateBusy(target);
+    try {
+      const result = await window.localAIHub.openAppUpdateTarget(target);
+      if (!result?.ok) {
+        setUpdateState((current) => ({
+          ...(current || {}),
+          message: result?.message || 'Local AI Hub could not open that trusted GitHub release link.',
+          status: 'error',
+        }));
+      }
+    } catch {
+      setUpdateState((current) => ({
+        ...(current || {}),
+        message: 'Local AI Hub could not open that trusted GitHub release link.',
+        status: 'error',
+      }));
+    } finally {
+      setUpdateBusy('');
+    }
+  }
 
   async function savePromptStyleDraft() {
     if (!promptStyleDraft.name.trim()) {
@@ -283,6 +438,104 @@ export default function SettingsPanel({
         title="Asset Libraries"
       >
         <AssetLibraryManager onToast={onToast} />
+      </SettingsSection>
+      <SettingsSection
+        action={(
+          <button className="primary-button" disabled={Boolean(updateBusy)} onClick={checkForUpdates} type="button">
+            {updateBusy === 'check' ? 'Checking...' : 'Check for updates'}
+          </button>
+        )}
+        eyebrow="Updates"
+        id="updates"
+        openSection={openSection}
+        setOpenSection={setOpenSection}
+        summary="Check the public Local AI Hub GitHub Releases feed and open a newer Windows installer in your browser."
+        title="App updates"
+      >
+        <div className="grid gap-3 xl:grid-cols-[0.8fr,1.2fr]">
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div>
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Current version</p>
+                <p className="mt-2 text-lg font-semibold text-white">v{updateState?.currentVersion || '0.49.0'}</p>
+              </div>
+              <div>
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Latest version</p>
+                <p className="mt-2 text-lg font-semibold text-white">{updateState?.latestVersion ? `v${updateState.latestVersion}` : 'Unknown'}</p>
+              </div>
+            </div>
+            <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-3">
+              <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Update status</p>
+              <p className="mt-2 text-sm leading-6 text-slate-200">{updateState?.message || 'Check GitHub Releases to see whether a newer version is available.'}</p>
+              <p className="mt-2 text-xs text-slate-500">Last successful check: {formatUpdateCheckedAt(updateState?.checkedAt)}</p>
+              {updateState?.status === 'error' && updateState?.latestVersion ? (
+                <p className="mt-2 text-xs leading-5 text-slate-400">The last successful release result is still shown above.</p>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
+            <button
+              aria-pressed={checkOnLaunchDraft}
+              className={`w-full rounded-2xl border p-4 text-left transition ${checkOnLaunchDraft ? 'border-cyan-300/40 bg-cyan-400/10' : 'border-white/10 bg-white/5 hover:bg-white/10'}`}
+              disabled={Boolean(updateBusy)}
+              onClick={toggleCheckOnLaunch}
+              type="button"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="font-medium text-white">Check for updates on launch</p>
+                  <p className="mt-1 text-sm leading-6 text-slate-300">Runs a quiet, non-blocking GitHub check after startup.</p>
+                </div>
+                <span className="status-pill border-white/10 bg-white/5 text-slate-200">{checkOnLaunchDraft ? 'On' : 'Off'}</span>
+              </div>
+            </button>
+
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button className="primary-button" disabled={Boolean(updateBusy) || !updateState?.installerUrlAvailable} onClick={() => openUpdateTarget('installer')} type="button">
+                {updateBusy === 'installer' ? 'Opening...' : 'Download installer'}
+              </button>
+
+              <button className="ghost-button" disabled={Boolean(updateBusy) || !updateState?.releaseUrlAvailable} onClick={() => openUpdateTarget('notes')} type="button">
+                {updateBusy === 'notes' ? 'Opening...' : 'Release notes'}
+              </button>
+            </div>
+
+            <p className="mt-4 text-xs leading-5 text-slate-400">
+              Update checks contact GitHub Releases to compare versions. No diagnostics, files, provider keys, or usage data are uploaded.
+            </p>
+            <p className="mt-2 text-xs leading-5 text-slate-500">
+              Installer downloads open in your browser. Local AI Hub never runs or installs them automatically.
+            </p>
+          </div>
+        </div>
+      </SettingsSection>
+      <SettingsSection
+        eyebrow="Support"
+        id="support-diagnostics"
+        openSection={openSection}
+        setOpenSection={setOpenSection}
+        summary="Copy a safe support summary or create a local, reviewable diagnostics bundle. Nothing is uploaded automatically."
+        title="Support and Diagnostics"
+      >
+        <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
+          <p className="max-w-4xl text-sm leading-6 text-slate-300">
+            Create a local diagnostics bundle for bug reports. It includes app version, hardware summary, tool readiness, recent sanitized logs, and recent run summaries. It does not intentionally include API keys, model files, source media, generated outputs, or prompt contents. Review it before sharing.
+          </p>
+          <div className="mt-4 flex flex-wrap gap-2">
+            <button className="primary-button" disabled={Boolean(diagnosticsBusy)} onClick={copySystemInfo} type="button">
+              {diagnosticsBusy === 'copy' ? 'Copying...' : 'Copy system info'}
+            </button>
+            <button className="primary-button" disabled={Boolean(diagnosticsBusy)} onClick={createDiagnostics} type="button">
+              {diagnosticsBusy === 'create' ? 'Creating bundle...' : 'Create diagnostics bundle'}
+            </button>
+            <button className="ghost-button" disabled={Boolean(diagnosticsBusy)} onClick={openDiagnosticsFolder} type="button">
+              {diagnosticsBusy === 'open' ? 'Opening...' : 'Open diagnostics folder'}
+            </button>
+          </div>
+          {diagnosticsStatus ? <p className="mt-3 text-sm text-slate-200">{diagnosticsStatus}</p> : null}
+          {diagnosticsPath ? <p className="mt-2 break-all text-xs leading-5 text-slate-500">Latest bundle: {diagnosticsPath}</p> : null}
+        </div>
       </SettingsSection>
       <SettingsSection
         action={(

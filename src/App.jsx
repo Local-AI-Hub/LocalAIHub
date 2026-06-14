@@ -3,6 +3,7 @@ import AiderPanel from './components/AiderPanel';
 import CloudChatPanel from './components/CloudChatPanel';
 import ConnectionsPanel from './components/ConnectionsPanel';
 import HardwareGate from './components/HardwareGate';
+import HomePanel from './components/HomePanel';
 import KoboldCppSetupDialog from './components/KoboldCppSetupDialog';
 import LibraryCard from './components/LibraryCard';
 import ModelManager from './components/ModelManager';
@@ -23,6 +24,16 @@ const PipelineBuilderPanel = lazy(() => import('./components/PipelineBuilderPane
 const RecorderPanel = lazy(() => import('./components/RecorderPanel'));
 
 const EMPTY_STATE = {
+  appUpdate: {
+    checkedAt: null,
+    currentVersion: '0.49.0',
+    installerUrlAvailable: false,
+    latestVersion: '',
+    message: 'Check GitHub Releases to see whether a newer version is available.',
+    releaseUrlAvailable: false,
+    status: 'unknown',
+    updateAvailable: false,
+  },
   appDataPath: '',
   appInstallPath: '',
   downloadedModelCount: 0,
@@ -39,7 +50,9 @@ const EMPTY_STATE = {
   providers: [],
   resources: null,
   settings: {
+    checkForUpdatesOnLaunch: false,
     closeBehavior: 'exit',
+    homeChecklistDismissed: false,
     liveResourcePolling: false,
     moveDeletedPipelineOutputsToRecycleBin: true,
   },
@@ -62,6 +75,19 @@ const CONTAINED_SHELL_PADDING_CLASS = 'px-5 pt-5 pb-2 lg:px-6';
 const CONTAINED_SHELL_HEIGHT_CLASS = 'xl:h-[calc(100dvh-8px)] xl:max-h-[calc(100dvh-8px)] xl:min-h-0 xl:overflow-hidden';
 const LIBRARY_PAGE_SIZE = 6;
 const STORE_PAGE_SIZE = 6;
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'local-ai-hub.sidebar-collapsed.v1';
+
+function getInitialSidebarCollapsed() {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
 
 function trimConsoleOutput(value) {
   const text = String(value || '');
@@ -185,7 +211,12 @@ export default function App() {
   const [launchProgressMap, setLaunchProgressMap] = useState({});
   const [updateProgressMap, setUpdateProgressMap] = useState({});
   const [toasts, setToasts] = useState([]);
-  const [activeTab, setActiveTab] = useState('library');
+  const [activeTab, setActiveTab] = useState('home');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(getInitialSidebarCollapsed);
+  const [visitedTabs, setVisitedTabs] = useState(() => new Set(['home']));
+  const [visitedActions, setVisitedActions] = useState(() => new Set());
+  const [pipelineEntryTarget, setPipelineEntryTarget] = useState('');
+  const [settingsEntryTarget, setSettingsEntryTarget] = useState('');
   const [activePipelineRun, setActivePipelineRun] = useState(null);
   const [activeRecording, setActiveRecording] = useState(null);
   const [storeSearch, setStoreSearch] = useState('');
@@ -441,6 +472,18 @@ export default function App() {
   const effectiveStoreInstallRoot = String(storeInstallRootDraft || savedPreferredInstallRoot || '').trim();
 
   useEffect(() => {
+    setVisitedTabs((current) => new Set([...current, activeTab]));
+  }, [activeTab]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(sidebarCollapsed));
+    } catch {
+      // Keep collapse available for this session when local storage is unavailable.
+    }
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
     setLibraryPage((page) => clampPaginationPage(page, libraryTotalPages));
   }, [libraryTotalPages]);
 
@@ -454,6 +497,34 @@ export default function App() {
 
   function dismissToast(id) {
     setToasts((current) => current.filter((toast) => toast.id !== id));
+  }
+
+  function navigateToTab(tab, target = '') {
+    setPipelineEntryTarget(tab === 'pipelines' ? target : '');
+    setSettingsEntryTarget(tab === 'settings' ? target : '');
+    if (target) {
+      setVisitedActions((current) => new Set([...current, target]));
+    }
+    setActiveTab(tab);
+  }
+
+  async function dismissHomeChecklist() {
+    setAppState((current) => ({
+      ...current,
+      settings: { ...current.settings, homeChecklistDismissed: true },
+    }));
+    try {
+      const result = await window.localAIHub.saveHomeChecklistDismissed(true);
+      if (!result?.ok) {
+        throw new Error(result?.message || 'Local AI Hub could not save that checklist preference.');
+      }
+    } catch (error) {
+      setAppState((current) => ({
+        ...current,
+        settings: { ...current.settings, homeChecklistDismissed: false },
+      }));
+      pushToast(error?.message || 'Local AI Hub could not save that checklist preference.', 'error');
+    }
   }
 
   function clearProgress(toolId) {
@@ -1878,20 +1949,6 @@ export default function App() {
       }
     });
 
-    const unsubscribeUpdateReady = window.localAIHub.onUpdateReady((payload) => {
-      pushToast(payload?.message || 'An update is ready. Restart Local AI Hub to install.', 'success', {
-        tag: 'update-ready',
-        persistent: true,
-        actionLabel: 'Restart Now',
-        onAction: async () => {
-          const result = await window.localAIHub.restartToUpdate();
-          if (!result?.ok) {
-            pushToast(result?.message || 'Local AI Hub could not restart to install the update.', 'error');
-          }
-        },
-      });
-    });
-
     return () => {
       unsubscribeInstallProgress();
       unsubscribeOpenToolUi();
@@ -1905,7 +1962,6 @@ export default function App() {
       unsubscribeUnexpectedStop();
       unsubscribeToolUpdateSummary();
       unsubscribeUpdateProgress();
-      unsubscribeUpdateReady();
     };
   }, []);
 
@@ -2159,8 +2215,10 @@ export default function App() {
     );
   }
 
-  const containedTab = ['library', 'store', 'models', 'recorder', 'pipelines', 'statistics', 'settings'].includes(activeTab);
-  const shellGridClassName = `mx-auto grid ${CONTAINED_CONTENT_MAX_WIDTH_CLASS} gap-5 xl:grid-cols-[280px,minmax(0,1fr)] ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`;
+  const containedTab = ['home', 'library', 'store', 'models', 'recorder', 'pipelines', 'statistics', 'settings'].includes(activeTab);
+  const shellGridClassName = sidebarCollapsed
+    ? `mx-auto grid ${CONTAINED_CONTENT_MAX_WIDTH_CLASS} grid-cols-1 grid-rows-[auto,minmax(0,1fr)] gap-3 ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`
+    : `mx-auto grid ${CONTAINED_CONTENT_MAX_WIDTH_CLASS} gap-5 xl:grid-cols-[280px,minmax(0,1fr)] ${containedTab ? 'xl:h-full xl:min-h-0' : ''}`;
   const appShellClassName = containedTab
     ? `min-h-screen bg-shell ${CONTAINED_SHELL_PADDING_CLASS} text-white ${CONTAINED_SHELL_HEIGHT_CLASS}`
     : 'min-h-screen bg-shell px-5 py-5 text-white lg:px-6';
@@ -2171,11 +2229,14 @@ export default function App() {
       <div className={shellGridClassName}>
         <Sidebar
           activeTab={activeTab}
+          collapsed={sidebarCollapsed}
           hardware={appState.hardware}
           installedCount={libraryCount}
           logsBusy={busyMap['open-logs']}
           modelManagerCount={modelManagerCount}
-          onChangeTab={setActiveTab}
+          onChangeTab={navigateToTab}
+          onCollapse={() => setSidebarCollapsed(true)}
+          onExpand={() => setSidebarCollapsed(false)}
           onOpenLogs={() => runAction('open-logs', () => window.localAIHub.openLogsFolder())}
           pipelineRunStatus={pipelineRunStatus}
           recordingStatus={activeRecording ? 'Recording' : ''}
@@ -2183,16 +2244,31 @@ export default function App() {
         />
 
         <main className={mainClassName}>
-          <ResourceStrip
-            activeTab={activeTab}
-            installedCount={libraryCount}
-            resources={currentResources}
-            runningCount={runningCount}
-            storage={appState.storage}
-            updateCount={toolUpdateSummary.availableCount || 0}
-          />
+          {activeTab !== 'home' ? (
+            <ResourceStrip
+              activeTab={activeTab}
+              installedCount={libraryCount}
+              resources={currentResources}
+              runningCount={runningCount}
+              storage={appState.storage}
+              updateCount={toolUpdateSummary.availableCount || 0}
+            />
+          ) : null}
 
-          {activeTab === 'library' ? (
+          {activeTab === 'home' ? (
+            <HomePanel
+              appVersion={appState.appUpdate?.currentVersion || '0.49.0'}
+              checklistDismissed={Boolean(appState.settings?.homeChecklistDismissed)}
+              connectedProviderCount={connectedProviders.length}
+              downloadedModelCount={modelManagerCount}
+              onDismissChecklist={dismissHomeChecklist}
+              onNavigate={navigateToTab}
+              storage={appState.storage}
+              tools={tools}
+              visitedActions={visitedActions}
+              visitedTabs={visitedTabs}
+            />
+          ) : activeTab === 'library' ? (
             <section className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
               <div className="flex-none space-y-3 overflow-y-auto pb-3 pr-1 [max-height:45vh]">
                 <ToolUpdatesPanel busyMap={busyMap} onUpdateTool={updateLibraryTool} summary={toolUpdateSummary} />
@@ -2468,6 +2544,7 @@ export default function App() {
               <PipelineBuilderPanel
                 graphWorkflowPresets={appState.graphWorkflowPresets}
                 hardware={appState.hardware}
+                initialFocus={pipelineEntryTarget}
                 manifests={appState.manifests}
                 promptStyles={appState.promptStyles}
                 moveDeletedPipelineOutputsToRecycleBin={appState.settings?.moveDeletedPipelineOutputsToRecycleBin !== false}
@@ -2491,7 +2568,10 @@ export default function App() {
             <section className="min-h-0 flex-1 overflow-y-auto pb-4 pr-1">
               <div className="space-y-3">
               <SettingsPanel
+                appUpdate={appState.appUpdate}
+                initialSection={settingsEntryTarget === 'diagnostics' ? 'support-diagnostics' : ''}
                 busyMap={busyMap}
+                checkForUpdatesOnLaunch={Boolean(appState.settings?.checkForUpdatesOnLaunch)}
                 cleanupPreview={cleanupPreview}
                 closeBehaviorDraft={closeBehaviorDraft}
                 liveResourcePollingDraft={liveResourcePollingDraft}

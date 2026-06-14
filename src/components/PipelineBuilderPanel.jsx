@@ -3717,7 +3717,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
     </>
   );
 }
-export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, manifests, moveDeletedPipelineOutputsToRecycleBin = true, onToast, promptStyles = [], providers, tools }) {
+export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, initialFocus = '', manifests, moveDeletedPipelineOutputsToRecycleBin = true, onToast, promptStyles = [], providers, tools }) {
   const [pipelines, setPipelines] = useState([]);
   const [draft, setDraft] = useState(() => createEmptyPipeline());
   const [selectedNodeId, setSelectedNodeId] = useState('');
@@ -3868,6 +3868,23 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
     () => wizardModelOptions.find((model) => model.id === getWizardModelId(wizardModel)) || null,
     [wizardModel, wizardModelOptions],
   );
+  useEffect(() => {
+    if (!initialFocus) {
+      return undefined;
+    }
+
+    if (initialFocus === 'templates') {
+      setSectionVisibility((current) => ({ ...current, starterTemplates: true }));
+    } else if (initialFocus === 'outputs') {
+      setPipelineOutputsExpanded(true);
+    }
+
+    const timerId = window.setTimeout(() => {
+      document.querySelector(`[data-pipeline-home-target="${initialFocus}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 0);
+    return () => window.clearTimeout(timerId);
+  }, [initialFocus]);
+
   useEffect(() => {
     if (Array.isArray(initialGraphWorkflowPresets)) {
       setGraphWorkflowPresets(initialGraphWorkflowPresets);
@@ -6138,7 +6155,7 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
               </div>
             ) : null}
           </div>
-          <div className={getPipelineSectionPanelClass(sectionVisibility.starterTemplates)}>
+          <div className={getPipelineSectionPanelClass(sectionVisibility.starterTemplates)} data-pipeline-home-target="templates">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('starterTemplates')} type="button">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Starter templates</p>
@@ -8955,18 +8972,19 @@ export default function PipelineBuilderPanel({ graphWorkflowPresets: initialGrap
             onConfirm={confirmDeleteOutput}
             onToggleIntermediates={(checked) => setOutputDeletionDialog((current) => current ? { ...current, includeIntermediates: checked } : current)}
           />
-          <PipelineOutputsPanel
-            className={pipelineOutputsExpanded ? 'xl:col-span-2 2xl:col-span-3' : ''}
-            busyPath={outputsBusyPath}
-            expanded={pipelineOutputsExpanded}
-            loading={outputsLoading}
-            onDelete={handleDeleteOutput}
-            onOpenPath={openPath}
-            onRefresh={() => loadPipelineOutputs()}
-            onRevealPath={(pathValue) => openPath(pathValue, true)}
-            onToggleExpanded={() => setPipelineOutputsExpanded((current) => !current)}
-            outputs={pipelineOutputs}
-          />
+          <div className={pipelineOutputsExpanded ? 'xl:col-span-2 2xl:col-span-3' : ''} data-pipeline-home-target="outputs">
+            <PipelineOutputsPanel
+              busyPath={outputsBusyPath}
+              expanded={pipelineOutputsExpanded}
+              loading={outputsLoading}
+              onDelete={handleDeleteOutput}
+              onOpenPath={openPath}
+              onRefresh={() => loadPipelineOutputs()}
+              onRevealPath={(pathValue) => openPath(pathValue, true)}
+              onToggleExpanded={() => setPipelineOutputsExpanded((current) => !current)}
+              outputs={pipelineOutputs}
+            />
+          </div>
       </>
       </div>
         </div>

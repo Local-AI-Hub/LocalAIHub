@@ -12,7 +12,7 @@ const {
   normalizePromptStylePresets,
 } = require('../shared/promptStyles.cjs');
 
-const CONFIG_VERSION = 4;
+const CONFIG_VERSION = 6;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
 const LEGACY_APP_DATA_DIR_NAMES = ['NestAI'];
 const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'recordings', 'runtimes', 'logs', 'temp', 'cache', 'libraries'];
@@ -317,6 +317,16 @@ function createDefaultConfig() {
     hardware: null,
     ignoredToolIds: [],
     closeBehavior: 'exit',
+    checkForUpdatesOnLaunch: false,
+    homeChecklistDismissed: false,
+    lastSeenBlockmapAvailable: false,
+    lastSeenInstallerName: '',
+    lastSeenInstallerUrl: '',
+    lastSeenLatestVersion: '',
+    lastSeenLatestYmlAvailable: false,
+    lastSeenReleaseName: '',
+    lastSeenReleaseUrl: '',
+    lastSuccessfulUpdateCheckAt: null,
     liveResourcePolling: false,
     moveDeletedPipelineOutputsToRecycleBin: true,
     graphWorkflowPresets: [],
@@ -367,6 +377,16 @@ function normalizeConfig(config, options = {}) {
       version: CONFIG_VERSION,
       ignoredToolIds: normalizeIgnoredToolIds(config?.ignoredToolIds),
       closeBehavior: normalizeCloseBehavior(config?.closeBehavior),
+      checkForUpdatesOnLaunch: Boolean(config?.checkForUpdatesOnLaunch),
+      homeChecklistDismissed: Boolean(config?.homeChecklistDismissed),
+      lastSeenBlockmapAvailable: Boolean(config?.lastSeenBlockmapAvailable),
+      lastSeenInstallerName: String(config?.lastSeenInstallerName || ''),
+      lastSeenInstallerUrl: String(config?.lastSeenInstallerUrl || ''),
+      lastSeenLatestVersion: String(config?.lastSeenLatestVersion || ''),
+      lastSeenLatestYmlAvailable: Boolean(config?.lastSeenLatestYmlAvailable),
+      lastSeenReleaseName: String(config?.lastSeenReleaseName || ''),
+      lastSeenReleaseUrl: String(config?.lastSeenReleaseUrl || ''),
+      lastSuccessfulUpdateCheckAt: config?.lastSuccessfulUpdateCheckAt || null,
       liveResourcePolling: Boolean(config?.liveResourcePolling),
       moveDeletedPipelineOutputsToRecycleBin: config?.moveDeletedPipelineOutputsToRecycleBin !== false,
       graphWorkflowPresets: normalizeGraphWorkflowPresets(config?.graphWorkflowPresets),

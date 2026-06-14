@@ -1,4 +1,4 @@
-﻿const assert = require('assert');
+const assert = require('assert');
 const fs = require('fs-extra');
 const os = require('os');
 const path = require('path');
@@ -448,9 +448,18 @@ function verifyTrayAndLayout() {
   const panelText = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'RecorderPanel.jsx'), 'utf8');
   const mainText = fs.readFileSync(path.join(__dirname, '..', 'electron', 'main.js'), 'utf8');
 
-  assert(resourceStripText.includes("['library', 'store', 'models', 'recorder', 'pipelines', 'statistics', 'settings'].includes(activeTab)"), 'Recorder should use the same compact ResourceStrip shell as the other main tabs.');
+  assert(resourceStripText.includes("['home', 'library', 'store', 'models', 'recorder', 'pipelines', 'statistics', 'settings'].includes(activeTab)"), 'Recorder should use the same compact ResourceStrip shell as the other main tabs.');
   assert(resourceStripText.includes("activeTab === 'recorder'") && resourceStripText.includes("? 'Recorder'"), 'Recorder should have its own compact shared header label.');
   assert(panelText.includes('className="min-h-0 flex-1 overflow-y-auto pb-4 pr-1"'), 'Recorder content should use the same contained internal-scroll shell as Settings and other main tabs.');
+  assert(panelText.includes("const MANAGED_STORAGE_COLLAPSED_STORAGE_KEY = 'local-ai-hub.recorder-managed-storage-collapsed.v1';"), 'Recorder Managed Storage collapse should use a local, versioned persistence key.');
+  assert(panelText.includes('useState(getInitialManagedStorageCollapsed)'), 'Recorder Managed Storage should restore its persisted collapse state and default to expanded.');
+  assert(panelText.includes('aria-expanded={!managedStorageCollapsed}') && panelText.includes('aria-controls="recorder-managed-storage-content"'), 'Recorder Managed Storage should expose an accessible expand/collapse control.');
+  assert(panelText.includes("data-recorder-managed-storage={managedStorageCollapsed ? 'collapsed' : 'expanded'}"), 'Recorder Managed Storage should expose both collapsed and expanded verifier states.');
+  assert(panelText.includes('setManagedStorageCollapsed((current) => !current)') && panelText.includes("managedStorageCollapsed ? 'Expand' : 'Collapse'"), 'Recorder Managed Storage should toggle in both directions.');
+  assert(panelText.includes('window.localStorage.setItem(MANAGED_STORAGE_COLLAPSED_STORAGE_KEY, String(managedStorageCollapsed))'), 'Recorder Managed Storage collapse changes should persist locally.');
+  const managedStorageIndex = panelText.indexOf('data-recorder-managed-storage=');
+  const startRecordingIndex = panelText.indexOf('Start recording');
+  assert(startRecordingIndex >= 0 && managedStorageIndex > startRecordingIndex, 'Critical Recorder controls should stay outside and above the collapsible Managed Storage section.');
   assert(panelText.includes('Finalizing recording; this can take a few seconds while the local capture backend writes the file.'), 'Slow finalization should describe the active local backend.');
   const stopFunctionSource = panelText.match(/async function stop\(\) \{([\s\S]*?)\n  \}\n\n  async function cancel/)?.[1] || '';
   assert(stopFunctionSource && !stopFunctionSource.includes('await loadRecordings()'), 'Recorder Stop should not wait for the recent-recordings scan.');

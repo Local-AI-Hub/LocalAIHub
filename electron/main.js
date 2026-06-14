@@ -3,6 +3,7 @@ const fs = require('fs');
 const {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   desktopCapturer,
   ipcMain,
@@ -103,7 +104,7 @@ const { getStatisticsCoreSnapshot, getStatisticsSnapshot, getStatisticsStorageSn
 const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./services/toolUpdateService');
 const { transcribeWithWhisper } = require('./services/whisperService');
 const { buildMergedToolStateList } = require('./services/toolStateService');
-const { configureAutoUpdates, isUpdateReady, restartToInstallUpdate } = require('./services/updateService');
+const { createUpdateService } = require('./services/updateService');
 const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
 const {
   cancelPipelineRecordInput,
@@ -121,6 +122,16 @@ const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./
 const { buildPipelineOutputDeletionPreview, deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
 const { redactSensitiveText } = require('./services/redactionService');
 const { appendLog } = require('./services/logService');
+const {
+  buildSystemInfoText,
+  collectSupportData,
+  createDiagnosticsBundle,
+  getDiagnosticsRoot,
+} = require('./services/diagnosticsService');
+
+const appUpdateService = createUpdateService({
+  openExternalImpl: (url) => shell.openExternal(url),
+});
 const {
   cancelRecording: cancelFfmpegRecording,
   deleteRecording: deleteStoredRecording,
@@ -246,7 +257,6 @@ let regionSelectionResolve = null;
 let regionSelectionReject = null;
 let isQuitting = false;
 let closeBehaviorPreference = 'exit';
-let pendingUpdateInstall = false;
 let shutdownComplete = false;
 let shutdownPromise = null;
 let backgroundHealthInterval = null;
@@ -384,14 +394,10 @@ async function shutdownOwnedResources() {
   }
   await disposeAllRuntimes().catch(() => null);
   await disposeBackgroundTasks().catch(() => null);
+  appUpdateService.dispose();
 }
 
-async function requestAppQuit(options = {}) {
-  if (options.installUpdate && !isUpdateReady()) {
-    return false;
-  }
-
-  pendingUpdateInstall = pendingUpdateInstall || Boolean(options.installUpdate);
+async function requestAppQuit() {
   if (!shutdownPromise) {
     shutdownPromise = (async () => {
       isQuitting = true;
@@ -401,15 +407,6 @@ async function requestAppQuit(options = {}) {
       if (tray && !tray.isDestroyed()) {
         tray.destroy();
         tray = null;
-      }
-
-      if (pendingUpdateInstall) {
-        const installingUpdate = restartToInstallUpdate();
-        if (installingUpdate) {
-          return true;
-        }
-
-        pendingUpdateInstall = false;
       }
 
       app.quit();
@@ -475,13 +472,6 @@ async function notify(title, body, options = {}) {
   });
   notification.show();
   return notification;
-}
-
-function sendUpdateReadyNotification() {
-  mainWindow?.webContents.send('app:update-ready', {
-    message: 'An update is ready. Restart Local AI Hub to install.',
-  });
-  notify('Local AI Hub update ready', 'An update is ready. Restart Local AI Hub to install.').catch(() => null);
 }
 
 function openInternalToolInterface(tool) {
@@ -715,10 +705,13 @@ async function buildAppState(options = {}) {
     providers: await listProviderConnections(),
     resources: await getCachedLiveResources(paths.managedRoot, { includeDisk: true }),
     settings: {
+      checkForUpdatesOnLaunch: Boolean(latestConfig.checkForUpdatesOnLaunch),
       closeBehavior: normalizeCloseBehavior(latestConfig.closeBehavior),
+      homeChecklistDismissed: Boolean(latestConfig.homeChecklistDismissed),
       liveResourcePolling: Boolean(latestConfig.liveResourcePolling),
       moveDeletedPipelineOutputsToRecycleBin: latestConfig.moveDeletedPipelineOutputsToRecycleBin !== false,
     },
+    appUpdate: await appUpdateService.getSnapshot(),
     storage,
     toolUpdates: await getToolUpdateSnapshot(tools),
     tools,
@@ -1348,6 +1341,42 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not refresh live system usage right now.'),
   );
 
+  ipcMain.handle('diagnostics:copy-system-info', () =>
+    withPlainEnglishErrors(async () => {
+      const data = await collectSupportData({
+        activePipelineRun: getActiveRunSnapshot(),
+        appVersion: app.getVersion(),
+        versions: process.versions,
+      });
+      const text = buildSystemInfoText(data);
+      clipboard.writeText(text);
+      return {
+        message: 'System information copied. Review it before sharing.',
+      };
+    }, 'Local AI Hub could not copy the system information.', { refreshMode: 'none' }),
+  );
+
+  ipcMain.handle('diagnostics:create-bundle', () =>
+    withPlainEnglishErrors(() => createDiagnosticsBundle({
+      activePipelineRun: getActiveRunSnapshot(),
+      appVersion: app.getVersion(),
+      versions: process.versions,
+    }), 'Local AI Hub could not create the diagnostics bundle.', { refreshMode: 'none' }),
+  );
+
+  ipcMain.handle('diagnostics:open-folder', () =>
+    withPlainEnglishErrors(async () => {
+      const diagnosticsRoot = getDiagnosticsRoot(await ensureStorage());
+      await fs.promises.mkdir(diagnosticsRoot, { recursive: true });
+      const result = await shell.openPath(diagnosticsRoot);
+      if (result) throw new Error(result);
+      return {
+        diagnosticsRoot,
+        message: 'Diagnostics folder opened.',
+      };
+    }, 'Local AI Hub could not open the diagnostics folder.', { refreshMode: 'none' }),
+  );
+
   ipcMain.handle('app:get-window-activity', () =>
     withPlainEnglishErrors(async () => getWindowActivityPayload(), 'Local AI Hub could not read the current window activity.'),
   );
@@ -1467,19 +1496,6 @@ function registerIpcHandlers() {
       await invalidateStatisticsIndexSections(['storage'], 'recording-deleted').catch(() => null);
       return result;
     }, 'Local AI Hub could not delete that recording.'),
-  );
-
-  ipcMain.handle('app:restart-to-update', () =>
-    withPlainEnglishErrors(async () => {
-      if (!isUpdateReady()) {
-        throw new Error('Local AI Hub does not have a downloaded update ready yet.');
-      }
-
-      requestAppQuit({ installUpdate: true }).catch((error) => reportShutdownError(error, { phase: 'restart-to-update' }));
-      return {
-        message: 'Local AI Hub is restarting to install the update.',
-      };
-    }, 'Local AI Hub could not restart to install the update.'),
   );
 
   ipcMain.handle('asset-libraries:list', (_event, payload) =>
@@ -1852,6 +1868,18 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not save that close-button setting.'),
   );
 
+  ipcMain.handle('settings:save-home-checklist-dismissed', (_event, dismissed) =>
+    withPlainEnglishErrors(async () => {
+      const homeChecklistDismissed = Boolean(dismissed);
+      await updateConfig((config) => ({
+        ...config,
+        homeChecklistDismissed,
+      }));
+      sendAppStateUpdate({ settings: { homeChecklistDismissed } });
+      return { homeChecklistDismissed };
+    }, 'Local AI Hub could not save that Home checklist preference.', { refreshMode: 'none' }),
+  );
+
   ipcMain.handle('settings:save-live-resource-polling', (_event, enabled) =>
     withPlainEnglishErrors(async () => {
       const liveResourcePolling = Boolean(enabled);
@@ -1866,6 +1894,40 @@ function registerIpcHandlers() {
         state: await buildAppState(),
       };
     }, 'Local AI Hub could not save the live usage polling setting.'),
+  );
+
+  ipcMain.handle('updates:check', () =>
+    withPlainEnglishErrors(async () => {
+      const update = await appUpdateService.checkForUpdates();
+      sendAppStateUpdate({ appUpdate: update });
+      return update;
+    }, 'Local AI Hub could not check for updates right now.', { refreshMode: 'none' }),
+  );
+
+  ipcMain.handle('updates:cancel-check', () =>
+    withPlainEnglishErrors(async () => {
+      appUpdateService.cancelUpdateCheck();
+      return { message: 'Update check stopped.' };
+    }, 'Local AI Hub could not stop that update check.', { refreshMode: 'none' }),
+  );
+
+  ipcMain.handle('updates:save-check-on-launch', (_event, enabled) =>
+    withPlainEnglishErrors(async () => {
+      const result = await appUpdateService.saveCheckOnLaunch(enabled);
+      sendAppStateUpdate({
+        appUpdate: result.update,
+        settings: { checkForUpdatesOnLaunch: result.checkForUpdatesOnLaunch },
+      });
+      return result;
+    }, 'Local AI Hub could not save that update-check setting.', { refreshMode: 'none' }),
+  );
+
+  ipcMain.handle('updates:open-target', (_event, target) =>
+    withPlainEnglishErrors(
+      () => appUpdateService.openUpdateTarget(target),
+      'Local AI Hub could not open that trusted GitHub release link.',
+      { refreshMode: 'none' },
+    ),
   );
 
   ipcMain.handle('settings:save-pipeline-output-trash', (_event, enabled) =>
@@ -2670,13 +2732,16 @@ async function startApplication() {
   tray = new Tray(createTrayIcon());
   tray.on('click', handleTrayClick);
   registerIpcHandlers();
-  configureAutoUpdates({ onUpdateReady: sendUpdateReadyNotification });
   await initializeToolRegistry();
   await initializeProviderRegistry();
   const initialState = await buildAppState({ forceDiscovery: true });
   await updateTrayMenu();
   await runSilentToolUpdateCheck(initialState.tools).catch(() => null);
   await updateHealthMonitor({ hasRunningTools: initialState.tools.some((tool) => tool.status === 'running') });
+  appUpdateService.scheduleLaunchUpdateCheck({
+    enabled: Boolean(initialConfig.checkForUpdatesOnLaunch),
+    onResult: (update) => sendAppStateUpdate({ appUpdate: update }),
+  });
   toolUpdateInterval = setInterval(() => {
     buildMergedToolStateList({ includeSnapshots: false, resolveStatuses: false })
       .then((tools) => runSilentToolUpdateCheck(tools))
@@ -2720,7 +2785,7 @@ app.on('before-quit', (event) => {
   }
 
   event.preventDefault();
-  requestAppQuit({ installUpdate: pendingUpdateInstall }).catch((error) => {
+  requestAppQuit().catch((error) => {
     reportShutdownError(error, { phase: 'before-quit' });
     shutdownComplete = true;
     app.exit(1);

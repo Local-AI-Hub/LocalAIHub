@@ -8,6 +8,10 @@ contextBridge.exposeInMainWorld('localAIHub', {
   bootstrap: () => invoke('app:bootstrap'),
   browseModels: (payload) => invoke('models:browse', payload),
   cancelModelBrowse: (requestId) => invoke('models:cancel-browse', { requestId }),
+  cancelUpdateCheck: () => invoke('updates:cancel-check'),
+  checkForUpdates: () => invoke('updates:check'),
+  copySystemInfo: () => invoke('diagnostics:copy-system-info'),
+  createDiagnosticsBundle: () => invoke('diagnostics:create-bundle'),
   createAssetLibrary: (payload) => invoke('asset-libraries:create', payload),
   deleteAssetLibrary: (payload) => invoke('asset-libraries:delete', payload),
   getAssetLibraryItemPreview: (payload) => invoke('asset-libraries:get-preview', payload),
@@ -67,6 +71,8 @@ contextBridge.exposeInMainWorld('localAIHub', {
   selectRecordingRegion: (displayId) => invoke('recordings:select-region', { displayId }),
   listRecordings: () => invoke('recordings:list'),
   logRendererEvent: (payload) => invoke('app:log-renderer-event', payload),
+  openDiagnosticsFolder: () => invoke('diagnostics:open-folder'),
+  openAppUpdateTarget: (target) => invoke('updates:open-target', target),
   openLogsFolder: () => invoke('app:open-logs-folder'),
   openRecording: (id) => invoke('recordings:open', { id }),
   openRecordingsFolder: () => invoke('recordings:open-folder'),
@@ -82,13 +88,14 @@ contextBridge.exposeInMainWorld('localAIHub', {
   refresh: () => invoke('app:refresh'),
   repairTool: (payload) => invoke('tools:repair', payload),
   revealRecording: (id) => invoke('recordings:reveal', { id }),
-  restartToUpdate: () => invoke('app:restart-to-update'),
   deleteRecording: (id) => invoke('recordings:delete', { id }),
   restoreSnapshot: (payload) => invoke('snapshots:restore', payload),
   resumePipelineValidation: (payload) => invoke('pipelines:resume-validation', payload),
   runCleanup: () => invoke('settings:run-cleanup'),
   runPipeline: (payload) => invoke('pipelines:run', payload),
   saveCloseBehavior: (closeBehavior) => invoke('settings:save-close-behavior', closeBehavior),
+  saveHomeChecklistDismissed: (dismissed) => invoke('settings:save-home-checklist-dismissed', dismissed),
+  saveCheckForUpdatesOnLaunch: (enabled) => invoke('updates:save-check-on-launch', enabled),
   saveLiveResourcePolling: (enabled) => invoke('settings:save-live-resource-polling', enabled),
   savePipelineOutputTrash: (enabled) => invoke('settings:save-pipeline-output-trash', enabled),
   savePreferredInstallRoot: (targetPath) => invoke('settings:save-preferred-install-root', targetPath),
@@ -164,11 +171,6 @@ contextBridge.exposeInMainWorld('localAIHub', {
     const listener = (_event, payload) => handler(payload);
     ipcRenderer.on('tools:update-progress', listener);
     return () => ipcRenderer.removeListener('tools:update-progress', listener);
-  },
-  onUpdateReady: (handler) => {
-    const listener = (_event, payload) => handler(payload);
-    ipcRenderer.on('app:update-ready', listener);
-    return () => ipcRenderer.removeListener('app:update-ready', listener);
   },
   onAppStateUpdated: (handler) => {
     const listener = (_event, payload) => handler(payload);

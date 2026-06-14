@@ -1,5 +1,15 @@
-﻿import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
+
+const MANAGED_STORAGE_COLLAPSED_STORAGE_KEY = 'local-ai-hub.recorder-managed-storage-collapsed.v1';
+
+function getInitialManagedStorageCollapsed() {
+  try {
+    return window.localStorage.getItem(MANAGED_STORAGE_COLLAPSED_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
 
 const MODES = [
   { id: 'screen', label: 'Screen', needsVideo: true, needsScreen: true },
@@ -81,6 +91,7 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
   const [loadingDisplays, setLoadingDisplays] = useState(true);
   const [busy, setBusy] = useState('');
   const [finalizingSlow, setFinalizingSlow] = useState(false);
+  const [managedStorageCollapsed, setManagedStorageCollapsed] = useState(getInitialManagedStorageCollapsed);
   const [now, setNow] = useState(Date.now());
 
   const selectedMode = MODES.find((entry) => entry.id === mode) || MODES[0];
@@ -187,6 +198,14 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
     loadDisplays();
     loadRecordings();
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(MANAGED_STORAGE_COLLAPSED_STORAGE_KEY, String(managedStorageCollapsed));
+    } catch {
+      // Keep the section usable for this session when local storage is unavailable.
+    }
+  }, [managedStorageCollapsed]);
 
   useEffect(() => {
     if (!activeRecording) {
@@ -477,38 +496,49 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
           )}
         </div>
 
-        <div className="rounded-[28px] border border-white/10 bg-white/5 p-6 shadow-soft">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Managed storage</p>
-              <h2 className="mt-2 text-xl font-semibold text-white">Recent recordings</h2>
-            </div>
-            <button className="ghost-button" onClick={loadRecordings} type="button">Refresh</button>
+        <div className="rounded-[28px] border border-white/10 bg-white/5 p-6 shadow-soft" data-recorder-managed-storage={managedStorageCollapsed ? 'collapsed' : 'expanded'}>
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <button
+              aria-controls="recorder-managed-storage-content"
+              aria-expanded={!managedStorageCollapsed}
+              className="group flex min-w-0 flex-1 items-center justify-between gap-4 text-left"
+              onClick={() => setManagedStorageCollapsed((current) => !current)}
+              type="button"
+            >
+              <span>
+                <span className="block text-xs uppercase tracking-[0.24em] text-slate-500">Managed storage</span>
+                <span className="mt-2 block text-xl font-semibold text-white">Recent recordings</span>
+              </span>
+              <span className="shrink-0 text-sm font-medium text-cyan-200 group-hover:text-cyan-100">{managedStorageCollapsed ? 'Expand' : 'Collapse'}</span>
+            </button>
+            {!managedStorageCollapsed ? <button className="ghost-button" onClick={loadRecordings} type="button">Refresh</button> : null}
           </div>
 
-          <div className="mt-4 space-y-3">
-            {recordings.length ? recordings.map((recording) => (
-              <article className="rounded-2xl border border-white/10 bg-slate-950/35 p-4" key={recording.id}>
-                <div className="flex flex-wrap items-start justify-between gap-4">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="break-all font-medium text-white">{recording.fileName || recording.id}</p>
-                      <span className={`rounded-full border px-2 py-1 text-[11px] font-semibold uppercase tracking-wide ${statusClass(recording.status)}`}>{recording.status}</span>
+          {!managedStorageCollapsed ? (
+            <div className="mt-4 space-y-3" id="recorder-managed-storage-content">
+              {recordings.length ? recordings.map((recording) => (
+                <article className="rounded-2xl border border-white/10 bg-slate-950/35 p-4" key={recording.id}>
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="break-all font-medium text-white">{recording.fileName || recording.id}</p>
+                        <span className={`rounded-full border px-2 py-1 text-[11px] font-semibold uppercase tracking-wide ${statusClass(recording.status)}`}>{recording.status}</span>
+                      </div>
+                      <p className="mt-2 text-xs text-slate-400">{formatDate(recording.startedAt)} · {recording.mode} · {recording.backend || 'ffmpeg'} · {recording.audioSources?.includes('systemAudio') ? 'system audio · ' : ''}{formatBytes(recording.sizeBytes || 0)}{formatCaptureTarget(recording) ? ` · ${formatCaptureTarget(recording)}` : ''}</p>
+                      {recording.errorSummary ? <p className="mt-2 text-sm text-amber-100">{recording.errorSummary}</p> : null}
                     </div>
-                    <p className="mt-2 text-xs text-slate-400">{formatDate(recording.startedAt)} · {recording.mode} · {recording.backend || 'ffmpeg'} · {recording.audioSources?.includes('systemAudio') ? 'system audio · ' : ''}{formatBytes(recording.sizeBytes || 0)}{formatCaptureTarget(recording) ? ` · ${formatCaptureTarget(recording)}` : ''}</p>
-                    {recording.errorSummary ? <p className="mt-2 text-sm text-amber-100">{recording.errorSummary}</p> : null}
+                    <div className="flex flex-wrap gap-2">
+                      <button className="ghost-button" disabled={!recording.fileExists} onClick={() => runRecordingAction(() => window.localAIHub.openRecording(recording.id), 'Local AI Hub could not open that recording.')} type="button">Open</button>
+                      <button className="ghost-button" disabled={!recording.fileExists} onClick={() => runRecordingAction(() => window.localAIHub.revealRecording(recording.id), 'Local AI Hub could not reveal that recording.')} type="button">Reveal</button>
+                      <button className="ghost-button" disabled={busy === `delete:${recording.id}`} onClick={() => removeRecording(recording)} type="button">{busy === `delete:${recording.id}` ? 'Deleting...' : 'Delete'}</button>
+                    </div>
                   </div>
-                  <div className="flex flex-wrap gap-2">
-                    <button className="ghost-button" disabled={!recording.fileExists} onClick={() => runRecordingAction(() => window.localAIHub.openRecording(recording.id), 'Local AI Hub could not open that recording.')} type="button">Open</button>
-                    <button className="ghost-button" disabled={!recording.fileExists} onClick={() => runRecordingAction(() => window.localAIHub.revealRecording(recording.id), 'Local AI Hub could not reveal that recording.')} type="button">Reveal</button>
-                    <button className="ghost-button" disabled={busy === `delete:${recording.id}`} onClick={() => removeRecording(recording)} type="button">{busy === `delete:${recording.id}` ? 'Deleting...' : 'Delete'}</button>
-                  </div>
-                </div>
-              </article>
-            )) : (
-              <div className="rounded-2xl border border-dashed border-white/15 px-5 py-8 text-center text-sm text-slate-400">No recordings yet. Your first completed or interrupted capture will appear here.</div>
-            )}
-          </div>
+                </article>
+              )) : (
+                <div className="rounded-2xl border border-dashed border-white/15 px-5 py-8 text-center text-sm text-slate-400">No recordings yet. Your first completed or interrupted capture will appear here.</div>
+              )}
+            </div>
+          ) : null}
         </div>
       </div>
     </section>
