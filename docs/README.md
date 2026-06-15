@@ -12,6 +12,6 @@ Start-Process .\docs\index.html
 
 No package installation or build command is required.
 
-The page references screenshots in `screenshots/`. Keep that relative directory structure intact when previewing or publishing the `docs/` folder.
+The page references screenshots in `screenshots/` and demo assets in `media/`. Keep those relative directory structures intact when previewing or publishing the `docs/` folder.
 
 GitHub Pages is configured to publish from the `main` branch and `/docs` folder.

@@ -34,27 +34,60 @@ Local AI Hub is intended for Windows users who want to explore local AI without 
 - **Recovery tools:** Create snapshots and run repair actions for supported installations.
 - **System tray:** Keep Local AI Hub available in the background and quickly reopen or launch tools.
 
+## Demo Video
+
+See Local AI Hub move through its local-first workflow, including Home, Library, Store, Model Manager, Recorder, Pipelines, Statistics, and the project website.
+
+<a href="docs/media/local-ai-hub-demo-v2.mp4">
+  <img src="docs/media/local-ai-hub-demo-v2-poster.jpg" alt="Watch the Local AI Hub demo video" width="100%">
+</a>
+
+[Watch or download the Local AI Hub demo video (MP4)](docs/media/local-ai-hub-demo-v2.mp4)
+
 ## Screenshots
 
-| Home | Library |
-| --- | --- |
-| [![Local AI Hub Home tab showing workspace status and quick actions](docs/screenshots/home.png)](docs/screenshots/home.png) | [![Local AI Hub Library showing installed tools and system resources](docs/screenshots/library.png)](docs/screenshots/library.png) |
-
-| Store | Model Manager |
-| --- | --- |
-| [![Local AI Hub Store showing installable tools and hardware guidance](docs/screenshots/store.png)](docs/screenshots/store.png) | [![Local AI Hub Model Manager showing downloaded models and catalog results](docs/screenshots/model-manager.png)](docs/screenshots/model-manager.png) |
-
-| Recorder | Pipelines Build |
-| --- | --- |
-| [![Local AI Hub Recorder showing local screen and audio capture controls](docs/screenshots/recorder.png)](docs/screenshots/recorder.png) | [![Local AI Hub Pipelines Build workspace showing a guided node workflow](docs/screenshots/pipelines-build.png)](docs/screenshots/pipelines-build.png) |
-
-| Pipelines Outputs | Statistics |
-| --- | --- |
-| [![Local AI Hub Pipelines Outputs workspace showing a saved video result](docs/screenshots/pipelines-outputs.png)](docs/screenshots/pipelines-outputs.png) | [![Local AI Hub Statistics showing local storage and launch activity](docs/screenshots/statistics.png)](docs/screenshots/statistics.png) |
-
-| Settings |
-| --- |
-| [![Local AI Hub Settings showing storage, cleanup, connections, and window controls](docs/screenshots/settings.png)](docs/screenshots/settings.png) |
+<table>
+  <tr>
+    <th width="50%">Home</th>
+    <th width="50%">Library</th>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/screenshots/home.png"><img src="docs/screenshots/home.png" alt="Local AI Hub Home tab showing workspace status and quick actions" width="100%"></a></td>
+    <td width="50%"><a href="docs/screenshots/library.png"><img src="docs/screenshots/library.png" alt="Local AI Hub Library showing installed tools and system resources" width="100%"></a></td>
+  </tr>
+  <tr>
+    <th width="50%">Store</th>
+    <th width="50%">Model Manager</th>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/screenshots/store.png"><img src="docs/screenshots/store.png" alt="Local AI Hub Store showing installable tools and hardware guidance" width="100%"></a></td>
+    <td width="50%"><a href="docs/screenshots/model-manager.png"><img src="docs/screenshots/model-manager.png" alt="Local AI Hub Model Manager showing downloaded models and catalog results" width="100%"></a></td>
+  </tr>
+  <tr>
+    <th width="50%">Recorder</th>
+    <th width="50%">Pipelines Build</th>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/screenshots/recorder.png"><img src="docs/screenshots/recorder.png" alt="Local AI Hub Recorder showing local screen and audio capture controls" width="100%"></a></td>
+    <td width="50%"><a href="docs/screenshots/pipelines-build.png"><img src="docs/screenshots/pipelines-build.png" alt="Local AI Hub Pipelines Build workspace showing a guided node workflow" width="100%"></a></td>
+  </tr>
+  <tr>
+    <th width="50%">Pipelines Outputs</th>
+    <th width="50%">Statistics</th>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/screenshots/pipelines-outputs.png"><img src="docs/screenshots/pipelines-outputs.png" alt="Local AI Hub Pipelines Outputs workspace showing a saved video result" width="100%"></a></td>
+    <td width="50%"><a href="docs/screenshots/statistics.png"><img src="docs/screenshots/statistics.png" alt="Local AI Hub Statistics showing local storage and launch activity" width="100%"></a></td>
+  </tr>
+  <tr>
+    <th width="50%">Settings</th>
+    <th width="50%"></th>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/screenshots/settings.png"><img src="docs/screenshots/settings.png" alt="Local AI Hub Settings showing storage, cleanup, connections, and window controls" width="100%"></a></td>
+    <td width="50%"></td>
+  </tr>
+</table>
 
 ## Quick Start
 
