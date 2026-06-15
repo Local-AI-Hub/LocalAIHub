@@ -65,6 +65,11 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
     label: 'Local model runtime',
     notes: 'Ollama fits the model-step architecture for text generation and multimodal text output, but it is not used for local media generation in this pass.',
   }),
+  whisper: Object.freeze({
+    id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
+    label: 'Operation-driven local tool',
+    notes: 'Whisper fits the sequential model-step pipeline for local audio transcription and runs through the embedded faster-whisper task adapter with typed text output and source-audio lineage.',
+  }),
   automatic1111: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
     label: 'Operation-driven local tool',

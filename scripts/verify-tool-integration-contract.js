@@ -3,6 +3,8 @@ const fs = require('fs');
 const path = require('path');
 
 const {
+  PIPELINE_OPERATION_IDS,
+  TOOL_PIPELINE_STRATEGY_IDS,
   getToolPipelineCapabilities,
   getToolPipelineStrategy,
 } = require('../electron/shared/pipelineCapabilities.cjs');
@@ -104,6 +106,16 @@ for (const tool of manifest) {
     warn(`${tool.id}: pipeline registration has no discoverable focused verifier reference.`);
   }
 }
+
+const whisperStrategy = getToolPipelineStrategy('whisper');
+const whisperCapabilities = getToolPipelineCapabilities('whisper');
+const whisperTranscription = whisperCapabilities?.operations?.[PIPELINE_OPERATION_IDS.WHISPER_TRANSCRIBE] || null;
+assert.strictEqual(whisperStrategy?.id, TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL, 'Whisper must explicitly use the operation-driven local tool pipeline strategy.');
+assert.deepStrictEqual(whisperTranscription?.inputKinds, ['audio'], 'Whisper transcription must explicitly accept audio input.');
+assert.deepStrictEqual(whisperTranscription?.outputKinds, ['text'], 'Whisper transcription must explicitly produce text output.');
+assert(!warnings.some((warning) => warning.startsWith('whisper: has pipeline operations but no explicit pipeline strategy.')), 'The Whisper pipeline strategy audit warning must remain resolved.');
+assert.strictEqual(getToolPipelineStrategy('aider'), null, 'Aider must remain outside the pipeline strategy registry.');
+assert.deepStrictEqual(Object.keys(getToolPipelineCapabilities('aider')?.operations || {}), [], 'Aider must not gain pipeline operations accidentally.');
 
 assert(diagnosticsText.includes('function summarizeTool(tool, paths)'), 'Diagnostics must retain generic tool integration summaries.');
 assert(diagnosticsText.includes('repairAvailable') && diagnosticsText.includes('lifecycleMode'), 'Diagnostics tool summaries must include lifecycle and repair visibility.');
