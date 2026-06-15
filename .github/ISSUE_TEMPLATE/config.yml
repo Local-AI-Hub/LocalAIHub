@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the troubleshooting guide
+    url: https://github.com/Local-AI-Hub/LocalAIHub/blob/main/docs/troubleshooting.md
+    about: Try practical fixes and learn how to create safe diagnostics before opening an issue.
+  - name: Diagnostics instructions
+    url: https://github.com/Local-AI-Hub/LocalAIHub/blob/main/docs/troubleshooting.md#creating-a-diagnostics-bundle
+    about: Use Copy system info or Create diagnostics bundle, then review the result before sharing.
+  - name: Read the project README
+    url: https://github.com/Local-AI-Hub/LocalAIHub/blob/main/README.md
+    about: Review installation, hardware, privacy, and current feature information.
+  - name: Download the latest release
+    url: https://github.com/Local-AI-Hub/LocalAIHub/releases/latest
+    about: Check whether a newer Local AI Hub installer is available.

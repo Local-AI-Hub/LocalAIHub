@@ -1,0 +1,106 @@
+name: Troubleshooting help
+description: Ask for help when Local AI Hub or a managed tool is not working as expected.
+title: "[Help]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the [troubleshooting guide](https://github.com/Local-AI-Hub/LocalAIHub/blob/main/docs/troubleshooting.md).
+
+        **Do not paste API/provider keys, PATs, tokens, passwords, private data, prompts, private media, model files, or generated outputs.** Local AI Hub does not upload support data automatically.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the result you want in plain English.
+    validations:
+      required: true
+
+  - type: textarea
+    id: stuck_step
+    attributes:
+      label: Where are you stuck?
+      description: Include the exact step and the message shown by Local AI Hub.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Tool, model, pipeline, or recorder context
+      placeholder: |
+        Tool and version:
+        Managed by Local AI Hub or external:
+        Model and variant:
+        Pipeline and failing step:
+        Recorder mode/capture target/audio:
+    validations:
+      required: true
+
+  - type: input
+    id: app_version
+    attributes:
+      label: Local AI Hub version
+      placeholder: "0.52.0"
+    validations:
+      required: true
+
+  - type: input
+    id: windows_version
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2, build 26100"
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and storage summary
+      description: In Settings -> Support and Diagnostics, use Copy system info and paste the reviewed result here.
+      placeholder: |
+        CPU:
+        GPU:
+        VRAM:
+        RAM:
+        Free space on C:
+        Free space on managed storage drive:
+    validations:
+      required: true
+
+  - type: dropdown
+    id: diagnostics
+    attributes:
+      label: Can you create a diagnostics bundle?
+      description: Use Settings -> Support and Diagnostics -> Create diagnostics bundle, then review it before sharing.
+      options:
+        - Yes, and I can attach the reviewed ZIP
+        - Yes, but I do not want to share it
+        - No, bundle creation fails
+        - I cannot open the app
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you already tried?
+      description: Include restarts, repair attempts, storage checks, security-software actions, or upstream guidance you followed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Safe error text or logs
+      description: Paste relevant sanitized text. Remove secrets, private paths, prompts, and personal data.
+      render: text
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I reviewed everything attached or pasted and removed secrets and private data.
+          required: true

@@ -1,0 +1,77 @@
+name: Feature request
+description: Suggest an improvement or new Local AI Hub capability.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem first, then the behavior you would like. Do not include provider keys, PATs, tokens, passwords, private media, or other sensitive data.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to accomplish, and what makes it difficult today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_behavior
+    attributes:
+      label: Proposed behavior
+      description: Explain what Local AI Hub should do from the user's point of view.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Tools and installers
+        - Models
+        - Pipelines
+        - Recorder
+        - UI/UX
+        - Diagnostics and support
+        - Providers and cloud
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware_constraints
+    attributes:
+      label: Hardware constraints
+      description: Include relevant CPU, GPU, VRAM, RAM, storage, or performance limits. Write "Not applicable" when none apply.
+
+  - type: dropdown
+    id: local_first
+    attributes:
+      label: Local-first or offline sensitivity
+      description: Does this request need to work locally or without a network connection?
+      options:
+        - Must work fully offline
+        - Local-first is strongly preferred
+        - Network or cloud use is acceptable
+        - Not applicable or unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives tried
+      description: What workarounds, tools, or workflows have you already tried?
+
+  - type: textarea
+    id: mockups
+    attributes:
+      label: Screenshots or mockups
+      description: Drag safe images here. Remove private media, credentials, prompts, filenames, and personal data first.
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add compatibility details, upstream references, or other useful context.

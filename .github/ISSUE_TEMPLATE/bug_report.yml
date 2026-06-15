@@ -1,0 +1,188 @@
+name: Bug report
+description: Report a reproducible problem in Local AI Hub.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Local AI Hub. Please remove secrets and private data before submitting.
+
+        For useful diagnostics, open **Settings -> Support and Diagnostics** and use **Copy system info** or **Create diagnostics bundle**. Review every file before attaching it. Never share API/provider keys, PATs, tokens, passwords, private media, model files, or generated outputs.
+
+  - type: input
+    id: app_version
+    attributes:
+      label: Local AI Hub version
+      description: Find the installed version in the app or installer/release name.
+      placeholder: "0.52.0"
+    validations:
+      required: true
+
+  - type: input
+    id: windows_version
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 24H2, build 26100"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_type
+    attributes:
+      label: Install type
+      options:
+        - Official GitHub installer
+        - Development checkout (npm run dev)
+        - Other or unknown
+    validations:
+      required: true
+
+  - type: input
+    id: installer_version
+    attributes:
+      label: Installer or release version
+      description: Include the installer filename or release tag when available.
+      placeholder: "LocalAIHub-Setup-0.52.0.exe or v0.52.0"
+
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware summary
+      description: Use Copy system info where possible.
+      placeholder: |
+        CPU:
+        GPU:
+        VRAM:
+        RAM:
+        Free space on C:
+        Free space on managed storage drive:
+    validations:
+      required: true
+
+  - type: input
+    id: tool
+    attributes:
+      label: Tool involved
+      description: Include the tool name and version, or write "Not applicable."
+      placeholder: "ComfyUI, Ollama, Automatic1111, InvokeAI, etc."
+
+  - type: dropdown
+    id: tool_management
+    attributes:
+      label: Tool installation ownership
+      description: Is this installation managed by Local AI Hub?
+      options:
+        - Managed by Local AI Hub
+        - External or vendor-managed installation
+        - Not applicable
+        - Unsure
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model involved
+      description: Include the model name and relevant variant or quantization. Do not attach the model file.
+      placeholder: "Not applicable"
+
+  - type: input
+    id: pipeline
+    attributes:
+      label: Pipeline involved
+      description: Include the pipeline name and failing step without pasting private prompts or inputs.
+      placeholder: "Not applicable"
+
+  - type: input
+    id: recorder
+    attributes:
+      label: Recorder mode involved
+      description: Include the mode, capture target, and audio sources.
+      placeholder: "Screen + system audio, region capture, microphone, etc.; or Not applicable"
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Exact steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Click ...
+        3. Select ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the plain-English error shown by Local AI Hub.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or errors
+      description: Paste relevant sanitized text when possible instead of only a screenshot. Remove secrets, private paths, prompts, and personal data.
+      render: text
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or screen recording
+      description: Drag files here only when they do not expose notifications, credentials, private media, prompts, filenames, or other sensitive data.
+
+  - type: dropdown
+    id: restart
+    attributes:
+      label: Does it still happen after restarting?
+      options:
+        - Yes, after restarting Local AI Hub
+        - Yes, after restarting Windows
+        - No
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: security_software
+    attributes:
+      label: Antivirus or security software interference
+      options:
+        - No interference noticed
+        - The installer or app was blocked or quarantined
+        - An exception or allow action changed the result
+        - Unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: diagnostics
+    attributes:
+      label: Diagnostics bundle
+      description: Create one from Settings -> Support and Diagnostics when appropriate.
+      options:
+        - Attached
+        - Created but not attached because it contains information I do not want to share
+        - Unable to create
+        - Not applicable
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I reviewed all diagnostics, logs, screenshots, and recordings before sharing them.
+          required: true
+        - label: I removed API/provider keys, PATs, tokens, passwords, private media, model files, generated outputs, and other sensitive data.
+          required: true
