@@ -211,8 +211,79 @@ function ModelPreview({ item }) {
       src={safePreviewUrl}
     />
   );
-}function ModelCard({ item, deleteBusy, downloadBusy, downloadProgress, localMatch, onDelete, onDownload }) {
-  const selectedArtifact = item.downloadPlan?.recommendedArtifactPath || item.installRelativePath || item.fileName || '';
+}
+function isSafeModelSourceUrl(value) {
+  return isSafeModelPreviewUrl(value);
+}
+function getArtifactChoices(item) {
+  return Array.isArray(item?.artifactChoices) ? item.artifactChoices.filter(Boolean) : [];
+}
+function getSelectedArtifactChoice(item, selectedChoiceId = '') {
+  const choices = getArtifactChoices(item);
+  if (!choices.length) {
+    return null;
+  }
+  const requested = String(selectedChoiceId || '').trim();
+  const requestedChoice = requested ? choices.find((choice) => choice.id === requested) : null;
+  if (requestedChoice && !requestedChoice.disabled) {
+    return requestedChoice;
+  }
+  return choices.find((choice) => choice.recommended && !choice.disabled) || choices.find((choice) => !choice.disabled) || choices[0] || null;
+}
+function buildSelectedCatalogItem(item, selectedChoiceId = '') {
+  const selectedChoice = getSelectedArtifactChoice(item, selectedChoiceId);
+  if (!selectedChoice) {
+    return item;
+  }
+  const payload = selectedChoice.payload || {};
+  return {
+    ...item,
+    ...payload,
+    artifactChoices: getArtifactChoices(item),
+    artifactLabel: payload.artifactLabel || selectedChoice.artifactLabel || item.artifactLabel,
+    artifactPath: payload.artifactPath || selectedChoice.artifactPath || item.artifactPath,
+    artifactUrl: payload.artifactUrl || selectedChoice.artifactUrl || item.artifactUrl,
+    fileName: payload.fileName || selectedChoice.fileName || item.fileName,
+    modelPageUrl: payload.modelPageUrl || selectedChoice.modelPageUrl || item.modelPageUrl,
+    modelType: payload.modelType || selectedChoice.modelType || item.modelType,
+    selectedArtifactChoice: selectedChoice,
+    selectedArtifactChoiceId: selectedChoice.id,
+    sizeBytes: Number(payload.sizeBytes || selectedChoice.sizeBytes || item.sizeBytes || 0) || item.sizeBytes,
+    sourceLabel: selectedChoice.sourceLabel || item.sourceLabel,
+    sourceUrl: payload.sourceUrl || selectedChoice.modelPageUrl || item.sourceUrl,
+    versionId: payload.versionId || selectedChoice.versionId || item.versionId,
+    versionLabel: payload.versionLabel || selectedChoice.versionLabel || item.versionLabel,
+  };
+}
+function getDownloadKey(item) {
+  return [item?.id, item?.selectedArtifactChoiceId || item?.downloadIdentity || item?.fileName].filter(Boolean).join('::') || item?.name || 'model-download';
+}
+function isModelConflictMessage(message) {
+  return /different model named|cannot confirm it is the same model|will not overwrite|already exists in .*same model|destination filename/i.test(String(message || ''));
+}
+function buildConflictMessage(message) {
+  const detail = String(message || '').trim();
+  const guidance = 'A different model already uses this destination filename. Choose another artifact or version, refresh local inventory, or rename the existing file outside Local AI Hub if you are sure it is not needed.';
+  return detail ? `${guidance} ${detail}` : guidance;
+}
+function ModelCard({
+  artifactChoiceId,
+  conflict,
+  deleteBusy,
+  downloadBusy,
+  downloadProgress,
+  item,
+  localMatch,
+  onArtifactChange,
+  onClearConflict,
+  onDelete,
+  onDownload,
+  onOpenSourceLink,
+  onRefreshLocal,
+}) {
+  const artifactChoices = getArtifactChoices(item);
+  const selectedChoice = getSelectedArtifactChoice(item, artifactChoiceId);
+  const selectedArtifact = item.downloadPlan?.recommendedArtifactPath || item.installRelativePath || item.artifactPath || item.fileName || selectedChoice?.label || '';
   const requiredArtifacts = item.downloadPlan?.requiredArtifacts || [];
   const optionalArtifacts = item.downloadPlan?.optionalArtifacts || [];
   const artifactStatus = item.downloadPlan?.runnable === false ? 'Blocked' : item.downloadPlan?.planType === 'package' ? 'Package' : item.downloadPlan?.warning ? 'Possible' : 'Selected';
@@ -222,6 +293,12 @@ function ModelPreview({ item }) {
     : 'border-emerald-400/20 bg-emerald-400/10 text-emerald-100';
   const diskLabel = item.diskWarning?.tone === 'danger' ? 'Low space' : item.diskWarning?.tone === 'warn' ? 'Watch space' : 'Looks safe';
   const planMessage = item.downloadPlan?.blockingReason || item.downloadPlan?.warning || '';
+  const sourceLabel = item.sourceLabel || item.source || 'Unknown source';
+  const versionLabel = item.versionLabel || item.catalogVersionLabel || selectedChoice?.versionLabel || 'Not listed';
+  const licenseLabel = item.license || 'Not listed';
+  const safeModelPageUrl = isSafeModelSourceUrl(item.modelPageUrl || item.sourceUrl) ? (item.modelPageUrl || item.sourceUrl) : '';
+  const safeArtifactUrl = isSafeModelSourceUrl(item.artifactUrl) ? item.artifactUrl : '';
+  const unsupportedChoices = artifactChoices.filter((choice) => choice.disabled);
 
   return (
     <article className="rounded-[24px] border border-white/10 bg-slate-950/35 p-3">
@@ -249,6 +326,11 @@ function ModelPreview({ item }) {
             {localMatch ? <span className="status-pill border-emerald-400/20 bg-emerald-400/10 text-emerald-100">Downloaded</span> : null}
           </div>
           <p className="mt-2 line-clamp-2 text-xs leading-5 text-slate-300">{item.description}</p>
+          <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-300">
+            <span className="status-pill border-white/10 bg-white/5 text-slate-300">Source: {sourceLabel}</span>
+            <span className="status-pill border-white/10 bg-white/5 text-slate-300">Version: {versionLabel}</span>
+            <span className="status-pill border-white/10 bg-white/5 text-slate-300">License: {licenseLabel}</span>
+          </div>
         </div>
       </div>
 
@@ -257,10 +339,32 @@ function ModelPreview({ item }) {
           <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Artifact</p>
           <span className={`status-pill ${artifactStatusClass}`}>{artifactStatus}</span>
         </div>
-        <p className="mt-1 truncate text-sm font-medium text-white" title={selectedArtifact || 'No compatible artifact selected'}>{selectedArtifact || 'No compatible artifact selected'}</p>
+        {artifactChoices.length > 1 ? (
+          <label className="mt-2 block">
+            <span className="sr-only">Choose model artifact or version</span>
+            <select
+              className="store-input w-full"
+              onChange={(event) => onArtifactChange(item, event.target.value)}
+              value={selectedChoice?.id || ''}
+            >
+              {artifactChoices.map((choice) => (
+                <option disabled={choice.disabled} key={choice.id} value={choice.id}>
+                  {[choice.recommended ? 'Recommended' : '', choice.label, choice.sizeBytes ? formatBytes(choice.sizeBytes) : choice.sizeLabel || ''].filter(Boolean).join(' | ')}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <p className="mt-1 truncate text-sm font-medium text-white" title={selectedArtifact || 'No compatible artifact selected'}>{selectedArtifact || 'No compatible artifact selected'}</p>
+        )}
         <p className="mt-1 text-xs leading-5 text-slate-400">
           {item.downloadPlan?.planType === 'package' ? [item.artifactLabel || 'Package', item.downloadPlan?.packageName].filter(Boolean).join(' | ') : item.artifactLabel || item.modelType || 'Model artifact'}
+          {selectedChoice?.sizeBytes ? ` | ${formatBytes(selectedChoice.sizeBytes)}` : item.sizeBytes ? ` | ${formatBytes(item.sizeBytes)}` : ''}
         </p>
+        {selectedChoice?.reason ? <p className="mt-1 text-xs leading-5 text-amber-100">{selectedChoice.reason}</p> : null}
+        {unsupportedChoices.length ? (
+          <p className="mt-1 text-xs leading-5 text-slate-500">{unsupportedChoices.length} incompatible artifact{unsupportedChoices.length === 1 ? '' : 's'} hidden from download choices by the selected tool and filters.</p>
+        ) : null}
       </div>
 
       {item.highVramWarning ? (
@@ -273,10 +377,34 @@ function ModelPreview({ item }) {
           {planMessage}
         </div>
       ) : null}
+      {conflict ? (
+        <div className="mt-3 rounded-2xl border border-amber-400/25 bg-amber-400/10 px-3 py-2 text-xs leading-5 text-amber-50">
+          <p className="font-semibold text-amber-100">Destination conflict</p>
+          <p className="mt-1">{conflict.message}</p>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {artifactChoices.length > 1 ? <span className="status-pill border-amber-300/25 bg-amber-300/10 text-amber-50">Choose another artifact or version above</span> : null}
+            <button className="ghost-button" onClick={onRefreshLocal} type="button">Refresh inventory</button>
+            <button className="ghost-button" onClick={() => onClearConflict(item)} type="button">Dismiss</button>
+          </div>
+        </div>
+      ) : null}
 
       <details className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-300">
-        <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Package, fit, and target details</summary>
+        <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Provenance, package, fit, and target details</summary>
         <div className="mt-3 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Source</p>
+            <p className="mt-1 text-sm font-medium text-white">{sourceLabel}</p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {safeModelPageUrl ? <button className="ghost-button" onClick={() => onOpenSourceLink(safeModelPageUrl)} type="button">Model page</button> : null}
+              {safeArtifactUrl ? <button className="ghost-button" onClick={() => onOpenSourceLink(safeArtifactUrl)} type="button">Artifact file</button> : null}
+            </div>
+          </div>
+          <div>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Version / license</p>
+            <p className="mt-1 text-sm font-medium text-white">{versionLabel}</p>
+            <p className="mt-1 text-xs leading-5 text-slate-400">License: {licenseLabel}</p>
+          </div>
           {item.catalogParentLabel || item.catalogContext ? (
             <div>
               <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Package source</p>
@@ -299,8 +427,9 @@ function ModelPreview({ item }) {
             <p className="mt-1 text-sm font-medium text-white">{item.targetToolName || item.toolId || 'Selected tool'}</p>
           </div>
           <div>
-            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Source / size</p>
-            <p className="mt-1 text-sm font-medium capitalize text-white">{item.source} | {item.sizeBytes ? formatBytes(item.sizeBytes) : item.sizeLabel || 'Unknown'}</p>
+            <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Artifact / size</p>
+            <p className="mt-1 text-sm font-medium text-white">{selectedArtifact || 'No compatible artifact'}</p>
+            <p className="mt-1 text-xs leading-5 text-slate-400">{item.sizeBytes ? formatBytes(item.sizeBytes) : item.sizeLabel || 'Unknown size'}</p>
           </div>
           <div>
             <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Hardware fit</p>
@@ -358,6 +487,8 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   const [civitaiApiKeyDraft, setCivitaiApiKeyDraft] = useState('');
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
   const [downloadBusyMap, setDownloadBusyMap] = useState({});
+  const [selectedArtifactMap, setSelectedArtifactMap] = useState({});
+  const [conflictMap, setConflictMap] = useState({});
   const [pagination, setPagination] = useState(EMPTY_PAGINATION);
   const [remoteCatalogPage, setRemoteCatalogPage] = useState(1);
   const [modelType, setModelType] = useState(getToolDefaults(modelTools[0]).modelType);
@@ -394,6 +525,8 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     setRemoteCatalogPage(1);
     browseRequestIdRef.current += 1;
     setRemoteItems([]);
+    setSelectedArtifactMap({});
+    setConflictMap({});
     setCatalogState({ error: null, query: '', source: defaults.source });
     setPagination(EMPTY_PAGINATION);
   }
@@ -471,9 +604,11 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
       browseRequestIdRef.current += 1;
       setRemoteItems([]);
       setLocalModels([]);
+      setSelectedArtifactMap({});
+      setConflictMap({});
       setPagination(EMPTY_PAGINATION);
       setRemoteCatalogPage(1);
-      setCatalogState({ error: null, query: '', source });
+      setCatalogState({ error: null, query: '', source: selectedSource });
       return;
     }
     if (append) {
@@ -481,6 +616,8 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     } else {
       setBrowseLoading(true);
       setRemoteItems([]);
+      setSelectedArtifactMap({});
+      setConflictMap({});
       setPagination(EMPTY_PAGINATION);
       setRemoteCatalogPage(1);
       setCatalogState({ error: null, query, source });
@@ -632,6 +769,8 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   }, [isActive]);
   useEffect(() => {
     setRemoteCatalogPage(1);
+    setSelectedArtifactMap({});
+    setConflictMap({});
   }, [modelType, search, selectedSource, selectedToolId, sort, taskType]);
 
   useEffect(() => {
@@ -653,9 +792,11 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
       browseRequestIdRef.current += 1;
       setRemoteItems([]);
       setLocalModels([]);
+      setSelectedArtifactMap({});
+      setConflictMap({});
       setPagination(EMPTY_PAGINATION);
       setRemoteCatalogPage(1);
-      setCatalogState({ error: null, query: '', source });
+      setCatalogState({ error: null, query: '', source: selectedSource });
       return;
     }
     const defaults = getToolDefaults(selectedTool);
@@ -678,23 +819,77 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     setPagination(EMPTY_PAGINATION);
     browse({ page: 1, cursor: null });
   }, [isActive, selectedTool, selectedToolId, selectedSource, modelType, sort, taskType]);
+  function handleArtifactChange(item, choiceId) {
+    setSelectedArtifactMap((current) => ({
+      ...current,
+      [item.id]: choiceId,
+    }));
+    setConflictMap((current) => {
+      if (!current[item.id]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[item.id];
+      return next;
+    });
+  }
+  function clearConflict(item) {
+    setConflictMap((current) => {
+      if (!current[item.id]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[item.id];
+      return next;
+    });
+  }
+  function registerConflict(item, message) {
+    setConflictMap((current) => ({
+      ...current,
+      [item.id]: {
+        message: buildConflictMessage(message),
+        rawMessage: message || '',
+      },
+    }));
+  }
+  async function handleOpenSourceLink(url) {
+    if (!isSafeModelSourceUrl(url)) {
+      onToast('Local AI Hub refused to open that model link because it is not a trusted HTTPS provider URL.', 'error');
+      return;
+    }
+    try {
+      const result = await window.localAIHub.openModelSourceLink(url);
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not open that model link.', 'error');
+      }
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not open that model link.', 'error');
+    }
+  }
   async function handleDownload(item) {
-    const subject = item?.name || item?.fileName || 'This model';
-    const downloadId = item?.id || item?.downloadIdentity || item?.fileName || subject;
+    const selectedItem = buildSelectedCatalogItem(item, selectedArtifactMap[item.id]);
+    const subject = selectedItem?.name || selectedItem?.fileName || 'This model';
+    const downloadId = getDownloadKey(selectedItem);
     if (downloadBusyMap[downloadId]) {
       return;
     }
+    clearConflict(selectedItem);
     setDownloadBusyMap((current) => ({
       ...current,
       [downloadId]: true,
     }));
     try {
       const preflightResult = await window.localAIHub.getModelDownloadPreflight({
-        ...item,
+        ...selectedItem,
         toolId: selectedToolId,
       });
       if (!preflightResult?.ok) {
-        onToast(preflightResult?.message || 'Local AI Hub could not check disk space for that model download.', 'error');
+        const message = preflightResult?.message || 'Local AI Hub could not check disk space for that model download.';
+        if (isModelConflictMessage(message)) {
+          registerConflict(selectedItem, message);
+        } else {
+          onToast(message, 'error');
+        }
         return;
       }
       const preflight = preflightResult.data;
@@ -710,15 +905,21 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
         }
       }
       const result = await window.localAIHub.downloadModel({
-        ...item,
+        ...selectedItem,
         lowDiskConfirmed,
         toolId: selectedToolId,
       });
       if (!result?.ok) {
-        onToast(result?.message || 'Local AI Hub could not download that model.', 'error');
+        const message = result?.message || 'Local AI Hub could not download that model.';
+        if (isModelConflictMessage(message)) {
+          registerConflict(selectedItem, message);
+        } else {
+          onToast(message, 'error');
+        }
         return;
       }
-      onToast(result.data?.message || `${item.name} was downloaded.`, 'success');
+      clearConflict(selectedItem);
+      onToast(result.data?.message || `${selectedItem.name} was downloaded.`, 'success');
       setLocalModels(result.data?.localModels || []);
       browse({ page: 1, cursor: null });
     } finally {
@@ -960,17 +1161,25 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
           <div className="mt-3 grid min-h-0 flex-1 gap-3 overflow-y-auto pb-4 pr-1 2xl:grid-cols-2">
             {remoteItems.length ? (
               pagedRemoteItems.map((item) => {
-                const localMatch = matchingLocalModel(item, localModels);
+                const selectedItem = buildSelectedCatalogItem(item, selectedArtifactMap[item.id]);
+                const downloadKey = getDownloadKey(selectedItem);
+                const localMatch = matchingLocalModel(selectedItem, localModels);
                 return (
                   <ModelCard
+                    artifactChoiceId={selectedItem.selectedArtifactChoiceId || ''}
+                    conflict={conflictMap[item.id] || null}
                     key={item.id}
                     deleteBusy={deleteBusyId === localMatch?.id}
-                    downloadBusy={Boolean(downloadBusyMap[item.id])}
-                    downloadProgress={downloadProgressMap[item.id]}
-                    item={item}
+                    downloadBusy={Boolean(downloadBusyMap[downloadKey])}
+                    downloadProgress={downloadProgressMap[selectedItem.id] || downloadProgressMap[downloadKey]}
+                    item={selectedItem}
                     localMatch={localMatch}
+                    onArtifactChange={handleArtifactChange}
+                    onClearConflict={clearConflict}
                     onDelete={handleDelete}
                     onDownload={handleDownload}
+                    onOpenSourceLink={handleOpenSourceLink}
+                    onRefreshLocal={() => loadLocalModels(selectedToolId)}
                   />
                 );
               })

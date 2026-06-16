@@ -1028,6 +1028,228 @@ function attachDownloadPlanFields(item, plan, targetDirectory = null) {
     downloadPlan: serializeDownloadPlan(plan, targetDirectory),
   };
 }
+function sanitizeModelSourceUrl(value) {
+  const rawValue = String(value || '').trim();
+  if (!rawValue) {
+    return null;
+  }
+  let parsed = null;
+  try {
+    parsed = new URL(rawValue);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:') {
+    return null;
+  }
+  if (!isAllowedPreviewHost(parsed.hostname)) {
+    return null;
+  }
+  parsed.username = '';
+  parsed.password = '';
+  parsed.hash = '';
+  return parsed.toString();
+}
+
+function sourceProviderLabel(source) {
+  const normalized = String(source || '').trim().toLowerCase();
+  if (normalized === 'huggingface') return 'Hugging Face';
+  if (normalized === 'civitai') return 'CivitAI';
+  if (normalized === 'ollama') return 'Ollama';
+  if (normalized === 'tabby') return 'Tabby';
+  if (normalized === 'local') return 'Local scan';
+  return normalized ? normalized.replace(/(^|[-_\s])([a-z])/g, (_match, prefix, letter) => prefix + letter.toUpperCase()) : 'Unknown';
+}
+
+function buildArtifactChoiceId(parts = []) {
+  return parts.map((part) => String(part || '').trim()).filter(Boolean).join('::');
+}
+
+function compactArtifactChoicePayload(payload = {}) {
+  return Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== undefined));
+}
+
+function buildHuggingFaceModelPageUrl(modelId) {
+  const normalized = String(modelId || '').trim().replace(/^\/+|\/+$/g, '');
+  return normalized ? sanitizeModelSourceUrl('https://huggingface.co/' + normalized) : null;
+}
+
+function buildHuggingFaceArtifactPageUrl(modelId, filePath) {
+  const normalizedModelId = String(modelId || '').trim().replace(/^\/+|\/+$/g, '');
+  const normalizedPath = String(filePath || '').trim().replace(/\\+/g, '/').split('/').map((segment) => encodeURIComponent(segment)).join('/');
+  return normalizedModelId && normalizedPath ? sanitizeModelSourceUrl('https://huggingface.co/' + normalizedModelId + '/blob/main/' + normalizedPath) : null;
+}
+
+function buildCivitaiModelPageUrl(modelId, versionId = null) {
+  const normalizedModelId = String(modelId || '').trim();
+  if (!normalizedModelId) {
+    return null;
+  }
+  const url = new URL('https://civitai.com/models/' + encodeURIComponent(normalizedModelId));
+  const normalizedVersionId = String(versionId || '').trim();
+  if (normalizedVersionId) {
+    url.searchParams.set('modelVersionId', normalizedVersionId);
+  }
+  return sanitizeModelSourceUrl(url.toString());
+}
+
+function buildOllamaModelPageUrl(libraryPathOrName) {
+  const rawValue = String(libraryPathOrName || '').trim();
+  if (!rawValue) {
+    return null;
+  }
+  if (/^https?:\/\//i.test(rawValue)) {
+    return sanitizeModelSourceUrl(rawValue);
+  }
+  const slug = rawValue.replace(/^\/+/, '').replace(/^library\//i, '').split(':')[0];
+  return slug ? sanitizeModelSourceUrl('https://ollama.com/library/' + encodeURIComponent(slug)) : null;
+}
+
+function buildHuggingFaceArtifactChoice(detail, file, tool, options = {}) {
+  const plan = file?.downloadPlan || null;
+  const isPackagePlan = plan?.planType === 'package';
+  const fileName = isPackagePlan ? (plan.packageName || path.basename(plan.packageRoot || detail.id || 'model-package')) : path.basename(file?.rfilename || '');
+  const artifactPathValue = isPackagePlan ? (plan.packageRoot || file?.rfilename || fileName) : String(file?.rfilename || '').trim();
+  const installRelativePath = normalizeRelativeInstallPath(artifactPathValue || fileName) || fileName;
+  const modelType = plan?.modelType || file?.modelType || options.modelType || 'Model';
+  const targetDirectory = getTargetDirectory(tool, modelType, { ...file, catalogRepositoryId: detail?.id });
+  const identity = buildSourceDownloadIdentity({
+    source: options.source || 'huggingface',
+    toolId: tool?.id,
+    catalogRepositoryId: detail?.id,
+    packageIdentity: plan?.packageIdentity || file?.packageIdentity || null,
+    sourceArtifactPath: isPackagePlan ? (plan.packageRoot || detail?.id) : artifactPathValue,
+    installRelativePath,
+    fileName,
+  });
+  const modelPageUrl = buildHuggingFaceModelPageUrl(detail?.id);
+  const artifactUrl = isPackagePlan ? null : buildHuggingFaceArtifactPageUrl(detail?.id, artifactPathValue);
+  return {
+    artifactLabel: file?.artifactLabel || plan?.artifactLabel || modelType,
+    artifactPath: artifactPathValue,
+    artifactUrl,
+    disabled: plan?.runnable === false,
+    fileName,
+    id: identity || buildArtifactChoiceId([options.source || 'huggingface', detail?.id, artifactPathValue]),
+    label: artifactPathValue || fileName,
+    modelPageUrl,
+    modelType,
+    payload: compactArtifactChoicePayload({
+      artifactKind: file?.artifactKind || null,
+      artifactLabel: file?.artifactLabel || plan?.artifactLabel || modelType,
+      catalogRepositoryId: detail?.id,
+      downloadIdentity: identity,
+      downloadPlan: serializeDownloadPlan(plan, targetDirectory),
+      downloadUrl: isPackagePlan ? null : buildHuggingFaceResolveUrl(detail?.id, artifactPathValue),
+      fileName,
+      installRelativePath,
+      modelPageUrl,
+      artifactUrl,
+      modelType,
+      packageIdentity: plan?.packageIdentity || file?.packageIdentity || null,
+      packageName: plan?.packageName || null,
+      packageRoot: plan?.packageRoot || null,
+      sha256: file?.sha256 || null,
+      sizeBytes: Number(plan?.sizeBytes || file?.sizeBytes || 0) || 0,
+      sourceArtifactPath: isPackagePlan ? (plan?.packageRoot || detail?.id) : artifactPathValue,
+      sourceUrl: modelPageUrl,
+      versionLabel: options.versionLabel || 'main',
+    }),
+    reason: plan?.blockingReason || null,
+    recommended: Boolean(options.recommended),
+    sizeBytes: Number(plan?.sizeBytes || file?.sizeBytes || 0) || 0,
+    source: options.source || 'huggingface',
+    sourceLabel: sourceProviderLabel(options.source || 'huggingface'),
+    versionLabel: options.versionLabel || 'main',
+  };
+}
+
+function buildRejectedArtifactChoices(plan, source = '') {
+  return (plan?.rejectedArtifacts || []).map((artifact) => ({
+    artifactLabel: artifact.modelType || 'Unsupported',
+    artifactPath: artifact.path || artifact.fileName || '',
+    disabled: true,
+    fileName: artifact.fileName || path.basename(String(artifact.path || '')),
+    id: buildArtifactChoiceId([source || 'rejected', artifact.path || artifact.fileName, artifact.reason]),
+    label: artifact.path || artifact.fileName || 'Unsupported artifact',
+    modelType: artifact.modelType || 'Unsupported',
+    reason: artifact.reason || 'This artifact is not compatible with the selected target.',
+    recommended: false,
+    source,
+    sourceLabel: sourceProviderLabel(source),
+  }));
+}
+
+function buildCivitaiArtifactChoice(model, entry, tool, options = {}) {
+  const fileName = String(entry?.file?.name || '').trim();
+  const versionLabel = formatCivitaiVersionLabel(entry?.version);
+  const installRelativePath = normalizeRelativeInstallPath(fileName) || fileName;
+  const plan = entry?.file?.downloadPlan || null;
+  const modelType = entry?.file?.normalizedType || entry?.file?.modelType || plan?.modelType || 'Model';
+  const targetDirectory = getTargetDirectory(tool, modelType, entry?.file || {});
+  const identity = buildSourceDownloadIdentity({
+    source: 'civitai',
+    toolId: tool?.id,
+    catalogModelId: model?.id,
+    catalogVersionId: entry?.version?.id,
+    catalogVersionLabel: versionLabel,
+    sourceFileId: entry?.file?.id,
+    sourceArtifactPath: fileName,
+    installRelativePath,
+    fileName,
+  });
+  const modelPageUrl = buildCivitaiModelPageUrl(model?.id, entry?.version?.id);
+  return {
+    artifactLabel: entry?.file?.artifactLabel || plan?.artifactLabel || modelType,
+    artifactPath: fileName,
+    disabled: plan?.runnable === false,
+    fileName,
+    id: identity || buildArtifactChoiceId(['civitai', model?.id, entry?.version?.id || versionLabel, entry?.file?.id || fileName]),
+    label: [versionLabel, fileName].filter(Boolean).join(' | '),
+    modelPageUrl,
+    modelType,
+    payload: compactArtifactChoicePayload({
+      artifactKind: entry?.file?.artifactKind || null,
+      artifactLabel: entry?.file?.artifactLabel || plan?.artifactLabel || modelType,
+      catalogModelId: model?.id ? String(model.id) : null,
+      catalogVersionId: entry?.version?.id ? String(entry.version.id) : null,
+      catalogVersionLabel: versionLabel,
+      downloadIdentity: identity,
+      downloadPlan: serializeDownloadPlan(plan, targetDirectory),
+      downloadUrl: entry?.file?.downloadUrl || entry?.version?.downloadUrl || null,
+      fileName,
+      installRelativePath,
+      modelPageUrl,
+      modelType,
+      sha256: entry?.file?.sha256 || null,
+      sizeBytes: Number(entry?.file?.sizeBytes || 0) || 0,
+      sourceArtifactPath: fileName,
+      sourceFileId: entry?.file?.id ? String(entry.file.id) : null,
+      sourceUrl: modelPageUrl,
+      versionId: entry?.version?.id ? String(entry.version.id) : null,
+      versionLabel,
+    }),
+    reason: plan?.blockingReason || null,
+    recommended: Boolean(options.recommended),
+    sizeBytes: Number(entry?.file?.sizeBytes || 0) || 0,
+    source: 'civitai',
+    sourceLabel: 'CivitAI',
+    versionId: entry?.version?.id ? String(entry.version.id) : null,
+    versionLabel,
+  };
+}
+
+function dedupeArtifactChoices(choices = []) {
+  const seen = new Set();
+  return choices.filter((choice) => {
+    const key = String(choice?.id || choice?.artifactPath || choice?.label || '').trim();
+    if (!key || seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
 function getToolModelDirectories(tool) {
   const targetLayout = getModelManagerTargetLayout(tool);
   if (targetLayout) {
@@ -3115,7 +3337,7 @@ function getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch) {
   }
   return artifactItems.length ? [artifactItems] : [modelItems];
 }
-function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl) {
+function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl, choiceFiles = []) {
   const plan = file.downloadPlan || null;
   const isPackagePlan = plan?.planType === 'package';
   const fileName = isPackagePlan ? (plan.packageName || path.basename(plan.packageRoot || detail.id)) : path.basename(file.rfilename || '');
@@ -3132,9 +3354,22 @@ function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, 
     fileName,
   };
   const identity = buildSourceDownloadIdentity(identityPayload);
+  const cardData = detail.cardData || detail.card_data || {};
+  const modelPageUrl = buildHuggingFaceModelPageUrl(detail.id);
+  const artifactUrl = isPackagePlan ? null : buildHuggingFaceArtifactPageUrl(detail.id, file.rfilename);
+  const artifactChoices = dedupeArtifactChoices([
+    ...(choiceFiles.length ? choiceFiles : [file]).map((choiceFile) => buildHuggingFaceArtifactChoice(detail, choiceFile, tool, {
+      recommended: String(choiceFile?.rfilename || '') === String(file?.rfilename || ''),
+      source: 'huggingface',
+      versionLabel: 'main',
+    })),
+    ...buildRejectedArtifactChoices(plan, 'huggingface'),
+  ]);
   return attachHardwareHints(
     attachDownloadPlanFields({
       id: 'huggingface:repository:' + detail.id,
+      artifactChoices,
+      artifactUrl,
       author: detail.author || null,
       catalogEntityLabel: isPackagePlan ? 'Package' : 'Repository',
       catalogEntityType: isPackagePlan ? 'package' : 'repository',
@@ -3148,6 +3383,8 @@ function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, 
       fileName,
       highVramWarning: catalogRequirements,
       installRelativePath,
+      license: cardData.license || detail.license || null,
+      modelPageUrl,
       modelType: plan?.modelType || file.modelType,
       name: detail.id,
       packageIdentity: plan?.packageIdentity || file.packageIdentity || null,
@@ -3158,16 +3395,22 @@ function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, 
       sizeBytes: Number(plan?.sizeBytes || file.sizeBytes || 0),
       sha256: file.sha256 || null,
       source: 'huggingface',
+      sourceLabel: 'Hugging Face',
+      sourceUrl: modelPageUrl,
       toolId: tool.id,
+      versionLabel: 'main',
     }, plan || file.downloadPlan, getTargetDirectory(tool, plan?.modelType || file.modelType, { ...file, catalogRepositoryId: detail.id })),
     tool,
     hardwareContext,
   );
 }
 function buildHuggingFaceBlockedRepositoryResult(detail, plan, tool, hardwareContext, catalogRequirements, previewUrl) {
+  const cardData = detail.cardData || detail.card_data || {};
+  const modelPageUrl = buildHuggingFaceModelPageUrl(detail.id);
   return attachHardwareHints(
     attachDownloadPlanFields({
       id: 'huggingface:repository:' + detail.id + ':blocked',
+      artifactChoices: buildRejectedArtifactChoices(plan, 'huggingface'),
       author: detail.author || null,
       catalogEntityLabel: 'Repository',
       catalogEntityType: 'repository',
@@ -3180,12 +3423,17 @@ function buildHuggingFaceBlockedRepositoryResult(detail, plan, tool, hardwareCon
       fileName: '',
       highVramWarning: catalogRequirements,
       installRelativePath: '',
+      license: cardData.license || detail.license || null,
+      modelPageUrl,
       modelType: 'Incompatible',
       name: detail.id,
       previewUrl,
       sizeBytes: 0,
       source: 'huggingface',
+      sourceLabel: 'Hugging Face',
+      sourceUrl: modelPageUrl,
       toolId: tool.id,
+      versionLabel: 'main',
     }, plan, null),
     tool,
     hardwareContext,
@@ -3195,9 +3443,14 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
   const fileName = path.basename(file.rfilename || '');
   const nestedPath = String(file.rfilename || '').trim();
   const installRelativePath = normalizeRelativeInstallPath(nestedPath || fileName) || fileName;
+  const identity = buildSourceDownloadIdentity({ source: 'huggingface', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName });
+  const cardData = detail.cardData || detail.card_data || {};
+  const modelPageUrl = buildHuggingFaceModelPageUrl(detail.id);
   return attachHardwareHints(
     attachDownloadPlanFields({
       id: 'huggingface:artifact:' + detail.id + ':' + normalizePathForId(nestedPath || fileName),
+      artifactChoices: [buildHuggingFaceArtifactChoice(detail, file, tool, { recommended: true, source: 'huggingface', versionLabel: 'main' })],
+      artifactUrl: buildHuggingFaceArtifactPageUrl(detail.id, file.rfilename),
       author: detail.author || null,
       catalogEntityLabel: 'Artifact',
       catalogEntityType: 'artifact',
@@ -3206,20 +3459,25 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
       catalogRepositoryId: detail.id,
       catalogRequirements,
       description: `File from ${detail.id} | ${buildHuggingFaceDescription(detail)}`,
-      downloaded: isDownloadedMatch(downloadedLookup, [buildSourceDownloadIdentity({ source: 'huggingface', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName })]),
-      downloadIdentity: buildSourceDownloadIdentity({ source: 'huggingface', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName }),
+      downloaded: isDownloadedMatch(downloadedLookup, [identity]),
+      downloadIdentity: identity,
       downloadUrl: buildHuggingFaceResolveUrl(detail.id, file.rfilename),
       fileName,
       highVramWarning: catalogRequirements,
       installRelativePath,
+      license: cardData.license || detail.license || null,
+      modelPageUrl,
       modelType: file.modelType,
       name: fileName,
       previewUrl,
       sizeBytes: Number(file.sizeBytes || 0),
       sha256: file.sha256 || null,
       source: 'huggingface',
+      sourceLabel: 'Hugging Face',
       sourceArtifactPath: file.rfilename,
+      sourceUrl: modelPageUrl,
       toolId: tool.id,
+      versionLabel: 'main',
     }, file.downloadPlan, getTargetDirectory(tool, file.modelType, { ...file, catalogRepositoryId: detail.id })),
     tool,
     hardwareContext,
@@ -3270,22 +3528,36 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
       const detailId = String(detail?.id || '').trim().toLowerCase();
       const isDefaultSeedDetail = defaultSeedModelIds.has(detailId);
       const previewUrl = await resolveHuggingFacePreview(detail, logger);
-      const matchingArtifacts = artifactLevelSearch ? await resolveHuggingFaceArtifactFiles(detail, browseOptions, logger, tool) : [];
-      const primaryFile = matchingArtifacts[0] || (await resolveHuggingFaceDownloadFile(detail, browseOptions.modelType, logger, tool));
+      const planningDetail = await expandHuggingFaceDetailForPlanning(detail, browseOptions.modelType, tool, logger);
+      let compatibleFiles = collectHuggingFaceDownloadFiles(planningDetail, browseOptions.modelType, tool);
+      compatibleFiles = await Promise.all(
+        compatibleFiles.map(async (file) =>
+          file.sizeBytes > 0
+            ? file
+            : {
+                ...file,
+                sizeBytes: await fetchHuggingFaceFileSize(planningDetail.id, file.rfilename, logger),
+              },
+        ),
+      );
+      const matchingArtifacts = artifactLevelSearch
+        ? compatibleFiles.filter((file) => matchesSearchQuery(query, [file.rfilename, path.basename(file.rfilename)]))
+        : [];
+      const primaryFile = matchingArtifacts[0] || compatibleFiles[0] || null;
       if (primaryFile) {
         if (!isDefaultSeedDetail) {
           sawNonSeedCompatibleModel = true;
         }
         modelItems.push(
-          buildHuggingFaceRepositoryResult(detail, primaryFile, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl),
+          buildHuggingFaceRepositoryResult(planningDetail, primaryFile, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl, compatibleFiles),
         );
       } else if (query) {
-        const plan = await resolveHuggingFaceDownloadPlan(detail, browseOptions.modelType, logger, tool);
+        const plan = await resolveHuggingFaceDownloadPlan(planningDetail, browseOptions.modelType, logger, tool);
         if (plan && plan.runnable === false && plan.rejectedArtifacts?.length) {
           if (!isDefaultSeedDetail) {
             sawNonSeedCompatibleModel = true;
           }
-          modelItems.push(buildHuggingFaceBlockedRepositoryResult(detail, plan, tool, hardwareContext, catalogRequirements, previewUrl));
+          modelItems.push(buildHuggingFaceBlockedRepositoryResult(planningDetail, plan, tool, hardwareContext, catalogRequirements, previewUrl));
         }
       }
       const mergedItems = mergeCatalogSearchItems(getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), browseOptions.limit);
@@ -3404,7 +3676,7 @@ function buildCivitaiDescription(model) {
 function formatCivitaiVersionLabel(version) {
   return String(version?.name || version?.id || 'latest').trim() || 'latest';
 }
-function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareContext, catalogRequirements) {
+function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareContext, catalogRequirements, choiceEntries = []) {
   const fileName = String(entry?.file?.name || '').trim();
   const versionLabel = formatCivitaiVersionLabel(entry?.version);
   const previewImage = entry?.version?.images?.find((image) => image.type === 'image');
@@ -3420,9 +3692,17 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
     installRelativePath,
     fileName,
   });
+  const modelPageUrl = buildCivitaiModelPageUrl(model.id, entry.version?.id);
+  const artifactChoices = dedupeArtifactChoices([
+    ...(choiceEntries.length ? choiceEntries : [entry]).map((choiceEntry) => buildCivitaiArtifactChoice(model, choiceEntry, tool, {
+      recommended: String(choiceEntry?.file?.id || choiceEntry?.file?.name || '') === String(entry?.file?.id || entry?.file?.name || ''),
+    })),
+    ...buildRejectedArtifactChoices(entry.file.downloadPlan, 'civitai'),
+  ]);
   return attachHardwareHints(
     attachDownloadPlanFields({
       id: 'civitai:model:' + model.id,
+      artifactChoices,
       author: model.creator?.username || null,
       catalogEntityLabel: 'Model',
       catalogEntityType: 'model',
@@ -3438,15 +3718,21 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
       fileName,
       highVramWarning: catalogRequirements,
       installRelativePath,
+      license: model.license || null,
+      modelPageUrl,
       modelType: entry.file.normalizedType,
       name: model.name,
       previewUrl: sanitizeModelPreviewUrl(previewImage?.url),
       sizeBytes: entry.file.sizeBytes,
       sha256: entry.file.sha256 || null,
       source: 'civitai',
+      sourceLabel: 'CivitAI',
       sourceArtifactPath: fileName,
       sourceFileId: entry.file.id ? String(entry.file.id) : null,
+      sourceUrl: modelPageUrl,
       toolId: tool.id,
+      versionId: entry.version?.id ? String(entry.version.id) : null,
+      versionLabel,
     }, entry.file.downloadPlan, getTargetDirectory(tool, entry.file.normalizedType, entry.file)),
     tool,
     hardwareContext,
@@ -3468,9 +3754,11 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
     installRelativePath,
     fileName,
   });
+  const modelPageUrl = buildCivitaiModelPageUrl(model.id, entry.version?.id);
   return attachHardwareHints(
     attachDownloadPlanFields({
       id: 'civitai:artifact:' + model.id + ':' + String(entry?.version?.id || versionLabel) + ':' + fileName,
+      artifactChoices: [buildCivitaiArtifactChoice(model, entry, tool, { recommended: true })],
       author: model.creator?.username || null,
       catalogEntityLabel: 'Artifact',
       catalogEntityType: 'artifact',
@@ -3487,15 +3775,21 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
       fileName,
       highVramWarning: catalogRequirements,
       installRelativePath,
+      license: model.license || null,
+      modelPageUrl,
       modelType: entry.file.normalizedType,
       name: fileName,
       previewUrl: sanitizeModelPreviewUrl(previewImage?.url),
       sizeBytes: entry.file.sizeBytes,
       sha256: entry.file.sha256 || null,
       source: 'civitai',
+      sourceLabel: 'CivitAI',
       sourceArtifactPath: fileName,
       sourceFileId: entry.file.id ? String(entry.file.id) : null,
+      sourceUrl: modelPageUrl,
       toolId: tool.id,
+      versionId: entry.version?.id ? String(entry.version.id) : null,
+      versionLabel,
     }, entry.file.downloadPlan, getTargetDirectory(tool, entry.file.normalizedType, entry.file)),
     tool,
     hardwareContext,
@@ -3574,7 +3868,7 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
       : [];
     const primaryEntry = (fileLevelSearch && matchingFiles[0]) || candidateFiles[0] || null;
     if (primaryEntry) {
-      modelItems.push(buildCivitaiModelResult(model, primaryEntry, tool, downloadedLookup, hardwareContext, catalogRequirements));
+      modelItems.push(buildCivitaiModelResult(model, primaryEntry, tool, downloadedLookup, hardwareContext, catalogRequirements, candidateFiles));
     }
     if (!primaryEntry && matchingFiles.length) {
       for (const entry of matchingFiles) {
@@ -3844,11 +4138,48 @@ function getOllamaDefaultVariant(familyDetails) {
   const variants = familyDetails?.variants || [];
   return variants.find((variant) => variant.latest && !variant.isLatestAlias) || variants.find((variant) => variant.isLatestAlias) || variants.find((variant) => variant.latest) || variants[0] || null;
 }
+function buildOllamaArtifactChoices(entry, familyDetails, selectedName) {
+  const variants = familyDetails?.variants || [];
+  const sourceUrl = buildOllamaModelPageUrl(entry.libraryPath || entry.name);
+  const choices = (variants.length ? variants : [{ name: selectedName || entry.name, sizeBytes: entry.sizeBytes, sizeLabel: entry.sizeLabel }]).map((variant) => {
+    const name = variant.name || selectedName || entry.name;
+    return {
+      artifactLabel: 'Ollama tag',
+      artifactPath: name,
+      disabled: false,
+      fileName: name,
+      id: buildArtifactChoiceId(['ollama', name]),
+      label: [name, variant.sizeLabel].filter(Boolean).join(' | '),
+      modelPageUrl: sourceUrl,
+      modelType: 'Model',
+      payload: compactArtifactChoicePayload({
+        artifactKind: 'ollama-tag',
+        artifactLabel: 'Ollama tag',
+        downloadPlan: ollamaTagPlan(name),
+        fileName: name,
+        modelPageUrl: sourceUrl,
+        modelType: 'Model',
+        sizeBytes: Number(variant.sizeBytes || 0) || 0,
+        sourceUrl,
+        versionLabel: name,
+      }),
+      recommended: name === selectedName,
+      sizeBytes: Number(variant.sizeBytes || 0) || 0,
+      sizeLabel: variant.sizeLabel || null,
+      source: 'ollama',
+      sourceLabel: 'Ollama',
+      versionLabel: name,
+    };
+  });
+  return dedupeArtifactChoices(choices);
+}
 function buildOllamaFamilyCard(entry, familyDetails) {
   const defaultVariant = getOllamaDefaultVariant(familyDetails);
   const pullName = defaultVariant?.name || entry.fileName || entry.name;
+  const sourceUrl = buildOllamaModelPageUrl(entry.libraryPath || entry.name);
   return {
     ...entry,
+    artifactChoices: buildOllamaArtifactChoices(entry, familyDetails, pullName),
     artifactKind: 'ollama-tag',
     artifactLabel: 'Ollama tag',
     catalogContext: defaultVariant?.name && defaultVariant.name !== entry.name ? `Default variant: ${defaultVariant.name}` : null,
@@ -3858,9 +4189,13 @@ function buildOllamaFamilyCard(entry, familyDetails) {
     familySearchText: familyDetails?.searchText || '',
     downloadPlan: ollamaTagPlan(pullName),
     fileName: pullName,
+    modelPageUrl: sourceUrl,
     previewUrl: sanitizeModelPreviewUrl(familyDetails?.previewUrl || entry.previewUrl),
     sizeBytes: defaultVariant?.sizeBytes || entry.sizeBytes || 0,
     sizeLabel: defaultVariant?.sizeLabel || entry.sizeLabel,
+    sourceLabel: 'Ollama',
+    sourceUrl,
+    versionLabel: pullName,
   };
 }
 function buildOllamaVariantCard(entry, familyDetails, variant) {
@@ -3874,6 +4209,7 @@ function buildOllamaVariantCard(entry, familyDetails, variant) {
     catalogParentLabel: entry.name,
     contextLabel: variant.contextLabel,
     description: familyDetails?.description || entry.description,
+    artifactChoices: buildOllamaArtifactChoices(entry, familyDetails, variant.name),
     downloadPlan: ollamaTagPlan(variant.name),
     downloadUrl: null,
     familyDescription: familyDetails?.description || entry.description,
@@ -3885,11 +4221,15 @@ function buildOllamaVariantCard(entry, familyDetails, variant) {
     libraryPath: variant.libraryPath,
     modelType: 'Model',
     name: variant.name,
+    modelPageUrl: buildOllamaModelPageUrl(variant.libraryPath || entry.libraryPath || entry.name),
     previewUrl: sanitizeModelPreviewUrl(familyDetails?.previewUrl || entry.previewUrl),
     sizeBytes: variant.sizeBytes,
     sizeLabel: variant.sizeLabel,
     source: 'ollama',
+    sourceLabel: 'Ollama',
+    sourceUrl: buildOllamaModelPageUrl(variant.libraryPath || entry.libraryPath || entry.name),
     toolId: 'ollama',
+    versionLabel: variant.name,
     updatedLabel: variant.updatedLabel || entry.updatedLabel,
   };
 }
@@ -4313,6 +4653,8 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
             .join(' | '),
           catalogEntityLabel: 'Repository',
           catalogEntityType: 'repository',
+          artifactChoices: [buildHuggingFaceArtifactChoice(detail, file, tool, { recommended: true, source: 'tabby', versionLabel: 'main' })],
+          artifactUrl: buildHuggingFaceArtifactPageUrl(detail.id, file.rfilename),
           catalogRepositoryId: detail.id,
           description: `Tabby ${categoryLabels || 'registry'} pick | ${buildHuggingFaceDescription(detail)} | ${entry.license}`,
           downloaded: isDownloadedMatch(downloadedLookup, [identity]),
@@ -4320,13 +4662,18 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
           downloadUrl: buildHuggingFaceResolveUrl(detail.id, file.rfilename),
           fileName,
           installRelativePath,
+          license: entry.license || (detail.cardData || detail.card_data || {}).license || null,
+          modelPageUrl: sanitizeModelSourceUrl(entry.repoUrl) || buildHuggingFaceModelPageUrl(detail.id),
           modelType: file.modelType,
           name: entry.name || detail.id,
           previewUrl: await resolveHuggingFacePreview(detail, logger),
           sizeBytes: Number(file.sizeBytes || 0),
           sha256: file.sha256 || null,
           source: 'tabby',
+          sourceLabel: 'Tabby',
           sourceArtifactPath: file.rfilename,
+          sourceUrl: sanitizeModelSourceUrl(entry.repoUrl) || buildHuggingFaceModelPageUrl(detail.id),
+          versionLabel: 'main',
           toolId: tool.id,
         }, file.downloadPlan, getTargetDirectory(tool, file.modelType, { ...file, catalogRepositoryId: detail.id })),
         tool,
@@ -5428,6 +5775,7 @@ module.exports = {
   listToolAssets,
   readModelSettings,
   saveModelManagerSettings,
+  sanitizeModelSourceUrl,
   supportsModelManager,
   _test: {
     assertSafeModelOperationPath,

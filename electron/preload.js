@@ -75,6 +75,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   openDiagnosticsFolder: () => invoke('diagnostics:open-folder'),
   openAppUpdateTarget: (target) => invoke('updates:open-target', target),
   openLogsFolder: () => invoke('app:open-logs-folder'),
+  openModelSourceLink: (url) => invoke('models:open-source-link', { url }),
   openRecording: (id) => invoke('recordings:open', { id }),
   openRecordingsFolder: () => invoke('recordings:open-folder'),
   openPath: (payload) => invoke('app:open-path', payload),

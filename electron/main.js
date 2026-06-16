@@ -43,6 +43,7 @@ const {
   listToolAssets,
   readModelSettings,
   saveModelManagerSettings,
+  sanitizeModelSourceUrl,
   supportsModelManager,
 } = require('./services/modelService');
 const {
@@ -2248,6 +2249,18 @@ function registerIpcHandlers() {
 
   ipcMain.handle('models:cancel-browse', (event, payload = {}) =>
     withPlainEnglishErrors(() => cancelTabOwnedRequest(event, payload, 'modelCatalog'), 'Local AI Hub could not cancel that catalog request.', { refreshMode: 'none' }),
+  );
+  ipcMain.handle('models:open-source-link', (_event, payload = {}) =>
+    withPlainEnglishErrors(async () => {
+      const safeUrl = sanitizeModelSourceUrl(payload?.url);
+      if (!safeUrl) {
+        throw new Error('Local AI Hub refused to open that model link because it is not a trusted HTTPS provider URL.');
+      }
+      await shell.openExternal(safeUrl);
+      return {
+        message: 'Local AI Hub opened the model page in your browser.',
+      };
+    }, 'Local AI Hub could not open that model link.', { refreshMode: 'none' }),
   );
 
   ipcMain.handle('models:list-local', (event, payload = {}) =>

@@ -608,6 +608,7 @@ async function main() {
   }
 
   await fs.remove(rvcRoot);
+  modelServiceTest.clearAllModelManagerCaches();
   await fs.ensureDir(path.join(rvcRoot, 'weights', 'repo-folder'));
   const nestedRvcModelPath = path.join(rvcRoot, 'weights', 'repo-folder', 'model.pth');
   await fs.writeFile(nestedRvcModelPath, Buffer.from('nested-rvc-test-weight'));
@@ -910,6 +911,7 @@ async function main() {
     if (urlText.includes('/tree/main?recursive=true&expand=true')) {
       return {
         ok: true,
+        headers: { get: () => '' },
         json: async () => [
           { path: 'safety_checker/model.fp16.safetensors', type: 'file', size: 608_018_440 },
           { path: 'v1-5-pruned-emaonly.safetensors', type: 'file', size: 4_265_146_304 },
@@ -1078,6 +1080,7 @@ async function main() {
     if (urlText.includes('/api/models/stable-diffusion-v1-5/stable-diffusion-v1-5/tree/main')) {
       return {
         ok: true,
+        headers: { get: () => '' },
         json: async () => [
           { path: 'safety_checker/model.fp16.safetensors', type: 'file', size: 608_018_440 },
           { path: 'v1-5-pruned-emaonly.safetensors', type: 'file', size: 4_265_146_304 },
