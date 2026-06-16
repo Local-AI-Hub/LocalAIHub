@@ -34,6 +34,138 @@ const {
 const APP_USER_AGENT = `LocalAIHub/${APP_VERSION}`;
 const MODEL_BROWSE_CONTEXT = new AsyncLocalStorage();
 
+function cloneCacheValue(value) {
+  if (value === undefined || value === null) {
+    return value;
+  }
+  if (typeof structuredClone === 'function') {
+    try {
+      return structuredClone(value);
+    } catch {
+      // Fall through to JSON cloning for plain provider/cache payloads.
+    }
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function createExpiringCache(options = {}) {
+  const ttlMs = Number(options.ttlMs || 0) || 0;
+  const maxEntries = Math.max(1, Number(options.maxEntries || 100) || 100);
+  const cloneValues = options.cloneValues !== false;
+  const entries = new Map();
+  const api = {
+    clear() {
+      entries.clear();
+    },
+    delete(key) {
+      return entries.delete(String(key || ''));
+    },
+    get(key, now = Date.now()) {
+      const normalizedKey = String(key || '');
+      const entry = entries.get(normalizedKey);
+      if (!entry) {
+        return undefined;
+      }
+      if (ttlMs > 0 && now - entry.createdAt >= ttlMs) {
+        entries.delete(normalizedKey);
+        return undefined;
+      }
+      entries.delete(normalizedKey);
+      entries.set(normalizedKey, entry);
+      return cloneValues ? cloneCacheValue(entry.value) : entry.value;
+    },
+    keys() {
+      return [...entries.keys()];
+    },
+    set(key, value, now = Date.now()) {
+      const normalizedKey = String(key || '');
+      if (!normalizedKey || value === undefined) {
+        return value;
+      }
+      if (entries.has(normalizedKey)) {
+        entries.delete(normalizedKey);
+      }
+      entries.set(normalizedKey, {
+        createdAt: now,
+        value: cloneValues ? cloneCacheValue(value) : value,
+      });
+      while (entries.size > maxEntries) {
+        const oldestKey = entries.keys().next().value;
+        entries.delete(oldestKey);
+      }
+      return value;
+    },
+    size() {
+      return entries.size;
+    },
+  };
+  return api;
+}
+
+function buildStableCacheKeyPart(value) {
+  if (Array.isArray(value)) {
+    return value.map((entry) => buildStableCacheKeyPart(entry));
+  }
+  if (value && typeof value === 'object') {
+    return Object.keys(value).sort().reduce((result, key) => {
+      if (/key|token|secret|authorization|credential/i.test(key)) {
+        return result;
+      }
+      const entry = value[key];
+      if (entry !== undefined && typeof entry !== 'function') {
+        result[key] = buildStableCacheKeyPart(entry);
+      }
+      return result;
+    }, {});
+  }
+  return value;
+}
+
+function buildProviderCacheKey(source, parts = {}) {
+  return source + ':' + JSON.stringify(buildStableCacheKeyPart(parts));
+}
+
+function clearProviderCatalogCaches() {
+  for (const cache of [
+    HUGGING_FACE_FILE_SIZE_CACHE,
+    HUGGING_FACE_PREVIEW_CACHE,
+    HUGGING_FACE_TREE_CACHE,
+    HUGGING_FACE_PAGE_CACHE,
+    HUGGING_FACE_DETAIL_CACHE,
+    CIVITAI_SEARCH_CACHE,
+    OLLAMA_LIBRARY_CACHE,
+    OLLAMA_FAMILY_CACHE,
+    TABBY_REGISTRY_CACHE,
+  ]) {
+    cache.clear();
+  }
+}
+
+function getModelInventoryCacheStats() {
+  return {
+    keys: MODEL_INVENTORY_CACHE.keys(),
+    size: MODEL_INVENTORY_CACHE.size(),
+  };
+}
+
+function getProviderCatalogCacheStats() {
+  return {
+    civitaiSearch: CIVITAI_SEARCH_CACHE.size(),
+    huggingFaceDetails: HUGGING_FACE_DETAIL_CACHE.size(),
+    huggingFaceFiles: HUGGING_FACE_FILE_SIZE_CACHE.size(),
+    huggingFacePages: HUGGING_FACE_PAGE_CACHE.size(),
+    huggingFacePreviews: HUGGING_FACE_PREVIEW_CACHE.size(),
+    huggingFaceTrees: HUGGING_FACE_TREE_CACHE.size(),
+    ollamaFamilies: OLLAMA_FAMILY_CACHE.size(),
+    ollamaLibrary: OLLAMA_LIBRARY_CACHE.size(),
+    tabbyRegistry: TABBY_REGISTRY_CACHE.size(),
+  };
+}
+
+function clearAllModelManagerCaches() {
+  MODEL_INVENTORY_CACHE.clear();
+  clearProviderCatalogCaches();
+}
 function createModelBrowseAbortError() {
   const error = new Error('Model catalog loading was canceled.');
   error.name = 'AbortError';
@@ -98,13 +230,24 @@ const MODEL_SCAN_MAX_DEPTH = 12;
 const MODEL_SCAN_MAX_ENTRIES = 50000;
 const MODEL_SCAN_IGNORED_DIRECTORY_NAMES = new Set(['.cache', 'cache', 'caches', 'tmp', 'temp', '.tmp', '__pycache__', 'node_modules', '.git']);
 const MODEL_SCAN_TEMP_FILE_PATTERN = /(?:\.download|\.tmp|\.temp|\.part|\.partial|\.crdownload)$/i;
+const MODEL_INVENTORY_CACHE_TTL_MS = 15000;
+const MODEL_INVENTORY_CACHE_MAX_ENTRIES = 128;
+const PROVIDER_CACHE_TTL_MS = 10 * 60 * 1000;
+const PROVIDER_CACHE_MAX_ENTRIES = 200;
+const PROVIDER_DETAIL_CACHE_MAX_ENTRIES = 400;
 const SAFE_PREVIEW_EXACT_HOSTS = new Set(['huggingface.co', 'hf.co', 'civitai.com', 'civitai.green', 'ollama.com', 'models.tabbyml.com', 'tabby.tabbyml.com']);
 const SAFE_PREVIEW_HOST_SUFFIXES = ['.huggingface.co', '.civitai.com', '.civitai.green', '.ollama.com', '.tabbyml.com'];
 const README_FILE_PATTERN = /(?:^|\/)README\.md$/i;
-const HUGGING_FACE_FILE_SIZE_CACHE = new Map();
-const HUGGING_FACE_PREVIEW_CACHE = new Map();
-const HUGGING_FACE_TREE_CACHE = new Map();
-const OLLAMA_FAMILY_CACHE = new Map();
+const MODEL_INVENTORY_CACHE = createExpiringCache({ maxEntries: MODEL_INVENTORY_CACHE_MAX_ENTRIES, ttlMs: MODEL_INVENTORY_CACHE_TTL_MS });
+const HUGGING_FACE_FILE_SIZE_CACHE = createExpiringCache({ maxEntries: PROVIDER_DETAIL_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
+const HUGGING_FACE_PREVIEW_CACHE = createExpiringCache({ maxEntries: PROVIDER_DETAIL_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
+const HUGGING_FACE_TREE_CACHE = createExpiringCache({ maxEntries: PROVIDER_DETAIL_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
+const HUGGING_FACE_PAGE_CACHE = createExpiringCache({ maxEntries: PROVIDER_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
+const HUGGING_FACE_DETAIL_CACHE = createExpiringCache({ maxEntries: PROVIDER_DETAIL_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
+const CIVITAI_SEARCH_CACHE = createExpiringCache({ maxEntries: PROVIDER_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
+const OLLAMA_LIBRARY_CACHE = createExpiringCache({ maxEntries: PROVIDER_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
+const OLLAMA_FAMILY_CACHE = createExpiringCache({ maxEntries: PROVIDER_DETAIL_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
+const TABBY_REGISTRY_CACHE = createExpiringCache({ maxEntries: PROVIDER_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS, cloneValues: false });
 const MODEL_DOWNLOAD_LOCKS = new Map();
 const HF_SORT_MAP = {
   'most-downloaded': 'downloads',
@@ -494,6 +637,7 @@ async function saveModelManagerSettings(patch) {
     ...currentPublicSettings,
     ...stripModelManagerSecrets(nextPatch),
   });
+  clearProviderCatalogCaches();
   const secrets = await readModelManagerSecrets();
   return {
     ...buildModelSettingsDefaults(),
@@ -962,7 +1106,8 @@ async function assertSafeModelOperationPath(rootPath, candidatePath, message) {
 async function removeSafeModelPath(rootPath, candidatePath, message) {
   const safePath = await assertSafeModelOperationPath(rootPath, candidatePath, message);
   await fs.remove(safePath);
-}function normalizePathForId(value) {
+}
+function normalizePathForId(value) {
   return String(value || '').replace(/[\\/]+/g, ':');
 }
 function getModelMetadataPath(modelPath) {
@@ -1618,7 +1763,46 @@ async function listLocalOllamaModels(tool, options = {}) {
     return listLocalOllamaModelsFromFilesystem(tool, options);
   }
 }
-async function listDownloadedModels(tool, options = {}) {
+function buildModelInventoryDirectorySignature(tool) {
+  const directories = getUniqueModelDirectoryGroups(getToolModelDirectories(tool));
+  return directories
+    .map((group) => ({
+      directory: normalizePhysicalPathKey(group.directory),
+      modelTypes: uniqueNormalizedModelTypes(group.modelTypes).map((type) => type.toLowerCase()).sort(),
+    }))
+    .sort((left, right) => left.directory.localeCompare(right.directory));
+}
+
+function buildModelInventoryCacheKey(tool) {
+  const managedRoot = getAppPaths().managedRoot || '';
+  return buildProviderCacheKey('local-inventory', {
+    appDir: normalizePhysicalPathKey(tool?.appDir || ''),
+    directories: buildModelInventoryDirectorySignature(tool),
+    installDir: normalizePhysicalPathKey(tool?.installDir || ''),
+    managedRoot: normalizePhysicalPathKey(managedRoot),
+    status: String(tool?.status || '').trim().toLowerCase(),
+    toolId: String(tool?.id || '').trim().toLowerCase(),
+  });
+}
+
+function invalidateModelInventoryCache(toolOrToolId = null) {
+  if (!toolOrToolId) {
+    MODEL_INVENTORY_CACHE.clear();
+    return;
+  }
+  const toolId = String(typeof toolOrToolId === 'string' ? toolOrToolId : toolOrToolId?.id || '').trim().toLowerCase();
+  if (!toolId) {
+    MODEL_INVENTORY_CACHE.clear();
+    return;
+  }
+  for (const key of MODEL_INVENTORY_CACHE.keys()) {
+    if (key.includes(`"toolId":"${toolId}"`)) {
+      MODEL_INVENTORY_CACHE.delete(key);
+    }
+  }
+}
+
+async function scanDownloadedModelsUncached(tool, options = {}) {
   throwIfSignalAborted(options.signal);
   let models = [];
   if (tool?.id === 'rvc') {
@@ -1634,6 +1818,22 @@ async function listDownloadedModels(tool, options = {}) {
   }
   throwIfSignalAborted(options.signal);
   return models;
+}
+
+async function listDownloadedModels(tool, options = {}) {
+  throwIfSignalAborted(options.signal);
+  const forceRefresh = Boolean(options.forceRefresh || options.refresh || options.bypassCache || options.cache === false);
+  const cacheKey = buildModelInventoryCacheKey(tool || {});
+  if (!forceRefresh) {
+    const cachedModels = MODEL_INVENTORY_CACHE.get(cacheKey);
+    if (cachedModels !== undefined) {
+      throwIfSignalAborted(options.signal);
+      return cachedModels;
+    }
+  }
+  const models = await scanDownloadedModelsUncached(tool, options);
+  MODEL_INVENTORY_CACHE.set(cacheKey, models);
+  return cloneCacheValue(models);
 }
 function isStableDiffusionWebUiTool(tool) {
   const toolId = String(tool?.id || '').trim().toLowerCase();
@@ -2043,16 +2243,7 @@ async function listToolAssets(tool, options = {}) {
   };
 }
 async function countDownloadedModels(tool) {
-  if (tool?.id === 'rvc') {
-    return (await listDownloadedModels(tool)).length;
-  }
-  if (!supportsModelManager(tool)) {
-    return 0;
-  }
-  if (tool.id === 'ollama') {
-    return (await listLocalOllamaModels(tool)).length;
-  }
-  return (await listLocalFileModels(tool)).length;
+  return (await listDownloadedModels(tool)).length;
 }
 function normalizeLookupKey(value) {
   return String(value || '').trim().replace(/[\\/]+/g, '/').toLowerCase();
@@ -2237,19 +2428,21 @@ async function fetchHuggingFaceRepositoryTree(detail, logger) {
   if (!modelId) {
     return [];
   }
-  if (HUGGING_FACE_TREE_CACHE.has(modelId)) {
-    return HUGGING_FACE_TREE_CACHE.get(modelId);
+  const treeCacheKey = buildProviderCacheKey('huggingface-tree', { modelId });
+  const cachedTree = HUGGING_FACE_TREE_CACHE.get(treeCacheKey);
+  if (cachedTree !== undefined) {
+    return cachedTree;
   }
   const treeUrl = HUGGING_FACE_MODEL_URL + '/' + modelId + '/tree/main?recursive=true&expand=true';
   try {
     await logger.info('Expanding Hugging Face repository file tree for artifact planning.', { modelId }).catch(() => null);
-    const { payload } = await fetchJsonResponse(treeUrl, {
+    const { payload } = await fetchCachedJsonResponse(HUGGING_FACE_TREE_CACHE, treeCacheKey, treeUrl, {
       headers: {
         'User-Agent': APP_USER_AGENT,
       },
     });
     const entries = Array.isArray(payload) ? payload.map(normalizeHuggingFaceTreeEntry).filter(Boolean) : [];
-    HUGGING_FACE_TREE_CACHE.set(modelId, entries);
+    HUGGING_FACE_TREE_CACHE.set(treeCacheKey, entries);
     return entries;
   } catch (error) {
     rethrowModelBrowseCancellation(error);
@@ -2521,6 +2714,41 @@ async function fetchJsonResponse(url, options = {}) {
     payload,
   };
 }
+async function fetchCachedJsonResponse(cache, cacheKey, url, options = {}) {
+  const cached = cache.get(cacheKey);
+  if (cached !== undefined) {
+    return {
+      payload: cached.payload,
+      response: {
+        headers: {
+          get: (name) => cached.headers?.[String(name || '').toLowerCase()] || null,
+        },
+      },
+    };
+  }
+  const result = await fetchJsonResponse(url, options);
+  cache.set(cacheKey, {
+    headers: {
+      link: result.response.headers.get('link') || '',
+    },
+    payload: result.payload,
+  });
+  return result;
+}
+
+async function fetchCachedText(cache, cacheKey, url, options = {}) {
+  const cached = cache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const response = await fetch(url, withModelBrowseSignal(options));
+  if (!response.ok) {
+    throw new Error(`Request failed with status ${response.status}.`);
+  }
+  const text = await response.text();
+  cache.set(cacheKey, text);
+  return text;
+}
 function extractCursorFromLinkHeader(linkHeader, rel) {
   const link = String(linkHeader || '')
     .split(',')
@@ -2539,30 +2767,38 @@ function extractCursorFromLinkHeader(linkHeader, rel) {
     return null;
   }
 }
+async function fetchHuggingFaceDetail(result, logger) {
+  const modelId = String(result?.id || '').trim();
+  if (!modelId || result?.private || result?.gated) {
+    return null;
+  }
+  const cacheKey = buildProviderCacheKey('huggingface-detail', { modelId });
+  const cachedDetail = HUGGING_FACE_DETAIL_CACHE.get(cacheKey);
+  if (cachedDetail !== undefined) {
+    return cachedDetail;
+  }
+  try {
+    const { payload } = await fetchJsonResponse(HUGGING_FACE_MODEL_URL + '/' + modelId + '?files_metadata=true', {
+      headers: {
+        'User-Agent': APP_USER_AGENT,
+      },
+    });
+    HUGGING_FACE_DETAIL_CACHE.set(cacheKey, payload);
+    return payload;
+  } catch (error) {
+    rethrowModelBrowseCancellation(error);
+    await logger.warn('A Hugging Face model detail request failed.', {
+      error,
+      modelId,
+    }).catch(() => null);
+    return null;
+  }
+}
+
 async function fetchHuggingFaceDetails(results, logger) {
-  const eligibleResults = (results || []).filter((result) => !result.private && !result.gated);
-  const detailResults = await Promise.allSettled(
-    eligibleResults.map((result) =>
-      fetchJsonResponse(HUGGING_FACE_MODEL_URL + '/' + result.id + '?files_metadata=true', {
-        headers: {
-          'User-Agent': APP_USER_AGENT,
-        },
-      }).then((payload) => payload.payload),
-    ),
-  );
+  const detailResults = await Promise.all((results || []).map((result) => fetchHuggingFaceDetail(result, logger)));
   throwIfModelBrowseCanceled();
-  return detailResults
-    .map((entry, index) => {
-      if (entry.status === 'fulfilled') {
-        return entry.value;
-      }
-      logger.warn('A Hugging Face model detail request failed.', {
-        error: entry.reason,
-        modelId: eligibleResults[index]?.id,
-      }).catch(() => null);
-      return null;
-    })
-    .filter(Boolean);
+  return detailResults.filter(Boolean);
 }
 function parseSizeHeader(response) {
   const contentRange = response.headers.get('content-range');
@@ -2585,9 +2821,10 @@ function parseSizeHeader(response) {
   return 0;
 }
 async function fetchHuggingFaceFileSize(modelId, filePath, logger) {
-  const cacheKey = modelId + '::' + filePath;
-  if (HUGGING_FACE_FILE_SIZE_CACHE.has(cacheKey)) {
-    return HUGGING_FACE_FILE_SIZE_CACHE.get(cacheKey);
+  const cacheKey = buildProviderCacheKey('huggingface-size', { filePath, modelId });
+  const cachedSize = HUGGING_FACE_FILE_SIZE_CACHE.get(cacheKey);
+  if (cachedSize !== undefined) {
+    return cachedSize;
   }
   const downloadUrl = buildHuggingFaceResolveUrl(modelId, filePath);
   let sizeBytes = 0;
@@ -2622,7 +2859,8 @@ async function fetchHuggingFaceFileSize(modelId, filePath, logger) {
   }
   HUGGING_FACE_FILE_SIZE_CACHE.set(cacheKey, sizeBytes || 0);
   return sizeBytes || 0;
-}async function resolveHuggingFaceDownloadFile(detail, selectedType, logger, tool = null) {
+}
+async function resolveHuggingFaceDownloadFile(detail, selectedType, logger, tool = null) {
   const planningDetail = await expandHuggingFaceDetailForPlanning(detail, selectedType, tool, logger);
   const downloadFile = pickHuggingFaceDownloadFile(planningDetail, selectedType, tool);
   if (!downloadFile) {
@@ -2678,8 +2916,10 @@ async function fetchHuggingFaceReadmePreview(detail, logger) {
   return null;
 }
 async function resolveHuggingFacePreview(detail, logger) {
-  if (HUGGING_FACE_PREVIEW_CACHE.has(detail.id)) {
-    return HUGGING_FACE_PREVIEW_CACHE.get(detail.id);
+  const previewCacheKey = buildProviderCacheKey('huggingface-preview', { modelId: detail.id });
+  const cachedPreview = HUGGING_FACE_PREVIEW_CACHE.get(previewCacheKey);
+  if (cachedPreview !== undefined) {
+    return cachedPreview;
   }
   const previewUrl = sanitizeModelPreviewUrl(
     pickHuggingFacePreviewFromMetadata(detail) ||
@@ -2687,7 +2927,7 @@ async function resolveHuggingFacePreview(detail, logger) {
     (await fetchHuggingFaceReadmePreview(detail, logger)) ||
     null
   );
-  HUGGING_FACE_PREVIEW_CACHE.set(detail.id, previewUrl);
+  HUGGING_FACE_PREVIEW_CACHE.set(previewCacheKey, previewUrl);
   return previewUrl;
 }
 function mergeUniqueDetailsById(details = []) {
@@ -2779,7 +3019,8 @@ async function requestHuggingFacePage(tool, browseOptions, logger, pipelineTag =
     taskType: browseOptions.taskType,
     toolId: tool.id,
   });
-  const { response, payload } = await fetchJsonResponse(searchUrl, {
+  const pageCacheKey = buildProviderCacheKey('huggingface-page', { toolId: tool.id, url: searchUrl.toString() });
+  const { response, payload } = await fetchCachedJsonResponse(HUGGING_FACE_PAGE_CACHE, pageCacheKey, searchUrl, {
     headers: {
       'User-Agent': APP_USER_AGENT,
     },
@@ -3259,7 +3500,8 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
     tool,
     hardwareContext,
   );
-}async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settings, hardwareContext, logger) {
+}
+async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settings, hardwareContext, logger) {
   const selectedModelType = normalizeModelTypeFilter(browseOptions.modelType);
   const selectedTaskType = normalizeTaskTypeFilter(browseOptions.taskType);
   const modelTypeProfile = getModelTypeProfile(selectedModelType);
@@ -3307,7 +3549,12 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
     toolId: tool.id,
     types: mergeUniqueStrings(mappedTypes),
   });
-  const { payload } = await fetchJsonResponse(searchUrl, {
+  const civitaiCacheKey = buildProviderCacheKey('civitai-search', {
+    hasApiKey: Boolean(settings.hasCivitaiApiKey),
+    toolId: tool.id,
+    url: searchUrl.toString(),
+  });
+  const { payload } = await fetchCachedJsonResponse(CIVITAI_SEARCH_CACHE, civitaiCacheKey, searchUrl, {
     headers: buildCivitaiHeaders(settings),
   });
   const modelItems = [];
@@ -3371,7 +3618,10 @@ async function browseRemoteModels(tool, options = {}, context = {}) {
       hasCivitaiApiKey: Boolean(settings.hasCivitaiApiKey),
       hasSavedCivitaiApiKey: Boolean(settings.hasSavedCivitaiApiKey),
     };
-    const localModels = await listDownloadedModels(tool, { signal: context.signal }).catch((error) => {
+    const localModels = await listDownloadedModels(tool, {
+      forceRefresh: Boolean(context.forceRefresh || options.forceRefresh || options.refresh),
+      signal: context.signal,
+    }).catch((error) => {
       rethrowModelBrowseCancellation(error);
       return [];
     });
@@ -3414,7 +3664,8 @@ async function browseRemoteModels(tool, options = {}, context = {}) {
       settings: publicSettings,
     };
   });
-}function parseOllamaCompactNumber(value) {
+}
+function parseOllamaCompactNumber(value) {
   const match = String(value || '').trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*([KMBT])?$/i);
   if (!match) {
     return 0;
@@ -3552,22 +3803,19 @@ async function fetchOllamaFamilyDetails(entry, logger) {
       variants: [],
     };
   }
-  if (OLLAMA_FAMILY_CACHE.has(cacheKey)) {
-    return OLLAMA_FAMILY_CACHE.get(cacheKey);
+  const cachedDetails = OLLAMA_FAMILY_CACHE.get(cacheKey);
+  if (cachedDetails !== undefined) {
+    return cachedDetails;
   }
 
   const familyUrl = buildOllamaAbsoluteUrl(entry.libraryPath || `/library/${entry.slug || entry.name}`);
   try {
     throwIfModelBrowseCanceled();
-    const response = await fetch(familyUrl, withModelBrowseSignal({
+    const html = await fetchCachedText(OLLAMA_LIBRARY_CACHE, buildProviderCacheKey('ollama-family-html', { familyUrl }), familyUrl, {
       headers: {
         'User-Agent': APP_USER_AGENT,
       },
-    }));
-    if (!response.ok) {
-      throw new Error(`Request failed with status ${response.status}.`);
-    }
-    const html = await response.text();
+    });
     throwIfModelBrowseCanceled();
     const details = {
       description: extractOllamaFamilyDescription(html, entry.description || `Ollama model ${entry.name}`),
@@ -3591,7 +3839,8 @@ async function fetchOllamaFamilyDetails(entry, logger) {
       variants: [],
     };
   }
-}function getOllamaDefaultVariant(familyDetails) {
+}
+function getOllamaDefaultVariant(familyDetails) {
   const variants = familyDetails?.variants || [];
   return variants.find((variant) => variant.latest && !variant.isLatestAlias) || variants.find((variant) => variant.isLatestAlias) || variants.find((variant) => variant.latest) || variants[0] || null;
 }
@@ -3751,15 +4000,17 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
     sort: normalizedSort,
     url: searchUrl.toString(),
   });
-  const response = await fetch(searchUrl, withModelBrowseSignal({
-    headers: {
-      'User-Agent': APP_USER_AGENT,
-    },
-  }));
-  if (!response.ok) {
+  let html = '';
+  try {
+    html = await fetchCachedText(OLLAMA_LIBRARY_CACHE, buildProviderCacheKey('ollama-library', { sort: normalizedSort, url: searchUrl.toString() }), searchUrl, {
+      headers: {
+        'User-Agent': APP_USER_AGENT,
+      },
+    });
+  } catch (error) {
+    rethrowModelBrowseCancellation(error);
     throw new Error('Local AI Hub could not load the Ollama library list right now.');
   }
-  const html = await response.text();
   const allFamilies = parseOllamaLibraryCards(html);
   const startIndex = (browseOptions.page - 1) * OLLAMA_PAGE_SIZE;
   const endIndex = startIndex + OLLAMA_PAGE_SIZE;
@@ -3874,19 +4125,15 @@ async function fetchTabbyRegistryHtml(logger) {
       await logger.info('Loading Tabby model registry.', {
         url: registryUrl,
       });
-      const response = await fetch(registryUrl, withModelBrowseSignal({
+      const html = await fetchCachedText(TABBY_REGISTRY_CACHE, buildProviderCacheKey('tabby-registry', { url: registryUrl }), registryUrl, {
         headers: {
           'User-Agent': APP_USER_AGENT,
         },
-      }));
-      if (!response.ok) {
-        lastError = new Error(`Request failed with status ${response.status}.`);
-        continue;
-      }
-      const html = await response.text();
+      });
       if (html.includes('<table>')) {
         return html;
       }
+      lastError = new Error('Registry response did not include a model table.');
     } catch (error) {
       rethrowModelBrowseCancellation(error);
       lastError = error;
@@ -5015,7 +5262,7 @@ async function withModelDownloadLock(tool, payload = {}, operation) {
     }
   }
 }
-async function downloadModel(tool, payload, options = {}) {
+async function downloadModelUncached(tool, payload, options = {}) {
   return withModelDownloadLock(tool, payload, async () => {
     if (tool.id === 'ollama') {
       return pullOllamaModel(tool, payload, options);
@@ -5025,6 +5272,14 @@ async function downloadModel(tool, payload, options = {}) {
     }
     return downloadRemoteModel(tool, payload, options);
   });
+}
+async function downloadModel(tool, payload, options = {}) {
+  invalidateModelInventoryCache(tool);
+  try {
+    return await downloadModelUncached(tool, payload, options);
+  } finally {
+    invalidateModelInventoryCache(tool);
+  }
 }
 
 async function resolveOllamaCommand(tool) {
@@ -5075,7 +5330,8 @@ async function deletePackageModel(tool, payload = {}) {
   return {
     message: (metadata.packageName || payload.name || 'That model package') + ' was deleted from ' + (tool.name || 'this tool') + '.',
   };
-}async function deleteInvokeAiModel(tool, payload = {}) {
+}
+async function deleteInvokeAiModel(tool, payload = {}) {
   const modelKey = String(payload.invokeAiModelKey || payload.key || '').trim();
   if (!modelKey) {
     throw new Error('Local AI Hub can only remove InvokeAI models through InvokeAI\'s model registry. Launch InvokeAI, refresh Downloaded Models, then try again.');
@@ -5107,7 +5363,7 @@ async function deletePackageModel(tool, payload = {}) {
     await finishInvokeAiModelImportSession(session);
   }
 }
-async function deleteModel(tool, payload) {
+async function deleteModelUncached(tool, payload) {
   if (tool.id === 'invokeai') {
     return deleteInvokeAiModel(tool, payload);
   }
@@ -5152,13 +5408,22 @@ async function deleteModel(tool, payload) {
     message: `${payload.fileName || payload.name} was deleted from ${tool.name}.`,
   };
 }
+async function deleteModel(tool, payload) {
+  try {
+    return await deleteModelUncached(tool, payload);
+  } finally {
+    invalidateModelInventoryCache(tool);
+  }
+}
 module.exports = {
   browseRemoteModels,
+  clearProviderCatalogCaches,
   countDownloadedModels,
   deleteModel,
   downloadModel,
   getModelDownloadPreflight,
   getToolModelDirectories,
+  invalidateModelInventoryCache,
   listDownloadedModels,
   listToolAssets,
   readModelSettings,
@@ -5176,7 +5441,10 @@ module.exports = {
     buildRvcArtifactSearchQuery,
     buildRvcHuggingFaceApiSearchQuery,
     collectCivitaiVersionFiles,
+    clearAllModelManagerCaches,
+    clearProviderCatalogCaches,
     collectHuggingFaceDownloadFiles,
+    createExpiringCache,
     createModelDownloadPlan,
     downloadOptionalCompanionFiles,
     getToolModelDirectories,
@@ -5189,9 +5457,15 @@ module.exports = {
     buildInvokeAiModelImportConfig,
     buildInvokeAiModelInstallRequest,
     buildModelDownloadPreflight,
+    buildModelInventoryCacheKey,
+    buildProviderCacheKey,
     isInvokeAiApiImportPayload,
     normalizeInvokeAiModelType,
     resolveInvokeAiModelPath,
+    fetchCachedJsonResponse,
+    getModelInventoryCacheStats,
+    getProviderCatalogCacheStats,
+    invalidateModelInventoryCache,
     readOllamaPullStream,
     readPackageMetadata,
     resolveModelDestination,

@@ -89,6 +89,7 @@ async function verifyPackageReconciliation() {
   try {
     const tool = audiocraftTool(root);
 
+    modelService._test.clearAllModelManagerCaches();
     await writePackageManifest(root, { files: ['state_dict.bin', 'compression_state_dict.bin'] });
     let models = await modelService.listDownloadedModels(tool);
     let pkg = models.find((model) => model.packageIdentity === 'hf:facebook/musicgen-medium:audiocraft-snapshot');
@@ -98,6 +99,7 @@ async function verifyPackageReconciliation() {
 
     await fs.remove(root);
     await fs.ensureDir(root);
+    modelService.invalidateModelInventoryCache(tool);
     await writePackageManifest(root, { files: ['state_dict.bin'] });
     models = await modelService.listDownloadedModels(tool);
     pkg = models.find((model) => model.packageIdentity === 'hf:facebook/musicgen-medium:audiocraft-snapshot');
@@ -109,6 +111,7 @@ async function verifyPackageReconciliation() {
 
     await fs.remove(root);
     await fs.ensureDir(root);
+    modelService.invalidateModelInventoryCache(tool);
     await writePackageManifest(root, { files: [] });
     models = await modelService.listDownloadedModels(tool);
     pkg = models.find((model) => model.packageIdentity === 'hf:facebook/musicgen-medium:audiocraft-snapshot');
@@ -126,6 +129,7 @@ async function verifyPackageReconciliation() {
     const forgeModels = await modelService.listDownloadedModels(forge);
     assert(forgeModels.some((model) => model.fileName === 'plain.safetensors' && model.downloaded === true), 'Single-file model detection should still work.');
   } finally {
+    modelService._test.clearAllModelManagerCaches();
     await fs.remove(root).catch(() => null);
   }
 }

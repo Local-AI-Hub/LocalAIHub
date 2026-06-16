@@ -38,6 +38,7 @@ const {
   deleteModel,
   downloadModel,
   getModelDownloadPreflight,
+  invalidateModelInventoryCache,
   listDownloadedModels,
   listToolAssets,
   readModelSettings,
@@ -1660,6 +1661,7 @@ function registerIpcHandlers() {
         onProgress: (progressPayload) => sendInstallProgress(progressPayload),
       });
       invalidateDiscoveryCache();
+      invalidateModelInventoryCache();
       await invalidateStatisticsIndexSections(['storage'], 'tool-installed', { toolId }).catch(() => null);
       return {
         message:
@@ -1806,6 +1808,7 @@ function registerIpcHandlers() {
         onProgress: (progressPayload) => sendUpdateProgress(progressPayload),
       });
       invalidateDiscoveryCache();
+      invalidateModelInventoryCache(tool.id);
       await invalidateStatisticsIndexSections(['storage'], 'tool-updated', { toolId }).catch(() => null);
       const nextState = await buildAppState({ forceDiscovery: true });
       await refreshInstalledToolUpdates(nextState.tools).catch(() => null);
@@ -1831,6 +1834,7 @@ function registerIpcHandlers() {
         removeOrphanedToolFolders: Boolean(payload?.removeOrphanedToolFolders),
       });
       invalidateDiscoveryCache();
+      invalidateModelInventoryCache(tool.id);
       await invalidateStatisticsIndexSections(['storage'], 'tool-repaired', { toolId }).catch(() => null);
       return {
         message: repairedTool.lastRepairMessage,
@@ -1858,6 +1862,7 @@ function registerIpcHandlers() {
       }
       const removedTool = await uninstallTool(tool, { capability });
       invalidateDiscoveryCache();
+      invalidateModelInventoryCache(tool.id);
       await invalidateStatisticsIndexSections(['storage'], 'tool-uninstalled', { toolId: tool.id }).catch(() => null);
       return {
         message: removedTool.uninstallMessage || `${tool.name} was removed from Local AI Hub.`,
@@ -1894,6 +1899,7 @@ function registerIpcHandlers() {
         migrationSourceRoot: payload?.migrationSourceRoot || null,
       });
       invalidateDiscoveryCache();
+      invalidateModelInventoryCache();
       await invalidateStatisticsIndexSections(['storage'], 'storage-location-changed', { targetPath: normalizedTargetPath }).catch(() => null);
       return {
         message: `Large Local AI Hub data will now use ${normalizedTargetPath}. Direct Local AI Hub-managed tool folders can move there when you choose migration, but official-installer apps stay in their current Windows install location until you reinstall them.`,
@@ -1916,6 +1922,7 @@ function registerIpcHandlers() {
         preferredInstallRoot: normalizedTargetPath,
       }));
       invalidateDiscoveryCache();
+      invalidateModelInventoryCache();
       await invalidateStatisticsIndexSections(['storage'], 'preferred-install-root-changed', { targetPath: normalizedTargetPath }).catch(() => null);
       return {
         message: `New store installs will default to ${normalizedTargetPath}. Tools that use an external official installer may still ask you to confirm or change the final destination.`,
@@ -2009,6 +2016,7 @@ function registerIpcHandlers() {
   ipcMain.handle('settings:run-cleanup', () =>
     withPlainEnglishErrors(async () => {
       const cleanupSummary = await runCleanup();
+      invalidateModelInventoryCache();
       await invalidateStatisticsIndexSections(['storage'], 'storage-cleanup').catch(() => null);
       const removedCount = cleanupSummary.removedEntries?.length || 0;
       const failedCount = cleanupSummary.failedEntries?.length || 0;
@@ -2219,6 +2227,7 @@ function registerIpcHandlers() {
   ipcMain.handle('models:save-settings', (_event, payload) =>
     withPlainEnglishErrors(async () => {
       const settings = await saveModelManagerSettings(payload || {});
+      invalidateModelInventoryCache();
       return {
         message: 'Model Manager settings were saved on this PC. Sensitive keys are stored in Windows Credential Manager.',
         settings,
@@ -2230,7 +2239,10 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(() => runTabOwnedRequest(event, payload, 'modelCatalog', async (signal) => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      return browseRemoteModels(tool, payload, { signal });
+      return browseRemoteModels(tool, payload, {
+        forceRefresh: Boolean(payload.forceRefresh || payload.refresh),
+        signal,
+      });
     }), 'Local AI Hub could not load remote models right now.', { allowCancellation: true }),
   );
 
@@ -2242,7 +2254,10 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(() => runTabOwnedRequest(event, payload, 'modelCatalog', async (signal) => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      return listDownloadedModels(tool, { signal });
+      return listDownloadedModels(tool, {
+        forceRefresh: Boolean(payload.forceRefresh || payload.refresh),
+        signal,
+      });
     }), 'Local AI Hub could not load the downloaded models for that tool.', { allowCancellation: true }),
   );
 
