@@ -93,6 +93,7 @@ const HUGGING_FACE_FILE_SIZE_CACHE = new Map();
 const HUGGING_FACE_PREVIEW_CACHE = new Map();
 const HUGGING_FACE_TREE_CACHE = new Map();
 const OLLAMA_FAMILY_CACHE = new Map();
+const MODEL_DOWNLOAD_LOCKS = new Map();
 const HF_SORT_MAP = {
   'most-downloaded': 'downloads',
   newest: 'created_at',
@@ -4422,6 +4423,108 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   }
   throw new Error(humanizeError(lastError, `${payload.name} could not be downloaded.`));
 }
+function buildOllamaPullFailureMessage(modelName, detail = '') {
+  const suffix = String(detail || '').trim();
+  return suffix
+    ? `${modelName} could not be pulled from Ollama right now. ${suffix}`
+    : `${modelName} could not be pulled from Ollama right now.`;
+}
+
+function parseOllamaPullPayloadLine(line, modelName) {
+  let payloadLine = null;
+  try {
+    payloadLine = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const detail = String(payloadLine?.error || '').trim();
+  if (detail) {
+    throw new Error(buildOllamaPullFailureMessage(modelName, detail));
+  }
+  return payloadLine;
+}
+
+function handleOllamaPullPayloadLine(payloadLine, payload, options = {}, latestPercent = 0) {
+  if (!payloadLine) {
+    return {
+      latestPercent,
+      terminalSuccess: false,
+      receivedBytes: 0,
+      totalBytes: 0,
+    };
+  }
+  const percent = payloadLine.total
+    ? Math.max(latestPercent, Math.round(((payloadLine.completed || 0) / payloadLine.total) * 100))
+    : latestPercent;
+  const status = String(payloadLine.status || '').trim();
+  emitProgress(options.onProgress, {
+    downloadId: payload.id,
+    message: status || `Pulling ${payload.name}.`,
+    percent: percent || null,
+    receivedBytes: payloadLine.completed || 0,
+    totalBytes: payloadLine.total || 0,
+  });
+  return {
+    latestPercent: percent,
+    terminalSuccess: /^success$/i.test(status),
+    receivedBytes: payloadLine.completed || 0,
+    totalBytes: payloadLine.total || 0,
+  };
+}
+
+async function readOllamaPullStream(response, payload, options = {}) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let latestPercent = 0;
+  let terminalSuccess = false;
+  let receivedBytes = 0;
+  let totalBytes = 0;
+
+  const processLine = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+    const payloadLine = parseOllamaPullPayloadLine(trimmed, payload.name);
+    const result = handleOllamaPullPayloadLine(payloadLine, payload, options, latestPercent);
+    latestPercent = result.latestPercent;
+    terminalSuccess = terminalSuccess || result.terminalSuccess;
+    receivedBytes = result.receivedBytes || receivedBytes;
+    totalBytes = result.totalBytes || totalBytes;
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    if (buffer.length > MODEL_DOWNLOAD_BUFFER_LIMIT) {
+      buffer = buffer.slice(-MODEL_DOWNLOAD_BUFFER_LIMIT);
+    }
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      processLine(line);
+    }
+  }
+
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    processLine(buffer);
+  }
+
+  if (!terminalSuccess) {
+    throw new Error(buildOllamaPullFailureMessage(payload.name, 'Ollama ended the download stream before confirming the model was ready.'));
+  }
+
+  return {
+    latestPercent,
+    receivedBytes,
+    totalBytes,
+  };
+}
 async function pullOllamaModel(tool, payload, options = {}) {
   assertRunnableDownloadPlan(payload);
   await ensureDiskHasCapacity(tool, payload);
@@ -4472,57 +4575,19 @@ async function pullOllamaModel(tool, payload, options = {}) {
         payloadLine = null;
       }
       const detail = String(payloadLine?.error || payloadLine?.message || raw || '').trim();
-      throw new Error(detail ? `${payload.name} could not be pulled from Ollama right now. ${detail}` : `${payload.name} could not be pulled from Ollama right now.`);
+      throw new Error(buildOllamaPullFailureMessage(payload.name, detail));
     }
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let latestPercent = 0;
     await logger.info('Ollama model pull started.', {
       autoStarted: Boolean(session.autoStarted),
       model: payload.name,
     });
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      if (buffer.length > MODEL_DOWNLOAD_BUFFER_LIMIT) {
-        buffer = buffer.slice(-MODEL_DOWNLOAD_BUFFER_LIMIT);
-      }
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          continue;
-        }
-        let payloadLine = null;
-        try {
-          payloadLine = JSON.parse(trimmed);
-        } catch {
-          continue;
-        }
-        const percent = payloadLine.total
-          ? Math.max(latestPercent, Math.round(((payloadLine.completed || 0) / payloadLine.total) * 100))
-          : latestPercent;
-        latestPercent = percent;
-        emitProgress(options.onProgress, {
-          downloadId: payload.id,
-          message: payloadLine.status || `Pulling ${payload.name}.`,
-          percent: percent || null,
-          receivedBytes: payloadLine.completed || 0,
-          totalBytes: payloadLine.total || 0,
-        });
-      }
-    }
+    const pullResult = await readOllamaPullStream(response, payload, options);
     emitProgress(options.onProgress, {
       downloadId: payload.id,
       message: `${payload.name} is ready.`,
       percent: 100,
-      receivedBytes: 0,
-      totalBytes: 0,
+      receivedBytes: pullResult.receivedBytes || 0,
+      totalBytes: pullResult.totalBytes || 0,
     });
     return {
       alreadyPresent: false,
@@ -4547,15 +4612,58 @@ async function pullOllamaModel(tool, payload, options = {}) {
     await finishOllamaSession(session);
   }
 }
-async function downloadModel(tool, payload, options = {}) {
-  if (tool.id === 'ollama') {
-    return pullOllamaModel(tool, payload, options);
+function resolveModelDownloadLockKey(tool, payload = {}) {
+  const toolId = normalizeLookupKey(tool?.id || tool?.name || 'model-tool');
+  if (tool?.id === 'ollama') {
+    return `ollama:${toolId}:${normalizeLookupKey(payload.name || payload.id || payload.fileName || 'model')}`;
   }
-  if (tool.id === 'invokeai') {
-    return downloadInvokeAiImportedModel(tool, payload, options);
+  if (isPackageDownloadPayload(payload)) {
+    const destination = resolvePackageDestination(tool, payload);
+    return `package:${normalizePhysicalPathKey(destination.packageRootPath || destination.manifestPath)}`;
   }
-  return downloadRemoteModel(tool, payload, options);
+  if (tool?.id === 'invokeai') {
+    const identity = buildExpectedDownloadIdentity(tool, payload, {
+      fileName: payload.fileName,
+      installRelativePath: payload.installRelativePath,
+    });
+    return `invokeai:${toolId}:${normalizeLookupKey(identity || payload.id || payload.name || payload.fileName || 'model')}`;
+  }
+  const destination = resolveModelDestination(tool, payload);
+  return `file:${normalizePhysicalPathKey(destination.destinationPath)}`;
 }
+
+async function withModelDownloadLock(tool, payload = {}, operation) {
+  const lockKey = resolveModelDownloadLockKey(tool, payload);
+  const token = {
+    toolId: tool?.id || null,
+    modelId: payload?.id || null,
+    startedAt: Date.now(),
+  };
+  if (MODEL_DOWNLOAD_LOCKS.has(lockKey)) {
+    const modelName = payload?.name || payload?.fileName || 'that model';
+    throw new Error(`A download for ${modelName} is already in progress. Wait for it to finish, then try again.`);
+  }
+  MODEL_DOWNLOAD_LOCKS.set(lockKey, token);
+  try {
+    return await operation();
+  } finally {
+    if (MODEL_DOWNLOAD_LOCKS.get(lockKey) === token) {
+      MODEL_DOWNLOAD_LOCKS.delete(lockKey);
+    }
+  }
+}
+async function downloadModel(tool, payload, options = {}) {
+  return withModelDownloadLock(tool, payload, async () => {
+    if (tool.id === 'ollama') {
+      return pullOllamaModel(tool, payload, options);
+    }
+    if (tool.id === 'invokeai') {
+      return downloadInvokeAiImportedModel(tool, payload, options);
+    }
+    return downloadRemoteModel(tool, payload, options);
+  });
+}
+
 async function resolveOllamaCommand(tool) {
   const candidates = [
     tool.launchProfile?.kind === 'binary' ? tool.launchProfile.executable : null,
@@ -4711,6 +4819,7 @@ module.exports = {
     isInvokeAiApiImportPayload,
     normalizeInvokeAiModelType,
     resolveInvokeAiModelPath,
+    readOllamaPullStream,
     resolveModelDestination,
     resolveRvcCompanionDestination,
     writeModelMetadata,

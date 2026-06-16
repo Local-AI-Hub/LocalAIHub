@@ -123,6 +123,78 @@ function createAudioCraftPackagePlan(options, artifacts) {
   };
 }
 
+function parseWanDiffusionShardName(fileName) {
+  const match = String(fileName || '').match(/^diffusion_pytorch_model-(\d{5})-of-(\d{5})\.safetensors$/i);
+  if (!match) {
+    return null;
+  }
+  return {
+    index: Number.parseInt(match[1], 10),
+    total: Number.parseInt(match[2], 10),
+  };
+}
+
+function validateWanDiffusionShardMatches(matches = []) {
+  const shardEntries = [];
+  const unshardedEntries = [];
+
+  for (const artifact of matches) {
+    const name = artifactName(artifact);
+    const shard = parseWanDiffusionShardName(name);
+    if (shard) {
+      shardEntries.push({ artifact, name, ...shard });
+    } else if (/^diffusion_pytorch_model\.safetensors$/i.test(name)) {
+      unshardedEntries.push(artifact);
+    }
+  }
+
+  if (!shardEntries.length) {
+    return null;
+  }
+
+  if (unshardedEntries.length) {
+    return 'This Wan model snapshot mixes sharded and non-sharded diffusion weights. Choose a snapshot with either one complete diffusion_pytorch_model.safetensors file or one complete shard set.';
+  }
+
+  const totals = new Set(shardEntries.map((entry) => entry.total));
+  if (totals.size !== 1) {
+    return 'This Wan model snapshot mixes diffusion shard counts. Choose a snapshot where every diffusion shard uses the same -of-000NN total.';
+  }
+
+  const total = shardEntries[0].total;
+  if (!Number.isInteger(total) || total < 1) {
+    return 'This Wan model snapshot has an invalid diffusion shard count.';
+  }
+
+  const byIndex = new Map();
+  for (const entry of shardEntries) {
+    if (!Number.isInteger(entry.index) || entry.index < 1 || entry.index > total) {
+      return `This Wan model snapshot has an invalid diffusion shard name: ${entry.name}.`;
+    }
+    const existing = byIndex.get(entry.index) || [];
+    existing.push(entry);
+    byIndex.set(entry.index, existing);
+  }
+
+  const duplicates = Array.from(byIndex.entries()).filter(([, entries]) => entries.length > 1);
+  if (duplicates.length) {
+    const index = String(duplicates[0][0]).padStart(5, '0');
+    return `This Wan model snapshot has duplicate diffusion shard ${index}. Choose a snapshot with exactly one file for each shard.`;
+  }
+
+  const missing = [];
+  for (let index = 1; index <= total; index += 1) {
+    if (!byIndex.has(index)) {
+      missing.push(String(index).padStart(5, '0'));
+    }
+  }
+
+  if (missing.length) {
+    return `This Wan model snapshot is missing diffusion shard ${missing[0]} of ${String(total).padStart(5, '0')}. Local AI Hub needs every diffusion_pytorch_model-00001-of-000NN through diffusion_pytorch_model-000NN-of-000NN file.`;
+  }
+
+  return null;
+}
 function createWanPackagePlan(options, artifacts) {
   const rawRepositoryId = String(options && (options.catalogRepositoryId || options.repositoryId) || '').trim().replace(/\\+/g, '/');
   const repositoryId = normalizeRepositoryId(rawRepositoryId);
@@ -138,6 +210,12 @@ function createWanPackagePlan(options, artifacts) {
     if (!matches.length) {
       missingPatterns.push(String(pattern));
       continue;
+    }
+    if (pattern.test('diffusion_pytorch_model.safetensors')) {
+      const shardIssue = validateWanDiffusionShardMatches(matches);
+      if (shardIssue) {
+        return buildBlockedPackagePlan(options.tool, repositoryId, shardIssue, artifacts);
+      }
     }
     requiredFiles.push(...matches.map((artifact) => packageArtifactEntry(artifact, true)));
   }

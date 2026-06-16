@@ -196,7 +196,7 @@ function ModelPreview({ item }) {
     />
   );
 }
-function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, onDownload }) {
+function ModelCard({ item, deleteBusy, downloadBusy, downloadProgress, localMatch, onDelete, onDownload }) {
   const selectedArtifact = item.downloadPlan?.recommendedArtifactPath || item.installRelativePath || item.fileName || '';
   const requiredArtifacts = item.downloadPlan?.requiredArtifacts || [];
   const optionalArtifacts = item.downloadPlan?.optionalArtifacts || [];
@@ -320,8 +320,8 @@ function ModelCard({ item, deleteBusy, downloadProgress, localMatch, onDelete, o
             {deleteBusy ? 'Deleting...' : 'Delete'}
           </button>
         ) : (
-          <button className="primary-button" disabled={item.downloadPlan?.runnable === false} onClick={() => onDownload(item)} type="button">
-            {item.downloadPlan?.runnable === false ? 'Not compatible' : 'Download'}
+          <button className="primary-button" disabled={item.downloadPlan?.runnable === false || downloadBusy || Boolean(downloadProgress)} onClick={() => onDownload(item)} type="button">
+            {item.downloadPlan?.runnable === false ? 'Not compatible' : downloadBusy || downloadProgress ? 'Downloading...' : 'Download'}
           </button>
         )}
       </div>
@@ -342,6 +342,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   const [settings, setSettings] = useState({ civitaiApiKey: '', civitaiCredentialSource: 'missing', civitaiEnvVarName: 'CIVITAI_API_KEY', hasCivitaiApiKey: false, hasSavedCivitaiApiKey: false });
   const [civitaiApiKeyDraft, setCivitaiApiKeyDraft] = useState('');
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
+  const [downloadBusyMap, setDownloadBusyMap] = useState({});
   const [pagination, setPagination] = useState(EMPTY_PAGINATION);
   const [remoteCatalogPage, setRemoteCatalogPage] = useState(1);
   const [modelType, setModelType] = useState(getToolDefaults(modelTools[0]).modelType);
@@ -664,38 +665,54 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   }, [isActive, selectedTool, selectedToolId, selectedSource, modelType, sort, taskType]);
   async function handleDownload(item) {
     const subject = item?.name || item?.fileName || 'This model';
-    const preflightResult = await window.localAIHub.getModelDownloadPreflight({
-      ...item,
-      toolId: selectedToolId,
-    });
-    if (!preflightResult?.ok) {
-      onToast(preflightResult?.message || 'Local AI Hub could not check disk space for that model download.', 'error');
+    const downloadId = item?.id || item?.downloadIdentity || item?.fileName || subject;
+    if (downloadBusyMap[downloadId]) {
       return;
     }
-    const preflight = preflightResult.data;
-    if (preflight?.blocked) {
-      onToast(buildBlockedDiskMessage(subject, preflight), 'error');
-      return;
-    }
-    let lowDiskConfirmed = false;
-    if (preflight?.requiresConfirmation) {
-      lowDiskConfirmed = window.confirm(buildLowDiskConfirmationMessage(subject, preflight));
-      if (!lowDiskConfirmed) {
+    setDownloadBusyMap((current) => ({
+      ...current,
+      [downloadId]: true,
+    }));
+    try {
+      const preflightResult = await window.localAIHub.getModelDownloadPreflight({
+        ...item,
+        toolId: selectedToolId,
+      });
+      if (!preflightResult?.ok) {
+        onToast(preflightResult?.message || 'Local AI Hub could not check disk space for that model download.', 'error');
         return;
       }
+      const preflight = preflightResult.data;
+      if (preflight?.blocked) {
+        onToast(buildBlockedDiskMessage(subject, preflight), 'error');
+        return;
+      }
+      let lowDiskConfirmed = false;
+      if (preflight?.requiresConfirmation) {
+        lowDiskConfirmed = window.confirm(buildLowDiskConfirmationMessage(subject, preflight));
+        if (!lowDiskConfirmed) {
+          return;
+        }
+      }
+      const result = await window.localAIHub.downloadModel({
+        ...item,
+        lowDiskConfirmed,
+        toolId: selectedToolId,
+      });
+      if (!result?.ok) {
+        onToast(result?.message || 'Local AI Hub could not download that model.', 'error');
+        return;
+      }
+      onToast(result.data?.message || `${item.name} was downloaded.`, 'success');
+      setLocalModels(result.data?.localModels || []);
+      browse({ page: 1, cursor: null });
+    } finally {
+      setDownloadBusyMap((current) => {
+        const next = { ...current };
+        delete next[downloadId];
+        return next;
+      });
     }
-    const result = await window.localAIHub.downloadModel({
-      ...item,
-      lowDiskConfirmed,
-      toolId: selectedToolId,
-    });
-    if (!result?.ok) {
-      onToast(result?.message || 'Local AI Hub could not download that model.', 'error');
-      return;
-    }
-    onToast(result.data?.message || `${item.name} was downloaded.`, 'success');
-    setLocalModels(result.data?.localModels || []);
-    browse({ page: 1, cursor: null });
   }
   async function handleDelete(model, remoteItem = null) {
     const displayName = remoteItem?.name || model?.name || model?.fileName || 'this model';
@@ -933,6 +950,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
                   <ModelCard
                     key={item.id}
                     deleteBusy={deleteBusyId === localMatch?.id}
+                    downloadBusy={Boolean(downloadBusyMap[item.id])}
                     downloadProgress={downloadProgressMap[item.id]}
                     item={item}
                     localMatch={localMatch}

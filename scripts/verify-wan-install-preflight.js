@@ -13,7 +13,7 @@ const wan = manifest.find((entry) => entry.id === 'wan21-webui');
 assert(wan, 'Wan2.1 WebUI must stay declared in the Store manifest.');
 
 const wanLaunchCommand = String(wan.launchCommand || '');
-assert.strictEqual(wanLaunchCommand, 'python gradio/t2v_1.3B_singleGPU.py', 'Wan managed launch command should target the real upstream 1.3B Gradio entrypoint.');
+assert.strictEqual(wanLaunchCommand, 'python gradio/t2v_1.3B_singleGPU.py --ckpt_dir models/Wan-AI/Wan2.1-T2V-1.3B', 'Wan managed launch command should target the real upstream 1.3B Gradio entrypoint and managed model folder.');
 assert(!wanLaunchCommand.includes('gradio/app.py'), 'Wan managed launch command must not point to the stale gradio/app.py entrypoint.');
 assert(!/--server-(name|port)/.test(wanLaunchCommand), 'Wan t2v Gradio launcher does not accept server-name/server-port flags.');
 assert((wan.discovery?.markerPaths || []).includes('gradio\\t2v_1.3B_singleGPU.py'), 'Wan discovery markers should include the launcher that exists in the current upstream archive.');
@@ -27,7 +27,7 @@ const sampleLaunchProfile = buildManagedLaunchProfile({
 }, wan);
 assert.strictEqual(sampleLaunchProfile.kind, 'python-script', 'Wan should register as a Python script launcher.');
 assert.strictEqual(sampleLaunchProfile.target, 'gradio/t2v_1.3B_singleGPU.py', 'Wan launch profile should validate the actual upstream Gradio script.');
-assert.deepStrictEqual(sampleLaunchProfile.args, [], 'Wan launch profile should not pass unsupported Gradio server arguments.');
+assert.deepStrictEqual(sampleLaunchProfile.args, ['--ckpt_dir', 'models/Wan-AI/Wan2.1-T2V-1.3B'], 'Wan launch profile should pass the managed checkpoint directory without unsupported Gradio server arguments.');
 
 const installs = wan.installInstructions.pipInstalls || [];
 const flashAttn = installs.find((entry) => entry.value === 'flash_attn');

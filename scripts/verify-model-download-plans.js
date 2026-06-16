@@ -261,10 +261,10 @@ async function main() {
     selectedType: 'video',
     catalogRepositoryId: 'Wan-AI/Wan2.1-I2V-14B-480P',
     artifacts: [
-      artifact('diffusion_pytorch_model-00001-of-00002.safetensors', 1_000_000_000),
-      artifact('diffusion_pytorch_model-00002-of-00002.safetensors', 1_000_000_000),
-      artifact('models_t5_umt5-xxl-enc-bf16.pth', 8_000_000_000),
-      artifact('Wan2.1_VAE.pth', 500_000_000),
+      artifact('diffusion_pytorch_model-00001-of-00002.safetensors', 10_000),
+      artifact('diffusion_pytorch_model-00002-of-00002.safetensors', 10_000),
+      artifact('models_t5_umt5-xxl-enc-bf16.pth', 10_000),
+      artifact('Wan2.1_VAE.pth', 10_000),
       artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 1_000_000_000),
     ],
   });
@@ -277,7 +277,7 @@ async function main() {
     source: 'huggingface',
     selectedType: 'video',
     catalogRepositoryId: 'Wan-AI/Wan2.1-I2V-14B-480P',
-    artifacts: [artifact('diffusion_pytorch_model.safetensors', 1_000_000_000), artifact('models_t5_umt5-xxl-enc-bf16.pth', 8_000_000_000), artifact('Wan2.1_VAE.pth', 500_000_000)],
+    artifacts: [artifact('diffusion_pytorch_model.safetensors', 1_000_000_000), artifact('models_t5_umt5-xxl-enc-bf16.pth', 10_000), artifact('Wan2.1_VAE.pth', 10_000)],
   });
   assert.strictEqual(incompleteWanPlan.runnable, false, 'Wan image-to-video packages missing CLIP must be blocked.');
 
