@@ -15,7 +15,12 @@ const { runCommand } = require('./commandService');
 const { assessDiskSpace, detectHardwareSnapshot, detectStorageSnapshot, findDiskForPath, getDiskSnapshotForPath } = require('./hardwareService');
 const { createLogger } = require('./logService');
 const { buildOllamaUnavailableMessage, finishOllamaSession, listOllamaModels, prepareOllamaSession } = require('./ollamaService');
-const { assertLoopbackUrl, assertSecureRemoteUrl } = require('./pathSafetyService');
+const {
+  assertLoopbackUrl,
+  assertRealPathInside,
+  assertSecureRemoteUrl,
+  isPathInside: isPathInsideSafe,
+} = require('./pathSafetyService');
 const { getToolManifest } = require('./toolRegistry');
 const { annotateArtifactsForDownloadPlan, artifactPath, createModelDownloadPlan, ollamaTagPlan } = require('./modelDownloadPlanService');
 const { listStableDiffusionApiCheckpoints } = require('./workflowToolService');
@@ -89,6 +94,12 @@ const PACKAGE_SUPPORT_FILE_PATTERN = /(?:^|\/)(?:config\.json|tokenizer\.model)$
 const RVC_REMOTE_ARTIFACT_FILE_PATTERN = /\.(pth|pt|index)$/i;
 const RVC_INDEX_FILE_PATTERN = /\.index$/i;
 const IMAGE_FILE_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
+const MODEL_SCAN_MAX_DEPTH = 12;
+const MODEL_SCAN_MAX_ENTRIES = 50000;
+const MODEL_SCAN_IGNORED_DIRECTORY_NAMES = new Set(['.cache', 'cache', 'caches', 'tmp', 'temp', '.tmp', '__pycache__', 'node_modules', '.git']);
+const MODEL_SCAN_TEMP_FILE_PATTERN = /(?:\.download|\.tmp|\.temp|\.part|\.partial|\.crdownload)$/i;
+const SAFE_PREVIEW_EXACT_HOSTS = new Set(['huggingface.co', 'hf.co', 'civitai.com', 'civitai.green', 'ollama.com', 'models.tabbyml.com', 'tabby.tabbyml.com']);
+const SAFE_PREVIEW_HOST_SUFFIXES = ['.huggingface.co', '.civitai.com', '.civitai.green', '.ollama.com', '.tabbyml.com'];
 const README_FILE_PATTERN = /(?:^|\/)README\.md$/i;
 const HUGGING_FACE_FILE_SIZE_CACHE = new Map();
 const HUGGING_FACE_PREVIEW_CACHE = new Map();
@@ -941,11 +952,17 @@ function resolveModelDestination(tool, payload = {}) {
   };
 }
 function isSafeChildPath(parentPath, candidatePath) {
-  const normalizedParent = path.resolve(parentPath || '');
-  const normalizedCandidate = path.resolve(candidatePath || '');
-  return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+  return isPathInsideSafe(parentPath, candidatePath);
 }
-function normalizePathForId(value) {
+
+async function assertSafeModelOperationPath(rootPath, candidatePath, message) {
+  return assertRealPathInside(rootPath, candidatePath, message || 'Local AI Hub refused to use a model path outside the approved model folder.');
+}
+
+async function removeSafeModelPath(rootPath, candidatePath, message) {
+  const safePath = await assertSafeModelOperationPath(rootPath, candidatePath, message);
+  await fs.remove(safePath);
+}function normalizePathForId(value) {
   return String(value || '').replace(/[\\/]+/g, ':');
 }
 function getModelMetadataPath(modelPath) {
@@ -1153,6 +1170,7 @@ async function buildLocalPackageModel(tool, modelType, directory, manifestPath) 
     sourceCatalogModelId: metadata.catalogModelId || null,
     sourceName: metadata.source || 'local',
     status: incomplete ? 'Damaged' : 'Installed',
+    scanWarnings: Array.isArray(metadata.scanWarnings) ? metadata.scanWarnings : undefined,
     statusMessage: incomplete ? 'This package is incomplete. Missing required file' + (missingRequiredFiles.length === 1 ? '' : 's') + ': ' + missingRequiredFiles.slice(0, 4).join(', ') + (missingRequiredFiles.length > 4 ? ', and more' : '') + '. Download it again or delete the damaged package before using it.' : null,
     toolId: tool.id,
   };
@@ -1251,6 +1269,7 @@ async function listLocalFileModels(tool, options = {}) {
       continue;
     }
     const files = await walkDirectoryFiles(directory, options);
+    const scanWarnings = Array.isArray(files.scanWarnings) ? files.scanWarnings : [];
     const packageManifestPaths = files.filter(isPackageManifestPath);
     const packageFilePaths = new Set();
     const packageRootPaths = new Set();
@@ -1260,6 +1279,9 @@ async function listLocalFileModels(tool, options = {}) {
       const packageModel = await buildLocalPackageModel(tool, fallbackPackageType, directory, manifestPath);
       if (!packageModel) {
         continue;
+      }
+      if (scanWarnings.length) {
+        packageModel.scanWarnings = scanWarnings;
       }
       localModels.push(packageModel);
       const packageRoot = path.resolve(packageModel.packageRootPath || packageModel.path || '');
@@ -1298,6 +1320,7 @@ async function listLocalFileModels(tool, options = {}) {
         name: path.parse(path.basename(fullPath)).name,
         path: fullPath,
         relativePath: path.relative(directory, fullPath),
+        scanWarnings: scanWarnings.length ? scanWarnings : undefined,
         sizeBytes: stats.size,
         source: 'local',
         sourceArtifactPath: metadata?.sourceArtifactPath || null,
@@ -1310,23 +1333,113 @@ async function listLocalFileModels(tool, options = {}) {
   }
   return localModels.sort((left, right) => left.name.localeCompare(right.name));
 }
+function addScanWarning(warnings, message) {
+  if (!warnings.includes(message)) {
+    warnings.push(message);
+  }
+}
+
+function isIgnoredModelScanDirectoryName(name) {
+  const normalized = String(name || '').trim().toLowerCase();
+  return MODEL_SCAN_IGNORED_DIRECTORY_NAMES.has(normalized) || normalized.startsWith('.localaihub-download-');
+}
+
+function isIgnoredModelScanFileName(name) {
+  const normalized = String(name || '').trim();
+  return !normalized || MODEL_SCAN_TEMP_FILE_PATTERN.test(normalized);
+}
+
+function attachScanWarnings(files, warnings) {
+  Object.defineProperty(files, 'scanWarnings', {
+    configurable: true,
+    enumerable: false,
+    value: warnings,
+  });
+  return files;
+}
+
 async function walkDirectoryFiles(directory, options = {}) {
   throwIfSignalAborted(options.signal);
-  const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+  const root = path.resolve(String(directory || '').trim());
+  const maxDepth = Number.isFinite(Number(options.maxDepth)) ? Math.max(0, Number(options.maxDepth)) : MODEL_SCAN_MAX_DEPTH;
+  const maxEntries = Number.isFinite(Number(options.maxEntries)) ? Math.max(1, Number(options.maxEntries)) : MODEL_SCAN_MAX_ENTRIES;
   const files = [];
-  for (const entry of entries) {
+  const warnings = [];
+  const visitedRealDirectories = new Set();
+  const stack = [{ depth: 0, directory: root }];
+  let visitedEntries = 0;
+
+  while (stack.length) {
     throwIfSignalAborted(options.signal);
-    const fullPath = path.join(directory, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...(await walkDirectoryFiles(fullPath, options)));
+    const current = stack.pop();
+    if (!current || current.depth > maxDepth) {
+      addScanWarning(warnings, `Model scan stopped at depth ${maxDepth} to keep the app responsive.`);
       continue;
     }
-    if (entry.isFile()) {
-      files.push(fullPath);
+
+    const directoryStats = await fs.lstat(current.directory).catch(() => null);
+    if (!directoryStats || !directoryStats.isDirectory()) {
+      continue;
+    }
+    if (current.depth > 0 && ((typeof directoryStats.isSymbolicLink === 'function' && directoryStats.isSymbolicLink()) || (typeof directoryStats.isReparsePoint === 'function' && directoryStats.isReparsePoint()))) {
+      addScanWarning(warnings, 'Model scan skipped a symlink or junction inside the model folder.');
+      continue;
+    }
+
+    const realDirectory = await fs.realpath(current.directory).catch(() => null);
+    const realKey = realDirectory ? normalizePhysicalPathKey(realDirectory) : normalizePhysicalPathKey(current.directory);
+    if (visitedRealDirectories.has(realKey)) {
+      addScanWarning(warnings, 'Model scan skipped a repeated folder to avoid a filesystem loop.');
+      continue;
+    }
+    visitedRealDirectories.add(realKey);
+
+    const entries = await fs.readdir(current.directory, { withFileTypes: true }).catch(() => {
+      addScanWarning(warnings, 'Model scan skipped a folder Local AI Hub could not read.');
+      return [];
+    });
+
+    for (const entry of entries) {
+      throwIfSignalAborted(options.signal);
+      visitedEntries += 1;
+      if (visitedEntries > maxEntries) {
+        addScanWarning(warnings, `Model scan stopped after ${maxEntries} files and folders to keep the app responsive.`);
+        return attachScanWarnings(files, warnings);
+      }
+
+      const fullPath = path.join(current.directory, entry.name);
+      if (typeof entry.isSymbolicLink === 'function' && entry.isSymbolicLink()) {
+        addScanWarning(warnings, 'Model scan skipped a symlink or junction inside the model folder.');
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (isIgnoredModelScanDirectoryName(entry.name)) {
+          continue;
+        }
+        if (current.depth + 1 > maxDepth) {
+          addScanWarning(warnings, `Model scan stopped at depth ${maxDepth} to keep the app responsive.`);
+          continue;
+        }
+        const stats = await fs.lstat(fullPath).catch(() => null);
+        if (!stats || !stats.isDirectory()) {
+          continue;
+        }
+        if ((typeof stats.isSymbolicLink === 'function' && stats.isSymbolicLink()) || (typeof stats.isReparsePoint === 'function' && stats.isReparsePoint())) {
+          addScanWarning(warnings, 'Model scan skipped a symlink or junction inside the model folder.');
+          continue;
+        }
+        stack.push({ depth: current.depth + 1, directory: fullPath });
+        continue;
+      }
+      if (entry.isFile() && !isIgnoredModelScanFileName(entry.name)) {
+        files.push(fullPath);
+      }
     }
   }
-  return files;
-}function normalizeRvcCompanionToken(value) {
+
+  return attachScanWarnings(files, warnings);
+}
+function normalizeRvcCompanionToken(value) {
   return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
 }
 
@@ -2300,22 +2413,49 @@ function collectHuggingFaceDownloadFiles(detail, selectedType, tool = null) {
 function pickHuggingFaceDownloadFile(detail, selectedType, tool = null) {
   return collectHuggingFaceDownloadFiles(detail, selectedType, tool)[0] || null;
 }
+function isAllowedPreviewHost(hostname) {
+  const normalizedHost = String(hostname || '').trim().toLowerCase();
+  return SAFE_PREVIEW_EXACT_HOSTS.has(normalizedHost) || SAFE_PREVIEW_HOST_SUFFIXES.some((suffix) => normalizedHost.endsWith(suffix));
+}
+
+function sanitizeModelPreviewUrl(value) {
+  const rawValue = String(value || '').trim();
+  if (!rawValue) {
+    return null;
+  }
+  let parsed = null;
+  try {
+    parsed = new URL(rawValue);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'https:') {
+    return null;
+  }
+  if (!isAllowedPreviewHost(parsed.hostname)) {
+    return null;
+  }
+  parsed.username = '';
+  parsed.password = '';
+  parsed.hash = '';
+  return parsed.toString();
+}
 function normalizeHuggingFacePreviewCandidate(modelId, value) {
   const rawValue = String(value || '').trim();
   if (!rawValue || /^data:/i.test(rawValue)) {
     return null;
   }
   if (/^https?:\/\//i.test(rawValue)) {
-    return rawValue;
+    return sanitizeModelPreviewUrl(rawValue);
   }
   if (/^\/\//.test(rawValue)) {
-    return 'https:' + rawValue;
+    return sanitizeModelPreviewUrl('https:' + rawValue);
   }
   if (rawValue.startsWith('/')) {
-    return 'https://huggingface.co' + rawValue;
+    return sanitizeModelPreviewUrl('https://huggingface.co' + rawValue);
   }
   const normalizedPath = rawValue.replace(/^\.\//, '').replace(/^\//, '');
-  return normalizedPath ? buildHuggingFaceResolveUrl(modelId, normalizedPath) : null;
+  return normalizedPath ? sanitizeModelPreviewUrl(buildHuggingFaceResolveUrl(modelId, normalizedPath)) : null;
 }
 function collectHuggingFaceWidgetPreviewCandidates(entries = []) {
   const candidates = [];
@@ -2541,11 +2681,12 @@ async function resolveHuggingFacePreview(detail, logger) {
   if (HUGGING_FACE_PREVIEW_CACHE.has(detail.id)) {
     return HUGGING_FACE_PREVIEW_CACHE.get(detail.id);
   }
-  const previewUrl =
+  const previewUrl = sanitizeModelPreviewUrl(
     pickHuggingFacePreviewFromMetadata(detail) ||
     pickHuggingFacePreviewFromSiblings(detail) ||
     (await fetchHuggingFaceReadmePreview(detail, logger)) ||
-    null;
+    null
+  );
   HUGGING_FACE_PREVIEW_CACHE.set(detail.id, previewUrl);
   return previewUrl;
 }
@@ -3058,7 +3199,7 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
       installRelativePath,
       modelType: entry.file.normalizedType,
       name: model.name,
-      previewUrl: previewImage?.url || null,
+      previewUrl: sanitizeModelPreviewUrl(previewImage?.url),
       sizeBytes: entry.file.sizeBytes,
       sha256: entry.file.sha256 || null,
       source: 'civitai',
@@ -3107,7 +3248,7 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
       installRelativePath,
       modelType: entry.file.normalizedType,
       name: fileName,
-      previewUrl: previewImage?.url || null,
+      previewUrl: sanitizeModelPreviewUrl(previewImage?.url),
       sizeBytes: entry.file.sizeBytes,
       sha256: entry.file.sha256 || null,
       source: 'civitai',
@@ -3407,7 +3548,7 @@ async function fetchOllamaFamilyDetails(entry, logger) {
   if (!cacheKey) {
     return {
       description: entry?.description || 'Ollama model',
-      previewUrl: entry?.previewUrl || null,
+      previewUrl: sanitizeModelPreviewUrl(entry?.previewUrl),
       variants: [],
     };
   }
@@ -3430,7 +3571,7 @@ async function fetchOllamaFamilyDetails(entry, logger) {
     throwIfModelBrowseCanceled();
     const details = {
       description: extractOllamaFamilyDescription(html, entry.description || `Ollama model ${entry.name}`),
-      previewUrl: extractOllamaFamilyPreviewUrl(html) || entry.previewUrl || null,
+      previewUrl: sanitizeModelPreviewUrl(extractOllamaFamilyPreviewUrl(html) || entry.previewUrl),
       searchText: extractOllamaFamilySearchText(html),
       variants: parseOllamaFamilyVariants(html, entry.name),
     };
@@ -3445,7 +3586,7 @@ async function fetchOllamaFamilyDetails(entry, logger) {
     }).catch(() => null);
     return {
       description: entry.description || `Ollama model ${entry.name}`,
-      previewUrl: entry.previewUrl || null,
+      previewUrl: sanitizeModelPreviewUrl(entry.previewUrl),
       searchText: '',
       variants: [],
     };
@@ -3468,7 +3609,7 @@ function buildOllamaFamilyCard(entry, familyDetails) {
     familySearchText: familyDetails?.searchText || '',
     downloadPlan: ollamaTagPlan(pullName),
     fileName: pullName,
-    previewUrl: familyDetails?.previewUrl || entry.previewUrl || null,
+    previewUrl: sanitizeModelPreviewUrl(familyDetails?.previewUrl || entry.previewUrl),
     sizeBytes: defaultVariant?.sizeBytes || entry.sizeBytes || 0,
     sizeLabel: defaultVariant?.sizeLabel || entry.sizeLabel,
   };
@@ -3495,7 +3636,7 @@ function buildOllamaVariantCard(entry, familyDetails, variant) {
     libraryPath: variant.libraryPath,
     modelType: 'Model',
     name: variant.name,
-    previewUrl: familyDetails?.previewUrl || entry.previewUrl || null,
+    previewUrl: sanitizeModelPreviewUrl(familyDetails?.previewUrl || entry.previewUrl),
     sizeBytes: variant.sizeBytes,
     sizeLabel: variant.sizeLabel,
     source: 'ollama',
@@ -3980,8 +4121,14 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
     throw new Error(options.errorMessage || `Download failed with status ${response.status}.`);
   }
   await fs.ensureDir(path.dirname(destinationPath));
+  const safeRoot = options.safeRoot ? path.resolve(options.safeRoot) : path.dirname(destinationPath);
+  await assertSafeModelOperationPath(safeRoot, destinationPath, 'Local AI Hub refused to save a model through a symlink, junction, or path outside the approved model folder.');
   const tempPath = `${destinationPath}.download`;
-  await fs.remove(tempPath).catch(() => null);
+  if (options.safeRoot) {
+    await removeSafeModelPath(safeRoot, tempPath, 'Local AI Hub refused to clean up a model download through a symlink or junction.').catch(() => null);
+  } else {
+    await fs.remove(tempPath).catch(() => null);
+  }
   const fileHandle = await open(tempPath, 'w');
   const reader = response.body.getReader();
   const reportedBytes = normalizeExpectedByteCount(response.headers.get('content-length'));
@@ -4024,6 +4171,7 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
     if (expectedSha256 && actualSha256 !== expectedSha256) {
       throw new Error(buildDownloadIntegrityError(displayName, 'The SHA-256 checksum did not match the provider metadata. The partial file was not installed.'));
     }
+    await assertSafeModelOperationPath(safeRoot, destinationPath, 'Local AI Hub refused to finalize a model download through a symlink, junction, or path outside the approved model folder.');
     await fs.move(tempPath, destinationPath, { overwrite: true });
     moved = true;
     return {
@@ -4040,7 +4188,11 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
   } finally {
     await fileHandle.close().catch(() => null);
     if (!moved) {
-      await fs.remove(tempPath).catch(() => null);
+      if (options.safeRoot) {
+        await removeSafeModelPath(safeRoot, tempPath, 'Local AI Hub refused to clean up a model download through a symlink or junction.').catch(() => null);
+      } else {
+        await fs.remove(tempPath).catch(() => null);
+      }
     }
   }
 }
@@ -4249,6 +4401,7 @@ async function downloadOptionalCompanionFiles(tool, payload, headers, logger, op
         sourceArtifactPath: companionPayload.sourceArtifactPath,
       });
       await streamDownloadToFile(companionUrl, destination.destinationPath, {
+        safeRoot: path.resolve(String(tool?.appDir || tool?.installDir || '')),
         downloadId: payload.id,
         displayName: companionPayload.fileName,
         expectedBytes: companionPayload.sizeBytes,
@@ -4265,8 +4418,8 @@ async function downloadOptionalCompanionFiles(tool, payload, headers, logger, op
         error,
         sourceArtifactPath: companion.path,
       });
-      await fs.remove(destination.destinationPath).catch(() => null);
-      await fs.remove(destination.destinationPath + '.download').catch(() => null);
+      await removeSafeModelPath(path.resolve(String(tool?.appDir || tool?.installDir || '')), destination.destinationPath, 'Local AI Hub refused to clean up an RVC companion through a symlink or junction.').catch(() => null);
+      await removeSafeModelPath(path.resolve(String(tool?.appDir || tool?.installDir || '')), destination.destinationPath + '.download', 'Local AI Hub refused to clean up an RVC companion download through a symlink or junction.').catch(() => null);
       failed.push(companion.fileName || companion.path || 'RVC index');
     }
   }
@@ -4347,7 +4500,11 @@ async function downloadPackageModel(tool, payload, options = {}) {
   if (!requiredFiles.length) {
     throw new Error('Local AI Hub could not identify the required files for that model package.');
   }
-  const existingMetadata = await readPackageMetadata(destination.manifestPath);
+  let existingMetadata = null;
+  if (await fs.pathExists(destination.manifestPath)) {
+    await assertSafeModelOperationPath(destination.targetDirectory, destination.manifestPath, 'Local AI Hub refused to read a package manifest through a symlink, junction, or path outside the approved model folder.');
+    existingMetadata = await readPackageMetadata(destination.manifestPath);
+  }
   if (existingMetadata?.downloadIdentity) {
     const present = requiredFiles.every((file) => fs.pathExistsSync(path.join(destination.packageRootPath, file.installRelativePath)));
     if (present) {
@@ -4379,6 +4536,7 @@ async function downloadPackageModel(tool, payload, options = {}) {
         totalBytes,
       });
       const result = await streamDownloadToFile(downloadUrl, tempDestination, {
+        safeRoot: destination.targetDirectory,
         downloadId: payload.id,
         displayName: file.fileName,
         expectedBytes: file.sizeBytes,
@@ -4391,13 +4549,12 @@ async function downloadPackageModel(tool, payload, options = {}) {
       receivedBytes += Number(result.downloadedBytes || file.sizeBytes || 0);
       installedFiles.push({ ...file, downloadedBytes: Number(result.downloadedBytes || 0) });
     }
+    await assertSafeModelOperationPath(destination.targetDirectory, destination.packageRootPath, 'Local AI Hub refused to prepare a model package through a symlink or junction.');
     await fs.ensureDir(destination.packageRootPath);
     for (const file of installedFiles) {
       const sourcePath = path.join(tempRoot, file.installRelativePath);
       const finalPath = path.join(destination.packageRootPath, file.installRelativePath);
-      if (!isSafeChildPath(destination.packageRootPath, finalPath)) {
-        throw new Error('Local AI Hub refused to place a package file outside its package folder.');
-      }
+      await assertSafeModelOperationPath(destination.targetDirectory, finalPath, 'Local AI Hub refused to place a package file through a symlink, junction, or path outside the approved model folder.');
       await fs.ensureDir(path.dirname(finalPath));
       await fs.move(sourcePath, finalPath, { overwrite: true });
     }
@@ -4424,11 +4581,11 @@ async function downloadPackageModel(tool, payload, options = {}) {
     };
   } catch (error) {
     await logger.warn('Model package download failed.', { error, packageName: destination.packageName });
-    await fs.remove(tempRoot).catch(() => null);
-    await fs.remove(destination.manifestPath).catch(() => null);
+    await removeSafeModelPath(destination.targetDirectory, tempRoot, 'Local AI Hub refused to clean up a package download through a symlink or junction.').catch(() => null);
+    await removeSafeModelPath(destination.targetDirectory, destination.manifestPath, 'Local AI Hub refused to clean up a package manifest through a symlink or junction.').catch(() => null);
     throw new Error(humanizeError(error, (payload.name || destination.packageName) + ' could not be installed as a complete package.'));
   } finally {
-    await fs.remove(tempRoot).catch(() => null);
+    await removeSafeModelPath(destination.targetDirectory, tempRoot, 'Local AI Hub refused to clean up a package download through a symlink or junction.').catch(() => null);
   }
 }
 async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
@@ -4466,6 +4623,7 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
       totalBytes: payload.sizeBytes || 0,
     });
     const result = await streamDownloadToFile(downloadUrl, stagePath, {
+      safeRoot: stageRoot,
       downloadId: payload.id,
       displayName: payload.name || payload.fileName,
       expectedBytes: payload.sizeBytes,
@@ -4525,7 +4683,7 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
     throw new Error(humanizeError(error, (payload.name || payload.fileName || 'That model') + ' could not be imported into InvokeAI.'));
   } finally {
     await finishInvokeAiModelImportSession(session);
-    await fs.remove(stageRoot).catch(() => null);
+    await removeSafeModelPath(path.dirname(stageRoot), stageRoot, 'Local AI Hub refused to clean up an InvokeAI staging folder through a symlink or junction.').catch(() => null);
   }
 }
 function assertExistingModelFileMatchesRequest(tool, payload, destination, existingMetadata) {
@@ -4557,6 +4715,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   const settings = await readModelSettingsInternal();
   const headers = payload.source === 'civitai' ? buildCivitaiHeaders(settings) : { 'User-Agent': APP_USER_AGENT };
   if (await fs.pathExists(destinationPath)) {
+    await assertSafeModelOperationPath(targetDirectory, destinationPath, 'Local AI Hub refused to read an existing model through a symlink, junction, or path outside the approved model folder.');
     const existingMetadata = await readModelMetadata(destinationPath);
     assertExistingModelFileMatchesRequest(tool, payload, { destinationPath, fileName, installRelativePath, targetDirectory }, existingMetadata);
     return {
@@ -4585,6 +4744,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
         totalBytes: payload.sizeBytes || 0,
       });
       const result = await streamDownloadToFile(downloadUrl, destinationPath, {
+        safeRoot: targetDirectory,
         downloadId: payload.id,
         displayName: payload.name || payload.fileName,
         expectedBytes: payload.sizeBytes,
@@ -4620,8 +4780,8 @@ async function downloadRemoteModel(tool, payload, options = {}) {
         attempt,
         error,
       });
-      await fs.remove(destinationPath).catch(() => null);
-      await fs.remove(`${destinationPath}.download`).catch(() => null);
+      await removeSafeModelPath(targetDirectory, destinationPath, 'Local AI Hub refused to clean up a model file through a symlink or junction.').catch(() => null);
+      await removeSafeModelPath(targetDirectory, destinationPath + '.download', 'Local AI Hub refused to clean up a model download through a symlink or junction.').catch(() => null);
     }
   }
   throw new Error(humanizeError(lastError, `${payload.name} could not be downloaded.`));
@@ -4888,32 +5048,34 @@ async function resolveOllamaCommand(tool) {
 async function deletePackageModel(tool, payload = {}) {
   const manifestPath = path.resolve(String(payload.packageManifestPath || payload.path || '').trim());
   const directories = Object.values(getToolModelDirectories(tool)).map((entry) => path.resolve(entry));
-  if (!manifestPath || !directories.some((directory) => isSafeChildPath(directory, manifestPath) || manifestPath === directory)) {
+  const modelRoot = directories.find((directory) => manifestPath && (isSafeChildPath(directory, manifestPath) || manifestPath === directory));
+  if (!manifestPath || !modelRoot) {
     throw new Error('Local AI Hub refused to delete a package outside the approved model folder.');
   }
+  await assertSafeModelOperationPath(modelRoot, manifestPath, 'Local AI Hub refused to delete that package because its manifest crosses a symlink, junction, or leaves the approved model folder.');
   const metadata = await readPackageMetadata(manifestPath);
   if (!metadata) {
     throw new Error('Local AI Hub could not read the package manifest for that model.');
   }
   const packageRoot = path.resolve(String(metadata.packageRootPath || path.dirname(manifestPath)).trim());
-  if (!directories.some((directory) => isSafeChildPath(directory, packageRoot) || packageRoot === directory)) {
+  if (!isSafeChildPath(modelRoot, packageRoot) && packageRoot !== modelRoot) {
     throw new Error('Local AI Hub refused to delete package files outside the approved model folder.');
   }
+  await assertSafeModelOperationPath(modelRoot, packageRoot, 'Local AI Hub refused to delete that package because its folder crosses a symlink, junction, or leaves the approved model folder.');
   for (const relativeFile of packageInstalledRelativeFiles(metadata)) {
     const filePath = path.join(packageRoot, normalizeRelativeInstallPath(relativeFile));
     if (isSafeChildPath(packageRoot, filePath)) {
-      await fs.remove(filePath).catch(() => null);
+      await removeSafeModelPath(modelRoot, filePath, 'Local AI Hub refused to delete a package file through a symlink, junction, or path outside the approved model folder.').catch(() => null);
     }
   }
-  await fs.remove(manifestPath).catch(() => null);
+  await removeSafeModelPath(modelRoot, manifestPath, 'Local AI Hub refused to delete that package manifest through a symlink or junction.').catch(() => null);
   if (path.basename(manifestPath) === PACKAGE_METADATA_FILE) {
-    await fs.remove(packageRoot).catch(() => null);
+    await removeSafeModelPath(modelRoot, packageRoot, 'Local AI Hub refused to delete that package folder through a symlink or junction.').catch(() => null);
   }
   return {
     message: (metadata.packageName || payload.name || 'That model package') + ' was deleted from ' + (tool.name || 'this tool') + '.',
   };
-}
-async function deleteInvokeAiModel(tool, payload = {}) {
+}async function deleteInvokeAiModel(tool, payload = {}) {
   const modelKey = String(payload.invokeAiModelKey || payload.key || '').trim();
   if (!modelKey) {
     throw new Error('Local AI Hub can only remove InvokeAI models through InvokeAI\'s model registry. Launch InvokeAI, refresh Downloaded Models, then try again.');
@@ -4931,7 +5093,10 @@ async function deleteInvokeAiModel(tool, payload = {}) {
     }
     const modelPath = String(payload.path || '').trim();
     if (modelPath) {
-      await fs.remove(getModelMetadataPath(modelPath)).catch(() => null);
+      const targetDirectory = getTargetDirectory(tool, payload.modelType, payload);
+      if (targetDirectory && isSafeChildPath(targetDirectory, modelPath)) {
+        await removeSafeModelPath(targetDirectory, getModelMetadataPath(modelPath), 'Local AI Hub refused to delete InvokeAI metadata through a symlink or junction.').catch(() => null);
+      }
     }
     return {
       message: (payload.name || payload.fileName || 'That model') + ' was removed through InvokeAI\'s model registry.',
@@ -4981,8 +5146,8 @@ async function deleteModel(tool, payload) {
   if (!resolvedPath || !targetDirectory || !isSafeChildPath(targetDirectory, resolvedPath)) {
     throw new Error('Local AI Hub refused to delete a file outside the model folder.');
   }
-  await fs.remove(resolvedPath);
-  await fs.remove(getModelMetadataPath(resolvedPath)).catch(() => null);
+  await removeSafeModelPath(targetDirectory, resolvedPath, 'Local AI Hub refused to delete that model because its path crosses a symlink, junction, or leaves the approved model folder.');
+  await removeSafeModelPath(targetDirectory, getModelMetadataPath(resolvedPath), 'Local AI Hub refused to delete model metadata through a symlink or junction.').catch(() => null);
   return {
     message: `${payload.fileName || payload.name} was deleted from ${tool.name}.`,
   };
@@ -5000,6 +5165,7 @@ module.exports = {
   saveModelManagerSettings,
   supportsModelManager,
   _test: {
+    assertSafeModelOperationPath,
     buildDiskBlockedMessage,
     buildDownloadedLookup,
     buildDownloadMetadata,
@@ -5017,6 +5183,7 @@ module.exports = {
     matchesSearchQuery,
     resolveHuggingFaceDownloadFile,
     searchHuggingFaceModels,
+    sanitizeModelPreviewUrl,
     streamDownloadToFile,
     buildInvokeAiInstallErrorMessage,
     buildInvokeAiModelImportConfig,
@@ -5029,6 +5196,7 @@ module.exports = {
     readPackageMetadata,
     resolveModelDestination,
     resolveRvcCompanionDestination,
+    walkDirectoryFiles,
     writeModelMetadata,
   }
 };

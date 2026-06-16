@@ -39,6 +39,21 @@ const EMPTY_PAGINATION = {
   nextPage: null,
 };
 const REMOTE_CATALOG_PAGE_SIZE = 6;
+const SAFE_PREVIEW_EXACT_HOSTS = new Set(['huggingface.co', 'hf.co', 'civitai.com', 'civitai.green', 'ollama.com', 'models.tabbyml.com', 'tabby.tabbyml.com']);
+const SAFE_PREVIEW_HOST_SUFFIXES = ['.huggingface.co', '.civitai.com', '.civitai.green', '.ollama.com', '.tabbyml.com'];
+function isSafeModelPreviewUrl(value) {
+  const rawValue = String(value || '').trim();
+  if (!rawValue) {
+    return false;
+  }
+  try {
+    const parsed = new URL(rawValue);
+    const host = parsed.hostname.toLowerCase();
+    return parsed.protocol === 'https:' && (SAFE_PREVIEW_EXACT_HOSTS.has(host) || SAFE_PREVIEW_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix)));
+  } catch {
+    return false;
+  }
+}
 function getModelManagerConfig(tool) {
   const config = tool?.modelManager;
   if (!config || config.enabled === false) {
@@ -181,10 +196,11 @@ function PreviewFallback({ source }) {
 }
 function ModelPreview({ item }) {
   const [imageFailed, setImageFailed] = useState(false);
+  const safePreviewUrl = useMemo(() => (isSafeModelPreviewUrl(item.previewUrl) ? item.previewUrl : ''), [item.previewUrl]);
   useEffect(() => {
     setImageFailed(false);
-  }, [item.previewUrl]);
-  if (!item.previewUrl || imageFailed) {
+  }, [safePreviewUrl]);
+  if (!safePreviewUrl || imageFailed) {
     return <PreviewFallback source={item.source} />;
   }
   return (
@@ -192,11 +208,10 @@ function ModelPreview({ item }) {
       alt={item.name}
       className="h-full w-full object-cover"
       onError={() => setImageFailed(true)}
-      src={item.previewUrl}
+      src={safePreviewUrl}
     />
   );
-}
-function ModelCard({ item, deleteBusy, downloadBusy, downloadProgress, localMatch, onDelete, onDownload }) {
+}function ModelCard({ item, deleteBusy, downloadBusy, downloadProgress, localMatch, onDelete, onDownload }) {
   const selectedArtifact = item.downloadPlan?.recommendedArtifactPath || item.installRelativePath || item.fileName || '';
   const requiredArtifacts = item.downloadPlan?.requiredArtifacts || [];
   const optionalArtifacts = item.downloadPlan?.optionalArtifacts || [];

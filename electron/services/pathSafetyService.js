@@ -1,3 +1,4 @@
+﻿const fs = require('fs-extra');
 const path = require('path');
 
 const { getAppPaths, normalizePathList } = require('./configService');
@@ -10,12 +11,19 @@ function normalizeResolvedPath(value) {
   return path.resolve(String(value || ''));
 }
 
+function normalizePathComparisonKey(value) {
+  const resolved = normalizeResolvedPath(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
 function isPathInside(parentPath, candidatePath) {
   const resolvedParent = normalizeResolvedPath(parentPath);
   const resolvedCandidate = normalizeResolvedPath(candidatePath);
+  const parentKey = normalizePathComparisonKey(resolvedParent);
+  const candidateKey = normalizePathComparisonKey(resolvedCandidate);
   return (
-    resolvedCandidate === resolvedParent ||
-    resolvedCandidate.startsWith(`${resolvedParent}${path.sep}`)
+    candidateKey === parentKey ||
+    candidateKey.startsWith(`${parentKey}${path.sep}`)
   );
 }
 
@@ -25,6 +33,82 @@ function assertPathInside(parentPath, candidatePath, message) {
   }
 
   return normalizeResolvedPath(candidatePath);
+}
+
+function isReparsePointStats(stats) {
+  return Boolean(stats && (
+    (typeof stats.isSymbolicLink === 'function' && stats.isSymbolicLink()) ||
+    (typeof stats.isReparsePoint === 'function' && stats.isReparsePoint())
+  ));
+}
+
+async function pathExists(targetPath) {
+  return fs.pathExists(targetPath).catch(() => false);
+}
+
+async function findNearestExistingPath(parentPath, candidatePath) {
+  let currentPath = normalizeResolvedPath(candidatePath);
+  const resolvedParent = normalizeResolvedPath(parentPath);
+  while (isPathInside(resolvedParent, currentPath)) {
+    if (await pathExists(currentPath)) {
+      return currentPath;
+    }
+    const nextPath = path.dirname(currentPath);
+    if (nextPath === currentPath) {
+      break;
+    }
+    currentPath = nextPath;
+  }
+  return (await pathExists(resolvedParent)) ? resolvedParent : null;
+}
+
+async function assertNoReparsePointTraversal(parentPath, candidatePath, message) {
+  const resolvedParent = normalizeResolvedPath(parentPath);
+  const resolvedCandidate = normalizeResolvedPath(candidatePath);
+  if (!isPathInside(resolvedParent, resolvedCandidate)) {
+    throw new Error(message || 'Local AI Hub refused to use a path outside its expected folder.');
+  }
+
+  const relativePath = path.relative(resolvedParent, resolvedCandidate);
+  if (!relativePath || relativePath === '') {
+    return resolvedCandidate;
+  }
+
+  const segments = relativePath.split(path.sep).filter(Boolean);
+  let currentPath = resolvedParent;
+  for (const segment of segments) {
+    currentPath = path.join(currentPath, segment);
+    const stats = await fs.lstat(currentPath).catch(() => null);
+    if (!stats) {
+      break;
+    }
+    if (isReparsePointStats(stats)) {
+      throw new Error(message || 'Local AI Hub refused to use that model path because it crosses a symlink or junction. Choose a normal folder inside the managed model directory.');
+    }
+  }
+
+  return resolvedCandidate;
+}
+
+async function assertRealPathInside(parentPath, candidatePath, message, options = {}) {
+  const resolvedParent = assertPathInside(parentPath, parentPath, message);
+  const resolvedCandidate = assertPathInside(resolvedParent, candidatePath, message);
+  const nearestExistingPath = await findNearestExistingPath(resolvedParent, resolvedCandidate);
+  if (!nearestExistingPath) {
+    throw new Error(message || 'Local AI Hub could not verify that folder before using it.');
+  }
+
+  if (options.rejectReparse !== false) {
+    await assertNoReparsePointTraversal(resolvedParent, nearestExistingPath, message);
+  }
+
+  const realParent = await fs.realpath(resolvedParent).catch(() => null);
+  const realExisting = await fs.realpath(nearestExistingPath).catch(() => null);
+  if (!realParent || !realExisting || !isPathInside(realParent, realExisting)) {
+    throw new Error(message || 'Local AI Hub refused to use a path outside its expected folder.');
+  }
+
+  return resolvedCandidate;
 }
 
 function sanitizeManifestId(toolId) {
@@ -120,13 +204,16 @@ function assertSafeCommandString(value, label = 'command') {
 
 module.exports = {
   assertLoopbackUrl,
+  assertNoReparsePointTraversal,
   assertPathInside,
+  assertRealPathInside,
   assertSafeCommandString,
   assertSecureRemoteUrl,
   findManagedToolsRootForPath,
   getManagedToolsRoots,
   isLoopbackUrl,
   isPathInside,
+  normalizePathComparisonKey,
   resolveManagedToolPaths,
   sanitizeManifestId,
 };
