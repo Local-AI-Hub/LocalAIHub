@@ -281,7 +281,7 @@ function normalizeModelType(value) {
   if (normalized.includes('vae')) {
     return 'VAE';
   }
-  if (normalized.includes('embedding') || normalized.includes('textual inversion')) {
+  if (normalized.includes('embedding') || normalized.includes('textual inversion') || normalized.includes('textualinversion')) {
     return 'Embedding';
   }
   if (normalized.includes('control')) {
@@ -1000,6 +1000,14 @@ function buildSourceDownloadIdentity(item = {}) {
   const repositoryId = normalizeIdentityPart(item.catalogRepositoryId || item.name || 'unknown-source');
   return `${source}|${toolId}|source:${repositoryId}|artifact:${artifactPath}`;
 }
+function buildExpectedDownloadIdentity(tool, payload, destination = {}) {
+  return buildSourceDownloadIdentity({
+    ...payload,
+    fileName: destination.fileName || payload.fileName,
+    installRelativePath: destination.installRelativePath || payload.installRelativePath,
+    toolId: tool?.id || payload.toolId,
+  });
+}
 function buildDownloadMetadata(tool, payload, destination = {}) {
   const identityPayload = {
     ...payload,
@@ -1110,12 +1118,96 @@ async function buildLocalPackageModel(tool, modelType, directory, manifestPath) 
     toolId: tool.id,
   };
 }
+function normalizePhysicalPathKey(value) {
+  const resolved = path.resolve(String(value || '').trim());
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+function uniqueNormalizedModelTypes(values = []) {
+  const seen = new Set();
+  const types = [];
+  for (const value of values || []) {
+    const type = normalizeModelType(value);
+    const key = type.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    types.push(type);
+  }
+  return types;
+}
+function getUniqueModelDirectoryGroups(directories = {}) {
+  const groups = new Map();
+  for (const [modelType, directory] of Object.entries(directories || {})) {
+    const resolvedDirectory = path.resolve(String(directory || '').trim());
+    if (!resolvedDirectory) {
+      continue;
+    }
+    const key = normalizePhysicalPathKey(resolvedDirectory);
+    const group = groups.get(key) || { directory: resolvedDirectory, modelTypes: [] };
+    group.modelTypes = uniqueNormalizedModelTypes([...group.modelTypes, modelType]);
+    groups.set(key, group);
+  }
+  return [...groups.values()];
+}
+function localPathHasTypeEvidence(modelType, value) {
+  const normalized = String(value || '').replace(/\\+/g, '/').toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (modelType === 'Inpainting') return /(^|[\/_.\s-])inpaint(?:ing)?([\/_.\s-]|$)/i.test(normalized);
+  if (modelType === 'LoRA') return /(^|[\/_.\s-])(?:lora|locon|lycoris)([\/_.\s-]|$)/i.test(normalized);
+  if (modelType === 'VAE') return /(^|[\/_.\s-])vae([\/_.\s-]|$)/i.test(normalized);
+  if (modelType === 'ControlNet') return /(^|[\/_.\s-])control(?:net)?([\/_.\s-]|$)/i.test(normalized);
+  if (modelType === 'Embedding') return /(^|[\/_.\s-])(?:embedding|embeddings|textual[_\s-]?inversion)([\/_.\s-]|$)/i.test(normalized);
+  if (modelType === 'Hypernetwork') return /(^|[\/_.\s-])hyper(?:network)?([\/_.\s-]|$)/i.test(normalized);
+  if (modelType === 'Upscaler') return /(^|[\/_.\s-])(?:upscaler|upscale|esrgan|realesrgan)([\/_.\s-]|$)/i.test(normalized) || /\.(?:param|bin)$/i.test(normalized);
+  if (modelType === 'GGUF') return /\.gguf$/i.test(normalized);
+  if (modelType === 'RVC Voice Model') return /(^|[\/_.\s-])(?:rvc|voice)([\/_.\s-]|$)/i.test(normalized) || /\.(?:pth|pt)$/i.test(normalized);
+  if (modelType === 'Audio / Speech') return /(^|[\/_.\s-])(?:audio|speech|musicgen|audiogen|bark)([\/_.\s-]|$)/i.test(normalized);
+  if (modelType === 'Video') return /(^|[\/_.\s-])(?:video|wan2\.1|wan-ai)([\/_.\s-]|$)/i.test(normalized);
+  return false;
+}
+function inferLocalFileModelType(tool, fullPath, directory, modelTypes = [], metadata = null) {
+  const allowedTypes = uniqueNormalizedModelTypes(modelTypes);
+  const metadataType = metadata?.modelType ? normalizeModelType(metadata.modelType) : '';
+  if (metadataType && (!allowedTypes.length || allowedTypes.some((type) => type.toLowerCase() === metadataType.toLowerCase()))) {
+    return metadataType;
+  }
+  const relativePath = path.relative(directory, fullPath);
+  const context = [relativePath, metadata?.sourceArtifactPath, metadata?.installRelativePath, metadata?.fileName]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .join(' ');
+  for (const type of allowedTypes) {
+    if (type === 'Checkpoint') {
+      continue;
+    }
+    if (localPathHasTypeEvidence(type, context)) {
+      return type;
+    }
+  }
+  if (allowedTypes.length === 1) {
+    return allowedTypes[0];
+  }
+  if (allowedTypes.includes('Checkpoint')) {
+    return 'Checkpoint';
+  }
+  if (allowedTypes.includes('Model')) {
+    return 'Model';
+  }
+  if (allowedTypes.includes('GGUF')) {
+    return 'GGUF';
+  }
+  return allowedTypes[0] || normalizeModelType(path.basename(fullPath));
+}
 async function listLocalFileModels(tool, options = {}) {
   throwIfSignalAborted(options.signal);
-  const directories = getToolModelDirectories(tool);
+  const directoryGroups = getUniqueModelDirectoryGroups(getToolModelDirectories(tool));
   const localModels = [];
-  for (const [modelType, directory] of Object.entries(directories)) {
+  for (const group of directoryGroups) {
     throwIfSignalAborted(options.signal);
+    const directory = group.directory;
     if (!(await fs.pathExists(directory))) {
       continue;
     }
@@ -1123,9 +1215,10 @@ async function listLocalFileModels(tool, options = {}) {
     const packageManifestPaths = files.filter(isPackageManifestPath);
     const packageFilePaths = new Set();
     const packageRootPaths = new Set();
+    const fallbackPackageType = group.modelTypes.includes('Checkpoint') ? 'Checkpoint' : group.modelTypes[0] || 'Checkpoint';
     for (const manifestPath of packageManifestPaths) {
       throwIfSignalAborted(options.signal);
-      const packageModel = await buildLocalPackageModel(tool, modelType, directory, manifestPath);
+      const packageModel = await buildLocalPackageModel(tool, fallbackPackageType, directory, manifestPath);
       if (!packageModel) {
         continue;
       }
@@ -1155,6 +1248,7 @@ async function listLocalFileModels(tool, options = {}) {
       }
       const stats = await fs.stat(fullPath);
       const metadata = await readModelMetadata(fullPath);
+      const modelType = inferLocalFileModelType(tool, fullPath, directory, group.modelTypes, metadata);
       localModels.push({
         id: tool.id + ':' + modelType + ':' + normalizePathForId(path.relative(directory, fullPath)),
         downloaded: true,
@@ -2776,13 +2870,28 @@ function buildCivitaiHeaders(settings) {
     Authorization: `Bearer ${apiKey}`,
   };
 }
+function isGenericCivitaiFileType(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return !normalized || normalized === 'model' || normalized === 'file' || normalized === 'other' || normalized === 'unknown';
+}
+function resolveCivitaiVersionFileType(model, file) {
+  const fileType = String(file?.type || '').trim();
+  const parentType = String(model?.type || '').trim();
+  if (fileType && !isGenericCivitaiFileType(fileType)) {
+    return normalizeModelType(fileType);
+  }
+  if (parentType && !isGenericCivitaiFileType(parentType)) {
+    return normalizeModelType(parentType);
+  }
+  return normalizeModelType(fileType || file?.name || parentType);
+}
 function collectCivitaiVersionFiles(model, selectedType, tool = null) {
   const entries = (model.modelVersions || []).flatMap((version) =>
     (version.files || []).map((file) => ({
       file: {
         ...file,
         name: String(file.name || '').trim(),
-        normalizedType: normalizeModelType(file.type || file.name || model.type),
+        normalizedType: resolveCivitaiVersionFileType(model, file),
         rfilename: String(file.name || '').trim(),
         sizeBytes: Number(file.sizeBytes || 0) || toFileSizeBytes(Number(file.sizeKB || 0)),
       },
@@ -2792,7 +2901,7 @@ function collectCivitaiVersionFiles(model, selectedType, tool = null) {
   const plannedPaths = tool
     ? new Set(
         annotateArtifactsForDownloadPlan({
-          artifacts: entries.map((entry) => ({ ...entry.file, primary: entry.file.primary })),
+          artifacts: entries.map((entry) => ({ ...entry.file, modelType: entry.file.normalizedType, primary: entry.file.primary })),
           selectedType,
           source: 'civitai',
           tool,
@@ -2806,7 +2915,7 @@ function collectCivitaiVersionFiles(model, selectedType, tool = null) {
     .map((entry) => ({
       ...entry,
       file: tool
-        ? annotateArtifactsForDownloadPlan({ artifacts: [entry.file], selectedType, source: 'civitai', tool })[0]
+        ? annotateArtifactsForDownloadPlan({ artifacts: [{ ...entry.file, modelType: entry.file.normalizedType }], selectedType, source: 'civitai', tool })[0]
         : entry.file,
     }))
     .sort((left, right) => {
@@ -4217,6 +4326,19 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
     await fs.remove(stageRoot).catch(() => null);
   }
 }
+function assertExistingModelFileMatchesRequest(tool, payload, destination, existingMetadata) {
+  const requestedIdentity = buildExpectedDownloadIdentity(tool, payload, destination);
+  const existingIdentity = existingMetadata?.downloadIdentity || null;
+  if (requestedIdentity && existingIdentity && normalizeLookupKey(requestedIdentity) === normalizeLookupKey(existingIdentity)) {
+    return;
+  }
+  const fileName = destination.fileName || payload.fileName || payload.name || 'that model file';
+  const requestedName = payload.name || payload.fileName || 'the requested model';
+  if (!existingIdentity) {
+    throw new Error(`${fileName} already exists in ${tool.name}, but Local AI Hub cannot confirm it is the same model. Rename or delete the existing file, then try downloading ${requestedName} again.`);
+  }
+  throw new Error(`A different model named ${fileName} is already in ${tool.name}. Local AI Hub will not overwrite or relabel it. Delete or rename the existing file, then try downloading ${requestedName} again.`);
+}
 async function downloadRemoteModel(tool, payload, options = {}) {
   if (isPackageDownloadPayload(payload)) {
     return downloadPackageModel(tool, payload, options);
@@ -4234,9 +4356,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   const headers = payload.source === 'civitai' ? buildCivitaiHeaders(settings) : { 'User-Agent': APP_USER_AGENT };
   if (await fs.pathExists(destinationPath)) {
     const existingMetadata = await readModelMetadata(destinationPath);
-    if (!existingMetadata?.downloadIdentity) {
-      await writeModelMetadata(destinationPath, buildDownloadMetadata(tool, payload, { destinationPath, fileName, installRelativePath, targetDirectory })).catch(() => null);
-    }
+    assertExistingModelFileMatchesRequest(tool, payload, { destinationPath, fileName, installRelativePath, targetDirectory }, existingMetadata);
     return {
       destinationPath,
       fileName,
@@ -4574,6 +4694,7 @@ module.exports = {
     buildHuggingFaceRepositoryResult,
     buildHardwareFit,
     buildSourceDownloadIdentity,
+    buildExpectedDownloadIdentity,
     buildRvcArtifactSearchQuery,
     buildRvcHuggingFaceApiSearchQuery,
     collectCivitaiVersionFiles,

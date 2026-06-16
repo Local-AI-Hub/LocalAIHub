@@ -235,7 +235,7 @@ function normalizeModelType(value) {
   if (normalized.includes('inpaint')) return 'Inpainting';
   if (normalized.includes('lora') || normalized.includes('locon')) return 'LoRA';
   if (normalized.includes('vae')) return 'VAE';
-  if (normalized.includes('embedding') || normalized.includes('textual inversion')) return 'Embedding';
+  if (normalized.includes('embedding') || normalized.includes('textual inversion') || normalized.includes('textualinversion')) return 'Embedding';
   if (normalized.includes('control')) return 'ControlNet';
   if (normalized.includes('hyper')) return 'Hypernetwork';
   return 'Checkpoint';
