@@ -169,7 +169,7 @@ The full package build writes local artifacts to the ignored `release/` director
 
 `npm run verify:wizard-live` runs the Pipeline Wizard live provider verifier. This is an opt-in manual check only: it uses saved live provider credentials and may consume quota or hit provider rate limits. Keep normal release, push, npm verify, and CI-style validation on mocked/offline wizard verifiers such as `node scripts/verify-pipeline-wizard.js` and `node scripts/verify-pipeline-wizard-lifecycle.js`.
 
-## Untested Features as of v0.51.0
+## Untested Features as of v0.52.0
 
 The following features are implemented and covered by automated verification where practical, but have not yet been validated with real-world hardware, local model assets, or live cloud-provider accounts. Treat them as experimental until they are manually tested.
 
