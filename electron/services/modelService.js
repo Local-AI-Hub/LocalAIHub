@@ -1,4 +1,5 @@
 const path = require('path');
+const crypto = require('node:crypto');
 const fs = require('fs-extra');
 const { open } = require('node:fs/promises');
 const { AsyncLocalStorage } = require('node:async_hooks');
@@ -1037,6 +1038,7 @@ function buildDownloadMetadata(tool, payload, destination = {}) {
     fileName: destination.fileName || payload.fileName || null,
     modelType: payload.modelType || null,
     sizeBytes: Number(payload.sizeBytes || payload.downloadPlan?.sizeBytes || 0) || null,
+    sha256: normalizeTrustedSha256(payload.sha256 || payload.expectedSha256 || payload.downloadPlan?.sha256),
     downloadUrl: payload.downloadUrl || null,
   };
 }
@@ -1071,11 +1073,27 @@ async function writePackageMetadata(manifestPath, metadata) {
 function isPackageManifestPath(filePath) {
   return path.basename(String(filePath || '')).toLowerCase().endsWith(PACKAGE_METADATA_SUFFIX);
 }
+function packageRelativeFileFromEntry(entry) {
+  return String(typeof entry === 'string' ? entry : entry?.installRelativePath || entry?.path || entry?.fileName || '').trim();
+}
+
 function packageInstalledRelativeFiles(metadata = {}) {
   return (metadata.installedFiles || metadata.downloadFiles || [])
-    .map((entry) => String(entry.installRelativePath || entry.path || entry.fileName || '').trim())
+    .map(packageRelativeFileFromEntry)
     .filter(Boolean);
 }
+
+function packageRequiredRelativeFiles(metadata = {}) {
+  const requiredFiles = Array.isArray(metadata.requiredFiles) ? metadata.requiredFiles.map(packageRelativeFileFromEntry).filter(Boolean) : [];
+  if (requiredFiles.length) {
+    return requiredFiles;
+  }
+  return (metadata.installedFiles || metadata.downloadFiles || [])
+    .filter((entry) => typeof entry === 'string' || entry?.required !== false)
+    .map(packageRelativeFileFromEntry)
+    .filter(Boolean);
+}
+
 async function buildLocalPackageModel(tool, modelType, directory, manifestPath) {
   const metadata = await readPackageMetadata(manifestPath);
   if (!metadata) {
@@ -1083,26 +1101,44 @@ async function buildLocalPackageModel(tool, modelType, directory, manifestPath) 
   }
   const packageRoot = path.resolve(String(metadata.packageRootPath || path.dirname(manifestPath)).trim());
   const installedRelativeFiles = packageInstalledRelativeFiles(metadata);
+  const requiredRelativeFiles = packageRequiredRelativeFiles(metadata);
   const existingFiles = [];
+  const existingRequiredFiles = [];
+  const missingRequiredFiles = [];
   for (const relativeFile of installedRelativeFiles) {
     const candidate = path.join(packageRoot, normalizeRelativeInstallPath(relativeFile));
     if (await fs.pathExists(candidate)) {
       existingFiles.push(candidate);
     }
   }
-  if (!existingFiles.length) {
+  for (const relativeFile of requiredRelativeFiles) {
+    const candidate = path.join(packageRoot, normalizeRelativeInstallPath(relativeFile));
+    if (await fs.pathExists(candidate)) {
+      existingRequiredFiles.push(candidate);
+    } else {
+      missingRequiredFiles.push(relativeFile);
+    }
+  }
+  if (requiredRelativeFiles.length && !existingRequiredFiles.length) {
     return null;
   }
+  if (!requiredRelativeFiles.length && !existingFiles.length) {
+    return null;
+  }
+  const incomplete = missingRequiredFiles.length > 0;
   const sizeBytes = (await Promise.all(existingFiles.map((filePath) => fs.stat(filePath).catch(() => null))))
     .filter(Boolean)
     .reduce((total, stat) => total + Number(stat.size || 0), 0);
   const relativePath = path.relative(directory, packageRoot) || metadata.packageName || metadata.packageRoot || '';
   return {
     id: tool.id + ':' + modelType + ':package:' + normalizePathForId(metadata.packageIdentity || relativePath || metadata.packageName),
-    downloaded: true,
+    damaged: incomplete,
+    downloaded: !incomplete,
     downloadIdentity: metadata.downloadIdentity,
     fileName: metadata.packageName || path.basename(packageRoot),
+    incomplete,
     metadata,
+    missingRequiredFiles,
     modelType: metadata.modelType || modelType,
     name: metadata.packageName || path.basename(packageRoot),
     packageIdentity: metadata.packageIdentity || null,
@@ -1116,6 +1152,8 @@ async function buildLocalPackageModel(tool, modelType, directory, manifestPath) 
     sourceCatalogRepositoryId: metadata.catalogRepositoryId || null,
     sourceCatalogModelId: metadata.catalogModelId || null,
     sourceName: metadata.source || 'local',
+    status: incomplete ? 'Damaged' : 'Installed',
+    statusMessage: incomplete ? 'This package is incomplete. Missing required file' + (missingRequiredFiles.length === 1 ? '' : 's') + ': ' + missingRequiredFiles.slice(0, 4).join(', ') + (missingRequiredFiles.length > 4 ? ', and more' : '') + '. Download it again or delete the damaged package before using it.' : null,
     toolId: tool.id,
   };
 }
@@ -2025,6 +2063,34 @@ function getKnownHuggingFaceFileSize(entry) {
   }
   return 0;
 }
+function normalizeTrustedSha256(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(normalized) ? normalized : '';
+}
+
+function getKnownHuggingFaceFileSha256(entry) {
+  const candidates = [
+    entry?.sha256,
+    entry?.hash,
+    entry?.lfs?.sha256,
+    entry?.lfs?.oid,
+    entry?.xet?.sha256,
+    entry?.xet?.hash,
+    entry?.blob?.sha256,
+    entry?.metadata?.sha256,
+  ];
+  for (const candidate of candidates) {
+    const sha256 = normalizeTrustedSha256(candidate);
+    if (sha256) {
+      return sha256;
+    }
+  }
+  return '';
+}
+
+function getKnownCivitaiFileSha256(file) {
+  return normalizeTrustedSha256(file?.hashes?.SHA256 || file?.hashes?.sha256 || file?.sha256 || file?.hash);
+}
 function normalizeHuggingFaceTreeEntry(entry) {
   const filePath = String(entry?.rfilename || entry?.path || '').trim();
   if (!filePath || String(entry?.type || 'file').toLowerCase() === 'directory') {
@@ -2193,6 +2259,7 @@ function collectHuggingFacePackageFiles(detail, selectedType, tool = null) {
     .map((entry) => ({
       ...entry,
       modelType: inferHuggingFaceType(detail, entry),
+      sha256: getKnownHuggingFaceFileSha256(entry),
       sizeBytes: getKnownHuggingFaceFileSize(entry),
     }));
   const plan = createModelDownloadPlan({ artifacts, catalogRepositoryId: detail.id, selectedType, source: 'huggingface', tool });
@@ -2218,6 +2285,7 @@ function collectHuggingFaceDownloadFiles(detail, selectedType, tool = null) {
     .map((entry) => ({
       ...entry,
       modelType: inferHuggingFaceType(detail, entry),
+      sha256: getKnownHuggingFaceFileSha256(entry),
       sizeBytes: getKnownHuggingFaceFileSize(entry),
     }));
   if (!tool) {
@@ -2706,6 +2774,7 @@ function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, 
       sourceArtifactPath: isPackagePlan ? (plan.packageRoot || detail.id) : file.rfilename,
       previewUrl,
       sizeBytes: Number(plan?.sizeBytes || file.sizeBytes || 0),
+      sha256: file.sha256 || null,
       source: 'huggingface',
       toolId: tool.id,
     }, plan || file.downloadPlan, getTargetDirectory(tool, plan?.modelType || file.modelType, { ...file, catalogRepositoryId: detail.id })),
@@ -2765,6 +2834,7 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
       name: fileName,
       previewUrl,
       sizeBytes: Number(file.sizeBytes || 0),
+      sha256: file.sha256 || null,
       source: 'huggingface',
       sourceArtifactPath: file.rfilename,
       toolId: tool.id,
@@ -2894,6 +2964,7 @@ function collectCivitaiVersionFiles(model, selectedType, tool = null) {
         name: String(file.name || '').trim(),
         normalizedType: resolveCivitaiVersionFileType(model, file),
         rfilename: String(file.name || '').trim(),
+        sha256: getKnownCivitaiFileSha256(file),
         sizeBytes: Number(file.sizeBytes || 0) || toFileSizeBytes(Number(file.sizeKB || 0)),
       },
       version,
@@ -2989,6 +3060,7 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
       name: model.name,
       previewUrl: previewImage?.url || null,
       sizeBytes: entry.file.sizeBytes,
+      sha256: entry.file.sha256 || null,
       source: 'civitai',
       sourceArtifactPath: fileName,
       sourceFileId: entry.file.id ? String(entry.file.id) : null,
@@ -3037,6 +3109,7 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
       name: fileName,
       previewUrl: previewImage?.url || null,
       sizeBytes: entry.file.sizeBytes,
+      sha256: entry.file.sha256 || null,
       source: 'civitai',
       sourceArtifactPath: fileName,
       sourceFileId: entry.file.id ? String(entry.file.id) : null,
@@ -3863,6 +3936,7 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
           name: entry.name || detail.id,
           previewUrl: await resolveHuggingFacePreview(detail, logger),
           sizeBytes: Number(file.sizeBytes || 0),
+          sha256: file.sha256 || null,
           source: 'tabby',
           sourceArtifactPath: file.rfilename,
           toolId: tool.id,
@@ -3888,6 +3962,15 @@ function emitProgress(onProgress, payload) {
     onProgress(payload);
   }
 }
+function normalizeExpectedByteCount(value) {
+  const bytes = Number(value || 0);
+  return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes) : 0;
+}
+
+function buildDownloadIntegrityError(displayName, detail) {
+  return `${displayName || 'That model'} could not be installed because the downloaded file failed an integrity check. ${detail}`;
+}
+
 async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) {
   const safeDownloadUrl = assertSecureRemoteUrl(downloadUrl, 'model download URL');
   const response = await fetch(safeDownloadUrl, {
@@ -3901,9 +3984,15 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
   await fs.remove(tempPath).catch(() => null);
   const fileHandle = await open(tempPath, 'w');
   const reader = response.body.getReader();
-  const reportedBytes = Number(response.headers.get('content-length')) || 0;
-  const totalBytes = Number(options.expectedBytes || reportedBytes || 0);
+  const reportedBytes = normalizeExpectedByteCount(response.headers.get('content-length'));
+  const providerExpectedBytes = normalizeExpectedByteCount(options.expectedBytes);
+  const expectedBytes = providerExpectedBytes || reportedBytes;
+  const expectedBytesSource = providerExpectedBytes ? 'provider metadata' : reportedBytes ? 'server Content-Length' : '';
+  const expectedSha256 = normalizeTrustedSha256(options.expectedSha256 || options.sha256);
+  const hash = expectedSha256 ? crypto.createHash('sha256') : null;
+  const displayName = options.displayName || options.downloadName || path.basename(destinationPath);
   let downloadedBytes = 0;
+  let moved = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -3912,55 +4001,160 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
       }
       const chunk = Buffer.from(value);
       downloadedBytes += chunk.length;
+      if (expectedBytes > 0 && downloadedBytes > expectedBytes) {
+        throw new Error(buildDownloadIntegrityError(displayName, `Expected ${formatBytes(expectedBytes)} from ${expectedBytesSource}, but received more data than expected. The partial file was not installed.`));
+      }
+      if (hash) {
+        hash.update(chunk);
+      }
       await fileHandle.write(chunk, 0, chunk.length);
       emitProgress(options.onProgress, {
         downloadId: options.downloadId,
         message: options.progressMessage,
-        percent: totalBytes > 0 ? Math.min(99, Math.round((downloadedBytes / totalBytes) * 100)) : null,
+        percent: expectedBytes > 0 ? Math.min(99, Math.round((downloadedBytes / expectedBytes) * 100)) : null,
         receivedBytes: downloadedBytes,
-        totalBytes,
+        totalBytes: expectedBytes,
       });
     }
+    await fileHandle.close().catch(() => null);
+    if (expectedBytes > 0 && downloadedBytes !== expectedBytes) {
+      throw new Error(buildDownloadIntegrityError(displayName, `Expected ${formatBytes(expectedBytes)} from ${expectedBytesSource}, but received ${formatBytes(downloadedBytes)}. The partial file was not installed.`));
+    }
+    const actualSha256 = hash ? hash.digest('hex') : '';
+    if (expectedSha256 && actualSha256 !== expectedSha256) {
+      throw new Error(buildDownloadIntegrityError(displayName, 'The SHA-256 checksum did not match the provider metadata. The partial file was not installed.'));
+    }
+    await fs.move(tempPath, destinationPath, { overwrite: true });
+    moved = true;
+    return {
+      downloadedBytes,
+      expectedBytes,
+      expectedBytesSource,
+      hashVerified: Boolean(expectedSha256),
+      sizeVerified: expectedBytes > 0,
+      totalBytes: expectedBytes,
+      destinationPath,
+    };
+  } catch (error) {
+    throw error;
   } finally {
     await fileHandle.close().catch(() => null);
+    if (!moved) {
+      await fs.remove(tempPath).catch(() => null);
+    }
   }
-  await fs.move(tempPath, destinationPath, { overwrite: true });
-  return {
-    downloadedBytes,
-    totalBytes,
-    destinationPath,
-  };
 }
 function assertRunnableDownloadPlan(payload = {}) {
   if (payload?.downloadPlan && payload.downloadPlan.runnable === false) {
     throw new Error(payload.downloadPlan.blockingReason || 'That catalog item is not compatible with the selected tool.');
   }
 }
-async function getModelDownloadPreflight(tool, payload = {}) {
-  assertRunnableDownloadPlan(payload);
+function getDownloadSizeBytes(payload = {}) {
+  return Number(payload.sizeBytes || payload.downloadPlan?.sizeBytes || 0) || 0;
+}
+
+function buildModelDownloadPreflightRequirements(tool, payload = {}, options = {}) {
+  const sizeBytes = getDownloadSizeBytes(payload);
+  if (isInvokeAiApiImportPayload(tool, payload)) {
+    const stagePath = options.stagePath || getInvokeAiImportStagePath(tool, payload);
+    const { targetDirectory } = resolveModelDestination(tool, payload);
+    return [
+      {
+        kind: 'invokeai-staging',
+        label: 'InvokeAI temporary staging folder',
+        path: path.dirname(stagePath),
+        requiredBytes: sizeBytes,
+      },
+      {
+        kind: 'invokeai-final',
+        label: 'InvokeAI final model folder',
+        path: targetDirectory,
+        requiredBytes: sizeBytes,
+      },
+    ];
+  }
+  if (isPackageDownloadPayload(payload)) {
+    const destination = resolvePackageDestination(tool, payload);
+    return [{ kind: 'package-target', label: 'model package folder', path: destination.targetDirectory, requiredBytes: sizeBytes }];
+  }
   const { targetDirectory } = resolveModelDestination(tool, payload);
-  const sizeBytes = Number(payload.sizeBytes || 0);
-  const { disk } = await getDiskSnapshotForPath(targetDirectory);
+  return [{ kind: 'model-target', label: 'model folder', path: targetDirectory, requiredBytes: sizeBytes }];
+}
+
+async function buildModelDownloadPreflight(tool, payload = {}, options = {}) {
+  assertRunnableDownloadPlan(payload);
+  const requirements = buildModelDownloadPreflightRequirements(tool, payload, options);
+  const disks = Array.isArray(options.disks) ? options.disks : await detectStorageSnapshot();
+  const grouped = new Map();
+  for (const requirement of requirements) {
+    const disk = findDiskForPath(disks, requirement.path);
+    const key = disk?.mount ? 'disk:' + disk.mount.toLowerCase() : 'path:' + path.resolve(requirement.path || '');
+    const existing = grouped.get(key) || {
+      disk,
+      kinds: [],
+      labels: [],
+      paths: [],
+      requiredBytes: 0,
+    };
+    existing.kinds.push(requirement.kind);
+    existing.labels.push(requirement.label);
+    existing.paths.push(requirement.path);
+    existing.requiredBytes += Number(requirement.requiredBytes || 0) || 0;
+    grouped.set(key, existing);
+  }
+  const checks = [...grouped.values()].map((group) => {
+    const uniqueLabels = [...new Set(group.labels.filter(Boolean))];
+    const uniquePaths = [...new Set(group.paths.filter(Boolean))];
+    const assessment = assessDiskSpace(group.disk, group.requiredBytes);
+    return {
+      ...assessment,
+      disk: group.disk || null,
+      kinds: group.kinds,
+      label: uniqueLabels.join(' and ') || 'download folder',
+      path: uniquePaths.join(' and '),
+      paths: uniquePaths,
+      requiredBytes: group.requiredBytes,
+    };
+  });
+  const primary = checks.find((check) => check.blocked) || checks.find((check) => check.requiresConfirmation) || checks[0] || assessDiskSpace(null, getDownloadSizeBytes(payload));
   return {
-    ...assessDiskSpace(disk, sizeBytes),
-    disk,
+    ...primary,
+    checks,
+    disk: primary.disk || null,
     modelName: String(payload.name || payload.fileName || 'This download').trim() || 'This download',
-    sizeKnown: Number.isFinite(sizeBytes) && sizeBytes > 0,
-    targetDirectory,
+    sizeKnown: requirements.some((requirement) => Number(requirement.requiredBytes || 0) > 0),
+    targetDirectory: requirements[0]?.path || '',
     toolId: tool.id,
     toolName: tool.name,
   };
 }
+
+async function getModelDownloadPreflight(tool, payload = {}) {
+  return buildModelDownloadPreflight(tool, payload);
+}
+function getPrimaryDiskCheck(preflight, fieldName) {
+  return (preflight.checks || []).find((check) => check[fieldName]) || preflight;
+}
+
+function formatDiskCheckLocation(check = {}) {
+  const label = check.label || 'download folder';
+  const pathText = check.path ? ` at ${check.path}` : '';
+  const mountText = check.mount ? ` on ${check.mount}` : '';
+  return `${label}${pathText}${mountText}`;
+}
+
 function buildDiskBlockedMessage(preflight) {
   const subject = preflight.modelName || 'This download';
-  return `${subject} needs ${formatBytes(preflight.requiredBytes)}, but only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}. Clear space and try again.`;
+  const check = getPrimaryDiskCheck(preflight, 'blocked');
+  return `${subject} needs ${formatBytes(check.requiredBytes)}, but only ${formatBytes(check.availableBytes)} is free for ${formatDiskCheckLocation(check)}. Clear space and try again.`;
 }
 function buildDiskConfirmationMessage(preflight) {
   const subject = preflight.modelName || 'This download';
+  const check = getPrimaryDiskCheck(preflight, 'requiresConfirmation');
   if (preflight.sizeKnown) {
-    return `${subject} needs about ${formatBytes(preflight.requiredBytes)}. Only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}, so this would leave less than 10% free. Confirm the download to continue.`;
+    return `${subject} needs about ${formatBytes(check.requiredBytes)}. Only ${formatBytes(check.availableBytes)} is free for ${formatDiskCheckLocation(check)}, so this would leave less than 10% free. Confirm the download to continue.`;
   }
-  return `Local AI Hub could not confirm the file size for ${subject}. ${preflight.mount} is already below 10% free space, so confirm the download before continuing.`;
+  return `Local AI Hub could not confirm the file size for ${subject}. ${formatDiskCheckLocation(check)} is already below 10% free space, so confirm the download before continuing.`;
 }
 async function ensureDiskHasCapacity(tool, payload) {
   const preflight = await getModelDownloadPreflight(tool, payload);
@@ -4056,7 +4250,9 @@ async function downloadOptionalCompanionFiles(tool, payload, headers, logger, op
       });
       await streamDownloadToFile(companionUrl, destination.destinationPath, {
         downloadId: payload.id,
+        displayName: companionPayload.fileName,
         expectedBytes: companionPayload.sizeBytes,
+        expectedSha256: companionPayload.sha256,
         headers,
         errorMessage: companionPayload.fileName + ' could not be downloaded right now.',
         onProgress: options.onProgress,
@@ -4113,6 +4309,7 @@ function normalizePackageDownloadFiles(plan = {}) {
     installRelativePath: normalizeRelativeInstallPath(file.installRelativePath || file.path || file.fileName || ''),
     path: String(file.path || file.sourceArtifactPath || '').trim(),
     required: file.required !== false,
+    sha256: normalizeTrustedSha256(file.sha256 || file.expectedSha256),
     sizeBytes: Number(file.sizeBytes || 0) || 0,
   })).filter((file) => file.path && file.installRelativePath && file.fileName);
 }
@@ -4162,7 +4359,7 @@ async function downloadPackageModel(tool, payload, options = {}) {
       };
     }
   }
-  await ensureDiskHasCapacity(tool, { ...payload, sizeBytes: Number(payload.downloadPlan?.sizeBytes || payload.sizeBytes || 0) });
+  await ensureDiskHasCapacity(tool, { ...payload, sizeBytes: getDownloadSizeBytes(payload) });
   const settings = await readModelSettingsInternal();
   const headers = payload.source === 'civitai' ? buildCivitaiHeaders(settings) : { 'User-Agent': APP_USER_AGENT };
   const tempRoot = path.join(destination.targetDirectory, '.localaihub-download-' + Date.now() + '-' + Math.random().toString(16).slice(2));
@@ -4183,7 +4380,9 @@ async function downloadPackageModel(tool, payload, options = {}) {
       });
       const result = await streamDownloadToFile(downloadUrl, tempDestination, {
         downloadId: payload.id,
+        displayName: file.fileName,
         expectedBytes: file.sizeBytes,
+        expectedSha256: file.sha256,
         headers,
         errorMessage: file.fileName + ' could not be downloaded right now.',
         onProgress: null,
@@ -4268,7 +4467,9 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
     });
     const result = await streamDownloadToFile(downloadUrl, stagePath, {
       downloadId: payload.id,
+      displayName: payload.name || payload.fileName,
       expectedBytes: payload.sizeBytes,
+      expectedSha256: payload.sha256 || payload.expectedSha256,
       headers,
       errorMessage: (payload.name || payload.fileName || 'That model') + ' could not be downloaded for InvokeAI right now.',
       onProgress: options.onProgress,
@@ -4385,7 +4586,9 @@ async function downloadRemoteModel(tool, payload, options = {}) {
       });
       const result = await streamDownloadToFile(downloadUrl, destinationPath, {
         downloadId: payload.id,
+        displayName: payload.name || payload.fileName,
         expectedBytes: payload.sizeBytes,
+        expectedSha256: payload.sha256 || payload.expectedSha256,
         headers,
         errorMessage: `${payload.name} could not be downloaded right now.`,
         onProgress: options.onProgress,
@@ -4797,6 +5000,7 @@ module.exports = {
   saveModelManagerSettings,
   supportsModelManager,
   _test: {
+    buildDiskBlockedMessage,
     buildDownloadedLookup,
     buildDownloadMetadata,
     buildHuggingFaceRepositoryResult,
@@ -4813,13 +5017,16 @@ module.exports = {
     matchesSearchQuery,
     resolveHuggingFaceDownloadFile,
     searchHuggingFaceModels,
+    streamDownloadToFile,
     buildInvokeAiInstallErrorMessage,
     buildInvokeAiModelImportConfig,
     buildInvokeAiModelInstallRequest,
+    buildModelDownloadPreflight,
     isInvokeAiApiImportPayload,
     normalizeInvokeAiModelType,
     resolveInvokeAiModelPath,
     readOllamaPullStream,
+    readPackageMetadata,
     resolveModelDestination,
     resolveRvcCompanionDestination,
     writeModelMetadata,

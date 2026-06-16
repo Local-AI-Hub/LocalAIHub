@@ -60,6 +60,7 @@ function packageArtifactEntry(artifact, required = true, installRelativePath = n
     installRelativePath: String(installRelativePath || sourcePath || fileName).replace(/\\+/g, '/'),
     path: sourcePath,
     required: Boolean(required),
+    sha256: String(artifact?.sha256 || artifact?.expectedSha256 || '').trim(),
     sizeBytes: Number((artifact && artifact.sizeBytes) || 0),
   };
 }
@@ -487,6 +488,22 @@ function inferRvcArtifact(artifact) {
   return { artifactKind: 'rvc-voice-model', artifactLabel: 'RVC voice model', modelType: 'RVC Voice Model', score };
 }
 
+function hasExplicitUpscalerContext(artifact) {
+  const explicitType = String(artifact?.modelType || artifact?.type || artifact?.parentModelType || artifact?.category || '').trim();
+  if (explicitType && normalizeModelType(explicitType) === 'Upscaler') {
+    return true;
+  }
+  const context = [
+    artifactPath(artifact),
+    artifactName(artifact),
+    artifact?.source,
+    artifact?.category,
+    artifact?.baseModel,
+    artifact?.parentModelType,
+    ...(Array.isArray(artifact?.tags) ? artifact.tags : []),
+  ].filter(Boolean).join(' ').toLowerCase();
+  return /(?:^|[\s_./-])(?:upscaler|upscale[_-]?models?|realesrgan|real-esrgan|esrgan|swinir|ultrasharp)(?:$|[\s_./-])/i.test(context);
+}
 function inferImageArtifact(artifact) {
   const relativePath = artifactPath(artifact);
   const fileName = artifactName(artifact);
@@ -503,10 +520,14 @@ function inferImageArtifact(artifact) {
   if (combined.includes('embedding') || combined.includes('textual inversion')) return { artifactKind: 'embedding', artifactLabel: 'Embedding', modelType: 'Embedding' };
   if (combined.includes('hypernetwork')) return { artifactKind: 'hypernetwork', artifactLabel: 'Hypernetwork', modelType: 'Hypernetwork' };
   if (combined.includes('vae')) return { artifactKind: 'vae', artifactLabel: 'VAE', modelType: 'VAE' };
-  if (combined.includes('upscaler') || combined.includes('realesrgan') || combined.includes('esrgan')) return { artifactKind: 'upscaler', artifactLabel: 'Upscaler', modelType: 'Upscaler' };
+  const isPytorchWeight = extension === '.pt' || extension === '.pth';
+  const explicitType = String(artifact?.modelType || artifact?.type || artifact?.parentModelType || '').trim();
+  const explicitModelType = explicitType ? normalizeModelType(explicitType) : null;
+  if ((!isPytorchWeight && (combined.includes('upscaler') || combined.includes('realesrgan') || combined.includes('esrgan'))) || (isPytorchWeight && hasExplicitUpscalerContext(artifact))) return { artifactKind: 'upscaler', artifactLabel: 'Upscaler', modelType: 'Upscaler' };
   if (combined.includes('inpaint')) return { artifactKind: 'inpainting', artifactLabel: 'Inpainting', modelType: 'Inpainting' };
   if (extension === '.safetensors' || extension === '.ckpt') return { artifactKind: 'checkpoint', artifactLabel: 'Checkpoint', modelType: 'Checkpoint' };
-  if (extension === '.pt' || extension === '.pth') return { artifactKind: 'upscaler', artifactLabel: 'Upscaler', modelType: 'Upscaler' };
+  if (isPytorchWeight && explicitModelType === 'Checkpoint') return { artifactKind: 'checkpoint', artifactLabel: 'Checkpoint', modelType: 'Checkpoint' };
+  if (isPytorchWeight) return { rejected: true, artifactKind: 'generic-pytorch-weight', artifactLabel: 'Generic PyTorch weight', modelType: 'PyTorch weight', reason: (fileName || 'This .pt/.pth file') + ' is not clearly labeled as a supported image model type. Local AI Hub will not install arbitrary PyTorch weight files as upscalers.' };
   return { rejected: true, artifactKind: 'unsupported', artifactLabel: 'Unsupported', modelType: normalizeModelType(fileName), reason: (fileName || 'This file') + ' is not a recognized runnable image-generation model artifact for this target.' };
 }
 

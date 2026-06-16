@@ -228,7 +228,7 @@ async function main() {
     source: 'huggingface',
     selectedType: 'audio-speech',
     catalogRepositoryId: 'facebook/musicgen-medium',
-    artifacts: [artifact('config.json', 1024), artifact('state_dict.bin', 2_000_000_000), artifact('compression_state_dict.bin', 100_000_000), artifact('README.md', 1024)],
+    artifacts: [artifact('config.json', 2), artifact('state_dict.bin', 5), artifact('compression_state_dict.bin', 11), artifact('README.md', 1024)],
   });
   assert.strictEqual(audiocraftPlan.runnable, true, 'Complete known AudioCraft snapshots should be package-runnable.');
   assert.strictEqual(audiocraftPlan.planType, 'package', 'AudioCraft should use a package download plan.');
@@ -240,7 +240,7 @@ async function main() {
     source: 'huggingface',
     selectedType: 'audio-speech',
     catalogRepositoryId: 'facebook/audiogen-medium',
-    artifacts: [artifact('state_dict.bin', 2_000_000_000), artifact('compression_state_dict.bin', 100_000_000), artifact('README.md', 1024)],
+    artifacts: [artifact('state_dict.bin', 5), artifact('compression_state_dict.bin', 11), artifact('README.md', 1024)],
   });
   assert.strictEqual(audioGenPlan.runnable, true, 'AudioGen snapshots should be accepted when their runtime-required state/compression files are present even without config.json.');
   assert.strictEqual(audioGenPlan.downloadFiles.length, 2, 'AudioGen should download only the runtime-required snapshot files.');
@@ -250,7 +250,7 @@ async function main() {
     source: 'huggingface',
     selectedType: 'audio-speech',
     catalogRepositoryId: 'facebook/musicgen-medium',
-    artifacts: [artifact('config.json', 1024), artifact('state_dict.bin', 2_000_000_000)],
+    artifacts: [artifact('config.json', 2), artifact('state_dict.bin', 5)],
   });
   assert.strictEqual(incompleteAudiocraftPlan.runnable, false, 'Incomplete AudioCraft snapshots must be blocked.');
   assert(/missing required files/i.test(incompleteAudiocraftPlan.blockingReason), 'Incomplete AudioCraft snapshots should explain missing required files.');
@@ -261,11 +261,11 @@ async function main() {
     selectedType: 'video',
     catalogRepositoryId: 'Wan-AI/Wan2.1-I2V-14B-480P',
     artifacts: [
-      artifact('diffusion_pytorch_model-00001-of-00002.safetensors', 10_000),
-      artifact('diffusion_pytorch_model-00002-of-00002.safetensors', 10_000),
-      artifact('models_t5_umt5-xxl-enc-bf16.pth', 10_000),
-      artifact('Wan2.1_VAE.pth', 10_000),
-      artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 1_000_000_000),
+      artifact('diffusion_pytorch_model-00001-of-00002.safetensors', 12),
+      artifact('diffusion_pytorch_model-00002-of-00002.safetensors', 12),
+      artifact('models_t5_umt5-xxl-enc-bf16.pth', 12),
+      artifact('Wan2.1_VAE.pth', 12),
+      artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 12),
     ],
   });
   assert.strictEqual(wanPlan.runnable, true, 'Complete Wan model folders should be package-runnable.');
@@ -277,7 +277,7 @@ async function main() {
     source: 'huggingface',
     selectedType: 'video',
     catalogRepositoryId: 'Wan-AI/Wan2.1-I2V-14B-480P',
-    artifacts: [artifact('diffusion_pytorch_model.safetensors', 1_000_000_000), artifact('models_t5_umt5-xxl-enc-bf16.pth', 10_000), artifact('Wan2.1_VAE.pth', 10_000)],
+    artifacts: [artifact('diffusion_pytorch_model.safetensors', 12), artifact('models_t5_umt5-xxl-enc-bf16.pth', 12), artifact('Wan2.1_VAE.pth', 12)],
   });
   assert.strictEqual(incompleteWanPlan.runnable, false, 'Wan image-to-video packages missing CLIP must be blocked.');
 
@@ -286,7 +286,7 @@ async function main() {
     source: 'huggingface',
     selectedType: 'upscaler',
     catalogRepositoryId: 'custom/upscayl-models',
-    artifacts: [artifact('ultrasharp.param', 100_000), artifact('ultrasharp.bin', 50_000_000), artifact('preview.png', 20_000)],
+    artifacts: [artifact('ultrasharp.param', 12), artifact('ultrasharp.bin', 12), artifact('preview.png', 20_000)],
   });
   assert.strictEqual(upscaylPlan.runnable, true, 'Upscayl paired .param/.bin sets should be package-runnable.');
   assert.strictEqual(upscaylPlan.packageTargetMode, 'flat', 'Upscayl model sets should install into the discovered models folder, not a nested runtime-invisible folder.');
@@ -297,22 +297,22 @@ async function main() {
     source: 'huggingface',
     selectedType: 'upscaler',
     catalogRepositoryId: 'custom/upscayl-models',
-    artifacts: [artifact('ultrasharp.param', 100_000)],
+    artifacts: [artifact('ultrasharp.param', 12)],
   });
   assert.strictEqual(paramOnlyUpscaylPlan.runnable, false, 'Upscayl .param-only assets must be blocked.');
   assert(/matching \.param and \.bin/i.test(paramOnlyUpscaylPlan.blockingReason), 'Upscayl pair blocking should explain the required paired files.');
 
   const packageSearchDetails = new Map([
-    ['facebook/musicgen-small', { author: 'facebook', id: 'facebook/musicgen-small', pipeline_tag: 'text-to-audio', siblings: [artifact('config.json', 1024), artifact('state_dict.bin', 10_000), artifact('compression_state_dict.bin', 1_000)], tags: ['musicgen'] }],
-    ['facebook/musicgen-medium', { author: 'facebook', id: 'facebook/musicgen-medium', pipeline_tag: 'text-to-audio', siblings: [artifact('config.json', 1024), artifact('state_dict.bin', 10_000), artifact('compression_state_dict.bin', 1_000)], tags: ['musicgen'] }],
-    ['facebook/musicgen-large', { author: 'facebook', id: 'facebook/musicgen-large', pipeline_tag: 'text-to-audio', siblings: [artifact('config.json', 1024), artifact('state_dict.bin', 10_000), artifact('compression_state_dict.bin', 1_000)], tags: ['musicgen'] }],
-    ['facebook/musicgen-melody', { author: 'facebook', id: 'facebook/musicgen-melody', pipeline_tag: 'text-to-audio', siblings: [artifact('config.json', 1024), artifact('state_dict.bin', 10_000), artifact('compression_state_dict.bin', 1_000), artifact('tokenizer.model', 500)], tags: ['musicgen'] }],
-    ['facebook/audiogen-medium', { author: 'facebook', id: 'facebook/audiogen-medium', pipeline_tag: 'text-to-audio', siblings: [artifact('state_dict.bin', 10_000), artifact('compression_state_dict.bin', 1_000)], tags: ['audiogen'] }],
-    ['Wan-AI/Wan2.1-T2V-1.3B', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-T2V-1.3B', pipeline_tag: 'text-to-video', siblings: [artifact('diffusion_pytorch_model.safetensors', 10_000), artifact('models_t5_umt5-xxl-enc-bf16.pth', 1_000), artifact('Wan2.1_VAE.pth', 1_000)], tags: ['wan2.1'] }],
-    ['Wan-AI/Wan2.1-T2V-14B', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-T2V-14B', pipeline_tag: 'text-to-video', siblings: [artifact('diffusion_pytorch_model-00001-of-00002.safetensors', 10_000), artifact('diffusion_pytorch_model-00002-of-00002.safetensors', 10_000), artifact('models_t5_umt5-xxl-enc-bf16.pth', 1_000), artifact('Wan2.1_VAE.pth', 1_000)], tags: ['wan2.1'] }],
-    ['Wan-AI/Wan2.1-I2V-14B-480P', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-I2V-14B-480P', pipeline_tag: 'image-to-video', siblings: [artifact('diffusion_pytorch_model.safetensors', 10_000), artifact('models_t5_umt5-xxl-enc-bf16.pth', 1_000), artifact('Wan2.1_VAE.pth', 1_000), artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 1_000)], tags: ['wan2.1'] }],
-    ['Wan-AI/Wan2.1-I2V-14B-720P', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-I2V-14B-720P', pipeline_tag: 'image-to-video', siblings: [artifact('diffusion_pytorch_model.safetensors', 10_000), artifact('models_t5_umt5-xxl-enc-bf16.pth', 1_000), artifact('Wan2.1_VAE.pth', 1_000), artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 1_000)], tags: ['wan2.1'] }],
-    ['custom/upscayl-models', { author: 'custom', id: 'custom/upscayl-models', pipeline_tag: 'image-to-image', siblings: [artifact('ultrasharp.param', 100_000), artifact('ultrasharp.bin', 50_000_000), artifact('preview.png', 20_000)], tags: ['upscayl'] }],
+    ['facebook/musicgen-small', { author: 'facebook', id: 'facebook/musicgen-small', pipeline_tag: 'text-to-audio', siblings: [artifact('config.json', 2), artifact('state_dict.bin', 5), artifact('compression_state_dict.bin', 11)], tags: ['musicgen'] }],
+    ['facebook/musicgen-medium', { author: 'facebook', id: 'facebook/musicgen-medium', pipeline_tag: 'text-to-audio', siblings: [artifact('config.json', 2), artifact('state_dict.bin', 5), artifact('compression_state_dict.bin', 11)], tags: ['musicgen'] }],
+    ['facebook/musicgen-large', { author: 'facebook', id: 'facebook/musicgen-large', pipeline_tag: 'text-to-audio', siblings: [artifact('config.json', 2), artifact('state_dict.bin', 5), artifact('compression_state_dict.bin', 11)], tags: ['musicgen'] }],
+    ['facebook/musicgen-melody', { author: 'facebook', id: 'facebook/musicgen-melody', pipeline_tag: 'text-to-audio', siblings: [artifact('config.json', 2), artifact('state_dict.bin', 5), artifact('compression_state_dict.bin', 11), artifact('tokenizer.model', 500)], tags: ['musicgen'] }],
+    ['facebook/audiogen-medium', { author: 'facebook', id: 'facebook/audiogen-medium', pipeline_tag: 'text-to-audio', siblings: [artifact('state_dict.bin', 5), artifact('compression_state_dict.bin', 11)], tags: ['audiogen'] }],
+    ['Wan-AI/Wan2.1-T2V-1.3B', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-T2V-1.3B', pipeline_tag: 'text-to-video', siblings: [artifact('diffusion_pytorch_model.safetensors', 12), artifact('models_t5_umt5-xxl-enc-bf16.pth', 12), artifact('Wan2.1_VAE.pth', 12)], tags: ['wan2.1'] }],
+    ['Wan-AI/Wan2.1-T2V-14B', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-T2V-14B', pipeline_tag: 'text-to-video', siblings: [artifact('diffusion_pytorch_model-00001-of-00002.safetensors', 12), artifact('diffusion_pytorch_model-00002-of-00002.safetensors', 12), artifact('models_t5_umt5-xxl-enc-bf16.pth', 12), artifact('Wan2.1_VAE.pth', 12)], tags: ['wan2.1'] }],
+    ['Wan-AI/Wan2.1-I2V-14B-480P', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-I2V-14B-480P', pipeline_tag: 'image-to-video', siblings: [artifact('diffusion_pytorch_model.safetensors', 12), artifact('models_t5_umt5-xxl-enc-bf16.pth', 12), artifact('Wan2.1_VAE.pth', 12), artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 12)], tags: ['wan2.1'] }],
+    ['Wan-AI/Wan2.1-I2V-14B-720P', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-I2V-14B-720P', pipeline_tag: 'image-to-video', siblings: [artifact('diffusion_pytorch_model.safetensors', 12), artifact('models_t5_umt5-xxl-enc-bf16.pth', 12), artifact('Wan2.1_VAE.pth', 12), artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 12)], tags: ['wan2.1'] }],
+    ['custom/upscayl-models', { author: 'custom', id: 'custom/upscayl-models', pipeline_tag: 'image-to-image', siblings: [artifact('ultrasharp.param', 12), artifact('ultrasharp.bin', 12), artifact('preview.png', 20_000)], tags: ['upscayl'] }],
   ]);
   const originalPackageSearchFetch = global.fetch;
   global.fetch = async (url) => {
@@ -506,7 +506,7 @@ async function main() {
     selectedType: 'rvc-voice',
     artifacts: [
       artifact('weights/Alice.pth', 80_000_000, { modelType: 'RVC Voice Model' }),
-      artifact('logs/Alice/added_IVF.index', 4_000_000, { modelType: 'RVC Voice Model' }),
+      artifact('logs/Alice/added_IVF.index', 11, { modelType: 'RVC Voice Model' }),
       artifact('samples/alice-preview.wav', 2_000_000, { modelType: 'RVC Voice Model' }),
       artifact('config.json', 2048, { modelType: 'RVC Voice Model' }),
       artifact('pytorch_model.pth', 1_000_000_000, { modelType: 'Checkpoint' }),
@@ -543,7 +543,7 @@ async function main() {
     tool: rvc,
     source: 'huggingface',
     selectedType: 'rvc-voice',
-    artifacts: [artifact('logs/Alice/added_IVF.index', 4_000_000, { modelType: 'RVC Voice Model' })],
+    artifacts: [artifact('logs/Alice/added_IVF.index', 11, { modelType: 'RVC Voice Model' })],
   });
   assert.strictEqual(rvcIndexOnlyPlan.runnable, false, 'RVC index-only repositories must stay blocked.');
   assert(/optional companions/i.test(rvcIndexOnlyPlan.blockingReason), 'RVC index-only plans should explain that an index is not a primary weight.');
@@ -562,7 +562,7 @@ async function main() {
     source: 'huggingface',
     selectedType: 'rvc-voice',
     artifacts: [
-      artifact('Alice.pth', 80_000_000, { modelType: 'RVC Voice Model' }),
+      artifact('Alice.pth', 12, { modelType: 'RVC Voice Model' }),
       artifact('logs/first/added_IVF.index', 4_000_000, { modelType: 'RVC Voice Model' }),
       artifact('logs/second/added_IVF.index', 4_000_000, { modelType: 'RVC Voice Model' }),
     ],
@@ -768,7 +768,7 @@ async function main() {
   global.fetch = async (url) => {
     const urlText = String(url);
     const fileName = path.basename(new URL(urlText).pathname);
-    return new Response(Buffer.from(fileName || 'package-file'), { status: 200, headers: { 'content-length': '12' } });
+    return new Response(Buffer.from('package-file'), { status: 200, headers: { 'content-length': '12' } });
   };
   try {
     await fs.remove(wanRoot);
@@ -934,8 +934,8 @@ async function main() {
       id: 'voice-maker/alice-rvc-voice-model',
       pipeline_tag: 'audio-to-audio',
       siblings: [
-        artifact('Alice.pth', 80_000_000),
-        artifact('logs/Alice/added_IVF.index', 4_000_000),
+        artifact('Alice.pth', 12),
+        artifact('logs/Alice/added_IVF.index', 11),
         artifact('samples/preview.wav', 2_000_000),
       ],
       tags: ['rvc', 'voice-conversion'],

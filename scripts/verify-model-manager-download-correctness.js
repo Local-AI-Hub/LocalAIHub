@@ -87,7 +87,7 @@ async function verifyDownloadExecutionLocking() {
     let fetchCount = 0;
     global.fetch = async () => {
       fetchCount += 1;
-      return responseFromChunks(['mo', 'del'], 20, { 'content-length': '4' });
+      return responseFromChunks(['da', 'ta'], 20, { 'content-length': '4' });
     };
 
     const first = modelService.downloadModel(tool, payload);
@@ -111,7 +111,7 @@ async function verifyDownloadExecutionLocking() {
     const failurePayload = remotePayload('failure-model', 'failure-model.safetensors');
     global.fetch = async () => new Response('temporary outage', { status: 503 });
     await expectRejectsWith(modelService.downloadModel(tool, failurePayload), /could not be downloaded|Download failed/i, 'A failed download');
-    global.fetch = async () => responseFromChunks(['ok'], 0, { 'content-length': '2' });
+    global.fetch = async () => responseFromChunks(['good'], 0, { 'content-length': '4' });
     const retryResult = await modelService.downloadModel(tool, failurePayload);
     assert.strictEqual(retryResult.alreadyPresent, false, 'The lock should release after a failed download.');
 
