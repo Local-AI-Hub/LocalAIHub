@@ -111,6 +111,13 @@ function StoreCard({ manifest, compatibility, progress, busy, busyMap, installed
               <p className="mt-1 line-clamp-3 leading-5" title={compatibility.message}>{compatibility.message}</p>
             </div>
           </div>
+          {manifest.setupNotes?.length ? (
+            <ul className="mt-3 grid gap-1 text-xs leading-5 text-slate-300">
+              {manifest.setupNotes.map((note) => (
+                <li key={note}>- {note}</li>
+              ))}
+            </ul>
+          ) : null}
         </details>
 
         {progress ? (

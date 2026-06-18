@@ -28,6 +28,7 @@ const {
 } = require('./windowsUninstallService');
 const { assertPathInside, assertSecureRemoteUrl, findManagedToolsRootForPath, isPathInside, resolveManagedToolPaths } = require('./pathSafetyService');
 const { appendSupportGuidance, recordSupportEvent } = require('./supportEventService');
+const { HYPERFRAMES_TOOL_ID, getHyperFramesInstallPreflight, installManagedHyperFrames, repairManagedHyperFrames } = require('./hyperFramesService');
 
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const MIN_CACHE_BYTES = 1024;
@@ -343,6 +344,9 @@ async function getToolInstallPreflight(toolRequest) {
     : baseManifest;
 
   const installRoot = await resolvePreferredInstallRoot(payload.installRoot || null);
+  if (manifest.id === HYPERFRAMES_TOOL_ID || manifest.installInstructions?.kind === 'npm-package') {
+    return getHyperFramesInstallPreflight(manifest, { installRoot });
+  }
   const logger = createLogger('installer', {
     toolId,
     toolName: manifest.name,
@@ -4205,6 +4209,20 @@ async function installToolUnlocked(toolId, options = {}) {
       }, logger);
     }
 
+
+    if (manifest.id === HYPERFRAMES_TOOL_ID || manifest.installInstructions?.kind === 'npm-package') {
+      const toolState = await installManagedHyperFrames(manifest, {
+        ...options,
+        installRoot,
+      }, logger);
+      await upsertTool(toolState);
+      await logger.info('HyperFrames managed runtime install completed successfully.', {
+        installDir: toolState.installDir,
+        browserExecutablePath: toolState.hyperframes?.browserExecutablePath || null,
+      });
+      return toolState;
+    }
+
     const discoveredTools = await syncDiscoveredTools({ force: true });
     existingTool = discoveredTools[toolId];
     rollbackManagedInstallOnFailure =
@@ -4448,6 +4466,18 @@ async function repairToolInstallationUnlocked(toolState, options = {}) {
       installRoot,
       lifecycleMode: toolState.lifecycleMode || null,
     });
+
+    if (manifest.id === HYPERFRAMES_TOOL_ID || manifest.installInstructions?.kind === 'npm-package') {
+      const repairedTool = await repairManagedHyperFrames(toolState, manifest, options, logger);
+      await upsertTool(repairedTool);
+      await advanceStep(logger, options.onProgress, {
+        toolId: toolState.id,
+        percent: 100,
+        stage: 'complete',
+        message: repairedTool.lastRepairMessage || 'HyperFrames is ready.',
+      });
+      return repairedTool;
+    }
 
     if (capability === 'desktop' && manifest.companionDesktop) {
       const companionManifest = manifest.companionDesktop;

@@ -183,6 +183,10 @@ function setRuntimeEventSink(listener) {
 }
 
 function getPipelineOnlyLaunchMessage(toolState) {
+  if (String(toolState?.id || '').trim().toLowerCase() === 'hyperframes') {
+    return 'HyperFrames is installed as a managed runtime foundation. Rendering UI and pipeline nodes are not enabled in this pass.';
+  }
+
   if (String(toolState?.id || '').trim().toLowerCase() === 'chatterbox-tts') {
     return 'Chatterbox-Turbo is used through Pipeline Builder. Create a Reference Voice TTS pipeline to generate audio.';
   }

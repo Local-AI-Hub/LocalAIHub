@@ -1,5 +1,5 @@
 {
   "algorithm": "ed25519",
   "keyId": "localaihub-tools-manifest-v1",
-  "signature": "v0LvwhI9TfPAtp8v21CY72I3m5SW/EHVTFHIwH5Q1SvbJcpUaUx8SuWrRinD446sxW7dHz7MMe13SrN9BplDDQ=="
+  "signature": "4eTohfPiZzvwWF86DQps3OIRAXVQDdLNga4jTlk7ExgstC8sT2Tivwanr1c5+u7UgSNSU3+Z6njE0cg2ztApBA=="
 }

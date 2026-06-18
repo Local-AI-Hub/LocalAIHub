@@ -1713,6 +1713,75 @@
     }
   },
   {
+    "id": "hyperframes",
+    "name": "HyperFrames",
+    "description": "Renders local HTML video compositions to MP4 using Chrome Headless Shell, FFmpeg, and FFprobe.",
+    "icon": "HF",
+    "category": "Video tools",
+    "interfaceMode": "pipeline-only",
+    "downloadUrl": "https://www.npmjs.com/package/hyperframes/v/0.6.112",
+    "setupNotes": [
+      "Requires Node.js 22 or newer and npm.",
+      "Uses Local AI Hub-managed FFmpeg, FFprobe, npm cache, temporary workspace, and Chrome Headless Shell.",
+      "First install downloads npm dependencies and Chrome Headless Shell and can use significant disk space.",
+      "HyperFrames compositions can execute local HTML/CSS/JavaScript when rendered. Only render compositions you trust."
+    ],
+    "installInstructions": {
+      "kind": "npm-package",
+      "runtime": "node",
+      "archiveName": "hyperframes-0.6.112",
+      "installSummary": "Checks external Node.js 22+ and npm, installs hyperframes@0.6.112 locally, provisions Chrome Headless Shell in Local AI Hub-managed storage, and verifies FFmpeg, FFprobe, and HyperFrames doctor readiness.",
+      "npmPackage": "hyperframes",
+      "npmVersion": "0.6.112",
+      "pinnedPackage": "hyperframes@0.6.112",
+      "configTargets": [
+        "runtime",
+        "browser-profile",
+        "npm-cache",
+        "temp",
+        "logs",
+        "state"
+      ],
+      "externalExecutableCandidates": [],
+      "externalBatchCandidates": [],
+      "externalPythonCandidates": [],
+      "compatibility": {
+        "minimumVramMb": 0,
+        "recommendedVramMb": 4096,
+        "minimumRamMb": 8192,
+        "recommendedRamMb": 16384
+      }
+    },
+    "launchCommand": "embedded://hyperframes-runtime",
+    "launchModes": [
+      {
+        "id": "runtime",
+        "capability": "runtime",
+        "label": "Managed Runtime",
+        "kind": "runtime",
+        "interfaceMode": "pipeline-only",
+        "launchCommand": "embedded://hyperframes-runtime"
+      }
+    ],
+    "preferredLaunchMode": "runtime",
+    "detectionPaths": [
+      "%LOCALAPPDATA%\\LocalAIHub\\tools\\hyperframes\\runtime\\node_modules\\hyperframes\\package.json",
+      "%APPDATA%\\LocalAIHub\\tools\\hyperframes\\runtime\\node_modules\\hyperframes\\package.json"
+    ],
+    "discovery": {
+      "folderNames": [
+        "hyperframes",
+        "HyperFrames"
+      ],
+      "markerPaths": [
+        "runtime\\node_modules\\hyperframes\\package.json",
+        "state\\browser.json"
+      ],
+      "pathExecutables": [],
+      "pythonModules": []
+    }
+  },
+  {
     "id": "opencode",
     "name": "OpenCode",
     "description": "OpenCode is a coding agent with desktop and terminal interfaces. Configure providers inside OpenCode; IDE extension integration is not managed by Local AI Hub yet.",

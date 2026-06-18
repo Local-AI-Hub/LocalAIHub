@@ -332,6 +332,9 @@ function normalizeCompanionDesktopDefinition(toolId, rawCompanion) {
     runtimeAssets: installInstructions.runtimeAssets || [],
     packagingBootstrapPackages: installInstructions.packagingBootstrapPackages || [],
     preflightChecks: installInstructions.preflightChecks || [],
+    npmPackage: installInstructions.npmPackage || null,
+    npmVersion: installInstructions.npmVersion || null,
+    pinnedPackage: installInstructions.pinnedPackage || null,
     installerArgs: installInstructions.installerArgs || [],
     managedInstallSupported: installInstructions.managedInstallSupported === true,
     materializationTimeoutMs: Number(installInstructions.materializationTimeoutMs) > 0
@@ -566,6 +569,7 @@ function getToolCatalog() {
     launchModes: tool.launchModes,
     preferredLaunchMode: tool.preferredLaunchMode,
     installSummary: tool.installInstructions.installSummary,
+    setupNotes: tool.setupNotes || [],
     companionDesktop: tool.companionDesktop,
     installCapabilities: tool.companionDesktop
       ? [

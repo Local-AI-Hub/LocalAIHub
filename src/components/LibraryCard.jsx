@@ -7,11 +7,29 @@ function isPipelineOnlyTool(tool) {
 }
 
 function pipelineOnlyMessage(tool) {
+  if (tool?.id === 'hyperframes') {
+    return 'HyperFrames is installed as a managed runtime foundation. Rendering UI and pipeline nodes are not enabled in this pass.';
+  }
+
   if (tool?.id === 'chatterbox-tts') {
     return 'Chatterbox-Turbo is used through Pipeline Builder. Create a Reference Voice TTS pipeline to generate audio.';
   }
 
   return `${tool?.name || 'This tool'} is used through Pipeline Builder.`;
+}
+
+function hyperFramesStatusItems(tool) {
+  if (tool?.id !== 'hyperframes' || !tool?.hyperframes) {
+    return [];
+  }
+
+  const runtime = tool.hyperframes;
+  return [
+    runtime.pinnedVersion ? `HyperFrames ${runtime.pinnedVersion}` : '',
+    runtime.nodeVersion ? `Node ${runtime.nodeVersion}` : '',
+    runtime.browserReady ? 'Chrome Headless Shell ready' : 'Chrome Headless Shell needs repair',
+    runtime.ffmpegReady ? 'FFmpeg and FFprobe ready' : 'FFmpeg/FFprobe need repair',
+  ].filter(Boolean);
 }
 
 function voiceCloneConsentMessage(tool) {
@@ -450,6 +468,7 @@ function LibraryCard({
   const hasUpdate = Boolean(updateInfo?.updateAvailable);
   const note = installNote(tool);
   const consentNote = voiceCloneConsentMessage(tool);
+  const hyperFramesStatus = hyperFramesStatusItems(tool);
   const uninstallLabel = primaryUninstallLabel(tool);
   const hasBothCapabilities = bothCapabilitiesInstalled(tool);
   const singleCapability = singleInstalledCapability(tool);
@@ -535,6 +554,13 @@ function LibraryCard({
         </div>
       ) : null}
 
+      {hyperFramesStatus.length ? (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {hyperFramesStatus.map((item) => (
+            <span className="status-pill border-white/10 bg-white/5 text-slate-300" key={item}>{item}</span>
+          ))}
+        </div>
+      ) : null}
       {tool.lastError ? (
         <div className="mt-2 rounded-2xl border border-rose-400/25 bg-rose-400/10 p-2 text-xs text-rose-100">
           <div className="flex flex-wrap items-start justify-between gap-4">

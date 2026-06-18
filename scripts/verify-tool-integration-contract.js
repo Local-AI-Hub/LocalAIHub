@@ -25,6 +25,7 @@ const warnings = [];
 const readinessExceptions = new Map([
   ['lmstudio', 'Desktop app readiness uses process/vendor-app confirmation.'],
   ['gpt4all', 'Desktop app readiness uses process/vendor-app confirmation.'],
+  ['hyperframes', 'Managed runtime readiness uses Node/npm/FFmpeg/FFprobe/Chrome doctor state; render surface arrives later.'],
   ['jan', 'Desktop app readiness uses process/vendor-app confirmation.'],
   ['opencode', 'Desktop app readiness uses process/vendor-app confirmation.'],
   ['upscayl', 'Desktop app readiness uses process/vendor-app confirmation.'],

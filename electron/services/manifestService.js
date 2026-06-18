@@ -17,9 +17,9 @@ const {
 
 const REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/Local-AI-Hub/LocalAIHub/main/electron/config/tools-manifest.json';
 const REMOTE_MANIFEST_SIGNATURE_URL = `${REMOTE_MANIFEST_URL}.sig`;
-const ALLOWED_INSTALL_KINDS = new Set(['zip', 'single-file', 'installer-exe', 'pip-package']);
-const ALLOWED_RUNTIME_KINDS = new Set(['python', 'binary']);
-const ALLOWED_LAUNCH_MODE_KINDS = new Set(['webui', 'desktop', 'service', 'cli', 'embedded']);
+const ALLOWED_INSTALL_KINDS = new Set(['zip', 'single-file', 'installer-exe', 'pip-package', 'npm-package']);
+const ALLOWED_RUNTIME_KINDS = new Set(['python', 'binary', 'node']);
+const ALLOWED_LAUNCH_MODE_KINDS = new Set(['webui', 'desktop', 'service', 'cli', 'embedded', 'runtime']);
 
 let loadedManifest = null;
 let refreshPromise = null;
