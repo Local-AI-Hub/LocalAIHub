@@ -5,6 +5,7 @@ const { compareVersions, runCommand } = require('./commandService');
 const { humanizeError, readConfig, upsertTool } = require('./configService');
 const { getNvidiaRuntimeDetails, detectHardwareSnapshot } = require('./hardwareService');
 const { repairToolInstallation } = require('./installerService');
+const { appendSupportGuidance, recordSupportEvent } = require('./supportEventService');
 
 const PYTORCH_REPAIR_BUILDS = [
   {
@@ -833,10 +834,18 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
     }
 
     if (toolState.source !== 'managed') {
+      const message = `${toolState.name} failed to start, but Local AI Hub only applies automatic Python and CUDA repairs to tools it installed itself. Open the logs folder for the full error.`;
+      recordSupportEvent({
+        area: 'readiness',
+        toolId: toolState.id,
+        operation: 'launch',
+        category: 'readiness',
+        message,
+      });
       return {
         handled: true,
         recovered: false,
-        userMessage: `${toolState.name} failed to start, but Local AI Hub only applies automatic Python and CUDA repairs to tools it installed itself. Open the logs folder for the full error.`,
+        userMessage: appendSupportGuidance(message),
       };
     }
 
@@ -892,12 +901,20 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
       : retryLaunchResult?.status === 'running';
 
     if (!ready) {
+      const message = usesLocalUrl
+        ? `${toolState.name} was repaired and retried, but it still did not answer on its local port. Open the logs folder for the full launch output.`
+        : `${toolState.name} was repaired and retried, but it still did not stay running. Open the logs folder for the full launch output.`;
+      recordSupportEvent({
+        area: 'readiness',
+        toolId: toolState.id,
+        operation: 'readiness',
+        category: 'readiness',
+        message,
+      });
       return {
         handled: true,
         recovered: false,
-        userMessage: usesLocalUrl
-          ? `${toolState.name} was repaired and retried, but it still did not answer on its local port. Open the logs folder for the full launch output.`
-          : `${toolState.name} was repaired and retried, but it still did not stay running. Open the logs folder for the full launch output.`,
+        userMessage: appendSupportGuidance(message),
       };
     }
 
@@ -920,6 +937,14 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
     };
   } catch (error) {
     const message = humanizeError(error, `${toolState.name} still could not start after Local AI Hub tried to repair it.`);
+    const guidedMessage = appendSupportGuidance(message);
+    recordSupportEvent({
+      area: 'readiness',
+      toolId: toolState.id,
+      operation: 'repair',
+      error,
+      message,
+    });
     await logger.error('Automatic launch recovery failed.', {
       error,
       stderr: stderrText,
@@ -927,7 +952,7 @@ async function attemptAutomaticLaunchRecovery(toolState, stderrText, options = {
     return {
       handled: true,
       recovered: false,
-      userMessage: message,
+      userMessage: guidedMessage,
     };
   } finally {
     recoveryLocks.delete(toolState.id);

@@ -125,7 +125,7 @@ Some antivirus tools may block the download, quarantine the installer, or interr
 
 ## Getting Help and Reporting Issues
 
-Start with the [troubleshooting guide](docs/troubleshooting.md). For a safe system summary or diagnostics ZIP, open **Settings -> Support and Diagnostics** and use **Copy system info** or **Create diagnostics bundle**. Nothing is uploaded automatically; review all files before sharing and remove secrets or private data.
+Start with the [troubleshooting guide](docs/troubleshooting.md). For a safe system summary or diagnostics ZIP, open **Settings -> Support and Diagnostics** and use **Copy system info** or **Create diagnostics bundle**. Diagnostics include sanitized Model Manager health counts and status categories, not model files. Nothing is uploaded automatically; review all files before sharing and remove secrets or private data.
 
 Use the [GitHub issue chooser](https://github.com/Local-AI-Hub/LocalAIHub/issues/new/choose) for bug reports, troubleshooting requests, and feature requests. Check the [latest release](https://github.com/Local-AI-Hub/LocalAIHub/releases/latest) before reporting a problem that may already be fixed.
 

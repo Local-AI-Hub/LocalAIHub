@@ -32,7 +32,9 @@ body:
       placeholder: |
         Tool and version:
         Managed by Local AI Hub or external:
-        Model and variant:
+        Model Manager source/provider:
+        Model Manager operation (install, repair, download, delete, browse/search, discovery, integrity, or preflight):
+        Broad model type and variant:
         Pipeline and failing step:
         Recorder mode/capture target/audio:
     validations:
@@ -73,7 +75,7 @@ body:
     id: diagnostics
     attributes:
       label: Can you create a diagnostics bundle?
-      description: Use Settings -> Support and Diagnostics -> Create diagnostics bundle, then review it before sharing.
+      description: Use Settings -> Support and Diagnostics -> Copy system info and Create diagnostics bundle when safe, then review it before sharing.
       options:
         - Yes, and I can attach the reviewed ZIP
         - Yes, but I do not want to share it

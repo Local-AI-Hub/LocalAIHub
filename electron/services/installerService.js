@@ -27,6 +27,7 @@ const {
   runWindowsUninstaller,
 } = require('./windowsUninstallService');
 const { assertPathInside, assertSecureRemoteUrl, findManagedToolsRootForPath, isPathInside, resolveManagedToolPaths } = require('./pathSafetyService');
+const { appendSupportGuidance, recordSupportEvent } = require('./supportEventService');
 
 const DOWNLOAD_TIMEOUT_MS = 30000;
 const MIN_CACHE_BYTES = 1024;
@@ -252,10 +253,10 @@ function isLockedPathRepairError(error) {
 
 function buildRepairFailureMessage(error, manifest) {
   if (isLockedPathRepairError(error)) {
-    return `${manifest.name} is still running or Windows is holding files open. Close ${manifest.name}, wait a few seconds, then run Repair again.`;
+    return appendSupportGuidance(`${manifest.name} is still running or Windows is holding files open. Close ${manifest.name}, wait a few seconds, then run Repair again.`);
   }
 
-  return humanizeError(error, `Local AI Hub could not repair ${manifest.name}.`);
+  return appendSupportGuidance(humanizeError(error, `Local AI Hub could not repair ${manifest.name}.`));
 }
 function buildRepairCleanupNotes(cleanupSummary) {
   const notes = [];
@@ -4356,6 +4357,14 @@ async function installToolUnlocked(toolId, options = {}) {
     return finalizeManagedInstallResult(ensureManagedToolStatePaths(verifiedToolState), manifest, existingTool);
   } catch (error) {
     const readableMessage = humanizeError(error, `Local AI Hub could not install ${manifest.name}.`);
+    const supportMessage = appendSupportGuidance(readableMessage);
+    recordSupportEvent({
+      area: 'installer',
+      toolId,
+      operation: 'install',
+      error,
+      message: readableMessage,
+    });
     if (rollbackManagedInstallOnFailure) {
       await fs.remove(managedPaths.installDir).catch(() => null);
       await logger.warn('Removed incomplete managed install after a failed install attempt.', {
@@ -4365,9 +4374,9 @@ async function installToolUnlocked(toolId, options = {}) {
 
     await logger.error('Install failed.', {
       error,
-      readableMessage,
+      readableMessage: supportMessage,
     });
-    throw error;
+    throw new Error(supportMessage);
   }
 }
 async function removePythonCaches(directory) {
@@ -4781,6 +4790,13 @@ async function repairToolInstallationUnlocked(toolState, options = {}) {
     return trackedManagedTool;
   } catch (error) {
     const readableMessage = buildRepairFailureMessage(error, manifest);
+    recordSupportEvent({
+      area: 'repair',
+      toolId: toolState.id,
+      operation: 'repair',
+      error,
+      message: readableMessage,
+    });
     await upsertTool({
       id: toolState.id,
       lastError: readableMessage,

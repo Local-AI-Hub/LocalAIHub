@@ -12,6 +12,7 @@ const { buildOllamaAllocationFailureMessage, isOllamaAllocationFailureMessage } 
 const { attemptAutomaticLaunchRecovery, diagnoseLaunchFailure, selectPyTorchRepairCandidates } = require('./runtimeRecoveryService');
 const { assessDiskSpace, detectStorageSnapshot, findDiskForPath, getNvidiaRuntimeDetails, detectHardwareSnapshot } = require('./hardwareService');
 const { assertLoopbackUrl, assertPathInside } = require('./pathSafetyService');
+const { appendSupportGuidance, recordSupportEvent } = require('./supportEventService');
 
 const runtimes = new Map();
 const OPEN_TIMEOUT_MS = 30000;
@@ -3389,11 +3390,19 @@ async function launchToolInternal(toolState, options = {}) {
     const message = startupOutcome?.message
       || runtimeState?.startupFailureMessage
       || humanizeError(error, `${toolState.name} could not start.`);
+    const guidedMessage = appendSupportGuidance(message);
+    recordSupportEvent({
+      area: 'readiness',
+      toolId: toolState.id,
+      operation: 'launch',
+      error,
+      message,
+    });
     await persistToolRuntimeState(toolState, 'error', {
-      lastError: message,
+      lastError: guidedMessage,
       lastRepairMessage: null,
     });
-    throw new Error(message);
+    throw new Error(guidedMessage);
   }
 }
 

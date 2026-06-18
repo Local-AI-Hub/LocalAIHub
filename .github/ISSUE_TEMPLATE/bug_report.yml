@@ -82,9 +82,25 @@ body:
   - type: input
     id: model
     attributes:
-      label: Model involved
-      description: Include the model name and relevant variant or quantization. Do not attach the model file.
+      label: Model Manager source, tool, and model type
+      description: Include the source/provider, destination tool, broad model type, and relevant variant or quantization. Do not attach model files.
       placeholder: "Not applicable"
+
+  - type: dropdown
+    id: model_manager_operation
+    attributes:
+      label: Model Manager operation
+      options:
+        - Not applicable
+        - Install or repair
+        - Download
+        - Delete
+        - Browse or search
+        - Model discovery or scan
+        - Integrity or preflight check
+        - Other
+    validations:
+      required: true
 
   - type: input
     id: pipeline
@@ -168,7 +184,7 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostics bundle
-      description: Create one from Settings -> Support and Diagnostics when appropriate.
+      description: Use Copy system info and create a diagnostics bundle from Settings -> Support and Diagnostics when safe. Review diagnostics before sharing.
       options:
         - Attached
         - Created but not attached because it contains information I do not want to share

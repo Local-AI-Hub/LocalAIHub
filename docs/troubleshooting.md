@@ -31,6 +31,7 @@ Bundles include support-focused summaries of:
 - Local AI Hub, Electron, Node.js, and Windows versions.
 - CPU, GPU, VRAM, RAM, managed storage, and free disk space.
 - Tool installation and readiness state.
+- Sanitized Model Manager health: model-managed tool counts, model counts by broad type, damaged or incomplete package counts, scan warning categories, cache status, and recent local failure categories.
 - Provider connection state, without provider credentials.
 - Recorder availability and recent recording metadata.
 - Recent pipeline run metadata and sanitized error summaries.
@@ -43,6 +44,7 @@ Local AI Hub does not intentionally include:
 
 - API keys, provider keys, PATs, tokens, or passwords.
 - Model files.
+- Raw model filenames or full local model paths.
 - Source media, recorder captures, or pipeline artifact media.
 - Generated outputs.
 - Prompt bodies or message contents.
@@ -119,9 +121,14 @@ Do not paste a full console dump without reviewing it for paths, prompts, tokens
 - Check required VRAM, RAM, disk space, model format, variant, and quantization.
 - Verify free space for both the download and temporary files.
 - Retry after restarting Local AI Hub if a download was interrupted.
+- If Local AI Hub reports a damaged or incomplete package, download it again or delete the damaged package from Model Manager before using it.
+- If a download was cancelled or failed, create a diagnostics bundle after the failure so the recent local failure category is included.
+- If an integrity or preflight check fails, include the exact plain-English message and whether the failure happened before download, during transfer, or while finalizing/importing.
+- If Model Manager shows scan warnings, include the warning category or text but do not paste private filenames or full local paths.
+- If previews are missing, note whether the source was Hugging Face, CivitAI, Ollama, or Tabby; Local AI Hub only loads previews from its allowlisted HTTPS hosts and falls back when a preview URL is unsafe.
 - Consult the upstream model/tool documentation for license or access requirements.
 
-Never attach model files to an issue. Report the model name, source page, variant, expected destination tool, and exact error instead.
+Never attach model files to an issue. Report the model source page, source/provider, broad model type, expected destination tool, operation involved (install, repair, download, delete, browse/search, or model discovery), and exact error instead.
 
 ## Pipeline run fails
 

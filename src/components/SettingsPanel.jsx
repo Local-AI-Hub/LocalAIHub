@@ -436,7 +436,7 @@ export default function SettingsPanel({
       >
         <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-4">
           <p className="max-w-4xl text-sm leading-6 text-slate-300">
-            Create a local diagnostics bundle for bug reports. It includes app version, hardware summary, tool readiness, recent sanitized logs, and recent run summaries. It does not intentionally include API keys, model files, source media, generated outputs, or prompt contents. Review it before sharing.
+            Create a local diagnostics bundle for bug reports. It includes app version, hardware summary, tool readiness, sanitized Model Manager health counts/status, recent sanitized logs, and recent run summaries. It does not intentionally include API keys, model files, source media, generated outputs, or prompt contents. Review it before sharing.
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="primary-button" disabled={Boolean(diagnosticsBusy)} onClick={copySystemInfo} type="button">

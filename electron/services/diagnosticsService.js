@@ -8,11 +8,12 @@ const { promisify } = require('util');
 const { ensureStorage, getAppPaths, readConfig } = require('./configService');
 const { detectHardwareSnapshot, detectStorageSnapshot, findDiskForPath, getLiveResourceUsage } = require('./hardwareService');
 const { resolveFfmpegPath } = require('./mediaCompositionService');
-const { readModelSettings, supportsModelManager } = require('./modelService');
+const { getModelManagerCacheSummary, listDownloadedModels, readModelSettings, supportsModelManager } = require('./modelService');
 const { listPipelineOutputs } = require('./pipelineOutputStoreService');
 const { listProviderConnections } = require('./providerService');
 const { listRecentRecordings } = require('./recordingService');
 const { redactDiagnosticValue, redactSensitiveText } = require('./redactionService');
+const { getRecentSupportEvents } = require('./supportEventService');
 const { buildMergedToolStateList } = require('./toolStateService');
 
 const execFileAsync = promisify(execFile);
@@ -206,6 +207,152 @@ function withCollectionTimeout(operation, label, timeoutMs = 15000) {
   });
 }
 
+const MAX_MODEL_HEALTH_TOOLS = 20;
+const MAX_MODEL_HEALTH_FAILURE_EVENTS = 20;
+const MODEL_HEALTH_SCAN_MAX_DEPTH = 10;
+const MODEL_HEALTH_SCAN_MAX_ENTRIES = 10000;
+
+function incrementCount(target, key, amount = 1) {
+  const normalizedKey = String(key || 'Unknown').trim() || 'Unknown';
+  target[normalizedKey] = Number(target[normalizedKey] || 0) + amount;
+}
+
+function normalizeScanWarningCategory(message) {
+  const text = String(message || '').toLowerCase();
+  if (/symlink|junction|reparse/.test(text)) return 'reparse-point-skipped';
+  if (/depth/.test(text)) return 'depth-limit';
+  if (/files and folders|responsive|stopped after/.test(text)) return 'entry-limit';
+  if (/could not read|unreadable|permission/.test(text)) return 'unreadable-folder';
+  if (/loop|repeated folder/.test(text)) return 'filesystem-loop';
+  return 'other';
+}
+
+function pathIsInside(rootPath, candidatePath) {
+  const rootText = String(rootPath || '').trim();
+  const candidateText = String(candidatePath || '').trim();
+  if (!rootText || !candidateText) return false;
+  const root = path.resolve(rootText);
+  const candidate = path.resolve(candidateText);
+  const relative = path.relative(root, candidate);
+  return Boolean(relative && !relative.startsWith('..') && !path.isAbsolute(relative)) || root === candidate;
+}
+
+function rootCategoryForTool(tool, paths = {}) {
+  const candidates = [tool?.installDir, tool?.appDir, tool?.detectedPath, tool?.displayPath].filter(Boolean);
+  if (candidates.some((entry) => pathIsInside(paths.toolsRoot, entry))) return 'toolsRoot';
+  if (candidates.some((entry) => pathIsInside(paths.managedRoot, entry))) return 'managedRoot';
+  if (candidates.length) return 'externalRoot';
+  return 'unknownRoot';
+}
+
+function summarizeModelManagerSources(tools = []) {
+  return tools.reduce((counts, tool) => {
+    for (const source of tool?.modelManager?.sources || []) {
+      incrementCount(counts, source?.id || 'unknown');
+    }
+    return counts;
+  }, {});
+}
+
+function summarizeRecentModelFailures(events = []) {
+  return events
+    .filter((event) => ['model-manager', 'installer', 'repair', 'readiness'].includes(String(event.area || '').toLowerCase()))
+    .slice(0, MAX_MODEL_HEALTH_FAILURE_EVENTS)
+    .map((event) => ({
+      timestamp: event.timestamp,
+      area: event.area,
+      toolId: event.toolId,
+      operation: event.operation,
+      category: event.category,
+      message: sanitizeText(event.message, {}, 500),
+    }));
+}
+
+async function collectModelManagerHealth(modelTools = [], paths = {}, modelSettings = {}, deps = {}) {
+  const health = {
+    schemaVersion: 1,
+    collection: {
+      bounded: true,
+      liveProviderFetches: false,
+      downloadsStarted: false,
+      mutatesModelState: false,
+      maxTools: MAX_MODEL_HEALTH_TOOLS,
+      maxScanDepth: MODEL_HEALTH_SCAN_MAX_DEPTH,
+      maxScanEntriesPerRoot: MODEL_HEALTH_SCAN_MAX_ENTRIES,
+    },
+    managerToolCount: modelTools.length,
+    availableToolFolders: modelTools.filter((tool) => Boolean(tool?.installDir || tool?.appDir || tool?.detectedPath)).length,
+    credentials: {
+      civitaiConfigured: Boolean(modelSettings.hasCivitaiApiKey),
+      civitaiCredentialSource: modelSettings.civitaiCredentialSource ? String(modelSettings.civitaiCredentialSource) : '',
+    },
+    providerAvailability: {
+      configuredSourceCounts: summarizeModelManagerSources(modelTools),
+      sourceStatusIsNonLive: true,
+    },
+    cacheStatus: deps.getModelManagerCacheSummary(),
+    installedModelCounts: {},
+    damagedPackageCounts: {},
+    incompletePackageCounts: {},
+    scanWarningCounts: {},
+    tools: [],
+    recentFailures: summarizeRecentModelFailures(deps.getRecentSupportEvents({ limit: MAX_MODEL_HEALTH_FAILURE_EVENTS })),
+    warnings: [],
+  };
+
+  for (const tool of modelTools.slice(0, MAX_MODEL_HEALTH_TOOLS)) {
+    const rootCategory = rootCategoryForTool(tool, paths);
+    const toolSummary = {
+      toolId: String(tool?.id || '').trim(),
+      rootCategory,
+      installedModelCounts: {},
+      damagedPackageCounts: {},
+      incompletePackageCounts: {},
+      scanWarningCounts: {},
+      collectionStatus: 'ok',
+    };
+
+    try {
+      const models = await deps.listDownloadedModels(tool, {
+        maxDepth: MODEL_HEALTH_SCAN_MAX_DEPTH,
+        maxEntries: MODEL_HEALTH_SCAN_MAX_ENTRIES,
+      });
+      for (const model of (models || []).slice(0, MODEL_HEALTH_SCAN_MAX_ENTRIES)) {
+        const modelType = String(model?.modelType || 'Unknown').trim() || 'Unknown';
+        incrementCount(toolSummary.installedModelCounts, modelType);
+        incrementCount(health.installedModelCounts[toolSummary.toolId] || (health.installedModelCounts[toolSummary.toolId] = {}), modelType);
+        if (model?.damaged) {
+          incrementCount(toolSummary.damagedPackageCounts, modelType);
+          incrementCount(health.damagedPackageCounts[toolSummary.toolId] || (health.damagedPackageCounts[toolSummary.toolId] = {}), modelType);
+        }
+        if (model?.incomplete) {
+          incrementCount(toolSummary.incompletePackageCounts, modelType);
+          incrementCount(health.incompletePackageCounts[toolSummary.toolId] || (health.incompletePackageCounts[toolSummary.toolId] = {}), modelType);
+        }
+        for (const warning of model?.scanWarnings || []) {
+          incrementCount(toolSummary.scanWarningCounts, normalizeScanWarningCategory(warning));
+        }
+      }
+      for (const [category, count] of Object.entries(toolSummary.scanWarningCounts)) {
+        const categoryKey = `${rootCategory}:${category}`;
+        incrementCount(health.scanWarningCounts[toolSummary.toolId] || (health.scanWarningCounts[toolSummary.toolId] = {}), categoryKey, count);
+      }
+    } catch (error) {
+      toolSummary.collectionStatus = 'failed';
+      const warning = `Model Manager health for ${toolSummary.toolId || 'a tool'} was unavailable: ${sanitizeText(error?.message || error, paths, 300)}`;
+      health.warnings.push(warning);
+    }
+
+    health.tools.push(toolSummary);
+  }
+
+  if (modelTools.length > MAX_MODEL_HEALTH_TOOLS) {
+    health.warnings.push(`Model Manager health summarized the first ${MAX_MODEL_HEALTH_TOOLS} tools to keep diagnostics bounded.`);
+  }
+
+  return health;
+}
+
 async function collectSupportData(context = {}, dependencies = {}) {
   const deps = {
     ensureStorage: dependencies.ensureStorage || ensureStorage,
@@ -221,6 +368,9 @@ async function collectSupportData(context = {}, dependencies = {}) {
     listRecordings: dependencies.listRecordings || (() => listRecentRecordings({ limit: 20 })),
     listPipelineOutputs: dependencies.listPipelineOutputs || listPipelineOutputs,
     readModelSettings: dependencies.readModelSettings || readModelSettings,
+    listDownloadedModels: dependencies.listDownloadedModels || listDownloadedModels,
+    getModelManagerCacheSummary: dependencies.getModelManagerCacheSummary || getModelManagerCacheSummary,
+    getRecentSupportEvents: dependencies.getRecentSupportEvents || getRecentSupportEvents,
     getFfmpegSummary: dependencies.getFfmpegSummary || getFfmpegSummary,
   };
 
@@ -249,7 +399,8 @@ async function collectSupportData(context = {}, dependencies = {}) {
   const hardware = value(4, config.hardware || {});
   const resources = value(5, {});
   const disks = value(6, hardware.disks || []);
-  const tools = value(7, []).map((tool) => summarizeTool(tool, paths));
+  const rawTools = value(7, []);
+  const tools = rawTools.map((tool) => summarizeTool(tool, paths));
   const providers = value(8, []).map((provider) => summarizeProvider(provider, paths));
   const recordings = value(9, []).map((recording) => summarizeRecorderEntry(recording, paths));
   const outputs = value(10, []);
@@ -260,12 +411,52 @@ async function collectSupportData(context = {}, dependencies = {}) {
   const managedDrive = findDiskForPath(disks, paths.managedRoot) || null;
   const activeRun = summarizeActiveRun(context.activePipelineRun, paths);
   const modelTools = tools.filter((tool) => {
-    const original = value(7, []).find((entry) => entry.id === tool.id);
+    const original = rawTools.find((entry) => entry.id === tool.id);
     return original && supportsModelManager(original);
   });
-  const warnings = settled
+  const rawModelTools = rawTools.filter((tool) => supportsModelManager(tool));
+  let modelManagerHealth = null;
+  let modelManagerHealthWarnings = [];
+  try {
+    modelManagerHealth = await withCollectionTimeout(
+      () => collectModelManagerHealth(rawModelTools, paths, modelSettings, deps),
+      'Model Manager health',
+      15000,
+    );
+    modelManagerHealthWarnings = Array.isArray(modelManagerHealth.warnings) ? modelManagerHealth.warnings : [];
+  } catch (error) {
+    const warning = `Model Manager health was unavailable: ${sanitizeText(error?.message || error, paths, 300)}`;
+    modelManagerHealthWarnings = [warning];
+    modelManagerHealth = {
+      schemaVersion: 1,
+      collection: {
+        bounded: true,
+        liveProviderFetches: false,
+        downloadsStarted: false,
+        mutatesModelState: false,
+        status: 'failed',
+      },
+      managerToolCount: rawModelTools.length,
+      availableToolFolders: modelTools.filter((tool) => tool.installed).length,
+      credentials: {
+        civitaiConfigured: Boolean(modelSettings.hasCivitaiApiKey),
+      },
+      cacheStatus: deps.getModelManagerCacheSummary(),
+      installedModelCounts: {},
+      damagedPackageCounts: {},
+      incompletePackageCounts: {},
+      scanWarningCounts: {},
+      tools: [],
+      recentFailures: summarizeRecentModelFailures(deps.getRecentSupportEvents({ limit: MAX_MODEL_HEALTH_FAILURE_EVENTS })),
+      warnings: modelManagerHealthWarnings,
+    };
+  }
+  const warnings = [
+    ...settled
     .map((entry, index) => entry.status === 'rejected' ? `Support data source ${index + 1} was unavailable: ${sanitizeText(entry.reason?.message || entry.reason, paths, 300)}` : '')
-    .filter(Boolean);
+    .filter(Boolean),
+    ...modelManagerHealthWarnings,
+  ];
 
   return {
     schemaVersion: DIAGNOSTICS_SCHEMA_VERSION,
@@ -324,6 +515,7 @@ async function collectSupportData(context = {}, dependencies = {}) {
       managerToolCount: modelTools.length,
       availableToolFolders: modelTools.filter((tool) => tool.installed).length,
       civitaiConfigured: Boolean(modelSettings.hasCivitaiApiKey),
+      health: modelManagerHealth,
     },
     recordings,
     pipelineRuns: {
@@ -367,6 +559,7 @@ function buildSystemInfoText(data) {
     `Tools: ${data.tools.installedCount} installed, ${data.tools.readyCount} ready, ${data.tools.needsSetupOrRepairCount} need setup or repair`,
     `Providers: ${data.providers.configuredCount} configured, ${data.providers.totalCount - data.providers.configuredCount} not configured`,
     `Model folders: ${data.models.availableToolFolders} available for ${data.models.managerToolCount} model-managed tools`,
+    `Model Manager health: ${data.models.health?.tools?.length || 0} tool summaries, ${data.models.health?.recentFailures?.length || 0} recent support event(s), CivitAI credential configured=${data.models.health?.credentials?.civitaiConfigured ? 'yes' : 'no'}`,
     `Last pipeline error: ${data.pipelineRuns.lastErrorSummary || 'None available'}`,
   ];
   if (data.warnings.length) lines.push('', `Collection notes: ${data.warnings.length} optional data source(s) were unavailable.`);
@@ -469,7 +662,7 @@ async function createDiagnosticsBundle(context = {}, dependencies = {}) {
     'Local AI Hub diagnostics bundle',
     '',
     'Review every file in this folder before sharing it.',
-    'This bundle contains app/version details, hardware and storage summaries, tool/provider readiness, recent recorder and pipeline metadata, and capped sanitized app logs.',
+    'This bundle contains app/version details, hardware and storage summaries, tool/provider readiness, sanitized Model Manager health counts/status, recent recorder and pipeline metadata, and capped sanitized app logs.',
     'Local AI Hub does not intentionally include API keys, tokens, model files, source media, generated outputs, recorder media, pipeline artifact media, prompt bodies, browser data, or environment-variable dumps.',
     'Nothing was uploaded or sent automatically.',
     '',
@@ -490,6 +683,7 @@ async function createDiagnosticsBundle(context = {}, dependencies = {}) {
   }, paths);
   await writeJson(path.join(bundlePath, 'tools-summary.json'), data.tools, paths);
   await writeJson(path.join(bundlePath, 'providers-summary.json'), data.providers, paths);
+  await writeJson(path.join(bundlePath, 'model-manager-health.json'), data.models.health, paths);
   await writeJson(path.join(bundlePath, 'recorder-summary.json'), { recordings: data.recordings }, paths);
   await writeJson(path.join(bundlePath, 'pipeline-runs-summary.json'), data.pipelineRuns, paths);
   await writeJson(path.join(bundlePath, 'config-summary.json'), data.configSummary, paths);

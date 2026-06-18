@@ -125,6 +125,7 @@ const { deletePipeline, getPipeline, listPipelines, savePipeline } = require('./
 const { buildPipelineOutputDeletionPreview, deletePipelineOutput, listPipelineOutputs } = require('./services/pipelineOutputStoreService');
 const { redactSensitiveText } = require('./services/redactionService');
 const { appendLog } = require('./services/logService');
+const { appendSupportGuidance, recordSupportEvent } = require('./services/supportEventService');
 const {
   buildSystemInfoText,
   collectSupportData,
@@ -2287,7 +2288,17 @@ function registerIpcHandlers() {
     withPlainEnglishErrors(async () => {
       const state = await buildAppState();
       const tool = modelToolLookup(payload.toolId, state.tools);
-      return getModelDownloadPreflight(tool, payload);
+      try {
+        return await getModelDownloadPreflight(tool, payload);
+      } catch (error) {
+        recordSupportEvent({
+          area: 'model-manager',
+          toolId: tool?.id || payload?.toolId,
+          operation: 'preflight',
+          error,
+        });
+        throw new Error(appendSupportGuidance(error?.message || 'Local AI Hub could not check disk space for that model download.'));
+      }
     }, 'Local AI Hub could not check disk space for that model download.'),
   );
 

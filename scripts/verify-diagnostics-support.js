@@ -61,6 +61,14 @@ function fakeDependencies(paths) {
       outputLabel: 'private-output.mp4',
     }],
     readModelSettings: async () => ({ hasCivitaiApiKey: true, civitaiApiKey: SECRETS[2] }),
+    listDownloadedModels: async () => [
+      { toolId: 'comfyui', modelType: 'Checkpoint', fileName: 'private-model.safetensors', path: path.join(paths.modelsRoot, 'private-model.safetensors'), scanWarnings: ['Model scan skipped a symlink or junction inside the model folder.'] },
+    ],
+    getModelManagerCacheSummary: () => ({
+      inventoryCache: { enabled: true, ttlMs: 15000, maxEntries: 128, entryCount: 1 },
+      providerCatalogCache: { enabled: true, ttlMs: 600000, maxEntries: 200, detailMaxEntries: 400, entryCounts: {} },
+    }),
+    getRecentSupportEvents: () => [],
     getFfmpegSummary: async () => ({ available: true, version: 'ffmpeg version 7.1-test' }),
   };
 }
@@ -141,7 +149,7 @@ async function main() {
   assert(result.bundlePath.startsWith(diagnosticsRoot + path.sep), 'Bundle must be created under the diagnostics root.');
   const expected = [
     'README.txt', 'system-info.txt', 'app-summary.json', 'tools-summary.json', 'providers-summary.json',
-    'recorder-summary.json', 'pipeline-runs-summary.json', 'config-summary.json', 'logs',
+    'model-manager-health.json', 'recorder-summary.json', 'pipeline-runs-summary.json', 'config-summary.json', 'logs',
   ];
   for (const entry of expected) assert(await fs.pathExists(path.join(result.bundlePath, entry)), `Bundle should include ${entry}.`);
 
@@ -158,6 +166,7 @@ async function main() {
   assert(!combined.includes('private client prompt body'), 'Bundle logs must omit prompt contents.');
   assert(!combined.includes('private-output.mp4'), 'Bundle must omit generated output file names.');
   assert(!combined.includes('private-client-demo.mkv'), 'Bundle must omit recorder media file names.');
+  assert(!combined.includes('private-model.safetensors'), 'Bundle must omit model file names from Model Manager health.');
 
   const logFiles = files.filter((file) => path.dirname(file).endsWith(`${path.sep}logs`) && file.toLowerCase().endsWith('.log'));
   const includedLogBytes = (await Promise.all(logFiles.map((file) => fs.stat(file)))).reduce((total, stat) => total + stat.size, 0);

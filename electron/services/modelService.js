@@ -26,6 +26,7 @@ const { annotateArtifactsForDownloadPlan, artifactPath, createModelDownloadPlan,
 const { listStableDiffusionApiCheckpoints } = require('./workflowToolService');
 const { isToolActive, isToolReady, launchToolFromUserAction, stopTool } = require('./processService');
 const { getResolvedToolState } = require('./toolStateService');
+const { appendSupportGuidance, recordSupportEvent } = require('./supportEventService');
 const {
   findStableDiffusionCheckpointMatch,
   getRvcVoiceModels,
@@ -159,6 +160,24 @@ function getProviderCatalogCacheStats() {
     ollamaFamilies: OLLAMA_FAMILY_CACHE.size(),
     ollamaLibrary: OLLAMA_LIBRARY_CACHE.size(),
     tabbyRegistry: TABBY_REGISTRY_CACHE.size(),
+  };
+}
+
+function getModelManagerCacheSummary() {
+  return {
+    inventoryCache: {
+      enabled: true,
+      ttlMs: MODEL_INVENTORY_CACHE_TTL_MS,
+      maxEntries: MODEL_INVENTORY_CACHE_MAX_ENTRIES,
+      entryCount: MODEL_INVENTORY_CACHE.size(),
+    },
+    providerCatalogCache: {
+      enabled: true,
+      ttlMs: PROVIDER_CACHE_TTL_MS,
+      maxEntries: PROVIDER_CACHE_MAX_ENTRIES,
+      detailMaxEntries: PROVIDER_DETAIL_CACHE_MAX_ENTRIES,
+      entryCounts: getProviderCatalogCacheStats(),
+    },
   };
 }
 
@@ -5807,6 +5826,24 @@ async function downloadModel(tool, payload, options = {}) {
   invalidateModelInventoryCache(tool);
   try {
     return await downloadModelUncached(tool, payload, options);
+  } catch (error) {
+    if (isModelDownloadCancellationError(error) || options.cancelSignal?.aborted || error?.name === 'AbortError') {
+      recordSupportEvent({
+        area: 'model-manager',
+        toolId: tool?.id,
+        operation: 'cancellation',
+        category: 'cancelled',
+        error,
+      });
+      throw error;
+    }
+    recordSupportEvent({
+      area: 'model-manager',
+      toolId: tool?.id,
+      operation: /integrity|checksum|sha-?256|partial file/i.test(String(error?.message || '')) ? 'integrity' : 'download',
+      error,
+    });
+    throw new Error(appendSupportGuidance(error?.message || `${payload?.name || 'That model'} could not be downloaded.`));
   } finally {
     invalidateModelInventoryCache(tool);
   }
@@ -5953,10 +5990,11 @@ module.exports = {
   deleteModel,
   downloadModel,
   getModelDownloadPreflight,
+  getModelManagerCacheSummary,
   getToolModelDirectories,
   invalidateModelInventoryCache,
-  listDownloadedModels,
   listToolAssets,
+  listDownloadedModels,
   readModelSettings,
   saveModelManagerSettings,
   sanitizeModelSourceUrl,
