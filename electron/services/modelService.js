@@ -249,6 +249,8 @@ const OLLAMA_LIBRARY_CACHE = createExpiringCache({ maxEntries: PROVIDER_CACHE_MA
 const OLLAMA_FAMILY_CACHE = createExpiringCache({ maxEntries: PROVIDER_DETAIL_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS });
 const TABBY_REGISTRY_CACHE = createExpiringCache({ maxEntries: PROVIDER_CACHE_MAX_ENTRIES, ttlMs: PROVIDER_CACHE_TTL_MS, cloneValues: false });
 const MODEL_DOWNLOAD_LOCKS = new Map();
+const MODEL_DOWNLOAD_ACTIVE_BY_ID = new Map();
+const MODEL_DOWNLOAD_CANCEL_CODE = 'MODEL_DOWNLOAD_CANCELLED';
 const HF_SORT_MAP = {
   'most-downloaded': 'downloads',
   newest: 'created_at',
@@ -2088,6 +2090,23 @@ function mergeBackendAndLocalStableDiffusionModels(backendModels = [], localMode
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+function sleepWithSignal(ms, signal) {
+  if (!signal) {
+    return sleep(ms);
+  }
+  throwIfModelDownloadCancelled(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(createModelDownloadCancelledError());
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 async function resolveFreshToolForAssetRefresh(tool) {
   const resolved = await getResolvedToolState(tool?.id, { includeSnapshots: false, resolveStatuses: true }).catch(() => null);
@@ -2277,7 +2296,8 @@ async function waitForInvokeAiInstallJob(tool, job, options = {}) {
   }
   const startedAt = Date.now();
   while (Date.now() - startedAt <= INVOKEAI_MODEL_IMPORT_TIMEOUT_MS) {
-    const latest = await fetchInvokeAiJson(tool, '/api/v2/models/install/' + encodeURIComponent(String(jobId)));
+    throwIfModelDownloadCancelled(options.cancelSignal);
+    const latest = await fetchInvokeAiJson(tool, '/api/v2/models/install/' + encodeURIComponent(String(jobId)), { signal: options.cancelSignal || undefined });
     const status = getInvokeAiImportStatus(latest);
     if (status === 'completed') {
       return latest;
@@ -2292,7 +2312,7 @@ async function waitForInvokeAiInstallJob(tool, job, options = {}) {
       receivedBytes: options.receivedBytes || 0,
       totalBytes: options.totalBytes || 0,
     });
-    await sleep(INVOKEAI_MODEL_IMPORT_POLL_INTERVAL_MS);
+    await sleepWithSignal(INVOKEAI_MODEL_IMPORT_POLL_INTERVAL_MS, options.cancelSignal);
   }
   throw new Error('InvokeAI is still importing this model. Open InvokeAI to check the model install job, then refresh Downloaded Models.');
 }
@@ -4692,6 +4712,82 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
     },
   };
 }
+function normalizeModelDownloadOperationId(value) {
+  return String(value || '').trim();
+}
+
+function buildActiveDownloadKey(tool, downloadId) {
+  const toolId = normalizeLookupKey(tool?.id || tool?.name || 'model-tool');
+  const normalizedDownloadId = normalizeModelDownloadOperationId(downloadId);
+  return normalizedDownloadId ? `${toolId}:${normalizedDownloadId}` : '';
+}
+
+function createModelDownloadCancelledError(message = 'The download was cancelled before installation completed.') {
+  const error = new Error(message);
+  error.name = 'ModelDownloadCancelledError';
+  error.code = MODEL_DOWNLOAD_CANCEL_CODE;
+  return error;
+}
+
+function isModelDownloadCancellationError(error) {
+  return error?.code === MODEL_DOWNLOAD_CANCEL_CODE || error?.name === 'ModelDownloadCancelledError';
+}
+
+function throwIfModelDownloadCancelled(signal) {
+  if (signal?.aborted) {
+    throw isModelDownloadCancellationError(signal.reason)
+      ? signal.reason
+      : createModelDownloadCancelledError();
+  }
+}
+
+function registerActiveModelDownload(token) {
+  const key = buildActiveDownloadKey({ id: token.toolId }, token.downloadId);
+  if (!key) {
+    return () => {};
+  }
+  const activeSet = MODEL_DOWNLOAD_ACTIVE_BY_ID.get(key) || new Set();
+  activeSet.add(token);
+  MODEL_DOWNLOAD_ACTIVE_BY_ID.set(key, activeSet);
+  return () => {
+    const currentSet = MODEL_DOWNLOAD_ACTIVE_BY_ID.get(key);
+    if (!currentSet) {
+      return;
+    }
+    currentSet.delete(token);
+    if (!currentSet.size) {
+      MODEL_DOWNLOAD_ACTIVE_BY_ID.delete(key);
+    }
+  };
+}
+
+function cancelModelDownload(tool, payload = {}) {
+  const downloadId = normalizeModelDownloadOperationId(payload.downloadId || payload.id || payload.operationId);
+  const key = buildActiveDownloadKey(tool, downloadId);
+  if (!key) {
+    return {
+      canceled: false,
+      message: 'No active model download matched that request.',
+    };
+  }
+  const activeSet = MODEL_DOWNLOAD_ACTIVE_BY_ID.get(key);
+  if (!activeSet || !activeSet.size) {
+    return {
+      canceled: false,
+      message: 'No active model download is running for that item.',
+    };
+  }
+  for (const token of [...activeSet]) {
+    if (!token.controller.signal.aborted) {
+      token.cancelRequested = true;
+      token.controller.abort(createModelDownloadCancelledError());
+    }
+  }
+  return {
+    canceled: true,
+    message: 'Download cancelled.',
+  };
+}
 function emitProgress(onProgress, payload) {
   if (typeof onProgress === 'function') {
     onProgress(payload);
@@ -4708,8 +4804,10 @@ function buildDownloadIntegrityError(displayName, detail) {
 
 async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) {
   const safeDownloadUrl = assertSecureRemoteUrl(downloadUrl, 'model download URL');
+  throwIfModelDownloadCancelled(options.cancelSignal);
   const response = await fetch(safeDownloadUrl, {
     headers: options.headers || {},
+    signal: options.cancelSignal || undefined,
   });
   if (!response.ok || !response.body) {
     throw new Error(options.errorMessage || `Download failed with status ${response.status}.`);
@@ -4736,6 +4834,7 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
   let moved = false;
   try {
     while (true) {
+      throwIfModelDownloadCancelled(options.cancelSignal);
       const { done, value } = await reader.read();
       if (done) {
         break;
@@ -4765,7 +4864,9 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
     if (expectedSha256 && actualSha256 !== expectedSha256) {
       throw new Error(buildDownloadIntegrityError(displayName, 'The SHA-256 checksum did not match the provider metadata. The partial file was not installed.'));
     }
+    throwIfModelDownloadCancelled(options.cancelSignal);
     await assertSafeModelOperationPath(safeRoot, destinationPath, 'Local AI Hub refused to finalize a model download through a symlink, junction, or path outside the approved model folder.');
+    throwIfModelDownloadCancelled(options.cancelSignal);
     await fs.move(tempPath, destinationPath, { overwrite: true });
     moved = true;
     return {
@@ -4778,8 +4879,14 @@ async function streamDownloadToFile(downloadUrl, destinationPath, options = {}) 
       destinationPath,
     };
   } catch (error) {
+    if (isModelDownloadCancellationError(error) || options.cancelSignal?.aborted || error?.name === 'AbortError') {
+      throw isModelDownloadCancellationError(error) ? error : createModelDownloadCancelledError();
+    }
     throw error;
   } finally {
+    if (!moved && reader && typeof reader.cancel === 'function') {
+      await reader.cancel().catch(() => null);
+    }
     await fileHandle.close().catch(() => null);
     if (!moved) {
       if (options.safeRoot) {
@@ -4973,6 +5080,7 @@ async function downloadOptionalCompanionFiles(tool, payload, headers, logger, op
   const installed = [];
   const failed = [];
   for (const companion of companions) {
+    throwIfModelDownloadCancelled(options.cancelSignal);
     const destination = resolveRvcCompanionDestination(tool, payload, companion);
     const companionPayload = buildOptionalCompanionPayload(tool, payload, companion, destination);
     const companionUrl = companionPayload.downloadUrl ? assertSecureRemoteUrl(companionPayload.downloadUrl, 'RVC companion download URL') : '';
@@ -5001,6 +5109,7 @@ async function downloadOptionalCompanionFiles(tool, payload, headers, logger, op
         expectedBytes: companionPayload.sizeBytes,
         expectedSha256: companionPayload.sha256,
         headers,
+        cancelSignal: options.cancelSignal,
         errorMessage: companionPayload.fileName + ' could not be downloaded right now.',
         onProgress: options.onProgress,
         progressMessage: 'Downloading optional RVC index companion.',
@@ -5008,6 +5117,9 @@ async function downloadOptionalCompanionFiles(tool, payload, headers, logger, op
       await writeModelMetadata(destination.destinationPath, buildDownloadMetadata(tool, companionPayload, destination)).catch(() => null);
       installed.push(destination.fileName);
     } catch (error) {
+      if (isModelDownloadCancellationError(error) || options.cancelSignal?.aborted) {
+        throw isModelDownloadCancellationError(error) ? error : createModelDownloadCancelledError();
+      }
       await logger.warn('Optional RVC companion download failed.', {
         error,
         sourceArtifactPath: companion.path,
@@ -5094,8 +5206,10 @@ async function downloadPackageModel(tool, payload, options = {}) {
   if (!requiredFiles.length) {
     throw new Error('Local AI Hub could not identify the required files for that model package.');
   }
+  const packageRootExistedBeforeDownload = await fs.pathExists(destination.packageRootPath);
+  const packageManifestExistedBeforeDownload = await fs.pathExists(destination.manifestPath);
   let existingMetadata = null;
-  if (await fs.pathExists(destination.manifestPath)) {
+  if (packageManifestExistedBeforeDownload) {
     await assertSafeModelOperationPath(destination.targetDirectory, destination.manifestPath, 'Local AI Hub refused to read a package manifest through a symlink, junction, or path outside the approved model folder.');
     existingMetadata = await readPackageMetadata(destination.manifestPath);
   }
@@ -5118,8 +5232,10 @@ async function downloadPackageModel(tool, payload, options = {}) {
   let receivedBytes = 0;
   const totalBytes = Number(payload.downloadPlan?.sizeBytes || files.reduce((total, file) => total + Number(file.sizeBytes || 0), 0));
   try {
+    throwIfModelDownloadCancelled(options.cancelSignal);
     await fs.ensureDir(tempRoot);
     for (const file of files) {
+      throwIfModelDownloadCancelled(options.cancelSignal);
       const downloadUrl = assertSecureRemoteUrl(buildPackageDownloadUrl(payload, file), 'model package file URL');
       const tempDestination = path.join(tempRoot, file.installRelativePath);
       emitProgress(options.onProgress, {
@@ -5136,6 +5252,7 @@ async function downloadPackageModel(tool, payload, options = {}) {
         expectedBytes: file.sizeBytes,
         expectedSha256: file.sha256,
         headers,
+        cancelSignal: options.cancelSignal,
         errorMessage: file.fileName + ' could not be downloaded right now.',
         onProgress: null,
         progressMessage: 'Downloading ' + file.fileName + '.',
@@ -5143,9 +5260,11 @@ async function downloadPackageModel(tool, payload, options = {}) {
       receivedBytes += Number(result.downloadedBytes || file.sizeBytes || 0);
       installedFiles.push({ ...file, downloadedBytes: Number(result.downloadedBytes || 0) });
     }
+    throwIfModelDownloadCancelled(options.cancelSignal);
     await assertSafeModelOperationPath(destination.targetDirectory, destination.packageRootPath, 'Local AI Hub refused to prepare a model package through a symlink or junction.');
     await fs.ensureDir(destination.packageRootPath);
     for (const file of installedFiles) {
+      throwIfModelDownloadCancelled(options.cancelSignal);
       const sourcePath = path.join(tempRoot, file.installRelativePath);
       const finalPath = path.join(destination.packageRootPath, file.installRelativePath);
       await assertSafeModelOperationPath(destination.targetDirectory, finalPath, 'Local AI Hub refused to place a package file through a symlink, junction, or path outside the approved model folder.');
@@ -5158,6 +5277,7 @@ async function downloadPackageModel(tool, payload, options = {}) {
         throw new Error('Local AI Hub could not verify every required package file after download.');
       }
     }
+    throwIfModelDownloadCancelled(options.cancelSignal);
     const metadata = buildPackageMetadata(tool, payload, destination, installedFiles);
     await writePackageMetadata(destination.manifestPath, metadata);
     emitProgress(options.onProgress, {
@@ -5174,6 +5294,17 @@ async function downloadPackageModel(tool, payload, options = {}) {
       message: `${payload.name || destination.packageName} was installed as a complete package for ${tool.name}.`,
     };
   } catch (error) {
+    if (isModelDownloadCancellationError(error) || options.cancelSignal?.aborted) {
+      await logger.info('Model package download cancelled.', { packageName: destination.packageName });
+      await removeSafeModelPath(destination.targetDirectory, tempRoot, 'Local AI Hub refused to clean up a package download through a symlink or junction.').catch(() => null);
+      if (!packageManifestExistedBeforeDownload) {
+        await removeSafeModelPath(destination.targetDirectory, destination.manifestPath, 'Local AI Hub refused to clean up a package manifest through a symlink or junction.').catch(() => null);
+      }
+      if (!packageRootExistedBeforeDownload && destination.packageRootPath !== destination.targetDirectory) {
+        await removeSafeModelPath(destination.targetDirectory, destination.packageRootPath, 'Local AI Hub refused to clean up a cancelled model package through a symlink or junction.').catch(() => null);
+      }
+      throw isModelDownloadCancellationError(error) ? error : createModelDownloadCancelledError();
+    }
     await logger.warn('Model package download failed.', { error, packageName: destination.packageName });
     await removeSafeModelPath(destination.targetDirectory, tempRoot, 'Local AI Hub refused to clean up a package download through a symlink or junction.').catch(() => null);
     await removeSafeModelPath(destination.targetDirectory, destination.manifestPath, 'Local AI Hub refused to clean up a package manifest through a symlink or junction.').catch(() => null);
@@ -5204,6 +5335,7 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
   const stageRoot = path.dirname(stagePath);
   let session = null;
   try {
+    throwIfModelDownloadCancelled(options.cancelSignal);
     await logger.info('Downloading InvokeAI model to a temporary import file.', {
       downloadUrl,
       stagePath,
@@ -5223,6 +5355,7 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
       expectedBytes: payload.sizeBytes,
       expectedSha256: payload.sha256 || payload.expectedSha256,
       headers,
+      cancelSignal: options.cancelSignal,
       errorMessage: (payload.name || payload.fileName || 'That model') + ' could not be downloaded for InvokeAI right now.',
       onProgress: options.onProgress,
       progressMessage: 'Downloading ' + (payload.name || payload.fileName || 'model') + ' for InvokeAI import.',
@@ -5234,12 +5367,15 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
       receivedBytes: result.downloadedBytes,
       totalBytes: result.totalBytes || payload.sizeBytes || 0,
     });
+    throwIfModelDownloadCancelled(options.cancelSignal);
     session = await prepareInvokeAiModelImportSession(tool);
+    throwIfModelDownloadCancelled(options.cancelSignal);
     const request = buildInvokeAiModelInstallRequest(session.readyTool, stagePath, buildInvokeAiModelImportConfig(payload));
     const response = await fetch(request.url, {
       body: request.body,
       headers: request.headers,
       method: request.method,
+      signal: options.cancelSignal || undefined,
     });
     const job = await response.json().catch(() => null);
     if (!response.ok) {
@@ -5255,9 +5391,11 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
     const completedJob = await waitForInvokeAiInstallJob(session.readyTool, job, {
       downloadId: payload.id,
       onProgress: options.onProgress,
+      cancelSignal: options.cancelSignal,
       receivedBytes: result.downloadedBytes,
       totalBytes: result.totalBytes || payload.sizeBytes || 0,
     });
+    throwIfModelDownloadCancelled(options.cancelSignal);
     await writeInvokeAiImportMetadata(session.readyTool, payload, completedJob);
     emitProgress(options.onProgress, {
       downloadId: payload.id,
@@ -5273,6 +5411,10 @@ async function downloadInvokeAiImportedModel(tool, payload, options = {}) {
       message: (payload.name || payload.fileName || 'The model') + ' was imported into InvokeAI and registered in InvokeAI\'s model database.' + (session.startedForImport ? ' Local AI Hub started InvokeAI for this import and stopped it afterward.' : ''),
     };
   } catch (error) {
+    if (isModelDownloadCancellationError(error) || options.cancelSignal?.aborted || error?.name === 'AbortError') {
+      await logger.info('InvokeAI model import cancelled.', { stagePath });
+      throw isModelDownloadCancellationError(error) ? error : createModelDownloadCancelledError();
+    }
     await logger.warn('InvokeAI model import failed.', { error, stagePath });
     throw new Error(humanizeError(error, (payload.name || payload.fileName || 'That model') + ' could not be imported into InvokeAI.'));
   } finally {
@@ -5308,6 +5450,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   const downloadUrl = assertSecureRemoteUrl(payload.downloadUrl, 'model download URL');
   const settings = await readModelSettingsInternal();
   const headers = payload.source === 'civitai' ? buildCivitaiHeaders(settings) : { 'User-Agent': APP_USER_AGENT };
+  throwIfModelDownloadCancelled(options.cancelSignal);
   if (await fs.pathExists(destinationPath)) {
     await assertSafeModelOperationPath(targetDirectory, destinationPath, 'Local AI Hub refused to read an existing model through a symlink, junction, or path outside the approved model folder.');
     const existingMetadata = await readModelMetadata(destinationPath);
@@ -5323,6 +5466,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
+      throwIfModelDownloadCancelled(options.cancelSignal);
       await logger.info('Downloading model file.', {
         downloadUrl,
         destinationPath,
@@ -5344,6 +5488,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
         expectedBytes: payload.sizeBytes,
         expectedSha256: payload.sha256 || payload.expectedSha256,
         headers,
+        cancelSignal: options.cancelSignal,
         errorMessage: `${payload.name} could not be downloaded right now.`,
         onProgress: options.onProgress,
         progressMessage: `Downloading ${payload.name}.`,
@@ -5355,6 +5500,7 @@ async function downloadRemoteModel(tool, payload, options = {}) {
         receivedBytes: result.downloadedBytes,
         totalBytes: result.totalBytes || payload.sizeBytes || 0,
       });
+      throwIfModelDownloadCancelled(options.cancelSignal);
       await writeModelMetadata(destinationPath, buildDownloadMetadata(tool, payload, { destinationPath, fileName, installRelativePath, targetDirectory })).catch(() => null);
       const companions = await downloadOptionalCompanionFiles(tool, payload, headers, logger, options);
       const companionMessage = companions.installed.length
@@ -5369,6 +5515,12 @@ async function downloadRemoteModel(tool, payload, options = {}) {
         message: `${payload.name} was added to ${tool.name}.` + companionMessage,
       };
     } catch (error) {
+      if (isModelDownloadCancellationError(error) || options.cancelSignal?.aborted || error?.name === 'AbortError') {
+        await logger.info('Model download cancelled.', { attempt, modelId: payload.id });
+        await removeSafeModelPath(targetDirectory, destinationPath, 'Local AI Hub refused to clean up a model file through a symlink or junction.').catch(() => null);
+        await removeSafeModelPath(targetDirectory, destinationPath + '.download', 'Local AI Hub refused to clean up a model download through a symlink or junction.').catch(() => null);
+        throw isModelDownloadCancellationError(error) ? error : createModelDownloadCancelledError();
+      }
       lastError = error;
       await logger.warn('Model download attempt failed.', {
         attempt,
@@ -5431,6 +5583,7 @@ function handleOllamaPullPayloadLine(payloadLine, payload, options = {}, latestP
 
 async function readOllamaPullStream(response, payload, options = {}) {
   const reader = response.body.getReader();
+  throwIfModelDownloadCancelled(options.cancelSignal);
   const decoder = new TextDecoder();
   let buffer = '';
   let latestPercent = 0;
@@ -5452,6 +5605,7 @@ async function readOllamaPullStream(response, payload, options = {}) {
   };
 
   while (true) {
+    throwIfModelDownloadCancelled(options.cancelSignal);
     const { done, value } = await reader.read();
     if (done) {
       break;
@@ -5467,6 +5621,7 @@ async function readOllamaPullStream(response, payload, options = {}) {
     }
   }
 
+  throwIfModelDownloadCancelled(options.cancelSignal);
   buffer += decoder.decode();
   if (buffer.trim()) {
     processLine(buffer);
@@ -5500,11 +5655,15 @@ async function pullOllamaModel(tool, payload, options = {}) {
   });
   let session = null;
   try {
+    throwIfModelDownloadCancelled(options.cancelSignal);
     session = await prepareOllamaSession(tool, {
       autoStart: true,
       launchContext: 'model-download',
     });
-  } catch {
+  } catch (error) {
+    if (isModelDownloadCancellationError(error) || options.cancelSignal?.aborted || error?.name === 'AbortError') {
+      throw isModelDownloadCancellationError(error) ? error : createModelDownloadCancelledError();
+    }
     throw new Error(buildOllamaUnavailableMessage(tool, {
       actionLabel: `download ${payload.name}`,
       autoStartAttempted: true,
@@ -5513,6 +5672,7 @@ async function pullOllamaModel(tool, payload, options = {}) {
   const activeTool = session.tool || tool;
   const launchUrl = assertLoopbackUrl(activeTool.launchUrl, 'Ollama API URL');
   try {
+    throwIfModelDownloadCancelled(options.cancelSignal);
     const response = await fetch(new URL('/api/pull', `${launchUrl.replace(/\/$/, '')}/`).toString(), {
       method: 'POST',
       headers: {
@@ -5522,6 +5682,7 @@ async function pullOllamaModel(tool, payload, options = {}) {
         model: payload.name,
         stream: true,
       }),
+      signal: options.cancelSignal || undefined,
     });
     if (!response.ok || !response.body) {
       const raw = await response.text().catch(() => '');
@@ -5539,6 +5700,7 @@ async function pullOllamaModel(tool, payload, options = {}) {
       model: payload.name,
     });
     const pullResult = await readOllamaPullStream(response, payload, options);
+    throwIfModelDownloadCancelled(options.cancelSignal);
     emitProgress(options.onProgress, {
       downloadId: payload.id,
       message: `${payload.name} is ready.`,
@@ -5553,6 +5715,13 @@ async function pullOllamaModel(tool, payload, options = {}) {
         : `${payload.name} was downloaded into Ollama.`,
     };
   } catch (error) {
+    if (isModelDownloadCancellationError(error) || options.cancelSignal?.aborted || error?.name === 'AbortError') {
+      await logger.info('Ollama model pull cancelled.', {
+        autoStarted: Boolean(session?.autoStarted),
+        model: payload.name,
+      });
+      throw isModelDownloadCancellationError(error) ? error : createModelDownloadCancelledError();
+    }
     await logger.warn('Ollama model pull failed.', {
       autoStarted: Boolean(session?.autoStarted),
       error,
@@ -5591,33 +5760,47 @@ function resolveModelDownloadLockKey(tool, payload = {}) {
 
 async function withModelDownloadLock(tool, payload = {}, operation) {
   const lockKey = resolveModelDownloadLockKey(tool, payload);
+  const controller = new AbortController();
   const token = {
-    toolId: tool?.id || null,
+    cancelRequested: false,
+    controller,
+    downloadId: normalizeModelDownloadOperationId(payload?.id || payload?.downloadId || lockKey),
+    lockKey,
     modelId: payload?.id || null,
     startedAt: Date.now(),
+    toolId: tool?.id || null,
   };
   if (MODEL_DOWNLOAD_LOCKS.has(lockKey)) {
     const modelName = payload?.name || payload?.fileName || 'that model';
     throw new Error(`A download for ${modelName} is already in progress. Wait for it to finish, then try again.`);
   }
   MODEL_DOWNLOAD_LOCKS.set(lockKey, token);
+  const unregisterActiveDownload = registerActiveModelDownload(token);
   try {
-    return await operation();
+    return await operation({
+      signal: controller.signal,
+      token,
+    });
   } finally {
+    unregisterActiveDownload();
     if (MODEL_DOWNLOAD_LOCKS.get(lockKey) === token) {
       MODEL_DOWNLOAD_LOCKS.delete(lockKey);
     }
   }
 }
 async function downloadModelUncached(tool, payload, options = {}) {
-  return withModelDownloadLock(tool, payload, async () => {
+  return withModelDownloadLock(tool, payload, async ({ signal }) => {
+    const downloadOptions = {
+      ...options,
+      cancelSignal: signal,
+    };
     if (tool.id === 'ollama') {
-      return pullOllamaModel(tool, payload, options);
+      return pullOllamaModel(tool, payload, downloadOptions);
     }
     if (tool.id === 'invokeai') {
-      return downloadInvokeAiImportedModel(tool, payload, options);
+      return downloadInvokeAiImportedModel(tool, payload, downloadOptions);
     }
-    return downloadRemoteModel(tool, payload, options);
+    return downloadRemoteModel(tool, payload, downloadOptions);
   });
 }
 async function downloadModel(tool, payload, options = {}) {
@@ -5764,6 +5947,7 @@ async function deleteModel(tool, payload) {
 }
 module.exports = {
   browseRemoteModels,
+  cancelModelDownload,
   clearProviderCatalogCaches,
   countDownloadedModels,
   deleteModel,
@@ -5807,6 +5991,9 @@ module.exports = {
     buildModelDownloadPreflight,
     buildModelInventoryCacheKey,
     buildProviderCacheKey,
+    cancelModelDownload,
+    createModelDownloadCancelledError,
+    isModelDownloadCancellationError,
     isInvokeAiApiImportPayload,
     normalizeInvokeAiModelType,
     resolveInvokeAiModelPath,

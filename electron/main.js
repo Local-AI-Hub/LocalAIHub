@@ -34,6 +34,7 @@ const {
 } = require('./services/configService');
 const {
   browseRemoteModels,
+  cancelModelDownload,
   countDownloadedModels,
   deleteModel,
   downloadModel,
@@ -2310,6 +2311,15 @@ function registerIpcHandlers() {
         localModels,
       };
     }, 'Local AI Hub could not download that model.'),
+  );
+  ipcMain.handle('models:cancel-download', (_event, payload = {}) =>
+    withPlainEnglishErrors(async () => {
+      const state = await buildAppState();
+      const tool = modelToolLookup(payload.toolId, state.tools);
+      return cancelModelDownload(tool, {
+        downloadId: payload.downloadId,
+      });
+    }, 'Local AI Hub could not cancel that model download.', { refreshMode: 'none' }),
   );
 
   ipcMain.handle('models:delete', (_event, payload) =>

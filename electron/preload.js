@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   bootstrap: () => invoke('app:bootstrap'),
   browseModels: (payload) => invoke('models:browse', payload),
   cancelModelBrowse: (requestId) => invoke('models:cancel-browse', { requestId }),
+  cancelModelDownload: (payload) => invoke('models:cancel-download', payload),
   cancelUpdateCheck: () => invoke('updates:cancel-check'),
   checkForUpdates: () => invoke('updates:check'),
   copySystemInfo: () => invoke('diagnostics:copy-system-info'),

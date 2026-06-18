@@ -261,6 +261,9 @@ function getDownloadKey(item) {
 function isModelConflictMessage(message) {
   return /different model named|cannot confirm it is the same model|will not overwrite|already exists in .*same model|destination filename/i.test(String(message || ''));
 }
+function isModelCancellationMessage(message) {
+  return /download (was )?cancelled|cancelled before installation completed|canceled before installation completed/i.test(String(message || ''));
+}
 function buildConflictMessage(message) {
   const detail = String(message || '').trim();
   const guidance = 'A different model already uses this destination filename. Choose another artifact or version, refresh local inventory, or rename the existing file outside Local AI Hub if you are sure it is not needed.';
@@ -270,6 +273,7 @@ function ModelCard({
   artifactChoiceId,
   conflict,
   deleteBusy,
+  cancelBusy,
   downloadBusy,
   downloadProgress,
   item,
@@ -278,6 +282,7 @@ function ModelCard({
   onClearConflict,
   onDelete,
   onDownload,
+  onCancelDownload,
   onOpenSourceLink,
   onRefreshLocal,
 }) {
@@ -299,6 +304,7 @@ function ModelCard({
   const safeModelPageUrl = isSafeModelSourceUrl(item.modelPageUrl || item.sourceUrl) ? (item.modelPageUrl || item.sourceUrl) : '';
   const safeArtifactUrl = isSafeModelSourceUrl(item.artifactUrl) ? item.artifactUrl : '';
   const unsupportedChoices = artifactChoices.filter((choice) => choice.disabled);
+  const downloadActive = downloadBusy || Boolean(downloadProgress);
 
   return (
     <article className="rounded-[24px] border border-white/10 bg-slate-950/35 p-3">
@@ -464,9 +470,16 @@ function ModelCard({
             {deleteBusy ? 'Deleting...' : 'Delete'}
           </button>
         ) : (
-          <button className="primary-button" disabled={item.downloadPlan?.runnable === false || downloadBusy || Boolean(downloadProgress)} onClick={() => onDownload(item)} type="button">
-            {item.downloadPlan?.runnable === false ? 'Not compatible' : downloadBusy || downloadProgress ? 'Downloading...' : 'Download'}
-          </button>
+          <>
+            <button className="primary-button" disabled={item.downloadPlan?.runnable === false || downloadActive} onClick={() => onDownload(item)} type="button">
+              {item.downloadPlan?.runnable === false ? 'Not compatible' : downloadActive ? 'Downloading...' : 'Download'}
+            </button>
+            {downloadActive ? (
+              <button className="ghost-button border-amber-300/30 text-amber-100" disabled={cancelBusy} onClick={() => onCancelDownload(item)} type="button">
+                {cancelBusy ? 'Cancelling...' : 'Cancel'}
+              </button>
+            ) : null}
+          </>
         )}
       </div>
     </article>
@@ -487,6 +500,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   const [civitaiApiKeyDraft, setCivitaiApiKeyDraft] = useState('');
   const [downloadProgressMap, setDownloadProgressMap] = useState({});
   const [downloadBusyMap, setDownloadBusyMap] = useState({});
+  const [cancelBusyMap, setCancelBusyMap] = useState({});
   const [selectedArtifactMap, setSelectedArtifactMap] = useState({});
   const [conflictMap, setConflictMap] = useState({});
   const [pagination, setPagination] = useState(EMPTY_PAGINATION);
@@ -878,6 +892,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
       ...current,
       [downloadId]: true,
     }));
+    let cancelledDownload = false;
     try {
       const preflightResult = await window.localAIHub.getModelDownloadPreflight({
         ...selectedItem,
@@ -887,6 +902,9 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
         const message = preflightResult?.message || 'Local AI Hub could not check disk space for that model download.';
         if (isModelConflictMessage(message)) {
           registerConflict(selectedItem, message);
+        } else if (isModelCancellationMessage(message)) {
+          cancelledDownload = true;
+          onToast(message, 'info');
         } else {
           onToast(message, 'error');
         }
@@ -913,6 +931,9 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
         const message = result?.message || 'Local AI Hub could not download that model.';
         if (isModelConflictMessage(message)) {
           registerConflict(selectedItem, message);
+        } else if (isModelCancellationMessage(message)) {
+          cancelledDownload = true;
+          onToast(message, 'info');
         } else {
           onToast(message, 'error');
         }
@@ -928,6 +949,77 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
         delete next[downloadId];
         return next;
       });
+      setCancelBusyMap((current) => {
+        const next = { ...current };
+        delete next[downloadId];
+        return next;
+      });
+      if (cancelledDownload) {
+        setDownloadProgressMap((current) => {
+          const next = { ...current };
+          delete next[selectedItem.id];
+          delete next[downloadId];
+          return next;
+        });
+      }
+    }
+  }
+  async function handleCancelDownload(item) {
+    const selectedItem = buildSelectedCatalogItem(item, selectedArtifactMap[item.id]);
+    const downloadKey = getDownloadKey(selectedItem);
+    if (cancelBusyMap[downloadKey]) {
+      return;
+    }
+    setCancelBusyMap((current) => ({
+      ...current,
+      [downloadKey]: true,
+    }));
+    let keepCancelBusy = false;
+    try {
+      const result = await window.localAIHub.cancelModelDownload({
+        downloadId: selectedItem.id,
+        toolId: selectedToolId,
+      });
+      const message = result?.data?.message || result?.message || 'Download cancelled.';
+      if (!result?.ok) {
+        onToast(message, 'error');
+        return;
+      }
+      if (result.data?.canceled === false) {
+        setDownloadProgressMap((current) => {
+          const next = { ...current };
+          delete next[selectedItem.id];
+          delete next[downloadKey];
+          return next;
+        });
+        setDownloadBusyMap((current) => {
+          const next = { ...current };
+          delete next[downloadKey];
+          return next;
+        });
+        onToast(message, 'info');
+        return;
+      }
+      keepCancelBusy = true;
+      setDownloadProgressMap((current) => ({
+        ...current,
+        [selectedItem.id]: {
+          downloadId: selectedItem.id,
+          message: 'Cancelling download...',
+          percent: current[selectedItem.id]?.percent ?? current[downloadKey]?.percent ?? null,
+        },
+      }));
+      onToast(message, 'info');
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not cancel that model download.', 'error');
+    } finally {
+      if (!keepCancelBusy) {
+        setCancelBusyMap((current) => {
+          const next = { ...current };
+          delete next[downloadKey];
+          return next;
+        });
+      }
     }
   }
   async function handleDelete(model, remoteItem = null) {
@@ -1170,6 +1262,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
                     conflict={conflictMap[item.id] || null}
                     key={item.id}
                     deleteBusy={deleteBusyId === localMatch?.id}
+                    cancelBusy={Boolean(cancelBusyMap[downloadKey])}
                     downloadBusy={Boolean(downloadBusyMap[downloadKey])}
                     downloadProgress={downloadProgressMap[selectedItem.id] || downloadProgressMap[downloadKey]}
                     item={selectedItem}
@@ -1178,6 +1271,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
                     onClearConflict={clearConflict}
                     onDelete={handleDelete}
                     onDownload={handleDownload}
+                    onCancelDownload={handleCancelDownload}
                     onOpenSourceLink={handleOpenSourceLink}
                     onRefreshLocal={() => loadLocalModels(selectedToolId)}
                   />
