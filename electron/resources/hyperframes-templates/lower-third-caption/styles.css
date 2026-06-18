@@ -1,0 +1,25 @@
+﻿:root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; color: #f8fafc; background: #151515; }
+* { box-sizing: border-box; }
+html, body, .scene, .frame { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+.scene { background: linear-gradient(140deg, #101820, #263238 48%, #173b3f); }
+.frame { position: relative; }
+.frame::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent 0, rgba(0, 0, 0, 0.38) 100%);
+}
+.lower-third {
+  position: absolute;
+  left: 72px;
+  right: 72px;
+  bottom: 72px;
+  max-width: 780px;
+  border-left: 8px solid #f59e0b;
+  background: rgba(8, 13, 18, 0.82);
+  padding: 28px 34px;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.32);
+}
+.name { margin: 0; color: #fde68a; font-size: 34px; font-weight: 700; }
+.caption { margin: 8px 0 0; color: #e5e7eb; font-size: 24px; line-height: 1.35; }
+body:not(.hf-ready) .lower-third { opacity: 0; }

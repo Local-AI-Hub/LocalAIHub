@@ -89,6 +89,17 @@ const {
   resolveAssetLibraryPreviewRequest,
   updateColorPaletteItem,
 } = require('./services/assetLibraryService');
+const {
+  buildHyperFramesProjectPipelineDraft,
+  createHyperFramesProject,
+  deleteHyperFramesProject,
+  duplicateHyperFramesProject,
+  inspectHyperFramesProject,
+  listHyperFramesProjectTemplates,
+  listHyperFramesProjects,
+  openHyperFramesProjectFolder,
+  renameHyperFramesProject,
+} = require('./services/hyperFramesProjectService');
 const { inspectCleanupTargets, runCleanup } = require('./services/storageCleanupService');
 const { dismissManagedDataMigration, getStorageOverview, setManagedDataRoot } = require('./services/storageLocationService');
 const { getToolCatalog, getToolManifest, initializeToolRegistry } = require('./services/toolRegistry');
@@ -1649,6 +1660,41 @@ function registerIpcHandlers() {
 
   ipcMain.handle('asset-libraries:update-color', (_event, payload) =>
     withPlainEnglishErrors(async () => updateColorPaletteItem(payload?.libraryId, payload?.item), 'Local AI Hub could not save that color.'),
+  );
+  ipcMain.handle('hyperframes-projects:list', () =>
+    withPlainEnglishErrors(async () => listHyperFramesProjects(), 'Local AI Hub could not load HyperFrames projects.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:templates', () =>
+    withPlainEnglishErrors(async () => listHyperFramesProjectTemplates(), 'Local AI Hub could not load HyperFrames project templates.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:get', (_event, payload) =>
+    withPlainEnglishErrors(async () => ({ project: await inspectHyperFramesProject(typeof payload === 'string' ? payload : payload?.projectId) }), 'Local AI Hub could not inspect that HyperFrames project.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:create', (_event, payload) =>
+    withPlainEnglishErrors(async () => createHyperFramesProject(payload || {}), 'Local AI Hub could not create that HyperFrames project.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:rename', (_event, payload) =>
+    withPlainEnglishErrors(async () => renameHyperFramesProject(payload?.projectId, payload?.displayName), 'Local AI Hub could not rename that HyperFrames project.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:duplicate', (_event, payload) =>
+    withPlainEnglishErrors(async () => duplicateHyperFramesProject(payload?.projectId, payload?.displayName), 'Local AI Hub could not duplicate that HyperFrames project.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:delete', (_event, payload) =>
+    withPlainEnglishErrors(async () => deleteHyperFramesProject(typeof payload === 'string' ? payload : payload?.projectId), 'Local AI Hub could not delete that HyperFrames project.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:open-folder', (_event, payload) =>
+    withPlainEnglishErrors(async () => openHyperFramesProjectFolder(typeof payload === 'string' ? payload : payload?.projectId, (targetPath) => shell.openPath(targetPath)), 'Local AI Hub could not open that HyperFrames project folder.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:prepare-pipeline', (_event, payload) =>
+    withPlainEnglishErrors(async () => buildHyperFramesProjectPipelineDraft(typeof payload === 'string' ? payload : payload?.projectId), 'Local AI Hub could not prepare a HyperFrames project pipeline.'),
   );
   ipcMain.handle('tools:install', (_event, payload) =>
     withPlainEnglishErrors(async () => {

@@ -3959,6 +3959,18 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    window.localAIHub.listHyperFramesProjects?.().then((result) => {
+      if (!cancelled && result?.ok) {
+        setHyperFramesProjects(result.data?.projects || []);
+      }
+    }).catch(() => null);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (selectedNode?.type !== 'recordInput') {
       return;
     }
@@ -4182,6 +4194,18 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     });
     setPendingConnection(null);
     setDirty(Boolean(options.dirty));
+  }
+
+  function useHyperFramesProjectInPipeline(nextPipeline, project) {
+    if (!nextPipeline) return;
+    const hasDraftContent = draft.nodes.length > 0 || dirty || currentPipelineSaved;
+    if (hasDraftContent && !window.confirm('Replace the current pipeline draft with a HyperFrames render draft? Unsaved changes in the current draft will be discarded.')) {
+      return;
+    }
+    replaceDraft(nextPipeline, { dirty: true, selectedNodeId: nextPipeline.nodes?.[0]?.id || '' });
+    setActiveSubview('build');
+    setSectionVisibility((current) => ({ ...current, canvas: true, inspector: true }));
+    onToast?.('Created a HyperFrames render draft for ' + (project?.displayName || 'that project') + '. Review it before running.', 'success');
   }
 
   function applyRunSnapshot(nextRun) {
@@ -6775,6 +6799,21 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                   );
                 })() : null}
 
+                {selectedNode.type === 'hyperframesProjectInput' ? (
+                  <div>
+                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="hyperframes-project-input-select">Managed HyperFrames project</label>
+                    <select
+                      className="store-input mt-3"
+                      id="hyperframes-project-input-select"
+                      onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, projectId: event.target.value } }))}
+                      value={selectedNode.config?.projectId || ''}
+                    >
+                      <option value="">Choose a managed project</option>
+                      {hyperFramesProjects.filter((project) => project.health?.runnable).map((project) => <option key={project.projectId} value={project.projectId}>{project.displayName || project.projectId}</option>)}
+                    </select>
+                    <p className="mt-2 text-xs leading-5 text-slate-400">This node resolves a managed project ID to its local index.html at run time. It does not accept arbitrary folder paths.</p>
+                  </div>
+                ) : null}
                 {['imageInput', 'audioInput', 'videoInput', 'fileInput'].includes(selectedNode.type) ? (
                   <div className="space-y-3">
                     <div>
@@ -9161,6 +9200,30 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                 <div className="mt-4">
                   <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">Loading asset libraries...</div>}>
                     <AssetLibraryManager onToast={onToast} />
+                  </Suspense>
+                </div>
+              ) : null}
+            </div>
+
+            <div className={getPipelineTwoColumnSectionPanelClass(sectionVisibility.hyperFramesProjects)} data-pipeline-resource-section="hyperframes-projects">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <button className="min-w-0 flex-1 text-left" onClick={() => toggleSection('hyperFramesProjects')} type="button">
+                  <p className="text-xs uppercase tracking-[0.22em] text-slate-500">HyperFrames Projects</p>
+                  <p className="mt-2 text-lg font-semibold text-white">Managed composition projects and templates</p>
+                  <p className="mt-2 text-sm leading-6 text-slate-400">Create local starter projects, check render health, and hand a project to HyperFrames Render.</p>
+                </button>
+                <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('hyperFramesProjects')} type="button">
+                  {sectionVisibility.hyperFramesProjects ? 'Collapse' : 'Expand'}
+                </button>
+              </div>
+              {sectionVisibility.hyperFramesProjects ? (
+                <div className="mt-4">
+                  <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">Loading HyperFrames projects...</div>}>
+                    <HyperFramesProjectManager
+                      onProjectsChanged={setHyperFramesProjects}
+                      onToast={onToast}
+                      onUseProjectInPipeline={useHyperFramesProjectInPipeline}
+                    />
                   </Suspense>
                 </div>
               ) : null}

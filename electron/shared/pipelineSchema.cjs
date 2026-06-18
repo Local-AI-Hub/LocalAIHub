@@ -1,4 +1,4 @@
-const {
+﻿const {
   PIPELINE_OPERATION_IDS,
   PIPELINE_RECORD_INPUT_CAPABILITY,
   RECORD_INPUT_MODE_IDS,
@@ -399,6 +399,23 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       filePath: '',
+    },
+  }),
+  hyperframesProjectInput: Object.freeze({
+    type: 'hyperframesProjectInput',
+    label: 'HyperFrames Project Input',
+    category: 'Inputs',
+    description: 'Supplies a managed local HyperFrames project index.html to HyperFrames Render by project ID.',
+    inputPorts: [],
+    outputPorts: [
+      {
+        id: 'project',
+        kind: PORT_KIND_FILE,
+        label: 'index.html',
+      },
+    ],
+    configDefaults: {
+      projectId: '',
     },
   }),
   collectionInput: Object.freeze({
@@ -5689,6 +5706,21 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
+      if (node.type === 'hyperframesProjectInput') {
+        if (!String(node.config?.projectId || '').trim()) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose a managed HyperFrames project before running this pipeline.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'This node resolves a managed local HyperFrames project to its trusted index.html artifact at run time.',
+          };
+        }
+      }
+
       if (node.type === 'collectionInput') {
         if (!analyzeCollectionInputNode(node, summary)) {
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
@@ -6923,7 +6955,7 @@ function analyzePipeline(definition = {}, context = {}) {
         if (!projectKinds.includes(PORT_KIND_FILE)) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect a File Input that points to a local index.html before running HyperFrames Render.',
+            message: 'Connect a File Input or HyperFrames Project Input that points to a local index.html before running HyperFrames Render.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (![24, 30, 60].includes(fps)) {
@@ -7158,6 +7190,4 @@ module.exports = {
 };
 
 module.exports.default = module.exports;
-
-
 

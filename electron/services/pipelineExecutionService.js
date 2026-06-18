@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+﻿const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs-extra');
 
@@ -69,6 +69,7 @@ const {
 const { generateImageWithLocalImageTool } = require('./localImageService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
 const { renderHyperFramesComposition } = require('./hyperFramesRenderService');
+const { prepareHyperFramesProjectForPipeline } = require('./hyperFramesProjectService');
 const { extractVideoLastFrameArtifact } = require('./videoFrameService');
 const {
   applyPromptStyleToPrompt,
@@ -9505,6 +9506,22 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
   if (node.type === 'recordInput') {
     return waitForRecordInput(run, node);
+  }
+
+  if (node.type === 'hyperframesProjectInput') {
+    const projectId = String(node.config?.projectId || '').trim();
+    if (!projectId) {
+      throw new Error('Choose a managed HyperFrames project before running this pipeline.');
+    }
+    const prepared = await prepareHyperFramesProjectForPipeline(projectId);
+    const artifact = prepared.artifact;
+    return {
+      message: 'Prepared the managed HyperFrames project input.',
+      outputs: {
+        project: artifact,
+      },
+      preview: summarizeArtifact(artifact),
+    };
   }
 
   if (node.type === 'imageInput' || node.type === 'audioInput' || node.type === 'videoInput' || node.type === 'fileInput') {

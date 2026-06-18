@@ -1,0 +1,28 @@
+﻿:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", Arial, sans-serif;
+  background: #0d1117;
+  color: #f8fafc;
+}
+
+* { box-sizing: border-box; }
+html, body, .scene { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+.scene {
+  display: grid;
+  place-items: center;
+  background: radial-gradient(circle at 30% 25%, #1d5568 0, transparent 32%), linear-gradient(135deg, #0d1117, #1f2937 58%, #1f3a3d);
+}
+.title-card {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 18px;
+  text-align: center;
+  padding: 96px;
+}
+.eyebrow { margin: 0; color: #67e8f9; font-size: 28px; letter-spacing: 0; text-transform: uppercase; }
+h1 { margin: 0; font-size: 86px; line-height: 1; letter-spacing: 0; }
+.subtitle { margin: 0; color: #cbd5e1; font-size: 30px; }
+body:not(.hf-ready) .title-card { opacity: 0; }

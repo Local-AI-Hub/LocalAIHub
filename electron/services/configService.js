@@ -1,4 +1,4 @@
-const path = require('path');
+﻿const path = require('path');
 const fs = require('fs-extra');
 const { app } = require('electron');
 
@@ -16,7 +16,7 @@ const {
 const CONFIG_VERSION = 7;
 const APP_DATA_DIR_NAME = 'LocalAIHub';
 const LEGACY_APP_DATA_DIR_NAMES = ['NestAI'];
-const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'recordings', 'runtimes', 'logs', 'temp', 'cache', 'libraries'];
+const MANAGED_DATA_SUBDIRECTORIES = ['tools', 'downloads', 'models', 'snapshots', 'recordings', 'runtimes', 'logs', 'temp', 'cache', 'libraries', 'projects'];
 const UNINSTALL_METADATA_FILE = 'uninstall-cleanup.ini';
 
 let configOperationQueue = Promise.resolve();
@@ -151,6 +151,7 @@ function buildManagedSubdirectoryPaths(rootPath) {
     logsRoot: path.join(managedRoot, 'logs'),
     librariesRoot: path.join(managedRoot, 'libraries'),
     modelsRoot: path.join(managedRoot, 'models'),
+    projectsRoot: path.join(managedRoot, 'projects'),
     recordingsRoot: path.join(managedRoot, 'recordings'),
     runtimesRoot: path.join(managedRoot, 'runtimes'),
     snapshotsRoot: path.join(managedRoot, 'snapshots'),
@@ -666,6 +667,7 @@ async function prepareStorage() {
     fs.ensureDir(paths.snapshotsRoot),
     fs.ensureDir(paths.downloadsRoot),
     fs.ensureDir(paths.modelsRoot),
+    fs.ensureDir(paths.projectsRoot),
     fs.ensureDir(paths.recordingsRoot),
     fs.ensureDir(paths.runtimesRoot),
     fs.ensureDir(paths.logsRoot),

@@ -1,0 +1,18 @@
+﻿:root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; color: #fff; background: #111827; }
+* { box-sizing: border-box; }
+html, body, .scene, .kinetic { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+.scene { background: linear-gradient(130deg, #111827, #3b2846 52%, #365314); }
+.kinetic { position: relative; display: grid; place-items: center; }
+.word {
+  position: absolute;
+  font-size: 88px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  text-shadow: 0 16px 44px rgba(0, 0, 0, 0.38);
+}
+.word-one { color: #a7f3d0; }
+.word-two { color: #fef3c7; }
+.word-three { color: #bae6fd; }
+body:not(.hf-ready) .word { opacity: 0; }
