@@ -45,6 +45,7 @@ const PIPELINE_OPERATION_IDS = Object.freeze({
   IMAGE_GENERATE: 'imageGenerate',
   IMAGE_TRANSFORM: 'imageTransform',
   VIDEO_GENERATE: 'videoGenerate',
+  HYPERFRAMES_RENDER: 'hyperframesRender',
   AUDIO_GENERATE: 'audioGenerate',
   AUDIO_TRANSFORM: 'audioTransform',
   LLM_PROMPT: 'llmPrompt',
@@ -69,6 +70,11 @@ const TOOL_PIPELINE_STRATEGIES = Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
     label: 'Operation-driven local tool',
     notes: 'Whisper fits the sequential model-step pipeline for local audio transcription and runs through the embedded faster-whisper task adapter with typed text output and source-audio lineage.',
+  }),
+  hyperframes: Object.freeze({
+    id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
+    label: 'Operation-driven local tool',
+    notes: 'HyperFrames is exposed only through the HyperFrames Render operation in this pass, rendering trusted local index.html composition projects to MP4 through the managed runtime.',
   }),
   automatic1111: Object.freeze({
     id: TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL,
@@ -146,6 +152,19 @@ const TOOL_PIPELINE_CAPABILITIES = Object.freeze({
         inputKinds: Object.freeze([MODALITY_AUDIO]),
         notes: 'Runs locally through faster-whisper inside Local AI Hub and keeps transcript timing details attached to the result.',
         outputKinds: Object.freeze([MODALITY_TEXT]),
+      }),
+    }),
+    targetType: 'tool',
+  }),
+  hyperframes: Object.freeze({
+    operations: Object.freeze({
+      [PIPELINE_OPERATION_IDS.HYPERFRAMES_RENDER]: Object.freeze({
+        inputKinds: Object.freeze([MODALITY_FILE]),
+        notes: 'Renders a trusted local index.html HyperFrames composition project to one MP4 artifact. Workers, browser GPU, format, and output path are fixed by Local AI Hub.',
+        outputKinds: Object.freeze([MODALITY_VIDEO]),
+        deterministic: true,
+        localOnly: true,
+        requiresLocalIndexHtml: true,
       }),
     }),
     targetType: 'tool',

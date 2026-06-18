@@ -3,6 +3,8 @@ const fs = require('fs');
 const path = require('path');
 
 const {
+  PIPELINE_OPERATION_IDS,
+  TOOL_PIPELINE_STRATEGY_IDS,
   getToolPipelineCapabilities,
   getToolPipelineStrategy,
 } = require('../electron/shared/pipelineCapabilities.cjs');
@@ -14,7 +16,7 @@ assert(hyperframes, 'HyperFrames must be present in the manifest.');
 
 assert.strictEqual(hyperframes.name, 'HyperFrames', 'HyperFrames display name should be stable.');
 assert.strictEqual(hyperframes.category, 'Video tools', 'HyperFrames should be categorized as a local video/media tool.');
-assert.strictEqual(hyperframes.interfaceMode, 'pipeline-only', 'HyperFrames must not expose a launch/render surface in pass 1.');
+assert.strictEqual(hyperframes.interfaceMode, 'pipeline-only', 'HyperFrames must remain pipeline-only and must not expose a launch surface.');
 assert.strictEqual(hyperframes.installInstructions.kind, 'npm-package', 'HyperFrames should use the managed npm-package lifecycle.');
 assert.strictEqual(hyperframes.installInstructions.runtime, 'node', 'HyperFrames should declare its external Node runtime dependency.');
 assert.strictEqual(hyperframes.installInstructions.npmPackage, 'hyperframes', 'HyperFrames package name should be explicit.');
@@ -35,10 +37,15 @@ const storeCardSource = fs.readFileSync(path.join(repoRoot, 'src/components/Stor
 assert(storeCardSource.includes('manifest.setupNotes'), 'Store card should render focused setup notes.');
 const libraryCardSource = fs.readFileSync(path.join(repoRoot, 'src/components/LibraryCard.jsx'), 'utf8');
 assert(libraryCardSource.includes('hyperFramesStatusItems'), 'Library card should render HyperFrames runtime readiness chips.');
-assert(libraryCardSource.includes('Rendering UI and pipeline nodes are not enabled in this pass'), 'Library card should avoid implying render support.');
+assert(libraryCardSource.includes('Use the HyperFrames Render pipeline node for trusted local index.html projects'), 'Library card should point users to the narrow pipeline render node.');
 
-assert.strictEqual(getToolPipelineStrategy('hyperframes'), null, 'HyperFrames must not gain a pipeline strategy in pass 1.');
-assert.deepStrictEqual(Object.keys(getToolPipelineCapabilities('hyperframes')?.operations || {}), [], 'HyperFrames must not gain render/pipeline operations in pass 1.');
+const strategy = getToolPipelineStrategy('hyperframes');
+assert(strategy, 'HyperFrames must expose a pipeline strategy for its pass-2 render node.');
+assert.strictEqual(strategy.id, TOOL_PIPELINE_STRATEGY_IDS.LOCAL_OPERATION_TOOL, 'HyperFrames must remain an operation-driven local tool.');
+const operations = getToolPipelineCapabilities('hyperframes')?.operations || {};
+assert.deepStrictEqual(Object.keys(operations), [PIPELINE_OPERATION_IDS.HYPERFRAMES_RENDER], 'HyperFrames must expose only the narrow render pipeline operation.');
+assert.deepStrictEqual(operations[PIPELINE_OPERATION_IDS.HYPERFRAMES_RENDER].inputKinds, ['file'], 'HyperFrames render must accept file artifacts only.');
+assert.deepStrictEqual(operations[PIPELINE_OPERATION_IDS.HYPERFRAMES_RENDER].outputKinds, ['video'], 'HyperFrames render must produce video artifacts only.');
 
 const sourceCorpus = [
   fs.readFileSync(path.join(repoRoot, 'electron/services/hyperFramesService.js'), 'utf8'),
@@ -46,7 +53,7 @@ const sourceCorpus = [
   storeCardSource,
   libraryCardSource,
 ].join('\n');
-assert(!/HyperFrames Render button|Render button|composition chooser|Studio embedding|Preview button/i.test(sourceCorpus), 'Pass 1 must not add HyperFrames render/editor/preview UI.');
+assert(!/HyperFrames Render button|Render button|composition chooser|Studio embedding|Preview button|Project browser|Studio/i.test(sourceCorpus), 'Pass 2 must not add HyperFrames launch/editor/preview/project-browser UI.');
 assert(!/HYPERFRAMES_BROWSER_PATH\s*=\s*['"]C:/i.test(sourceCorpus), 'HyperFrames browser override must not hard-code the user C: cache.');
 
 console.log('HyperFrames tool contract verifier passed.');

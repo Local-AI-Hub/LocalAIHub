@@ -48,6 +48,7 @@ const {
   MIN_NODE_MAJOR,
   buildHyperFramesChildProcessEnv,
   buildHyperFramesRuntimePaths,
+  getManagedHyperFramesExecutionRuntime,
   buildNodeMissingMessage,
   buildNodeTooOldMessage,
   buildNpmUnavailableMessage,
@@ -66,6 +67,7 @@ async function main() {
   assert(serviceSource.includes('process.versions?.electron'), 'External Node detection must explicitly reject Electron embedded runtime as the managed Node runtime.');
   assert(serviceSource.includes('findExecutableOnPath(\'node\')'), 'External Node detection must use normal child-process lookup.');
   assert(serviceSource.includes('findExecutableOnPath(\'npm\')'), 'npm detection must use normal child-process lookup.');
+  assert.strictEqual(typeof getManagedHyperFramesExecutionRuntime, 'function', 'Pipeline execution must have a readiness-only managed HyperFrames runtime helper.');
   assert(serviceSource.includes('npm_config_cache'), 'HyperFrames child processes must use a managed npm cache.');
   for (const variable of ['USERPROFILE', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'TEMP', 'TMP', 'HYPERFRAMES_NO_UPDATE_CHECK', 'HYPERFRAMES_BROWSER_PATH']) {
     assert(serviceSource.includes(variable), `HyperFrames child environment should manage ${variable}.`);
@@ -137,7 +139,7 @@ async function main() {
 
   assert(installerSource.includes("manifest.installInstructions?.kind === 'npm-package'"), 'Installer must route npm-package tools through the HyperFrames managed runtime installer.');
   assert(installerSource.includes('repairManagedHyperFrames'), 'Repair must route HyperFrames through the managed runtime repair path.');
-  assert(processSource.includes('Rendering UI and pipeline nodes are not enabled in this pass'), 'Launch attempts should not imply HyperFrames render support yet.');
+  assert(processSource.includes('Use the HyperFrames Render pipeline node for trusted local index.html projects'), 'Launch attempts should point to the narrow pipeline render node.');
 
   console.log('HyperFrames managed runtime verifier passed.');
 }

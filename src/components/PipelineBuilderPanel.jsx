@@ -8837,6 +8837,49 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                   </div>
                 ) : null}
 
+                {selectedNode.type === 'hyperframesRender' ? (
+                  <div className="space-y-4">
+                    <div className="rounded-[24px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-100">
+                      HyperFrames renders HTML/CSS/JavaScript in Chromium. Render only compositions you trust. This first version is intended for local projects with local assets.
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="hyperframes-render-fps">FPS</label>
+                        <select className="store-input mt-3" id="hyperframes-render-fps" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, fps: Number(event.target.value) } }))} value={Number(selectedNode.config?.fps || 30)}>
+                          <option value={24}>24 FPS</option>
+                          <option value={30}>30 FPS</option>
+                          <option value={60}>60 FPS</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="hyperframes-render-quality">Quality</label>
+                        <select className="store-input mt-3" id="hyperframes-render-quality" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, quality: event.target.value } }))} value={['standard', 'high'].includes(selectedNode.config?.quality) ? selectedNode.config.quality : 'draft'}>
+                          <option value="draft">Draft</option>
+                          <option value="standard">Standard</option>
+                          <option value="high">High</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="hyperframes-render-format">Format</label>
+                        <input className="store-input mt-3" id="hyperframes-render-format" readOnly value="MP4" />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="hyperframes-render-workers">Workers</label>
+                        <input className="store-input mt-3" id="hyperframes-render-workers" readOnly value="1" />
+                      </div>
+                      <div>
+                        <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="hyperframes-render-browser-gpu">Browser GPU</label>
+                        <input className="store-input mt-3" id="hyperframes-render-browser-gpu" readOnly value="Disabled" />
+                      </div>
+                    </div>
+                    <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
+                      Connect a File Input artifact named index.html. Local assets are staged before lint and render; use system or local fonts only.
+                    </div>
+                  </div>
+                ) : null}
+
                 {selectedNode.type === 'branchMerge' ? (
                   <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
                     Connect compatible branches here. Local AI Hub waits for earlier branches to finish or skip, then forwards the single branch that still has an artifact. When this merge is the retry target for a Retry Loop, the first attempt uses the connected branch and later attempts can re-enter with the loop-carried retry artifact. If two unrelated live results arrive together, the run stops with a plain-English error so the merge stays explicit.

@@ -147,6 +147,7 @@ const PIPELINE_OPERATION_LABELS = Object.freeze({
   [PIPELINE_OPERATION_IDS.IMAGE_GENERATE]: 'Image generation',
   [PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM]: 'Image transform',
   [PIPELINE_OPERATION_IDS.VIDEO_GENERATE]: 'Video generation',
+  [PIPELINE_OPERATION_IDS.HYPERFRAMES_RENDER]: 'HyperFrames render',
   [PIPELINE_OPERATION_IDS.AUDIO_GENERATE]: 'Audio generation',
   [PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM]: 'Audio transform',
   [PIPELINE_OPERATION_IDS.LLM_PROMPT]: 'Text response',
@@ -1351,6 +1352,34 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       fps: 30,
       fitMode: 'contain',
       stopMode: 'shortest',
+    },
+  }),
+  hyperframesRender: Object.freeze({
+    type: 'hyperframesRender',
+    label: 'HyperFrames Render',
+    category: 'Deterministic Media Operations',
+    description: 'Renders a trusted local index.html HyperFrames composition project to a single MP4 video artifact.',
+    inputPorts: [
+      {
+        id: 'project',
+        kind: PORT_KIND_FILE,
+        label: 'index.html',
+        required: true,
+      },
+    ],
+    outputPorts: [
+      {
+        id: 'video',
+        kind: PORT_KIND_VIDEO,
+        label: 'MP4 Video',
+      },
+    ],
+    configDefaults: {
+      fps: 30,
+      quality: 'draft',
+      workers: 1,
+      browserGpu: false,
+      format: 'mp4',
     },
   }),
   planOutput: Object.freeze({
@@ -3624,6 +3653,17 @@ function resolveToolBackedNodeCapability(node, contextMaps = {}) {
       targetLabel: 'Cloud provider',
     };
   }
+  if (node.type === 'hyperframesRender') {
+    const tool = getContextToolEntry('hyperframes', contextMaps);
+    return {
+      capability: getContextToolOperation('hyperframes', PIPELINE_OPERATION_IDS.HYPERFRAMES_RENDER, contextMaps),
+      operationId: PIPELINE_OPERATION_IDS.HYPERFRAMES_RENDER,
+      targetId: 'hyperframes',
+      targetKind: 'tool',
+      targetLabel: tool?.name || 'HyperFrames',
+    };
+  }
+
   if (node.type === 'graphWorkflow') {
     const resolvedPreset = resolveGraphWorkflowPresetNode(node, contextMaps);
     const effectiveNode = resolvedPreset.node;
@@ -4763,6 +4803,10 @@ function getLocalToolRequirement(node, contextMaps = {}) {
   }
   if (node.type === 'graphWorkflow') {
     return getGraphWorkflowToolId(node);
+  }
+
+  if (node.type === 'hyperframesRender') {
+    return 'hyperframes';
   }
 
   return null;
@@ -6866,6 +6910,50 @@ function analyzePipeline(definition = {}, context = {}) {
           summary.readiness = {
             tone: 'info',
             message: 'This export renders the connected composition to a video artifact through the shared ffmpeg-backed export path.',
+          };
+        }
+      }
+
+      if (node.type === 'hyperframesRender') {
+        const projectKinds = getIncomingKindsForNodePort(node, 'project', graph);
+        const fps = Number(node.config?.fps || 30);
+        const quality = String(node.config?.quality || 'draft').trim().toLowerCase();
+        const tool = contextMaps.toolsById.hyperframes || null;
+        const runtime = tool?.hyperframes || null;
+        if (!projectKinds.includes(PORT_KIND_FILE)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Connect a File Input that points to a local index.html before running HyperFrames Render.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (![24, 30, 60].includes(fps)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'HyperFrames Render supports 24, 30, or 60 FPS in this first version.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!['draft', 'standard', 'high'].includes(quality)) {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Choose Draft, Standard, or High quality for HyperFrames Render.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!tool || !tool.installedByLocalAIHub || tool.status === 'not-installed') {
+          summary.readiness = {
+            tone: 'error',
+            message: 'Install or repair HyperFrames before running this render step.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else if (!runtime?.browserReady || !runtime?.doctorReady || !runtime?.ffmpegReady) {
+          summary.readiness = {
+            tone: 'error',
+            message: runtime?.setupSummary || 'HyperFrames is installed but not ready. Open HyperFrames setup or run Repair, then try again.',
+          };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
+        } else {
+          summary.readiness = {
+            tone: 'info',
+            message: 'HyperFrames is ready. This step lints a trusted local index.html project, stages local assets, and renders one MP4 artifact.',
           };
         }
       }

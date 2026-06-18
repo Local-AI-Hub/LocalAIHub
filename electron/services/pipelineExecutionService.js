@@ -68,6 +68,7 @@ const {
 } = require('../shared/toolAssetSelection.cjs');
 const { generateImageWithLocalImageTool } = require('./localImageService');
 const { generateVideoWithLocalVideoTool } = require('./localVideoService');
+const { renderHyperFramesComposition } = require('./hyperFramesRenderService');
 const { extractVideoLastFrameArtifact } = require('./videoFrameService');
 const {
   applyPromptStyleToPrompt,
@@ -466,6 +467,10 @@ function isHeavyLocalPipelineNode(node) {
   if (node.type === 'graphWorkflow') {
     const toolId = String(getGraphWorkflowToolId(node) || '').trim().toLowerCase();
     return toolId === 'comfyui' || toolId === 'invokeai';
+  }
+
+  if (node.type === 'hyperframesRender') {
+    return true;
   }
 
   return false;
@@ -9270,6 +9275,34 @@ async function executeMediaCompositionNode(node, graph, run) {
     preview: summarizeArtifact(persistedComposition),
   };
 }
+async function executeHyperFramesRenderNode(node, graph, run, contextMaps, reportProgress) {
+  const projectInput = getNodeInputArtifacts(node.id, 'project', graph, run.resultsByNodeId, run)[0] || null;
+  const sourceNode = projectInput?.edge?.source?.nodeId
+    ? graph.nodeMap.get(projectInput.edge.source.nodeId) || null
+    : null;
+  const toolState = contextMaps?.toolsById?.hyperframes || null;
+  const renderResult = await renderHyperFramesComposition({
+    artifact: projectInput?.artifact || null,
+    sourceNode,
+  }, {
+    cancelSignal: activeRunAbortController?.signal || null,
+    config: node.config || {},
+    displayName: node.label || 'HyperFrames render',
+    nodeId: node.id,
+    reportProgress,
+    runDirectories: run.directories,
+    toolState,
+  });
+
+  return {
+    destinationPath: renderResult.artifact.filePath,
+    message: renderResult.message,
+    outputs: {
+      video: renderResult.artifact,
+    },
+    preview: summarizeArtifact(renderResult.artifact),
+  };
+}
 async function executeMediaExportNode(node, graph, run, reportProgress) {
   const compositionInput = getNodeInputArtifacts(node.id, 'composition', graph, run.resultsByNodeId, run)[0] || null;
   const compositionArtifact = compositionInput?.artifact || null;
@@ -10070,6 +10103,10 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
 
   if (node.type === 'mediaExport') {
     return executeMediaExportNode(node, graph, run, reportProgress);
+  }
+
+  if (node.type === 'hyperframesRender') {
+    return executeHyperFramesRenderNode(node, graph, run, contextMaps, reportProgress);
   }
 
   if (node.type === 'branchMerge') {

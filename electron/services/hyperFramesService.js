@@ -310,12 +310,17 @@ async function runHyperFramesCli(paths, runtime, args, options = {}) {
   }
   const env = buildHyperFramesChildProcessEnv(paths, runtime, {
     browserExecutablePath: options.browserExecutablePath || null,
+    env: options.env || null,
+    ffmpegPaths: options.ffmpegPaths || null,
   });
   return runCommand(runtime.nodePath, [cliPath, ...args], {
+    abortMessage: options.abortMessage || 'HyperFrames render was cancelled.',
     allowFailure: Boolean(options.allowFailure),
-    cwd: paths.runtimeDir,
+    cwd: options.cwd || paths.runtimeDir,
     env,
+    signal: options.signal || null,
     timeoutMs: options.timeoutMs || COMMAND_TIMEOUT_MS,
+    timeoutMessage: options.timeoutMessage || 'HyperFrames took too long and Local AI Hub stopped the render.',
     errorMessage: options.errorMessage || 'Local AI Hub could not run the managed HyperFrames CLI.',
   });
 }
@@ -574,6 +579,34 @@ async function installManagedHyperFrames(manifest, options = {}, logger = null) 
   return toolState;
 }
 
+async function getManagedHyperFramesExecutionRuntime(toolState = {}, options = {}) {
+  const installRoot = normalizeOptionalDirectoryPath(options.installRoot || toolState?.installRoot || toolState?.requestedInstallRoot || '') || getAppPaths().managedRoot;
+  const paths = buildHyperFramesRuntimePaths({ installRoot });
+  const runtime = await detectExternalNodeAndNpm();
+  const packageReadiness = await verifyPinnedHyperFramesPackage(paths);
+  if (!packageReadiness.ok) {
+    throw new Error(packageReadiness.error || 'HyperFrames is not installed in the managed runtime folder. Run Repair to reinstall it.');
+  }
+
+  const ffmpegReadiness = await assertManagedFfmpegReady();
+  const configuredBrowserPath = String(options.browserExecutablePath || toolState?.hyperframes?.browserExecutablePath || '').trim();
+  const browserExecutablePath = configuredBrowserPath
+    ? await validateManagedBrowserExecutable(paths, configuredBrowserPath)
+    : await getValidPersistedBrowserPath(paths);
+  if (!browserExecutablePath) {
+    throw new Error('HyperFrames needs its managed Chrome Headless Shell before rendering. Run Repair to provision it.');
+  }
+
+  const doctorReadiness = await runHyperFramesDoctor(paths, runtime, browserExecutablePath, options.logger || null);
+  return {
+    browserExecutablePath,
+    doctorReadiness,
+    ffmpegReadiness,
+    packageReadiness,
+    paths,
+    runtime,
+  };
+}
 async function inspectHyperFramesRepairState(toolState, manifest) {
   const installRoot = normalizeOptionalDirectoryPath(toolState?.installRoot || toolState?.requestedInstallRoot || '') || getAppPaths().managedRoot;
   const paths = buildHyperFramesRuntimePaths({ installRoot });
@@ -643,6 +676,7 @@ module.exports = {
   getBrowserResourcesStatus,
   getHyperFramesCliPath,
   getHyperFramesInstallPreflight,
+  getManagedHyperFramesExecutionRuntime,
   getHomeDriveAndPath,
   getInstalledHyperFramesVersion,
   inspectHyperFramesRepairState,

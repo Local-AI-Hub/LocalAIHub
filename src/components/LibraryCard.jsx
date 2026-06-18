@@ -8,7 +8,7 @@ function isPipelineOnlyTool(tool) {
 
 function pipelineOnlyMessage(tool) {
   if (tool?.id === 'hyperframes') {
-    return 'HyperFrames is installed as a managed runtime foundation. Rendering UI and pipeline nodes are not enabled in this pass.';
+    return 'HyperFrames is installed as a managed runtime foundation. Use the HyperFrames Render pipeline node for trusted local index.html projects.';
   }
 
   if (tool?.id === 'chatterbox-tts') {

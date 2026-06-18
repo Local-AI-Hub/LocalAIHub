@@ -184,7 +184,7 @@ async function verifySameFilenameIdentityConflicts() {
     const secondPayload = remotePayload(tool, 'publisher/second', 'Second Model');
     await assert.rejects(
       () => modelService.downloadModel(tool, secondPayload),
-      /different model named model\.safetensors.*will not overwrite or relabel/i,
+      /different model named (?:model\.safetensors|<private-file>).*will not overwrite or relabel/i,
       'Different source identity with the same filename should be blocked clearly.',
     );
 

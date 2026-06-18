@@ -1718,6 +1718,10 @@ async function buildFileArtifact(filePath, options = {}) {
     artifact.compositionExport = serializeArtifactForUi(options.compositionExport);
   }
 
+  if (options.hyperFramesRender && typeof options.hyperFramesRender === 'object') {
+    artifact.hyperFramesRender = serializeArtifactForUi(options.hyperFramesRender);
+  }
+
   if ((previewKind === 'image' || previewKind === 'animated-image') && nativeImage) {
     try {
       const image = nativeImage.createFromPath(resolvedPath);
@@ -2184,11 +2188,14 @@ async function saveVideoArtifactMetadata(filePath, artifact) {
   const videoNormalization = serializeVideoNormalizationForUi(artifact?.videoNormalization);
   const mediaTrim = serializeMediaTrimForUi(artifact?.mediaTrim);
   const subtitleBurn = serializeSubtitleBurnForUi(artifact?.subtitleBurn);
-  if (!compositionExport && !videoGeneration && !videoStitch && !videoNormalization && !mediaTrim && !subtitleBurn) {
+  const hyperFramesRender = artifact?.hyperFramesRender && typeof artifact.hyperFramesRender === 'object'
+    ? serializeArtifactForUi(artifact.hyperFramesRender)
+    : null;
+  if (!compositionExport && !videoGeneration && !videoStitch && !videoNormalization && !mediaTrim && !subtitleBurn && !hyperFramesRender) {
     return [];
   }
 
-  const suffix = (videoGeneration || videoStitch || videoNormalization || mediaTrim || subtitleBurn) ? '.video.json' : '.composition-export.json';
+  const suffix = (videoGeneration || videoStitch || videoNormalization || mediaTrim || subtitleBurn || hyperFramesRender) ? '.video.json' : '.composition-export.json';
   const metadataPath = path.join(path.dirname(filePath), path.basename(filePath, path.extname(filePath)) + suffix);
   await fs.writeJson(metadataPath, {
     compositionExport,
@@ -2202,6 +2209,7 @@ async function saveVideoArtifactMetadata(filePath, artifact) {
     videoNormalization,
     mediaTrim,
     subtitleBurn,
+    hyperFramesRender,
   }, { spaces: 2 });
 
   return [metadataPath];
@@ -2652,6 +2660,7 @@ async function copyArtifactToOutput(artifact, runDirectories, options = {}) {
     audioStitch: artifact.audioStitch,
     compositionExport: artifact.compositionExport,
     displayName: title,
+    hyperFramesRender: artifact.hyperFramesRender,
     imageTransformation: artifact.imageTransformation,
     videoFrameExtraction: artifact.videoFrameExtraction,
     videoGeneration: artifact.videoGeneration,
@@ -2934,6 +2943,9 @@ async function describeArtifactForLlm(artifact) {
     artifact.audioExtraction?.sourceVideo?.fileName ? 'Extracted audio from: ' + artifact.audioExtraction.sourceVideo.fileName : '',
     artifact.audioNormalization?.sourceAudio?.fileName ? 'Normalized audio from: ' + artifact.audioNormalization.sourceAudio.fileName : '',
     artifact.mediaTrim?.sourceArtifact?.fileName ? 'Trimmed from: ' + artifact.mediaTrim.sourceArtifact.fileName : '',
+    artifact.hyperFramesRender?.toolId ? 'Rendered by: HyperFrames' : '',
+    artifact.hyperFramesRender?.fps ? 'Render FPS: ' + artifact.hyperFramesRender.fps : '',
+    artifact.hyperFramesRender?.quality ? 'Render quality: ' + artifact.hyperFramesRender.quality : '',
     artifact.imageTransformation?.backendLabel ? 'Image transformed by: ' + artifact.imageTransformation.backendLabel : '',
     artifact.imageTransformation?.toolLabel ? 'Image transform tool: ' + artifact.imageTransformation.toolLabel : '',
     artifact.imageTransformation?.model ? 'Image transform model: ' + artifact.imageTransformation.model : '',
