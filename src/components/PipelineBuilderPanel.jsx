@@ -1,12 +1,8 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
-import pipelineWizardShared from '../../electron/shared/pipelineWizard.cjs';
-import pipelineWizardLifecycleShared from '../../electron/shared/pipelineWizardLifecycle.cjs';
 import pipelineTemplatesShared from '../../electron/shared/pipelineTemplates.cjs';
 import toolAssetSelectionShared from '../../electron/shared/toolAssetSelection.cjs';
-import AssetLibraryManager from './AssetLibraryManager';
 import HoverRevealText from './HoverRevealText';
-import PromptStylePresetManager from './PromptStylePresetManager';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
   GRAPH_WORKFLOW_TOOL_IDS,
@@ -29,22 +25,28 @@ import collectionInputState from '../lib/pipeline-collection-input-state.cjs';
 import { expectNextPrintableKeyDiagnostic, isEditableTarget, logRendererActionDiagnostic } from '../lib/focus-guard';
 import { formatBytes } from '../lib/formatters';
 
-const {
-  buildPipelineWizardContext,
-  buildPipelineWizardDraft,
-  buildPipelineWizardMessages,
-  buildPipelineWizardStructuredOutputRequest,
-  getPipelineWizardRequestProfile,
-  parsePipelineWizardPlan,
-} = pipelineWizardShared;
+const AssetLibraryManager = React.lazy(() => import('./AssetLibraryManager'));
+const PromptStylePresetManager = React.lazy(() => import('./PromptStylePresetManager'));
 
-const {
-  WIZARD_CLOUD_DRAFT_TIMEOUT_MS,
-  WIZARD_CLIENT_TIMEOUT_GRACE_MS,
-  WIZARD_LOCAL_DRAFT_TIMEOUT_MS,
-  buildWizardFailureSummary,
-  runPipelineWizardLifecycle,
-} = pipelineWizardLifecycleShared;
+let pipelineWizardModulesPromise = null;
+
+function unwrapCommonJsModule(moduleValue) {
+  return moduleValue?.default || moduleValue || {};
+}
+
+function loadPipelineWizardModules() {
+  if (!pipelineWizardModulesPromise) {
+    pipelineWizardModulesPromise = Promise.all([
+      import('../../electron/shared/pipelineWizard.cjs'),
+      import('../../electron/shared/pipelineWizardLifecycle.cjs'),
+    ]).then(([wizardModule, lifecycleModule]) => ({
+      ...unwrapCommonJsModule(wizardModule),
+      ...unwrapCommonJsModule(lifecycleModule),
+    }));
+  }
+
+  return pipelineWizardModulesPromise;
+}
 
 const {
   BUILT_IN_PIPELINE_TEMPLATES,
@@ -3876,8 +3878,8 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     [draft.nodes, graph, selectedNode],
   );
   const connectedProviders = useMemo(() => (providers || []).filter((provider) => provider.isConnected), [providers]);
-  const wizardContext = useMemo(
-    () => buildPipelineWizardContext({ hardware, manifests, providers, tools: pipelineTools, assetLibraries: { soundEffects: soundEffectLibraries, fonts: fontLibraries, colorPalettes: colorPaletteLibraries } }),
+  const wizardContextInput = useMemo(
+    () => ({ hardware, manifests, providers, tools: pipelineTools, assetLibraries: { soundEffects: soundEffectLibraries, fonts: fontLibraries, colorPalettes: colorPaletteLibraries } }),
     [colorPaletteLibraries, fontLibraries, hardware, manifests, pipelineTools, providers, soundEffectLibraries],
   );
   const wizardTarget = useMemo(() => ({
@@ -5583,14 +5585,30 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     setWizardSummary(null);
 
     const targetLabel = getWizardTargetLabel({ ...wizardTarget, model: wizardModelId }, connectedProviders);
-    const requestTimeoutMs = wizardExecutionMode === 'ollama'
-      ? WIZARD_LOCAL_DRAFT_TIMEOUT_MS
-      : WIZARD_CLOUD_DRAFT_TIMEOUT_MS;
     const timeoutMessage = wizardExecutionMode === 'ollama'
       ? 'Ollama took too long to draft the pipeline. Local AI Hub kept the request bounded; for complex workflows on this hardware, try a simpler request, a stronger downloaded model, or a cloud wizard model.'
       : 'The wizard model did not return a draft within the allowed time. Try a simpler request, a stronger model, or split the workflow into stages.';
+    let buildWizardFailureSummaryForCatch = null;
 
     try {
+      const {
+        WIZARD_CLIENT_TIMEOUT_GRACE_MS,
+        WIZARD_CLOUD_DRAFT_TIMEOUT_MS,
+        WIZARD_LOCAL_DRAFT_TIMEOUT_MS,
+        buildPipelineWizardContext,
+        buildPipelineWizardDraft,
+        buildPipelineWizardMessages,
+        buildPipelineWizardStructuredOutputRequest,
+        buildWizardFailureSummary,
+        getPipelineWizardRequestProfile,
+        parsePipelineWizardPlan,
+        runPipelineWizardLifecycle,
+      } = await loadPipelineWizardModules();
+      buildWizardFailureSummaryForCatch = buildWizardFailureSummary;
+      const wizardContext = buildPipelineWizardContext(wizardContextInput);
+      const requestTimeoutMs = wizardExecutionMode === 'ollama'
+        ? WIZARD_LOCAL_DRAFT_TIMEOUT_MS
+        : WIZARD_CLOUD_DRAFT_TIMEOUT_MS;
       const requestProfile = getPipelineWizardRequestProfile({
         context: wizardContext,
         intent: normalizedIntent,
@@ -5677,11 +5695,24 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
         return;
       }
       const message = error?.message || 'Local AI Hub could not finish this wizard request.';
-      const summary = buildWizardFailureSummary({
-        category: 'provider_call_failed',
-        message,
-        targetLabel,
-      });
+      const summary = typeof buildWizardFailureSummaryForCatch === 'function'
+        ? buildWizardFailureSummaryForCatch({
+            category: 'provider_call_failed',
+            message,
+            targetLabel,
+          })
+        : {
+            recipeId: '',
+            recipeLabel: 'Wizard model error',
+            resultState: 'error',
+            targetLabel,
+            headline: 'Wizard draft was not created',
+            message,
+            gaps: [message],
+            manualRefinementNotes: [],
+            graphErrorCount: 1,
+            graphWarningCount: 0,
+          };
       setWizardSummary(summary);
       onToast(message, 'error');
     } finally {
@@ -9083,7 +9114,13 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                   {sectionVisibility.assetLibraries ? 'Collapse' : 'Expand'}
                 </button>
               </div>
-              {sectionVisibility.assetLibraries ? <div className="mt-4"><AssetLibraryManager onToast={onToast} /></div> : null}
+              {sectionVisibility.assetLibraries ? (
+                <div className="mt-4">
+                  <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">Loading asset libraries...</div>}>
+                    <AssetLibraryManager onToast={onToast} />
+                  </Suspense>
+                </div>
+              ) : null}
             </div>
 
             <div className={getPipelineTwoColumnSectionPanelClass(sectionVisibility.promptStyles)} data-pipeline-resource-section="prompt-styles">
@@ -9099,12 +9136,14 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
               </div>
               {sectionVisibility.promptStyles ? (
                 <div className="mt-4">
-                  <PromptStylePresetManager
-                    busyMap={busyMap}
-                    onDeletePromptStyle={onDeletePromptStyle}
-                    onSavePromptStyle={onSavePromptStyle}
-                    promptStyles={promptStyles}
-                  />
+                  <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">Loading prompt styles...</div>}>
+                    <PromptStylePresetManager
+                      busyMap={busyMap}
+                      onDeletePromptStyle={onDeletePromptStyle}
+                      onSavePromptStyle={onSavePromptStyle}
+                      promptStyles={promptStyles}
+                    />
+                  </Suspense>
                 </div>
               ) : null}
             </div>

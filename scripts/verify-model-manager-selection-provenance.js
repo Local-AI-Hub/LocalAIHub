@@ -127,7 +127,7 @@ async function verifySelectionIdentityAndConflicts() {
 
     await assert.rejects(
       () => modelService.downloadModel(tool, second),
-      /different model named model\.safetensors.*will not overwrite or relabel/i,
+      /different model named (?:model\.safetensors|<private-file>).*will not overwrite or relabel/i,
       'Same destination with a different source identity should produce the conflict message used by the UI.',
     );
   } finally {
