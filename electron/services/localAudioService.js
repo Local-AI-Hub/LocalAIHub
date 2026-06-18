@@ -8,6 +8,7 @@ try {
 }
 
 const { runCommand } = require('./commandService');
+const { prependManagedFfmpegBinToPath, resolveManagedFfmpegPaths } = require('./managedFfmpegService');
 const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
@@ -49,30 +50,11 @@ function getHelperScriptPath(toolId) {
 }
 
 async function resolveBundledFfmpegPath() {
-  const candidates = [];
-  if (app?.isPackaged && process.resourcesPath) {
-    candidates.push(path.join(process.resourcesPath, 'bin', 'ffmpeg.exe'));
-  }
-
   try {
-    const ffmpegStaticPath = require('ffmpeg-static');
-    if (ffmpegStaticPath) {
-      candidates.push(String(ffmpegStaticPath));
-    }
+    return resolveManagedFfmpegPaths().ffmpegPath;
   } catch {
-    // The packaged app copies ffmpeg.exe into extra resources instead of relying on node_modules.
+    return '';
   }
-
-  candidates.push(path.join(__dirname, '..', '..', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'));
-  candidates.push(path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'));
-
-  for (const candidate of uniqueNonEmptyStrings(candidates)) {
-    if (await fs.pathExists(candidate)) {
-      return path.resolve(candidate);
-    }
-  }
-
-  return '';
 }
 
 function prependExecutableDirectoryToPath(env, executablePath) {
@@ -81,16 +63,11 @@ function prependExecutableDirectoryToPath(env, executablePath) {
     return env;
   }
 
-  const executableDirectory = path.dirname(resolvedExecutablePath);
-  const pathKey = Object.keys(env || {}).find((key) => key.toLowerCase() === 'path') || 'PATH';
-  const existingPath = String(env?.[pathKey] || process.env[pathKey] || '');
-  const existingSegments = existingPath.split(path.delimiter).filter(Boolean);
-  const alreadyPresent = existingSegments.some((segment) => path.resolve(segment).toLowerCase() === path.resolve(executableDirectory).toLowerCase());
-  return {
-    ...env,
-    FFMPEG_BINARY: resolvedExecutablePath,
-    [pathKey]: alreadyPresent ? existingPath : executableDirectory + (existingPath ? path.delimiter + existingPath : ''),
-  };
+  try {
+    return prependManagedFfmpegBinToPath(env, resolveManagedFfmpegPaths());
+  } catch {
+    return env;
+  }
 }
 
 async function prepareLocalAudioRuntimeEnv(tool, toolId) {

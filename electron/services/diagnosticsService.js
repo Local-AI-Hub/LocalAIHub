@@ -2,12 +2,10 @@ const path = require('path');
 const fs = require('fs-extra');
 const si = require('systeminformation');
 const archiver = require('archiver');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
 
 const { ensureStorage, getAppPaths, readConfig } = require('./configService');
 const { detectHardwareSnapshot, detectStorageSnapshot, findDiskForPath, getLiveResourceUsage } = require('./hardwareService');
-const { resolveFfmpegPath } = require('./mediaCompositionService');
+const { getManagedFfmpegReadiness, resolveManagedFfmpegPaths } = require('./managedFfmpegService');
 const { getModelManagerCacheSummary, listDownloadedModels, readModelSettings, supportsModelManager } = require('./modelService');
 const { listPipelineOutputs } = require('./pipelineOutputStoreService');
 const { listProviderConnections } = require('./providerService');
@@ -16,7 +14,6 @@ const { redactDiagnosticValue, redactSensitiveText } = require('./redactionServi
 const { getRecentSupportEvents } = require('./supportEventService');
 const { buildMergedToolStateList } = require('./toolStateService');
 
-const execFileAsync = promisify(execFile);
 const DIAGNOSTICS_SCHEMA_VERSION = 1;
 const MAX_LOG_FILES = 6;
 const MAX_LOG_FILE_BYTES = 256 * 1024;
@@ -180,12 +177,18 @@ function summarizeOutputRuns(outputs = []) {
 
 async function getFfmpegSummary(paths) {
   try {
-    const executable = resolveFfmpegPath();
-    const result = await execFileAsync(executable, ['-version'], { windowsHide: true, timeout: 8000, maxBuffer: 64 * 1024 });
-    const version = String(result.stdout || result.stderr || '').split(/\r?\n/)[0].trim().slice(0, 240);
-    return { available: true, version: sanitizeText(version, paths, 240) };
+    const managedPaths = resolveManagedFfmpegPaths();
+    const readiness = await getManagedFfmpegReadiness(managedPaths);
+    if (!readiness.ok) {
+      return { available: false, version: '', ffprobeVersion: '', error: sanitizeText(readiness.error || 'Managed FFmpeg is incomplete.', paths, 300) };
+    }
+    return {
+      available: true,
+      version: sanitizeText(readiness.ffmpegVersion, paths, 240),
+      ffprobeVersion: sanitizeText(readiness.ffprobeVersion, paths, 240),
+    };
   } catch (error) {
-    return { available: false, version: '', error: sanitizeText(error?.message || 'FFmpeg was not found.', paths, 300) };
+    return { available: false, version: '', ffprobeVersion: '', error: sanitizeText(error?.message || 'Managed FFmpeg was not found.', paths, 300) };
   }
 }
 

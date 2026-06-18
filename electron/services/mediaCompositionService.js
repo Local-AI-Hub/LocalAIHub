@@ -1,21 +1,8 @@
 const path = require('path');
 const fs = require('fs-extra');
 
-let app = null;
-try {
-  ({ app } = require('electron'));
-} catch {
-  app = null;
-}
-
-let ffmpegStaticPath = '';
-try {
-  ffmpegStaticPath = require('ffmpeg-static') || '';
-} catch {
-  ffmpegStaticPath = '';
-}
-
 const { runCommand } = require('./commandService');
+const { resolveManagedFfmpegPaths } = require('./managedFfmpegService');
 const { createLogger } = require('./logService');
 const { buildFileArtifact, isCompositionArtifact, serializeArtifactForUi, summarizeArtifact } = require('./pipelineArtifactService');
 const { resolveAssetLibraryPreviewFile } = require('./assetLibraryService');
@@ -114,18 +101,11 @@ function buildFfmpegFailureMessage(commandResult) {
     : `Local AI Hub could not render the media composition to video. ${codeMessage}${outputHint}`;
 }
 function resolveFfmpegPath() {
-  const packagedPath = app?.isPackaged
-    ? path.join(process.resourcesPath, 'bin', 'ffmpeg.exe')
-    : '';
-  if (packagedPath && fs.existsSync(packagedPath)) {
-    return packagedPath;
-  }
+  return resolveManagedFfmpegPaths().ffmpegPath;
+}
 
-  if (ffmpegStaticPath && fs.existsSync(ffmpegStaticPath)) {
-    return ffmpegStaticPath;
-  }
-
-  throw new Error('Local AI Hub could not find its bundled ffmpeg runtime. Rebuild or reinstall the app, then try this export again.');
+function resolveFfprobePath() {
+  return resolveManagedFfmpegPaths().ffprobePath;
 }
 
 function getCompositionTracks(artifact) {
@@ -1067,4 +1047,5 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
 module.exports = {
   exportCompositionArtifactToVideo,
   resolveFfmpegPath,
+  resolveFfprobePath,
 };

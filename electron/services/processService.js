@@ -7,7 +7,7 @@ const { PythonShell } = require('python-shell');
 const { getAppPaths, humanizeError, upsertTool } = require('./configService');
 const { killProcessTree, runCommand } = require('./commandService');
 const { createLogger } = require('./logService');
-const { resolveFfmpegPath } = require('./mediaCompositionService');
+const { prependManagedFfmpegBinToPath, resolveManagedFfmpegPaths } = require('./managedFfmpegService');
 const { buildOllamaAllocationFailureMessage, isOllamaAllocationFailureMessage } = require('./ollamaFailureService');
 const { attemptAutomaticLaunchRecovery, diagnoseLaunchFailure, selectPyTorchRepairCandidates } = require('./runtimeRecoveryService');
 const { assessDiskSpace, detectStorageSnapshot, findDiskForPath, getNvidiaRuntimeDetails, detectHardwareSnapshot } = require('./hardwareService');
@@ -71,6 +71,8 @@ const MANAGED_LAUNCH_ENV_KEYS = Object.freeze([
   'LOCALAIHUB_FFMPEG_DIR',
   'FFMPEG_BINARY',
   'IMAGEIO_FFMPEG_EXE',
+  'FFPROBE_BINARY',
+  'LOCALAIHUB_FFPROBE_BINARY',
 ]);
 const MANAGED_STABLE_DIFFUSION_CLIP_PACKAGE = '--no-build-isolation git+https://github.com/openai/CLIP.git@d50d76daa670286dd6cacf3bcd80b5e4823fc8e1#egg=clip';
 const MANAGED_STABLE_DIFFUSION_REPO_URL = 'https://github.com/w-e-w/stablediffusion.git';
@@ -1066,44 +1068,27 @@ function shouldExposeBundledFfmpeg(toolState, policy) {
   );
 }
 
-function prependDirectoryToEnvPath(env, directoryPath) {
-  const normalizedDirectory = String(directoryPath || '').trim();
-  if (!normalizedDirectory) {
-    return env;
-  }
-
-  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') || 'PATH';
-  const existingPath = String(env[pathKey] || '');
-  const existingEntries = existingPath.split(path.delimiter).map((entry) => entry.trim()).filter(Boolean);
-  const normalizedTarget = path.resolve(normalizedDirectory).toLowerCase();
-  const alreadyPresent = existingEntries.some((entry) => path.resolve(entry).toLowerCase() === normalizedTarget);
-  env[pathKey] = alreadyPresent
-    ? existingPath
-    : [normalizedDirectory, ...existingEntries].join(path.delimiter);
-  return env;
-}
 
 async function applyBundledFfmpegLaunchEnv(toolState, policy, env) {
   if (!shouldExposeBundledFfmpeg(toolState, policy)) {
     return env;
   }
 
-  let ffmpegPath = '';
+  let managedPaths = null;
   try {
-    ffmpegPath = resolveFfmpegPath();
+    managedPaths = resolveManagedFfmpegPaths();
   } catch (error) {
-    throw new Error('Local AI Hub could not find its bundled FFmpeg runtime for FaceFusion. Reinstall Local AI Hub, then try launching FaceFusion again.');
+    throw new Error('Local AI Hub could not find its managed FFmpeg and FFprobe runtime. Reinstall Local AI Hub, then try launching this tool again.');
   }
 
-  if (!(await fs.pathExists(ffmpegPath))) {
-    throw new Error('Local AI Hub found a FaceFusion FFmpeg setting, but the bundled ffmpeg.exe is missing. Reinstall Local AI Hub, then try launching FaceFusion again.');
+  if (!(await fs.pathExists(managedPaths.ffmpegPath))) {
+    throw new Error('Local AI Hub found a managed FFmpeg setting, but ffmpeg.exe is missing. Reinstall Local AI Hub, then try launching this tool again.');
+  }
+  if (!(await fs.pathExists(managedPaths.ffprobePath))) {
+    throw new Error('Local AI Hub found a managed FFmpeg setting, but ffprobe.exe is missing. Reinstall Local AI Hub, then try launching this tool again.');
   }
 
-  const ffmpegDir = path.dirname(ffmpegPath);
-  env.LOCALAIHUB_FFMPEG_DIR = ffmpegDir;
-  env.FFMPEG_BINARY = ffmpegPath;
-  env.IMAGEIO_FFMPEG_EXE = ffmpegPath;
-  prependDirectoryToEnvPath(env, ffmpegDir);
+  Object.assign(env, prependManagedFfmpegBinToPath(env, managedPaths));
   return env;
 }
 
