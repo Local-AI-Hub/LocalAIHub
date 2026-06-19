@@ -51,6 +51,10 @@ function verifyPipelineOnlyDynamicImports() {
     'Pipeline Resources should lazy-load PromptStylePresetManager.',
   );
   assert(
+    pipelineSource.includes("const HyperFramesProjectManager = React.lazy(() => import('./HyperFramesProjectManager'));"),
+    'Pipeline Resources should lazy-load HyperFramesProjectManager.',
+  );
+  assert(
     pipelineSource.includes('loadPipelineWizardModules') && pipelineSource.includes('await loadPipelineWizardModules()'),
     'Wizard generation should load wizard modules on demand.',
   );
@@ -107,6 +111,10 @@ function verifyBuiltChunks() {
   assert(
     jsAssets.some((asset) => asset.fileName.startsWith('PromptStylePresetManager-')),
     'Build output should include a separate PromptStylePresetManager dynamic chunk.',
+  );
+  assert(
+    jsAssets.some((asset) => asset.fileName.startsWith('HyperFramesProjectManager-')),
+    'Build output should include a separate HyperFramesProjectManager dynamic chunk.',
   );
   assert(
     jsAssets.some((asset) => asset.fileName.startsWith('pipeline-templates-')),

@@ -26,6 +26,7 @@ import { expectNextPrintableKeyDiagnostic, isEditableTarget, logRendererActionDi
 import { formatBytes } from '../lib/formatters';
 
 const AssetLibraryManager = React.lazy(() => import('./AssetLibraryManager'));
+const HyperFramesProjectManager = React.lazy(() => import('./HyperFramesProjectManager'));
 const PromptStylePresetManager = React.lazy(() => import('./PromptStylePresetManager'));
 
 let pipelineWizardModulesPromise = null;
@@ -134,6 +135,7 @@ const DEFAULT_PIPELINE_SECTION_VISIBILITY = Object.freeze({
   runStatus: false,
   savedPipelines: false,
   assetLibraries: true,
+  hyperFramesProjects: false,
   promptStyles: false,
   pipelineOutputs: true,
 });
@@ -756,6 +758,22 @@ function logPipelineBuilderRendererEvent(message, context = {}, level = 'error')
 
 function clampValue(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
+}
+
+function normalizeHyperFramesProjectsForPipelineSelector(value) {
+  return (Array.isArray(value) ? value : [])
+    .map((project, index) => {
+      const source = project && typeof project === 'object' ? project : {};
+      const projectId = String(source.projectId || `damaged-project-${index + 1}`).trim();
+      return {
+        projectId,
+        displayName: String(source.displayName || projectId).trim() || projectId,
+        health: {
+          runnable: Boolean(source.health && typeof source.health === 'object' && source.health.runnable),
+        },
+      };
+    })
+    .filter((project) => project.projectId);
 }
 
 function normalizePipelineSectionVisibility(value) {
@@ -3319,6 +3337,44 @@ function PipelineTimeline({ draft, runState, recordInputBusy, validationComment,
   );
 }
 
+class HyperFramesProjectsErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidUpdate(prevProps) {
+    if (this.state.hasError && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false });
+    }
+  }
+
+  componentDidCatch(error, info) {
+    logPipelineBuilderRendererEvent('HyperFrames Projects panel render failed.', {
+      componentStack: String(info?.componentStack || ''),
+      error: formatRendererDiagnosticError(error),
+      section: 'hyperframes-projects',
+    });
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="rounded-2xl border border-amber-400/30 bg-amber-500/10 p-4 text-sm leading-6 text-amber-50">
+          <p className="text-[11px] uppercase tracking-[0.18em] text-amber-200">HyperFrames Projects issue</p>
+          <p className="mt-2">Local AI Hub hit a problem while showing HyperFrames projects. The rest of Pipelines is still available.</p>
+          <button className="ghost-button mt-3" onClick={this.props.onRetry} type="button">Retry</button>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
 class PipelineInspectorErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
@@ -3776,6 +3832,8 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   const [outputsBusyPath, setOutputsBusyPath] = useState('');
   const [outputDeletionDialog, setOutputDeletionDialog] = useState(null);
   const [templateSearch, setTemplateSearch] = useState('');
+  const [hyperFramesProjects, setHyperFramesProjects] = useState([]);
+  const [hyperFramesProjectsPanelRetryKey, setHyperFramesProjectsPanelRetryKey] = useState(0);
   const [activeSubview, setActiveSubview] = useState(() => getPipelineSubviewForTarget(initialFocus));
   const [sectionVisibility, setSectionVisibility] = useState(() => {
     if (typeof window === 'undefined') {
@@ -3962,7 +4020,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     let cancelled = false;
     window.localAIHub.listHyperFramesProjects?.().then((result) => {
       if (!cancelled && result?.ok) {
-        setHyperFramesProjects(result.data?.projects || []);
+        setHyperFramesProjects(normalizeHyperFramesProjectsForPipelineSelector(result.data?.projects));
       }
     }).catch(() => null);
     return () => {
@@ -9218,13 +9276,19 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
               </div>
               {sectionVisibility.hyperFramesProjects ? (
                 <div className="mt-4">
-                  <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">Loading HyperFrames projects...</div>}>
-                    <HyperFramesProjectManager
-                      onProjectsChanged={setHyperFramesProjects}
-                      onToast={onToast}
-                      onUseProjectInPipeline={useHyperFramesProjectInPipeline}
-                    />
-                  </Suspense>
+                  <HyperFramesProjectsErrorBoundary
+                    onRetry={() => setHyperFramesProjectsPanelRetryKey((current) => current + 1)}
+                    resetKey={hyperFramesProjectsPanelRetryKey}
+                  >
+                    <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">Loading HyperFrames projects...</div>}>
+                      <HyperFramesProjectManager
+                        key={hyperFramesProjectsPanelRetryKey}
+                        onProjectsChanged={setHyperFramesProjects}
+                        onToast={onToast}
+                        onUseProjectInPipeline={useHyperFramesProjectInPipeline}
+                      />
+                    </Suspense>
+                  </HyperFramesProjectsErrorBoundary>
                 </div>
               ) : null}
             </div>

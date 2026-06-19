@@ -55,7 +55,12 @@ function verifyResources() {
   assert(pipelineSource.includes("activeSubview === 'resources'"), 'Resources should have its own workspace body.');
   assert(pipelineSource.includes('<AssetLibraryManager onToast={onToast} />'), 'Resources should render the existing Asset Library Manager.');
   assert(pipelineSource.includes('<PromptStylePresetManager'), 'Resources should render the prompt style preset manager.');
-  assert(pipelineSource.includes("toggleSection('assetLibraries')") && pipelineSource.includes("toggleSection('promptStyles')"), 'Both Resources sections should remain collapsible and expandable.');
+  assert(pipelineSource.includes('<HyperFramesProjectManager'), 'Resources should render the HyperFrames Projects manager.');
+  assert(pipelineSource.includes('data-pipeline-resource-section="hyperframes-projects"'), 'Resources should expose a HyperFrames Projects section marker.');
+  assert(pipelineSource.includes('HyperFramesProjectsErrorBoundary'), 'HyperFrames Projects should be isolated by a local render boundary.');
+  assert(pipelineSource.includes('hyperFramesProjects: false'), 'HyperFrames Projects should have an explicit default Resources expansion state.');
+  assert(pipelineSource.includes('const [hyperFramesProjects, setHyperFramesProjects] = useState([]);'), 'HyperFrames Projects should define parent state used by project input selectors.');
+  assert(pipelineSource.includes("toggleSection('assetLibraries')") && pipelineSource.includes("toggleSection('promptStyles')") && pipelineSource.includes("toggleSection('hyperFramesProjects')"), 'All Resources sections should remain collapsible and expandable.');
   assert(!settingsSource.includes('Asset Libraries'), 'Asset Libraries should no longer appear in Settings.');
   assert(!settingsSource.includes('Prompt Style Presets'), 'Prompt Style Presets should no longer appear in Settings.');
   assert(promptStyleSource.includes('onSavePromptStyle?.(buildPromptStylePayload(promptStyleDraft))'), 'Prompt style saving should preserve the existing callback and payload path.');
