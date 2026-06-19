@@ -2,21 +2,36 @@
   const duration = 5;
   const root = document.body;
   const card = document.querySelector('.title-card');
-  function render(time) {
-    const progress = Math.max(0, Math.min(1, time / duration));
-    const intro = Math.min(1, progress * 2.8);
-    const settle = Math.sin(progress * Math.PI);
-    card.style.opacity = String(Math.min(1, intro + 0.05));
-    card.style.transform = 'translateY(' + ((1 - intro) * 32).toFixed(2) + 'px) scale(' + (0.96 + settle * 0.04).toFixed(4) + ')';
+
+  function clamp(value) { return Math.max(0, Math.min(1, value)); }
+
+  function renderAt(time) {
+    const progress = clamp((Number(time) || 0) / duration);
+    const intro = clamp(progress * 3.1);
+    const drift = Math.sin(progress * Math.PI);
+    const bgShift = Math.round(18 + progress * 28);
+    card.style.opacity = String(clamp(intro));
+    card.style.transform = 'translateY(' + ((1 - intro) * 42 - progress * 16).toFixed(2) + 'px) scale(' + (0.94 + drift * 0.07).toFixed(4) + ')';
+    root.style.setProperty('--title-glow-x', bgShift + '%');
   }
+
   root.classList.add('hf-ready');
-  render(0);
+  renderAt(0);
+
+  // HyperFrames 0.6.112 samples registered timelines through totalTime(time).
   const timeline = {
     duration,
-    totalTime: function () { return duration; },
-    pause: function () {},
-    seek: function (time) { render(Number(time) || 0); return this; }
+    pause: function () { return this; },
+    seek: function (time) { renderAt(time); return this; },
+    totalTime: function (time) {
+      if (arguments.length > 0) {
+        renderAt(time);
+        return this;
+      }
+      return duration;
+    },
   };
+
   window.hyperframesTimeline = timeline;
   window.__timelines = window.__timelines || {};
   window.__timelines['animated-title-card'] = timeline;
