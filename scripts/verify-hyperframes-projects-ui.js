@@ -34,6 +34,7 @@ async function main() {
   const mainSource = read('electron/main.js');
   const preloadSource = read('electron/preload.js');
   const serviceSource = read('electron/services/hyperFramesProjectService.js');
+  const editorSource = read('src/components/HyperFramesProjectEditor.jsx');
   const assetLibrarySource = read('src/components/AssetLibraryManager.jsx');
   const promptStylesSource = read('src/components/PromptStylePresetManager.jsx');
 
@@ -54,8 +55,12 @@ async function main() {
   assert(managerSource.includes('HyperFrames projects could not load.'), 'Project-list failures must render an inline error state.');
   assert(managerSource.includes('Retry'), 'Inline project errors must include retry.');
   assert(managerSource.includes('No HyperFrames projects yet.'), 'Empty project list must render the intended empty state.');
+  assert(managerSource.includes('Open Editor'), 'Project manager exposes the safe editor action.');
+  assert(managerSource.includes('This editor works only inside Local AI Hub-managed HyperFrames projects.'), 'Project manager includes editor scope note.');
+  assert(editorSource.includes('<textarea'), 'Project editor uses a simple textarea editor.');
   assert(managerSource.includes("getApiMethod('listHyperFramesProjects'"), 'Missing preload list method must be handled explicitly.');
   assert(!managerSource.includes('filePath:') && !managerSource.includes('folderPath:'), 'Renderer project actions must not submit arbitrary paths.');
+  assert(!editorSource.includes('filePath:') && !editorSource.includes('folderPath:'), 'Editor renderer actions must not submit arbitrary paths.');
   for (const actionName of ['renameHyperFramesProject', 'duplicateHyperFramesProject', 'deleteHyperFramesProject', 'openHyperFramesProjectFolder', 'prepareHyperFramesProjectPipeline']) {
     assert(managerSource.includes(`getApiMethod('${actionName}')({ projectId: id`), `${actionName} must be called with projectId.`);
   }
@@ -88,6 +93,14 @@ async function main() {
     ['deleteHyperFramesProject', 'hyperframes-projects:delete'],
     ['openHyperFramesProjectFolder', 'hyperframes-projects:open-folder'],
     ['prepareHyperFramesProjectPipeline', 'hyperframes-projects:prepare-pipeline'],
+    ['getHyperFramesProjectEditorState', 'hyperframes-projects:editor-state'],
+    ['readHyperFramesProjectFile', 'hyperframes-projects:read-file'],
+    ['saveHyperFramesProjectFile', 'hyperframes-projects:save-file'],
+    ['createHyperFramesProjectFile', 'hyperframes-projects:create-file'],
+    ['renameHyperFramesProjectFile', 'hyperframes-projects:rename-file'],
+    ['duplicateHyperFramesProjectFile', 'hyperframes-projects:duplicate-file'],
+    ['deleteHyperFramesProjectFile', 'hyperframes-projects:delete-file'],
+    ['pickHyperFramesProjectAssets', 'hyperframes-projects:pick-assets'],
   ]) {
     assert(preloadSource.includes(`${method}:`) && preloadSource.includes(`invoke('${channel}'`), `${method} preload bridge must invoke ${channel}.`);
     assert(mainSource.includes(`ipcMain.handle('${channel}'`), `${channel} must have a main-process handler.`);
@@ -103,6 +116,7 @@ async function main() {
   assert(pipelineSource.includes("const AssetLibraryManager = React.lazy(() => import('./AssetLibraryManager'));"), 'AssetLibraryManager lazy loading remains intact.');
   assert(pipelineSource.includes("const PromptStylePresetManager = React.lazy(() => import('./PromptStylePresetManager'));"), 'PromptStylePresetManager lazy loading remains intact.');
   assert(!managerSource.includes('Local AI Hub could not load its interface.'), 'HyperFrames Projects path must not invoke the global interface fallback.');
+  assert(!editorSource.includes('<iframe') && !editorSource.includes('<webview') && !editorSource.includes('Monaco'), 'Safe editor does not add iframe, webview, or Monaco.');
 
   await fs.remove(tempRoot);
   console.log('HyperFrames Projects UI verifier passed.');

@@ -34,6 +34,25 @@ const PROJECT_TREE_LIMITS = Object.freeze({
   maxFiles: 1200,
   maxTotalBytes: 256 * 1024 * 1024,
 });
+const PROJECT_FILE_BROWSER_LIMITS = Object.freeze({
+  maxDepth: 8,
+  maxEntries: 800,
+  maxTotalBytes: 256 * 1024 * 1024,
+});
+const MAX_EDITABLE_TEXT_FILE_BYTES = 256 * 1024;
+const MAX_NEW_TEXT_FILE_BYTES = MAX_EDITABLE_TEXT_FILE_BYTES;
+const MAX_ASSET_FILE_BYTES = 75 * 1024 * 1024;
+const MAX_PROJECT_TOTAL_BYTES = 512 * 1024 * 1024;
+const PROJECT_ASSETS_DIRECTORY = 'assets';
+const EDITABLE_TEXT_EXTENSIONS = Object.freeze(['.html', '.css', '.js', '.md', '.txt']);
+const SAFE_DATA_JSON_EXTENSIONS = Object.freeze(['.json']);
+const EDITABLE_FILE_EXTENSIONS = Object.freeze([...EDITABLE_TEXT_EXTENSIONS]);
+const TEXT_HEALTH_EXTENSIONS = new Set([...EDITABLE_TEXT_EXTENSIONS, ...SAFE_DATA_JSON_EXTENSIONS]);
+const ASSET_FILE_EXTENSIONS = Object.freeze(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.wav', '.mp3', '.m4a', '.ogg', '.mp4', '.webm', '.mov', '.ttf', '.otf', '.woff', '.woff2']);
+const ASSET_FILE_EXTENSION_SET = new Set(ASSET_FILE_EXTENSIONS);
+const BLOCKED_PROJECT_ENTRY_NAMES = new Set(['.git', '.hg', '.svn', '.gitkeep', '.cache', '.hyperframes-cache', 'node_modules', 'npm-cache', 'browser-profile', 'chrome', 'chrome-headless-shell', 'tmp', 'temp']);
+const RESERVED_WINDOWS_DEVICE_NAMES = new Set(['con', 'prn', 'aux', 'nul', 'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9', 'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9']);
+const LOCAL_ONLY_POLICY_MESSAGE = 'This first HyperFrames integration supports local project assets only. Remote http, https, and data references are blocked.';
 const BUILT_IN_TEMPLATES = Object.freeze([
   Object.freeze({
     id: 'animated-title-card',
@@ -529,6 +548,590 @@ async function openHyperFramesProjectFolder(projectId, openPath, options = {}) {
   return { message: 'Opened the HyperFrames project folder.', projectId: safeProjectId };
 }
 
+function normalizeRelativePathSeparators(value) {
+  return String(value || '').replace(/\\/g, '/').replace(/\/+/g, '/').trim();
+}
+
+function splitRelativeProjectPath(value, options = {}) {
+  const normalized = normalizeRelativePathSeparators(value);
+  if (!normalized && options.allowEmpty) return [];
+  if (!normalized) {
+    throw new Error('Choose a project file first.');
+  }
+  if (path.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized) || normalized.startsWith('//')) {
+    throw new Error('Local AI Hub accepts project-relative paths only for HyperFrames project editing.');
+  }
+  const segments = normalized.split('/').filter(Boolean);
+  if (!segments.length && !options.allowEmpty) {
+    throw new Error('Choose a project file first.');
+  }
+  for (const segment of segments) {
+    validateSafePathSegment(segment);
+    if (segment === '.' || segment === '..') {
+      throw new Error('Local AI Hub refused to use a path traversal segment.');
+    }
+  }
+  return segments;
+}
+
+function normalizeProjectRelativePath(value, options = {}) {
+  const segments = splitRelativeProjectPath(value, options);
+  return segments.join('/');
+}
+
+function validateSafePathSegment(value) {
+  const segment = String(value || '');
+  if (!segment.trim()) {
+    throw new Error('Enter a file or folder name first.');
+  }
+  if (/[\\/:*?"<>|]/.test(segment) || /[\x00-\x1f]/.test(segment)) {
+    throw new Error('Use a normal Windows file name without path separators or reserved characters.');
+  }
+  if (segment.endsWith('.') || segment.endsWith(' ')) {
+    throw new Error('Windows file names cannot end with a dot or space.');
+  }
+  const lower = segment.toLowerCase();
+  const base = lower.includes('.') ? lower.slice(0, lower.indexOf('.')) : lower;
+  if (RESERVED_WINDOWS_DEVICE_NAMES.has(base)) {
+    throw new Error('That file name is reserved by Windows. Choose a different name.');
+  }
+  if (segment === '.' || segment === '..') {
+    throw new Error('Local AI Hub refused to use a path traversal segment.');
+  }
+  return segment;
+}
+
+function validateSafeFileName(value) {
+  const name = path.basename(String(value || '').trim());
+  if (name !== String(value || '').trim()) {
+    throw new Error('Enter a file name only, without folders.');
+  }
+  return validateSafePathSegment(name);
+}
+
+function extensionForRelativePath(relativePath) {
+  return path.extname(String(relativePath || '')).toLowerCase();
+}
+
+function isEditableProjectTextPath(relativePath) {
+  const normalized = normalizeProjectRelativePath(relativePath);
+  if (normalized.toLowerCase() === PROJECT_MANIFEST_FILE) return false;
+  return EDITABLE_FILE_EXTENSIONS.includes(extensionForRelativePath(normalized));
+}
+
+function assertEditableProjectTextPath(relativePath) {
+  const normalized = normalizeProjectRelativePath(relativePath);
+  if (!isEditableProjectTextPath(normalized)) {
+    throw new Error(`Local AI Hub can edit ${EDITABLE_FILE_EXTENSIONS.join(', ')} files in this first HyperFrames editor pass. project.json is managed by Local AI Hub.`);
+  }
+  return normalized;
+}
+
+function assertMutableProjectPath(relativePath, options = {}) {
+  const normalized = normalizeProjectRelativePath(relativePath);
+  const lower = normalized.toLowerCase();
+  if (lower === PROJECT_MANIFEST_FILE) {
+    throw new Error('Local AI Hub manages project.json automatically, so it cannot be edited or renamed here.');
+  }
+  if (options.blockEntrypoint !== false && lower === PROJECT_ENTRY_FILE) {
+    throw new Error('index.html is the managed HyperFrames project entrypoint and cannot be deleted or renamed in this first editor pass.');
+  }
+  return normalized;
+}
+
+function shouldHideProjectEntry(name) {
+  return BLOCKED_PROJECT_ENTRY_NAMES.has(String(name || '').trim().toLowerCase());
+}
+
+function hasBinaryBytes(buffer) {
+  if (!Buffer.isBuffer(buffer)) return false;
+  const sampleLength = Math.min(buffer.length, 4096);
+  for (let index = 0; index < sampleLength; index += 1) {
+    if (buffer[index] === 0) return true;
+  }
+  return false;
+}
+
+function validateLocalOnlyTextContent(content, relativePath = '') {
+  const text = String(content || '');
+  const findings = [];
+  if (/https?:\/\//i.test(text)) findings.push('remote http/https references');
+  if (/\bdata:/i.test(text)) findings.push('data URL references');
+  if (/\.\.[\\/]\.\.[\\/]/.test(text)) findings.push('path escape references such as ..\\..\\');
+  if (findings.length) {
+    throw new Error(`${LOCAL_ONLY_POLICY_MESSAGE} Remove ${findings.join(', ')} from ${relativePath || 'this file'} before saving.`);
+  }
+}
+
+async function resolveManagedProject(projectId, options = {}) {
+  const { projectDir, projectsRoot, projectId: safeProjectId } = resolveProjectDir(projectId, options);
+  if (!(await fs.pathExists(projectDir))) {
+    throw new Error('That HyperFrames project no longer exists on this PC.');
+  }
+  await assertRealPathInside(projectsRoot, projectDir, 'Local AI Hub refused to use a HyperFrames project outside managed storage.');
+  await assertNoReparsePointTraversal(projectsRoot, projectDir, 'Local AI Hub refused to use that HyperFrames project because it crosses a symlink or junction.');
+  return { projectDir, projectsRoot, projectId: safeProjectId };
+}
+
+async function resolveProjectRelativeFile(projectId, relativePath, options = {}) {
+  const project = await resolveManagedProject(projectId, options);
+  const normalizedRelativePath = normalizeProjectRelativePath(relativePath);
+  const targetPath = path.resolve(path.join(project.projectDir, ...normalizedRelativePath.split('/')));
+  assertPathInside(project.projectDir, targetPath, 'Local AI Hub refused to use a file outside this managed HyperFrames project.');
+  await assertRealPathInside(project.projectDir, targetPath, 'Local AI Hub refused to use that project file because it crosses a symlink or junction.');
+  return { ...project, relativePath: normalizedRelativePath, targetPath };
+}
+
+async function resolveProjectRelativeParent(projectId, relativePath, options = {}) {
+  const project = await resolveManagedProject(projectId, options);
+  const normalizedRelativePath = normalizeProjectRelativePath(relativePath);
+  const targetPath = path.resolve(path.join(project.projectDir, ...normalizedRelativePath.split('/')));
+  const parentPath = path.dirname(targetPath);
+  assertPathInside(project.projectDir, targetPath, 'Local AI Hub refused to use a file outside this managed HyperFrames project.');
+  assertPathInside(project.projectDir, parentPath, 'Local AI Hub refused to use a folder outside this managed HyperFrames project.');
+  await assertRealPathInside(project.projectDir, parentPath, 'Local AI Hub refused to use that project folder because it crosses a symlink or junction.');
+  return { ...project, relativePath: normalizedRelativePath, targetPath, parentPath };
+}
+
+async function updateProjectModifiedTime(projectDir, projectId) {
+  const manifestPath = getManifestPath(projectDir);
+  const current = await fs.readJson(manifestPath).catch(() => null);
+  if (!current) return null;
+  const manifest = normalizeProjectManifest({ ...current, updatedAt: nowIso() }, { projectId });
+  await writeJsonAtomic(manifestPath, manifest);
+  return manifest;
+}
+
+function serializeProjectEntry(projectDir, currentPath, stats, kind) {
+  const relativePath = path.relative(projectDir, currentPath).replace(/\\/g, '/');
+  const extension = kind === 'file' ? extensionForRelativePath(relativePath) : '';
+  return {
+    kind,
+    name: path.basename(currentPath),
+    relativePath,
+    sizeBytes: kind === 'file' ? Number(stats.size || 0) : 0,
+    modifiedAt: stats.mtime ? stats.mtime.toISOString() : null,
+    extension,
+    editable: kind === 'file' && isEditableProjectTextPath(relativePath) && Number(stats.size || 0) <= MAX_EDITABLE_TEXT_FILE_BYTES,
+    asset: kind === 'file' && relativePath.toLowerCase().startsWith(`${PROJECT_ASSETS_DIRECTORY}/`) && ASSET_FILE_EXTENSION_SET.has(extension),
+  };
+}
+
+async function listProjectTreeEntries(projectDir, options = {}) {
+  const limits = {
+    maxDepth: Math.max(1, Number(options.maxDepth || PROJECT_FILE_BROWSER_LIMITS.maxDepth) || PROJECT_FILE_BROWSER_LIMITS.maxDepth),
+    maxEntries: Math.max(1, Number(options.maxEntries || PROJECT_FILE_BROWSER_LIMITS.maxEntries) || PROJECT_FILE_BROWSER_LIMITS.maxEntries),
+    maxTotalBytes: Math.max(1, Number(options.maxTotalBytes || PROJECT_FILE_BROWSER_LIMITS.maxTotalBytes) || PROJECT_FILE_BROWSER_LIMITS.maxTotalBytes),
+  };
+  const entries = [];
+  const state = { totalBytes: 0 };
+  async function visit(currentPath, depth) {
+    if (depth > limits.maxDepth) {
+      throw new Error('This HyperFrames project is deeper than Local AI Hub can safely list.');
+    }
+    const stats = await fs.lstat(currentPath);
+    if ((typeof stats.isSymbolicLink === 'function' && stats.isSymbolicLink()) || (typeof stats.isReparsePoint === 'function' && stats.isReparsePoint())) {
+      throw new Error('This HyperFrames project contains a symlink or junction. Local AI Hub will not browse through it.');
+    }
+    if (currentPath !== projectDir) {
+      const name = path.basename(currentPath);
+      if (shouldHideProjectEntry(name)) return;
+      const kind = stats.isDirectory() ? 'directory' : stats.isFile() ? 'file' : '';
+      if (!kind) return;
+      entries.push(serializeProjectEntry(projectDir, currentPath, stats, kind));
+      if (entries.length > limits.maxEntries) {
+        throw new Error('This HyperFrames project has more files than Local AI Hub can safely list.');
+      }
+      if (stats.isFile()) {
+        state.totalBytes += Number(stats.size || 0);
+        if (state.totalBytes > limits.maxTotalBytes) {
+          throw new Error('This HyperFrames project is larger than Local AI Hub can safely list.');
+        }
+      }
+    }
+    if (!stats.isDirectory()) return;
+    const children = await fs.readdir(currentPath);
+    for (const child of children.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))) {
+      if (shouldHideProjectEntry(child)) continue;
+      await visit(path.join(currentPath, child), depth + 1);
+    }
+  }
+  await visit(projectDir, 0);
+  return { entries, totalBytes: state.totalBytes };
+}
+
+async function listHyperFramesProjectFiles(projectId, options = {}) {
+  const project = await resolveManagedProject(projectId, options);
+  const [projectInfo, tree] = await Promise.all([
+    inspectHyperFramesProject(project.projectId, options),
+    listProjectTreeEntries(project.projectDir, options.limits || PROJECT_FILE_BROWSER_LIMITS),
+  ]);
+  return {
+    files: tree.entries,
+    limits: { ...PROJECT_FILE_BROWSER_LIMITS, maxEditableTextFileBytes: MAX_EDITABLE_TEXT_FILE_BYTES },
+    project: projectInfo,
+    totalBytes: tree.totalBytes,
+  };
+}
+
+async function readHyperFramesProjectTextFile(projectId, relativePath, options = {}) {
+  const editablePath = assertEditableProjectTextPath(relativePath);
+  const resolved = await resolveProjectRelativeFile(projectId, editablePath, options);
+  const stats = await fs.stat(resolved.targetPath).catch(() => null);
+  if (!stats || !stats.isFile()) {
+    throw new Error('Local AI Hub could not find that project text file.');
+  }
+  if (stats.size > MAX_EDITABLE_TEXT_FILE_BYTES) {
+    throw new Error(`That file is larger than Local AI Hub's ${Math.round(MAX_EDITABLE_TEXT_FILE_BYTES / 1024)} KB editor limit.`);
+  }
+  const buffer = await fs.readFile(resolved.targetPath);
+  if (hasBinaryBytes(buffer)) {
+    throw new Error('Local AI Hub will not open binary files in the HyperFrames text editor.');
+  }
+  const text = buffer.toString('utf8');
+  return {
+    content: text,
+    editable: true,
+    encoding: 'utf8',
+    lineEnding: text.includes('\r\n') ? 'crlf' : 'lf',
+    maxBytes: MAX_EDITABLE_TEXT_FILE_BYTES,
+    modifiedAt: stats.mtime ? stats.mtime.toISOString() : null,
+    relativePath: resolved.relativePath,
+    sizeBytes: stats.size,
+  };
+}
+
+function normalizeSavedTextContent(nextContent, previousContent = '') {
+  const text = String(nextContent ?? '');
+  if (String(previousContent || '').includes('\r\n')) {
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n/g, '\r\n');
+  }
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+async function saveHyperFramesProjectTextFile(projectId, relativePath, content, options = {}) {
+  return queueOperation(async () => {
+    const editablePath = assertEditableProjectTextPath(relativePath);
+    validateLocalOnlyTextContent(content, editablePath);
+    const resolved = await resolveProjectRelativeFile(projectId, editablePath, options);
+    const stats = await fs.stat(resolved.targetPath).catch(() => null);
+    if (!stats || !stats.isFile()) {
+      throw new Error('Local AI Hub could not find that project text file.');
+    }
+    if (stats.size > MAX_EDITABLE_TEXT_FILE_BYTES) {
+      throw new Error(`That file is larger than Local AI Hub's ${Math.round(MAX_EDITABLE_TEXT_FILE_BYTES / 1024)} KB editor limit.`);
+    }
+    const previousBuffer = await fs.readFile(resolved.targetPath);
+    if (hasBinaryBytes(previousBuffer)) {
+      throw new Error('Local AI Hub will not save over binary files from the HyperFrames text editor.');
+    }
+    const nextText = normalizeSavedTextContent(content, previousBuffer.toString('utf8'));
+    const nextBuffer = Buffer.from(nextText, 'utf8');
+    if (nextBuffer.length > MAX_EDITABLE_TEXT_FILE_BYTES) {
+      throw new Error(`That edit is larger than Local AI Hub's ${Math.round(MAX_EDITABLE_TEXT_FILE_BYTES / 1024)} KB editor limit.`);
+    }
+    const tempPath = `${resolved.targetPath}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(tempPath, nextBuffer);
+    await fs.move(tempPath, resolved.targetPath, { overwrite: true });
+    await updateProjectModifiedTime(resolved.projectDir, resolved.projectId);
+    const health = await getHyperFramesProjectHealth(resolved.projectId, options);
+    return {
+      file: await readHyperFramesProjectTextFile(resolved.projectId, editablePath, options),
+      health,
+      message: 'HyperFrames project file saved.',
+    };
+  });
+}
+
+async function createHyperFramesProjectTextFile(projectId, relativePath, content = '', options = {}) {
+  return queueOperation(async () => {
+    const editablePath = assertEditableProjectTextPath(relativePath);
+    validateLocalOnlyTextContent(content, editablePath);
+    const resolved = await resolveProjectRelativeParent(projectId, editablePath, options);
+    const nextBuffer = Buffer.from(String(content ?? ''), 'utf8');
+    if (nextBuffer.length > MAX_NEW_TEXT_FILE_BYTES) {
+      throw new Error(`New HyperFrames text files must be ${Math.round(MAX_NEW_TEXT_FILE_BYTES / 1024)} KB or smaller.`);
+    }
+    if (await fs.pathExists(resolved.targetPath)) {
+      throw new Error('A project file with that name already exists.');
+    }
+    await fs.ensureDir(resolved.parentPath);
+    await fs.writeFile(resolved.targetPath, nextBuffer);
+    await updateProjectModifiedTime(resolved.projectDir, resolved.projectId);
+    return { file: await readHyperFramesProjectTextFile(resolved.projectId, editablePath, options), message: 'HyperFrames project file created.' };
+  });
+}
+
+async function renameHyperFramesProjectFile(projectId, relativePath, newName, options = {}) {
+  return queueOperation(async () => {
+    const sourceRelativePath = assertMutableProjectPath(relativePath);
+    const safeName = validateSafeFileName(newName);
+    const source = await resolveProjectRelativeFile(projectId, sourceRelativePath, options);
+    const targetRelativePath = normalizeProjectRelativePath([...sourceRelativePath.split('/').slice(0, -1), safeName].filter(Boolean).join('/'));
+    assertMutableProjectPath(targetRelativePath);
+    const target = await resolveProjectRelativeParent(projectId, targetRelativePath, options);
+    if (await fs.pathExists(target.targetPath)) {
+      throw new Error('A project file with that name already exists.');
+    }
+    await fs.move(source.targetPath, target.targetPath, { overwrite: false });
+    await updateProjectModifiedTime(source.projectDir, source.projectId);
+    return { message: 'HyperFrames project file renamed.', relativePath: targetRelativePath };
+  });
+}
+
+function buildDuplicateName(fileName) {
+  const extension = path.extname(fileName);
+  const base = path.basename(fileName, extension);
+  return `${base} copy${extension}`;
+}
+
+async function nextAvailableProjectPath(projectDir, preferredRelativePath) {
+  const normalized = normalizeProjectRelativePath(preferredRelativePath);
+  const dir = path.dirname(normalized).replace(/\\/g, '/');
+  const name = path.basename(normalized);
+  const extension = path.extname(name);
+  const base = path.basename(name, extension);
+  for (let index = 0; index < 1000; index += 1) {
+    const candidateName = index === 0 ? name : `${base} (${index + 1})${extension}`;
+    const candidateRelative = normalizeProjectRelativePath([dir === '.' ? '' : dir, candidateName].filter(Boolean).join('/'));
+    const candidatePath = path.resolve(path.join(projectDir, ...candidateRelative.split('/')));
+    assertPathInside(projectDir, candidatePath, 'Local AI Hub refused to create a duplicate outside this HyperFrames project.');
+    if (!(await fs.pathExists(candidatePath))) return { candidatePath, candidateRelative };
+  }
+  throw new Error('Local AI Hub could not find a safe duplicate file name.');
+}
+
+async function duplicateHyperFramesProjectFile(projectId, relativePath, newName = '', options = {}) {
+  return queueOperation(async () => {
+    const sourceRelativePath = assertMutableProjectPath(relativePath, { blockEntrypoint: false });
+    const source = await resolveProjectRelativeFile(projectId, sourceRelativePath, options);
+    const stats = await fs.stat(source.targetPath).catch(() => null);
+    if (!stats || !stats.isFile()) {
+      throw new Error('Local AI Hub can duplicate files in this first HyperFrames editor pass.');
+    }
+    const targetName = newName ? validateSafeFileName(newName) : buildDuplicateName(path.basename(sourceRelativePath));
+    const preferredRelativePath = [...sourceRelativePath.split('/').slice(0, -1), targetName].filter(Boolean).join('/');
+    const target = await nextAvailableProjectPath(source.projectDir, preferredRelativePath);
+    await fs.copyFile(source.targetPath, target.candidatePath);
+    await updateProjectModifiedTime(source.projectDir, source.projectId);
+    return { message: 'HyperFrames project file duplicated.', relativePath: target.candidateRelative };
+  });
+}
+
+async function deleteHyperFramesProjectFile(projectId, relativePath, options = {}) {
+  return queueOperation(async () => {
+    const sourceRelativePath = assertMutableProjectPath(relativePath);
+    const source = await resolveProjectRelativeFile(projectId, sourceRelativePath, options);
+    const stats = await fs.stat(source.targetPath).catch(() => null);
+    if (!stats || !stats.isFile()) {
+      throw new Error('Local AI Hub can delete project files in this first HyperFrames editor pass.');
+    }
+    await fs.remove(source.targetPath);
+    await updateProjectModifiedTime(source.projectDir, source.projectId);
+    return { message: 'HyperFrames project file deleted.', deletedRelativePath: sourceRelativePath };
+  });
+}
+
+function assertAssetRelativePath(relativePath, options = {}) {
+  const normalized = normalizeProjectRelativePath(relativePath, options);
+  if (!normalized && options.allowEmpty) return '';
+  const lower = normalized.toLowerCase();
+  if (lower !== PROJECT_ASSETS_DIRECTORY && !lower.startsWith(`${PROJECT_ASSETS_DIRECTORY}/`)) {
+    throw new Error('HyperFrames project asset actions are limited to the project assets folder.');
+  }
+  return normalized;
+}
+
+async function listHyperFramesProjectAssets(projectId, options = {}) {
+  const project = await resolveManagedProject(projectId, options);
+  const assetsDir = path.join(project.projectDir, PROJECT_ASSETS_DIRECTORY);
+  await fs.ensureDir(assetsDir);
+  await assertRealPathInside(project.projectDir, assetsDir, 'Local AI Hub refused to list assets through a symlink or junction.');
+  const tree = await listProjectTreeEntries(assetsDir, {
+    ...(options.limits || PROJECT_FILE_BROWSER_LIMITS),
+    maxDepth: Math.min(PROJECT_FILE_BROWSER_LIMITS.maxDepth, Number(options.limits?.maxDepth || PROJECT_FILE_BROWSER_LIMITS.maxDepth) || PROJECT_FILE_BROWSER_LIMITS.maxDepth),
+  });
+  const assets = tree.entries.map((entry) => ({
+    ...entry,
+    relativePath: `${PROJECT_ASSETS_DIRECTORY}/${entry.relativePath}`.replace(/\/+/g, '/'),
+    reference: `${PROJECT_ASSETS_DIRECTORY}/${entry.relativePath}`.replace(/\/+/g, '/'),
+    supported: entry.kind === 'directory' || ASSET_FILE_EXTENSION_SET.has(entry.extension),
+  }));
+  return {
+    assets,
+    allowedExtensions: ASSET_FILE_EXTENSIONS,
+    limits: { maxAssetFileBytes: MAX_ASSET_FILE_BYTES, maxProjectTotalBytes: MAX_PROJECT_TOTAL_BYTES },
+    project: await inspectHyperFramesProject(project.projectId, options),
+  };
+}
+
+function validateAssetExtension(filePath) {
+  const extension = path.extname(String(filePath || '')).toLowerCase();
+  if (!ASSET_FILE_EXTENSION_SET.has(extension)) {
+    throw new Error(`Local AI Hub can copy only these asset types into HyperFrames projects: ${ASSET_FILE_EXTENSIONS.join(', ')}.`);
+  }
+  return extension;
+}
+
+async function getProjectTotalBytes(projectDir) {
+  let total = 0;
+  async function visit(currentPath) {
+    const stats = await fs.lstat(currentPath);
+    if ((typeof stats.isSymbolicLink === 'function' && stats.isSymbolicLink()) || (typeof stats.isReparsePoint === 'function' && stats.isReparsePoint())) {
+      throw new Error('This HyperFrames project contains a symlink or junction.');
+    }
+    if (stats.isDirectory()) {
+      const children = await fs.readdir(currentPath);
+      for (const child of children) await visit(path.join(currentPath, child));
+      return;
+    }
+    if (stats.isFile()) total += Number(stats.size || 0);
+  }
+  await visit(projectDir);
+  return total;
+}
+
+async function importHyperFramesProjectAssets(projectId, payload = {}, options = {}) {
+  return queueOperation(async () => {
+    const sourceFiles = Array.isArray(payload?.sourceFiles || payload?.files) ? (payload.sourceFiles || payload.files) : [];
+    if (!sourceFiles.length) {
+      throw new Error('Choose at least one local asset file to copy into the HyperFrames project.');
+    }
+    const targetSubfolder = normalizeProjectRelativePath(payload?.targetSubfolder || PROJECT_ASSETS_DIRECTORY, { allowEmpty: true }) || PROJECT_ASSETS_DIRECTORY;
+    const targetFolderRelative = assertAssetRelativePath(targetSubfolder === PROJECT_ASSETS_DIRECTORY ? PROJECT_ASSETS_DIRECTORY : targetSubfolder);
+    const project = await resolveManagedProject(projectId, options);
+    const assetsDir = path.join(project.projectDir, PROJECT_ASSETS_DIRECTORY);
+    const targetDir = path.resolve(path.join(project.projectDir, ...targetFolderRelative.split('/')));
+    assertPathInside(assetsDir, targetDir, 'Local AI Hub refused to copy assets outside this project assets folder.');
+    await fs.ensureDir(targetDir);
+    await assertRealPathInside(project.projectDir, targetDir, 'Local AI Hub refused to copy assets through a symlink or junction.');
+    const imported = [];
+    let currentTotalBytes = await getProjectTotalBytes(project.projectDir);
+    for (const sourceFile of sourceFiles) {
+      const sourcePath = path.resolve(String(sourceFile || '').trim());
+      const extension = validateAssetExtension(sourcePath);
+      if (!(await fs.pathExists(sourcePath))) {
+        throw new Error('Local AI Hub could not find one of the selected asset files anymore.');
+      }
+      const stats = await fs.stat(sourcePath);
+      if (!stats.isFile()) {
+        throw new Error('Local AI Hub can copy asset files, not folders, into HyperFrames projects.');
+      }
+      if (stats.size > MAX_ASSET_FILE_BYTES) {
+        throw new Error(`Each HyperFrames project asset must be ${Math.round(MAX_ASSET_FILE_BYTES / (1024 * 1024))} MB or smaller.`);
+      }
+      if (currentTotalBytes + Number(stats.size || 0) > MAX_PROJECT_TOTAL_BYTES) {
+        throw new Error(`This project would exceed Local AI Hub's ${Math.round(MAX_PROJECT_TOTAL_BYTES / (1024 * 1024))} MB managed project size limit.`);
+      }
+      const safeBase = path.basename(sourcePath, extension).replace(/[^a-zA-Z0-9._ -]+/g, '-').replace(/^[. ]+|[. ]+$/g, '').slice(0, 80) || 'asset';
+      const safeName = validateSafeFileName(`${safeBase}${extension}`);
+      const preferredRelative = `${targetFolderRelative}/${safeName}`;
+      const target = await nextAvailableProjectPath(project.projectDir, preferredRelative);
+      assertPathInside(assetsDir, target.candidatePath, 'Local AI Hub refused to copy assets outside this project assets folder.');
+      await fs.copy(sourcePath, target.candidatePath, { overwrite: false, errorOnExist: true });
+      currentTotalBytes += Number(stats.size || 0);
+      imported.push({
+        name: path.basename(target.candidateRelative),
+        relativePath: target.candidateRelative,
+        reference: target.candidateRelative.replace(/\\/g, '/'),
+        sizeBytes: Number(stats.size || 0),
+        extension,
+      });
+    }
+    await updateProjectModifiedTime(project.projectDir, project.projectId);
+    return { assets: imported, assetList: await listHyperFramesProjectAssets(project.projectId, options), message: 'Assets copied into the managed HyperFrames project.' };
+  });
+}
+
+async function renameHyperFramesProjectAsset(projectId, relativePath, newName, options = {}) {
+  assertAssetRelativePath(relativePath);
+  return renameHyperFramesProjectFile(projectId, relativePath, newName, options);
+}
+
+async function duplicateHyperFramesProjectAsset(projectId, relativePath, newName = '', options = {}) {
+  assertAssetRelativePath(relativePath);
+  return duplicateHyperFramesProjectFile(projectId, relativePath, newName, options);
+}
+
+async function deleteHyperFramesProjectAsset(projectId, relativePath, options = {}) {
+  assertAssetRelativePath(relativePath);
+  return deleteHyperFramesProjectFile(projectId, relativePath, options);
+}
+
+function getHyperFramesProjectAssetReference(relativePath) {
+  const normalized = assertAssetRelativePath(relativePath);
+  return { reference: normalized.replace(/\\/g, '/'), relativePath: normalized };
+}
+
+async function getHyperFramesProjectHealth(projectId, options = {}) {
+  const project = await resolveManagedProject(projectId, options);
+  const details = {
+    bounds: { ok: false, fileCount: 0, totalBytes: 0 },
+    damaged: [],
+    entrypointExists: false,
+    lastModifiedAt: null,
+    localOnly: false,
+    manifestValid: false,
+    manifestStatus: 'unknown',
+    unsupportedAssets: [],
+    unsafePaths: [],
+  };
+  const manifestResult = await readManifestForProject(project.projectDir, project.projectId);
+  details.manifestValid = Boolean(manifestResult.manifest);
+  details.manifestStatus = manifestResult.health?.status || 'valid';
+  details.lastModifiedAt = manifestResult.manifest?.updatedAt || null;
+  details.entrypointExists = await fs.pathExists(path.join(project.projectDir, PROJECT_ENTRY_FILE));
+  if (!details.entrypointExists) details.damaged.push(PROJECT_ENTRY_FILE);
+  try {
+    const tree = await listProjectTreeEntries(project.projectDir, options.limits || PROJECT_FILE_BROWSER_LIMITS);
+    details.bounds = { ok: true, fileCount: tree.entries.filter((entry) => entry.kind === 'file').length, totalBytes: tree.totalBytes };
+    details.unsupportedAssets = tree.entries
+      .filter((entry) => entry.kind === 'file' && entry.relativePath.toLowerCase().startsWith(`${PROJECT_ASSETS_DIRECTORY}/`) && !ASSET_FILE_EXTENSION_SET.has(entry.extension))
+      .map((entry) => entry.relativePath)
+      .slice(0, 20);
+  } catch (error) {
+    details.unsafePaths.push(error?.message || 'Local AI Hub could not safely inspect this project tree.');
+  }
+  try {
+    await scanStagedCompositionForRemoteReferences(project.projectDir, options.limits || PROJECT_TREE_LIMITS);
+    details.localOnly = true;
+  } catch (error) {
+    details.localOnly = false;
+    details.damaged.push(error?.code === 'HYPERFRAMES_REMOTE_REFERENCE' ? 'remote-or-data-reference' : 'local-only-scan');
+  }
+  const runnable = details.manifestValid && details.entrypointExists && details.localOnly && details.bounds.ok && !details.unsupportedAssets.length && !details.unsafePaths.length;
+  return {
+    ...details,
+    message: runnable
+      ? 'This managed HyperFrames project passes the editor health checks.'
+      : 'This project needs attention before rendering. Local AI Hub did not execute or preview the composition while checking it.',
+    runnable,
+    status: runnable ? 'healthy' : 'needs-attention',
+  };
+}
+
+async function getHyperFramesProjectEditorState(projectId, options = {}) {
+  const [project, files, assets, health] = await Promise.all([
+    inspectHyperFramesProject(projectId, options),
+    listHyperFramesProjectFiles(projectId, options),
+    listHyperFramesProjectAssets(projectId, options),
+    getHyperFramesProjectHealth(projectId, options),
+  ]);
+  return {
+    allowedAssetExtensions: ASSET_FILE_EXTENSIONS,
+    allowedEditableExtensions: EDITABLE_FILE_EXTENSIONS,
+    assets: assets.assets,
+    files: files.files,
+    health,
+    limits: {
+      maxAssetFileBytes: MAX_ASSET_FILE_BYTES,
+      maxEditableTextFileBytes: MAX_EDITABLE_TEXT_FILE_BYTES,
+      maxProjectTotalBytes: MAX_PROJECT_TOTAL_BYTES,
+      tree: PROJECT_FILE_BROWSER_LIMITS,
+    },
+    project,
+  };
+}
 async function prepareHyperFramesProjectForPipeline(projectId, options = {}) {
   const project = await inspectHyperFramesProject(projectId, options);
   if (!project.health?.runnable) {
@@ -595,23 +1198,47 @@ async function buildHyperFramesProjectPipelineDraft(projectId, options = {}) {
 }
 
 module.exports = {
+  ASSET_FILE_EXTENSIONS,
   BUILT_IN_TEMPLATES,
+  EDITABLE_FILE_EXTENSIONS,
+  LOCAL_ONLY_POLICY_MESSAGE,
+  MAX_ASSET_FILE_BYTES,
+  MAX_EDITABLE_TEXT_FILE_BYTES,
+  MAX_PROJECT_TOTAL_BYTES,
+  PROJECT_ASSETS_DIRECTORY,
   PROJECT_CREATED_BY,
   PROJECT_ENTRY_FILE,
+  PROJECT_FILE_BROWSER_LIMITS,
   PROJECT_MANIFEST_FILE,
   PROJECT_SCHEMA_VERSION,
   PROJECT_TREE_LIMITS,
   buildHyperFramesProjectPipelineDraft,
   createHyperFramesProject,
+  createHyperFramesProjectTextFile,
   deleteHyperFramesProject,
+  deleteHyperFramesProjectAsset,
+  deleteHyperFramesProjectFile,
   duplicateHyperFramesProject,
+  duplicateHyperFramesProjectAsset,
+  duplicateHyperFramesProjectFile,
+  getHyperFramesProjectAssetReference,
+  getHyperFramesProjectEditorState,
+  getHyperFramesProjectHealth,
   getHyperFramesProjectsRoot,
   getTemplateResourcesRoot,
+  importHyperFramesProjectAssets,
   inspectHyperFramesProject,
+  listHyperFramesProjectAssets,
+  listHyperFramesProjectFiles,
   listHyperFramesProjectTemplates,
   listHyperFramesProjects,
   openHyperFramesProjectFolder,
   prepareHyperFramesProjectForPipeline,
+  readHyperFramesProjectTextFile,
   renameHyperFramesProject,
+  renameHyperFramesProjectAsset,
+  renameHyperFramesProjectFile,
+  saveHyperFramesProjectTextFile,
+  validateLocalOnlyTextContent,
   validateTemplate,
 };

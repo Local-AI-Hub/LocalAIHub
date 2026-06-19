@@ -1,4 +1,5 @@
-﻿import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import HyperFramesProjectEditor from './HyperFramesProjectEditor';
 
 function safeText(value, fallback = '') {
   const text = String(value ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -100,8 +101,10 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
   const [templateId, setTemplateId] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
+  const [editorProjectId, setEditorProjectId] = useState('');
 
   const defaultTemplateId = useMemo(() => templates[0]?.id || '', [templates]);
+  const editorProject = useMemo(() => projects.find((project) => project.projectId === editorProjectId) || null, [projects, editorProjectId]);
 
   async function loadProjects() {
     setLoading(true);
@@ -219,15 +222,17 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
     <div className="space-y-4">
       <div className="grid gap-2 text-sm leading-6 text-slate-300">
         <p>Projects are stored under Local AI Hub managed storage and remain available if HyperFrames is repaired or reinstalled.</p>
-        <p>HyperFrames projects can execute HTML/CSS/JavaScript when rendered. Open and render only projects you trust.</p>
-        <p>This version provides project management and templates. In-app editing and preview come later.</p>
+        <p>This editor works only inside Local AI Hub-managed HyperFrames projects.</p>
+        <p>HyperFrames compositions execute HTML/CSS/JavaScript when rendered. Edit and render only projects you trust.</p>
+        <p>This version supports local project assets only. Remote http/https/data references are blocked.</p>
+        <p>Preview and Studio integration are planned later.</p>
       </div>
 
       <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <p className="text-sm font-semibold text-white">Managed projects</p>
-            <p className="mt-1 text-xs leading-5 text-slate-400">Create a local starter, inspect its health, and hand it to HyperFrames Render.</p>
+            <p className="mt-1 text-xs leading-5 text-slate-400">Create a local starter, inspect its health, edit local files, manage assets, and hand it to HyperFrames Render.</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <button className="ghost-button px-3 py-1.5 text-xs" disabled={loading} onClick={loadProjects} type="button">Refresh</button>
@@ -290,6 +295,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <button className="primary-button px-3 py-1.5 text-xs" disabled={!runnable || busy} onClick={() => useInPipeline(project)} type="button">Use in Pipeline</button>
+                    <button className="ghost-button px-3 py-1.5 text-xs" disabled={busy} onClick={() => setEditorProjectId(project.projectId)} type="button">Open Editor</button>
                     <button className="ghost-button px-3 py-1.5 text-xs" disabled={busy} onClick={() => openFolder(project)} type="button">Open Project Folder</button>
                     <button className="ghost-button px-3 py-1.5 text-xs" disabled={!runnable || busy} onClick={() => renameProject(project)} type="button">Rename</button>
                     <button className="ghost-button px-3 py-1.5 text-xs" disabled={!runnable || busy} onClick={() => duplicateProject(project)} type="button">Duplicate</button>
@@ -300,6 +306,16 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
             );
           })}
         </div>
+      ) : null}
+
+      {editorProject ? (
+        <HyperFramesProjectEditor
+          key={editorProject.projectId}
+          onClose={() => setEditorProjectId('')}
+          onProjectsChanged={loadProjects}
+          onToast={onToast}
+          project={editorProject}
+        />
       ) : null}
     </div>
   );
