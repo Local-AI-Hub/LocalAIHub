@@ -52,6 +52,10 @@ async function main() {
 
   assert(managerSource.includes('normalizeHyperFramesProjectsForUi'), 'Project responses must be normalized before render.');
   assert(managerSource.includes('normalizeHyperFramesTemplatesForUi'), 'Template responses must be normalized before render.');
+  assert(managerSource.includes('normalizeHyperFramesBlankProjectForUi'), 'Blank Project metadata must be normalized separately from starter templates.');
+  assert(managerSource.includes('<optgroup label="Starter templates">') && managerSource.includes('{blankProject ? <option'), 'Blank Project must be first-class without appearing inside the starter template group.');
+  assert(!managerSource.includes('Open in HyperFrames Studio'), 'Deferred Studio feasibility must not expose a broken launch action.');
+  assert(!managerSource.includes('<iframe') && !managerSource.includes('<webview'), 'Project manager must not embed HyperFrames Studio.');
   assert(managerSource.includes('HyperFrames projects could not load.'), 'Project-list failures must render an inline error state.');
   assert(managerSource.includes('Retry'), 'Inline project errors must include retry.');
   assert(managerSource.includes('No HyperFrames projects yet.'), 'Empty project list must render the intended empty state.');
@@ -83,6 +87,9 @@ async function main() {
   assert.strictEqual(normal[0].health.runnable, true, 'Runnable health survives normalization.');
   const templates = bundle.normalizeHyperFramesTemplatesForUi([{ id: 'animated-title-card', label: 'Animated title card' }]);
   assert.strictEqual(templates[0].id, 'animated-title-card', 'Template metadata normalizes safely.');
+  const blankProject = bundle.normalizeHyperFramesBlankProjectForUi({ id: 'blank', label: 'Blank Project', sourceType: 'blank-scaffold' });
+  assert.strictEqual(blankProject.id, 'blank', 'Blank Project metadata normalizes independently.');
+  assert.strictEqual(blankProject.sourceType, 'blank-scaffold', 'Blank Project provenance survives normalization.');
 
   for (const [method, channel] of [
     ['listHyperFramesProjects', 'hyperframes-projects:list'],

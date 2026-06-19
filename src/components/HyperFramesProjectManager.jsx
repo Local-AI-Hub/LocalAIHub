@@ -33,7 +33,14 @@ export function normalizeHyperFramesTemplateForUi(template, index = 0) {
     description: safeText(source.description),
     localAssetsOnly: source.localAssetsOnly !== false,
     version: Math.max(1, Number(source.version || 1) || 1),
+    sourceType: safeText(source.sourceType, 'starter-template'),
   };
+}
+
+export function normalizeHyperFramesBlankProjectForUi(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const normalized = normalizeHyperFramesTemplateForUi(value);
+  return { ...normalized, id: 'blank', label: safeText(value.label, 'Blank Project'), sourceType: 'blank-scaffold' };
 }
 
 export function normalizeHyperFramesTemplatesForUi(value) {
@@ -52,6 +59,7 @@ export function normalizeHyperFramesProjectForUi(project, index = 0) {
     templateId: safeText(source.templateId),
     templateLabel: safeText(source.templateLabel, 'Unknown template'),
     templateVersion: Math.max(0, Number(source.templateVersion || 0) || 0),
+    sourceType: safeText(source.sourceType, source.templateId === 'blank' ? 'blank-scaffold' : 'managed-project'),
     createdAt: safeTimestamp(source.createdAt),
     updatedAt: safeTimestamp(source.updatedAt),
     localAssetsOnly: source.localAssetsOnly === true,
@@ -94,6 +102,7 @@ function healthLabel(project) {
 export default function HyperFramesProjectManager({ onProjectsChanged, onToast, onUseProjectInPipeline }) {
   const [projects, setProjects] = useState([]);
   const [templates, setTemplates] = useState([]);
+  const [blankProject, setBlankProject] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [busyProjectId, setBusyProjectId] = useState('');
@@ -103,7 +112,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
   const [statusMessage, setStatusMessage] = useState('');
   const [editorProjectId, setEditorProjectId] = useState('');
 
-  const defaultTemplateId = useMemo(() => templates[0]?.id || '', [templates]);
+  const defaultTemplateId = useMemo(() => blankProject?.id || templates[0]?.id || '', [blankProject, templates]);
   const editorProject = useMemo(() => projects.find((project) => project.projectId === editorProjectId) || null, [projects, editorProjectId]);
 
   async function loadProjects() {
@@ -130,8 +139,10 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
         setStatusMessage(getResultMessage(templateResult, 'Local AI Hub could not load HyperFrames templates.'));
       } else {
         const nextTemplates = normalizeHyperFramesTemplatesForUi(templateResult.data?.templates);
+        const nextBlankProject = normalizeHyperFramesBlankProjectForUi(templateResult.data?.blankProject);
         setTemplates(nextTemplates);
-        if (!templateId && nextTemplates[0]?.id) setTemplateId(nextTemplates[0].id);
+        setBlankProject(nextBlankProject);
+        if (!templateId && (nextBlankProject?.id || nextTemplates[0]?.id)) setTemplateId(nextBlankProject?.id || nextTemplates[0].id);
       }
     } catch (error) {
       const message = safeText(error?.message, 'Local AI Hub could not load HyperFrames projects.');
@@ -225,7 +236,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
         <p>This editor works only inside Local AI Hub-managed HyperFrames projects.</p>
         <p>HyperFrames compositions execute HTML/CSS/JavaScript when rendered. Edit and render only projects you trust.</p>
         <p>This version supports local project assets only. Remote http/https/data references are blocked.</p>
-        <p>Preview and Studio integration are planned later.</p>
+        <p>HyperFrames Studio support remains pending while its network and project-write behavior is reviewed.</p>
       </div>
 
       <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
@@ -243,9 +254,12 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
         {createOpen ? (
           <div className="mt-4 grid gap-3 rounded-2xl border border-white/10 bg-white/5 p-3 lg:grid-cols-[minmax(0,1fr),minmax(0,1fr),auto] lg:items-end">
             <label className="block">
-              <span className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Template</span>
+              <span className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Starting point</span>
               <select className="store-input mt-2" onChange={(event) => setTemplateId(event.target.value)} value={templateId || defaultTemplateId}>
-                {templates.map((template) => <option key={template.id} value={template.id}>{template.label}</option>)}
+                {blankProject ? <option value={blankProject.id}>{blankProject.label}</option> : null}
+                <optgroup label="Starter templates">
+                  {templates.map((template) => <option key={template.id} value={template.id}>{template.label}</option>)}
+                </optgroup>
               </select>
             </label>
             <label className="block">
@@ -290,7 +304,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
                       <span className={`rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] ${healthClassName(project)}`}>{healthLabel(project)}</span>
                       {project.localAssetsOnly ? <span className="rounded-full border border-cyan-300/25 bg-cyan-300/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.16em] text-cyan-100">Local only</span> : null}
                     </div>
-                    <p className="mt-2 text-xs leading-5 text-slate-400">{project.templateLabel || 'Unknown template'} - Created {formatDate(project.createdAt)} - Updated {formatDate(project.updatedAt)}</p>
+                    <p className="mt-2 text-xs leading-5 text-slate-400">{project.sourceType === 'blank-scaffold' ? 'Blank Project scaffold' : (project.templateLabel || 'Unknown template')} - Created {formatDate(project.createdAt)} - Updated {formatDate(project.updatedAt)}</p>
                     {project.health?.message ? <p className="mt-2 text-xs leading-5 text-slate-300">{project.health.message}</p> : null}
                   </div>
                   <div className="flex flex-wrap items-center gap-2">

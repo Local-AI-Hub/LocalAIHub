@@ -108,7 +108,7 @@ async function main() {
   assert(managerSource.includes('This editor works only inside Local AI Hub-managed HyperFrames projects.'), 'UI includes managed-project editor note');
   assert(managerSource.includes('HyperFrames compositions execute HTML/CSS/JavaScript when rendered. Edit and render only projects you trust.'), 'UI includes trusted-code warning');
   assert(managerSource.includes('This version supports local project assets only. Remote http/https/data references are blocked.'), 'UI includes local-only policy note');
-  assert(managerSource.includes('Preview and Studio integration are planned later.'), 'UI includes planned-later note');
+  assert(managerSource.includes('HyperFrames Studio support remains pending while its network and project-write behavior is reviewed.'), 'UI includes factual deferred-Studio note');
   assert(uiSource.includes('<textarea'), 'editor uses a built-in textarea');
   assert(!uiSource.includes('<iframe') && !uiSource.includes('<webview') && !uiSource.includes('Monaco'), 'editor adds no iframe, webview, or Monaco');
   assert(!managerSource.includes('<iframe') && !managerSource.includes('<webview') && !managerSource.includes('Monaco'), 'manager adds no iframe, webview, or Monaco');

@@ -74,6 +74,13 @@ const BUILT_IN_TEMPLATES = Object.freeze([
   }),
 ]);
 const BUILT_IN_TEMPLATE_BY_ID = new Map(BUILT_IN_TEMPLATES.map((template) => [template.id, template]));
+const BLANK_PROJECT = Object.freeze({
+  id: 'blank',
+  version: 1,
+  label: 'Blank Project',
+  description: 'A minimal renderable scaffold for composing from scratch with local HTML, CSS, and JavaScript.',
+  sourceType: 'blank-scaffold',
+});
 const FORBIDDEN_MANIFEST_KEYS = new Set([
   'args',
   'browserPath',
@@ -148,6 +155,21 @@ function getHyperFramesProjectsRoot(options = {}) {
 
 function getTemplateResourcesRoot() {
   return path.resolve(path.join(__dirname, '..', 'resources', 'hyperframes-templates'));
+}
+
+function getBlankProjectResourcesDir() {
+  return path.resolve(path.join(__dirname, '..', 'resources', 'hyperframes-blank-project'));
+}
+
+function getProjectSourceType(templateId, requestedSourceType = '') {
+  if (templateId === BLANK_PROJECT.id) return BLANK_PROJECT.sourceType;
+  if (BUILT_IN_TEMPLATE_BY_ID.has(templateId)) return 'starter-template';
+  return String(requestedSourceType || '').trim() === 'blank-scaffold' ? 'blank-scaffold' : 'managed-project';
+}
+
+function getProjectTemplateLabel(templateId) {
+  if (templateId === BLANK_PROJECT.id) return BLANK_PROJECT.label;
+  return BUILT_IN_TEMPLATE_BY_ID.get(templateId)?.label || 'Unknown';
 }
 
 function resolveTemplateDir(templateId) {
@@ -230,6 +252,7 @@ function normalizeProjectManifest(source, options = {}) {
   }
   const templateId = String(source.templateId || '').trim();
   const template = BUILT_IN_TEMPLATE_BY_ID.get(templateId) || null;
+  const sourceType = getProjectSourceType(templateId, source.sourceType);
   const createdAt = source.createdAt || nowIso();
   const updatedAt = source.updatedAt || createdAt;
   return {
@@ -237,7 +260,8 @@ function normalizeProjectManifest(source, options = {}) {
     projectId,
     displayName: sanitizeDisplayName(source.displayName, 'Untitled HyperFrames Project'),
     templateId,
-    templateVersion: Math.max(1, Number(source.templateVersion || template?.version || 1) || 1),
+    templateVersion: Math.max(1, Number(source.templateVersion || template?.version || (templateId === BLANK_PROJECT.id ? BLANK_PROJECT.version : 1)) || 1),
+    sourceType,
     entryFile: PROJECT_ENTRY_FILE,
     createdAt,
     updatedAt,
@@ -248,7 +272,7 @@ function normalizeProjectManifest(source, options = {}) {
   };
 }
 
-function buildProjectManifest({ projectId, displayName, templateId, templateVersion, description, createdAt }) {
+function buildProjectManifest({ projectId, displayName, templateId, templateVersion, sourceType, description, createdAt }) {
   const now = nowIso();
   return normalizeProjectManifest({
     schemaVersion: PROJECT_SCHEMA_VERSION,
@@ -256,6 +280,7 @@ function buildProjectManifest({ projectId, displayName, templateId, templateVers
     displayName,
     templateId,
     templateVersion,
+    sourceType,
     entryFile: PROJECT_ENTRY_FILE,
     createdAt: createdAt || now,
     updatedAt: now,
@@ -353,6 +378,7 @@ async function inspectHyperFramesProject(projectId, options = {}) {
     displayName: safeProjectId,
     templateId: '',
     templateVersion: 0,
+    sourceType: 'managed-project',
     localAssetsOnly: false,
     createdAt: null,
     updatedAt: null,
@@ -361,7 +387,7 @@ async function inspectHyperFramesProject(projectId, options = {}) {
   if (manifestResult.health) {
     return {
       ...fallbackManifest,
-      templateLabel: BUILT_IN_TEMPLATE_BY_ID.get(fallbackManifest.templateId)?.label || 'Unknown',
+      templateLabel: getProjectTemplateLabel(fallbackManifest.templateId),
       health: manifestResult.health,
     };
   }
@@ -370,7 +396,7 @@ async function inspectHyperFramesProject(projectId, options = {}) {
   if (!(await fs.pathExists(entryPath))) {
     return {
       ...fallbackManifest,
-      templateLabel: BUILT_IN_TEMPLATE_BY_ID.get(fallbackManifest.templateId)?.label || 'Unknown',
+      templateLabel: getProjectTemplateLabel(fallbackManifest.templateId),
       health: buildHealth('missing-entry', 'This project is missing index.html, so it cannot be rendered.'),
     };
   }
@@ -382,7 +408,7 @@ async function inspectHyperFramesProject(projectId, options = {}) {
     const scan = await scanStagedCompositionForRemoteReferences(projectDir, options.limits || PROJECT_TREE_LIMITS);
     return {
       ...fallbackManifest,
-      templateLabel: BUILT_IN_TEMPLATE_BY_ID.get(fallbackManifest.templateId)?.label || 'Unknown',
+      templateLabel: getProjectTemplateLabel(fallbackManifest.templateId),
       health: buildHealth('healthy', 'This managed HyperFrames project is ready for the pipeline.', true, {
         scannedFileCount: scan.scannedFileCount,
         scannedExtensions: scan.scannedExtensions,
@@ -391,7 +417,7 @@ async function inspectHyperFramesProject(projectId, options = {}) {
   } catch (error) {
     return {
       ...fallbackManifest,
-      templateLabel: BUILT_IN_TEMPLATE_BY_ID.get(fallbackManifest.templateId)?.label || 'Unknown',
+      templateLabel: getProjectTemplateLabel(fallbackManifest.templateId),
       health: buildHealth(error?.code === 'HYPERFRAMES_REMOTE_REFERENCE' ? 'remote-references' : 'unsafe-project', error?.message || HYPERFRAMES_LOCAL_ASSETS_ERROR),
     };
   }
@@ -399,7 +425,8 @@ async function inspectHyperFramesProject(projectId, options = {}) {
 
 async function listHyperFramesProjectTemplates() {
   return {
-    templates: BUILT_IN_TEMPLATES.map((template) => ({ ...template, localAssetsOnly: true })),
+    blankProject: { ...BLANK_PROJECT, localAssetsOnly: true },
+    templates: BUILT_IN_TEMPLATES.map((template) => ({ ...template, localAssetsOnly: true, sourceType: 'starter-template' })),
   };
 }
 
@@ -441,25 +468,41 @@ async function validateTemplate(templateId) {
   return { template, templateDir };
 }
 
+async function validateProjectCreationSource(sourceId) {
+  if (sourceId === BLANK_PROJECT.id) {
+    const sourceDir = getBlankProjectResourcesDir();
+    const entryPath = path.join(sourceDir, PROJECT_ENTRY_FILE);
+    if (!(await fs.pathExists(entryPath))) {
+      throw new Error('The Blank Project scaffold is missing index.html. Reinstall Local AI Hub.');
+    }
+    await inspectTreeSafety(sourceDir, PROJECT_TREE_LIMITS);
+    await scanStagedCompositionForRemoteReferences(sourceDir, PROJECT_TREE_LIMITS);
+    return { source: BLANK_PROJECT, sourceDir };
+  }
+  const { template, templateDir } = await validateTemplate(sourceId);
+  return { source: { ...template, sourceType: 'starter-template' }, sourceDir: templateDir };
+}
+
 async function createHyperFramesProject(payload = {}, options = {}) {
   return queueOperation(async () => {
     if (!options.managedRoot) {
       await ensureStorage();
     }
-    const { template, templateDir } = await validateTemplate(payload.templateId || BUILT_IN_TEMPLATES[0].id);
-    const displayName = sanitizeDisplayName(payload.displayName, template.label);
+    const { source, sourceDir } = await validateProjectCreationSource(payload.templateId || BUILT_IN_TEMPLATES[0].id);
+    const displayName = sanitizeDisplayName(payload.displayName, source.label);
     const projectId = createProjectId(displayName);
     const { projectDir, projectsRoot } = resolveProjectDir(projectId, options);
     await fs.ensureDir(projectsRoot);
     if (await fs.pathExists(projectDir)) {
       throw new Error('Local AI Hub could not create a unique HyperFrames project folder. Try again.');
     }
-    await copyCompositionProjectSafely(templateDir, projectDir, PROJECT_TREE_LIMITS);
+    await copyCompositionProjectSafely(sourceDir, projectDir, PROJECT_TREE_LIMITS);
     const manifest = buildProjectManifest({
       projectId,
       displayName,
-      templateId: template.id,
-      templateVersion: template.version,
+      templateId: source.id,
+      templateVersion: source.version,
+      sourceType: source.sourceType,
       description: payload.description,
     });
     await writeJsonAtomic(getManifestPath(projectDir), manifest);
@@ -507,6 +550,7 @@ async function duplicateHyperFramesProject(projectId, displayName, options = {})
       displayName: nextName,
       templateId: source.templateId,
       templateVersion: source.templateVersion,
+      sourceType: source.sourceType,
       description: source.description,
     });
     await writeJsonAtomic(getManifestPath(targetDir), manifest);
@@ -1149,6 +1193,7 @@ async function prepareHyperFramesProjectForPipeline(projectId, options = {}) {
     displayName: project.displayName,
     templateId: project.templateId,
     templateVersion: project.templateVersion,
+    sourceType: project.sourceType,
     entryFile: PROJECT_ENTRY_FILE,
     localAssetsOnly: true,
     trustedManagedProject: true,
@@ -1199,6 +1244,7 @@ async function buildHyperFramesProjectPipelineDraft(projectId, options = {}) {
 
 module.exports = {
   ASSET_FILE_EXTENSIONS,
+  BLANK_PROJECT,
   BUILT_IN_TEMPLATES,
   EDITABLE_FILE_EXTENSIONS,
   LOCAL_ONLY_POLICY_MESSAGE,
@@ -1224,6 +1270,7 @@ module.exports = {
   getHyperFramesProjectAssetReference,
   getHyperFramesProjectEditorState,
   getHyperFramesProjectHealth,
+  getBlankProjectResourcesDir,
   getHyperFramesProjectsRoot,
   getTemplateResourcesRoot,
   importHyperFramesProjectAssets,
@@ -1240,5 +1287,6 @@ module.exports = {
   renameHyperFramesProjectFile,
   saveHyperFramesProjectTextFile,
   validateLocalOnlyTextContent,
+  validateProjectCreationSource,
   validateTemplate,
 };
