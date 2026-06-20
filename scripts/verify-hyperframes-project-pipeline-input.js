@@ -79,7 +79,9 @@ function main() {
   assert(manager.includes('Projects are stored under Local AI Hub managed storage and remain available if HyperFrames is repaired or reinstalled.'), 'manager includes storage lifecycle note');
   assert(manager.includes('HyperFrames compositions execute HTML/CSS/JavaScript when rendered. Edit and render only projects you trust.'), 'manager includes trusted code warning');
   assert(manager.includes('This editor works only inside Local AI Hub-managed HyperFrames projects.'), 'manager includes managed editor scope note');
-  assert(manager.includes('HyperFrames Studio support remains pending while its network and project-write behavior is reviewed.'), 'manager keeps factual deferred-Studio note');
+  assert(manager.includes('Open in HyperFrames Studio (Experimental)'), 'manager labels the restricted Studio prototype experimental');
+  assert(manager.includes('Studio previews project HTML/CSS/JavaScript. Open only projects you trust.'), 'manager warns that Studio executes project code');
+  assert(manager.includes('Studio is restricted to Local AI Hub-managed HyperFrames projects. Remote network requests are blocked by Local AI Hub.'), 'manager states the enforced Studio scope and network contract');
   assert(manager.includes('Create Project'), 'manager supports create action');
   assert(manager.includes('Use in Pipeline'), 'manager supports pipeline handoff');
   assert(manager.includes('Open Project Folder'), 'manager supports safe open-folder action');

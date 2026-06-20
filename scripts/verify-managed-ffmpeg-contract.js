@@ -79,7 +79,7 @@ function verifyManagedMediaEnvironment() {
 
 function verifyPackagingAndLifecycleSource() {
   const packageJson = JSON.parse(read('package.json'));
-  assert.strictEqual(packageJson.version, '0.53.0', 'This pass must not bump the app version.');
+  assert.strictEqual(packageJson.version, '0.54.0', 'This pass must not bump the current development version.');
   assert.strictEqual(packageJson.dependencies['ffmpeg-ffprobe-static'], '6.1.1', 'The managed pair should use the exact paired ffmpeg-ffprobe-static package.');
   assert(packageJson.dependencies['ffmpeg-static'], 'Existing ffmpeg-static dependency should remain available for legacy verifier fixtures.');
   const resources = packageJson.build.extraResources || [];

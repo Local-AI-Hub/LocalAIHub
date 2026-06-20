@@ -111,6 +111,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
   const [displayName, setDisplayName] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
   const [editorProjectId, setEditorProjectId] = useState('');
+  const [studioStatus, setStudioStatus] = useState({ status: 'not-running', projectId: '', message: 'HyperFrames Studio is not running.' });
 
   const defaultTemplateId = useMemo(() => blankProject?.id || templates[0]?.id || '', [blankProject, templates]);
   const editorProject = useMemo(() => projects.find((project) => project.projectId === editorProjectId) || null, [projects, editorProjectId]);
@@ -156,6 +157,24 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
 
   useEffect(() => {
     loadProjects();
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    async function refreshStudioStatus() {
+      try {
+        const result = await getApiMethod('getHyperFramesStudioStatus', 'HyperFrames Studio is not available in this Local AI Hub build.')();
+        if (active && result?.ok && result.data) setStudioStatus(result.data);
+      } catch {
+        if (active) setStudioStatus({ status: 'failed', projectId: '', message: 'Local AI Hub could not read HyperFrames Studio status.' });
+      }
+    }
+    refreshStudioStatus();
+    const timer = window.setInterval(refreshStudioStatus, 2000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
   }, []);
 
   async function runProjectAction(projectId, action) {
@@ -229,6 +248,41 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
     });
   }
 
+  async function openStudio(project) {
+    const projectId = safeText(project?.projectId);
+    if (!projectId) return;
+    setStudioStatus({ status: 'starting', projectId, message: 'Starting the restricted HyperFrames Studio session...' });
+    setStatusMessage('');
+    try {
+      const result = await getApiMethod('openHyperFramesStudio')({ projectId });
+      if (!result?.ok) throw new Error(getResultMessage(result, 'Local AI Hub could not start HyperFrames Studio.'));
+      setStudioStatus(result.data);
+      setStatusMessage(result.data?.message || 'HyperFrames Studio opened.');
+    } catch (error) {
+      const message = safeText(error?.message, 'Local AI Hub could not start HyperFrames Studio.');
+      setStudioStatus({ status: 'failed', projectId, message });
+      setStatusMessage(message);
+      onToast?.(message, 'error');
+    }
+  }
+
+  async function stopStudio(project) {
+    const projectId = safeText(project?.projectId);
+    if (!projectId) return;
+    setStatusMessage('');
+    try {
+      const result = await getApiMethod('stopHyperFramesStudio')({ projectId });
+      if (!result?.ok) throw new Error(getResultMessage(result, 'Local AI Hub could not stop HyperFrames Studio.'));
+      setStudioStatus(result.data);
+      setStatusMessage(result.data?.message || 'HyperFrames Studio stopped.');
+    } catch (error) {
+      const message = safeText(error?.message, 'Local AI Hub could not stop HyperFrames Studio.');
+      setStudioStatus({ status: 'failed', projectId, message });
+      setStatusMessage(message);
+      onToast?.(message, 'error');
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="grid gap-2 text-sm leading-6 text-slate-300">
@@ -236,7 +290,8 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
         <p>This editor works only inside Local AI Hub-managed HyperFrames projects.</p>
         <p>HyperFrames compositions execute HTML/CSS/JavaScript when rendered. Edit and render only projects you trust.</p>
         <p>This version supports local project assets only. Remote http/https/data references are blocked.</p>
-        <p>HyperFrames Studio support remains pending while its network and project-write behavior is reviewed.</p>
+        <p>Studio previews project HTML/CSS/JavaScript. Open only projects you trust.</p>
+        <p>Studio is restricted to Local AI Hub-managed HyperFrames projects. Remote network requests are blocked by Local AI Hub.</p>
       </div>
 
       <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
@@ -273,6 +328,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
         ) : null}
 
         {statusMessage ? <p className="mt-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-xs leading-5 text-slate-300">{statusMessage}</p> : null}
+        <p className="mt-3 text-xs leading-5 text-slate-400">Studio status: <span className="font-semibold text-slate-200">{safeText(studioStatus.status, 'not-running').replace(/-/g, ' ')}</span>{studioStatus.projectId ? ' - ' + studioStatus.projectId : ''}</p>
       </div>
 
       {loading ? <p className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-slate-300">Loading HyperFrames projects...</p> : null}
@@ -308,6 +364,18 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
                     {project.health?.message ? <p className="mt-2 text-xs leading-5 text-slate-300">{project.health.message}</p> : null}
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
+                    {studioStatus.status === 'running' && studioStatus.projectId === project.projectId ? (
+                      <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => stopStudio(project)} type="button">Stop Studio</button>
+                    ) : (
+                      <button
+                        className="ghost-button px-3 py-1.5 text-xs"
+                        disabled={!runnable || busy || studioStatus.status === 'starting' || (studioStatus.status === 'running' && studioStatus.projectId !== project.projectId)}
+                        onClick={() => openStudio(project)}
+                        type="button"
+                      >
+                        Open in HyperFrames Studio (Experimental)
+                      </button>
+                    )}
                     <button className="primary-button px-3 py-1.5 text-xs" disabled={!runnable || busy} onClick={() => useInPipeline(project)} type="button">Use in Pipeline</button>
                     <button className="ghost-button px-3 py-1.5 text-xs" disabled={busy} onClick={() => setEditorProjectId(project.projectId)} type="button">Open Editor</button>
                     <button className="ghost-button px-3 py-1.5 text-xs" disabled={busy} onClick={() => openFolder(project)} type="button">Open Project Folder</button>

@@ -54,7 +54,7 @@ async function main() {
   assert(managerSource.includes('normalizeHyperFramesTemplatesForUi'), 'Template responses must be normalized before render.');
   assert(managerSource.includes('normalizeHyperFramesBlankProjectForUi'), 'Blank Project metadata must be normalized separately from starter templates.');
   assert(managerSource.includes('<optgroup label="Starter templates">') && managerSource.includes('{blankProject ? <option'), 'Blank Project must be first-class without appearing inside the starter template group.');
-  assert(!managerSource.includes('Open in HyperFrames Studio'), 'Deferred Studio feasibility must not expose a broken launch action.');
+  assert(managerSource.includes('Open in HyperFrames Studio (Experimental)'), 'Restricted Studio prototype must remain clearly experimental.');
   assert(!managerSource.includes('<iframe') && !managerSource.includes('<webview'), 'Project manager must not embed HyperFrames Studio.');
   assert(managerSource.includes('HyperFrames projects could not load.'), 'Project-list failures must render an inline error state.');
   assert(managerSource.includes('Retry'), 'Inline project errors must include retry.');

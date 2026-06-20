@@ -116,6 +116,7 @@ const {
   renameHyperFramesProjectFile,
   saveHyperFramesProjectTextFile,
 } = require('./services/hyperFramesProjectService');
+const { createHyperFramesStudioService } = require('./services/hyperFramesStudioService');
 const { inspectCleanupTargets, runCleanup } = require('./services/storageCleanupService');
 const { dismissManagedDataMigration, getStorageOverview, setManagedDataRoot } = require('./services/storageLocationService');
 const { getToolCatalog, getToolManifest, initializeToolRegistry } = require('./services/toolRegistry');
@@ -282,6 +283,8 @@ try {
   // Electron only allows scheme registration before app readiness; ignore duplicate registration in test-like reloads.
 }
 
+const hyperFramesStudioService = createHyperFramesStudioService({ BrowserWindow, session });
+
 let mainWindow = null;
 let tray = null;
 let cachedTrayToolItems = [];
@@ -434,6 +437,7 @@ async function shutdownOwnedResources() {
   } else {
     await disposeRecording().catch(() => null);
   }
+  await hyperFramesStudioService.dispose().catch(() => null);
   await disposeAllRuntimes().catch(() => null);
   await disposeBackgroundTasks().catch(() => null);
   appUpdateService.dispose();
@@ -1785,6 +1789,15 @@ function registerIpcHandlers() {
 
   ipcMain.handle('hyperframes-projects:prepare-pipeline', (_event, payload) =>
     withPlainEnglishErrors(async () => buildHyperFramesProjectPipelineDraft(typeof payload === 'string' ? payload : payload?.projectId), 'Local AI Hub could not prepare a HyperFrames project pipeline.'),
+  );
+  ipcMain.handle('hyperframes-studio:status', () =>
+    withPlainEnglishErrors(async () => hyperFramesStudioService.getStatus(), 'Local AI Hub could not read HyperFrames Studio status.'),
+  );
+  ipcMain.handle('hyperframes-studio:open', (_event, payload) =>
+    withPlainEnglishErrors(async () => hyperFramesStudioService.start(payload), 'Local AI Hub could not start the restricted HyperFrames Studio session.'),
+  );
+  ipcMain.handle('hyperframes-studio:stop', (_event, payload) =>
+    withPlainEnglishErrors(async () => hyperFramesStudioService.stop(payload), 'Local AI Hub could not stop HyperFrames Studio.'),
   );
   ipcMain.handle('tools:install', (_event, payload) =>
     withPlainEnglishErrors(async () => {
