@@ -74,6 +74,9 @@ async function main() {
   await service.deleteHyperFramesProjectFile(projectId, 'notes-copy.txt', options);
   assert(!(await fs.pathExists(path.join(projectDir, 'notes-copy.txt'))), 'delete text file is project-scoped');
   await assertRejects(() => service.createHyperFramesProjectTextFile(projectId, 'CON.txt', '', options), /reserved/i, 'reserved filename create');
+  await assertRejects(() => service.createHyperFramesProjectTextFile(projectId, 'bad/name.txt', '', options), /file name|separators|folder|outside/i, 'nested create rejected');
+  await assertRejects(() => service.createHyperFramesProjectTextFile(projectId, 'trailing.txt ', '', options), /dot or space/i, 'trailing space create');
+  await assertRejects(() => service.createHyperFramesProjectTextFile(projectId, 'project.json', '{}', options), /project\.json|can edit/i, 'project manifest create rejected');
   await assertRejects(() => service.renameHyperFramesProjectFile(projectId, 'notes-renamed.txt', 'bad/name.txt', options), /file name only|separators/i, 'bad filename rename');
   await assertRejects(() => service.deleteHyperFramesProjectFile(projectId, 'index.html', options), /entrypoint|index\.html/i, 'index deletion');
   await assertRejects(() => service.saveHyperFramesProjectTextFile(projectId, 'project.json', '{}', options), /project\.json|can edit/i, 'project manifest edit');
@@ -110,6 +113,9 @@ async function main() {
   assert(managerSource.includes('This version supports local project assets only. Remote http/https/data references are blocked.'), 'UI includes local-only policy note');
   assert(managerSource.includes('Open in HyperFrames Studio (Experimental)'), 'UI includes the experimental restricted Studio action');
   assert(uiSource.includes('<textarea'), 'editor uses a built-in textarea');
+  assert(uiSource.includes('setCreateFileOpen'), 'editor uses an inline New Text File form instead of a silent prompt-only action');
+  assert(uiSource.includes('collisions get a safe suffix'), 'editor explains collision-safe file creation');
+  assert(uiSource.includes('project.json is app-managed and read-only.'), 'editor explains app-managed manifest files inline');
   assert(!uiSource.includes('<iframe') && !uiSource.includes('<webview') && !uiSource.includes('Monaco'), 'editor adds no iframe, webview, or Monaco');
   assert(!managerSource.includes('<iframe') && !managerSource.includes('<webview') && !managerSource.includes('Monaco'), 'manager adds no iframe, webview, or Monaco');
   assert(mainSource.includes("hyperframes-projects:editor-state") && preloadSource.includes('getHyperFramesProjectEditorState'), 'editor IPC is exposed through project-scoped bridge');

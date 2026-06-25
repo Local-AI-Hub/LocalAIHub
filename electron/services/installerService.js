@@ -15,7 +15,7 @@ const { detectHardwareSnapshot } = require('./hardwareService');
 const { detectPythonRequirement, describePythonRequirement } = require('./pythonRequirementService');
 const { ensureManagedPythonRuntime } = require('./pythonRuntimeService');
 const { applyRepairCleanup, getDiskPreflight, inspectRepairCleanup, preflightPathRemoval, removePathWithRetries } = require('./storageMaintenanceService');
-const { syncDiscoveredTools } = require('./toolDiscoveryService');
+const { invalidateDiscoveryCache, syncDiscoveredTools } = require('./toolDiscoveryService');
 const { getCachedToolUpdateEntry, refreshInstalledToolUpdates } = require('./toolUpdateService');
 const { buildLaunchModeState, buildManagedLaunchProfile, getToolManifest, initializeToolRegistry } = require('./toolRegistry');
 const { INSTALL_DESTINATION_CONTROL, getToolActionSemantics, isDirectManagedTool, isOfficialInstallerTool, normalizeToolLifecycle } = require('./toolLifecycleService');
@@ -41,6 +41,8 @@ const INSTALLER_MATERIALIZATION_POLL_MS = 1000;
 const GUIDED_INSTALLER_LAUNCH_SETTLE_MS = 1500;
 const OFFICIAL_DESKTOP_UPDATE_DETECTION_TIMEOUT_MS = 30000;
 const OFFICIAL_DESKTOP_UPDATE_DETECTION_POLL_MS = 1000;
+const POST_UPDATE_VERSION_RECONCILE_TIMEOUT_MS = 45000;
+const POST_UPDATE_VERSION_RECONCILE_POLL_MS = 1500;
 const OFFICIAL_UNINSTALL_SETTLE_TIMEOUT_MS = 45000;
 const OFFICIAL_UNINSTALL_SETTLE_POLL_MS = 1000;
 const MANAGED_CUDA_PYTORCH_INSTALL_TOOL_IDS = new Set(['comfyui']);
@@ -460,29 +462,34 @@ async function readExecutableProductVersion(targetPath) {
   }
 
   const escapedPath = String(targetPath).replace(/'/g, "''");
-  const result = await runCommand('powershell.exe', ['-NoProfile', '-Command', `(Get-Item -LiteralPath '${escapedPath}').VersionInfo.ProductVersion`], {
+  const result = await runCommand('powershell.exe', ['-NoProfile', '-Command', `$item = Get-Item -LiteralPath '${escapedPath}'; @($item.VersionInfo.ProductVersion, $item.VersionInfo.FileVersion) | ForEach-Object { $_ }`], {
     allowFailure: true,
   }).catch(() => null);
 
-  return normalizeVersionText(result?.stdout || '');
+  const versions = String(result?.stdout || '')
+    .split(/\r?\n/)
+    .map((entry) => normalizeVersionText(entry))
+    .filter(Boolean);
+  return versions[0] || '';
 }
 
 async function readInstalledBinaryVersion(toolState) {
   return normalizeVersionText(toolState?.installedVersion || '')
+    || normalizeVersionText(toolState?.windowsUninstallDisplayVersion || '')
     || normalizeVersionText(toolState?.windowsUninstallDisplayName || '')
     || await readExecutableProductVersion(toolState?.launchProfile?.executable || toolState?.executablePath || '');
 }
 
 function buildIncompleteUpdateVersionMessage(manifest, expectedVersion, detectedVersion = '', previousVersion = '') {
   if (detectedVersion) {
-    return `Local AI Hub ran the ${manifest.name} updater, but Windows still reports version ${detectedVersion} instead of ${expectedVersion}.`;
+    return `The updater completed, but Windows has not reported the new version yet. Local AI Hub still sees ${detectedVersion} instead of ${expectedVersion}. Relaunch Local AI Hub or open logs if it still shows old.`;
   }
 
   if (previousVersion) {
-    return `Local AI Hub ran the ${manifest.name} updater, but it still appears to be on version ${previousVersion} instead of ${expectedVersion}.`;
+    return `The updater completed, but Windows has not reported the new version yet. Local AI Hub still sees ${previousVersion} instead of ${expectedVersion}. Relaunch Local AI Hub or open logs if it still shows old.`;
   }
 
-  return `Local AI Hub ran the ${manifest.name} updater, but it could not verify that version ${expectedVersion} was installed.`;
+  return `The updater completed, but Windows has not reported the new version yet. Relaunch Local AI Hub or open logs if it still shows old.`;
 }
 
 function buildUnverifiedExternalUpdateMessage(manifest, expectedVersion) {
@@ -546,6 +553,87 @@ function officialDesktopUpdateStateIsApproved(manifest, toolState) {
   return Boolean(toolState.windowsUninstallDetected) || officialDesktopPathMatchesManifest(manifest, toolState);
 }
 
+async function reconcileInstalledToolUpdateVersion(manifest, baseToolState, expectedVersion, logger, options = {}) {
+  const normalizedExpectedVersion = normalizeVersionText(expectedVersion || '');
+  if (!normalizedExpectedVersion) {
+    return {
+      detectedVersion: await readInstalledBinaryVersion(baseToolState),
+      toolState: baseToolState,
+      verified: true,
+    };
+  }
+
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.max(0, options.timeoutMs)
+    : POST_UPDATE_VERSION_RECONCILE_TIMEOUT_MS;
+  const pollMs = Number.isFinite(options.pollMs)
+    ? Math.max(0, options.pollMs)
+    : POST_UPDATE_VERSION_RECONCILE_POLL_MS;
+  const wait = typeof options.sleep === 'function' ? options.sleep : sleep;
+  const discoverTools = typeof options.discoverTools === 'function'
+    ? options.discoverTools
+    : () => syncDiscoveredTools({ force: true, persist: false });
+  const attachWindowsMetadata = typeof options.attachWindowsUninstallMetadata === 'function'
+    ? options.attachWindowsUninstallMetadata
+    : (state) => attachWindowsUninstallMetadata(state, manifest, { refresh: true });
+  const readVersion = typeof options.readInstalledBinaryVersion === 'function'
+    ? options.readInstalledBinaryVersion
+    : readInstalledBinaryVersion;
+  const clearDiscoveryCache = typeof options.invalidateDiscoveryCache === 'function'
+    ? options.invalidateDiscoveryCache
+    : invalidateDiscoveryCache;
+  const deadline = Date.now() + timeoutMs;
+  let attempts = 0;
+  let latestToolState = baseToolState;
+  let latestVersion = '';
+
+  while (true) {
+    attempts += 1;
+    clearDiscoveryCache();
+    const discoveredTools = await discoverTools().catch(() => ({}));
+    const discoveredTool = discoveredTools?.[manifest.id];
+    latestToolState = discoveredTool && await toolIsAvailable(discoveredTool)
+      ? normalizeToolLifecycle({
+          ...latestToolState,
+          ...discoveredTool,
+          downloadCachePath: latestToolState?.downloadCachePath || baseToolState?.downloadCachePath || null,
+          installedByLocalAIHub: latestToolState?.installedByLocalAIHub !== false,
+          lastError: null,
+          status: discoveredTool.status === 'running' ? 'running' : 'stopped',
+        }, manifest)
+      : latestToolState;
+    latestToolState = await attachWindowsMetadata(latestToolState);
+    latestVersion = await readVersion(latestToolState);
+
+    await logger?.info?.('Re-probed installed tool version after updater completion.', {
+      attempts,
+      detectedVersion: latestVersion || null,
+      expectedVersion: normalizedExpectedVersion,
+      toolId: manifest.id,
+      windowsUninstallDisplayVersion: latestToolState?.windowsUninstallDisplayVersion || null,
+    });
+
+    if (latestVersion && compareVersionText(latestVersion, normalizedExpectedVersion) >= 0) {
+      return {
+        attempts,
+        detectedVersion: latestVersion,
+        toolState: latestToolState,
+        verified: true,
+      };
+    }
+
+    if (Date.now() >= deadline) {
+      return {
+        attempts,
+        detectedVersion: latestVersion,
+        toolState: latestToolState,
+        verified: false,
+      };
+    }
+
+    await wait(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+  }
+}
 async function detectOfficialDesktopUpdateToolState(manifest, archivePath, logger, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs)
     ? Math.max(0, options.timeoutMs)
@@ -3652,30 +3740,36 @@ async function updateExecutableInstallerTool(manifest, paths, options = {}) {
 
     throw new Error(buildManagedPlacementFailureMessage(manifest, installDir));
   }
-  const detectedVersion = await readInstalledBinaryVersion(toolState);
+  let detectedVersion = await readInstalledBinaryVersion(toolState);
+  let reconciledToolState = toolState;
   let detectionWarning = '';
   if (expectedVersion) {
-    if (detectedVersion) {
-      if (compareVersionText(detectedVersion, expectedVersion) < 0) {
-        throw new Error(buildIncompleteUpdateVersionMessage(manifest, expectedVersion, detectedVersion, previousVersion));
+    const needsReconcile = !detectedVersion || compareVersionText(detectedVersion, expectedVersion) < 0;
+    if (needsReconcile) {
+      const reconciliation = await reconcileInstalledToolUpdateVersion(manifest, toolState, expectedVersion, options.logger, options.versionReconciliation || {});
+      detectedVersion = normalizeVersionText(reconciliation.detectedVersion || detectedVersion || '');
+      reconciledToolState = reconciliation.toolState || toolState;
+      if (!reconciliation.verified) {
+        if (expectManagedInstall) {
+          throw new Error(buildIncompleteUpdateVersionMessage(manifest, expectedVersion, detectedVersion, previousVersion));
+        }
+        detectionWarning = detectedVersion
+          ? buildIncompleteUpdateVersionMessage(manifest, expectedVersion, detectedVersion, previousVersion)
+          : buildUnverifiedExternalUpdateMessage(manifest, expectedVersion);
+        await options.logger.warn('The official updater finished, but version recognition did not settle before the bounded reconciliation timeout.', {
+          detectedPath: reconciledToolState.displayPath || reconciledToolState.installDir || reconciledToolState.detectedPath || null,
+          detectedVersion: detectedVersion || null,
+          expectedVersion,
+          previousVersion,
+        });
       }
-    } else if (previousVersion && compareVersionText(previousVersion, expectedVersion) < 0) {
-      if (expectManagedInstall) {
-        throw new Error(buildIncompleteUpdateVersionMessage(manifest, expectedVersion, '', previousVersion));
-      }
-      detectionWarning = buildUnverifiedExternalUpdateMessage(manifest, expectedVersion);
-      await options.logger.warn('The official updater finished and the app was detected, but version verification was unavailable.', {
-        detectedPath: toolState.displayPath || toolState.installDir || toolState.detectedPath || null,
-        expectedVersion,
-        previousVersion,
-      });
     }
   }
 
   return {
     detectedVersion,
     detectionWarning,
-    toolState,
+    toolState: reconciledToolState,
   };
 }
 async function ensureCachedDownload(manifest, archivePath, logger, onProgress, toolId) {
@@ -6096,6 +6190,7 @@ module.exports = {
     buildOfficialDesktopUpdateVerificationLagMessage,
     buildUnverifiedExternalUpdateMessage,
     detectOfficialDesktopUpdateToolState,
+    reconcileInstalledToolUpdateVersion,
     ensureManagedToolStatePaths,
     officialDesktopUpdateStateIsApproved,
     collectManagedModelAssetRootsForUninstall,

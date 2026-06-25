@@ -1,4 +1,4 @@
-const assert = require('assert');
+﻿const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
@@ -105,6 +105,9 @@ assert(executionSource.includes('return true;') && executionSource.includes("nod
 
 const renderServiceSource = fs.readFileSync(path.join(repoRoot, 'electron/services/hyperFramesRenderService.js'), 'utf8');
 assert(renderServiceSource.includes("['lint', '--json', stagedRoot]"), 'Render service must lint before render.');
+assert(renderServiceSource.includes('buildHyperFramesLintFailureMessage'), 'Render service must preserve actionable lint details in failures.');
+assert(renderServiceSource.includes('Lint phase: hyperframes lint --json.'), 'Lint failures must identify the command phase.');
+assert(renderServiceSource.includes('stderrTail') && renderServiceSource.includes('stdoutTail'), 'Lint failures include bounded stdout/stderr tails.');
 assert(renderServiceSource.includes("'--no-browser-gpu'") && renderServiceSource.includes("'--workers'") && renderServiceSource.includes('HYPERFRAMES_RENDER_WORKERS'), 'Render service must force workers=1 and disable browser GPU.');
 assert(renderServiceSource.includes("'--format'") && renderServiceSource.includes('HYPERFRAMES_RENDER_FORMAT'), 'Render service must force MP4 format.');
 assert(!renderServiceSource.includes('cloud ') && !renderServiceSource.includes('preview '), 'Render service must not route cloud or studio commands.');

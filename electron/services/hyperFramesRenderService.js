@@ -263,6 +263,21 @@ function buildCliSummary(result, options = {}) {
   };
 }
 
+function buildHyperFramesLintFailureMessage(lintSummary = {}) {
+  const details = [];
+  details.push('Lint phase: hyperframes lint --json.');
+  const combinedTail = [lintSummary.stderrTail, lintSummary.stdoutTail]
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean)
+    .join('\n');
+  if (combinedTail) {
+    details.push('Lint details: ' + combinedTail.slice(0, 3000));
+  } else {
+    details.push('HyperFrames did not emit specific lint details on stdout or stderr.');
+  }
+  return 'HyperFrames lint found a problem in this composition. Fix the local project, then run the pipeline again. ' + details.join(' ');
+}
+
 function parseRational(value) {
   const text = String(value || '').trim();
   const match = text.match(/^(\d+)\/(\d+)$/);
@@ -405,7 +420,10 @@ async function renderHyperFramesComposition(input, options = {}) {
     });
     lintSummary = buildCliSummary(lintResult, { managedRoot: runtimeContext.paths.installDir, sourceRoot: projectRoot });
     if (Number(lintResult.code || 0) !== 0) {
-      throw new Error('HyperFrames lint found a problem in this composition. Fix the local project, then run the pipeline again.');
+      const lintError = new Error(buildHyperFramesLintFailureMessage(lintSummary));
+      lintError.code = 'HYPERFRAMES_LINT_FAILED';
+      lintError.hyperFramesLint = lintSummary;
+      throw lintError;
     }
 
     options.reportProgress?.({ stage: 'rendering', message: 'Rendering the HyperFrames composition to MP4.' });
@@ -472,6 +490,7 @@ module.exports = {
   assertSupportedHyperFramesRenderSettings,
   assertTrustedCompositionArtifact,
   buildCliSummary,
+  buildHyperFramesLintFailureMessage,
   buildHyperFramesRenderMetadata,
   buildRenderArgs,
   copyCompositionProjectSafely,

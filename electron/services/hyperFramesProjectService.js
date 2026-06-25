@@ -646,8 +646,9 @@ function validateSafePathSegment(value) {
 }
 
 function validateSafeFileName(value) {
-  const name = path.basename(String(value || '').trim());
-  if (name !== String(value || '').trim()) {
+  const rawName = String(value || '');
+  const name = path.basename(rawName);
+  if (name !== rawName) {
     throw new Error('Enter a file name only, without folders.');
   }
   return validateSafePathSegment(name);
@@ -889,20 +890,24 @@ async function saveHyperFramesProjectTextFile(projectId, relativePath, content, 
 
 async function createHyperFramesProjectTextFile(projectId, relativePath, content = '', options = {}) {
   return queueOperation(async () => {
-    const editablePath = assertEditableProjectTextPath(relativePath);
+    const editablePath = assertEditableProjectTextPath(validateSafeFileName(relativePath));
     validateLocalOnlyTextContent(content, editablePath);
     const resolved = await resolveProjectRelativeParent(projectId, editablePath, options);
     const nextBuffer = Buffer.from(String(content ?? ''), 'utf8');
     if (nextBuffer.length > MAX_NEW_TEXT_FILE_BYTES) {
       throw new Error(`New HyperFrames text files must be ${Math.round(MAX_NEW_TEXT_FILE_BYTES / 1024)} KB or smaller.`);
     }
-    if (await fs.pathExists(resolved.targetPath)) {
-      throw new Error('A project file with that name already exists.');
-    }
-    await fs.ensureDir(resolved.parentPath);
-    await fs.writeFile(resolved.targetPath, nextBuffer);
+    const target = await nextAvailableProjectPath(resolved.projectDir, editablePath);
+    assertPathInside(resolved.parentPath, path.dirname(target.candidatePath), 'Local AI Hub refused to create a HyperFrames text file outside the requested project folder.');
+    await fs.ensureDir(path.dirname(target.candidatePath));
+    await fs.writeFile(target.candidatePath, nextBuffer);
     await updateProjectModifiedTime(resolved.projectDir, resolved.projectId);
-    return { file: await readHyperFramesProjectTextFile(resolved.projectId, editablePath, options), message: 'HyperFrames project file created.' };
+    return {
+      file: await readHyperFramesProjectTextFile(resolved.projectId, target.candidateRelative, options),
+      message: target.candidateRelative === editablePath
+        ? 'HyperFrames project file created.'
+        : `HyperFrames project file created as ${target.candidateRelative} because that name already existed.`,
+    };
   });
 }
 

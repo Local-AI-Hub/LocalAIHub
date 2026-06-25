@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 
 function safeText(value, fallback = '') {
   const text = String(value ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -71,6 +71,8 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
   const [selectedFile, setSelectedFile] = useState('');
   const [content, setContent] = useState('');
   const [savedContent, setSavedContent] = useState('');
+  const [createFileOpen, setCreateFileOpen] = useState(false);
+  const [createFileName, setCreateFileName] = useState('composition-notes.txt');
 
   const files = useMemo(() => (Array.isArray(state?.files) ? state.files.map(normalizeFile) : []), [state]);
   const assets = useMemo(() => (Array.isArray(state?.assets) ? state.assets.map(normalizeFile) : []), [state]);
@@ -155,19 +157,24 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
     }
   }
 
-  async function createFile() {
+  async function createFile(event) {
+    event?.preventDefault?.();
     if (!confirmDiscard()) return;
-    const relativePath = window.prompt('New HyperFrames text file path inside this project', 'notes.txt');
-    if (!relativePath) return;
+    const relativePath = normalizeSlash(createFileName || 'composition-notes.txt');
     setBusy('create-file');
     setError('');
     try {
       const result = await getApiMethod('createHyperFramesProjectFile')({ projectId, relativePath, content: '' });
       if (!result?.ok) throw new Error(messageFrom(result, 'Local AI Hub could not create that HyperFrames project file.'));
+      const createdPath = result.data?.file?.relativePath || relativePath;
       await loadEditor();
-      await openFile(result.data?.file?.relativePath || relativePath, { skipDirtyCheck: true });
+      await openFile(createdPath, { skipDirtyCheck: true });
       await onProjectsChanged?.();
-      onToast?.('HyperFrames project file created.', 'success');
+      const message = messageFrom(result, 'HyperFrames project file created.');
+      setStatus(message);
+      setCreateFileName('composition-notes.txt');
+      setCreateFileOpen(false);
+      onToast?.(message, 'success');
     } catch (caught) {
       const message = safeText(caught?.message, 'Local AI Hub could not create that HyperFrames project file.');
       setError(message);
@@ -297,17 +304,37 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
           <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
             <div className="flex items-center justify-between gap-2">
               <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Project files</p>
-              <button className="ghost-button px-3 py-1.5 text-xs" disabled={Boolean(busy)} onClick={createFile} type="button">New Text File</button>
+              <button className="ghost-button px-3 py-1.5 text-xs" disabled={Boolean(busy)} onClick={() => setCreateFileOpen((current) => !current)} type="button">New Text File</button>
             </div>
+            {createFileOpen ? (
+              <form className="mt-3 grid gap-2 rounded-xl border border-white/10 bg-slate-950/35 p-2" onSubmit={createFile}>
+                <label className="block">
+                  <span className="text-[11px] uppercase tracking-[0.16em] text-slate-500">File name</span>
+                  <input
+                    className="store-input mt-2"
+                    disabled={busy === 'create-file'}
+                    onChange={(event) => setCreateFileName(event.target.value)}
+                    placeholder="composition-notes.txt"
+                    value={createFileName}
+                  />
+                </label>
+                <p className="text-[11px] leading-5 text-slate-400">Allowed: .html, .css, .js, .md, .txt. Names stay inside this project; collisions get a safe suffix.</p>
+                <div className="flex flex-wrap gap-2">
+                  <button className="primary-button px-3 py-1.5 text-xs" disabled={busy === 'create-file'} type="submit">{busy === 'create-file' ? 'Creating...' : 'Create File'}</button>
+                  <button className="ghost-button px-3 py-1.5 text-xs" disabled={busy === 'create-file'} onClick={() => setCreateFileOpen(false)} type="button">Cancel</button>
+                </div>
+              </form>
+            ) : null}
             <div className="mt-3 max-h-80 space-y-1 overflow-y-auto pr-1">
               {files.length ? files.map((file) => (
                 <div className={`rounded-xl border px-2 py-2 text-xs ${selectedFile === file.relativePath ? 'border-cyan-300/40 bg-cyan-300/10' : 'border-white/10 bg-slate-950/30'}`} key={file.relativePath} style={indentFor(file.relativePath)}>
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <button className={`min-w-0 text-left ${file.editable ? 'text-slate-100' : 'text-slate-500'}`} disabled={!file.editable || Boolean(busy)} onClick={() => openFile(file.relativePath)} type="button">
+                    <button className={`min-w-0 text-left ${file.editable ? 'text-slate-100' : 'text-slate-500'}`} title={file.editable ? `Open ${file.relativePath}` : `${file.relativePath} is app-managed or not an editable text type.`} disabled={!file.editable || Boolean(busy)} onClick={() => openFile(file.relativePath)} type="button">
                       <span className="truncate">{file.kind === 'directory' ? 'Folder: ' : ''}{file.relativePath}</span>
                     </button>
                     {file.kind === 'file' ? <span className="text-slate-500">{formatBytes(file.sizeBytes)}</span> : null}
                   </div>
+                  {file.kind === 'file' && !file.editable ? <p className="mt-2 text-[11px] leading-5 text-slate-500">{file.relativePath === 'project.json' ? 'project.json is app-managed and read-only.' : 'This file type is not editable in this pass.'}</p> : null}
                   {file.kind === 'file' && file.relativePath !== 'project.json' ? (
                     <div className="mt-2 flex flex-wrap gap-2">
                       <button className="ghost-button px-2 py-1 text-[11px]" disabled={file.relativePath === 'index.html' || Boolean(busy)} onClick={() => renameFile(file)} type="button">Rename</button>

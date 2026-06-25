@@ -34,6 +34,7 @@ const BLOCKED_ENDPOINT_PREFIXES = [
   '/api/projects/:project/waveform',
 ];
 const MAX_CAPTURED_LOG_CHARS = 32768;
+const STUDIO_READINESS_TIMEOUT_MS = 60000;
 
 /*
  * Enforced Studio contract:
@@ -62,7 +63,7 @@ function assertProjectIdPayload(payload) {
 function isAllowedStudioReadPath(pathname, projectName) {
   if (pathname === '/' || pathname === '/favicon.ico') return true;
   if (pathname.startsWith('/assets/') || pathname.startsWith('/icons/')) return true;
-  if (pathname === '/api/events' || pathname === '/api/projects' || pathname === '/api/runtime.js') return true;
+  if (pathname === '/api/config' || pathname === '/api/events' || pathname === '/api/projects' || pathname === '/api/runtime.js') return true;
   const projectBase = '/api/projects/' + encodeURIComponent(projectName);
   if (pathname === projectBase || pathname === projectBase + '/lint') return true;
   if (pathname.startsWith(projectBase + '/files/')) return true;
@@ -115,36 +116,89 @@ function allocateLoopbackPort() {
 
 function requestJson(port, pathname) {
   return new Promise((resolve, reject) => {
-    const request = http.get({ hostname: HYPERFRAMES_STUDIO_HOST, path: pathname, port, timeout: 1000 }, (response) => {
+    const request = http.get({ hostname: HYPERFRAMES_STUDIO_HOST, path: pathname, port, timeout: 1500 }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
       response.on('end', () => {
-        if (response.statusCode !== 200) return reject(new Error('Studio did not become ready on its managed loopback port.'));
+        if (response.statusCode !== 200) {
+          const error = new Error(`GET ${pathname} returned HTTP ${response.statusCode || 'unknown'}.`);
+          error.httpStatus = response.statusCode || 0;
+          reject(error);
+          return;
+        }
         try {
           resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-        } catch {
-          reject(new Error('Studio returned an invalid local readiness response.'));
+        } catch (parseError) {
+          const error = new Error(`GET ${pathname} returned invalid JSON.`);
+          error.cause = parseError;
+          reject(error);
         }
       });
     });
-    request.on('error', reject);
-    request.on('timeout', () => request.destroy(new Error('Studio readiness timed out.')));
+    request.on('error', (error) => reject(error));
+    request.on('timeout', () => request.destroy(new Error(`GET ${pathname} timed out.`)));
   });
 }
 
-async function waitForStudioReady(port, child) {
-  const deadline = Date.now() + 30000;
+function sanitizeStudioLogText(value, maxChars = 2000) {
+  return String(value || '')
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .replace(/(token|secret|password|api[_-]?key)=\S+/gi, '$1=[redacted]')
+    .replace(/[A-Za-z]:\\[^\r\n\t"']+/g, '[local-path]')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-16)
+    .join('\n')
+    .slice(-maxChars);
+}
+
+function buildStudioReadinessFailureMessage(reason, diagnostics = {}) {
+  const port = diagnostics.port ? ` Port: ${diagnostics.port}.` : '';
+  const lastProbe = diagnostics.lastProbe ? ` Last readiness check: ${diagnostics.lastProbe}` : ' Last readiness check: no response yet.';
+  const childState = diagnostics.childExited
+    ? ` Studio process exited${diagnostics.exitCode !== null && diagnostics.exitCode !== undefined ? ` with code ${diagnostics.exitCode}` : ''}${diagnostics.signalCode ? ` and signal ${diagnostics.signalCode}` : ''}.`
+    : ' Studio process was still running when readiness timed out.';
+  const logTail = [
+    sanitizeStudioLogText(diagnostics.stderr),
+    sanitizeStudioLogText(diagnostics.stdout),
+  ].filter(Boolean).join('\n');
+  const logText = logTail ? ` Recent Studio output: ${logTail}` : ' Recent Studio output: no stdout/stderr was captured.';
+  return `${reason}${port}${lastProbe}${childState}${logText}`;
+}
+
+async function waitForStudioReady(port, child, options = {}) {
+  const timeoutMs = Math.max(5000, Number(options.timeoutMs || STUDIO_READINESS_TIMEOUT_MS) || STUDIO_READINESS_TIMEOUT_MS);
+  const deadline = Date.now() + timeoutMs;
+  let lastProbe = '';
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode) {
-      throw new Error('HyperFrames Studio stopped before its local server became ready.');
+      throw new Error(buildStudioReadinessFailureMessage('HyperFrames Studio stopped before its local server became ready.', {
+        childExited: true,
+        exitCode: child.exitCode,
+        lastProbe,
+        port,
+        signalCode: child.signalCode,
+        stderr: typeof options.stderr === 'function' ? options.stderr() : options.stderr,
+        stdout: typeof options.stdout === 'function' ? options.stdout() : options.stdout,
+      }));
     }
     try {
       return await requestJson(port, '/api/config');
-    } catch {
+    } catch (error) {
+      lastProbe = error?.message || String(error || 'readiness request failed');
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
   }
-  throw new Error('HyperFrames Studio did not become ready in time.');
+  throw new Error(buildStudioReadinessFailureMessage('HyperFrames Studio did not become ready in time.', {
+    childExited: false,
+    exitCode: child.exitCode,
+    lastProbe,
+    port,
+    signalCode: child.signalCode,
+    stderr: typeof options.stderr === 'function' ? options.stderr() : options.stderr,
+    stdout: typeof options.stdout === 'function' ? options.stdout() : options.stdout,
+  }));
 }
 
 function samePath(left, right) {
@@ -275,7 +329,7 @@ function createHyperFramesStudioService(dependencies = {}) {
       child.stdout && child.stdout.on('data', (chunk) => { stdout = (stdout + String(chunk)).slice(-MAX_CAPTURED_LOG_CHARS); });
       child.stderr && child.stderr.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-MAX_CAPTURED_LOG_CHARS); });
 
-      const config = await waitForStudioReady(port, child);
+      const config = await waitForStudioReady(port, child, { stdout: () => stdout, stderr: () => stderr });
       if (!samePath(config.projectDir, stagedRoot)) {
         throw new Error('HyperFrames Studio resolved a project outside its approved disposable workspace.');
       }
@@ -365,8 +419,11 @@ module.exports = {
   HYPERFRAMES_STUDIO_HOST,
   HYPERFRAMES_STUDIO_NETWORK_NOTICE,
   HYPERFRAMES_STUDIO_WARNING,
+  STUDIO_READINESS_TIMEOUT_MS,
   assertProjectIdPayload,
   createHyperFramesStudioService,
+  buildStudioReadinessFailureMessage,
   evaluateStudioRequest,
   isAllowedStudioReadPath,
+  sanitizeStudioLogText,
 };

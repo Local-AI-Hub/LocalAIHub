@@ -103,6 +103,7 @@ function normalizeEntry(rawEntry = {}) {
   return {
     displayIcon: normalizeDisplayIcon(rawEntry.displayIcon),
     displayName: String(rawEntry.displayName || '').trim(),
+    displayVersion: String(rawEntry.displayVersion || '').trim(),
     installLocation: normalizeOptionalPath(rawEntry.installLocation),
     keyPath: String(rawEntry.keyPath || '').trim(),
     publisher: String(rawEntry.publisher || '').trim(),
@@ -129,6 +130,7 @@ async function listWindowsUninstallEntries(options = {}) {
     '      $entries.Add([PSCustomObject]@{',
     '        displayIcon = [string]$props.DisplayIcon',
     '        displayName = [string]$props.DisplayName',
+    '        displayVersion = [string]$props.DisplayVersion',
     '        installLocation = [string]$props.InstallLocation',
     '        keyPath = [string]$_.Name',
     '        publisher = [string]$props.Publisher',
@@ -468,6 +470,7 @@ function enrichToolWithWindowsUninstall(toolState, context) {
     windowsUninstallBrokenCount: brokenEntries.length,
     windowsUninstallDetected: Boolean(entry),
     windowsUninstallDisplayName: entry?.displayName || null,
+    windowsUninstallDisplayVersion: entry?.displayVersion || null,
     windowsUninstallKeyPath: entry?.keyPath || null,
     windowsUninstallPathState,
     windowsUninstallQuietCommand: entry?.quietUninstallString || null,

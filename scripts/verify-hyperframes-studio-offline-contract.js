@@ -6,7 +6,9 @@ const {
   BLOCKED_ENDPOINT_PREFIXES,
   HYPERFRAMES_STUDIO_CONTRACT_VERSION,
   HYPERFRAMES_STUDIO_HOST,
+  STUDIO_READINESS_TIMEOUT_MS,
   assertProjectIdPayload,
+  buildStudioReadinessFailureMessage,
   evaluateStudioRequest,
   isAllowedStudioReadPath,
 } = require('../electron/services/hyperFramesStudioService');
@@ -31,10 +33,12 @@ assert.throws(() => assertProjectIdPayload({ projectId: 'managed-project', path:
 assert.throws(() => assertProjectIdPayload('managed-project'), /managed .*project/i);
 
 assert.strictEqual(decision('http://127.0.0.1:45678/').allowed, true, 'exact Studio origin is allowed');
+assert.strictEqual(decision('http://127.0.0.1:45678/api/config').allowed, true, 'readiness/config route is allowed on exact Studio origin');
 assert.strictEqual(decision('http://127.0.0.1:45678/api/projects/managed-project').allowed, true, 'selected project metadata is readable');
 assert.strictEqual(decision('http://127.0.0.1:45678/api/projects/managed-project/files/index.html').allowed, true, 'selected project files are readable');
 assert.strictEqual(decision('http://127.0.0.1:45678/api/projects/managed-project/preview/comp/index.html').allowed, true, 'selected project preview is readable');
 assert.strictEqual(decision('http://127.0.0.1:45678/api/projects/other-project').allowed, false, 'other project APIs are blocked');
+assert.strictEqual(decision('http://127.0.0.1:45678/api/projects/managed-project/files/index.html', 'HEAD').allowed, true, 'project files allow HEAD for safe startup probes');
 assert.strictEqual(decision('http://127.0.0.1:45678/api/projects/managed-project/files/index.html', 'PUT').allowed, false, 'project writes are blocked');
 assert.strictEqual(decision('http://127.0.0.1:45678/api/projects/managed-project/upload', 'POST').allowed, false, 'uploads are blocked');
 assert.strictEqual(decision('http://127.0.0.1:45678/api/registry/blocks').allowed, false, 'registry is blocked');
@@ -54,8 +58,17 @@ assert.strictEqual(isAllowedStudioReadPath('/api/projects/managed-project/storyb
 assert.strictEqual(decision('http://127.0.0.1:45678/api/projects/managed-project/files/%2e%2e/secret').allowed, false, 'encoded path traversal is blocked');
 assert(BLOCKED_ENDPOINT_PREFIXES.some((entry) => entry.includes('upload')), 'blocked endpoint inventory documents upload');
 assert(BLOCKED_ENDPOINT_PREFIXES.some((entry) => entry.includes('render')), 'blocked endpoint inventory documents render');
+assert.strictEqual(STUDIO_READINESS_TIMEOUT_MS, 60000, 'packaged Studio readiness timeout is bounded but long enough for installed app startup');
+const readinessMessage = buildStudioReadinessFailureMessage('HyperFrames Studio did not become ready in time.', { port: 45678, lastProbe: 'GET /api/config returned HTTP 503.', childExited: false, stderr: 'token=secret\nD:\\Private\\User\\path\\studio.js failed', stdout: 'ready soon' });
+assert(readinessMessage.includes('Port: 45678'), 'readiness failure includes selected port');
+assert(readinessMessage.includes('GET /api/config returned HTTP 503'), 'readiness failure includes last HTTP status/error');
+assert(readinessMessage.includes('Recent Studio output'), 'readiness failure includes recent Studio output');
+assert(!readinessMessage.includes('secret') && !readinessMessage.includes('D:\\Private'), 'readiness diagnostics sanitize secrets and private paths');
 
 assert(serviceSource.includes('prepareHyperFramesProjectForPipeline(projectId)'), 'main resolves and validates a managed project');
+assert(serviceSource.includes('verifyPinnedHyperFramesPackage(paths)') && serviceSource.includes('getHyperFramesCliPath(paths)'), 'Studio resolves the pinned managed HyperFrames CLI path before launch');
+assert(serviceSource.includes("requestJson(port, '/api/config')"), 'readiness probe uses the exact allowed local config route');
+assert(serviceSource.includes('buildStudioReadinessFailureMessage'), 'readiness timeout path includes actionable diagnostics');
 assert(serviceSource.includes('copyCompositionProjectSafely(sourceRoot, stagedRoot'), 'Studio receives a safe disposable project copy');
 assert(serviceSource.includes('assertNoReparsePointTraversal'), 'Studio workspace has reparse-point checks');
 assert(serviceSource.includes("HYPERFRAMES_PREVIEW_HOST: HYPERFRAMES_STUDIO_HOST"), 'child host is process-controlled');
