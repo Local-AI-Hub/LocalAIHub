@@ -81,6 +81,95 @@ const BLANK_PROJECT = Object.freeze({
   description: 'A minimal renderable scaffold for composing from scratch with local HTML, CSS, and JavaScript.',
   sourceType: 'blank-scaffold',
 });
+const HYPERFRAMES_AUTHORING_CONTRACT = Object.freeze({
+  compositionAttributes: ['data-composition-id', 'data-width', 'data-height', 'data-start', 'data-duration'],
+  timelineRegistry: 'script.js must initialize window.__timelines and assign a timeline under the same composition id used in index.html.',
+  localOnly: 'Use local relative references only. Remote http, https, and data URLs are blocked by Local AI Hub.',
+  pipeline: 'Render with Project Input -> HyperFrames Render -> Video Output.',
+  timelineShape: 'The scaffold uses a deterministic local timeline object with pause(), seek(time), and totalTime(time) for HyperFrames 0.6.112.',
+});
+const HYPERFRAMES_THREE_FILE_SCAFFOLD = Object.freeze({
+  compositionId: 'custom-scene',
+  title: 'Valid three-file HyperFrames scaffold',
+  files: Object.freeze([
+    Object.freeze({ relativePath: 'index.html', language: 'html', content: `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Custom HyperFrames Composition</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="scene" data-composition-id="custom-scene" data-start="0" data-duration="4" data-width="1280" data-height="720">
+    <section class="composition" data-start="0" data-duration="4" data-track-index="0">
+      <p class="eyebrow">Local AI Hub</p>
+      <h1>Custom Scene</h1>
+    </section>
+  </main>
+  <script src="./script.js"></script>
+</body>
+</html>
+` }),
+    Object.freeze({ relativePath: 'styles.css', language: 'css', content: `:root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; color: #f8fafc; background: #10151b; }
+* { box-sizing: border-box; }
+html, body, .scene { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+.scene { display: grid; place-items: center; background: linear-gradient(135deg, #10151b, #263238 55%, #275861); }
+.composition { text-align: center; transform: translateY(34px); opacity: 0; }
+.eyebrow { margin: 0 0 16px; color: #67e8f9; font-size: 28px; text-transform: uppercase; }
+h1 { margin: 0; font-size: 86px; line-height: 1; letter-spacing: 0; }
+body.hf-ready .composition { opacity: 1; }
+` }),
+    Object.freeze({ relativePath: 'script.js', language: 'javascript', content: `(function () {
+  var compositionId = 'custom-scene';
+  var duration = 4;
+  var card = document.querySelector('.composition');
+
+  function clamp(value) { return Math.max(0, Math.min(1, value)); }
+
+  function renderAt(time) {
+    var progress = clamp((Number(time) || 0) / duration);
+    var lift = (1 - progress) * 34 - Math.sin(progress * Math.PI) * 18;
+    card.style.opacity = String(clamp(progress * 3));
+    card.style.transform = 'translateY(' + lift.toFixed(2) + 'px) scale(' + (0.96 + progress * 0.06).toFixed(3) + ')';
+  }
+
+  document.body.classList.add('hf-ready');
+  renderAt(0);
+
+  var timeline = {
+    duration: duration,
+    pause: function () { return this; },
+    seek: function (time) { renderAt(time); return this; },
+    totalTime: function (time) {
+      if (arguments.length > 0) {
+        renderAt(time);
+        return this;
+      }
+      return duration;
+    },
+  };
+
+  window.__timelines = window.__timelines || {};
+  window.__timelines[compositionId] = timeline;
+})();
+` }),
+  ]),
+  guidance: Object.freeze([
+    'index.html must contain a root element with data-composition-id plus numeric data-width, data-height, data-start, and data-duration.',
+    'script.js must initialize window.__timelines and register the timeline using the same composition id.',
+    'Keep references local to the project folder; remote http, https, and data URLs are rejected before render.',
+    'Use Project Input -> HyperFrames Render -> Video Output to render the managed project to MP4.',
+  ]),
+});
+
+function getHyperFramesAuthoringScaffold() {
+  return {
+    ...HYPERFRAMES_THREE_FILE_SCAFFOLD,
+    files: HYPERFRAMES_THREE_FILE_SCAFFOLD.files.map((file) => ({ ...file })),
+    guidance: [...HYPERFRAMES_THREE_FILE_SCAFFOLD.guidance],
+  };
+}
 const FORBIDDEN_MANIFEST_KEYS = new Set([
   'args',
   'browserPath',
@@ -1169,6 +1258,8 @@ async function getHyperFramesProjectEditorState(projectId, options = {}) {
   return {
     allowedAssetExtensions: ASSET_FILE_EXTENSIONS,
     allowedEditableExtensions: EDITABLE_FILE_EXTENSIONS,
+    authoringContract: HYPERFRAMES_AUTHORING_CONTRACT,
+    authoringScaffold: getHyperFramesAuthoringScaffold(),
     assets: assets.assets,
     files: files.files,
     health,
@@ -1253,6 +1344,8 @@ module.exports = {
   BUILT_IN_TEMPLATES,
   EDITABLE_FILE_EXTENSIONS,
   LOCAL_ONLY_POLICY_MESSAGE,
+  HYPERFRAMES_AUTHORING_CONTRACT,
+  HYPERFRAMES_THREE_FILE_SCAFFOLD,
   MAX_ASSET_FILE_BYTES,
   MAX_EDITABLE_TEXT_FILE_BYTES,
   MAX_PROJECT_TOTAL_BYTES,
@@ -1276,6 +1369,7 @@ module.exports = {
   getHyperFramesProjectEditorState,
   getHyperFramesProjectHealth,
   getBlankProjectResourcesDir,
+  getHyperFramesAuthoringScaffold,
   getHyperFramesProjectsRoot,
   getTemplateResourcesRoot,
   importHyperFramesProjectAssets,

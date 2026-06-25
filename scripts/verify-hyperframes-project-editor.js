@@ -42,6 +42,11 @@ async function main() {
   assert(editorState.files.some((entry) => entry.relativePath === 'assets' && entry.kind === 'directory'), 'file browser lists assets folder');
   assert(editorState.files.every((entry) => !path.isAbsolute(entry.relativePath) && !/^[a-zA-Z]:/.test(entry.relativePath)), 'file browser exposes relative paths only');
   assert.strictEqual(editorState.health.runnable, true, 'fresh template passes editor health');
+  assert(editorState.authoringContract && editorState.authoringContract.timelineRegistry.includes('window.__timelines'), 'editor state exposes the HyperFrames authoring contract');
+  assert(editorState.authoringScaffold && editorState.authoringScaffold.files.length === 3, 'editor state exposes the three-file scaffold');
+  assert.deepStrictEqual(editorState.authoringScaffold.files.map((entry) => entry.relativePath), ['index.html', 'styles.css', 'script.js'], 'scaffold file identities are stable');
+  assert(!editorState.authoringScaffold.files.find((entry) => entry.relativePath === 'index.html').content.includes('window.__timelines'), 'scaffold index.html does not use an inline fallback timeline');
+  assert(editorState.authoringScaffold.files.find((entry) => entry.relativePath === 'script.js').content.includes('window.__timelines[compositionId] = timeline'), 'scaffold script.js registers the timeline');
 
   await assertRejects(() => service.getHyperFramesProjectEditorState('missing-project', options), /no longer exists|invalid/i, 'missing project id');
   await assertRejects(() => service.readHyperFramesProjectTextFile(projectId, path.join(projectDir, 'index.html'), options), /relative paths only|invalid|outside/i, 'absolute path read');
@@ -115,6 +120,9 @@ async function main() {
   assert(uiSource.includes('<textarea'), 'editor uses a built-in textarea');
   assert(uiSource.includes('setCreateFileOpen'), 'editor uses an inline New Text File form instead of a silent prompt-only action');
   assert(uiSource.includes('collisions get a safe suffix'), 'editor explains collision-safe file creation');
+  assert(uiSource.includes('data-hyperframes-scaffold'), 'editor includes the scaffold guidance panel');
+  assert(uiSource.includes('Copy File') && uiSource.includes('Insert Into Editor'), 'editor exposes copy and guarded insert scaffold actions');
+  assert(uiSource.includes('External authors can use this exact scaffold'), 'editor guidance is usable by external code generators');
   assert(uiSource.includes('project.json is app-managed and read-only.'), 'editor explains app-managed manifest files inline');
   assert(!uiSource.includes('<iframe') && !uiSource.includes('<webview') && !uiSource.includes('Monaco'), 'editor adds no iframe, webview, or Monaco');
   assert(!managerSource.includes('<iframe') && !managerSource.includes('<webview') && !managerSource.includes('Monaco'), 'manager adds no iframe, webview, or Monaco');

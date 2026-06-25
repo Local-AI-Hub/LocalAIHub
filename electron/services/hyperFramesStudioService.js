@@ -7,19 +7,26 @@ const { spawn } = require('child_process');
 
 const { killProcessTree } = require('./commandService');
 const { prepareHyperFramesProjectForPipeline, PROJECT_TREE_LIMITS } = require('./hyperFramesProjectService');
-const { copyCompositionProjectSafely } = require('./hyperFramesRenderService');
+const {
+  buildCliSummary,
+  buildHyperFramesLintFailureMessage,
+  copyCompositionProjectSafely,
+  inlineLocalScriptsForHyperFramesLint,
+} = require('./hyperFramesRenderService');
 const {
   buildHyperFramesChildProcessEnv,
   buildHyperFramesRuntimePaths,
   detectExternalNodeAndNpm,
   getHomeDriveAndPath,
   getHyperFramesCliPath,
+  runHyperFramesCli,
   verifyPinnedHyperFramesPackage,
 } = require('./hyperFramesService');
 const { assertPathInside, assertRealPathInside, assertNoReparsePointTraversal } = require('./pathSafetyService');
 
 const HYPERFRAMES_STUDIO_CONTRACT_VERSION = 1;
 const HYPERFRAMES_STUDIO_HOST = '127.0.0.1';
+const HYPERFRAMES_STUDIO_CONFIG_PATH = '/__hyperframes_config';
 const HYPERFRAMES_STUDIO_WARNING = 'Studio previews project HTML/CSS/JavaScript. Open only projects you trust.';
 const HYPERFRAMES_STUDIO_NETWORK_NOTICE = 'Studio is restricted to Local AI Hub-managed HyperFrames projects. Remote network requests are blocked by Local AI Hub.';
 const BLOCKED_LOCAL_MARKERS = ['/posthog', '/telemetry', '/analytics', '/capture', '/identify'];
@@ -63,11 +70,12 @@ function assertProjectIdPayload(payload) {
 function isAllowedStudioReadPath(pathname, projectName) {
   if (pathname === '/' || pathname === '/favicon.ico') return true;
   if (pathname.startsWith('/assets/') || pathname.startsWith('/icons/')) return true;
-  if (pathname === '/api/config' || pathname === '/api/events' || pathname === '/api/projects' || pathname === '/api/runtime.js') return true;
+  if (pathname === HYPERFRAMES_STUDIO_CONFIG_PATH || pathname === '/api/events' || pathname === '/api/projects' || pathname === '/api/runtime.js') return true;
   const projectBase = '/api/projects/' + encodeURIComponent(projectName);
   if (pathname === projectBase || pathname === projectBase + '/lint') return true;
   if (pathname.startsWith(projectBase + '/files/')) return true;
   if (pathname === projectBase + '/preview' || pathname.startsWith(projectBase + '/preview/')) return true;
+  if (pathname.startsWith(projectBase + '/gsap-animations/')) return true;
   return false;
 }
 
@@ -114,30 +122,47 @@ function allocateLoopbackPort() {
   });
 }
 
-function requestJson(port, pathname) {
+function requestText(port, pathname) {
   return new Promise((resolve, reject) => {
     const request = http.get({ hostname: HYPERFRAMES_STUDIO_HOST, path: pathname, port, timeout: 1500 }, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
       response.on('end', () => {
-        if (response.statusCode !== 200) {
-          const error = new Error(`GET ${pathname} returned HTTP ${response.statusCode || 'unknown'}.`);
-          error.httpStatus = response.statusCode || 0;
-          reject(error);
-          return;
-        }
-        try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-        } catch (parseError) {
-          const error = new Error(`GET ${pathname} returned invalid JSON.`);
-          error.cause = parseError;
-          reject(error);
-        }
+        resolve({
+          body: Buffer.concat(chunks).toString('utf8'),
+          headers: response.headers || {},
+          statusCode: response.statusCode || 0,
+        });
       });
     });
     request.on('error', (error) => reject(error));
     request.on('timeout', () => request.destroy(new Error(`GET ${pathname} timed out.`)));
   });
+}
+
+async function requestJson(port, pathname) {
+  const response = await requestText(port, pathname);
+  if (response.statusCode !== 200) {
+    const error = new Error(`GET ${pathname} returned HTTP ${response.statusCode || 'unknown'}.`);
+    error.httpStatus = response.statusCode || 0;
+    throw error;
+  }
+  try {
+    return JSON.parse(response.body);
+  } catch (parseError) {
+    const error = new Error(`GET ${pathname} returned invalid JSON.`);
+    error.cause = parseError;
+    throw error;
+  }
+}
+
+function assertStudioTextResponse(response, pathname, pattern, description) {
+  if (!response || response.statusCode !== 200) {
+    throw new Error(`GET ${pathname} returned HTTP ${response?.statusCode || 'unknown'}.`);
+  }
+  if (pattern && !pattern.test(String(response.body || ''))) {
+    throw new Error(`GET ${pathname} did not return the expected ${description}.`);
+  }
 }
 
 function sanitizeStudioLogText(value, maxChars = 2000) {
@@ -184,7 +209,22 @@ async function waitForStudioReady(port, child, options = {}) {
       }));
     }
     try {
-      return await requestJson(port, '/api/config');
+      const config = await requestJson(port, HYPERFRAMES_STUDIO_CONFIG_PATH);
+      lastProbe = `GET ${HYPERFRAMES_STUDIO_CONFIG_PATH} returned HyperFrames Studio config.`;
+      if (config?.isHyperframes !== true) {
+        throw new Error(`GET ${HYPERFRAMES_STUDIO_CONFIG_PATH} did not report HyperFrames Studio.`);
+      }
+      if (options.projectName && String(config.projectName || '') !== String(options.projectName)) {
+        throw new Error(`GET ${HYPERFRAMES_STUDIO_CONFIG_PATH} returned a different project name.`);
+      }
+      if (options.stagedRoot && !samePath(config.projectDir, options.stagedRoot)) {
+        throw new Error(`GET ${HYPERFRAMES_STUDIO_CONFIG_PATH} returned a project outside the disposable workspace.`);
+      }
+      const shell = await requestText(port, '/');
+      assertStudioTextResponse(shell, '/', /<html|<div[^>]+id=["']root["']|HyperFrames/i, 'Studio app shell');
+      const runtimeScript = await requestText(port, '/api/runtime.js');
+      assertStudioTextResponse(runtimeScript, '/api/runtime.js', /window\.__timelines|hyperframes|runtime/i, 'Studio runtime script');
+      return config;
     } catch (error) {
       lastProbe = error?.message || String(error || 'readiness request failed');
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -200,9 +240,33 @@ async function waitForStudioReady(port, child, options = {}) {
     stdout: typeof options.stdout === 'function' ? options.stdout() : options.stdout,
   }));
 }
-
 function samePath(left, right) {
   return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
+}
+
+async function runStudioProjectPreflight(paths, runtime, stagedRoot, sourceRoot = '') {
+  const lintRoot = path.join(path.dirname(stagedRoot), `.lint-${path.basename(stagedRoot)}`);
+  try {
+    await fs.remove(lintRoot).catch(() => null);
+    await copyCompositionProjectSafely(stagedRoot, lintRoot, PROJECT_TREE_LIMITS);
+    await inlineLocalScriptsForHyperFramesLint(lintRoot);
+    const lintResult = await runHyperFramesCli(paths, runtime, ['lint', '--json', lintRoot], {
+      allowFailure: true,
+      cwd: lintRoot,
+      errorMessage: 'Local AI Hub could not lint this HyperFrames project before opening Studio.',
+      timeoutMs: 2 * 60 * 1000,
+    });
+    const lintSummary = buildCliSummary(lintResult, { managedRoot: paths.installDir, sourceRoot });
+    if (Number(lintResult.code || 0) !== 0) {
+      const error = new Error(buildHyperFramesLintFailureMessage(lintSummary));
+      error.code = 'HYPERFRAMES_STUDIO_PROJECT_INVALID';
+      error.hyperFramesLint = lintSummary;
+      throw error;
+    }
+    return { lintSummary };
+  } finally {
+    await fs.remove(lintRoot).catch(() => null);
+  }
 }
 
 function createHyperFramesStudioService(dependencies = {}) {
@@ -287,6 +351,7 @@ function createHyperFramesStudioService(dependencies = {}) {
       await assertRealPathInside(paths.installDir, runRoot, 'Local AI Hub refused a Studio folder that crosses a symlink or junction.');
       await assertNoReparsePointTraversal(paths.installDir, runRoot, 'Local AI Hub refused a Studio folder that crosses a symlink or junction.');
       await copyCompositionProjectSafely(sourceRoot, stagedRoot, PROJECT_TREE_LIMITS);
+      await runStudioProjectPreflight(paths, runtime, stagedRoot, sourceRoot);
 
       const port = await allocateLoopbackPort();
       const processRoot = path.join(runRoot, 'process');
@@ -329,7 +394,7 @@ function createHyperFramesStudioService(dependencies = {}) {
       child.stdout && child.stdout.on('data', (chunk) => { stdout = (stdout + String(chunk)).slice(-MAX_CAPTURED_LOG_CHARS); });
       child.stderr && child.stderr.on('data', (chunk) => { stderr = (stderr + String(chunk)).slice(-MAX_CAPTURED_LOG_CHARS); });
 
-      const config = await waitForStudioReady(port, child, { stdout: () => stdout, stderr: () => stderr });
+      const config = await waitForStudioReady(port, child, { projectName: path.basename(stagedRoot), stagedRoot, stdout: () => stdout, stderr: () => stderr });
       if (!samePath(config.projectDir, stagedRoot)) {
         throw new Error('HyperFrames Studio resolved a project outside its approved disposable workspace.');
       }
@@ -417,6 +482,7 @@ module.exports = {
   BLOCKED_ENDPOINT_PREFIXES,
   HYPERFRAMES_STUDIO_CONTRACT_VERSION,
   HYPERFRAMES_STUDIO_HOST,
+  HYPERFRAMES_STUDIO_CONFIG_PATH,
   HYPERFRAMES_STUDIO_NETWORK_NOTICE,
   HYPERFRAMES_STUDIO_WARNING,
   STUDIO_READINESS_TIMEOUT_MS,
@@ -425,5 +491,9 @@ module.exports = {
   buildStudioReadinessFailureMessage,
   evaluateStudioRequest,
   isAllowedStudioReadPath,
+  requestJson,
+  requestText,
+  runStudioProjectPreflight,
   sanitizeStudioLogText,
+  waitForStudioReady,
 };

@@ -1,4 +1,4 @@
-﻿const assert = require('assert');
+const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
@@ -85,6 +85,10 @@ async function main() {
     const scaffoldText = (await Promise.all(REQUIRED_FILES.filter((name) => name !== 'project.json').map((name) => fs.readFile(path.join(scaffoldRoot, name), 'utf8')))).join('\n');
     assert(!/https?:\/\//i.test(scaffoldText), 'blank scaffold contains no remote URL references');
     assert(!/\bdata:/i.test(scaffoldText), 'blank scaffold contains no data URL references');
+    const blankIndexSource = await fs.readFile(path.join(scaffoldRoot, 'index.html'), 'utf8');
+    const blankScriptSource = await fs.readFile(path.join(scaffoldRoot, 'script.js'), 'utf8');
+    assert(!blankIndexSource.includes('window.__timelines'), 'blank scaffold registers timelines from linked script.js only');
+    assert(blankScriptSource.includes('window.__timelines.blank = timeline'), 'blank linked script registers the blank timeline');
     assert(/totalTime:\s*function\s*\(time\)/.test(scaffoldText), 'blank scaffold implements deterministic totalTime(time)');
     assert(/seek:\s*function\s*\(time\)/.test(scaffoldText), 'blank scaffold implements seek(time)');
     assert(!/@keyframes|animation\s*:/i.test(scaffoldText), 'blank scaffold does not rely on ordinary CSS animation');

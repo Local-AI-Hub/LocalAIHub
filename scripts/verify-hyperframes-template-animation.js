@@ -18,6 +18,7 @@ const {
 const { getManagedHyperFramesExecutionRuntime } = require('../electron/services/hyperFramesService');
 const { resolveManagedFfmpegPaths } = require('../electron/services/managedFfmpegService');
 
+const repoRoot = path.resolve(__dirname, '..');
 const SMOKE_ROOT = 'D:\\LocalAIHub-HyperFrames-Template-Animation-Smoke';
 const DEFAULT_INSTALL_ROOT = 'D:\\LocalAIHub';
 const MIN_ADJACENT_MEAN_DIFF = 1.0;

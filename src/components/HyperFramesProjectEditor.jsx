@@ -73,10 +73,14 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
   const [savedContent, setSavedContent] = useState('');
   const [createFileOpen, setCreateFileOpen] = useState(false);
   const [createFileName, setCreateFileName] = useState('composition-notes.txt');
+  const [scaffoldPath, setScaffoldPath] = useState('index.html');
 
   const files = useMemo(() => (Array.isArray(state?.files) ? state.files.map(normalizeFile) : []), [state]);
   const assets = useMemo(() => (Array.isArray(state?.assets) ? state.assets.map(normalizeFile) : []), [state]);
   const health = useMemo(() => normalizeHealth(state?.health), [state]);
+  const scaffoldFiles = useMemo(() => (Array.isArray(state?.authoringScaffold?.files) ? state.authoringScaffold.files : []), [state]);
+  const scaffoldFile = useMemo(() => scaffoldFiles.find((file) => file.relativePath === scaffoldPath) || scaffoldFiles[0] || null, [scaffoldFiles, scaffoldPath]);
+  const scaffoldGuidance = Array.isArray(state?.authoringScaffold?.guidance) ? state.authoringScaffold.guidance : [];
   const dirty = content !== savedContent;
 
   useEffect(() => {
@@ -279,6 +283,32 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
     }
   }
 
+
+  async function copyScaffoldFile(file = scaffoldFile) {
+    if (!file) return;
+    try {
+      await navigator.clipboard?.writeText(String(file.content || ''));
+      setStatus(`Copied ${file.relativePath} scaffold contents.`);
+      onToast?.('HyperFrames scaffold copied.', 'success');
+    } catch {
+      setStatus(String(file.content || ''));
+    }
+  }
+
+  function insertScaffoldIntoEditor() {
+    if (!scaffoldFile) return;
+    if (!selectedFile) {
+      setStatus(`Open ${scaffoldFile.relativePath} before inserting scaffold contents.`);
+      return;
+    }
+    if (selectedFile !== scaffoldFile.relativePath) {
+      setStatus(`Open ${scaffoldFile.relativePath} before inserting that scaffold file.`);
+      return;
+    }
+    if ((dirty || content.trim()) && !window.confirm(`Replace the current editor contents for ${selectedFile}? Save afterward to write it to disk.`)) return;
+    setContent(String(scaffoldFile.content || ''));
+    setStatus(`Inserted ${selectedFile} scaffold contents. Review and Save to update the project.`);
+  }
   const editableLimit = state?.limits?.maxEditableTextFileBytes || 0;
   const assetLimit = state?.limits?.maxAssetFileBytes || 0;
 
@@ -377,6 +407,44 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
         </div>
 
         <div className="space-y-3">
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-3" data-hyperframes-scaffold="true">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">HyperFrames scaffold</p>
+                <p className="mt-1 text-sm font-semibold text-white">Valid three-file project contract</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button className="ghost-button px-3 py-1.5 text-xs" disabled={!scaffoldFile} onClick={() => copyScaffoldFile()} type="button">Copy File</button>
+                <button className="primary-button px-3 py-1.5 text-xs" disabled={!scaffoldFile || selectedFile !== scaffoldFile.relativePath} onClick={insertScaffoldIntoEditor} type="button">Insert Into Editor</button>
+              </div>
+            </div>
+            <p className="mt-2 text-xs leading-5 text-slate-400">External authors can use this exact scaffold: the root uses data-composition-id, width, height, start, and duration; script.js registers window.__timelines with the same id; all references stay local.</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {scaffoldFiles.length ? scaffoldFiles.map((file) => (
+                <button
+                  className={`ghost-button px-3 py-1.5 text-xs ${scaffoldFile?.relativePath === file.relativePath ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-100' : ''}`}
+                  key={file.relativePath}
+                  onClick={() => setScaffoldPath(file.relativePath)}
+                  type="button"
+                >
+                  {file.relativePath}
+                </button>
+              )) : <span className="text-xs text-slate-500">Scaffold unavailable in this build.</span>}
+            </div>
+            {scaffoldFile ? (
+              <textarea
+                className="mt-3 h-40 w-full resize-y rounded-2xl border border-white/10 bg-slate-950/70 p-3 font-mono text-xs leading-5 text-slate-100 outline-none"
+                readOnly
+                spellCheck={false}
+                value={String(scaffoldFile.content || '')}
+              />
+            ) : null}
+            {scaffoldGuidance.length ? (
+              <ul className="mt-3 space-y-1 text-xs leading-5 text-slate-400">
+                {scaffoldGuidance.map((entry) => <li key={entry}>{entry}</li>)}
+              </ul>
+            ) : null}
+          </div>
           <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">

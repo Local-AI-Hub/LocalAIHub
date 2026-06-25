@@ -37,7 +37,6 @@ const GENERATED_FIXTURE = Object.freeze({
     <h1>Local Motion</h1>
     <p>Rendered from editor-saved generated code.</p>
   </main>
-  <script>window.__timelines = window.__timelines || {}; window.__timelines.generatedLocal = window.__timelines.generatedLocal || { seek: function (time) { return this; }, totalTime: function (time) { return 3; }, pause: function () { return this; } };</script>
   <script src="./script.js"></script>
 </body>
 </html>
@@ -78,6 +77,9 @@ function assertLocalGeneratedFixture() {
   const combined = Object.values(GENERATED_FIXTURE).join('\n');
   assert(!/https?:\/\//i.test(combined), 'fixture has no http/https references');
   assert(!/\bdata:/i.test(combined), 'fixture has no data URL references');
+  assert(!GENERATED_FIXTURE['index.html'].includes('window.__timelines'), 'fixture proves timeline registration can live in linked script.js');
+  assert(/window\.__timelines\s*=\s*window\.__timelines\s*\|\|\s*\{\}/.test(GENERATED_FIXTURE['script.js']), 'linked script initializes the HyperFrames timeline registry');
+  assert(/window\.__timelines\.generatedLocal\s*=/.test(GENERATED_FIXTURE['script.js']), 'linked script registers the matching composition timeline');
   assert(/totalTime:\s*function\s*\(time\)/.test(combined), 'fixture uses deterministic totalTime(time)');
   assert(/seek:\s*function\s*\(time\)/.test(combined), 'fixture uses seek(time)');
 }

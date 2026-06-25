@@ -185,6 +185,62 @@ async function copyCompositionProjectSafely(sourceRoot, stagedRoot, limits = {},
   return currentState;
 }
 
+
+function readHtmlAttribute(tag, name) {
+  const pattern = new RegExp('\\b' + name + '\\s*=\\s*("([^"]*)"|\'([^\']*)\'|([^\\s>]+))', 'i');
+  const match = String(tag || '').match(pattern);
+  return match ? String(match[2] ?? match[3] ?? match[4] ?? '').trim() : '';
+}
+
+function isRelativeLocalReference(value) {
+  const reference = String(value || '').trim();
+  return Boolean(reference)
+    && !/^(?:[a-z][a-z0-9+.-]*:|\/\/|\/|#)/i.test(reference)
+    && !reference.includes(String.fromCharCode(92));
+}
+
+function stripUrlDecorations(value) {
+  return String(value || '').split('#')[0].split('?')[0];
+}
+
+async function readLocalInlineTarget(projectRoot, reference) {
+  if (!isRelativeLocalReference(reference)) return null;
+  const undecorated = stripUrlDecorations(reference);
+  let decoded = undecorated;
+  try { decoded = decodeURI(undecorated); } catch {}
+  const targetPath = path.resolve(path.join(projectRoot, ...decoded.split('/').filter(Boolean)));
+  assertPathInside(projectRoot, targetPath, 'Local AI Hub refused to inline a HyperFrames script outside the staged project.');
+  await assertRealPathInside(projectRoot, targetPath, 'Local AI Hub refused to inline a HyperFrames script through a symlink or junction.');
+  const stats = await fs.stat(targetPath).catch(() => null);
+  if (!stats || !stats.isFile()) return null;
+  return { content: await fs.readFile(targetPath, 'utf8'), relativePath: path.relative(projectRoot, targetPath).replace(/\\/g, '/') };
+}
+
+async function inlineLocalScriptsForHyperFramesLint(projectRoot) {
+  const indexPath = path.join(projectRoot, 'index.html');
+  if (!(await fs.pathExists(indexPath))) return { inlinedScripts: [] };
+  let html = await fs.readFile(indexPath, 'utf8');
+  const inlinedScripts = [];
+  const replacements = [];
+  const scriptPattern = /<script\b[^>]*\bsrc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)[^>]*>\s*<\/script>/gi;
+  for (const match of html.matchAll(scriptPattern)) {
+    const tag = match[0];
+    const source = readHtmlAttribute(tag, 'src');
+    const target = await readLocalInlineTarget(projectRoot, source);
+    if (!target) continue;
+    const safeScript = target.content.replace(/<\/script/gi, '<\\/script');
+    replacements.push({
+      from: tag,
+      to: `<script data-localaihub-inlined-from="${target.relativePath}">\n${safeScript}\n</script>`,
+    });
+    inlinedScripts.push(target.relativePath);
+  }
+  for (const replacement of replacements) {
+    html = html.replace(replacement.from, replacement.to);
+  }
+  if (replacements.length) await fs.writeFile(indexPath, html, 'utf8');
+  return { inlinedScripts };
+}
 async function scanStagedCompositionForRemoteReferences(stagedRoot, limits = {}) {
   const activeLimits = mergeStagingLimits(limits);
   const findings = [];
@@ -408,6 +464,7 @@ async function renderHyperFramesComposition(input, options = {}) {
     const stagingSummary = await copyCompositionProjectSafely(projectRoot, stagedRoot, options.limits || {});
     await assertRealPathInside(workRoot, path.join(stagedRoot, 'index.html'), 'Local AI Hub refused to stage a HyperFrames project that crosses a symlink or junction.');
     const localScan = await scanStagedCompositionForRemoteReferences(stagedRoot, options.limits || {});
+    await inlineLocalScriptsForHyperFramesLint(stagedRoot);
 
     options.reportProgress?.({ stage: 'linting', message: 'Checking the HyperFrames composition.' });
     const lintResult = await runHyperFramesCli(runtimeContext.paths, runtimeContext.runtime, ['lint', '--json', stagedRoot], {
@@ -487,6 +544,7 @@ module.exports = {
   HYPERFRAMES_RENDER_TIMEOUT_MS,
   HYPERFRAMES_RENDER_WARNING,
   HYPERFRAMES_RENDER_WORKERS,
+  inlineLocalScriptsForHyperFramesLint,
   assertSupportedHyperFramesRenderSettings,
   assertTrustedCompositionArtifact,
   buildCliSummary,
