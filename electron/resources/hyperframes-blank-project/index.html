@@ -7,14 +7,14 @@
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
-  <main id="blank-project" class="scene" data-composition-id="blank" data-start="0" data-duration="5" data-width="1280" data-height="720">
-    <!-- Edit this text or replace the panel with your own composition. -->
-    <section id="blank-project-scene" class="clip composition" data-start="0" data-duration="5" data-track-index="0">
-      <p class="label">From scratch</p>
-      <h1>Your composition</h1>
-      <p class="hint">Edit index.html, styles.css, and script.js.</p>
+  <main id="custom-scene-root" class="scene" data-composition-id="custom-scene" data-start="0" data-duration="4" data-width="1280" data-height="720">
+    <section id="scene-card" class="clip composition" data-start="0" data-duration="4" data-track-index="0">
+      <p id="scene-eyebrow" class="eyebrow">Local AI Hub</p>
+      <h1 id="scene-title">Custom Scene</h1>
+      <p id="scene-caption">Rendered locally with HyperFrames 0.6.112.</p>
     </section>
   </main>
+  <script src="./assets/vendor/localaihub-gsap-runtime.js"></script>
   <script src="./script.js"></script>
 </body>
 </html>

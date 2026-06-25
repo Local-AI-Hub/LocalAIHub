@@ -1,41 +1,15 @@
-﻿(function () {
-  // Edit this duration and renderAt() to change timing and motion.
-  const duration = 5;
-  const root = document.documentElement;
-  const composition = document.querySelector('.composition');
-
-  function clamp(value) {
-    return Math.max(0, Math.min(1, value));
-  }
-
-  function renderAt(time) {
-    const seconds = Math.max(0, Math.min(duration, Number(time) || 0));
-    const progress = seconds / duration;
-    const intro = clamp(progress * 4);
-    const lift = (1 - intro) * 34 - Math.sin(progress * Math.PI) * 10;
-    composition.style.opacity = String(intro);
-    composition.style.transform = 'translateY(' + lift.toFixed(2) + 'px)';
-    root.style.setProperty('--wash-x', (18 + progress * 60).toFixed(2) + '%');
-  }
-
-  document.body.classList.add('hf-ready');
-  renderAt(0);
-
-  // HyperFrames 0.6.112 samples this deterministic timeline during preview and render.
-  const timeline = {
-    duration,
-    pause: function () { return this; },
-    seek: function (time) { renderAt(time); return this; },
-    totalTime: function (time) {
-      if (arguments.length > 0) {
-        renderAt(time);
-        return this;
-      }
-      return duration;
-    },
-  };
-
-  window.hyperframesTimeline = timeline;
+(function () {
+  var duration = 4;
   window.__timelines = window.__timelines || {};
-  window.__timelines.blank = timeline;
-}());
+
+  var tl = gsap.timeline({ paused: true });
+  tl.fromTo('#scene-card', { opacity: 0, y: 38, scale: 0.96 }, { opacity: 1, y: 0, scale: 1, duration: 0.9 }, 0);
+  tl.fromTo('#scene-title', { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.75 }, 0.25);
+  tl.fromTo('#scene-caption', { opacity: 0, y: 18 }, { opacity: 1, y: 0, duration: 0.7 }, 0.75);
+  tl.fromTo('#scene-card', { y: 0, scale: 1 }, { y: -18, scale: 1.025, duration: 2.4 }, 1.4);
+  tl.fromTo('#scene-eyebrow', { opacity: 1 }, { opacity: 0.62, duration: 1.1 }, 2.6);
+  tl.to({}, { duration: duration }, 0);
+
+  window.__timelines["custom-scene"] = tl;
+  tl.seek(0);
+})();

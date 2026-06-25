@@ -28,6 +28,8 @@ const CACHE_PATHS = [
   'C:\\Users\\Dell\\.cache\\hyperframes\\chrome',
 ];
 const REQUIRED_FILES = ['project.json', 'index.html', 'styles.css', 'script.js', 'README.md'];
+const AUTHORING_RUNTIME = 'assets/vendor/localaihub-gsap-runtime.js';
+const SCANNED_LOCAL_ONLY_FILES = ['index.html', 'styles.css', 'script.js', AUTHORING_RUNTIME];
 
 async function snapshot(root) {
   if (!(await fs.pathExists(root))) return { exists: false, files: 0, bytes: 0, digest: '' };
@@ -82,15 +84,20 @@ async function main() {
       assert(await fs.pathExists(path.join(scaffoldRoot, fileName)), `blank scaffold includes ${fileName}`);
     }
     assert(await fs.pathExists(path.join(scaffoldRoot, 'assets')), 'blank scaffold includes assets directory');
-    const scaffoldText = (await Promise.all(REQUIRED_FILES.filter((name) => name !== 'project.json').map((name) => fs.readFile(path.join(scaffoldRoot, name), 'utf8')))).join('\n');
+    assert(await fs.pathExists(path.join(scaffoldRoot, AUTHORING_RUNTIME)), 'blank scaffold includes the managed local authoring runtime');
+    const scaffoldText = (await Promise.all(SCANNED_LOCAL_ONLY_FILES.map((name) => fs.readFile(path.join(scaffoldRoot, name), 'utf8')))).join('\n');
     assert(!/https?:\/\//i.test(scaffoldText), 'blank scaffold contains no remote URL references');
     assert(!/\bdata:/i.test(scaffoldText), 'blank scaffold contains no data URL references');
     const blankIndexSource = await fs.readFile(path.join(scaffoldRoot, 'index.html'), 'utf8');
     const blankScriptSource = await fs.readFile(path.join(scaffoldRoot, 'script.js'), 'utf8');
     assert(!blankIndexSource.includes('window.__timelines'), 'blank scaffold registers timelines from linked script.js only');
-    assert(blankScriptSource.includes('window.__timelines.blank = timeline'), 'blank linked script registers the blank timeline');
-    assert(/totalTime:\s*function\s*\(time\)/.test(scaffoldText), 'blank scaffold implements deterministic totalTime(time)');
-    assert(/seek:\s*function\s*\(time\)/.test(scaffoldText), 'blank scaffold implements seek(time)');
+    assert(blankIndexSource.indexOf('./assets/vendor/localaihub-gsap-runtime.js') > -1, 'blank index loads the local authoring runtime');
+    assert(blankIndexSource.indexOf('./assets/vendor/localaihub-gsap-runtime.js') < blankIndexSource.indexOf('./script.js'), 'blank index loads the local runtime before script.js');
+    assert(/data-composition-id="custom-scene"/.test(blankIndexSource), 'blank root uses the verified composition id');
+    assert(/window\.__timelines\s*=\s*window\.__timelines\s*\|\|\s*\{\}/.test(blankScriptSource), 'blank linked script initializes the HyperFrames timeline registry');
+    assert(blankScriptSource.includes('gsap.timeline({ paused: true })'), 'blank linked script uses the local GSAP-compatible runtime');
+    assert(blankScriptSource.includes('window.__timelines["custom-scene"] = tl'), 'blank linked script registers the literal matching timeline id');
+    assert(!/window\.__timelines\[[^"']/.test(blankScriptSource), 'blank linked script avoids variable-key timeline registration');
     assert(!/@keyframes|animation\s*:/i.test(scaffoldText), 'blank scaffold does not rely on ordinary CSS animation');
 
     const first = await createHyperFramesProject({ templateId: 'blank', displayName: 'Blank Verify' }, options);
@@ -110,6 +117,7 @@ async function main() {
     assert.strictEqual(manifest.localAssetsOnly, true, 'blank manifest is local-assets-only');
     for (const fileName of REQUIRED_FILES) assert(await fs.pathExists(path.join(projectDir, fileName)), `created blank project includes ${fileName}`);
     assert(await fs.pathExists(path.join(projectDir, 'assets')), 'created blank project includes assets directory');
+    assert(await fs.pathExists(path.join(projectDir, AUTHORING_RUNTIME)), 'created blank project includes the local authoring runtime');
 
     const editor = await getHyperFramesProjectEditorState(project.projectId, options);
     for (const editable of ['index.html', 'styles.css', 'script.js']) {

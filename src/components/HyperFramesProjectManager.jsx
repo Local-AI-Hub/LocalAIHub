@@ -290,6 +290,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
         <p>This editor works only inside Local AI Hub-managed HyperFrames projects.</p>
         <p>HyperFrames compositions execute HTML/CSS/JavaScript when rendered. Edit and render only projects you trust.</p>
         <p>This version supports local project assets only. Remote http/https/data references are blocked.</p>
+        <p>The editor includes a verified HyperFrames 0.6.112 external-AI prompt, a three-file scaffold, and a local GSAP-compatible runtime asset; Local AI Hub does not generate code in-app.</p>
         <p>Studio previews project HTML/CSS/JavaScript. Open only projects you trust.</p>
         <p>Studio is restricted to Local AI Hub-managed HyperFrames projects. Remote network requests are blocked by Local AI Hub.</p>
       </div>

@@ -284,14 +284,82 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
   }
 
 
+  async function writeClipboard(text, successMessage) {
+    try {
+      await navigator.clipboard?.writeText(String(text || ''));
+      setStatus(successMessage);
+      onToast?.(successMessage, 'success');
+    } catch {
+      setStatus(String(text || ''));
+    }
+  }
+
   async function copyScaffoldFile(file = scaffoldFile) {
     if (!file) return;
+    await writeClipboard(String(file.content || ''), `Copied ${file.relativePath} scaffold contents.`);
+  }
+
+  async function copyVerifiedScaffold() {
+    if (!scaffoldFiles.length) return;
+    const bundle = scaffoldFiles.map((file) => `--- ${file.relativePath} ---\n${String(file.content || '')}`).join('\n\n');
+    await writeClipboard(bundle, 'Copied the verified HyperFrames three-file scaffold.');
+  }
+
+  async function copyExternalAiPrompt() {
+    if (!externalAiPrompt) return;
+    await writeClipboard(externalAiPrompt, 'Copied the verified external-AI HyperFrames prompt.');
+  }
+
+  async function ensureAuthoringRuntime(options = {}) {
+    setBusy('authoring-runtime');
+    setError('');
     try {
-      await navigator.clipboard?.writeText(String(file.content || ''));
-      setStatus(`Copied ${file.relativePath} scaffold contents.`);
-      onToast?.('HyperFrames scaffold copied.', 'success');
-    } catch {
-      setStatus(String(file.content || ''));
+      const result = await getApiMethod('ensureHyperFramesProjectAuthoringRuntime')({ projectId });
+      if (!result?.ok) throw new Error(messageFrom(result, 'Local AI Hub could not add the local HyperFrames authoring runtime.'));
+      if (result.data?.editorState) setState(result.data.editorState);
+      await onProjectsChanged?.();
+      const message = messageFrom(result, 'Local HyperFrames authoring runtime added to this project.');
+      setStatus(message);
+      if (!options.silent) onToast?.(message, 'success');
+      return result.data || {};
+    } catch (caught) {
+      const message = safeText(caught?.message, 'Local AI Hub could not add the local HyperFrames authoring runtime.');
+      setError(message);
+      onToast?.(message, 'error');
+      return null;
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function insertVerifiedScaffoldProject() {
+    if (!scaffoldFiles.length) return;
+    if (!confirmDiscard()) return;
+    const existing = files.filter((file) => scaffoldFiles.some((scaffold) => scaffold.relativePath === file.relativePath));
+    const replaceLabel = existing.length ? existing.map((file) => file.relativePath).join(', ') : 'index.html, styles.css, script.js';
+    if (!window.confirm(`Replace ${replaceLabel} with the verified HyperFrames scaffold and add the local runtime asset?`)) return;
+    setBusy('insert-scaffold');
+    setError('');
+    try {
+      const runtimeResult = await getApiMethod('ensureHyperFramesProjectAuthoringRuntime')({ projectId });
+      if (!runtimeResult?.ok) throw new Error(messageFrom(runtimeResult, 'Local AI Hub could not add the local HyperFrames authoring runtime.'));
+      for (const file of scaffoldFiles) {
+        const result = await getApiMethod('saveHyperFramesProjectFile')({ projectId, relativePath: file.relativePath, content: String(file.content || '') });
+        if (!result?.ok) throw new Error(messageFrom(result, `Local AI Hub could not save ${file.relativePath}.`));
+      }
+      await loadEditor();
+      const target = scaffoldFiles.some((file) => file.relativePath === selectedFile) ? selectedFile : 'index.html';
+      await openFile(target, { skipDirtyCheck: true });
+      await onProjectsChanged?.();
+      const message = 'Inserted the verified HyperFrames scaffold and local runtime asset.';
+      setStatus(message);
+      onToast?.(message, 'success');
+    } catch (caught) {
+      const message = safeText(caught?.message, 'Local AI Hub could not insert the verified HyperFrames scaffold.');
+      setError(message);
+      onToast?.(message, 'error');
+    } finally {
+      setBusy('');
     }
   }
 
@@ -318,7 +386,7 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
         <div className="min-w-0">
           <p className="text-xs uppercase tracking-[0.22em] text-cyan-200">Safe composition editor</p>
           <h4 className="mt-1 truncate text-lg font-semibold text-white">{project?.displayName || projectId}</h4>
-          <p className="mt-2 text-xs leading-5 text-slate-400">Project-scoped file editing and local asset management. No live preview, webview, Studio, or AI authoring controls are included.</p>
+          <p className="mt-2 text-xs leading-5 text-slate-400">Project-scoped file editing, local asset management, and verified scaffold guidance. No live preview, webview, Studio, or in-app AI generation controls are included.</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <button className="ghost-button px-3 py-1.5 text-xs" disabled={Boolean(busy)} onClick={() => loadEditor()} type="button">Refresh</button>
@@ -414,11 +482,16 @@ export default function HyperFramesProjectEditor({ project, onClose, onProjectsC
                 <p className="mt-1 text-sm font-semibold text-white">Valid three-file project contract</p>
               </div>
               <div className="flex flex-wrap gap-2">
+                <button className="ghost-button px-3 py-1.5 text-xs" disabled={!externalAiPrompt} onClick={copyExternalAiPrompt} type="button">Copy External-AI Prompt</button>
+                <button className="ghost-button px-3 py-1.5 text-xs" disabled={!scaffoldFiles.length} onClick={copyVerifiedScaffold} type="button">Copy Verified Scaffold</button>
                 <button className="ghost-button px-3 py-1.5 text-xs" disabled={!scaffoldFile} onClick={() => copyScaffoldFile()} type="button">Copy File</button>
-                <button className="primary-button px-3 py-1.5 text-xs" disabled={!scaffoldFile || selectedFile !== scaffoldFile.relativePath} onClick={insertScaffoldIntoEditor} type="button">Insert Into Editor</button>
+                <button className="ghost-button px-3 py-1.5 text-xs" disabled={!authoringRuntime || busy === 'authoring-runtime'} onClick={() => ensureAuthoringRuntime()} type="button">Add Local Runtime</button>
+                <button className="primary-button px-3 py-1.5 text-xs" disabled={!scaffoldFiles.length || Boolean(busy)} onClick={insertVerifiedScaffoldProject} type="button">Insert Verified Scaffold</button>
+                <button className="ghost-button px-3 py-1.5 text-xs" disabled={!scaffoldFile || selectedFile !== scaffoldFile.relativePath} onClick={insertScaffoldIntoEditor} type="button">Insert Into Editor</button>
               </div>
             </div>
-            <p className="mt-2 text-xs leading-5 text-slate-400">External authors can use this exact scaffold: the root uses data-composition-id, width, height, start, and duration; script.js registers window.__timelines with the same id; all references stay local.</p>
+            <p className="mt-2 text-xs leading-5 text-slate-400">External authors can use the verified prompt and scaffold: target HyperFrames 0.6.112, load the local runtime before script.js, use a literal window.__timelines key matching data-composition-id, and keep all references local.</p>
+            {authoringRuntime ? <p className="mt-2 text-xs leading-5 text-cyan-100">Runtime asset: {authoringRuntime.relativePath}</p> : null}
             <div className="mt-3 flex flex-wrap gap-2">
               {scaffoldFiles.length ? scaffoldFiles.map((file) => (
                 <button

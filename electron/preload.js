@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   getHyperFramesProject: (payload) => invoke('hyperframes-projects:get', payload),
   getHyperFramesProjectAssetReference: (payload) => invoke('hyperframes-projects:asset-reference', payload),
   getHyperFramesProjectEditorState: (payload) => invoke('hyperframes-projects:editor-state', payload),
+  ensureHyperFramesProjectAuthoringRuntime: (payload) => invoke('hyperframes-projects:ensure-authoring-runtime', payload),
   getHyperFramesProjectHealth: (payload) => invoke('hyperframes-projects:health', payload),
   getHyperFramesStudioStatus: () => invoke('hyperframes-studio:status'),
   importAssetLibraryItems: (payload) => invoke('asset-libraries:import-items', payload),

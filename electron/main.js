@@ -100,6 +100,7 @@ const {
   duplicateHyperFramesProject,
   duplicateHyperFramesProjectAsset,
   duplicateHyperFramesProjectFile,
+  ensureHyperFramesProjectAuthoringRuntime,
   getHyperFramesProjectAssetReference,
   getHyperFramesProjectEditorState,
   getHyperFramesProjectHealth,
@@ -1711,6 +1712,10 @@ function registerIpcHandlers() {
 
   ipcMain.handle('hyperframes-projects:create-file', (_event, payload) =>
     withPlainEnglishErrors(async () => createHyperFramesProjectTextFile(payload?.projectId, payload?.relativePath, payload?.content || ''), 'Local AI Hub could not create that HyperFrames project file.'),
+  );
+
+  ipcMain.handle('hyperframes-projects:ensure-authoring-runtime', (_event, payload) =>
+    withPlainEnglishErrors(async () => ensureHyperFramesProjectAuthoringRuntime(payload?.projectId || payload), 'Local AI Hub could not add the HyperFrames authoring runtime to that project.'),
   );
 
   ipcMain.handle('hyperframes-projects:rename-file', (_event, payload) =>

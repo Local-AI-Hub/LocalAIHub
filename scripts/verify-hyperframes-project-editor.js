@@ -45,8 +45,20 @@ async function main() {
   assert(editorState.authoringContract && editorState.authoringContract.timelineRegistry.includes('window.__timelines'), 'editor state exposes the HyperFrames authoring contract');
   assert(editorState.authoringScaffold && editorState.authoringScaffold.files.length === 3, 'editor state exposes the three-file scaffold');
   assert.deepStrictEqual(editorState.authoringScaffold.files.map((entry) => entry.relativePath), ['index.html', 'styles.css', 'script.js'], 'scaffold file identities are stable');
-  assert(!editorState.authoringScaffold.files.find((entry) => entry.relativePath === 'index.html').content.includes('window.__timelines'), 'scaffold index.html does not use an inline fallback timeline');
-  assert(editorState.authoringScaffold.files.find((entry) => entry.relativePath === 'script.js').content.includes('window.__timelines[compositionId] = timeline'), 'scaffold script.js registers the timeline');
+  assert(editorState.authoringScaffold.externalAiPrompt && editorState.authoringScaffold.externalAiPrompt.includes('Target HyperFrames version is 0.6.112.'), 'editor state exposes the verified external-AI prompt');
+  assert(editorState.authoringRuntime && editorState.authoringRuntime.relativePath === 'assets/vendor/localaihub-gsap-runtime.js', 'editor state exposes the local authoring runtime path');
+  const scaffoldIndex = editorState.authoringScaffold.files.find((entry) => entry.relativePath === 'index.html').content;
+  const scaffoldScript = editorState.authoringScaffold.files.find((entry) => entry.relativePath === 'script.js').content;
+  assert(!scaffoldIndex.includes('window.__timelines'), 'scaffold index.html does not use an inline fallback timeline');
+  assert(scaffoldIndex.indexOf('./assets/vendor/localaihub-gsap-runtime.js') > -1, 'scaffold index loads the local runtime');
+  assert(scaffoldIndex.indexOf('./assets/vendor/localaihub-gsap-runtime.js') < scaffoldIndex.indexOf('./script.js'), 'scaffold index loads local runtime before script.js');
+  assert(scaffoldScript.includes('gsap.timeline({ paused: true })'), 'scaffold script uses the local GSAP-compatible runtime');
+  assert(scaffoldScript.includes('window.__timelines["custom-scene"] = tl'), 'scaffold script registers the literal matching timeline id');
+  assert(!/window\.__timelines\[[^"']/.test(scaffoldScript), 'scaffold avoids variable-key timeline registration');
+
+  const runtimeResult = await service.ensureHyperFramesProjectAuthoringRuntime(projectId, options);
+  assert.strictEqual(runtimeResult.asset.relativePath, 'assets/vendor/localaihub-gsap-runtime.js', 'ensure runtime reports the managed runtime asset');
+  assert(await fs.pathExists(path.join(projectDir, 'assets', 'vendor', 'localaihub-gsap-runtime.js')), 'ensure runtime copies the local authoring runtime into the project');
 
   await assertRejects(() => service.getHyperFramesProjectEditorState('missing-project', options), /no longer exists|invalid/i, 'missing project id');
   await assertRejects(() => service.readHyperFramesProjectTextFile(projectId, path.join(projectDir, 'index.html'), options), /relative paths only|invalid|outside/i, 'absolute path read');
@@ -122,11 +134,15 @@ async function main() {
   assert(uiSource.includes('collisions get a safe suffix'), 'editor explains collision-safe file creation');
   assert(uiSource.includes('data-hyperframes-scaffold'), 'editor includes the scaffold guidance panel');
   assert(uiSource.includes('Copy File') && uiSource.includes('Insert Into Editor'), 'editor exposes copy and guarded insert scaffold actions');
-  assert(uiSource.includes('External authors can use this exact scaffold'), 'editor guidance is usable by external code generators');
+  assert(uiSource.includes('Copy External-AI Prompt') && uiSource.includes('Copy Verified Scaffold') && uiSource.includes('Insert Verified Scaffold'), 'editor exposes verified prompt and scaffold authoring kit actions');
+  assert(uiSource.includes('Add Local Runtime') && uiSource.includes('ensureHyperFramesProjectAuthoringRuntime'), 'editor exposes the local runtime helper action through the safe bridge');
+  assert(uiSource.includes('External authors can use the verified prompt and scaffold'), 'editor guidance is usable by external code generators');
+  assert(uiSource.includes('in-app AI generation controls'), 'editor states that Local AI Hub does not generate code in-app');
   assert(uiSource.includes('project.json is app-managed and read-only.'), 'editor explains app-managed manifest files inline');
   assert(!uiSource.includes('<iframe') && !uiSource.includes('<webview') && !uiSource.includes('Monaco'), 'editor adds no iframe, webview, or Monaco');
   assert(!managerSource.includes('<iframe') && !managerSource.includes('<webview') && !managerSource.includes('Monaco'), 'manager adds no iframe, webview, or Monaco');
   assert(mainSource.includes("hyperframes-projects:editor-state") && preloadSource.includes('getHyperFramesProjectEditorState'), 'editor IPC is exposed through project-scoped bridge');
+  assert(mainSource.includes("hyperframes-projects:ensure-authoring-runtime") && preloadSource.includes('ensureHyperFramesProjectAuthoringRuntime'), 'authoring runtime IPC is exposed through project-scoped bridge');
   assert(!preloadSource.includes('importHyperFramesProjectAssets'), 'renderer is not exposed a direct arbitrary-source asset import method');
 
   await fs.remove(managedRoot);

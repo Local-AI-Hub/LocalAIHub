@@ -81,16 +81,26 @@ const BLANK_PROJECT = Object.freeze({
   description: 'A minimal renderable scaffold for composing from scratch with local HTML, CSS, and JavaScript.',
   sourceType: 'blank-scaffold',
 });
+const HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH = 'assets/vendor/localaihub-gsap-runtime.js';
+const HYPERFRAMES_AUTHORING_RUNTIME_LABEL = 'Local AI Hub GSAP-compatible runtime';
 const HYPERFRAMES_AUTHORING_CONTRACT = Object.freeze({
+  targetVersion: '0.6.112',
   compositionAttributes: ['data-composition-id', 'data-width', 'data-height', 'data-start', 'data-duration'],
-  timelineRegistry: 'script.js must initialize window.__timelines and assign a timeline under the same composition id used in index.html.',
-  localOnly: 'Use local relative references only. Remote http, https, and data URLs are blocked by Local AI Hub.',
+  root: 'The first non-script/style/meta/link element in body is the root composition. It must have data-composition-id plus numeric data-width, data-height, data-start, and data-duration.',
+  clips: 'Timeline-visible child elements should use class="clip" plus data-start, data-duration, data-track-index, and stable id values when Studio/editability matters.',
+  timelineRegistry: 'script.js must initialize window.__timelines and assign a timeline under a literal key matching data-composition-id, for example window.__timelines["custom-scene"] = tl.',
+  registrationKeys: 'HyperFrames 0.6.112 lint extracts literal window.__timelines["id"] or window.__timelines.id keys. Avoid variable-key registration in generated code.',
+  localRuntimePath: HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH,
+  gsapStrategy: 'GSAP is not required for all projects, but if generated code uses gsap.timeline/to/from/fromTo/set it must load the local Local AI Hub runtime before script.js. Remote GSAP/CDN URLs are blocked.',
+  localOnly: 'Use local relative references only. Remote http, https, data URLs, absolute paths, parent traversal, remote fonts, and CDN scripts are blocked.',
   pipeline: 'Render with Project Input -> HyperFrames Render -> Video Output.',
-  timelineShape: 'The scaffold uses a deterministic local timeline object with pause(), seek(time), and totalTime(time) for HyperFrames 0.6.112.',
+  studio: 'Studio is experimental and restricted. It can preview local projects, but direct timeline control of DOM may not round-trip through every Studio write-back panel.',
 });
 const HYPERFRAMES_THREE_FILE_SCAFFOLD = Object.freeze({
   compositionId: 'custom-scene',
-  title: 'Valid three-file HyperFrames scaffold',
+  durationSeconds: 4,
+  runtimePath: HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH,
+  title: 'Verified Local AI Hub HyperFrames authoring scaffold',
   files: Object.freeze([
     Object.freeze({ relativePath: 'index.html', language: 'html', content: `<!doctype html>
 <html lang="en">
@@ -101,12 +111,14 @@ const HYPERFRAMES_THREE_FILE_SCAFFOLD = Object.freeze({
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
-  <main class="scene" data-composition-id="custom-scene" data-start="0" data-duration="4" data-width="1280" data-height="720">
-    <section class="composition" data-start="0" data-duration="4" data-track-index="0">
-      <p class="eyebrow">Local AI Hub</p>
-      <h1>Custom Scene</h1>
+  <main id="custom-scene-root" class="scene" data-composition-id="custom-scene" data-start="0" data-duration="4" data-width="1280" data-height="720">
+    <section id="scene-card" class="clip composition" data-start="0" data-duration="4" data-track-index="0">
+      <p id="scene-eyebrow" class="eyebrow">Local AI Hub</p>
+      <h1 id="scene-title">Custom Scene</h1>
+      <p id="scene-caption">Rendered locally with HyperFrames 0.6.112.</p>
     </section>
   </main>
+  <script src="./assets/vendor/localaihub-gsap-runtime.js"></script>
   <script src="./script.js"></script>
 </body>
 </html>
@@ -114,62 +126,67 @@ const HYPERFRAMES_THREE_FILE_SCAFFOLD = Object.freeze({
     Object.freeze({ relativePath: 'styles.css', language: 'css', content: `:root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; color: #f8fafc; background: #10151b; }
 * { box-sizing: border-box; }
 html, body, .scene { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-.scene { display: grid; place-items: center; background: linear-gradient(135deg, #10151b, #263238 55%, #275861); }
-.composition { text-align: center; transform: translateY(34px); opacity: 0; }
-.eyebrow { margin: 0 0 16px; color: #67e8f9; font-size: 28px; text-transform: uppercase; }
-h1 { margin: 0; font-size: 86px; line-height: 1; letter-spacing: 0; }
-body.hf-ready .composition { opacity: 1; }
+.scene { display: grid; place-items: center; background: linear-gradient(135deg, #10151b, #263238 54%, #285861); }
+.composition { width: min(900px, calc(100% - 160px)); padding: 56px; border: 1px solid rgba(255,255,255,0.18); background: rgba(8,13,18,0.82); text-align: left; opacity: 0; }
+.eyebrow { margin: 0 0 16px; color: #67e8f9; font-size: 26px; text-transform: uppercase; }
+h1 { margin: 0; font-size: 82px; line-height: 1; letter-spacing: 0; }
+#scene-caption { margin: 24px 0 0; color: #cbd5e1; font-size: 28px; }
 ` }),
     Object.freeze({ relativePath: 'script.js', language: 'javascript', content: `(function () {
-  var compositionId = 'custom-scene';
   var duration = 4;
-  var card = document.querySelector('.composition');
-
-  function clamp(value) { return Math.max(0, Math.min(1, value)); }
-
-  function renderAt(time) {
-    var progress = clamp((Number(time) || 0) / duration);
-    var lift = (1 - progress) * 34 - Math.sin(progress * Math.PI) * 18;
-    card.style.opacity = String(clamp(progress * 3));
-    card.style.transform = 'translateY(' + lift.toFixed(2) + 'px) scale(' + (0.96 + progress * 0.06).toFixed(3) + ')';
-  }
-
-  document.body.classList.add('hf-ready');
-  renderAt(0);
-
-  var timeline = {
-    duration: duration,
-    pause: function () { return this; },
-    seek: function (time) { renderAt(time); return this; },
-    totalTime: function (time) {
-      if (arguments.length > 0) {
-        renderAt(time);
-        return this;
-      }
-      return duration;
-    },
-  };
-
   window.__timelines = window.__timelines || {};
-  window.__timelines[compositionId] = timeline;
+
+  var tl = gsap.timeline({ paused: true });
+  tl.fromTo('#scene-card', { opacity: 0, y: 38, scale: 0.96 }, { opacity: 1, y: 0, scale: 1, duration: 0.9 }, 0);
+  tl.fromTo('#scene-title', { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.75 }, 0.25);
+  tl.fromTo('#scene-caption', { opacity: 0, y: 18 }, { opacity: 1, y: 0, duration: 0.7 }, 0.75);
+  tl.fromTo('#scene-card', { y: 0, scale: 1 }, { y: -18, scale: 1.025, duration: 2.4 }, 1.4);
+  tl.fromTo('#scene-eyebrow', { opacity: 1 }, { opacity: 0.62, duration: 1.1 }, 2.6);
+  tl.to({}, { duration: duration }, 0);
+
+  window.__timelines["custom-scene"] = tl;
+  tl.seek(0);
 })();
 ` }),
   ]),
   guidance: Object.freeze([
-    'index.html must contain a root element with data-composition-id plus numeric data-width, data-height, data-start, and data-duration.',
-    'script.js must initialize window.__timelines and register the timeline using the same composition id.',
-    'Keep references local to the project folder; remote http, https, and data URLs are rejected before render.',
-    'Use Project Input -> HyperFrames Render -> Video Output to render the managed project to MP4.',
+    'Target HyperFrames version: 0.6.112.',
+    'index.html must load ./assets/vendor/localaihub-gsap-runtime.js before ./script.js when script.js uses gsap.*.',
+    'The root data-composition-id and the literal window.__timelines["custom-scene"] key must stay synchronized.',
+    'Use class="clip" plus data-start, data-duration, data-track-index, and stable ids on timeline-visible elements.',
+    'Keep references local to the project folder; remote http, https, data URLs, CDNs, and absolute paths are rejected before render.',
+    'Render through Project Input -> HyperFrames Render -> Video Output and read lint details if the pipeline stops.',
   ]),
 });
+const HYPERFRAMES_EXTERNAL_AI_PROMPT = [
+  'You are writing a Local AI Hub managed HyperFrames project.',
+  'Target HyperFrames version is 0.6.112.',
+  'Return exactly three file contents: index.html, styles.css, script.js. Do not modify project.json. Do not add extra files unless I explicitly ask for local assets under assets/.',
+  'Local AI Hub will already provide this local runtime file in the project: assets/vendor/localaihub-gsap-runtime.js. If you use gsap.timeline, gsap.set, gsap.to, gsap.from, or gsap.fromTo, index.html must load ./assets/vendor/localaihub-gsap-runtime.js before ./script.js. Do not use remote GSAP.',
+  'Strict local-only policy: no http://, no https://, no data:, no CDN, no unpkg, no jsdelivr, no Google Fonts, no remote scripts, no remote images, no remote audio, no remote video, no fetch/import from the network, no absolute filesystem paths, and no ../ parent traversal. Use relative local assets such as assets/example.png only.',
+  'HTML schema: make a valid HTML document. In body, the first real element must be the root composition wrapper. Give it a stable id, data-composition-id, data-start="0", numeric data-duration, numeric data-width, and numeric data-height. Use 1280x720 and duration 4 to 8 seconds unless I ask otherwise.',
+  'Timeline-visible children should have stable ids. Use class="clip" and data-start, data-duration, and data-track-index on visible timed elements. Keep ids/classes synchronized with script.js selectors.',
+  'Script order: link ./styles.css in head. At the end of body load ./assets/vendor/localaihub-gsap-runtime.js first, then ./script.js. Do not inline a remote runtime.',
+  'Timeline contract: script.js must initialize window.__timelines = window.__timelines || {}; create a paused timeline with gsap.timeline({ paused: true }); and register it with a literal key that exactly matches the HTML data-composition-id, for example window.__timelines["custom-scene"] = tl. Avoid variable-key registration because HyperFrames 0.6.112 lint only extracts literal keys reliably.',
+  'Timeline duration should match data-duration. Add tl.to({}, { duration: DURATION }, 0) if needed so duration is nonzero. Keep the timeline paused. Use absolute position parameters for deterministic timing.',
+  'Preferred animation pattern: use GSAP fromTo or set/to on stable id selectors. Avoid CSS transform on elements whose x, y, scale, or rotation is animated by GSAP because HyperFrames lint flags transform conflicts. Put initial opacity/layout in CSS and transform state in the timeline.',
+  'Allowed local runtime subset: gsap.timeline({ paused: true }), tl.set, tl.to, tl.from, tl.fromTo, tl.seek, tl.pause, tl.duration, tl.timeScale, tl.getChildren, and simple properties including opacity, x, y, scale, scaleX, scaleY, rotation, width, height, visibility, color, and backgroundColor. Do not use ScrollTrigger, plugins, registerPlugin, registerEffect, callbacks, network loaders, or browser-time-driven animation.',
+  'CSS rules: set fixed composition dimensions through the root data-width/data-height. Use CSS for layout, colors, typography, and initial visibility. Do not rely on normal CSS keyframes or wall-clock animation for rendered motion; HyperFrames samples the registered timeline at exact times.',
+  'Assets: use project-relative paths under assets/. Supported user asset types include images, audio, video, SVG, and fonts. Do not base64 encode generated assets. Do not use unsupported scripts except the provided Local AI Hub runtime path.',
+  'Render/Studio constraints: the project must pass hyperframes lint and Local AI Hub render validation. It renders through Project Input -> HyperFrames Render -> Video Output. Studio is experimental, local/offline restricted, and may not write back every direct timeline-controlled DOM edit. Do not depend on Studio-only APIs.',
+  'Troubleshooting: missing data-composition-id means the body root is wrong. Missing window.__timelines means script.js did not register a timeline or script order is wrong. Timeline registered as one id but HTML uses another means the literal key and data-composition-id are mismatched. GSAP not loaded means the local runtime script tag is missing or after script.js. Remote reference blocked means remove http/https/data/CDN/absolute paths. File too large means simplify code. Unsupported asset means copy a supported local media/font file under assets/. Studio readiness/preflight errors usually include the same lint detail.',
+  'Output format: first give a short explanation, then provide index.html, then styles.css, then script.js. Keep code compact enough for the Local AI Hub editor size limit. Do not include markdown fences if I ask for direct paste blocks.',
+].join('\n\n');
 
 function getHyperFramesAuthoringScaffold() {
   return {
     ...HYPERFRAMES_THREE_FILE_SCAFFOLD,
+    externalAiPrompt: HYPERFRAMES_EXTERNAL_AI_PROMPT,
     files: HYPERFRAMES_THREE_FILE_SCAFFOLD.files.map((file) => ({ ...file })),
     guidance: [...HYPERFRAMES_THREE_FILE_SCAFFOLD.guidance],
   };
 }
+
 const FORBIDDEN_MANIFEST_KEYS = new Set([
   'args',
   'browserPath',
@@ -248,6 +265,34 @@ function getTemplateResourcesRoot() {
 
 function getBlankProjectResourcesDir() {
   return path.resolve(path.join(__dirname, '..', 'resources', 'hyperframes-blank-project'));
+}
+
+function getAuthoringKitResourcesDir() {
+  return path.resolve(path.join(__dirname, '..', 'resources', 'hyperframes-authoring-kit'));
+}
+
+function getHyperFramesAuthoringRuntimeSourcePath() {
+  return path.join(getAuthoringKitResourcesDir(), HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH);
+}
+
+function isHyperFramesManagedRuntimeAsset(relativePath) {
+  const normalized = normalizeProjectRelativePath(relativePath);
+  return normalized === HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH
+    || `${PROJECT_ASSETS_DIRECTORY}/${normalized}`.replace(/\/+/g, '/') === HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH;
+}
+
+function isSupportedHyperFramesProjectAsset(entry) {
+  if (!entry || entry.kind === 'directory') return true;
+  if (isHyperFramesManagedRuntimeAsset(entry.relativePath)) return true;
+  return ASSET_FILE_EXTENSIONS.includes(String(entry.extension || '').toLowerCase());
+}
+
+async function copyHyperFramesAuthoringRuntimeToProject(projectDir) {
+  const sourcePath = getHyperFramesAuthoringRuntimeSourcePath();
+  const targetPath = path.join(projectDir, HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH);
+  assertPathInside(projectDir, targetPath, 'Local AI Hub refused to copy the HyperFrames authoring runtime outside the project folder.');
+  await fs.ensureDir(path.dirname(targetPath));
+  await fs.copy(sourcePath, targetPath, { overwrite: true, errorOnExist: false });
 }
 
 function getProjectSourceType(templateId, requestedSourceType = '') {
@@ -1093,7 +1138,7 @@ async function listHyperFramesProjectAssets(projectId, options = {}) {
     ...entry,
     relativePath: `${PROJECT_ASSETS_DIRECTORY}/${entry.relativePath}`.replace(/\/+/g, '/'),
     reference: `${PROJECT_ASSETS_DIRECTORY}/${entry.relativePath}`.replace(/\/+/g, '/'),
-    supported: entry.kind === 'directory' || ASSET_FILE_EXTENSION_SET.has(entry.extension),
+    supported: isSupportedHyperFramesProjectAsset(entry),
   }));
   return {
     assets,
@@ -1201,6 +1246,22 @@ function getHyperFramesProjectAssetReference(relativePath) {
   return { reference: normalized.replace(/\\/g, '/'), relativePath: normalized };
 }
 
+
+async function ensureHyperFramesProjectAuthoringRuntime(projectId, options = {}) {
+  return queueOperation(async () => {
+    const project = await resolveManagedProject(projectId, options);
+    await copyHyperFramesAuthoringRuntimeToProject(project.projectDir);
+    await updateProjectModifiedTime(project.projectDir, project.projectId);
+    return {
+      asset: {
+        relativePath: HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH,
+        reference: HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH,
+      },
+      editorState: await getHyperFramesProjectEditorState(project.projectId, options),
+      message: 'Local HyperFrames authoring runtime added to this project.',
+    };
+  });
+}
 async function getHyperFramesProjectHealth(projectId, options = {}) {
   const project = await resolveManagedProject(projectId, options);
   const details = {
@@ -1224,7 +1285,10 @@ async function getHyperFramesProjectHealth(projectId, options = {}) {
     const tree = await listProjectTreeEntries(project.projectDir, options.limits || PROJECT_FILE_BROWSER_LIMITS);
     details.bounds = { ok: true, fileCount: tree.entries.filter((entry) => entry.kind === 'file').length, totalBytes: tree.totalBytes };
     details.unsupportedAssets = tree.entries
-      .filter((entry) => entry.kind === 'file' && entry.relativePath.toLowerCase().startsWith(`${PROJECT_ASSETS_DIRECTORY}/`) && !ASSET_FILE_EXTENSION_SET.has(entry.extension))
+      .filter((entry) => entry.kind === 'file'
+        && entry.relativePath.toLowerCase().startsWith(`${PROJECT_ASSETS_DIRECTORY}/`)
+        && !isHyperFramesManagedRuntimeAsset(entry.relativePath)
+        && !ASSET_FILE_EXTENSION_SET.has(entry.extension))
       .map((entry) => entry.relativePath)
       .slice(0, 20);
   } catch (error) {
@@ -1260,6 +1324,7 @@ async function getHyperFramesProjectEditorState(projectId, options = {}) {
     allowedEditableExtensions: EDITABLE_FILE_EXTENSIONS,
     authoringContract: HYPERFRAMES_AUTHORING_CONTRACT,
     authoringScaffold: getHyperFramesAuthoringScaffold(),
+    authoringRuntime: { label: HYPERFRAMES_AUTHORING_RUNTIME_LABEL, relativePath: HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH },
     assets: assets.assets,
     files: files.files,
     health,
@@ -1345,6 +1410,9 @@ module.exports = {
   EDITABLE_FILE_EXTENSIONS,
   LOCAL_ONLY_POLICY_MESSAGE,
   HYPERFRAMES_AUTHORING_CONTRACT,
+  HYPERFRAMES_AUTHORING_RUNTIME_LABEL,
+  HYPERFRAMES_AUTHORING_RUNTIME_RELATIVE_PATH,
+  HYPERFRAMES_EXTERNAL_AI_PROMPT,
   HYPERFRAMES_THREE_FILE_SCAFFOLD,
   MAX_ASSET_FILE_BYTES,
   MAX_EDITABLE_TEXT_FILE_BYTES,
@@ -1359,6 +1427,7 @@ module.exports = {
   buildHyperFramesProjectPipelineDraft,
   createHyperFramesProject,
   createHyperFramesProjectTextFile,
+  ensureHyperFramesProjectAuthoringRuntime,
   deleteHyperFramesProject,
   deleteHyperFramesProjectAsset,
   deleteHyperFramesProjectFile,
@@ -1369,6 +1438,8 @@ module.exports = {
   getHyperFramesProjectEditorState,
   getHyperFramesProjectHealth,
   getBlankProjectResourcesDir,
+  getAuthoringKitResourcesDir,
+  getHyperFramesAuthoringRuntimeSourcePath,
   getHyperFramesAuthoringScaffold,
   getHyperFramesProjectsRoot,
   getTemplateResourcesRoot,
