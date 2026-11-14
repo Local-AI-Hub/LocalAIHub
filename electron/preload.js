@@ -6,6 +6,9 @@ function invoke(channel, payload) {
 
 contextBridge.exposeInMainWorld('localAIHub', {
   bootstrap: () => invoke('app:bootstrap'),
+  getAgentAccess: () => invoke('agent:get-access'),
+  setAgentAccess: (enabled) => invoke('agent:set-access', enabled),
+  showAgentExtension: () => invoke('agent:show-extension'),
   browseModels: (payload) => invoke('models:browse', payload),
   cancelModelBrowse: (requestId) => invoke('models:cancel-browse', { requestId }),
   cancelModelDownload: (payload) => invoke('models:cancel-download', payload),
@@ -173,6 +176,11 @@ contextBridge.exposeInMainWorld('localAIHub', {
     const listener = (_event, payload) => handler(payload);
     ipcRenderer.on('pipelines:run-update', listener);
     return () => ipcRenderer.removeListener('pipelines:run-update', listener);
+  },
+  onWebcamPreview: (handler) => {
+    const listener = (_event, payload) => handler(payload);
+    ipcRenderer.on('recordings:webcam-preview', listener);
+    return () => ipcRenderer.removeListener('recordings:webcam-preview', listener);
   },
   onRecordingStatus: (handler) => {
     const listener = (_event, payload) => handler(payload);

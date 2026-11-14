@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import AgentAccessPanel from './AgentAccessPanel';
 import { formatBytes, formatDiskAvailability } from '../lib/formatters';
 
 function buildSuggestedRoot(mount) {
@@ -251,6 +252,7 @@ export default function SettingsPanel({
 
   return (
     <section className="space-y-3">
+      <AgentAccessPanel />
       <SettingsSection
         action={(
           <button className="ghost-button" disabled={busyMap['settings:pick-folder']} onClick={onChooseStorageFolder} type="button">

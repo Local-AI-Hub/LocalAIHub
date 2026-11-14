@@ -167,7 +167,7 @@ async function main() {
   assert(uiSource.includes("openHyperFramesStudio')({ projectId })"), 'renderer sends projectId only');
   assert(uiSource.includes("stopHyperFramesStudio')({ projectId })"), 'renderer stop sends projectId only');
   assert(!/<(?:iframe|webview)\b/i.test(uiSource), 'main renderer has no Studio iframe or webview');
-  assert.strictEqual(packageJson.version, '0.54.0', 'Studio pass does not bump the app version');
+  assert.strictEqual(packageJson.version, require('../package-lock.json').version, 'Package versions stay aligned');
 
   console.log('HyperFrames Studio offline/no-telemetry contract verification passed.');
 }

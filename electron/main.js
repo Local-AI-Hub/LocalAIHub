@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const agentAccess = require('./services/agentAccessService');
 const {
   app,
   BrowserWindow,
@@ -448,6 +449,7 @@ async function requestAppQuit() {
   if (!shutdownPromise) {
     shutdownPromise = (async () => {
       isQuitting = true;
+      await agentAccess.stopAgentAccess();
       await shutdownOwnedResources();
       shutdownComplete = true;
 
@@ -1395,6 +1397,14 @@ async function withPlainEnglishErrors(handler, fallbackMessage, options = {}) {
 }
 
 function registerIpcHandlers() {
+  ipcMain.handle('agent:get-access', () => withPlainEnglishErrors(() => agentAccess.getAgentAccess(), 'Could not read agent access settings.'));
+  ipcMain.handle('agent:set-access', (_event, enabled) => withPlainEnglishErrors(() => agentAccess.setAgentAccess(enabled), 'Could not change agent access settings.'));
+  ipcMain.handle('agent:show-extension', () => withPlainEnglishErrors(async () => {
+    const access = await agentAccess.getAgentAccess();
+    if (!fs.existsSync(access.extensionPath)) throw new Error('Build the agent extension before opening it.');
+    shell.showItemInFolder(access.extensionPath);
+    return { message: 'Select LocalAIHub.mcpb in Claude Desktop extension settings.' };
+  }, 'Could not locate the Claude Desktop extension.'));
   ipcMain.handle('app:bootstrap', () =>
     withPlainEnglishErrors(() => buildAppState({ forceDiscovery: true }), 'Local AI Hub could not load the app state.'),
   );
@@ -2942,6 +2952,10 @@ async function startApplication() {
   setScreenModePreference(initialConfig.screenMode);
   createWindow();
   setRecordingEventSink((payload) => {
+    if (payload?.type === 'webcam-preview') {
+      mainWindow?.webContents.send('recordings:webcam-preview', payload);
+      return;
+    }
     mainWindow?.webContents.send('recordings:status-update', payload);
     handlePipelineRecordingStatus(payload).catch(() => null);
     if (payload?.recording?.status && payload.recording.status !== 'recording') {
@@ -2976,6 +2990,7 @@ async function startApplication() {
   setPipelineEventSink((payload) => {
     mainWindow?.webContents.send('pipelines:run-update', payload);
     const run = payload?.run || {};
+    agentAccess.rememberAgentRun(run);
     if (run.runId && ['completed', 'failed', 'cancelled'].includes(String(run.status || '').toLowerCase()) && !statisticsInvalidatedPipelineRuns.has(run.runId)) {
       statisticsInvalidatedPipelineRuns.add(run.runId);
       invalidateStatisticsIndexSections(['storage'], 'pipeline-run-finished', { runId: run.runId, status: run.status }).catch(() => null);
@@ -3009,6 +3024,9 @@ async function startApplication() {
       .catch(() => null);
   }, TOOL_UPDATE_CHECK_INTERVAL_MS);
   broadcastWindowActivity(true);
+  await agentAccess.startAgentAccess().catch(error => {
+    console.error('Agent access could not start:', humanizeError(error));
+  });
   appStartupComplete = true;
 }
 

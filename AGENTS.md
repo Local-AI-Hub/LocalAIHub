@@ -15,3 +15,4 @@ All data stays local — no network calls except for downloading tools during in
 The app should feel like native Windows software — proper window chrome, tray icon, installer via electron-builder
 Every error shown to the user must be plain English, never a raw stack trace
 Prioritize features in the order listed above — get each one working before moving to the next###
+Validation preference (November 10, 2026): Use automated code, service, and render verifiers. Do not run GUI/computer-use smoke tests unless Matt explicitly requests them again.

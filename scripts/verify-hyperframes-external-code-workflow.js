@@ -21,7 +21,7 @@ const {
 const { getManagedHyperFramesExecutionRuntime } = require('../electron/services/hyperFramesService');
 const { resolveManagedFfmpegPaths } = require('../electron/services/managedFfmpegService');
 
-const SMOKE_ROOT = 'D:\\LocalAIHub-HyperFrames-External-Code-Workflow-Smoke';
+const SMOKE_ROOT = path.join(require('os').tmpdir(), 'LocalAIHub-HyperFrames-external-code-workflow-Smoke');
 const DEFAULT_INSTALL_ROOT = 'D:\\LocalAIHub';
 const RENDER_CONFIG = Object.freeze({ fps: 30, quality: 'draft', workers: 1, browserGpu: false, format: 'mp4' });
 
@@ -94,10 +94,16 @@ function getRuntimeOptions() {
     : {};
 }
 
+async function cleanupSmokeRoot() {
+  // Chromium can briefly retain its working directory after the CLI exits.
+  await fs.promises.rm(SMOKE_ROOT, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
+}
+
 async function main() {
   const scaffold = getHyperFramesAuthoringScaffold();
-  const fixture = assertLocalGeneratedFixture(scaffold);
-  await fs.remove(SMOKE_ROOT);
+  assertLocalGeneratedFixture(scaffold);
+  const fixture = require('./fixtures/hyperframes-external-ai-scene.cjs');
+  await cleanupSmokeRoot();
   const options = { managedRoot: SMOKE_ROOT };
   const runDirectories = {
     root: SMOKE_ROOT,
@@ -126,6 +132,7 @@ async function main() {
     const prepared = await prepareHyperFramesProjectForPipeline(created.project.projectId, options);
     const projectHashBefore = hashProjectFiles(projectDir);
     const runtimeContext = await getManagedHyperFramesExecutionRuntime({}, getRuntimeOptions());
+    runtimeContext.paths = { ...runtimeContext.paths, tempDir: path.join(SMOKE_ROOT, 'runtime-temp') };
     const render = await renderHyperFramesComposition({ artifact: prepared.artifact, sourceNode: { type: 'hyperframesProjectInput' } }, {
       config: RENDER_CONFIG,
       displayName: 'Verified external-AI workflow verifier',
@@ -164,6 +171,11 @@ async function main() {
     assert(/index\.html:12:4|SyntaxError/.test(syntheticLintMessage), 'lint message includes file/line/error detail when available');
     assert(syntheticLintMessage.length < 3500, 'lint detail is bounded');
 
+    if (process.env.LOCALAIHUB_VERIFY_OUTPUT_DIR) {
+      const reviewRoot = path.resolve(process.env.LOCALAIHUB_VERIFY_OUTPUT_DIR);
+      await fs.ensureDir(reviewRoot);
+      await fs.copy(render.outputPath, path.join(reviewRoot, 'external-ai-scene.mp4'));
+    }
     success = true;
     console.log(JSON.stringify({
       message: 'verify-hyperframes-external-code-workflow: ok',
@@ -172,12 +184,12 @@ async function main() {
       meanAbsolutePixelDifferences: differences,
     }, null, 2));
   } finally {
-    if (success) await fs.remove(SMOKE_ROOT);
+    if (success) await cleanupSmokeRoot();
   }
 }
 
 main().catch(async (error) => {
-  await fs.remove(SMOKE_ROOT).catch(() => null);
+  await cleanupSmokeRoot().catch(() => null);
   console.error(error);
   process.exit(1);
 });

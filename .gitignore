@@ -21,3 +21,7 @@ AppData/
 *.credentials.json
 *.private.pem
 *.private.key
+
+# Local verification output and agent connection credentials
+/temp/
+**/agent-connection.json

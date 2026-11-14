@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
 
 const MANAGED_STORAGE_COLLAPSED_STORAGE_KEY = 'local-ai-hub.recorder-managed-storage-collapsed.v1';
@@ -93,6 +93,64 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
   const [finalizingSlow, setFinalizingSlow] = useState(false);
   const [managedStorageCollapsed, setManagedStorageCollapsed] = useState(getInitialManagedStorageCollapsed);
   const [now, setNow] = useState(Date.now());
+  const previewVideo = useRef(null);
+  const previewStream = useRef(null);
+  const previewTasks = useRef(new Set());
+  const previewGeneration = useRef(0);
+  const [previewEnabled, setPreviewEnabled] = useState(false);
+  const [previewMessage, setPreviewMessage] = useState('');
+  const [recordingPreview, setRecordingPreview] = useState(null);
+
+  function releasePreview() {
+    previewGeneration.current += 1;
+    previewStream.current?.getTracks().forEach(track => track.stop());
+    previewStream.current = null;
+    if (previewVideo.current) previewVideo.current.srcObject = null;
+  }
+
+  useEffect(() => {
+    releasePreview();
+    setPreviewMessage('');
+    if (!previewEnabled || activeRecording || busy || !['webcam', 'webcamMic'].includes(mode)) return undefined;
+    const generation = previewGeneration.current;
+    let stream;
+    const task = (async () => {
+      try {
+        // Permission unlocks device labels. Release this temporary stream before
+        // opening the exact camera selected in the DirectShow device list.
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        if (generation !== previewGeneration.current) { stream.getTracks().forEach(track => track.stop()); return; }
+        const cameras = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput');
+        stream.getTracks().forEach(track => track.stop());
+        stream = null;
+        const selected = devices.webcams.find(device => device.id === webcamId);
+        const normalizeLabel = label => String(label || '').replace(/ \([0-9a-f]{4}:[0-9a-f]{4}\)$/i, '').trim().toLowerCase();
+        const matching = cameras.filter(device => normalizeLabel(device.label) === normalizeLabel(selected?.name));
+        if (!matching.length && cameras.length === 1 && devices.webcams.length === 1) matching.push(cameras[0]);
+        if (matching.length !== 1) throw new Error('camera-match');
+        if (generation !== previewGeneration.current) return;
+        stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: matching[0].deviceId } }, audio: false });
+        if (generation !== previewGeneration.current) { stream.getTracks().forEach(track => track.stop()); return; }
+        previewStream.current = stream;
+        if (previewVideo.current) { previewVideo.current.srcObject = stream; await previewVideo.current.play(); }
+      } catch (error) {
+        stream?.getTracks().forEach(track => track.stop());
+        if (generation === previewGeneration.current) setPreviewMessage(error.message === 'camera-match'
+          ? 'The selected webcam could not be matched for preview. Recording can still use the selected device.'
+          : 'The webcam preview could not start. Close other camera apps and check Windows camera permissions.');
+      }
+    })();
+    previewTasks.current.add(task);
+    task.finally(() => previewTasks.current.delete(task));
+    return () => { releasePreview(); stream?.getTracks().forEach(track => track.stop()); };
+  }, [previewEnabled, webcamId, mode, activeRecording?.id, busy]);
+
+  useEffect(() => {
+    setRecordingPreview(null);
+    return window.localAIHub.onWebcamPreview?.(payload => {
+      if (payload?.recordingId === activeRecording?.id) setRecordingPreview(payload.frame);
+    });
+  }, [activeRecording?.id]);
 
   const selectedMode = MODES.find((entry) => entry.id === mode) || MODES[0];
   const hasMicrophone = devices.microphones.length > 0;
@@ -225,8 +283,10 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
   ])), [hasMicrophone, hasWebcam, displays.length]);
 
   async function start() {
+    releasePreview();
     setBusy('start');
     try {
+      await Promise.all([...previewTasks.current]);
       const captureTarget = selectedMode.needsScreen
         ? captureTargetType === 'region'
           ? {
@@ -338,6 +398,21 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
           <div className="mt-5 rounded-2xl border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-100">
             Screen and system-audio recording may capture notifications, passwords, app or browser sounds, meeting audio, private conversations, or confidential work. Close sensitive apps and windows before you start.
           </div>
+
+          {(selectedMode.needsWebcam || activeRecording?.sources?.webcam) ? (
+            <div className="mt-5 rounded-2xl border border-white/10 bg-slate-950/40 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-sm font-medium text-white">Webcam preview</p>
+                {!activeRecording ? <button className="ghost-button" type="button" disabled={Boolean(busy)} onClick={() => setPreviewEnabled(value => !value)}>{previewEnabled ? 'Hide preview' : 'Show preview'}</button> : null}
+              </div>
+              {activeRecording?.sources?.webcam ? (
+                recordingPreview ? <img className="mt-3 max-h-72 w-full rounded-xl object-contain" src={'data:image/jpeg;base64,' + recordingPreview} alt="Live webcam recording preview" />
+                  : <p className="mt-3 text-sm text-slate-400">Waiting for the camera...</p>
+              ) : previewEnabled ? <video ref={previewVideo} className="mt-3 max-h-72 w-full rounded-xl bg-black object-contain" muted playsInline autoPlay /> : null}
+              {previewMessage && !activeRecording ? <p className="mt-2 text-sm text-amber-200" role="status">{previewMessage}</p> : null}
+              <p className="mt-2 text-xs text-slate-400">Preview stays local. During recording it updates at 5 FPS to reduce overhead; the recording uses your selected frame rate.</p>
+            </div>
+          ) : null}
 
           {activeRecording ? (
             <div className="mt-5 rounded-2xl border border-rose-400/40 bg-rose-400/10 p-5">
@@ -485,6 +560,7 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
                 </label>
               ) : null}
 
+              {selectedMode.needsWebcam ? <p className="text-xs text-slate-400 lg:col-span-2">Webcam frame rates depend on the camera and video format. Unsupported rates are checked before recording starts.</p> : null}
               {['microphone', 'screenMic', 'webcam', 'webcamMic'].includes(mode) ? <p className="text-xs leading-5 text-slate-400 lg:col-span-2">System audio is unavailable for this combination. Microphone and webcam modes remain on the FFmpeg backend; cross-backend audio synchronization is deferred.</p> : null}
               <div className="flex flex-wrap items-end gap-2 lg:col-span-2">
                 <button className="primary-button" disabled={startDisabled} onClick={start} type="button">{busy === 'start' ? 'Starting...' : 'Start recording'}</button>

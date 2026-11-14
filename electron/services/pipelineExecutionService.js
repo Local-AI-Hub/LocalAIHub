@@ -1,4 +1,4 @@
-﻿const crypto = require('crypto');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs-extra');
 
@@ -6,7 +6,7 @@ const { chatWithOllama, inspectOllamaModel, inspectOllamaModelCapabilities } = r
 const { chatWithProvider, listProviderConnections, runProviderOperation } = require('./providerService');
 const { initializeProviderRegistry } = require('./providerRegistry');
 const { getToolCatalog } = require('./toolRegistry');
-const { listGraphWorkflowPresets, listPromptStyles } = require('./configService');
+const { readConfig, listGraphWorkflowPresets, listPromptStyles } = require('./configService');
 const { listAssetLibraries, resolveAssetLibraryPreviewFile } = require('./assetLibraryService');
 const { listDownloadedModels } = require('./modelService');
 const { buildMergedToolStateList, getResolvedToolState } = require('./toolStateService');
@@ -828,7 +828,7 @@ async function buildPipelineContext(definition = {}) {
 
   const promptStyles = typeof listPromptStyles === 'function' ? await listPromptStyles() : [];
   const context = buildContextMaps({
-    hardware: null,
+    hardware: (await readConfig()).hardware || null,
     graphWorkflowPresets: await listGraphWorkflowPresets(),
     providers: await listProviderConnections(),
     toolCatalog: getToolCatalog(),
@@ -10122,6 +10122,20 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     return executeMediaExportNode(node, graph, run, reportProgress);
   }
 
+  if (node.type === 'hyperframesCompose') {
+    const { composeHyperFramesProject } = require('./hyperFramesCompositionService');
+    const inputs = Object.fromEntries(['visuals', 'plan', 'narration', 'captions'].map(port => [
+      port, getNodeInputArtifacts(node.id, port, graph, run.resultsByNodeId, run)[0]?.artifact || null,
+    ]));
+    reportProgress({ message: 'Preparing local HyperFrames scenes and media...' });
+    const result = await composeHyperFramesProject(inputs, {
+      runDirectories: run.directories,
+      config: node.config,
+      cancelSignal: activeRunAbortController?.signal || null,
+    });
+    return { outputs: { project: result.artifact }, destinationPath: result.artifact.filePath, message: result.message, preview: summarizeArtifact(result.artifact) };
+  }
+
   if (node.type === 'hyperframesRender') {
     return executeHyperFramesRenderNode(node, graph, run, contextMaps, reportProgress);
   }
@@ -10340,23 +10354,36 @@ async function executeActiveRun(graph, context) {
   }
 }
 
+let pipelineStartPending = false;
+let externalToolActionPending = false;
+async function withIdlePipelineForToolAction(operation) {
+  if (externalToolActionPending || pipelineStartPending || ['running', 'paused'].includes(activeRun?.status)) {
+    throw new Error('Wait for the active pipeline or tool action to finish before changing tool state.');
+  }
+  externalToolActionPending = true;
+  try { return await operation(); } finally { externalToolActionPending = false; }
+}
 async function runPipeline(definition) {
-  if (activeRun && (activeRun.status === 'running' || activeRun.status === 'paused')) {
+  if (externalToolActionPending || pipelineStartPending || (activeRun && (activeRun.status === 'running' || activeRun.status === 'paused'))) {
     throw new Error('A pipeline is already running. Wait for it to finish or cancel it before starting another one.');
   }
-
-  const { analysis, context } = await analyzeWithCurrentContext(definition);
-  if (!analysis.executable) {
-    throw new Error(analysis.primaryIssue?.message || 'This pipeline is not ready to run yet.');
+  pipelineStartPending = true;
+  try {
+    const { analysis, context } = await analyzeWithCurrentContext(definition);
+    if (!analysis.executable) {
+      throw new Error(analysis.primaryIssue?.message || 'This pipeline is not ready to run yet.');
+    }
+    const graph = buildPipelineGraph(analysis.pipeline);
+    const nextRun = createRunRecord(analysis, graph, null);
+    nextRun.directories = await ensureRunDirectories(nextRun.runId);
+    activeRun = nextRun;
+    activeRunAbortController = new AbortController();
+    emitPipelineEvent();
+    executeActiveRun(graph, context).catch(() => null);
+    return getActiveRunSnapshot();
+  } finally {
+    pipelineStartPending = false;
   }
-
-  const graph = buildPipelineGraph(analysis.pipeline);
-  activeRun = createRunRecord(analysis, graph, null);
-  activeRunAbortController = new AbortController();
-  activeRun.directories = await ensureRunDirectories(activeRun.runId);
-  emitPipelineEvent();
-  executeActiveRun(graph, context).catch(() => null);
-  return getActiveRunSnapshot();
 }
 
 function cancelPipelineRun(runId) {
@@ -10439,6 +10466,7 @@ function resumePipelineValidation(runId, payload = {}) {
 }
 
 module.exports = {
+  withIdlePipelineForToolAction,
   analyzeWithCurrentContext,
   cancelPipelineRecordInput,
   cancelPipelineRun,

@@ -190,7 +190,8 @@ function verifyCommands() {
 
   for (const [mode, config] of Object.entries(modes)) {
     const args = _test.buildRecordingCommand(config, mode === 'microphone' ? output.replace('.mkv', '.wav') : output);
-    assert.strictEqual(args.at(-1).includes('recordings'), true, `${mode} should end with the generated output path.`);
+    assert(args.includes(mode === 'microphone' ? output.replace('.mkv', '.wav') : output), `${mode} should write the generated output path.`);
+    if (config.webcam) { assert.strictEqual(args.at(-1), 'pipe:1'); assert.strictEqual(args.filter(arg => arg === 'video=USB Camera').length, 1); }
     assert(args.includes('-f'), `${mode} should select explicit input formats.`);
     if (mode !== 'microphone') assert(args.includes('libx264'), `${mode} should use software H.264 encoding.`);
   }
@@ -212,7 +213,7 @@ function verifyCommands() {
 
   assert(_test.buildRecordingCommand(modes.microphone, output).includes('pcm_s16le'), 'Microphone mode should use PCM WAV audio.');
   assert(_test.buildRecordingCommand(modes.screenMic, output).includes('aac'), 'Screen plus microphone should use AAC audio.');
-  assert(_test.buildRecordingCommand(modes.webcamMic, output).filter((entry) => entry === '-map').length === 2, 'Webcam plus microphone should map video and audio explicitly.');
+  assert(_test.buildRecordingCommand(modes.webcamMic, output).filter((entry) => entry === '-map').length === 3, 'Webcam plus microphone should map video and audio explicitly.');
 
   assert.throws(() => _test.normalizeMode('screenWebcam'), /not available|supported recording modes/, 'Unsupported screen plus webcam mode should be rejected.');
   assert.throws(() => _test.normalizeFps(9), /between 10 and 60/, 'FPS below the safe bound should be rejected.');
@@ -531,6 +532,20 @@ function verifyScopedApiSurface() {
 
 async function main() {
   verifyCommands();
+  const cameraModes = _test.parseDshowVideoModes('[dshow] pixel_format=yuyv422 min s=640x480 fps=5 max s=640x480 fps=30\n[dshow] vcodec=mjpeg min s=1280x720 fps=15 max s=1280x720 fps=60');
+  assert.strictEqual(cameraModes.length, 2);
+  assert.strictEqual(_test.selectWebcamMode(cameraModes, 60).codec, 'mjpeg');
+  assert.throws(() => _test.selectWebcamMode(cameraModes.slice(0, 1), 60), /highest reported rate is 30/);
+  assert.strictEqual(_test.selectWebcamMode([], 60), null);
+  assert.strictEqual(_test.selectWebcamMode([{...cameraModes[1], minFps:59.94, maxFps:59.94}],60).fps,59.94);
+  assert.strictEqual(_test.selectWebcamMode([...cameraModes,{...cameraModes[1],width:3840,height:2160}],60).width,1280);
+  const frames = [];
+  const parse = _test.createJpegFrameParser(frame => frames.push(Buffer.from(frame)));
+  parse(Buffer.from([0xff])); parse(Buffer.from([0xd8, 1, 0xff])); parse(Buffer.from([0xd9, 0xff, 0xd8, 2, 0xff, 0xd9]));
+  assert.deepStrictEqual(frames.map(frame => [...frame]), [[255,216,1,255,217], [255,216,2,255,217]]);
+  const cameraArgs = _test.buildRecordingCommand({mode:'webcam',fps:60,webcam:{name:'Camera',alternativeName:'@unique'},webcamMode:cameraModes[1]}, 'capture.mkv');
+  assert(cameraArgs.includes('1280x720') && cameraArgs.includes('mjpeg') && cameraArgs.includes('video=@unique'));
+  assert(/frame rate/.test(_test.buildRecordingFailureMessage('Could not set video options')));
   verifyRegionSelectionOverlay();
   verifyTrayAndLayout();
   verifyScopedApiSurface();

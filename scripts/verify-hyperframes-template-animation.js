@@ -19,14 +19,14 @@ const { getManagedHyperFramesExecutionRuntime } = require('../electron/services/
 const { resolveManagedFfmpegPaths } = require('../electron/services/managedFfmpegService');
 
 const repoRoot = path.resolve(__dirname, '..');
-const SMOKE_ROOT = 'D:\\LocalAIHub-HyperFrames-Template-Animation-Smoke';
+const SMOKE_ROOT = path.join(require('os').tmpdir(), 'LocalAIHub-HyperFrames-Template-Animation-Smoke');
 const DEFAULT_INSTALL_ROOT = 'D:\\LocalAIHub';
 const MIN_ADJACENT_MEAN_DIFF = 1.0;
 const MIN_MAX_MEAN_DIFF = 2.0;
 const RENDER_CONFIG = Object.freeze({ fps: 30, quality: 'draft', workers: 1, browserGpu: false, format: 'mp4' });
 const CACHE_PATHS_TO_GUARD = Object.freeze([
-  'C:\\Users\\Dell.cache\\hyperframes\\chrome',
-  'C:\\Users\\Dell\\.cache\\hyperframes\\chrome',
+  path.join(require('os').homedir() + '.cache', 'hyperframes', 'chrome'),
+  path.join(require('os').homedir(), '.cache', 'hyperframes', 'chrome'),
 ]);
 
 const runDirectories = Object.freeze({
@@ -215,6 +215,7 @@ async function main() {
   let success = false;
   try {
     const runtimeContext = await getManagedHyperFramesExecutionRuntime({}, getRuntimeOptions());
+    runtimeContext.paths = { ...runtimeContext.paths, tempDir: path.join(SMOKE_ROOT, 'runtime-temp') };
     const ffmpegPaths = resolveManagedFfmpegPaths();
     const projectsRoot = getHyperFramesProjectsRoot({ managedRoot: SMOKE_ROOT });
     assert.strictEqual(projectsRoot, path.join(SMOKE_ROOT, 'projects', 'hyperframes'), 'Smoke projects must live under the explicit test-owned managed root.');
@@ -240,7 +241,7 @@ async function main() {
       if (resolvedSmokeRoot !== path.resolve(SMOKE_ROOT) || path.basename(resolvedSmokeRoot) !== 'LocalAIHub-HyperFrames-Template-Animation-Smoke') {
         throw new Error(`Refusing to clean unexpected smoke root: ${resolvedSmokeRoot}`);
       }
-      await fs.remove(resolvedSmokeRoot);
+      await fs.promises.rm(resolvedSmokeRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
     }
   }
 }

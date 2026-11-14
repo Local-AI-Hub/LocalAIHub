@@ -21,11 +21,11 @@ const { probeRenderedMp4, renderHyperFramesComposition } = require('../electron/
 const { getManagedHyperFramesExecutionRuntime } = require('../electron/services/hyperFramesService');
 const { resolveManagedFfmpegPaths } = require('../electron/services/managedFfmpegService');
 
-const SMOKE_ROOT = 'D:\\LocalAIHub-HyperFrames-Blank-Project-Smoke';
+const SMOKE_ROOT = path.join(require('os').tmpdir(), 'LocalAIHub-HyperFrames-Blank-Project-Smoke');
 const INSTALL_ROOT = 'D:\\LocalAIHub';
 const CACHE_PATHS = [
-  'C:\\Users\\Dell.cache\\hyperframes\\chrome',
-  'C:\\Users\\Dell\\.cache\\hyperframes\\chrome',
+  path.join(require('os').homedir() + '.cache', 'hyperframes', 'chrome'),
+  path.join(require('os').homedir(), '.cache', 'hyperframes', 'chrome'),
 ];
 const REQUIRED_FILES = ['project.json', 'index.html', 'styles.css', 'script.js', 'README.md'];
 const AUTHORING_RUNTIME = 'assets/vendor/localaihub-gsap-runtime.js';
@@ -135,6 +135,7 @@ async function main() {
     assert.strictEqual(prepared.artifact.hyperFramesProject.sourceType, 'blank-scaffold', 'Project Input preserves scaffold source type');
 
     const runtimeContext = await getManagedHyperFramesExecutionRuntime({}, { installRoot: INSTALL_ROOT });
+    runtimeContext.paths = { ...runtimeContext.paths, tempDir: path.join(SMOKE_ROOT, 'runtime-temp') };
     const ffmpeg = resolveManagedFfmpegPaths();
     const runDirectories = {
       root: SMOKE_ROOT,
@@ -172,7 +173,7 @@ async function main() {
     if (success) {
       const resolved = path.resolve(SMOKE_ROOT);
       assert.strictEqual(path.basename(resolved), 'LocalAIHub-HyperFrames-Blank-Project-Smoke', 'cleanup root must be the named smoke directory');
-      await fs.remove(resolved);
+      await fs.promises.rm(resolved, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
     }
   }
 }

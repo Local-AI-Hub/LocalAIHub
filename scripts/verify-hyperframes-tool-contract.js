@@ -37,7 +37,8 @@ const storeCardSource = fs.readFileSync(path.join(repoRoot, 'src/components/Stor
 assert(storeCardSource.includes('manifest.setupNotes'), 'Store card should render focused setup notes.');
 const libraryCardSource = fs.readFileSync(path.join(repoRoot, 'src/components/LibraryCard.jsx'), 'utf8');
 assert(libraryCardSource.includes('hyperFramesStatusItems'), 'Library card should render HyperFrames runtime readiness chips.');
-assert(libraryCardSource.includes('Use the HyperFrames Render pipeline node for trusted local index.html projects'), 'Library card should point users to the narrow pipeline render node.');
+assert(libraryCardSource.includes('Build scenes with HyperFrames Compose') && libraryCardSource.includes('connect HyperFrames Render'), 'Library card should explain Compose and Render.');
+assert(libraryCardSource.includes('isPipelineOnlyTool(tool) && settingsOpen'), 'Detailed pipeline notices must stay in expanded settings.');
 
 const strategy = getToolPipelineStrategy('hyperframes');
 assert(strategy, 'HyperFrames must expose a pipeline strategy for its pass-2 render node.');

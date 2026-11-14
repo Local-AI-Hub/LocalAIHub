@@ -32,7 +32,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
     if (request === './providerService') return { chatWithProvider: async () => ({ message: { content: 'pass' } }), listProviderConnections: async () => ([]), runProviderOperation: async () => ({ message: { content: '' } }) };
     if (request === './toolRegistry') return { getToolCatalog: () => [], initializeToolRegistry: async () => {} };
     if (request === './toolStateService') return { buildMergedToolStateList: async () => [], getResolvedToolState: async () => null };
-    if (request === './configService') return { listGraphWorkflowPresets: async () => [], listPromptStyles: async () => [] };
+    if (request === './configService') return { readConfig: async () => ({ hardware: null }), listGraphWorkflowPresets: async () => [], listPromptStyles: async () => [] };
     if (request === './modelService') return { listDownloadedModels: async () => [] };
   }
   return originalLoad.call(this, request, parent, isMain);
@@ -335,6 +335,31 @@ function verifySourceGuardsForUnexportedRegressionPaths() {
   assert(/setValidationRetryOverrides\(null\)/.test(builderPanelSource), 'Expected validation retry override form state to reset after a decision.');
 }
 
+async function verifyHyperFramesComposeExecution() {
+  const assets = await prepareAssets(4);
+  const images = pipelineSchema.createNode('collectionInput', { id: 'hf-images', config: { itemType: 'image', items: [{ id: 'one', filePath: assets.imageOne }, { id: 'two', filePath: assets.imageTwo }] } });
+  const narration = pipelineSchema.createNode('audioInput', { id: 'hf-narration', config: { filePath: assets.narration } });
+  const captions = pipelineSchema.createNode('textInput', { id: 'hf-captions', config: { text: 'Pipeline captions' } });
+  const compose = pipelineSchema.createNode('hyperframesCompose', { id: 'hf-compose' });
+  const output = pipelineSchema.createNode('fileOutput', { id: 'hf-project-output' });
+  const pipeline = pipelineSchema.createEmptyPipeline({ name: 'HyperFrames execution verification', nodes: [images, narration, captions, compose, output], edges: [
+    pipelineSchema.createEdge(images.id, 'collection', compose.id, 'visuals'),
+    pipelineSchema.createEdge(narration.id, 'audio', compose.id, 'narration'),
+    pipelineSchema.createEdge(captions.id, 'text', compose.id, 'captions'),
+    pipelineSchema.createEdge(compose.id, 'project', output.id, 'file'),
+  ] });
+  analyzeExecutablePipeline(pipeline, 'HyperFrames Compose pipeline');
+  const initial = await runPipeline(pipeline);
+  const completed = await waitForCompletedRun(initial.runId, 'HyperFrames Compose');
+  assert.strictEqual(completed.status, 'completed', completed.message);
+  const artifact = completed.resultsByNodeId[compose.id].outputs.project;
+  assert.strictEqual(artifact.hyperFramesComposition.scenes.length, 2);
+  assert.strictEqual(artifact.hyperFramesComposition.durationSeconds, 4);
+  assert.strictEqual(artifact.hyperFramesComposition.captionCount, 1);
+  assert(fs.existsSync(artifact.filePath));
+  assert(fs.existsSync(path.join(path.dirname(artifact.filePath), 'assets', 'narration.wav')));
+}
+
 async function main() {
   fs.rmSync(TEST_STORAGE_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_STORAGE_ROOT, { recursive: true });
@@ -347,6 +372,8 @@ async function main() {
   await verifyBurnSubtitlesFallbackWhenOriginalSourceUnavailable();
   await cleanupActiveRun();
   await verifyFocusedTransitionEnabledDynamicMediaExport();
+  await cleanupActiveRun();
+  await verifyHyperFramesComposeExecution();
   await cleanupActiveRun();
   console.log('Focused pipeline regression coverage verification passed.');
 }

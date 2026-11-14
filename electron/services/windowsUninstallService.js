@@ -634,7 +634,16 @@ async function runWindowsUninstaller(entry, logger, toolName = 'This tool') {
     throw new Error(`${toolName} did not expose a Windows uninstall command.`);
   }
 
-  const invocation = buildWindowsCommandInvocation(commandLine);
+  let invocation = buildWindowsCommandInvocation(commandLine);
+  // Qt IFW's registry command opens a GUI and waits for input. Use its
+  // supported headless removal command only after identifying the framework.
+  if (invocation && /^maintenancetool\.exe$/i.test(path.basename(invocation.command)) && !String(entry?.quietUninstallString || '').trim()) {
+    const help = await runCommand(invocation.command, ['--help'], { allowFailure: true, timeoutMs: 10000 });
+    const helpText = String(help.stdout || '') + String(help.stderr || '');
+    if (help.code === 0 && /Qt Installer Framework/.test(helpText) && /purge/.test(helpText) && /--confirm-command/.test(helpText)) {
+      invocation = { command: invocation.command, args: ['purge', '--confirm-command'] };
+    }
+  }
   await logger?.info?.('Running the Windows uninstaller for a tool.', {
     keyPath: entry?.keyPath || null,
     toolName,

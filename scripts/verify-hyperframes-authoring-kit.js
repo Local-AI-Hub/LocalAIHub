@@ -26,7 +26,7 @@ const {
 const { resolveManagedFfmpegPaths } = require('../electron/services/managedFfmpegService');
 const { runStudioProjectPreflight } = require('../electron/services/hyperFramesStudioService');
 
-const SMOKE_ROOT = 'D:\\LocalAIHub-HyperFrames-Authoring-Kit-Smoke';
+const SMOKE_ROOT = path.join(require('os').tmpdir(), 'LocalAIHub-HyperFrames-authoring-kit-Smoke');
 const DEFAULT_INSTALL_ROOT = 'D:\\LocalAIHub';
 const RENDER_CONFIG = Object.freeze({ fps: 30, quality: 'draft', workers: 1, browserGpu: false, format: 'mp4' });
 
@@ -149,6 +149,7 @@ async function main() {
     assert.strictEqual(health.runnable, true, 'verified scaffold project passes Local AI Hub health');
     const prepared = await prepareHyperFramesProjectForPipeline(created.project.projectId, options);
     const runtimeContext = await getManagedHyperFramesExecutionRuntime({}, getRuntimeOptions());
+    runtimeContext.paths = { ...runtimeContext.paths, tempDir: path.join(SMOKE_ROOT, 'runtime-temp') };
     const render = await renderHyperFramesComposition({ artifact: prepared.artifact, sourceNode: { type: 'hyperframesProjectInput' } }, {
       config: RENDER_CONFIG,
       displayName: 'HyperFrames authoring kit verifier',

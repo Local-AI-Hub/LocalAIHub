@@ -1,4 +1,4 @@
-﻿const path = require('path');
+const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const fs = require('fs-extra');
@@ -257,7 +257,6 @@ function buildScreenInputArgs(options) {
 
 function buildRecordingCommand(options, outputPath) {
   const args = ['-hide_banner', '-y'];
-  const fps = String(options.fps || DEFAULT_FPS);
 
   if (options.mode === 'screen') {
     args.push(...buildScreenInputArgs(options));
@@ -266,23 +265,84 @@ function buildRecordingCommand(options, outputPath) {
     args.push('-thread_queue_size', '512', '-f', 'dshow', '-i', `audio=${options.microphone.name}`);
     args.push('-vn', '-c:a', 'pcm_s16le', outputPath);
   } else if (options.mode === 'webcam') {
-    args.push('-thread_queue_size', '512', '-f', 'dshow', '-framerate', fps, '-i', `video=${options.webcam.name}`);
+    args.push(...buildWebcamInputArgs(options));
     args.push(...buildVideoEncodingArgs(), '-an', outputPath);
   } else if (options.mode === 'screenMic') {
     args.push(...buildScreenInputArgs(options));
     args.push('-thread_queue_size', '512', '-f', 'dshow', '-i', `audio=${options.microphone.name}`);
     args.push('-map', '0:v:0', '-map', '1:a:0', ...buildVideoEncodingArgs(), '-c:a', 'aac', '-b:a', '192k', '-af', 'aresample=async=1:first_pts=0', outputPath);
   } else if (options.mode === 'webcamMic') {
-    args.push('-thread_queue_size', '512', '-f', 'dshow', '-framerate', fps, '-i', `video=${options.webcam.name}`);
+    args.push(...buildWebcamInputArgs(options));
     args.push('-thread_queue_size', '512', '-f', 'dshow', '-i', `audio=${options.microphone.name}`);
     args.push('-map', '0:v:0', '-map', '1:a:0', ...buildVideoEncodingArgs(), '-c:a', 'aac', '-b:a', '192k', '-af', 'aresample=async=1:first_pts=0', outputPath);
   }
 
+  if (WEBCAM_MODES.has(options.mode)) {
+    // A second output shares the same camera input; never open the device twice.
+    args.push('-map', '0:v:0', '-an', '-vf', 'fps=5,scale=480:-2', '-c:v', 'mjpeg', '-q:v', '5', '-f', 'image2pipe', 'pipe:1');
+  }
   return args;
+}
+
+function parseDshowVideoModes(text) {
+  const modes = [];
+  const pattern = /(?:pixel_format=(\w+)|vcodec=(\w+)).*?min s=(\d+)x(\d+) fps=([\d.]+) max s=(\d+)x(\d+) fps=([\d.]+)/g;
+  for (const match of String(text || '').matchAll(pattern)) {
+    const mode = { pixelFormat: match[1] || null, codec: match[2] || null, width: Number(match[6]), height: Number(match[7]), minFps: Number(match[5]), maxFps: Number(match[8]) };
+    if (mode.width > 0 && mode.height > 0 && mode.maxFps >= mode.minFps && mode.minFps > 0) modes.push(mode);
+  }
+  return modes;
+}
+
+function selectWebcamMode(modes, fps) {
+  if (!modes.length) return null; // Some drivers cannot report capabilities.
+  // Accept standard fractional rates (29.97/59.94) for their nominal UI choices.
+  const tolerance = fps * 0.0011;
+  const supported = modes.filter(mode => fps >= mode.minFps - tolerance && fps <= mode.maxFps + tolerance);
+  if (!supported.length) {
+    const maximum = Math.max(...modes.map(mode => mode.maxFps));
+    throw new Error('This webcam does not report support for ' + fps + ' FPS. Its highest reported rate is ' + maximum + ' FPS. Choose another frame rate.');
+  }
+  const modest = supported.filter(mode => mode.width <= 1280 && mode.height <= 720);
+  const selected = modest.length
+    ? modest.sort((a, b) => b.width * b.height - a.width * a.height)[0]
+    : supported.sort((a, b) => a.width * a.height - b.width * b.height)[0];
+  return { ...selected, fps: Math.min(selected.maxFps, Math.max(selected.minFps, fps)) };
+}
+
+function buildWebcamInputArgs(options) {
+  const args = ['-thread_queue_size', '512', '-f', 'dshow', '-framerate', String(options.webcamMode?.fps || options.fps || DEFAULT_FPS)];
+  const mode = options.webcamMode;
+  if (mode) {
+    args.push('-video_size', mode.width + 'x' + mode.height);
+    if (mode.codec) args.push('-vcodec', mode.codec);
+    else if (mode.pixelFormat) args.push('-pixel_format', mode.pixelFormat);
+  }
+  args.push('-i', 'video=' + (options.webcam.alternativeName || options.webcam.name));
+  return args;
+}
+
+function createJpegFrameParser(onFrame) {
+  let pending = Buffer.alloc(0);
+  return chunk => {
+    pending = Buffer.concat([pending, Buffer.from(chunk)]);
+    let start = pending.indexOf(Buffer.from([0xff, 0xd8]));
+    while (start >= 0) {
+      const end = pending.indexOf(Buffer.from([0xff, 0xd9]), start + 2);
+      if (end < 0) break;
+      onFrame(pending.subarray(start, end + 2));
+      pending = pending.subarray(end + 2);
+      start = pending.indexOf(Buffer.from([0xff, 0xd8]));
+    }
+    if (pending.length > 4 * 1024 * 1024) pending = Buffer.alloc(0);
+  };
 }
 
 function buildRecordingFailureMessage(stderr) {
   const text = String(stderr || '').toLowerCase();
+  if (/could not set video options|could not set video format|unsupported.*frame|framerate.*not supported/.test(text)) {
+    return 'The webcam could not use the requested frame rate or video format. Try a lower frame rate and refresh the devices.';
+  }
   if (/access is denied|permission denied/.test(text)) {
     return 'Windows denied access to the selected recording device. Check privacy permissions and try again.';
   }
@@ -342,8 +402,12 @@ function runOneShot(command, args, options = {}) {
     let stderr = '';
     child.stdout?.on('data', (chunk) => { stdout = trimOutput(`${stdout}${chunk}`); });
     child.stderr?.on('data', (chunk) => { stderr = trimOutput(`${stderr}${chunk}`); });
-    child.once('error', reject);
-    child.once('close', (code) => resolve({ code: Number(code), stdout, stderr }));
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error('The recording device did not respond in time. Reconnect it and try again.'));
+    }, options.timeoutMs || 15000);
+    child.once('error', error => { clearTimeout(timeout); reject(error); });
+    child.once('close', (code) => { clearTimeout(timeout); resolve({ code: Number(code), stdout, stderr }); });
   });
 }
 
@@ -528,6 +592,10 @@ function createRecordingService(dependencies = {}) {
     const deviceResult = await listDevices({ forceRefresh: false });
     const allDevices = [...deviceResult.microphones, ...deviceResult.webcams];
     const options = normalizeRecordingOptions(input, allDevices, Array.isArray(context.displays) ? context.displays : []);
+    if (options.webcam) {
+      const probe = await runOneShotFn(resolveFfmpegPathFn(), ['-hide_banner', '-list_options', 'true', '-f', 'dshow', '-i', 'video=' + (options.webcam.alternativeName || options.webcam.name)]);
+      options.webcamMode = selectWebcamMode(parseDshowVideoModes(String(probe.stderr || '') + String(probe.stdout || '')), options.fps);
+    }
     const startedAtDate = now();
     const id = createRecordingId(startedAtDate);
     const pipelineStorage = await resolvePipelineRecordingPaths({
@@ -563,10 +631,12 @@ function createRecordingService(dependencies = {}) {
       fileName: path.basename(paths.outputPath),
       container: options.container,
       format: options.format,
-      fps: options.fps,
+      fps: options.webcamMode?.fps || options.fps,
+      requestedFps: options.fps,
+      webcamCaptureMode: options.webcamMode || null,
       dimensions: options.captureTarget?.type === 'region'
         ? { width: options.captureTarget.width, height: options.captureTarget.height }
-        : null,
+        : options.webcamMode ? { width: options.webcamMode.width, height: options.webcamMode.height } : null,
       captureTarget: options.captureTarget ? { ...options.captureTarget } : null,
       codecs: VIDEO_MODES.has(options.mode)
         ? { video: 'libx264', audio: MICROPHONE_MODES.has(options.mode) ? 'aac' : null }
@@ -626,7 +696,11 @@ function createRecordingService(dependencies = {}) {
     };
     activeRecording = recording;
 
-    child.stdout?.on('data', (chunk) => { recording.stdout = trimOutput(`${recording.stdout}${chunk}`); });
+    const previewParser = options.webcam ? createJpegFrameParser(frame => emit({ type: 'webcam-preview', recordingId: metadata.id, frame: frame.toString('base64') })) : null;
+    child.stdout?.on('data', (chunk) => {
+      if (previewParser) previewParser(chunk);
+      else recording.stdout = trimOutput(recording.stdout + chunk);
+    });
     child.stderr?.on('data', (chunk) => { recording.stderr = trimOutput(`${recording.stderr}${chunk}`); });
     child.once('error', (error) => {
       recording.stderr = trimOutput(`${recording.stderr}\n${error.message || error}`);
@@ -908,6 +982,9 @@ module.exports = {
   stopRecording: (...args) => defaultService.stopRecording(...args),
   createRecordingService,
   _test: {
+    parseDshowVideoModes,
+    selectWebcamMode,
+    createJpegFrameParser,
     buildRecordingCommand,
     buildRecordingFailureMessage,
     buildRecordingPaths,

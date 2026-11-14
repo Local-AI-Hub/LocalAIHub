@@ -67,6 +67,7 @@
     this.duration = Math.max(0, numberValue(duration, 0));
   }
   Tween.prototype.render = function (time) {
+    if (this.duration === 0 && time < this.start) return;
     var local = this.duration === 0 ? (time >= this.start ? 1 : 0) : clamp((time - this.start) / this.duration, 0, 1);
     var self = this;
     this.targets.forEach(function (element) {
@@ -80,6 +81,7 @@
   function Timeline() {
     this._items = [];
     this._duration = 0;
+    this._setInitial = [];
   }
   Timeline.prototype._add = function (target, fromVars, toVars, position) {
     var split = splitTweenVars(toVars);
@@ -89,7 +91,18 @@
     this._duration = Math.max(this._duration, start + split.duration);
     return this;
   };
-  Timeline.prototype.set = function (target, vars, position) { return this._add(target, vars || {}, vars || {}, position); };
+  Timeline.prototype.set = function (target, vars, position) {
+    var self = this;
+    var props = splitTweenVars(vars).props;
+    toArray(target).forEach(function (element) {
+      var initial = self._setInitial.find(function (entry) { return entry.element === element; });
+      if (!initial) { initial = { element: element, props: {} }; self._setInitial.push(initial); }
+      Object.keys(props).forEach(function (key) {
+        if (!Object.prototype.hasOwnProperty.call(initial.props, key)) initial.props[key] = readProp(element, key);
+      });
+    });
+    return this._add(target, props, props, position);
+  };
   Timeline.prototype.to = function (target, vars, position) {
     var split = splitTweenVars(vars);
     var from = {};
@@ -107,7 +120,8 @@
   Timeline.prototype.fromTo = function (target, fromVars, toVars, position) { return this._add(target, fromVars || {}, toVars || {}, position); };
   Timeline.prototype.seek = function (time) {
     var t = Math.max(0, Math.min(this._duration || 0, numberValue(time, 0)));
-    this._items.forEach(function (item) { item.render(t); });
+    this._setInitial.forEach(function (entry) { applyProps(entry.element, entry.props); });
+    this._items.slice().sort(function (a, b) { return a.start - b.start; }).forEach(function (item) { item.render(t); });
     return this;
   };
   Timeline.prototype.pause = function (time) { if (arguments.length) this.seek(time); return this; };
@@ -116,7 +130,7 @@
   Timeline.prototype.timeScale = function () { return arguments.length ? this : 1; };
   Timeline.prototype.getChildren = function () { return this._items.slice(); };
   var gsap = {
-    version: 'localaihub-0.54.0-hyperframes-0.6.112-runtime',
+    version: 'localaihub-0.55.0-hyperframes-0.6.112-runtime',
     timeline: function () { return new Timeline(); },
     set: function (target, vars) { var tl = new Timeline(); tl.set(target, vars, 0).seek(0); return tl; },
     to: function (target, vars) { var tl = new Timeline(); tl.to(target, vars, 0).seek(tl.duration()); return tl; },

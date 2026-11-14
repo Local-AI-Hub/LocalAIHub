@@ -1840,6 +1840,7 @@ async function burnSubtitlesIntoVideoArtifact(videoArtifact, captionArtifact, op
 }
 
 module.exports = {
+  resolveSubtitleCaptions,
   extractAudioFromVideoArtifact,
   extractVideoFrameArtifact,
   normalizeAudioCollectionArtifact,

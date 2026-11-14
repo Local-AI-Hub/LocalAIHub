@@ -33,6 +33,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
         recordingsRoot: RECORDINGS_ROOT,
         runtimesRoot: RUNTIMES_ROOT,
       }),
+      readConfig: async () => ({ hardware: null }),
       listGraphWorkflowPresets: async () => [],
       listPromptStyles: async () => [],
     };

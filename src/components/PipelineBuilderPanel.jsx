@@ -8934,6 +8934,29 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                   </div>
                 ) : null}
 
+                {selectedNode.type === 'hyperframesCompose' ? (
+                  <div className="space-y-4">
+                    <p className="text-sm leading-6 text-slate-300">Connect one image or video, or an ordered collection from generation steps. An optional Scene Plan supplies timing; its scenes must match the visuals in order and count. Connect the project output to HyperFrames Render.</p>
+                    <label className="block text-sm text-slate-300">Project title
+                      <input className="store-input mt-2" value={selectedNode.config?.title || ''} onChange={event => updateNode(selectedNode.id, current => ({ ...current, config: { ...current.config, title: event.target.value } }))} />
+                    </label>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      {[['width','Width',64,3840,2],['height','Height',64,2160,2],['secondsPerScene','Seconds per image / caption line',0.1,600,0.1]].map(([key,label,min,max,step]) => (
+                        <label className="block text-sm text-slate-300" key={key}>{label}
+                          <input className="store-input mt-2" type="number" min={min} max={max} step={step} value={selectedNode.config?.[key] ?? ''} onChange={event => updateNode(selectedNode.id, current => ({ ...current, config: { ...current.config, [key]: Number(event.target.value) } }))} />
+                        </label>
+                      ))}
+                      <label className="block text-sm text-slate-300">Media fit
+                        <select className="store-input mt-2" value={selectedNode.config?.fitMode || 'contain'} onChange={event => updateNode(selectedNode.id, current => ({ ...current, config: { ...current.config, fitMode: event.target.value } }))}>
+                          <option value="contain">Contain (show entire image)</option><option value="cover">Cover (fill frame)</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label className="flex items-center gap-2 text-sm text-slate-300"><input type="checkbox" checked={selectedNode.config?.motion !== false} onChange={event => updateNode(selectedNode.id, current => ({ ...current, config: { ...current.config, motion: event.target.checked } }))} />Gentle zoom on images</label>
+                    <p className="text-xs leading-5 text-slate-400">Without a plan, images share the narration duration evenly, or use seconds per image when there is no narration. Video clips use their own duration; their source audio is muted. Narration uses one connected audio track. Subtitles accept Whisper transcripts, caption lines, or SRT/VTT files. Timed captions must fit inside the visual timeline.</p>
+                  </div>
+                ) : null}
+
                 {selectedNode.type === 'hyperframesRender' ? (
                   <div className="space-y-4">
                     <div className="rounded-[24px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-100">
@@ -8972,7 +8995,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                       </div>
                     </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
-                      Connect a File Input artifact named index.html. Local assets are staged before lint and render; use system or local fonts only.
+                      Connect HyperFrames Compose, a HyperFrames Project Input, or a File Input artifact named index.html. Local assets are staged before lint and render; use system or local fonts only.
                     </div>
                   </div>
                 ) : null}

@@ -1,4 +1,4 @@
-﻿const path = require('path');
+const path = require('path');
 const fs = require('fs-extra');
 const { app } = require('electron');
 
@@ -316,6 +316,7 @@ function createDefaultConfig() {
   return {
     version: CONFIG_VERSION,
     firstLaunchCompleted: false,
+    agentAccessEnabled: false,
     hardware: null,
     ignoredToolIds: [],
     closeBehavior: 'exit',
@@ -378,6 +379,7 @@ function normalizeConfig(config, options = {}) {
       ...createDefaultConfig(),
       ...(config || {}),
       version: CONFIG_VERSION,
+      agentAccessEnabled: config?.agentAccessEnabled === true,
       ignoredToolIds: normalizeIgnoredToolIds(config?.ignoredToolIds),
       closeBehavior: normalizeCloseBehavior(config?.closeBehavior),
       screenMode: normalizeScreenMode(config?.screenMode),

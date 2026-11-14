@@ -1,6 +1,6 @@
 {
   "name": "local-ai-hub",
-  "version": "0.54.0",
+  "version": "0.58.0",
   "description": "Windows desktop manager for local AI tools",
   "author": "Local AI Hub",
   "private": true,
@@ -14,7 +14,7 @@
     "dev:ui": "vite",
     "dev:electron": "wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
     "build:ui": "vite build",
-    "build": "npm run build:ui && electron-builder",
+    "build": "npm run build:ui && npm run build:agent-extension && electron-builder",
     "sign:manifest": "node scripts/sign-tools-manifest.js",
     "verify:manifest": "node scripts/sign-tools-manifest.js --verify",
     "verify:launch-modes": "node scripts/verify-launch-modes.js",
@@ -31,7 +31,10 @@
     "verify:provider-credential-security": "node scripts/verify-provider-credential-security.js",
     "verify:aider-ollama-lifecycle": "node scripts/verify-aider-ollama-lifecycle.js",
     "verify:statistics-index": "node scripts/verify-statistics-index.js",
-    "verify:wizard-live": "node scripts/verify-pipeline-wizard-live-validation.js --live-provider-validation"
+    "verify:wizard-live": "node scripts/verify-pipeline-wizard-live-validation.js --live-provider-validation",
+    "verify:hyperframes-compose": "node scripts/verify-hyperframes-runtime-seeking.js && node scripts/verify-hyperframes-compose.js",
+    "build:agent-extension": "node scripts/build-agent-extension.js",
+    "verify:agent-access": "node scripts/verify-agent-hosted-start.js && node scripts/verify-agent-access.js && node scripts/verify-agent-features.js"
   },
   "dependencies": {
     "7zip-bin": "^5.2.0",
@@ -126,6 +129,17 @@
       {
         "from": "node_modules/ffmpeg-ffprobe-static/ffprobe.exe",
         "to": "bin/ffprobe.exe"
+      },
+      {
+        "from": "electron/agent",
+        "to": "agent",
+        "filter": [
+          "*.cjs"
+        ]
+      },
+      {
+        "from": "release/LocalAIHub.mcpb",
+        "to": "LocalAIHub.mcpb"
       }
     ]
   }

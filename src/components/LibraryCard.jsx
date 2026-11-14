@@ -8,7 +8,7 @@ function isPipelineOnlyTool(tool) {
 
 function pipelineOnlyMessage(tool) {
   if (tool?.id === 'hyperframes') {
-    return 'HyperFrames is installed as a managed runtime foundation. Use the HyperFrames Render pipeline node for trusted local index.html projects.';
+    return 'Build scenes with HyperFrames Compose, or choose an authored project, then connect HyperFrames Render.';
   }
 
   if (tool?.id === 'chatterbox-tts') {
@@ -479,7 +479,7 @@ function LibraryCard({
 
   return (
     <article className={`library-card h-full ${settingsOpen ? 'library-card-expanded' : ''}`.trim()}>
-      <div className="flex min-h-0 flex-wrap items-start justify-between gap-2 overflow-hidden">
+      <div className="flex shrink-0 flex-wrap items-start justify-between gap-2">
         <div className="flex min-w-0 flex-1 items-start gap-3">
           <div className="tool-emblem">{tool.icon || tool.name.slice(0, 2).toUpperCase()}</div>
           <div className="min-w-0 flex-1">
@@ -542,7 +542,7 @@ function LibraryCard({
       <ProgressNotice progress={progress} />
       <ProgressNotice accent="emerald" progress={updateProgress} showSpinner />
 
-      {isPipelineOnlyTool(tool) ? (
+      {isPipelineOnlyTool(tool) && settingsOpen ? (
         <div className="mt-2 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 p-2 text-xs leading-5 text-cyan-50">
           {pipelineOnlyMessage(tool)}
         </div>
@@ -554,7 +554,7 @@ function LibraryCard({
         </div>
       ) : null}
 
-      {hyperFramesStatus.length ? (
+      {hyperFramesStatus.length && settingsOpen ? (
         <div className="mt-2 flex flex-wrap gap-1.5">
           {hyperFramesStatus.map((item) => (
             <span className="status-pill border-white/10 bg-white/5 text-slate-300" key={item}>{item}</span>

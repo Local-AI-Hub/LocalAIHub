@@ -1,3 +1,4 @@
+const { normalizeSettings: validateHyperFramesCompositionSettings } = require('./hyperFramesComposition.cjs');
 ﻿const {
   PIPELINE_OPERATION_IDS,
   PIPELINE_RECORD_INPUT_CAPABILITY,
@@ -1370,6 +1371,20 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       fitMode: 'contain',
       stopMode: 'shortest',
     },
+  }),
+  hyperframesCompose: Object.freeze({
+    type: 'hyperframesCompose',
+    label: 'HyperFrames Compose',
+    category: 'Deterministic Media Operations',
+    description: 'Builds a local HyperFrames project from generated images or video clips, optional scene-plan timing, narration, and subtitles.',
+    inputPorts: [
+      { id: 'visuals', kind: PORT_KIND_ANY, allowedKinds: [PORT_KIND_IMAGE, PORT_KIND_VIDEO], collectionBehavior: 'allow', label: 'Images / Video Clips', required: true },
+      { id: 'plan', kind: PORT_KIND_PLAN, label: 'Scene Plan' },
+      { id: 'narration', kind: PORT_KIND_AUDIO, label: 'Narration' },
+      { id: 'captions', kind: PORT_KIND_ANY, allowedKinds: [PORT_KIND_TEXT, PORT_KIND_FILE], label: 'Transcript / Subtitles' },
+    ],
+    outputPorts: [{ id: 'project', kind: PORT_KIND_FILE, label: 'HyperFrames Project' }],
+    configDefaults: { title: 'Pipeline composition', width: 1280, height: 720, secondsPerScene: 4, fitMode: 'contain', motion: true },
   }),
   hyperframesRender: Object.freeze({
     type: 'hyperframesRender',
@@ -6946,6 +6961,17 @@ function analyzePipeline(definition = {}, context = {}) {
         }
       }
 
+      if (node.type === 'hyperframesCompose') {
+        try {
+          validateHyperFramesCompositionSettings(node.config || {});
+          const kinds = getIncomingKindsForNodePort(node, 'visuals', graph);
+          if (!kinds.some(kind => [PORT_KIND_IMAGE, PORT_KIND_VIDEO].includes(getCollectionItemKind(kind) || kind))) throw new Error('Connect images or video clips to HyperFrames Compose.');
+          summary.readiness = { tone: 'info', message: 'Creates a local project from connected media. Connect its project output to HyperFrames Render.' };
+        } catch (error) {
+          summary.readiness = { tone: 'error', message: error.message };
+          issues.push(buildNodeIssue(node, 'error', error.message));
+        }
+      }
       if (node.type === 'hyperframesRender') {
         const projectKinds = getIncomingKindsForNodePort(node, 'project', graph);
         const fps = Number(node.config?.fps || 30);
@@ -6955,7 +6981,7 @@ function analyzePipeline(definition = {}, context = {}) {
         if (!projectKinds.includes(PORT_KIND_FILE)) {
           summary.readiness = {
             tone: 'error',
-            message: 'Connect a File Input or HyperFrames Project Input that points to a local index.html before running HyperFrames Render.',
+            message: 'Connect a File Input, HyperFrames Project Input, or HyperFrames Compose output that supplies a local index.html before running HyperFrames Render.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         } else if (![24, 30, 60].includes(fps)) {

@@ -318,7 +318,7 @@ function formatTranscriptionLanguage(language) {
       .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function buildTranscriptionSummary(transcription = {}, limit = 180) {
+function buildTranscriptionSummary(transcription = null, limit = 180) {
   if (!transcription || typeof transcription !== 'object') {
     return '';
   }
