@@ -2,7 +2,25 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 const { validateArguments, TOOLS } = require('./contracts.cjs');
+const { checkNodeConfig, describeNode, getConfiguredPorts } = require('./nodeConfiguration.cjs');
+const { removalId } = require('./modelManager.cjs');
 const { fault } = require('./bridge.cjs');
+
+function getDraftEdgeExample(schema, pipeline) {
+  const graph = schema.buildPipelineGraph(pipeline);
+  const nodes = pipeline.nodes;
+  const ports = nodes.map(node => getConfiguredPorts(schema, node));
+  for (let target = 1; target < nodes.length; target++) {
+    for (let source = target - 1; source >= 0; source--) {
+      const context = { graph, sourceNode: nodes[source], targetNode: nodes[target] };
+      for (const output of ports[source].outputs) {
+        const input = ports[target].inputs.find(port => schema.arePortsCompatible(output, port, context));
+        if (input) return schema.createEdge(nodes[source].id, output.id, nodes[target].id, input.id);
+      }
+    }
+  }
+  return null;
+}
 
 function createOperations(deps) {
   const runs = new Map();
@@ -20,6 +38,7 @@ function createOperations(deps) {
     const ids = new Set();
     for (const node of value.nodes) {
       if (!node || !deps.schema.getNodeTypeDefinition(node.type) || typeof node.id !== 'string' || !node.id || ids.has(node.id)) throw fault('INVALID_PIPELINE', 'Each node needs a unique ID and a supported type.');
+      if (node.config !== undefined) checkNodeConfig(node.type, node.config, node.id + '.config');
       ids.add(node.id);
     }
     const edgeIds = new Set();
@@ -51,23 +70,48 @@ function createOperations(deps) {
         if (!job) throw fault('JOB_NOT_FOUND', 'That job is not available in this app session.');
         return { ...job };
       }
-      case 'hub_tool_action': {
-        const key = args.toolId + ':' + args.action;
+      case 'hub_model_manager': return deps.modelManager.discover();
+      case 'hub_model_search': return deps.modelManager.search(args);
+      case 'hub_model_preflight': return deps.modelManager.preflight(args);
+      case 'hub_model_cancel_download': {
+        const job = jobs.get(args.jobId);
+        if (job?.action !== 'install') throw fault('JOB_NOT_FOUND', 'Choose an agent model install job.');
+        return deps.modelManager.cancel(job);
+      }
+      case 'hub_tool_action':
+      case 'hub_model_install':
+      case 'hub_model_uninstall': {
+        const key = JSON.stringify([name, args.toolId, args.action, args.selectionId, args.choiceIndex, Boolean(args.lowDiskConfirmed), args.removalId]);
         const previous = jobRequests.get(args.requestId);
         if (previous) {
-          if (previous.key !== key) throw fault('REQUEST_CONFLICT', 'That request ID was used for another tool action.');
+          if (previous.key !== key) throw fault('REQUEST_CONFLICT', 'That request ID was used for another tool action or model operation.');
           return { ...jobs.get(previous.jobId) };
         }
-        if (jobs.size >= 1000) throw fault('SESSION_LIMIT', 'Restart the Hub before starting more tool actions.');
-        const tool = (await deps.listTools()).find(t => t.id === args.toolId);
-        if (!tool) throw fault('TOOL_NOT_FOUND', 'That tool is not installed.');
-        const job = { jobId: 'job-' + crypto.randomUUID(), toolId: tool.id, action: args.action, status: 'running', startedAt: new Date().toISOString() };
+        if (jobs.size >= 1000) throw fault('SESSION_LIMIT', 'Restart the Hub before starting more agent jobs.');
+        let tool, action, perform;
+        if (name === 'hub_model_install') {
+          const selection = await deps.modelManager.resolveSelection(args);
+          tool = selection.tool;
+          action = 'install';
+          perform = job => deps.modelManager.install(selection, args, job);
+        } else if (name === 'hub_model_uninstall') {
+          tool = await deps.modelManager.target(args.toolId);
+          action = 'uninstall';
+          perform = () => deps.modelManager.uninstall(tool, args.removalId);
+        } else {
+          tool = (await deps.listTools()).find(t => t.id === args.toolId);
+          if (!tool) throw fault('TOOL_NOT_FOUND', 'That tool is not installed.');
+          action = args.action;
+          perform = () => deps.changeToolState(tool, action);
+        }
+        const job = { jobId: 'job-' + crypto.randomUUID(), toolId: tool.id, action, status: 'running', startedAt: new Date().toISOString() };
         jobs.set(job.jobId, job);
         jobRequests.set(args.requestId, { key, jobId: job.jobId });
-        Promise.resolve().then(() => deps.changeToolState(tool, args.action)).then(result => {
+        Promise.resolve().then(() => perform(job)).then(result => {
           job.status = 'completed'; job.result = result;
         }, error => {
-          job.status = 'failed'; job.error = { code: error.code || 'TOOL_ACTION_FAILED', message: deps.humanizeError(error) };
+          job.status = error.code === 'MODEL_DOWNLOAD_CANCELLED' ? 'cancelled' : 'failed';
+          job.error = { code: error.code || 'TOOL_ACTION_FAILED', message: deps.humanizeError(error) };
         }).finally(() => { job.finishedAt = new Date().toISOString(); });
         return { ...job };
       }
@@ -76,13 +120,16 @@ function createOperations(deps) {
       case 'hub_models': {
         const tool = (await deps.listTools()).find(t => t.id === args.toolId);
         if (!tool) throw fault('TOOL_NOT_FOUND', 'That tool is not installed.');
-        return deps.listModels(tool);
+        const inventory = await deps.listModels(tool);
+        return inventory.slice(args.offset || 0, args.limit ? (args.offset || 0) + args.limit : undefined)
+          .map(model => ({ ...model, removalId: removalId(tool, model) }));
       }
       case 'hub_node_types': {
+        if (args.config && !args.type) throw fault('UNKNOWN_NODE', 'Choose a node type to preview its configuration.');
         if (!args.type) return Object.values(deps.schema.PIPELINE_NODE_TYPES).map(({ type, label, description }) => ({ type, label, description }));
         const entry = deps.schema.getNodeTypeDefinition(args.type);
         if (!entry) throw fault('UNKNOWN_NODE', 'That pipeline node type is not supported.');
-        return { ...entry, sampleNode: deps.schema.createNode(args.type) };
+        return describeNode(deps.schema, entry, args.config || {});
       }
       case 'hub_create_draft': {
         for (const type of args.types) if (!deps.schema.getNodeTypeDefinition(type)) throw fault('UNKNOWN_NODE', `Unsupported pipeline node type: ${type}.`);
@@ -90,7 +137,11 @@ function createOperations(deps) {
         pipeline.id = `agent-${crypto.randomUUID()}`;
         pipeline.name = args.name;
         pipeline.nodes = args.types.map((type, index) => deps.schema.createNode(type, { position: { x: 100 + index * 260, y: 100 } }));
-        return { pipeline, edgeExample: deps.schema.createEdge(pipeline.nodes[0].id, 'text', pipeline.nodes[1]?.id || 'target-node-id', 'text'), message: 'Fill node configurations and connect ports before validating and saving.' };
+        return {
+          pipeline,
+          edgeExample: getDraftEdgeExample(deps.schema, pipeline),
+          message: 'Configure nodes, then use hub_node_types with each configuration to check its ports before connecting, validating and saving.',
+        };
       }
       case 'hub_pipelines': return deps.store.listPipelines();
       case 'hub_get_pipeline': return deps.store.getPipeline(args.pipelineId);

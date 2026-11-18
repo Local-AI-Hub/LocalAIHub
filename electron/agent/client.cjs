@@ -19,7 +19,7 @@ async function callBridge(method, params = {}, descriptorPath = defaultDescripto
     let settled = false;
     const finish = (error, result) => { if (settled) return; settled = true; socket.destroy(); error ? reject(error) : resolve(result); };
     socket.setEncoding('utf8');
-    socket.setTimeout(30000, () => finish(new Error('Local AI Hub took too long to respond. Check its status before retrying a mutation.')));
+    socket.setTimeout(method === 'hub_model_search' ? 120000 : 30000, () => finish(new Error('Local AI Hub took too long to respond. Check its status before retrying a mutation.')));
     socket.on('connect', () => socket.write(request));
     socket.on('error', error => finish(Object.assign(new Error(['EACCES', 'EPERM'].includes(error.code) ? 'This client is not permitted to connect to Local AI Hub. Its sandbox or Windows permissions blocked the local connection.' : 'Local AI Hub is unavailable. Open the app and check Agent access in Settings.'), { code: error.code })));
     socket.on('close', () => finish(new Error('Local AI Hub closed the connection.')));

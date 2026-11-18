@@ -7,7 +7,7 @@ const { getToolPipelineCapabilities } = require('../shared/pipelineCapabilities.
 const { getManifestInstallContract } = require('./toolLifecycleService');
 
 let cachedToolDefinitions = null;
-let cachedToolManifestKey = '';
+let cachedManifest = null;
 
 const DEFAULT_EXTERNAL_CANDIDATES = {
   comfyui: {
@@ -307,6 +307,15 @@ function normalizeLaunchModes(tool) {
   };
 }
 
+function normalizeCompatibility(profile) {
+  if (!profile) return null;
+  return {
+    ...profile,
+    minimumRamMb: profile.minimumRamMb ?? profile.minRamMb ?? 0,
+    minimumVramMb: profile.minimumVramMb ?? profile.minVramMb ?? 0,
+  };
+}
+
 function normalizeCompanionDesktopDefinition(toolId, rawCompanion) {
   if (!rawCompanion || typeof rawCompanion !== 'object') {
     return null;
@@ -343,7 +352,7 @@ function normalizeCompanionDesktopDefinition(toolId, rawCompanion) {
     externalPythonCandidates: installInstructions.externalPythonCandidates || [],
     externalExecutableCandidates: installInstructions.externalExecutableCandidates || [],
     externalBatchCandidates: installInstructions.externalBatchCandidates || [],
-    compatibility: installInstructions.compatibility || null,
+    compatibility: normalizeCompatibility(installInstructions.compatibility),
   };
   const companion = {
     id: companionId,
@@ -489,7 +498,7 @@ function normalizeToolDefinition(tool) {
       ...(defaultExternalCandidates.externalBatchCandidates || []),
       ...(installInstructions.externalBatchCandidates || []),
     ]),
-    compatibility: installInstructions.compatibility || null,
+    compatibility: normalizeCompatibility(installInstructions.compatibility),
   };
   const installContract = getManifestInstallContract({
     ...tool,
@@ -537,11 +546,10 @@ function normalizeToolDefinition(tool) {
 
 function loadToolDefinitions() {
   const rawTools = getLoadedToolManifest();
-  const manifestKey = JSON.stringify(rawTools);
 
-  if (!cachedToolDefinitions || cachedToolManifestKey !== manifestKey) {
+  if (cachedManifest !== rawTools) {
     cachedToolDefinitions = rawTools.map(normalizeToolDefinition);
-    cachedToolManifestKey = manifestKey;
+    cachedManifest = rawTools;
   }
 
   return cachedToolDefinitions;

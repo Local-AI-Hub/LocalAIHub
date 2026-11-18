@@ -288,19 +288,20 @@ def main():
         config = Config()
         vc = VC(config)
         vc.get_vc(model_token)
+        settings = request.get('rvcInference', {})
         info, converted_audio = vc.vc_single(
             0,
             source_audio_path,
-            0,
+            settings.get('pitchChange', 0),
             None,
-            'rmvpe',
+            settings.get('pitchMethod', 'rmvpe'),
             index_path,
             '',
-            0.75,
+            settings.get('indexRate', 0.75),
             3,
             0,
-            0.25,
-            0.33,
+            settings.get('rmsMixRate', 0.25),
+            settings.get('protect', 0.33),
         )
 
         if not converted_audio or len(converted_audio) != 2:

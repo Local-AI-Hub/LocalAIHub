@@ -29,12 +29,12 @@ function verifyModelManagerLifecycle() {
   assert(modelManagerSource.includes('export default function ModelManager({ isActive = true, tools, onToast })'), 'Model Manager should receive an explicit active-tab signal.');
   assert(modelManagerSource.includes('const browseIpcRequestIdRef = useRef(null);'), 'Model Manager should track the active catalog IPC request.');
   assert(modelManagerSource.includes("window.localAIHub.cancelModelBrowse(ipcRequestId).catch(() => null);"), 'Leaving Model Manager should cancel its active catalog request.');
-  assert(modelManagerSource.includes('if (!activeRef.current || requestId !== browseRequestIdRef.current)'), 'Stale Model Manager responses should be ignored.');
+  assert(modelManagerSource.includes('if (!activeRef.current || requestView !== viewRef.current || requestId !== browseRequestIdRef.current)'), 'Stale Model Manager responses should be ignored.');
   assert(modelManagerSource.includes('if (result?.canceled)'), 'Normal Model Manager cancellation should be handled separately from errors.');
   assert(modelManagerSource.includes('[isActive, selectedTool, selectedToolId, selectedSource, modelType, sort, taskType]'), 'Returning to Model Manager should trigger a fresh catalog request.');
   assert(modelManagerSource.includes('requestId: ipcRequestId'), 'Catalog requests should carry scoped request IDs.');
   assert(modelManagerSource.includes('const localIpcRequestIdRef = useRef(null);'), 'Downloaded-model inventory should track its own cancellable request.');
-  assert(modelManagerSource.includes('window.localAIHub.listLocalModels({ requestId: ipcRequestId, toolId })'), 'Downloaded-model inventory should use the scoped Model Manager request boundary.');
+  assert(modelManagerSource.includes('window.localAIHub.listLocalModels({ requestId: ipcRequestId, toolId, forceRefresh: true })'), 'Downloaded-model inventory should use the scoped Model Manager request boundary.');
 
   const browseBody = getFunctionBody(modelManagerSource, '  async function browse(options = {}) {', '  async function handleLoadMore()');
   assert(browseBody.includes("onToast(message, 'error')"), 'Real catalog errors should still surface while Model Manager is active.');
@@ -71,7 +71,7 @@ function verifyScopedIpcAndServices() {
   assert(modelServiceSource.includes('fetch(url, withModelBrowseSignal(options))'), 'Remote JSON catalog fetches should be abortable.');
   assert(modelServiceSource.includes('throwIfModelBrowseCanceled();'), 'Catalog parsing loops should check for cancellation.');
   assert(statisticsServiceSource.includes('calculatePathSize(tool.installDir, { signal: options.signal })'), 'Statistics install scans should pass cancellation into path sizing.');
-  assert(statisticsServiceSource.includes('listDownloadedModels(tool, { signal: options.signal })'), 'Statistics model inventory should pass cancellation into local model walks.');
+  assert(statisticsServiceSource.includes('listDownloadedModels(tool, { signal: options.signal, forceRefresh: options.forceRefresh })'), 'Statistics model inventory should pass cancellation into local model walks.');
   assert(backgroundTaskSource.includes('worker.postMessage({ cancelRequestId: requestId })'), 'Worker-backed scans should receive cancellation messages.');
   assert(backgroundWorkerSource.includes('throwIfRequestCanceled(requestId);'), 'Long filesystem walks should check cancellation repeatedly.');
 }

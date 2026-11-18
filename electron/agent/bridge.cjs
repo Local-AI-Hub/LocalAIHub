@@ -47,6 +47,7 @@ function createBridge({ dispatch, descriptorPath, sanitizeError = () => 'The age
           if (!token || supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) {
             throw fault('UNAUTHORIZED', 'Agent access is disabled or the connection credentials are outdated.');
           }
+          if (request.method === 'hub_model_search') socket.setTimeout(120000);
           const data = await dispatch(request.method, request.params || {});
           const result = JSON.stringify({ ok: true, data });
           if (Buffer.byteLength(result) > MAX_BYTES) throw fault('RESULT_TOO_LARGE', 'Request a smaller result or a specific item.');

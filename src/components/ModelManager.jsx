@@ -1,3 +1,4 @@
+import { getArtifactChoices, getSelectedArtifactChoice, buildSelectedCatalogItem } from '../../electron/shared/modelArtifactSelection.cjs';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { formatBytes } from '../lib/formatters';
 import { logRendererActionDiagnostic } from '../lib/focus-guard';
@@ -142,6 +143,7 @@ function matchingLocalModel(remoteItem, localModels) {
     return null;
   }
   return (localModels || []).find((model) => {
+    if (model.damaged || model.incomplete || model.downloaded === false) return false;
     const localKeys = remoteItem?.source === 'ollama'
       ? [model?.relativePath, model?.fileName, model?.name]
       : [model?.downloadIdentity, model?.metadata?.downloadIdentity];
@@ -214,46 +216,6 @@ function ModelPreview({ item }) {
 }
 function isSafeModelSourceUrl(value) {
   return isSafeModelPreviewUrl(value);
-}
-function getArtifactChoices(item) {
-  return Array.isArray(item?.artifactChoices) ? item.artifactChoices.filter(Boolean) : [];
-}
-function getSelectedArtifactChoice(item, selectedChoiceId = '') {
-  const choices = getArtifactChoices(item);
-  if (!choices.length) {
-    return null;
-  }
-  const requested = String(selectedChoiceId || '').trim();
-  const requestedChoice = requested ? choices.find((choice) => choice.id === requested) : null;
-  if (requestedChoice && !requestedChoice.disabled) {
-    return requestedChoice;
-  }
-  return choices.find((choice) => choice.recommended && !choice.disabled) || choices.find((choice) => !choice.disabled) || choices[0] || null;
-}
-function buildSelectedCatalogItem(item, selectedChoiceId = '') {
-  const selectedChoice = getSelectedArtifactChoice(item, selectedChoiceId);
-  if (!selectedChoice) {
-    return item;
-  }
-  const payload = selectedChoice.payload || {};
-  return {
-    ...item,
-    ...payload,
-    artifactChoices: getArtifactChoices(item),
-    artifactLabel: payload.artifactLabel || selectedChoice.artifactLabel || item.artifactLabel,
-    artifactPath: payload.artifactPath || selectedChoice.artifactPath || item.artifactPath,
-    artifactUrl: payload.artifactUrl || selectedChoice.artifactUrl || item.artifactUrl,
-    fileName: payload.fileName || selectedChoice.fileName || item.fileName,
-    modelPageUrl: payload.modelPageUrl || selectedChoice.modelPageUrl || item.modelPageUrl,
-    modelType: payload.modelType || selectedChoice.modelType || item.modelType,
-    selectedArtifactChoice: selectedChoice,
-    selectedArtifactChoiceId: selectedChoice.id,
-    sizeBytes: Number(payload.sizeBytes || selectedChoice.sizeBytes || item.sizeBytes || 0) || item.sizeBytes,
-    sourceLabel: selectedChoice.sourceLabel || item.sourceLabel,
-    sourceUrl: payload.sourceUrl || selectedChoice.modelPageUrl || item.sourceUrl,
-    versionId: payload.versionId || selectedChoice.versionId || item.versionId,
-    versionLabel: payload.versionLabel || selectedChoice.versionLabel || item.versionLabel,
-  };
 }
 function getDownloadKey(item) {
   return [item?.id, item?.selectedArtifactChoiceId || item?.downloadIdentity || item?.fileName].filter(Boolean).join('::') || item?.name || 'model-download';
@@ -427,6 +389,7 @@ function ModelCard({
           <div>
             <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Install target</p>
             <p className="mt-1 break-all text-xs leading-5 text-slate-400">{targetDirectory || 'No compatible install folder for this target.'}</p>
+            {item.installRelativePath ? <p className="mt-1 break-all text-xs leading-5 text-slate-400">Save as: {item.installRelativePath}</p> : null}
           </div>
           <div>
             <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Target</p>
@@ -510,10 +473,15 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   const [taskType, setTaskType] = useState(getToolDefaults(modelTools[0]).taskType);
   const [deleteBusyId, setDeleteBusyId] = useState(null);
   const activeRef = useRef(isActive);
+  const viewRef = useRef(null);
+  const refreshBrowseRef = useRef(null);
+  const viewKey = JSON.stringify([selectedToolId, selectedSource, modelType, sort, taskType]);
+  viewRef.current = viewKey;
   const browseIpcRequestIdRef = useRef(null);
   const browseRequestIdRef = useRef(0);
   const localIpcRequestIdRef = useRef(null);
   const localRequestIdRef = useRef(0);
+  const inventoryVersionRef = useRef(0);
   const selectedTool = modelTools.find((tool) => tool.id === selectedToolId) || null;
   const sourceOptions = getModelManagerSources(selectedTool);
   const modelTypeOptions = getToolModelTypeOptions(selectedTool);
@@ -531,6 +499,9 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   function applyToolDefaults(toolId) {
     const tool = modelTools.find((entry) => entry.id === toolId) || null;
     const defaults = getToolDefaults(tool);
+    localRequestIdRef.current += 1;
+    setLocalModels([]);
+    setLocalLoading(false);
     setSelectedToolId(toolId);
     setSelectedSource(defaults.source);
     setModelType(defaults.modelType);
@@ -568,6 +539,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
       setLocalModels([]);
       return;
     }
+    const requestView = viewRef.current;
     const requestId = localRequestIdRef.current + 1;
     localRequestIdRef.current = requestId;
     const previousIpcRequestId = localIpcRequestIdRef.current;
@@ -578,21 +550,22 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     }
     setLocalLoading(true);
     try {
-      const result = await window.localAIHub.listLocalModels({ requestId: ipcRequestId, toolId });
-      if (!activeRef.current || requestId !== localRequestIdRef.current) {
+      const result = await window.localAIHub.listLocalModels({ requestId: ipcRequestId, toolId, forceRefresh: true });
+      if (!activeRef.current || requestView !== viewRef.current || requestId !== localRequestIdRef.current) {
         return;
       }
       if (result?.canceled) {
         return;
       }
       if (result?.ok) {
+        inventoryVersionRef.current += 1;
         setLocalModels(result.data || []);
       } else {
         onToast(result?.message || 'Local AI Hub could not load local models for that tool.', 'error');
         setLocalModels([]);
       }
     } catch (error) {
-      if (!activeRef.current || requestId !== localRequestIdRef.current || error?.name === 'AbortError') {
+      if (!activeRef.current || requestView !== viewRef.current || requestId !== localRequestIdRef.current || error?.name === 'AbortError') {
         return;
       }
       onToast(error?.message || 'Local AI Hub could not load local models for that tool.', 'error');
@@ -636,6 +609,9 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
       setRemoteCatalogPage(1);
       setCatalogState({ error: null, query, source });
     }
+    const requestView = viewRef.current;
+    const inventoryRequestId = localRequestIdRef.current;
+    const inventoryVersion = inventoryVersionRef.current;
     const requestId = browseRequestIdRef.current + 1;
     browseRequestIdRef.current = requestId;
     const previousIpcRequestId = browseIpcRequestIdRef.current;
@@ -657,7 +633,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
         toolId,
         requestId: ipcRequestId,
       });
-      if (!activeRef.current || requestId !== browseRequestIdRef.current) {
+      if (!activeRef.current || requestView !== viewRef.current || requestId !== browseRequestIdRef.current) {
         return;
       }
       if (result?.canceled) {
@@ -681,14 +657,16 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
       if (!append) {
         setCatalogState({ error: null, query, source });
       }
-      setLocalModels(result.data?.localModels || []);
+      if (inventoryRequestId === localRequestIdRef.current && inventoryVersion === inventoryVersionRef.current) {
+        setLocalModels(result.data?.localModels || []);
+      }
       setPagination(result.data?.pagination || EMPTY_PAGINATION);
       if (result.data?.settings) {
         setSettings(result.data.settings);
         setCivitaiApiKeyDraft('');
       }
     } catch (error) {
-      if (!activeRef.current || requestId !== browseRequestIdRef.current || error?.name === 'AbortError') {
+      if (!activeRef.current || requestView !== viewRef.current || requestId !== browseRequestIdRef.current || error?.name === 'AbortError') {
         return;
       }
       const message = error?.message || 'Local AI Hub could not load remote models right now.';
@@ -711,6 +689,8 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     }
   }
 
+  refreshBrowseRef.current = () => browse({ page: 1, cursor: null });
+
   async function handleLoadMore() {
     if (!pagination.hasMore) {
       return;
@@ -719,6 +699,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
       append: true,
       cursor: pagination.nextCursor,
       page: pagination.nextPage || 1,
+      query: catalogState.query,
     });
   }
   useEffect(() => {
@@ -781,6 +762,9 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     });
     return () => unsubscribe();
   }, [isActive]);
+  useEffect(() => {
+    if (isActive) loadLocalModels(selectedToolId);
+  }, [isActive, selectedToolId]);
   useEffect(() => {
     setRemoteCatalogPage(1);
     setSelectedArtifactMap({});
@@ -881,6 +865,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     }
   }
   async function handleDownload(item) {
+    const operationView = viewRef.current;
     const selectedItem = buildSelectedCatalogItem(item, selectedArtifactMap[item.id]);
     const subject = selectedItem?.name || selectedItem?.fileName || 'This model';
     const downloadId = getDownloadKey(selectedItem);
@@ -941,8 +926,14 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
       }
       clearConflict(selectedItem);
       onToast(result.data?.message || `${selectedItem.name} was downloaded.`, 'success');
-      setLocalModels(result.data?.localModels || []);
-      browse({ page: 1, cursor: null });
+      if (activeRef.current && operationView === viewRef.current) {
+        localRequestIdRef.current += 1;
+        setLocalLoading(false);
+        setLocalModels(result.data?.localModels || []);
+        refreshBrowseRef.current();
+      }
+    } catch (error) {
+      onToast(error?.message || 'Local AI Hub could not download that model.', 'error');
     } finally {
       setDownloadBusyMap((current) => {
         const next = { ...current };
@@ -1023,6 +1014,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     }
   }
   async function handleDelete(model, remoteItem = null) {
+    const operationView = viewRef.current;
     const displayName = remoteItem?.name || model?.name || model?.fileName || 'this model';
     const toolName = selectedTool?.name || 'this tool';
     const deleteMessage =
@@ -1045,8 +1037,12 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
         return;
       }
       onToast(result.data?.message || `${displayName} was deleted.`, 'success');
-      setLocalModels(result.data?.localModels || []);
-      browse({ page: 1, cursor: null });
+      if (activeRef.current && operationView === viewRef.current) {
+        localRequestIdRef.current += 1;
+        setLocalLoading(false);
+        setLocalModels(result.data?.localModels || []);
+        refreshBrowseRef.current();
+      }
     } catch (error) {
       onToast(error?.message || 'Local AI Hub could not delete that model.', 'error');
     } finally {
@@ -1212,6 +1208,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
                     <p className="min-w-0 flex-1 truncate text-sm font-semibold text-white" title={model.name}>{model.name}</p>
                     <span className="status-pill border-white/10 bg-slate-950/40 text-slate-300">{model.modelType}</span>
                   </div>
+                  {model.statusMessage ? <p className="mt-1 text-xs leading-5 text-amber-200">{model.statusMessage}</p> : null}
                   <p className="mt-1 truncate text-xs leading-5 text-slate-400" title={model.relativePath || model.fileName}>{model.relativePath || model.fileName}</p>
                   <div className="mt-2 flex items-center justify-between gap-2">
                     <p className="text-xs text-slate-300">{model.sizeBytes ? formatBytes(model.sizeBytes) : 'Unknown size'}</p>

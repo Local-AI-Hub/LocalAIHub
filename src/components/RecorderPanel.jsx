@@ -58,12 +58,15 @@ function formatCaptureTarget(recording) {
   if (target?.type === 'region') {
     return `Region ${target.width}x${target.height} at ${target.x}, ${target.y}`;
   }
+  if (target?.displayName) return target.displayName;
   return recording?.sources?.screen ? 'Full desktop' : '';
 }
 
 function getRegionValidationMessage(region, display) {
   if (!display) return 'Choose an available display.';
-  const [x, y, width, height] = [region.x, region.y, region.width, region.height].map(Number);
+  const fields = [region.x, region.y, region.width, region.height];
+  if (fields.some(value => String(value).trim() === '')) return 'Enter all four region fields.';
+  const [x, y, width, height] = fields.map(Number);
   if (![x, y, width, height].every(Number.isSafeInteger)) return 'Use whole numbers for all region fields.';
   if (width < 64 || height < 64) return 'Width and height must each be at least 64 pixels.';
   if (width % 2 !== 0 || height % 2 !== 0) return 'Width and height must be even numbers for H.264 recording.';
@@ -75,7 +78,7 @@ function getRegionValidationMessage(region, display) {
   return '';
 }
 
-export default function RecorderPanel({ activeRecording, onActiveRecordingChange, onToast }) {
+export default function RecorderPanel({ activeRecording, onToast }) {
   const [devices, setDevices] = useState({ microphones: [], webcams: [] });
   const [displays, setDisplays] = useState([]);
   const [recordings, setRecordings] = useState([]);
@@ -93,6 +96,8 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
   const [finalizingSlow, setFinalizingSlow] = useState(false);
   const [managedStorageCollapsed, setManagedStorageCollapsed] = useState(getInitialManagedStorageCollapsed);
   const [now, setNow] = useState(Date.now());
+  const historyRequest = useRef(0);
+  const [loadingHistory, setLoadingHistory] = useState(true);
   const previewVideo = useRef(null);
   const previewStream = useRef(null);
   const previewTasks = useRef(new Set());
@@ -243,7 +248,11 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
   }
 
   async function loadRecordings() {
-    const result = await window.localAIHub.listRecordings();
+    const request = ++historyRequest.current;
+    setLoadingHistory(true);
+    const result = await window.localAIHub.listRecordings().catch(() => null);
+    if (request !== historyRequest.current) return;
+    setLoadingHistory(false);
     if (!result?.ok) {
       onToast(result?.message || 'Local AI Hub could not load recent recordings.', 'error');
       return;
@@ -254,7 +263,6 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
   useEffect(() => {
     loadDevices(false);
     loadDisplays();
-    loadRecordings();
   }, []);
 
   useEffect(() => {
@@ -266,10 +274,12 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
   }, [managedStorageCollapsed]);
 
   useEffect(() => {
-    if (!activeRecording) {
-      loadRecordings();
-      return undefined;
-    }
+    if (!managedStorageCollapsed) loadRecordings();
+    return () => { historyRequest.current += 1; };
+  }, [managedStorageCollapsed, activeRecording?.id]);
+
+  useEffect(() => {
+    if (!activeRecording) return undefined;
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
@@ -312,7 +322,6 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
         onToast(result?.message || 'Local AI Hub could not start that recording.', 'error');
         return;
       }
-      onActiveRecordingChange(result.data?.recording || null);
       onToast(result.data?.message || 'Recording started.');
     } finally {
       setBusy('');
@@ -329,8 +338,7 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
         onToast(result?.message || 'Local AI Hub could not stop that recording.', 'error');
         return;
       }
-      onActiveRecordingChange(null);
-      onToast(result.data?.message || 'Recording stopped.');
+      if (result.data?.recording?.status === 'completed') onToast(result.data.message || 'Recording saved.');
     } finally {
       window.clearTimeout(slowTimer);
       setFinalizingSlow(false);
@@ -349,9 +357,7 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
         onToast(result?.message || 'Local AI Hub could not cancel that recording.', 'error');
         return;
       }
-      onActiveRecordingChange(null);
-      await loadRecordings();
-      onToast(result.data?.message || 'Recording canceled.');
+      if (result.data?.recording?.status === 'canceled') onToast(result.data.message || 'Recording canceled.');
     } finally {
       setBusy('');
     }
@@ -565,8 +571,8 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
               <div className="flex flex-wrap items-end gap-2 lg:col-span-2">
                 <button className="primary-button" disabled={startDisabled} onClick={start} type="button">{busy === 'start' ? 'Starting...' : 'Start recording'}</button>
                 <button className="ghost-button" disabled={loadingDevices || Boolean(busy)} onClick={() => loadDevices(true)} type="button">{loadingDevices ? 'Scanning devices...' : 'Refresh devices'}</button>
-                {!hasWebcam ? <span className="text-xs text-slate-400">No webcam detected. Webcam modes are disabled.</span> : null}
-                {!hasMicrophone ? <span className="text-xs text-slate-400">No microphone detected. Microphone modes are disabled.</span> : null}
+                {!loadingDevices && !hasWebcam ? <span className="text-xs text-slate-400">No webcam detected. Webcam modes are disabled.</span> : null}
+                {!loadingDevices && !hasMicrophone ? <span className="text-xs text-slate-400">No microphone detected. Microphone modes are disabled.</span> : null}
               </div>
             </div>
           )}
@@ -606,12 +612,12 @@ export default function RecorderPanel({ activeRecording, onActiveRecordingChange
                     <div className="flex flex-wrap gap-2">
                       <button className="ghost-button" disabled={!recording.fileExists} onClick={() => runRecordingAction(() => window.localAIHub.openRecording(recording.id), 'Local AI Hub could not open that recording.')} type="button">Open</button>
                       <button className="ghost-button" disabled={!recording.fileExists} onClick={() => runRecordingAction(() => window.localAIHub.revealRecording(recording.id), 'Local AI Hub could not reveal that recording.')} type="button">Reveal</button>
-                      <button className="ghost-button" disabled={busy === `delete:${recording.id}`} onClick={() => removeRecording(recording)} type="button">{busy === `delete:${recording.id}` ? 'Deleting...' : 'Delete'}</button>
+                      <button className="ghost-button" disabled={Boolean(busy) || recording.id === activeRecording?.id} onClick={() => removeRecording(recording)} type="button">{busy === `delete:${recording.id}` ? 'Deleting...' : 'Delete'}</button>
                     </div>
                   </div>
                 </article>
               )) : (
-                <div className="rounded-2xl border border-dashed border-white/15 px-5 py-8 text-center text-sm text-slate-400">No recordings yet. Your first completed or interrupted capture will appear here.</div>
+                <div className="rounded-2xl border border-dashed border-white/15 px-5 py-8 text-center text-sm text-slate-400">{loadingHistory ? 'Loading recent recordings...' : 'No recordings yet. Your first completed or interrupted capture will appear here.'}</div>
               )}
             </div>
           ) : null}

@@ -7,7 +7,7 @@ async function main() {
   const version = require('../electron/agent/extension-version.json').version;
   const manifest = {
     manifest_version: '0.3', name: 'local-ai-hub', display_name: 'Local AI Hub', version,
-    description: 'Discover local AI tools, create pipelines, run workflows, and retrieve results through Local AI Hub.',
+    description: 'Search, install and remove models, discover local AI tools, create pipelines, run workflows, and retrieve results through Local AI Hub.',
     author: { name: 'Local AI Hub' },
     server: { type: 'node', entry_point: 'server.cjs', mcp_config: { command: 'node', args: ['${__dirname}/server.cjs'] } },
     tools: TOOLS.map(({ name, description }) => ({ name, description })),

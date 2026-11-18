@@ -125,7 +125,7 @@ contextBridge.exposeInMainWorld('localAIHub', {
   deleteRecording: (id) => invoke('recordings:delete', { id }),
   restoreSnapshot: (payload) => invoke('snapshots:restore', payload),
   resumePipelineValidation: (payload) => invoke('pipelines:resume-validation', payload),
-  runCleanup: () => invoke('settings:run-cleanup'),
+  runCleanup: (paths) => invoke('settings:run-cleanup', paths),
   runPipeline: (payload) => invoke('pipelines:run', payload),
   saveWindowSettings: (payload) => invoke('settings:save-window-settings', payload),
   saveHomeChecklistDismissed: (dismissed) => invoke('settings:save-home-checklist-dismissed', dismissed),

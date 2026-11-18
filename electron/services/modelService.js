@@ -404,18 +404,6 @@ function supportsModelManager(tool) {
 function mergeUniqueStrings(values = []) {
   return [...new Set((values || []).filter(Boolean))];
 }
-function toFileSizeBytes(sizeValue) {
-  if (!Number.isFinite(sizeValue)) {
-    return 0;
-  }
-  if (sizeValue > 1024 * 1024) {
-    return Math.round(sizeValue);
-  }
-  if (sizeValue > 1024) {
-    return Math.round(sizeValue * 1024);
-  }
-  return Math.round(sizeValue * 1024 * 1024);
-}
 function parseHumanSizeToBytes(value) {
   const match = String(value || '').trim().match(/^([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?B)$/i);
   if (!match) {
@@ -904,13 +892,18 @@ function buildHardwareFit(itemOrSizeBytes, toolOrHardware, hardwareOrRequirement
       message: requirements?.warningMessage || 'This model needs more GPU memory than Local AI Hub detected on this PC.',
     };
   }
-  const family = inferRuntimeModelFamily(item);
-  if (family === 'gguf') {
+  const isOllama = item.source === 'ollama' || tool?.id === 'ollama';
+  if (isOllama && /(?:^|[-:])cloud$/i.test(item.fileName || item.name || '')) {
+    return { label: 'Cloud', tone: 'neutral', message: 'This Ollama tag runs on a cloud provider.' };
+  }
+  const family = isOllama ? 'ollama' : inferRuntimeModelFamily(item);
+  if (family === 'gguf' || isOllama) {
+    const modelLabel = isOllama ? 'Ollama model' : 'GGUF';
     if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
       return {
         label: 'Unknown',
         tone: 'neutral',
-        message: 'Local AI Hub could not estimate this GGUF file size yet.',
+        message: `Local AI Hub could not estimate this ${modelLabel} file size yet.`,
       };
     }
     const fileMb = bytesToMb(sizeBytes);
@@ -920,20 +913,20 @@ function buildHardwareFit(itemOrSizeBytes, toolOrHardware, hardwareOrRequirement
       return {
         label: 'Recommended',
         tone: 'good',
-        message: `This GGUF is about ${formatBytes(sizeBytes)} and should fit with GPU offload overhead on this PC.`,
+        message: `This ${modelLabel} is about ${formatBytes(sizeBytes)} and should fit with GPU offload overhead on this PC.`,
       };
     }
     if (ramMb > 0 && ramMb >= minimumRamMb) {
       return {
         label: 'Possible / may be slow',
         tone: 'warn',
-        message: `This GGUF is about ${formatBytes(sizeBytes)}. It may need CPU/RAM offload because detected VRAM is below the file size plus runtime overhead.`,
+        message: `This ${modelLabel} is about ${formatBytes(sizeBytes)}. It may need CPU/RAM offload because detected VRAM is below the file size plus runtime overhead.`,
       };
     }
     return {
       label: 'Not recommended',
       tone: 'danger',
-      message: `This GGUF is about ${formatBytes(sizeBytes)} and likely needs more RAM or VRAM headroom than Local AI Hub detected.`,
+      message: `This ${modelLabel} is about ${formatBytes(sizeBytes)} and likely needs more RAM or VRAM headroom than Local AI Hub detected.`,
     };
   }
   const runtimeProfile = imageRuntimeProfile(item, tool);
@@ -1131,7 +1124,9 @@ function buildHuggingFaceArtifactChoice(detail, file, tool, options = {}) {
   const isPackagePlan = plan?.planType === 'package';
   const fileName = isPackagePlan ? (plan.packageName || path.basename(plan.packageRoot || detail.id || 'model-package')) : path.basename(file?.rfilename || '');
   const artifactPathValue = isPackagePlan ? (plan.packageRoot || file?.rfilename || fileName) : String(file?.rfilename || '').trim();
-  const installRelativePath = normalizeRelativeInstallPath(artifactPathValue || fileName) || fileName;
+  const installRelativePath = isPackagePlan
+    ? normalizeRelativeInstallPath(artifactPathValue || fileName) || fileName
+    : getModelInstallRelativePath(tool, { source: options.source || 'huggingface', catalogRepositoryId: detail?.id, sourceArtifactPath: artifactPathValue, fileName });
   const modelType = plan?.modelType || file?.modelType || options.modelType || 'Model';
   const targetDirectory = getTargetDirectory(tool, modelType, { ...file, catalogRepositoryId: detail?.id });
   const identity = buildSourceDownloadIdentity({
@@ -1204,7 +1199,11 @@ function buildRejectedArtifactChoices(plan, source = '') {
 function buildCivitaiArtifactChoice(model, entry, tool, options = {}) {
   const fileName = String(entry?.file?.name || '').trim();
   const versionLabel = formatCivitaiVersionLabel(entry?.version);
-  const installRelativePath = normalizeRelativeInstallPath(fileName) || fileName;
+  const installRelativePath = getModelInstallRelativePath(tool, {
+    source: 'civitai', catalogModelId: model?.id, catalogVersionId: entry?.version?.id,
+    sourceFileId: entry?.file?.id, sourceArtifactPath: fileName, fileName,
+    downloadPlan: entry?.file?.downloadPlan,
+  });
   const plan = entry?.file?.downloadPlan || null;
   const modelType = entry?.file?.normalizedType || entry?.file?.modelType || plan?.modelType || 'Model';
   const targetDirectory = getTargetDirectory(tool, modelType, entry?.file || {});
@@ -1321,12 +1320,37 @@ function getTargetDirectory(tool, modelType, item = null) {
   }
   return targetDirectory;
 }
+function getModelInstallRelativePath(tool, payload = {}) {
+  const sourcePath = normalizeRelativeInstallPath(payload.installRelativePath || payload.sourceArtifactPath || payload.fileName || payload.name || 'model.safetensors');
+  const source = String(payload.source || '').trim().toLowerCase();
+  const repositoryId = String(payload.catalogRepositoryId || '').trim();
+  // Packages and backend-managed models need their original internal filenames.
+  if (source === 'ollama' || tool?.id === 'ollama' || tool?.id === 'invokeai' || isPackageDownloadPayload(payload) || getModelManagerTargetLayout(tool)?.repositoryScoped) return sourcePath;
+  if (!/^(?:model|models|weight|weights|pytorch_model|diffusion_pytorch_model|checkpoint|ckpt|best|last)(?:[._-](?:fp16|fp32|bf16|f16|f32|pruned|ema|emaonly))?\.(?:pth|pt|safetensors|ckpt|gguf|bin)$/i.test(path.basename(sourcePath))) return sourcePath;
+  const artifactPath = String(payload.sourceArtifactPath || sourcePath).replace(/\\/g, '/');
+  let identity;
+  let label;
+  if (['huggingface', 'tabby'].includes(source) && repositoryId) {
+    // Preserve the naming previously assigned to Hugging Face generic files.
+    identity = source === 'huggingface' ? repositoryId + ':' + artifactPath : source + ':' + repositoryId + ':' + artifactPath;
+    label = repositoryId;
+  } else if (source === 'civitai' && payload.catalogModelId && payload.catalogVersionId) {
+    identity = JSON.stringify([source, String(payload.catalogModelId), String(payload.catalogVersionId), String(payload.sourceFileId || artifactPath)]);
+    label = 'civitai-' + payload.catalogModelId + '-v' + payload.catalogVersionId;
+  } else {
+    // Missing provenance is not permission to overwrite an existing destination.
+    return sourcePath;
+  }
+  const suffix = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 10);
+  const safeLabel = sanitizePathSegment(label.replace(/[\\/]/g, '--')).slice(0, 80) || 'model';
+  return path.join(path.dirname(sourcePath), safeLabel + '--' + suffix + path.extname(sourcePath));
+}
 function resolveModelDestination(tool, payload = {}) {
   const targetDirectory = getTargetDirectory(tool, payload.modelType, payload);
   if (!targetDirectory) {
     throw new Error(`Local AI Hub could not determine where ${tool.name} stores ${payload.modelType || 'model'} files.`);
   }
-  const installRelativePath = normalizeRelativeInstallPath(payload.installRelativePath || payload.fileName || payload.name || 'model.safetensors');
+  const installRelativePath = getModelInstallRelativePath(tool, payload);
   const destinationPath = path.join(targetDirectory, installRelativePath || 'model.safetensors');
   if (!isSafeChildPath(targetDirectory, destinationPath)) {
     throw new Error('Local AI Hub refused to save a model outside the approved model folder.');
@@ -1828,7 +1852,7 @@ async function walkDirectoryFiles(directory, options = {}) {
   return attachScanWarnings(files, warnings);
 }
 function normalizeRvcCompanionToken(value) {
-  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  return String(value || '').trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/g, ' ');
 }
 
 function compactRvcCompanionToken(value) {
@@ -2512,6 +2536,7 @@ function normalizeLookupKey(value) {
 function buildDownloadedLookup(localModels) {
   const lookup = new Set();
   for (const model of localModels || []) {
+    if (model.damaged || model.incomplete || model.downloaded === false) continue;
     const identity = normalizeLookupKey(model.downloadIdentity || model.metadata?.downloadIdentity);
     if (identity) {
       lookup.add(identity);
@@ -2707,6 +2732,7 @@ async function fetchHuggingFaceRepositoryTree(detail, logger) {
     return entries;
   } catch (error) {
     rethrowModelBrowseCancellation(error);
+    if (error?.code === 'CATALOG_RATE_LIMITED') throw error;
     await logger.warn('A Hugging Face repository tree expansion failed.', { error, modelId }).catch(() => null);
     return [];
   }
@@ -2734,7 +2760,7 @@ function normalizeSearchQuery(value) {
 function normalizeSearchSeparators(value) {
   return normalizeSearchQuery(value)
     .replace(/\.(safetensors|ckpt|pt|pth|bin|gguf|param)$/i, ' $1')
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .trim()
     .replace(/\s+/g, ' ');
 }
@@ -2771,6 +2797,13 @@ function getSearchQueryVariants(query) {
   }
   return mergeUniqueStrings(variants.map((value) => String(value || '').trim()).filter(Boolean));
 }
+function getPartialSearchQueries(query) {
+  const stem = stripQuantizationSuffix(stripSearchFileExtension(String(query || '').trim()));
+  const tokens = searchTokens(stem).filter((token) => token.length >= 3 && !['model', 'models', 'rvc', 'voice', 'gguf', 'pth', 'safetensors'].includes(token));
+  const anchor = [...tokens].sort((a, b) => b.length - a.length)[0];
+  const normalized = normalizeSearchSeparators(stem);
+  return mergeUniqueStrings([stem, normalized, normalized.replace(/ /g, '-'), normalized.replace(/ /g, '_'), anchor].filter(Boolean));
+}
 function matchesSearchQuery(query, values = []) {
   const normalizedQuery = normalizeSearchQuery(query);
   if (!normalizedQuery) {
@@ -2795,8 +2828,8 @@ function matchesSearchQuery(query, values = []) {
         return (
           normalizedVariant &&
           (normalizedValue.includes(normalizedVariant) ||
-            valueCanonical.includes(canonicalVariant) ||
-            valueCompact.includes(compactSearchText(variant)))
+            (canonicalVariant && valueCanonical.includes(canonicalVariant)) ||
+            (canonicalVariant && valueCompact.includes(compactSearchText(variant))))
         );
       })
     ) {
@@ -2965,6 +2998,11 @@ function extractReadmeImageUrls(markdown) {
 async function fetchJsonResponse(url, options = {}) {
   throwIfModelBrowseCanceled();
   const response = await fetch(url, withModelBrowseSignal(options));
+  if (response.status === 429) {
+    const error = new Error(new URL(url).hostname + ' is receiving too many requests. Wait a few minutes, then repeat the search.');
+    error.code = 'CATALOG_RATE_LIMITED';
+    throw error;
+  }
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const detail = String(payload?.error || payload?.message || '').trim();
@@ -3039,7 +3077,7 @@ async function fetchHuggingFaceDetail(result, logger) {
     return cachedDetail;
   }
   try {
-    const { payload } = await fetchJsonResponse(HUGGING_FACE_MODEL_URL + '/' + modelId + '?files_metadata=true', {
+    const { payload } = await fetchJsonResponse(HUGGING_FACE_MODEL_URL + '/' + modelId + '?blobs=true', {
       headers: {
         'User-Agent': APP_USER_AGENT,
       },
@@ -3048,6 +3086,7 @@ async function fetchHuggingFaceDetail(result, logger) {
     return payload;
   } catch (error) {
     rethrowModelBrowseCancellation(error);
+    if (error?.code === 'CATALOG_RATE_LIMITED') throw error;
     await logger.warn('A Hugging Face model detail request failed.', {
       error,
       modelId,
@@ -3057,11 +3096,19 @@ async function fetchHuggingFaceDetail(result, logger) {
 }
 
 async function fetchHuggingFaceDetails(results, logger) {
-  const detailResults = await Promise.all((results || []).map((result) => fetchHuggingFaceDetail(result, logger)));
+  const details = [];
+  const batchSize = 4;
+  for (let offset = 0; offset < results.length; offset += batchSize) {
+    throwIfModelBrowseCanceled();
+    const batch = results.slice(offset, offset + batchSize);
+    const entries = await Promise.all(batch.map(result => fetchHuggingFaceDetail(result, logger)));
+    details.push(...entries.filter(Boolean));
+  }
   throwIfModelBrowseCanceled();
-  return detailResults.filter(Boolean);
+  return details;
 }
 function parseSizeHeader(response) {
+  if (!response.ok) return 0;
   const contentRange = response.headers.get('content-range');
   if (contentRange) {
     const match = contentRange.match(/\/(\d+)$/);
@@ -3127,7 +3174,7 @@ async function resolveHuggingFaceDownloadFile(detail, selectedType, logger, tool
   if (!downloadFile) {
     return null;
   }
-  if (downloadFile.sizeBytes > 0) {
+  if (downloadFile.sizeBytes > 0 || downloadFile.downloadPlan?.planType === 'package') {
     return downloadFile;
   }
   return {
@@ -3302,6 +3349,15 @@ function mergeUniqueRemoteEntriesById(entries = []) {
   return [...unique.values()];
 }
 async function fetchHuggingFacePage(tool, browseOptions, logger) {
+  // A fallback query must retain its own cursor rather than reuse it with the original query.
+  const cursorPrefix = 'localaihub-hf-search:';
+  if (String(browseOptions.cursor || '').startsWith(cursorPrefix)) {
+    let continuation;
+    try { continuation = JSON.parse(String(browseOptions.cursor).slice(cursorPrefix.length)); } catch { throw new Error('That model search has expired. Search again to continue.'); }
+    if (typeof continuation.query !== 'string' || typeof continuation.cursor !== 'string') throw new Error('That model search has expired. Search again to continue.');
+    const page = await requestHuggingFacePage(tool, { ...browseOptions, cursor: continuation.cursor }, logger, '', continuation.query);
+    return { ...page, nextCursor: page.nextCursor ? cursorPrefix + JSON.stringify({ query: continuation.query, cursor: page.nextCursor }) : null };
+  }
   const pipelineTags = getEffectiveHuggingFacePipelineTags(browseOptions);
   const derivedSearchQuery = resolveHuggingFaceSearchQuery(tool, browseOptions);
   const preferredPipelineTag = pipelineTags[0] || '';
@@ -3311,19 +3367,28 @@ async function fetchHuggingFacePage(tool, browseOptions, logger) {
     return primaryPage;
   }
   const fallbackQueries = isRvcSearch
-    ? getRvcHuggingFaceFallbackQueries(browseOptions, derivedSearchQuery)
-    : derivedSearchQuery && isFileLikeSearchQuery(derivedSearchQuery)
-      ? getSearchQueryVariants(derivedSearchQuery).slice(0, 6)
+    ? mergeUniqueStrings([...getPartialSearchQueries(derivedSearchQuery), ...getRvcHuggingFaceFallbackQueries(browseOptions, derivedSearchQuery)]).filter((query) => query !== derivedSearchQuery).slice(0, 6)
+    : derivedSearchQuery && !browseOptions.cursor && primaryPage.results.length < browseOptions.limit
+      ? getPartialSearchQueries(derivedSearchQuery).filter((query) => query !== derivedSearchQuery).slice(0, 4)
       : [];
+  if (!browseOptions.cursor && browseOptions.query && preferredPipelineTag && !primaryPage.results.length && derivedSearchQuery) {
+    // Component repositories may omit the provider's pipeline tag.
+    fallbackQueries.unshift(derivedSearchQuery);
+  }
   if (!fallbackQueries.length) {
     return primaryPage;
   }
   const fallbackPages = [];
   for (const variant of fallbackQueries) {
-    fallbackPages.push(await requestHuggingFacePage(tool, browseOptions, logger, '', variant));
+    if (browseOptions.cursor) break;
+    const page = await requestHuggingFacePage(tool, browseOptions, logger, '', variant);
+    fallbackPages.push({ ...page, query: variant });
   }
   return {
-    nextCursor: primaryPage.nextCursor || fallbackPages.find((page) => page.nextCursor)?.nextCursor || null,
+    nextCursor: primaryPage.nextCursor || (() => {
+      const page = fallbackPages.find((entry) => entry.nextCursor);
+      return page ? cursorPrefix + JSON.stringify({ query: page.query, cursor: page.nextCursor }) : null;
+    })(),
     results: mergeUniqueRemoteEntriesById([primaryPage, ...fallbackPages].flatMap((page) => page.results || [])),
   };
 }
@@ -3341,7 +3406,7 @@ async function resolveHuggingFaceArtifactFiles(detail, browseOptions, logger, to
   }
   return Promise.all(
     matchingFiles.map(async (file) =>
-      file.sizeBytes > 0
+      file.sizeBytes > 0 || file.downloadPlan?.planType === 'package'
         ? file
         : {
             ...file,
@@ -3382,7 +3447,7 @@ function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, 
   const fileName = isPackagePlan ? (plan.packageName || path.basename(plan.packageRoot || detail.id)) : path.basename(file.rfilename || '');
   const installRelativePath = isPackagePlan
     ? normalizeRelativeInstallPath(plan.packageRoot || file.rfilename || fileName) || fileName
-    : normalizeRelativeInstallPath(file.rfilename || fileName) || fileName;
+    : getModelInstallRelativePath(tool, { source: 'huggingface', catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, fileName });
   const identityPayload = {
     source: 'huggingface',
     toolId: tool.id,
@@ -3481,7 +3546,7 @@ function buildHuggingFaceBlockedRepositoryResult(detail, plan, tool, hardwareCon
 function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl) {
   const fileName = path.basename(file.rfilename || '');
   const nestedPath = String(file.rfilename || '').trim();
-  const installRelativePath = normalizeRelativeInstallPath(nestedPath || fileName) || fileName;
+  const installRelativePath = getModelInstallRelativePath(tool, { source: 'huggingface', catalogRepositoryId: detail.id, sourceArtifactPath: nestedPath, fileName });
   const identity = buildSourceDownloadIdentity({ source: 'huggingface', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName });
   const cardData = detail.cardData || detail.card_data || {};
   const modelPageUrl = buildHuggingFaceModelPageUrl(detail.id);
@@ -3525,6 +3590,7 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
 async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, hardwareContext, logger) {
   const modelItems = [];
   const artifactItems = [];
+  const blockedItems = [];
   const catalogRequirements = getCatalogRequirements(browseOptions);
   const query = String(browseOptions.query || '').trim();
   if (String(tool?.id || '').trim().toLowerCase() === 'upscayl' && !isRepositoryIdSearchQuery(query)) {
@@ -3542,7 +3608,6 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
     : []);
   let sawNonSeedCompatibleModel = false;
   const fileLevelSearch = Boolean(query) && isFileLikeSearchQuery(query);
-  const artifactLevelSearch = Boolean(query) && isArtifactLevelSearchQuery(query);
   const repositoryIdSearch = Boolean(query) && isRepositoryIdSearchQuery(query);
   let rawCursor = browseOptions.cursor;
   let nextCursor = null;
@@ -3552,9 +3617,10 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
     if (existingItems.length >= browseOptions.limit) {
       break;
     }
-    const page = await fetchHuggingFacePage(tool, { ...browseOptions, cursor: rawCursor }, logger);
-    const pageDetails = await fetchHuggingFaceDetails(page.results, logger);
     const seedDetails = scanCount === 0 && !rawCursor ? await fetchHuggingFaceSeedDetails(browseOptions, logger, tool) : [];
+    const exactRepository = repositoryIdSearch && seedDetails.some((detail) => detail.id.toLowerCase() === query.toLowerCase());
+    const page = exactRepository ? { results: [], nextCursor: null } : await fetchHuggingFacePage(tool, { ...browseOptions, cursor: rawCursor }, logger);
+    const pageDetails = await fetchHuggingFaceDetails(page.results, logger);
     let details = mergeUniqueDetailsById([...seedDetails, ...pageDetails]);
     if (repositoryIdSearch) {
       const exactDetails = details.filter((detail) => String(detail.id || '').toLowerCase() === query.toLowerCase());
@@ -3566,24 +3632,32 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
       throwIfModelBrowseCanceled();
       const detailId = String(detail?.id || '').trim().toLowerCase();
       const isDefaultSeedDetail = defaultSeedModelIds.has(detailId);
-      const previewUrl = await resolveHuggingFacePreview(detail, logger);
       const planningDetail = await expandHuggingFaceDetailForPlanning(detail, browseOptions.modelType, tool, logger);
       let compatibleFiles = collectHuggingFaceDownloadFiles(planningDetail, browseOptions.modelType, tool);
-      compatibleFiles = await Promise.all(
-        compatibleFiles.map(async (file) =>
-          file.sizeBytes > 0
-            ? file
-            : {
-                ...file,
-                sizeBytes: await fetchHuggingFaceFileSize(planningDetail.id, file.rfilename, logger),
-              },
-        ),
-      );
-      const matchingArtifacts = artifactLevelSearch
+      const matchingArtifacts = Boolean(query)
         ? compatibleFiles.filter((file) => matchesSearchQuery(query, [file.rfilename, path.basename(file.rfilename)]))
         : [];
-      const primaryFile = matchingArtifacts[0] || compatibleFiles[0] || null;
-      if (primaryFile) {
+      const searchableQuery = isRvcBrowseTarget(tool, browseOptions) ? stripRvcArtifactSearchHints(query) : query;
+      const repositoryMatches = matchesSearchQuery(searchableQuery, [
+        [detail.id, ...(detail.tags || []), buildHuggingFaceDescription(detail)].join(' '),
+      ]);
+      if (query && !repositoryMatches && !matchingArtifacts.length) continue;
+      const exactFile = matchingArtifacts.find((file) => path.basename(file.rfilename).toLowerCase() === query.toLowerCase());
+      const selectedFile = exactFile || matchingArtifacts[0] || compatibleFiles[0];
+      if (selectedFile) {
+        const selectedIndex = compatibleFiles.indexOf(selectedFile);
+        compatibleFiles = await Promise.all(
+          compatibleFiles.map(async (file) =>
+            file.sizeBytes > 0 || file.downloadPlan?.planType === 'package'
+              ? file
+              : {
+                  ...file,
+                  sizeBytes: await fetchHuggingFaceFileSize(planningDetail.id, file.rfilename, logger),
+                },
+          ),
+        );
+        const primaryFile = compatibleFiles[selectedIndex];
+        const previewUrl = await resolveHuggingFacePreview(detail, logger);
         if (!isDefaultSeedDetail) {
           sawNonSeedCompatibleModel = true;
         }
@@ -3596,7 +3670,8 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
           if (!isDefaultSeedDetail) {
             sawNonSeedCompatibleModel = true;
           }
-          modelItems.push(buildHuggingFaceBlockedRepositoryResult(planningDetail, plan, tool, hardwareContext, catalogRequirements, previewUrl));
+          const previewUrl = await resolveHuggingFacePreview(detail, logger);
+          blockedItems.push(buildHuggingFaceBlockedRepositoryResult(planningDetail, plan, tool, hardwareContext, catalogRequirements, previewUrl));
         }
       }
       const mergedItems = mergeCatalogSearchItems(getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), browseOptions.limit);
@@ -3611,7 +3686,7 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
     }
     rawCursor = nextCursor;
   }
-  const items = mergeCatalogSearchItems(getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), browseOptions.limit);
+  const items = mergeCatalogSearchItems([...getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), blockedItems], browseOptions.limit);
   const suppressSeedOnlyLoadMore = defaultSeedModelIds.size > 0 && items.length > 0 && !sawNonSeedCompatibleModel;
   return {
     items,
@@ -3658,7 +3733,7 @@ function collectCivitaiVersionFiles(model, selectedType, tool = null) {
         normalizedType: resolveCivitaiVersionFileType(model, file),
         rfilename: String(file.name || '').trim(),
         sha256: getKnownCivitaiFileSha256(file),
-        sizeBytes: Number(file.sizeBytes || 0) || toFileSizeBytes(Number(file.sizeKB || 0)),
+        sizeBytes: Number(file.sizeBytes || 0) || Math.round(Number(file.sizeKB || 0) * 1024),
       },
       version,
     })),
@@ -3719,7 +3794,11 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
   const fileName = String(entry?.file?.name || '').trim();
   const versionLabel = formatCivitaiVersionLabel(entry?.version);
   const previewImage = entry?.version?.images?.find((image) => image.type === 'image');
-  const installRelativePath = normalizeRelativeInstallPath(fileName) || fileName;
+  const installRelativePath = getModelInstallRelativePath(tool, {
+    source: 'civitai', catalogModelId: model?.id, catalogVersionId: entry?.version?.id,
+    sourceFileId: entry?.file?.id, sourceArtifactPath: fileName, fileName,
+    downloadPlan: entry?.file?.downloadPlan,
+  });
   const identity = buildSourceDownloadIdentity({
     source: 'civitai',
     toolId: tool.id,
@@ -3781,7 +3860,11 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
   const fileName = String(entry?.file?.name || '').trim();
   const versionLabel = formatCivitaiVersionLabel(entry?.version);
   const previewImage = entry?.version?.images?.find((image) => image.type === 'image');
-  const installRelativePath = normalizeRelativeInstallPath(fileName) || fileName;
+  const installRelativePath = getModelInstallRelativePath(tool, {
+    source: 'civitai', catalogModelId: model?.id, catalogVersionId: entry?.version?.id,
+    sourceFileId: entry?.file?.id, sourceArtifactPath: fileName, fileName,
+    downloadPlan: entry?.file?.downloadPlan,
+  });
   const identity = buildSourceDownloadIdentity({
     source: 'civitai',
     toolId: tool.id,
@@ -3862,6 +3945,7 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
   if (browseOptions.cursor) {
     searchUrl.searchParams.set('cursor', browseOptions.cursor);
   }
+  if (!browseOptions.cursor && browseOptions.page > 1) searchUrl.searchParams.set('page', String(browseOptions.page));
   if (apiSearchQuery) {
     searchUrl.searchParams.set('query', apiSearchQuery);
   }
@@ -3920,13 +4004,19 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
     }
   }
   const nextCursor = normalizeCivitaiNextCursor(payload.metadata);
+  let nextPage = null;
+  if (!nextCursor && payload.metadata?.nextPage) {
+    const link = URL.canParse(String(payload.metadata.nextPage)) ? new URL(payload.metadata.nextPage) : null;
+    const pageNumber = Number(link ? link.searchParams.get('page') : payload.metadata.nextPage);
+    if (Number.isSafeInteger(pageNumber) && pageNumber > (browseOptions.page || 1)) nextPage = pageNumber;
+  }
   const items = mergeCatalogSearchItems(getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), browseOptions.limit);
   return {
     items,
     pagination: {
-      hasMore: Boolean(nextCursor),
+      hasMore: Boolean(nextCursor || nextPage),
       nextCursor,
-      nextPage: null,
+      nextPage,
     },
   };
 }
@@ -4099,16 +4189,16 @@ function parseOllamaFamilyVariants(html, familyName) {
   const variants = [];
   const sectionMatch = String(html || '').match(/<section class="flex flex-1 flex-col">[\s\S]*?<h2 class="text-base font-semibold leading-6 text-neutral-900">Models<\/h2>[\s\S]*?<\/section>/i);
   const sectionHtml = sectionMatch?.[0] || '';
-  if (!sectionHtml) {
-    return variants;
-  }
-  const rowPattern = /<div class="hidden group[^"]*sm:grid[^"]*">[\s\S]*?<a href="\/library\/([^"#?]+)"[^>]*>([^<]+)<\/a>[\s\S]*?<p class="col-span-2 text-neutral-500">([^<]+)<\/p>[\s\S]*?<p class="col-span-2 text-neutral-500">([^<]+)<\/p>[\s\S]*?<p class="col-span-2 text-neutral-500">\s*([^<]+?)\s*<\/p>[\s\S]*?<\/div>/gi;
-  let match = null;
-  while ((match = rowPattern.exec(sectionHtml)) !== null) {
-    const variantName = stripHtml(match[2]);
-    const sizeLabel = stripHtml(match[3]);
-    const contextLabel = stripHtml(match[4]);
-    const inputLabel = stripHtml(match[5]);
+  const rows = sectionHtml.split(/<div\b[^>]*class="hidden group[^"]*sm:grid[^"]*"[^>]*>/i).slice(1);
+  for (const row of rows) {
+    const link = row.match(/<a\b[^>]*href="\/library\/([^"#?]+)"[^>]*>([^<]+)<\/a>/i);
+    if (!link) continue;
+    const variantName = stripHtml(link[2]);
+    const rowBody = row.slice(link.index + link[0].length).split(/<a\b/i)[0];
+    const fields = [...rowBody.matchAll(/<p\b[^>]*class="col-span-2 text-neutral-500"[^>]*>([\s\S]*?)<\/p>/gi)].map(field => stripHtml(field[1]));
+    const sizeLabel = stripHtml(rowBody).match(/\b\d+(?:\.\d+)?\s*[KMGT]B\b/i)?.[0];
+    const contextLabel = fields.find(field => /^\d+(?:\.\d+)?[KM]?$/i.test(field));
+    const inputLabel = fields.find(field => /\b(text|image|audio|video)\b/i.test(field));
     if (!variantName) {
       continue;
     }
@@ -4117,13 +4207,31 @@ function parseOllamaFamilyVariants(html, familyName) {
       familyName,
       inputLabel: inputLabel || null,
       isLatestAlias: /:latest$/i.test(variantName),
-      libraryPath: `/library/${match[1]}`,
-      latest: /text-blue-600">latest<\/span>/i.test(match[0]),
+      libraryPath: `/library/${link[1]}`,
+      latest: /text-blue-600">latest<\/span>/i.test(rowBody),
       name: variantName,
       sizeBytes: parseHumanSizeToBytes(sizeLabel),
       sizeLabel: sizeLabel || 'Unknown',
       updatedLabel: null,
     });
+  }
+  if (!variants.length) {
+    const seen = new Set();
+    const links = String(html || '').matchAll(/<a\b[^>]*?\shref=["'](?:https:\/\/ollama\.com)?\/library\/([\w.-]+)(?::|%3a)([\w.-]+)["'][^>]*>([\s\S]*?)<\/a>/gi);
+    for (const [, slug, tag, body] of links) {
+      const name = slug + ':' + tag;
+      if (slug.toLowerCase() !== familyName.toLowerCase() || seen.has(name)) continue;
+      seen.add(name);
+      const label = stripHtml(body);
+      const sizeLabel = label.match(/\b\d+(?:\.\d+)?\s*[KMGT]B\b/i)?.[0];
+      variants.push({
+        name, familyName, libraryPath: '/library/' + name, isLatestAlias: tag === 'latest',
+        latest: tag !== 'latest' && /\blatest\b/i.test(label),
+        sizeLabel: sizeLabel || 'Unknown', sizeBytes: parseHumanSizeToBytes(sizeLabel),
+        contextLabel: label.match(/\b\d+[KM]?\s+context window/i)?.[0] || null,
+        inputLabel: null, updatedLabel: null,
+      });
+    }
   }
   return variants;
 }
@@ -4195,6 +4303,7 @@ function buildOllamaArtifactChoices(entry, familyDetails, selectedName) {
         artifactKind: 'ollama-tag',
         artifactLabel: 'Ollama tag',
         downloadPlan: ollamaTagPlan(name),
+        name,
         fileName: name,
         modelPageUrl: sourceUrl,
         modelType: 'Model',
@@ -4279,7 +4388,7 @@ function matchesOllamaVariantQuery(entry, query) {
   }
   const [familyPart, suffixPart = ''] = normalizedQuery.split(':', 2);
   const normalizedFamilyName = String(entry?.familyName || '').trim().toLowerCase();
-  if (familyPart && normalizedFamilyName && normalizedFamilyName !== familyPart) {
+  if (normalizedQuery.includes(':') && familyPart && normalizedFamilyName && normalizedFamilyName !== familyPart) {
     return false;
   }
   const suffixTokens = parseOllamaQueryTokens(suffixPart);
@@ -4324,9 +4433,13 @@ function extractOllamaTextValues(cardHtml, pattern) {
 function parseOllamaLibraryCards(html) {
   const repoMarkup = extractOllamaRepoMarkup(html);
   const results = [];
-  const cardPattern = /<li[^>]*x-test-model[^>]*>[\s\S]*?<a href="\/library\/([^"#?]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<\/li>/gi;
+  // Family links survive layout and CSS changes on the public catalog.
+  const cardPattern = /<a\b[^>]*?\shref=["'](?:https:\/\/ollama\.com)?\/library\/([\w.-]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const seen = new Set();
   let match = null;
   while ((match = cardPattern.exec(repoMarkup)) !== null) {
+    if (seen.has(match[1])) continue;
+    seen.add(match[1]);
     const slug = stripHtml(match[1]);
     const name = stripHtml(match[1]);
     const cardHtml = match[2];
@@ -4391,6 +4504,7 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
     throw new Error('Local AI Hub could not load the Ollama library list right now.');
   }
   const allFamilies = parseOllamaLibraryCards(html);
+  if (!allFamilies.length) throw new Error('Local AI Hub could not read the model list from the Ollama library.');
   const startIndex = (browseOptions.page - 1) * OLLAMA_PAGE_SIZE;
   const endIndex = startIndex + OLLAMA_PAGE_SIZE;
   if (!normalizedQuery) {
@@ -4420,11 +4534,15 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
       },
     };
   }
-  let matchedFamilies = allFamilies.filter((entry) => matchesOllamaQuery(entry, normalizedQuery));
-  if (!matchedFamilies.length && normalizedQuery.includes(':')) {
-    const familyQuery = normalizedQuery.split(':')[0].trim();
-    matchedFamilies = allFamilies.filter((entry) => matchesOllamaQuery(entry, familyQuery));
-  }
+  const spacedTag = normalizedQuery.match(/^(\S+)\s+(\d+(?:\.\d+)?[bmkt](?:[-_][\w.-]+)*)$/i);
+  const variantQuery = spacedTag && allFamilies.some(entry => entry.name.toLowerCase() === spacedTag[1].toLowerCase())
+    ? spacedTag[1] + ':' + spacedTag[2]
+    : normalizedQuery;
+  const taggedFamily = variantQuery.includes(':') ? variantQuery.split(':')[0].trim().toLowerCase() : '';
+  const familyQuery = normalizedQuery.replace(/\b\d+(?:\.\d+)?\s*[bmkt]\b/ig, '').trim();
+  const matchedFamilies = taggedFamily
+    ? allFamilies.filter((entry) => entry.name.toLowerCase() === taggedFamily)
+    : allFamilies.filter((entry) => matchesOllamaQuery(entry, familyQuery || normalizedQuery));
   const fullMatchCount = matchedFamilies.length;
   if (!matchedFamilies.length) {
     return {
@@ -4436,13 +4554,21 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
       },
     };
   }
-  if (isOllamaVariantQuery(normalizedQuery)) {
+  if (isOllamaVariantQuery(variantQuery)) {
     const variantItems = [];
     for (const entry of matchedFamilies) {
-      const familyDetails = await fetchOllamaFamilyDetails(entry, logger);
+      let familyDetails = await fetchOllamaFamilyDetails(entry, logger);
+      if (taggedFamily && !familyDetails.variants.some((variant) => variant.name.toLowerCase() === variantQuery.toLowerCase())) {
+        const tagsUrl = buildOllamaAbsoluteUrl(entry.libraryPath + '/tags');
+        const tagsHtml = await fetchCachedText(OLLAMA_LIBRARY_CACHE, tagsUrl, tagsUrl, { headers: { 'User-Agent': APP_USER_AGENT } });
+        const tags = parseOllamaFamilyVariants(tagsHtml, entry.name);
+        const additional = tags.filter((tag) => tag.name.toLowerCase().startsWith(variantQuery.toLowerCase()) &&
+          !familyDetails.variants.some((variant) => variant.name === tag.name));
+        familyDetails = { ...familyDetails, variants: [...familyDetails.variants, ...additional] };
+      }
       for (const variant of familyDetails.variants || []) {
         const card = buildOllamaVariantCard(entry, familyDetails, variant);
-        if (!matchesOllamaVariantQuery(card, normalizedQuery)) {
+        if (!matchesOllamaVariantQuery(card, variantQuery)) {
           continue;
         }
         variantItems.push(
@@ -4452,7 +4578,7 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
               downloaded:
                 downloadedLookup.has(String(card.fileName || '').toLowerCase()) ||
                 downloadedLookup.has(String(card.name || '').toLowerCase()) ||
-                downloadedLookup.has(String(entry.name || '').toLowerCase()),
+                (variant.isLatestAlias && downloadedLookup.has(String(entry.name || '').toLowerCase())),
             },
             tool,
             hardwareContext,
@@ -4460,7 +4586,8 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
         );
       }
     }
-    if (variantItems.length) {
+    if (variantItems.length || variantQuery.includes(':')) {
+      variantItems.sort((a, b) => Number(b.name.toLowerCase() === variantQuery.toLowerCase()) - Number(a.name.toLowerCase() === variantQuery.toLowerCase()));
       return {
         items: variantItems.slice(startIndex, endIndex),
         pagination: {
@@ -4681,7 +4808,7 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
     resolvedEntries.map(async ({ detail, entry, file }) => {
       const fileName = path.basename(file.rfilename);
       const categoryLabels = mergeUniqueStrings((entry.categories || []).map((category) => TABBY_SECTION_LABELS[category])).join(' / ');
-      const installRelativePath = normalizeRelativeInstallPath(file.rfilename || fileName) || fileName;
+      const installRelativePath = getModelInstallRelativePath(tool, { source: 'tabby', catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, fileName, downloadPlan: file.downloadPlan });
       const identity = buildSourceDownloadIdentity({ source: 'tabby', toolId: tool.id, catalogRepositoryId: detail.id, sourceArtifactPath: file.rfilename, installRelativePath, fileName });
       return attachHardwareHints(
         attachDownloadPlanFields({
@@ -5057,7 +5184,10 @@ function resolveRvcCompanionDestination(tool, payload = {}, companion = {}) {
   if (!appRoot) {
     throw new Error('Local AI Hub could not determine where RVC stores companion index files.');
   }
-  const installRelativePath = getRvcCompanionInstallRelativePath(payload, companion);
+  const installRelativePath = getRvcCompanionInstallRelativePath({
+    ...payload,
+    fileName: path.basename(getModelInstallRelativePath(tool, payload)),
+  }, companion);
   const destinationPath = path.join(appRoot, installRelativePath);
   if (!isSafeChildPath(appRoot, destinationPath)) {
     throw new Error('Local AI Hub refused to save an RVC companion file outside the RVC folder.');
@@ -5232,6 +5362,17 @@ async function downloadPackageModel(tool, payload, options = {}) {
     await assertSafeModelOperationPath(destination.targetDirectory, destination.manifestPath, 'Local AI Hub refused to read a package manifest through a symlink, junction, or path outside the approved model folder.');
     existingMetadata = await readPackageMetadata(destination.manifestPath);
   }
+  const expectedIdentity = buildPackageMetadata(tool, payload, destination, files).downloadIdentity;
+  if (existingMetadata?.downloadIdentity && existingMetadata.downloadIdentity !== expectedIdentity) {
+    throw new Error('A different model already uses this package destination. Local AI Hub will not overwrite or relabel it.');
+  }
+  if (!existingMetadata?.downloadIdentity) {
+    for (const file of files) {
+      if (await fs.pathExists(path.join(destination.packageRootPath, file.installRelativePath))) {
+        throw new Error('A model file already exists in this package destination, but Local AI Hub cannot confirm it is the same model. Rename or delete the existing model before downloading this package.');
+      }
+    }
+  }
   if (existingMetadata?.downloadIdentity) {
     const present = requiredFiles.every((file) => fs.pathExistsSync(path.join(destination.packageRootPath, file.installRelativePath)));
     if (present) {
@@ -5273,7 +5414,15 @@ async function downloadPackageModel(tool, payload, options = {}) {
         headers,
         cancelSignal: options.cancelSignal,
         errorMessage: file.fileName + ' could not be downloaded right now.',
-        onProgress: null,
+        onProgress: (progress) => {
+          const aggregateBytes = receivedBytes + Number(progress.receivedBytes || 0);
+          emitProgress(options.onProgress, {
+            ...progress,
+            receivedBytes: aggregateBytes,
+            totalBytes,
+            percent: totalBytes > 0 ? Math.min(98, Math.round((aggregateBytes / totalBytes) * 100)) : null,
+          });
+        },
         progressMessage: 'Downloading ' + file.fileName + '.',
       });
       receivedBytes += Number(result.downloadedBytes || file.sizeBytes || 0);
@@ -5326,7 +5475,9 @@ async function downloadPackageModel(tool, payload, options = {}) {
     }
     await logger.warn('Model package download failed.', { error, packageName: destination.packageName });
     await removeSafeModelPath(destination.targetDirectory, tempRoot, 'Local AI Hub refused to clean up a package download through a symlink or junction.').catch(() => null);
-    await removeSafeModelPath(destination.targetDirectory, destination.manifestPath, 'Local AI Hub refused to clean up a package manifest through a symlink or junction.').catch(() => null);
+    if (!packageManifestExistedBeforeDownload) {
+      await removeSafeModelPath(destination.targetDirectory, destination.manifestPath, 'Local AI Hub refused to clean up a package manifest through a symlink or junction.').catch(() => null);
+    }
     throw new Error(humanizeError(error, (payload.name || destination.packageName) + ' could not be installed as a complete package.'));
   } finally {
     await removeSafeModelPath(destination.targetDirectory, tempRoot, 'Local AI Hub refused to clean up a package download through a symlink or junction.').catch(() => null);
@@ -5783,7 +5934,7 @@ async function withModelDownloadLock(tool, payload = {}, operation) {
   const token = {
     cancelRequested: false,
     controller,
-    downloadId: normalizeModelDownloadOperationId(payload?.id || payload?.downloadId || lockKey),
+    downloadId: normalizeModelDownloadOperationId(payload?.downloadId || payload?.id || lockKey),
     lockKey,
     modelId: payload?.id || null,
     startedAt: Date.now(),
@@ -5868,7 +6019,11 @@ async function resolveOllamaCommand(tool) {
   return 'ollama';
 }
 async function deletePackageModel(tool, payload = {}) {
-  const manifestPath = path.resolve(String(payload.packageManifestPath || payload.path || '').trim());
+  const rawManifestPath = String(payload.packageManifestPath || '').trim();
+  if (!rawManifestPath || !isPackageManifestPath(rawManifestPath)) {
+    throw new Error('Local AI Hub could not identify the package manifest for that model.');
+  }
+  const manifestPath = path.resolve(rawManifestPath);
   const directories = Object.values(getToolModelDirectories(tool)).map((entry) => path.resolve(entry));
   const modelRoot = directories.find((directory) => manifestPath && (isSafeChildPath(directory, manifestPath) || manifestPath === directory));
   if (!manifestPath || !modelRoot) {
@@ -5884,16 +6039,22 @@ async function deletePackageModel(tool, payload = {}) {
     throw new Error('Local AI Hub refused to delete package files outside the approved model folder.');
   }
   await assertSafeModelOperationPath(modelRoot, packageRoot, 'Local AI Hub refused to delete that package because its folder crosses a symlink, junction, or leaves the approved model folder.');
-  for (const relativeFile of packageInstalledRelativeFiles(metadata)) {
-    const filePath = path.join(packageRoot, normalizeRelativeInstallPath(relativeFile));
-    if (isSafeChildPath(packageRoot, filePath)) {
-      await removeSafeModelPath(modelRoot, filePath, 'Local AI Hub refused to delete a package file through a symlink, junction, or path outside the approved model folder.').catch(() => null);
+  // Validate every member before deleting any files, and preserve untracked files.
+  const memberPaths = packageInstalledRelativeFiles(metadata).map((relativeFile) => path.join(packageRoot, normalizeRelativeInstallPath(relativeFile)));
+  for (const filePath of memberPaths) {
+    await assertSafeModelOperationPath(packageRoot, filePath, 'Local AI Hub refused to delete a package file through a symlink, junction, or path outside the approved model folder.');
+    const stat = await fs.lstat(filePath).catch((error) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (stat && !stat.isFile()) {
+      throw new Error('Local AI Hub refused to delete a package member that is not a regular file.');
     }
   }
-  await removeSafeModelPath(modelRoot, manifestPath, 'Local AI Hub refused to delete that package manifest through a symlink or junction.').catch(() => null);
-  if (path.basename(manifestPath) === PACKAGE_METADATA_FILE) {
-    await removeSafeModelPath(modelRoot, packageRoot, 'Local AI Hub refused to delete that package folder through a symlink or junction.').catch(() => null);
+  for (const filePath of memberPaths) {
+    await removeSafeModelPath(modelRoot, filePath, 'Local AI Hub refused to delete a package file through a symlink or junction.');
   }
+  await removeSafeModelPath(modelRoot, manifestPath, 'Local AI Hub refused to delete that package manifest through a symlink or junction.');
   return {
     message: (metadata.packageName || payload.name || 'That model package') + ' was deleted from ' + (tool.name || 'this tool') + '.',
   };
@@ -5964,10 +6125,21 @@ async function deleteModelUncached(tool, payload) {
       message: modelName + ' was removed from Ollama.',
     };
   }
+  if (payload.packageManifestPath) {
+    return deletePackageModel(tool, payload);
+  }
   const resolvedPath = path.resolve(payload.path || '');
   const targetDirectory = getTargetDirectory(tool, payload.modelType, payload);
   if (!resolvedPath || !targetDirectory || !isSafeChildPath(targetDirectory, resolvedPath)) {
     throw new Error('Local AI Hub refused to delete a file outside the model folder.');
+  }
+  await assertSafeModelOperationPath(targetDirectory, resolvedPath, 'Local AI Hub refused to delete that model because its path crosses a symlink, junction, or leaves the approved model folder.');
+  const stat = await fs.lstat(resolvedPath).catch((error) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (stat && !stat.isFile()) {
+    throw new Error('Local AI Hub can only delete individual model files or models with a package manifest.');
   }
   await removeSafeModelPath(targetDirectory, resolvedPath, 'Local AI Hub refused to delete that model because its path crosses a symlink, junction, or leaves the approved model folder.');
   await removeSafeModelPath(targetDirectory, getModelMetadataPath(resolvedPath), 'Local AI Hub refused to delete model metadata through a symlink or junction.').catch(() => null);
@@ -5983,6 +6155,9 @@ async function deleteModel(tool, payload) {
   }
 }
 module.exports = {
+  getOllamaModelsRoot,
+  getModelManagerConfig,
+  getModelManagerDefaults,
   browseRemoteModels,
   cancelModelDownload,
   clearProviderCatalogCaches,
@@ -6018,9 +6193,16 @@ module.exports = {
     createModelDownloadPlan,
     downloadOptionalCompanionFiles,
     getToolModelDirectories,
+    buildCivitaiModelResult,
+    buildOllamaFamilyCard,
+    resolveModelDownloadLockKey,
+    getModelInstallRelativePath,
+    getPartialSearchQueries,
     matchesSearchQuery,
     resolveHuggingFaceDownloadFile,
     searchHuggingFaceModels,
+    searchOllamaLibrary,
+    searchCivitaiModels,
     sanitizeModelPreviewUrl,
     streamDownloadToFile,
     buildInvokeAiInstallErrorMessage,

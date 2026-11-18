@@ -1,4 +1,4 @@
-const path = require('path');
+﻿const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const fs = require('fs-extra');
@@ -255,6 +255,13 @@ function buildScreenInputArgs(options) {
   return args;
 }
 
+function deviceInput(device, kind) {
+  const number = !device.alternativeName && device.duplicateIndex > 0
+    ? ['-' + kind + '_device_number', String(device.duplicateIndex)]
+    : [];
+  return [...number, '-i', kind + '=' + (device.alternativeName || device.name)];
+}
+
 function buildRecordingCommand(options, outputPath) {
   const args = ['-hide_banner', '-y'];
 
@@ -262,18 +269,18 @@ function buildRecordingCommand(options, outputPath) {
     args.push(...buildScreenInputArgs(options));
     args.push(...buildVideoEncodingArgs(), '-an', outputPath);
   } else if (options.mode === 'microphone') {
-    args.push('-thread_queue_size', '512', '-f', 'dshow', '-i', `audio=${options.microphone.name}`);
+    args.push('-thread_queue_size', '512', '-f', 'dshow', ...deviceInput(options.microphone, 'audio'));
     args.push('-vn', '-c:a', 'pcm_s16le', outputPath);
   } else if (options.mode === 'webcam') {
     args.push(...buildWebcamInputArgs(options));
     args.push(...buildVideoEncodingArgs(), '-an', outputPath);
   } else if (options.mode === 'screenMic') {
     args.push(...buildScreenInputArgs(options));
-    args.push('-thread_queue_size', '512', '-f', 'dshow', '-i', `audio=${options.microphone.name}`);
+    args.push('-thread_queue_size', '512', '-f', 'dshow', ...deviceInput(options.microphone, 'audio'));
     args.push('-map', '0:v:0', '-map', '1:a:0', ...buildVideoEncodingArgs(), '-c:a', 'aac', '-b:a', '192k', '-af', 'aresample=async=1:first_pts=0', outputPath);
   } else if (options.mode === 'webcamMic') {
     args.push(...buildWebcamInputArgs(options));
-    args.push('-thread_queue_size', '512', '-f', 'dshow', '-i', `audio=${options.microphone.name}`);
+    args.push('-thread_queue_size', '512', '-f', 'dshow', ...deviceInput(options.microphone, 'audio'));
     args.push('-map', '0:v:0', '-map', '1:a:0', ...buildVideoEncodingArgs(), '-c:a', 'aac', '-b:a', '192k', '-af', 'aresample=async=1:first_pts=0', outputPath);
   }
 
@@ -318,7 +325,7 @@ function buildWebcamInputArgs(options) {
     if (mode.codec) args.push('-vcodec', mode.codec);
     else if (mode.pixelFormat) args.push('-pixel_format', mode.pixelFormat);
   }
-  args.push('-i', 'video=' + (options.webcam.alternativeName || options.webcam.name));
+  args.push(...deviceInput(options.webcam, 'video'));
   return args;
 }
 
@@ -532,13 +539,7 @@ function createRecordingService(dependencies = {}) {
     return recording.metadata;
   }
 
-  async function finalizeRecording(recording, code, signal) {
-    if (recording.finalized) {
-      return recording.metadata;
-    }
-    recording.finalized = true;
-    clearInterval(recording.timer);
-
+  async function saveFinalMetadata(recording, code, signal) {
     const stoppedAtDate = now();
     let sizeBytes = 0;
     if (await fsApi.pathExists(recording.outputPath)) {
@@ -549,7 +550,7 @@ function createRecordingService(dependencies = {}) {
     let errorSummary = '';
     if (recording.cancelRequested) {
       status = recording.forced ? 'interrupted' : 'canceled';
-    } else if (recording.stopRequested && !recording.forced && Number(code) === 0 && sizeBytes > 0) {
+    } else if (recording.stopRequested && !recording.forced && code === 0 && sizeBytes > 0) {
       status = 'completed';
     } else if (recording.stopRequested || recording.forced) {
       status = 'interrupted';
@@ -571,16 +572,25 @@ function createRecordingService(dependencies = {}) {
       durationSeconds: Math.max(0, Math.round((stoppedAtDate.getTime() - new Date(recording.metadata.startedAt).getTime()) / 100) / 10),
       sizeBytes,
       stopMethod: recording.stopMethod || (recording.stopRequested ? 'process-exit' : 'unexpected-exit'),
-      exitCode: Number.isFinite(Number(code)) ? Number(code) : null,
+      exitCode: Number.isInteger(code) ? code : null,
       exitSignal: signal || null,
       errorSummary,
     });
+  }
 
-    if (activeRecording === recording) {
-      activeRecording = null;
+  async function finalizeRecording(recording, code, signal) {
+    if (recording.finalized) return recording.closePromise;
+    recording.finalized = true;
+    try {
+      await saveFinalMetadata(recording, code, signal);
+    } catch {
+      recording.metadata.status = 'interrupted';
+      recording.metadata.errorSummary = 'Recording ended, but Local AI Hub could not save its final details. Check the recordings folder and available disk space.';
     }
-    emitStatus(recording, status === 'completed' ? 'Recording saved.' : status === 'canceled' ? 'Recording canceled.' : errorSummary);
+    if (activeRecording === recording) activeRecording = null;
+    const { status, errorSummary } = recording.metadata;
     recording.resolveClose(recording.metadata);
+    emitStatus(recording, status === 'completed' ? 'Recording saved.' : status === 'canceled' ? 'Recording canceled.' : errorSummary);
     return recording.metadata;
   }
 
@@ -589,11 +599,15 @@ function createRecordingService(dependencies = {}) {
       throw new Error('A recording is already active. Stop or cancel it before starting another one.');
     }
 
-    const deviceResult = await listDevices({ forceRefresh: false });
-    const allDevices = [...deviceResult.microphones, ...deviceResult.webcams];
+    const mode = normalizeMode(input?.mode);
+    let allDevices = [];
+    if (MICROPHONE_MODES.has(mode) || WEBCAM_MODES.has(mode)) {
+      const devices = await listDevices();
+      allDevices = [...devices.microphones, ...devices.webcams];
+    }
     const options = normalizeRecordingOptions(input, allDevices, Array.isArray(context.displays) ? context.displays : []);
     if (options.webcam) {
-      const probe = await runOneShotFn(resolveFfmpegPathFn(), ['-hide_banner', '-list_options', 'true', '-f', 'dshow', '-i', 'video=' + (options.webcam.alternativeName || options.webcam.name)]);
+      const probe = await runOneShotFn(resolveFfmpegPathFn(), ['-hide_banner', '-list_options', 'true', '-f', 'dshow', ...deviceInput(options.webcam, 'video')]);
       options.webcamMode = selectWebcamMode(parseDshowVideoModes(String(probe.stderr || '') + String(probe.stdout || '')), options.fps);
     }
     const startedAtDate = now();
@@ -692,7 +706,6 @@ function createRecordingService(dependencies = {}) {
       forced: false,
       finalized: false,
       stopMethod: '',
-      timer: null,
     };
     activeRecording = recording;
 
@@ -701,6 +714,7 @@ function createRecordingService(dependencies = {}) {
       if (previewParser) previewParser(chunk);
       else recording.stdout = trimOutput(recording.stdout + chunk);
     });
+    child.stdin?.on?.('error', () => { /* FFmpeg can exit while the stop command is in flight. */ });
     child.stderr?.on('data', (chunk) => { recording.stderr = trimOutput(`${recording.stderr}${chunk}`); });
     child.once('error', (error) => {
       recording.stderr = trimOutput(`${recording.stderr}\n${error.message || error}`);
@@ -723,16 +737,16 @@ function createRecordingService(dependencies = {}) {
     if (!recording) {
       throw new Error('There is no active recording to stop.');
     }
-    if (recording.stopRequested) {
-      if (cancelRequested && !recording.cancelRequested) {
-        recording.cancelRequested = true;
-        await updateMetadata(recording, { stopMethod: recording.stopMethod || 'stdin-q' });
-      }
-      return recording.closePromise;
+    if (cancelRequested) recording.cancelRequested = true;
+    if (!recording.stopAttempt) {
+      recording.stopAttempt = stopProcess(recording, options).finally(() => { recording.stopAttempt = null; });
     }
+    return recording.stopAttempt;
+  }
 
+  async function stopProcess(recording, options) {
+    if (recording.finalized) return recording.closePromise;
     recording.stopRequested = true;
-    recording.cancelRequested = cancelRequested;
     recording.stopMethod = 'stdin-q';
 
     try {
@@ -743,14 +757,12 @@ function createRecordingService(dependencies = {}) {
       // The termination fallback below will handle a closed stdin pipe.
     }
 
-    await updateMetadata(recording, { stopMethod: 'stdin-q' });
-
     let closed = await Promise.race([
       recording.closePromise.then(() => true),
       sleep(options.gracefulStopMs || gracefulStopMs).then(() => false),
     ]);
 
-    if (!closed && recording.child?.pid) {
+    if (!closed && !recording.finalized && recording.child?.pid) {
       recording.stopMethod = 'taskkill';
       await terminateProcessTree(recording.child.pid, false);
       closed = await Promise.race([
@@ -759,7 +771,7 @@ function createRecordingService(dependencies = {}) {
       ]);
     }
 
-    if (!closed && recording.child?.pid) {
+    if (!closed && !recording.finalized && recording.child?.pid) {
       recording.forced = true;
       recording.stopMethod = 'taskkill-force';
       await terminateProcessTree(recording.child.pid, true);
@@ -769,9 +781,8 @@ function createRecordingService(dependencies = {}) {
       ]);
     }
 
-    if (!closed) {
-      recording.forced = true;
-      await finalizeRecording(recording, null, 'termination-timeout');
+    if (!closed && !recording.finalized) {
+      throw new Error('Windows has not confirmed that FFmpeg stopped. Try stopping the recording again.');
     }
     return recording.closePromise;
   }
@@ -841,9 +852,13 @@ function createRecordingService(dependencies = {}) {
     const { recordingsRoot } = await getRecordingRoots();
     const sidecars = [];
     await collectSidecars(recordingsRoot, sidecars, recordingsRoot);
-    const records = (await Promise.all(sidecars.map((sidecarPath) => readRecordingSidecar(sidecarPath, recordingsRoot))))
-      .filter(Boolean)
-      .sort((left, right) => new Date(right.startedAt || 0).getTime() - new Date(left.startedAt || 0).getTime());
+    const records = [];
+    for (let offset = 0; offset < sidecars.length; offset += 16) {
+      const batch = sidecars.slice(offset, offset + 16);
+      const entries = await Promise.all(batch.map(file => readRecordingSidecar(file, recordingsRoot)));
+      records.push(...entries.filter(Boolean));
+    }
+    records.sort((left, right) => new Date(right.startedAt || 0) - new Date(left.startedAt || 0));
     return records.slice(0, Math.max(1, Math.min(250, Number(options.limit || 100))));
   }
 
@@ -855,12 +870,16 @@ function createRecordingService(dependencies = {}) {
     if (activeRecording?.metadata?.id === normalizedId) {
       return { ...activeRecording.metadata, outputPath: activeRecording.outputPath, sidecarPath: activeRecording.sidecarPath };
     }
-    const records = await listRecentRecordings({ limit: 250 });
-    const recording = records.find((entry) => entry.id === normalizedId);
-    if (!recording) {
-      throw new Error('Local AI Hub could not find that recording anymore.');
+    const { recordingsRoot } = await getRecordingRoots();
+    const sidecars = [];
+    await collectSidecars(recordingsRoot, sidecars, recordingsRoot);
+    const filename = normalizedId + '.recording.json';
+    for (const sidecar of sidecars) {
+      if (path.basename(sidecar).toLowerCase() !== filename) continue;
+      const recording = await readRecordingSidecar(sidecar, recordingsRoot);
+      if (recording?.id === normalizedId) return recording;
     }
-    return recording;
+    throw new Error('Local AI Hub could not find that recording anymore.');
   }
 
   async function openRecording(id, openPath) {

@@ -53,9 +53,8 @@ function uniquePaths(paths = []) {
 }
 
 function isPathInside(parentPath, candidatePath) {
-  const normalizedParent = normalizeDirectoryPath(parentPath);
-  const normalizedCandidate = normalizeDirectoryPath(candidatePath);
-  return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+  const relative = path.relative(parentPath, candidatePath);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function normalizeAliasToken(value) {
@@ -106,6 +105,7 @@ function filterWorkspaceRoots(paths = []) {
 
 async function calculateCleanupEntrySize(targetPath) {
   const stats = await fs.stat(targetPath).catch(() => null);
+  if (stats?.isDirectory()) return calculatePathSize(targetPath);
   return stats?.isFile() ? Number(stats.size || 0) : 0;
 }
 
@@ -294,10 +294,10 @@ function getAllowedScanRoots(paths, config) {
 }
 
 function getManagedScanRoots(paths) {
+  // A preferred install destination alone does not make its tools or downloads folders Hub-owned.
   return uniquePaths(filterWorkspaceRoots([
-    paths.root,
-    paths.managedRoot,
-    ...paths.knownManagedRoots,
+    paths.root, paths.localRoot, paths.managedRoot, paths.defaultManagedRoot,
+    ...(paths.managedDataRootHistory || []), ...paths.legacyConfigRoots,
   ]));
 }
 
@@ -354,7 +354,8 @@ async function collectDuplicateToolFolders(context, candidateToolDirs) {
     }
 
     const matchingKeys = new Set(group.paths.map((entry) => normalizePathKey(entry)).filter(Boolean));
-    const trackedInstallKey = context.trackedTools[toolId]?.installKey || '';
+    const tracked = context.config.tools?.[toolId];
+    const trackedInstallKey = tracked && normalizePathKey(normalizeTrackedInstallRoot(tracked.installDir || tracked.appDir));
     const preferredManagedKey = normalizePathKey(path.join(context.paths.managedRoot, 'tools', toolId));
     const canonicalManagedKey = normalizePathKey(
       group.paths.find((entry) => normalizeAliasToken(path.basename(entry)) === normalizeAliasToken(toolId)) || '',
@@ -522,19 +523,19 @@ async function collectIncompleteToolFolders(context, candidateToolDirs, excluded
 
 async function collectOrphanedManagedFolders(context, excludedKeys) {
   const trackedToolIds = new Set(
-    Object.values(context.trackedTools || {})
-      .map((tool) => String(tool?.id || tool?.manifest?.id || '').trim().toLowerCase())
+    Object.keys(context.config?.tools || {})
+      .map((toolId) => toolId.toLowerCase())
       .filter(Boolean),
   );
   const trackedInstallKeys = new Set(
-    Object.values(context.trackedTools || {})
+    Object.values(context.config?.tools || {})
       .map((tool) => normalizePathKey(normalizeTrackedInstallRoot(tool?.installDir || tool?.appDir || '')))
       .filter(Boolean),
   );
   const orphaned = [];
 
   for (const root of getManagedScanRoots(context.paths)) {
-    const subdirectories = ['tools', 'downloads', 'snapshots'];
+    const subdirectories = ['tools', 'downloads'];
     for (const directoryName of subdirectories) {
       const directoryPath = path.join(root, directoryName);
       if (!(await directoryExists(directoryPath))) {
@@ -583,7 +584,12 @@ async function collectLegacyNestAiFolders(context) {
       continue;
     }
 
-    if (!context.allowedRoots.some((root) => isPathInside(root, candidateRoot) || isPathInside(candidateRoot, root))) {
+    const protectedPaths = [context.paths.managedRoot, context.paths.configRoot, context.paths.appInstallDir,
+      ...Object.values(context.config.tools || {}).flatMap(tool => [tool?.installDir, tool?.appDir])];
+    if (protectedPaths.some(target => target && isPathInside(candidateRoot, target)) ||
+        await pathExists(path.join(candidateRoot, 'snapshots'))) continue;
+
+    if (!context.allowedRoots.some((root) => isPathInside(root, candidateRoot))) {
       continue;
     }
 
@@ -698,13 +704,15 @@ function assertShortcutPathAllowed(targetPath, allowedShortcutRoots = []) {
   return normalizedTargetPath;
 }
 
-async function runCleanup() {
+async function runCleanup(confirmedPaths) {
+  const confirmed = confirmedPaths === undefined ? null : new Set(confirmedPaths);
   const preview = await inspectCleanupTargets();
   const removedEntries = [];
   const failedEntries = [];
 
   for (const category of preview.categories) {
     for (const entry of category.entries) {
+      if (confirmed && !confirmed.has(entry.path)) continue;
       try {
         if (entry.kind === 'registry') {
           if (!entry.registryKeyPath) {

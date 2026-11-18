@@ -1,10 +1,10 @@
 import { memo, useEffect, useState } from 'react';
-import { formatBytes, formatDiskAvailability, formatTimestamp, formatUsage } from '../lib/formatters';
+import { formatBytes, formatDiskAvailability, formatTimestamp, formatMemory } from '../lib/formatters';
 
 const LONG_LOAD_MS = 15000;
 
 function MiniBar({ value, maxValue, tone = 'bg-cyan-300' }) {
-  const percent = maxValue > 0 ? Math.max(6, Math.min(100, Math.round((value / maxValue) * 100))) : 0;
+  const percent = maxValue > 0 ? Math.max(0, Math.min(100, Math.round((value / maxValue) * 100))) : 0;
   return (
     <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-950/35">
       <div className={`h-full rounded-full ${tone}`} style={{ width: `${percent}%` }} />
@@ -82,9 +82,13 @@ function VramHistoryChart({ history, loading }) {
   const width = 640;
   const height = 200;
   const padding = 20;
-  const maxValue = Math.max(...history.map((entry) => Number(entry.vramTotalMb || entry.vramUsedMb || 0)), 1);
+  const peak = Math.max(...history.map((entry) => entry.vramUsedMb));
+  const maxValue = Math.max(1, peak, ...history.map((entry) => Number(entry.vramTotalMb) || 0));
+  const times = history.map((entry) => Date.parse(entry.timestamp));
+  const start = Math.min(...times);
+  const duration = Math.max(...times) - start;
   const points = history.map((entry, index) => {
-    const x = padding + (index / Math.max(1, history.length - 1)) * (width - padding * 2);
+    const x = padding + (duration ? (times[index] - start) / duration : 0.5) * (width - padding * 2);
     const y = height - padding - ((Number(entry.vramUsedMb || 0) / maxValue) * (height - padding * 2));
     return `${x},${y}`;
   });
@@ -96,10 +100,11 @@ function VramHistoryChart({ history, loading }) {
           <p className="text-xs uppercase tracking-[0.22em] text-slate-500">VRAM history</p>
           <p className="mt-1 text-sm leading-6 text-slate-300">Updated locally while your tools are running.</p>
         </div>
-        <p className="text-sm font-medium text-white">Peak {formatUsage(Math.max(...history.map((entry) => Number(entry.vramUsedMb || 0))), maxValue)}</p>
+        <p className="text-sm font-medium text-white">Peak {peak < 1024 ? `${peak} MB` : formatMemory(peak)}</p>
       </div>
       <svg className="mt-3 w-full" viewBox={`0 0 ${width} ${height}`}>
         <rect fill="rgba(15,23,42,0.45)" height={height} rx="20" width={width} />
+        {history.length === 1 && <circle cx={width / 2} cy={points[0].split(',')[1]} r="3" fill="#67e8f9" />}
         <polyline fill="none" points={points.join(' ')} stroke="#67e8f9" strokeWidth="4" strokeLinejoin="round" strokeLinecap="round" />
       </svg>
       <div className="mt-2 flex flex-wrap items-center justify-between gap-3 text-xs uppercase tracking-[0.18em] text-slate-500">
@@ -161,7 +166,7 @@ function StorageValue({ data, loading }) {
     return <LoadingBlock className="mt-2 h-7 w-40" />;
   }
 
-  return <p className="mt-2 text-xl font-semibold text-white">{formatBytes(value || 0)}</p>;
+  return <p className="mt-2 text-xl font-semibold text-white">{typeof value === 'number' ? formatBytes(value) : 'Unavailable'}</p>;
 }
 
 function StatisticsPanel({ busy, data = null, error, loading, onOpenCleanup, onRefresh, sectionErrors = {}, sectionStatus = {} }) {
@@ -172,7 +177,7 @@ function StatisticsPanel({ busy, data = null, error, loading, onOpenCleanup, onR
   const storageReady = sectionStatus.storage === 'ready';
   const coreError = sectionErrors.core || error || '';
   const storageError = sectionErrors.storage || '';
-  const hasCoreData = Boolean(data?.generatedAt);
+  const hasCoreData = Boolean(data?.sectionFreshness?.core?.updatedAt);
   const hasStorageData = Array.isArray(data?.toolBreakdown) || Array.isArray(data?.storageRoots) || typeof data?.totalDiskUsage?.localAIHubBytes === 'number';
   const launchRanking = data?.launchRanking || [];
   const toolBreakdown = data?.toolBreakdown || [];
@@ -194,7 +199,7 @@ function StatisticsPanel({ busy, data = null, error, loading, onOpenCleanup, onR
             <p className="mt-1 text-sm leading-6 text-slate-300">Fast launch, drive, and VRAM data appear first; storage totals finish independently.</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button className="ghost-button" disabled={busy} onClick={onRefresh} type="button">
+            <button className="ghost-button" disabled={busy || loading} onClick={onRefresh} type="button">
               {busy ? 'Refreshing...' : 'Refresh stats'}
             </button>
             <button className="primary-button" onClick={onOpenCleanup} type="button">
@@ -206,7 +211,7 @@ function StatisticsPanel({ busy, data = null, error, loading, onOpenCleanup, onR
         <div className="mt-3 grid gap-3 lg:grid-cols-3">
           <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Local AI Hub storage</p>
-            <StorageValue data={data} loading={storageLoading || !hasStorageData} />
+            <StorageValue data={data} loading={storageLoading} />
             <p className="mt-1 line-clamp-2 text-xs leading-5 text-slate-300">{formatStorageFreshness(storageFreshness, storageLoading)}</p>
           </div>
           <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
@@ -218,8 +223,8 @@ function StatisticsPanel({ busy, data = null, error, loading, onOpenCleanup, onR
           </div>
           <div className="rounded-2xl border border-white/10 bg-slate-950/35 p-3">
             <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Updated</p>
-            {coreLoading && !hasCoreData ? <LoadingBlock className="mt-2 h-7 w-52" /> : <p className="mt-2 text-xl font-semibold text-white">{formatTimestamp(data?.generatedAt)}</p>}
-            <p className="mt-1 line-clamp-2 text-xs leading-5 text-slate-300">Latest local snapshot.</p>
+            {coreLoading && !hasCoreData ? <LoadingBlock className="mt-2 h-7 w-52" /> : <p className="mt-2 text-xl font-semibold text-white">{formatTimestamp(data?.sectionFreshness?.core?.updatedAt)}</p>}
+            <p className="mt-1 line-clamp-2 text-xs leading-5 text-slate-300">Latest launch and VRAM snapshot.</p>
           </div>
         </div>
       </div>
@@ -229,7 +234,7 @@ function StatisticsPanel({ busy, data = null, error, loading, onOpenCleanup, onR
           {coreLoading && !hasCoreData ? <SectionLoadingMessage>Loading launch history, drive details, and VRAM history first.</SectionLoadingMessage> : null}
           {busy && hasCoreData ? <SectionLoadingMessage>Updating statistics while keeping the current snapshot visible.</SectionLoadingMessage> : null}
           {storageLoading ? <SectionLoadingMessage>Loading storage and model sizes separately. Faster statistics are available while this continues.</SectionLoadingMessage> : null}
-          {coreError && !hasCoreData ? <SectionErrorMessage onRetry={onRefresh}>{coreError}</SectionErrorMessage> : null}
+          {coreError ? <SectionErrorMessage onRetry={onRefresh}>{coreError}</SectionErrorMessage> : null}
           {showEmptyState ? (
             <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 p-4 text-sm leading-7 text-slate-300">
               No usage statistics have been recorded yet. Launch tools, download models, or let VRAM sampling run to populate this page.

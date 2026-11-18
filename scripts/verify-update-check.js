@@ -156,18 +156,22 @@ async function main() {
   assert(persistenceHarness.getConfig().lastSuccessfulUpdateCheckAt, 'Successful checks should persist a timestamp.');
 
   const scheduledCallbacks = [];
+  const clearedTimers = [];
   const scheduledHarness = createHarness({
     setTimeoutImpl: (callback, delay) => {
       scheduledCallbacks.push({ callback, delay });
       return scheduledCallbacks.length;
     },
-    clearTimeoutImpl: () => null,
+    clearTimeoutImpl: timer => clearedTimers.push(timer),
   });
   const scheduled = scheduledHarness.service.scheduleLaunchUpdateCheck({ enabled: true });
   assert.strictEqual(scheduled, true);
   assert.strictEqual(scheduledCallbacks.length, 1, 'Launch update checks should be scheduled.');
   assert.strictEqual(scheduledCallbacks[0].delay, 12000);
   assert.strictEqual(scheduledHarness.getConfig().lastSuccessfulUpdateCheckAt, undefined, 'Scheduling must not block startup on a network check.');
+
+  await scheduledHarness.service.saveCheckOnLaunch(false);
+  assert.deepStrictEqual(clearedTimers, [1], 'Disabling launch checks should clear the pending request.');
 
   const trustedHarness = createHarness({
     config: {

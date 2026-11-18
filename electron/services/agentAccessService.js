@@ -6,6 +6,10 @@ const { createOperations } = require('../agent/operations.cjs');
 let bridge;
 let operations;
 let transition = Promise.resolve();
+let notifyModelChange;
+function listModelTools() {
+  return require('./toolStateService').buildMergedToolStateList({ resolveStatuses: true, includeSnapshots: false });
+}
 let mediaInspector;
 let mediaDelivery;
 function deliverMedia(output, args) {
@@ -23,6 +27,14 @@ function getOperations() {
   if (!operations) operations = createOperations({
     version: app.getVersion(),
     humanizeError: config.humanizeError,
+    modelManager: require('../agent/modelManager.cjs').createModelManager({
+      models: require('./modelService'),
+      listTools: listModelTools,
+      hardware: async () => (await config.readConfig()).hardware || require('./hardwareService').detectHardwareSnapshot(),
+      storage: () => require('./hardwareService').detectStorageSnapshot(),
+      changed: (tool, reason) => notifyModelChange?.(tool, reason),
+      withIdlePipeline: operation => require('./pipelineExecutionService').withIdlePipelineForToolAction(operation),
+    }),
     inspectMedia,
     deliverMedia,
     toolCapabilities: id => require('../shared/pipelineCapabilities.cjs').getToolPipelineCapabilities(id),
@@ -33,7 +45,7 @@ function getOperations() {
     schema: require('../shared/pipelineSchema.cjs'),
     store: require('./pipelineStoreService'),
     execution: require('./pipelineExecutionService'),
-    listTools: () => require('./toolStateService').buildMergedToolStateList({ resolveStatuses: true, includeSnapshots: false }),
+    listTools: listModelTools,
     listModels: tool => require('./modelService').listDownloadedModels(tool),
     listOutputs: () => require('./pipelineOutputStoreService').listPipelineOutputs(),
     runsRoot: () => path.join(config.getAppPaths().runtimesRoot, 'pipeline-runs'),
@@ -75,7 +87,7 @@ function setAgentAccess(enabled) {
   transition = task.catch(() => {});
   return task;
 }
-async function startAgentAccess() { return setAgentAccess(Boolean((await config.readConfig()).agentAccessEnabled)); }
+async function startAgentAccess(onModelChange) { notifyModelChange = onModelChange; return setAgentAccess(Boolean((await config.readConfig()).agentAccessEnabled)); }
 async function stopAgentAccess() { await transition; if (bridge) await bridge.stop(); if (mediaDelivery) await mediaDelivery.stop(); }
 function rememberAgentRun(run) { getOperations().remember(run); }
 module.exports = { getAgentAccess, setAgentAccess, startAgentAccess, stopAgentAccess, rememberAgentRun };

@@ -125,18 +125,12 @@ async function resolveRemoteDownloadSize(downloadUrl, logger) {
   const safeDownloadUrl = assertSecureRemoteUrl(downloadUrl, 'installer download URL');
 
   const readSizeFromResponse = (response) => {
-    const contentLength = Number(response.headers.get('content-length')) || 0;
-    if (contentLength > 0) {
-      return contentLength;
+    if (response.status === 206) {
+      const contentRange = response.headers.get('content-range') || '';
+      const rangeMatch = contentRange.match(/^bytes\s+\d+-\d+\/(\d+)$/i);
+      return rangeMatch ? Number(rangeMatch[1]) : 0;
     }
-
-    const contentRange = String(response.headers.get('content-range') || '');
-    const rangeMatch = contentRange.match(/\/(\d+)$/);
-    if (rangeMatch?.[1]) {
-      return Number(rangeMatch[1]) || 0;
-    }
-
-    return 0;
+    return Number(response.headers.get('content-length')) || 0;
   };
 
   const requestSize = async (method, headers = {}) => {
@@ -153,7 +147,11 @@ async function resolveRemoteDownloadSize(downloadUrl, logger) {
         },
       });
 
-      return response.ok ? readSizeFromResponse(response) : 0;
+      try {
+        return response.ok ? readSizeFromResponse(response) : 0;
+      } finally {
+        await response.body?.cancel();
+      }
     } finally {
       clearTimeout(timer);
     }
@@ -698,6 +696,10 @@ function assertSafePipInstallTarget(value) {
 }
 
 async function resolvePreferredInstallRoot(requestedRoot = null) {
+  const requested = String(requestedRoot || '').trim();
+  if (requested && !/^(?:[a-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+)/i.test(requested)) {
+    throw new Error('Choose a full install folder path, including the drive letter or network share.');
+  }
   const normalizedRequestedRoot = normalizeOptionalDirectoryPath(requestedRoot);
   if (normalizedRequestedRoot) {
     return normalizedRequestedRoot;
@@ -4273,6 +4275,18 @@ async function installPipPackageTool(manifest, options, logger) {
   return ensureManagedToolStatePaths(verifiedToolState);
 }
 
+// Only a directory created by this attempt belongs to its failure cleanup.
+async function createInstallDirectory(installDir) {
+  await fs.ensureDir(path.dirname(installDir));
+  try {
+    await fs.mkdir(installDir);
+    return true;
+  } catch (error) {
+    if (error.code === 'EEXIST' && (await fs.stat(installDir)).isDirectory()) return false;
+    throw error;
+  }
+}
+
 async function installTool(toolId, options = {}) {
   return withToolInstallOperationLock(toolId, 'installing or repairing', () => installToolUnlocked(toolId, options));
 }
@@ -4292,12 +4306,14 @@ async function installToolUnlocked(toolId, options = {}) {
   const installRoot = await resolvePreferredInstallRoot(options.installRoot || null);
   const managedPaths = buildManagedPaths(manifest, { installRoot });
   let existingTool = null;
-  let rollbackManagedInstallOnFailure = true;
+  let rollbackManagedInstallOnFailure = false;
 
   try {
     await setToolIgnored(toolId, false);
     if (capability === 'desktop' && manifest.companionDesktop) {
-      return installCompanionDesktopTool(manifest, {
+      const preflight = await getToolInstallPreflight({ toolId, capability, installRoot });
+      assertInstallPreflightApproved(preflight, Boolean(options.lowDiskConfirmed));
+      return await installCompanionDesktopTool(manifest, {
         ...options,
         installRoot,
       }, logger);
@@ -4305,6 +4321,9 @@ async function installToolUnlocked(toolId, options = {}) {
 
 
     if (manifest.id === HYPERFRAMES_TOOL_ID || manifest.installInstructions?.kind === 'npm-package') {
+      const preflight = await getToolInstallPreflight({ toolId, installRoot });
+      assertInstallPreflightApproved(preflight, Boolean(options.lowDiskConfirmed));
+      rollbackManagedInstallOnFailure = await createInstallDirectory(managedPaths.installDir);
       const toolState = await installManagedHyperFrames(manifest, {
         ...options,
         installRoot,
@@ -4319,9 +4338,6 @@ async function installToolUnlocked(toolId, options = {}) {
 
     const discoveredTools = await syncDiscoveredTools({ force: true });
     existingTool = discoveredTools[toolId];
-    rollbackManagedInstallOnFailure =
-      !(existingTool?.source === 'managed' || existingTool?.managedByLocalAIHub) &&
-      isDirectManagedTool({ source: 'managed' }, manifest);
     if (await toolIsAvailable(existingTool)) {
       const existingPath = existingTool.displayPath || existingTool.installDir;
       if (isManagedToolState(existingTool)) {
@@ -4347,6 +4363,10 @@ async function installToolUnlocked(toolId, options = {}) {
 
     const installPreflight = await getToolInstallPreflight({ toolId, installRoot });
     assertInstallPreflightApproved(installPreflight, Boolean(options.lowDiskConfirmed));
+
+    if (isDirectManagedTool({ source: 'managed' }, manifest)) {
+      rollbackManagedInstallOnFailure = await createInstallDirectory(managedPaths.installDir);
+    }
 
     const { archivePath, installDir } = managedPaths;
 

@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, useEffect, useState } from 'react';
 import { formatTimestamp, progressWidth, statusClass } from '../lib/formatters';
 import HoverRevealText from './HoverRevealText';
 
@@ -299,7 +299,7 @@ function installNote(tool) {
 function PrimaryAction({ tool, busyMap, onLaunch, onOpenInterface, onStop }) {
   if (isPipelineOnlyTool(tool)) {
     return (
-      <button className="ghost-button compact-card-button" disabled type="button" title={pipelineOnlyMessage(tool)}>
+      <button className="ghost-button compact-card-button" onClick={() => onOpenInterface(tool.id)} type="button" title={pipelineOnlyMessage(tool)}>
         Pipeline Builder
       </button>
     );
@@ -419,6 +419,10 @@ function areLibraryCardPropsEqual(prevProps, nextProps) {
     `stop:${toolId}`,
     `update:${toolId}`,
     `repair:${toolId}`,
+    `repair:${toolId}:webui`,
+    `repair:${toolId}:desktop`,
+    `uninstall:${toolId}:webui`,
+    `uninstall:${toolId}:desktop`,
     `snapshot:${toolId}`,
     `restore:${toolId}`,
     `uninstall:${toolId}`,
@@ -465,6 +469,28 @@ function LibraryCard({
   const runningUsage = tool.status === 'running' ? runningUsageLabel : tool.status === 'starting' ? 'Starting up' : 'Idle';
   const canRepair = actionSemantics(tool).repairKind !== 'repair-unavailable';
   const canSnapshot = lifecycleMode(tool) === 'managed';
+  const savingSnapshot = Boolean(busyMap[`snapshot:${tool.id}`]);
+  const [snapshots, setSnapshots] = useState([]);
+  const [snapshotNotice, setSnapshotNotice] = useState('');
+  useEffect(() => {
+    if (!settingsOpen || !canSnapshot || savingSnapshot) return;
+    let active = true;
+    setSnapshots([]);
+    setSnapshotNotice('Loading snapshots...');
+    async function loadSnapshots() {
+      try {
+        const result = await window.localAIHub.listSnapshots(tool.id);
+        if (!active) return;
+        if (!result?.ok) throw new Error(result?.message || 'Local AI Hub could not load snapshots.');
+        setSnapshots(result.data || []);
+        setSnapshotNotice('');
+      } catch (error) {
+        if (active) setSnapshotNotice(error.message || 'Local AI Hub could not load snapshots.');
+      }
+    }
+    loadSnapshots();
+    return () => { active = false; };
+  }, [tool.id, settingsOpen, canSnapshot, savingSnapshot]);
   const hasUpdate = Boolean(updateInfo?.updateAvailable);
   const note = installNote(tool);
   const consentNote = voiceCloneConsentMessage(tool);
@@ -496,11 +522,11 @@ function LibraryCard({
                 <p className="card-meta-value" title={installSource}>{installSource}</p>
               </div>
               <div className="card-meta-box">
-                <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Current VRAM load</p>
+                <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">{tool.status === 'running' ? 'System VRAM load' : 'Runtime activity'}</p>
                 <p className="card-meta-value" title={runningUsage}>{runningUsage}</p>
               </div>
               <div className="card-meta-box">
-                <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">Last seen</p>
+                <p className="text-[10px] uppercase tracking-[0.18em] text-slate-500">{tool.installedAt ? 'Installed' : 'Detected'}</p>
                 <p className="card-meta-value" title={lastSeen}>{lastSeen}</p>
               </div>
             </div>
@@ -514,7 +540,7 @@ function LibraryCard({
               {tool.launchSelectionStatus?.actionLabel || 'Change model'}
             </button>
           ) : null}
-          {String(tool.interfaceMode || '').startsWith('embedded-') && tool.interfaceMode !== 'embedded-terminal' ? (
+          {String(tool.interfaceMode || '').startsWith('embedded-') && (tool.interfaceMode !== 'embedded-terminal' || ['running', 'starting'].includes(tool.status)) ? (
             <button className="ghost-button compact-card-button" onClick={() => onOpenInterface(tool.id)} type="button">
               {embeddedActionLabel(tool)}
             </button>
@@ -530,7 +556,7 @@ function LibraryCard({
           <button
             className="ghost-button compact-card-button"
             disabled={!hasBothCapabilities && busyMap[singleUninstallBusyKey]}
-            onClick={() => (hasBothCapabilities ? onToggleSettings(tool.id) : onUninstall(tool, singleCapability))}
+            onClick={() => (hasBothCapabilities ? (!settingsOpen && onToggleSettings(tool.id)) : onUninstall(tool, singleCapability))}
             type="button"
           >
             {!hasBothCapabilities && busyMap[singleUninstallBusyKey] ? uninstallBusyLabel(tool) : uninstallLabel}
@@ -674,20 +700,21 @@ function LibraryCard({
                 </p>
               </div>
               {canSnapshot ? (
-                <button className="ghost-button compact-card-button" disabled={busyMap[`snapshot:${tool.id}`]} onClick={() => onSaveSnapshot(tool.id)} type="button">
+                <button className="ghost-button compact-card-button" disabled={savingSnapshot || busyMap[`restore:${tool.id}`]} onClick={() => onSaveSnapshot(tool.id)} type="button">
                   {busyMap[`snapshot:${tool.id}`] ? 'Saving...' : 'Save snapshot'}
                 </button>
               ) : null}
             </div>
 
             <div className="mt-4 space-y-2">
-              {canSnapshot && tool.snapshots?.length ? (
-                tool.snapshots.slice(0, 4).map((snapshot) => (
+              {canSnapshot && snapshots.length ? (
+                snapshots.map((snapshot) => (
                   <div key={snapshot.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-3 py-3 text-sm">
                     <span className="text-slate-300">{snapshot.fileName}</span>
                     <button
                       className="ghost-button compact-card-button"
-                      disabled={busyMap[`restore:${tool.id}`]}
+                      disabled={savingSnapshot || busyMap[`restore:${tool.id}`] || ['running', 'starting'].includes(tool.status)}
+                      title={['running', 'starting'].includes(tool.status) ? 'Stop this tool before restoring a snapshot.' : undefined}
                       onClick={() => onRestoreSnapshot(tool.id, snapshot.fileName)}
                       type="button"
                     >
@@ -698,7 +725,7 @@ function LibraryCard({
               ) : (
                 <p className="text-sm leading-6 text-slate-400">
                   {canSnapshot
-                    ? 'No snapshots saved for this tool yet.'
+                    ? snapshotNotice || 'No snapshots saved for this tool yet.'
                     : 'Snapshots are only available for tools that Local AI Hub manages directly.'}
                 </p>
               )}

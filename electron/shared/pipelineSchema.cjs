@@ -527,6 +527,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     configDefaults: {
       executionMode: 'cloud',
       operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT,
+      ollamaOptions: {},
+      cloudInference: {},
       providerId: '',
       toolId: '',
       model: '',
@@ -537,6 +539,12 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       imageQuality: 'auto',
       imageBackground: 'auto',
       videoSize: '1280x720',
+      videoFps: 15,
+      videoQuality: 5,
+      videoOperationMode: 'auto',
+      videoAspectRatio: '',
+      videoResolution: '',
+      scale: 4,
       audioVoice: '',
       audioMode: 'music',
       audiocraftItemMode: 'independent',
@@ -556,6 +564,11 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       height: 832,
       steps: 24,
       cfgScale: 7,
+      samplerName: '',
+      scheduler: '',
+      rvcInference: {},
+      whisperOptions: {},
+      chatterboxOptions: {},
       seed: -1,
       transformSubtype: '',
       analysisMode: 'clip',
@@ -599,6 +612,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       executionMode: 'cloud',
+      ollamaOptions: {},
+      cloudInference: {},
       providerId: '',
       model: '',
       schemaId: '',
@@ -671,6 +686,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       },
     ],
     configDefaults: {
+      workflowSource: 'local',
+      graphWorkflowPresetId: '',
       graphContractVersion: 1,
       toolId: DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
       workflowFormat: DEFAULT_GRAPH_WORKFLOW_BINDINGS.workflowFormat,
@@ -712,6 +729,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     configDefaults: {
       mode: 'user',
       llmExecutionMode: 'cloud',
+      ollamaOptions: {},
+      cloudInference: {},
       providerId: '',
       model: '',
       ruleset: '',
@@ -862,11 +881,14 @@ const PIPELINE_NODE_TYPES = Object.freeze({
     ],
     configDefaults: {
       mappingId: 'textToImage',
+      cloudInference: {},
       operationId: PIPELINE_OPERATION_IDS.IMAGE_GENERATE,
       executionMode: 'cloud',
       providerId: '',
       toolId: '',
       graphWorkflowToolId: DEFAULT_GRAPH_WORKFLOW_TOOL_ID,
+      workflowSource: 'local',
+      graphWorkflowPresetId: '',
       workflowText: '',
       inputBindings: DEFAULT_GRAPH_WORKFLOW_BINDINGS.inputBindings,
       outputBindings: DEFAULT_GRAPH_WORKFLOW_BINDINGS.outputBindings,
@@ -891,6 +913,11 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       height: 832,
       steps: 24,
       cfgScale: 7,
+      samplerName: '',
+      scheduler: '',
+      rvcInference: {},
+      whisperOptions: {},
+      chatterboxOptions: {},
       seed: -1,
       audioMode: 'music',
       audiocraftItemMode: 'independent',
@@ -913,6 +940,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
         enabled: false,
         mode: 'llm',
         llmExecutionMode: 'cloud',
+        ollamaOptions: {},
+        cloudInference: {},
         providerId: '',
         model: '',
         ruleset: '',
@@ -2215,7 +2244,7 @@ function doesToolExposeDownloadedModel(tool, model) {
 }
 
 function getNodeTypeDefinition(type) {
-  return PIPELINE_NODE_TYPES[type] || null;
+  return Object.hasOwn(PIPELINE_NODE_TYPES, type) ? PIPELINE_NODE_TYPES[type] : null;
 }
 
 function getMediaCompositionMode(nodeOrConfig) {

@@ -149,14 +149,14 @@ function remotePayload(tool, repositoryId, name = 'Shared Name') {
     id: 'huggingface:repository:' + repositoryId,
     catalogEntityType: 'repository',
     catalogRepositoryId: repositoryId,
-    downloadUrl: 'https://example.invalid/model.safetensors',
-    fileName: 'model.safetensors',
-    installRelativePath: 'model.safetensors',
+    downloadUrl: 'https://example.invalid/named-model.safetensors',
+    fileName: 'named-model.safetensors',
+    installRelativePath: 'named-model.safetensors',
     modelType: 'Checkpoint',
     name,
     sizeBytes: 1024,
     source: 'huggingface',
-    sourceArtifactPath: 'model.safetensors',
+    sourceArtifactPath: 'named-model.safetensors',
     toolId: tool.id,
   };
 }
@@ -184,7 +184,7 @@ async function verifySameFilenameIdentityConflicts() {
     const secondPayload = remotePayload(tool, 'publisher/second', 'Second Model');
     await assert.rejects(
       () => modelService.downloadModel(tool, secondPayload),
-      /different model named (?:model\.safetensors|<private-file>).*will not overwrite or relabel/i,
+      /different model named (?:named-model\.safetensors|<private-file>).*will not overwrite or relabel/i,
       'Different source identity with the same filename should be blocked clearly.',
     );
 

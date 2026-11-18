@@ -116,7 +116,7 @@ async function transcribeWithWhisper(tool, payload = {}) {
   try {
     const result = await runCommand(
       pythonPath,
-      [helperPath, audioPath, modelName, cacheDir],
+      [helperPath, audioPath, modelName, cacheDir, JSON.stringify(payload.whisperOptions || {})],
       {
         cwd: tool?.appDir || tool?.installDir || path.dirname(audioPath),
         env: {

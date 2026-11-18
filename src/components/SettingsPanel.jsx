@@ -45,14 +45,14 @@ function SettingsSection({ id, openSection, setOpenSection, eyebrow, title, summ
   return (
     <div className="panel overflow-hidden p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <button className="min-w-0 flex-1 text-left" onClick={() => setOpenSection(open ? '' : id)} type="button">
+        <button className="min-w-0 flex-1 text-left" aria-expanded={open} onClick={() => setOpenSection(open ? '' : id)} type="button">
           <p className="text-[10px] uppercase tracking-[0.22em] text-slate-500">{eyebrow}</p>
           <h3 className="mt-1 text-xl font-semibold text-white">{title}</h3>
           <p className="mt-1 line-clamp-2 max-w-4xl text-sm leading-6 text-slate-300">{summary}</p>
         </button>
         <div className="flex flex-wrap items-center gap-2">
           {action}
-          <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => setOpenSection(open ? '' : id)} type="button">
+          <button className="ghost-button px-3 py-1.5 text-xs" aria-expanded={open} onClick={() => setOpenSection(open ? '' : id)} type="button">
             {open ? 'Collapse' : 'Open'}
           </button>
         </div>
@@ -111,11 +111,6 @@ export default function SettingsPanel({
     }
   }, [initialSection]);
 
-  useEffect(() => {
-    if (cleanupPreview && !initialSection) {
-      setOpenSection('cleanup');
-    }
-  }, [cleanupPreview, initialSection]);
 
   useEffect(() => {
     setUpdateState(appUpdate || null);
@@ -127,7 +122,6 @@ export default function SettingsPanel({
 
   useEffect(() => () => {
     updateRequestSequence.current += 1;
-    window.localAIHub.cancelUpdateCheck().catch(() => null);
   }, []);
 
   async function runDiagnosticsAction(action, operation, fallbackMessage) {
@@ -255,7 +249,7 @@ export default function SettingsPanel({
       <AgentAccessPanel />
       <SettingsSection
         action={(
-          <button className="ghost-button" disabled={busyMap['settings:pick-folder']} onClick={onChooseStorageFolder} type="button">
+          <button className="ghost-button" disabled={busyMap['settings:pick-folder']} onClick={() => { setOpenSection('storage'); onChooseStorageFolder(); }} type="button">
             {busyMap['settings:pick-folder'] ? 'Opening...' : 'Browse storage folder'}
           </button>
         )}
@@ -359,7 +353,7 @@ export default function SettingsPanel({
 
       <SettingsSection
         action={(
-          <button className="primary-button" disabled={Boolean(updateBusy)} onClick={checkForUpdates} type="button">
+          <button className="primary-button" disabled={Boolean(updateBusy)} onClick={() => { setOpenSection('updates'); checkForUpdates(); }} type="button">
             {updateBusy === 'check' ? 'Checking...' : 'Check for updates'}
           </button>
         )}
@@ -375,7 +369,7 @@ export default function SettingsPanel({
             <div className="grid gap-3 sm:grid-cols-2">
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Current version</p>
-                <p className="mt-2 text-lg font-semibold text-white">v{updateState?.currentVersion || '0.49.0'}</p>
+                <p className="mt-2 text-lg font-semibold text-white">{updateState?.currentVersion ? `v${updateState.currentVersion}` : 'Unknown'}</p>
               </div>
               <div>
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Latest version</p>
@@ -457,7 +451,7 @@ export default function SettingsPanel({
       </SettingsSection>
       <SettingsSection
         action={(
-          <button className="primary-button" disabled={busyMap['settings:save-window-settings']} onClick={onSaveWindowSettings} type="button">
+          <button className="primary-button" disabled={screenModeBusy || busyMap['settings:save-window-settings']} onClick={onSaveWindowSettings} type="button">
             {busyMap['settings:save-window-settings'] ? 'Saving...' : 'Save window settings'}
           </button>
         )}
@@ -581,11 +575,11 @@ export default function SettingsPanel({
       <SettingsSection
         action={(
           <div className="flex flex-wrap gap-2">
-            <button className="ghost-button" disabled={busyMap['settings:preview-cleanup']} onClick={onPreviewCleanup} type="button">
+            <button className="ghost-button" disabled={busyMap['settings:preview-cleanup'] || busyMap['settings:run-cleanup']} onClick={() => { setOpenSection('cleanup'); onPreviewCleanup(); }} type="button">
               {busyMap['settings:preview-cleanup'] ? 'Scanning...' : 'Preview cleanup'}
             </button>
-            <button className="primary-button" disabled={busyMap['settings:run-cleanup'] || !cleanupPreview?.totalEntries} onClick={onRunCleanup} type="button">
-              {busyMap['settings:run-cleanup'] ? 'Cleaning...' : 'Delete selected leftovers'}
+            <button className="primary-button" disabled={openSection !== 'cleanup' || busyMap['settings:preview-cleanup'] || busyMap['settings:run-cleanup'] || !cleanupPreview?.totalEntries} onClick={onRunCleanup} type="button">
+              {busyMap['settings:run-cleanup'] ? 'Cleaning...' : 'Delete listed leftovers'}
             </button>
           </div>
         )}

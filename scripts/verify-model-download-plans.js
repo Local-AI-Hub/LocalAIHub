@@ -472,6 +472,14 @@ async function main() {
   const comfyPlan = createModelDownloadPlan({ tool: comfyui, source: 'huggingface', selectedType: 'vae', artifacts: [artifact('vae/diffusion_pytorch_model.safetensors', 300_000_000), artifact('foo.vae.safetensors', 300_000_000)] });
   assertRecommended(comfyPlan, 'foo.vae.safetensors', 'ComfyUI VAE');
 
+  for (const tool of [comfyui, forge]) {
+    const plan = createModelDownloadPlan({ tool, source: 'huggingface', selectedType: 'all', artifacts: [
+      artifact('diffusion_pytorch_model.safetensors', 334643238),
+      artifact('example_vae.safetensors', 334641162),
+    ] });
+    assertRecommended(plan, 'example_vae.safetensors', 'VAE repository with generic root weights');
+  }
+
   const incompleteSplit = createModelDownloadPlan({
     tool: koboldcpp,
     source: 'huggingface',

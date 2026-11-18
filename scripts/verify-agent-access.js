@@ -80,6 +80,42 @@ async function main() {
       socket.on('error',reject); socket.on('connect',()=>socket.write(JSON.stringify({token:'bad',method:'hub_status'})+'\n')); socket.on('data',b=>{text+=b}); socket.on('end',()=>resolve(JSON.parse(text)));
     });
     assert.equal(unauthorized.error.code, 'UNAUTHORIZED');
+    for (const { type } of await call('hub_node_types')) {
+      const info = await call('hub_node_types', { type });
+      assert.deepEqual(Object.keys(info.configSchema.properties), Object.keys(schema.getDefaultNodeConfig(type)));
+    }
+    const rvcConfig = { executionMode: 'localTool', operationId: 'audioTransform', toolId: 'rvc', rvcInference: { pitchChange: -5, indexRate: 0 } };
+    const preview = await call('hub_node_types', { type: 'llmPrompt', config: rvcConfig });
+    assert.deepEqual(preview.configuredPorts.outputs.map(port => port.id), ['audio']);
+    assert.equal(preview.sampleNode.config.rvcInference.indexRate, 0);
+    assert.equal(preview.configSchema.properties.rvcInference.properties.pitchMethod.enum.includes('harvest'), true);
+    for (const [types, expected] of [
+      [['textInput', 'llmPrompt'], [0, 'text', 1, 'prompt']],
+      [['imageInput', 'textInput', 'imageOutput'], [0, 'image', 2, 'image']],
+      [['textInput'], null],
+      [['llmPrompt', 'imageOutput'], null],
+      [['textInput', 'imageOutput'], null],
+    ]) {
+      const { pipeline, edgeExample } = await call('hub_create_draft', { name: 'Draft connections', types });
+      assert.deepEqual(pipeline.edges, []);
+      if (expected) {
+        const [from, output, to, input] = expected;
+        assert.deepEqual(edgeExample.source, { nodeId: pipeline.nodes[from].id, portId: output });
+        assert.deepEqual(edgeExample.target, { nodeId: pipeline.nodes[to].id, portId: input });
+        assert.equal(schema.buildPipelineGraph({ ...pipeline, edges: [edgeExample] }).edges.length, 1);
+      } else {
+        assert.equal(edgeExample, null);
+      }
+    }
+    const configured = (await call('hub_create_draft', { name: 'Configuration roundtrip', types: ['llmPrompt', 'collectionMap'] })).pipeline;
+    configured.nodes[0].config = rvcConfig;
+    configured.nodes[1].config.perItemValidation.ollamaOptions = { temperature: 0, seed: 7 };
+    await call('hub_save_pipeline', { definition: configured });
+    const saved = await call('hub_get_pipeline', { pipelineId: configured.id });
+    assert.deepEqual(saved.nodes[0].config.rvcInference, rvcConfig.rvcInference);
+    assert.deepEqual(saved.nodes[1].config.perItemValidation.ollamaOptions, { temperature: 0, seed: 7 });
+    configured.nodes[0].config.rvcInference.indexRate = 2;
+    await assert.rejects(call('hub_validate_pipeline', { definition: configured }), /indexRate/);
     const draft = (await call('hub_create_draft', { name: 'Agent verification', types: ['textInput', 'textOutput'] })).pipeline;
     draft.nodes[0].config.text = 'A real pipeline through the agent bridge.';
     draft.edges = [schema.createEdge(draft.nodes[0].id, 'text', draft.nodes[1].id, 'text')];

@@ -1,6 +1,6 @@
 import { memo } from 'react';
 import { progressWidth } from '../lib/formatters';
-import { compatibilityClass, describeRequirements } from '../lib/tool-ui';
+import { capabilityIsInstalled, compatibilityClass, describeRequirements, getInstallCapabilities } from '../lib/tool-ui';
 import HoverRevealText from './HoverRevealText';
 
 function installMethodLabel(manifest) {
@@ -21,45 +21,13 @@ function installButtonLabel(manifest) {
   return manifest?.installContract?.lifecycleMode === 'official-installer' ? 'Install Desktop App' : 'Install';
 }
 
-function installCapabilities(manifest) {
-  return Array.isArray(manifest?.installCapabilities) && manifest.installCapabilities.length
-    ? manifest.installCapabilities
-    : [{ id: 'default', installLabel: installButtonLabel(manifest), installedLabel: 'Installed' }];
-}
-
-function capabilityInstalled(tool, capabilityId) {
-  if (!tool) {
-    return false;
-  }
-
-  const capability = String(capabilityId || 'webui').trim().toLowerCase();
-  if (capability === 'default') {
-    return Boolean(tool);
-  }
-
-  if (tool.installedCapabilities && Object.prototype.hasOwnProperty.call(tool.installedCapabilities, capability)) {
-    return Boolean(tool.installedCapabilities[capability]);
-  }
-
-  if (capability === 'desktop') {
-    return Boolean(tool.desktopCompanion?.installed || (tool.launchModes || []).some((mode) => mode.id === 'desktop'));
-  }
-
-  if (capability === 'webui') {
-    return Boolean(tool.source === 'managed' || (tool.launchModes || []).some((mode) => mode.id === 'webui'));
-  }
-
-  return true;
-}
-
-function StoreCard({ manifest, compatibility, progress, busy, busyMap, installedTool, onInstall }) {
-  const capabilities = installCapabilities(manifest);
-  const hasCapabilityChoices = capabilities.length > 1;
+function StoreCard({ manifest, compatibility, progress, busy, installedTool, onInstall }) {
+  const capabilities = getInstallCapabilities(manifest);
   return (
     <article className="store-card h-full">
-      <div className="flex h-full min-h-0 flex-col gap-2 overflow-hidden">
-        <div className="flex min-h-0 items-start justify-between gap-2 overflow-hidden">
-          <div className="flex min-w-0 flex-1 items-start gap-3">
+      <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
+        <div className="flex shrink-0 flex-wrap items-start justify-between gap-2 overflow-hidden">
+          <div className="flex min-w-[min(100%,12rem)] flex-1 items-start gap-3">
             <div className="tool-emblem">{manifest.icon}</div>
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -73,15 +41,13 @@ function StoreCard({ manifest, compatibility, progress, busy, busyMap, installed
 
           <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
             {capabilities.map((capability) => {
-              const installed = capabilityInstalled(installedTool, capability.id);
-              const capabilityBusy = hasCapabilityChoices
-                ? Boolean(busyMap?.[`install:${manifest.id}:${capability.id}`])
-                : busy;
+              const installed = capabilityIsInstalled(installedTool, capability.id);
+              const capabilityBusy = busy === capability.id;
               return (
                 <button
                   key={capability.id}
                   className={installed ? 'ghost-button compact-card-button' : 'primary-button compact-card-button'}
-                  disabled={installed || capabilityBusy}
+                  disabled={installed || Boolean(busy)}
                   onClick={() => onInstall(manifest.id, capability.id)}
                   type="button"
                 >
@@ -92,14 +58,14 @@ function StoreCard({ manifest, compatibility, progress, busy, busyMap, installed
           </div>
         </div>
 
-        <div className="flex flex-wrap gap-1.5 overflow-hidden">
+        <div className="flex shrink-0 flex-wrap gap-1.5 overflow-hidden">
           <span className="status-pill max-w-[14rem] truncate border-amber-300/20 bg-amber-300/10 text-amber-100" title={installMethodLabel(manifest)}>{installMethodLabel(manifest)}</span>
           <span className="status-pill max-w-[18rem] truncate border-white/10 bg-white/5 text-slate-300" title={describeRequirements(manifest)}>{describeRequirements(manifest)}</span>
         </div>
 
-        <p className="line-clamp-2 text-sm leading-5 text-slate-300" title={compatibility.message}>{compatibility.message}</p>
+        <p className="shrink-0 line-clamp-2 text-sm leading-5 text-slate-300" title={compatibility.message}>{compatibility.message}</p>
 
-        <details className="overflow-hidden rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2 text-sm text-slate-300">
+        <details className="shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-2 text-sm text-slate-300">
           <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Install details</summary>
           <div className="mt-3 grid gap-3 lg:grid-cols-2">
             <div>
@@ -142,7 +108,7 @@ function areStoreCardPropsEqual(prevProps, nextProps) {
     prevProps.installedTool === nextProps.installedTool &&
     prevProps.progress === nextProps.progress &&
     prevProps.busy === nextProps.busy &&
-    prevProps.busyMap === nextProps.busyMap &&
+    prevProps.onInstall === nextProps.onInstall &&
     prevProps.compatibility?.label === nextProps.compatibility?.label &&
     prevProps.compatibility?.message === nextProps.compatibility?.message &&
     prevProps.compatibility?.tone === nextProps.compatibility?.tone

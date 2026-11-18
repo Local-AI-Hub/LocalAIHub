@@ -268,7 +268,9 @@ async function generateImageWithWorkflowTool(tool, options = {}) {
     runningTool,
     '/sdapi/v1/txt2img',
     {
-      cfg_scale: Number(options.cfgScale || 7),
+      cfg_scale: Number(options.cfgScale ?? 7),
+      ...(options.samplerName ? { sampler_name: options.samplerName } : {}),
+      ...(options.scheduler ? { scheduler: options.scheduler } : {}),
       height: Number(options.height || 832),
       negative_prompt: String(options.negativePrompt || ''),
       prompt: String(options.prompt || ''),

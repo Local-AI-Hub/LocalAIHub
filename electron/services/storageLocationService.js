@@ -19,6 +19,9 @@ const MIGRATABLE_DIRECTORY_LABELS = {
   downloads: 'Installer downloads',
   logs: 'Logs',
   models: 'Models',
+  recordings: 'Recordings',
+  projects: 'Projects',
+  libraries: 'Libraries',
   runtimes: 'Managed Python runtimes',
   snapshots: 'Snapshots',
   tools: 'Installed tools',
@@ -33,28 +36,16 @@ function pathsMatch(left, right) {
 }
 
 function isPathInside(parentPath, candidatePath) {
-  const normalizedParent = normalizeDirectoryPath(parentPath);
-  const normalizedCandidate = normalizeDirectoryPath(candidatePath);
-  return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+  const relative = path.relative(parentPath, candidatePath);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
 }
 
 function assertNonOverlappingRoots(sourceRoot, targetRoot) {
-  if (!sourceRoot || !targetRoot) {
-    return;
-  }
-
-  const sourceManagedPaths = buildManagedSubdirectoryPaths(sourceRoot);
-  const targetManagedPaths = buildManagedSubdirectoryPaths(targetRoot);
-
-  for (const directoryName of ['tools', 'downloads', 'snapshots', 'models', 'runtimes', 'logs']) {
-    const sourcePath = sourceManagedPaths[`${directoryName}Root`];
-    const targetPath = targetManagedPaths[`${directoryName}Root`];
-    if (!sourcePath || !targetPath) {
-      continue;
-    }
-
-    if (isPathInside(sourcePath, targetPath) || isPathInside(targetPath, sourcePath)) {
-      throw new Error('Choose a different storage folder so Local AI Hub can move your files safely.');
+  const source = buildManagedSubdirectoryPaths(sourceRoot);
+  const target = buildManagedSubdirectoryPaths(targetRoot);
+  for (const name of Object.keys(MIGRATABLE_DIRECTORY_LABELS)) {
+    if (isPathInside(source[`${name}Root`], targetRoot) || isPathInside(target[`${name}Root`], sourceRoot)) {
+      throw new Error('Choose a storage folder outside the data folders being moved.');
     }
   }
 }
@@ -97,7 +88,7 @@ async function buildTrackedToolMap() {
   );
 }
 
-async function buildMigrationEntries(sourceRoot, targetRoot, directoryName, trackedTools = null) {
+async function buildMigrationEntries(sourceRoot, targetRoot, directoryName) {
   const sourceDirectories = buildManagedSubdirectoryPaths(sourceRoot);
   const targetDirectories = buildManagedSubdirectoryPaths(targetRoot);
   const sourcePath = sourceDirectories[`${directoryName}Root`];
@@ -112,7 +103,7 @@ async function buildMigrationEntries(sourceRoot, targetRoot, directoryName, trac
 
   if (directoryName === 'tools') {
     const entries = await fs.readdir(sourcePath, { withFileTypes: true }).catch(() => []);
-    const trackedInstallMap = trackedTools || (await buildTrackedToolMap());
+    const trackedInstallMap = await buildTrackedToolMap();
     const trackedInstallEntries = Object.values(trackedInstallMap || {});
     const results = [];
 
@@ -140,7 +131,7 @@ async function buildMigrationEntries(sourceRoot, targetRoot, directoryName, trac
       });
     }
 
-    return results.filter((entry) => entry.sizeBytes > 0);
+    return results;
   }
 
   return [{
@@ -149,7 +140,7 @@ async function buildMigrationEntries(sourceRoot, targetRoot, directoryName, trac
     sizeBytes: await calculatePathSize(sourcePath),
     sourcePath,
     targetPath,
-  }].filter((entry) => entry.sizeBytes > 0);
+  }];
 }
 
 async function inspectManagedDataMigration(options = {}) {
@@ -168,10 +159,12 @@ async function inspectManagedDataMigration(options = {}) {
     };
   }
 
-  const trackedTools = await buildTrackedToolMap();
   const categoryEntries = [];
-  for (const directoryName of ['tools', 'downloads', 'snapshots', 'models', 'runtimes', 'logs']) {
-    const entries = await buildMigrationEntries(sourceRoot, targetRoot, directoryName, trackedTools);
+  for (const directoryName of Object.keys(MIGRATABLE_DIRECTORY_LABELS)) {
+    // A development checkout or an arbitrary installer directory can have its own projects.
+    if (['projects', 'libraries', 'recordings'].includes(directoryName) && pathsMatch(sourceRoot, paths.appInstallDir)
+      && !pathsMatch(sourceRoot, paths.managedRoot) && !pathsMatch(sourceRoot, paths.defaultManagedRoot)) continue;
+    const entries = await buildMigrationEntries(sourceRoot, targetRoot, directoryName);
     if (!entries.length) {
       continue;
     }
@@ -196,35 +189,23 @@ async function inspectManagedDataMigration(options = {}) {
   };
 }
 
-async function moveEntryWithMerge(sourcePath, targetPath) {
-  if (!(await fs.pathExists(sourcePath))) {
+async function planMigrationMoves(source, target, moves, mergedDirectories) {
+  const targetStat = await fs.lstat(target).catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (!targetStat) {
+    moves.push({ source, target });
     return;
   }
-
-  const sourceStats = await fs.stat(sourcePath).catch(() => null);
-  if (!sourceStats) {
-    return;
+  const sourceStat = await fs.lstat(source);
+  if (!sourceStat.isDirectory() || !targetStat.isDirectory()) {
+    throw new Error(`A file or folder already exists at ${target}. Choose an empty destination or resolve the conflict before moving storage.`);
   }
-
-  if (!(await fs.pathExists(targetPath))) {
-    await fs.ensureDir(path.dirname(targetPath));
-    await fs.move(sourcePath, targetPath, { overwrite: false });
-    return;
+  for (const name of await fs.readdir(source)) {
+    await planMigrationMoves(path.join(source, name), path.join(target, name), moves, mergedDirectories);
   }
-
-  if (sourceStats.isFile()) {
-    await fs.copy(sourcePath, targetPath, { overwrite: false, errorOnExist: false, preserveTimestamps: true });
-    await fs.remove(sourcePath);
-    return;
-  }
-
-  await fs.ensureDir(targetPath);
-  const entries = await fs.readdir(sourcePath, { withFileTypes: true }).catch(() => []);
-  for (const entry of entries) {
-    await moveEntryWithMerge(path.join(sourcePath, entry.name), path.join(targetPath, entry.name));
-  }
-
-  await fs.remove(sourcePath).catch(() => null);
+  mergedDirectories.push(source);
 }
 
 async function persistManagedRoot(targetRoot, options = {}) {
@@ -237,6 +218,7 @@ async function persistManagedRoot(targetRoot, options = {}) {
   return updateConfig((config) => ({
     ...config,
     managedDataRoot,
+    preferredInstallRoot: pathsMatch(config.preferredInstallRoot, paths.managedRoot) ? null : config.preferredInstallRoot,
     dismissedManagedMigrationRoots: (config.dismissedManagedMigrationRoots || []).filter(
       (entry) => normalizePathKey(entry) !== normalizePathKey(normalizedTargetRoot),
     ),
@@ -279,28 +261,54 @@ async function setManagedDataRoot(targetRoot, options = {}) {
     fs.ensureDir(nextManagedPaths.logsRoot),
   ]);
 
-  let pathMappings = [];
-  if (migrationSourceRoot && !pathsMatch(migrationSourceRoot, normalizedTargetRoot)) {
-    const migration = await inspectManagedDataMigration({
-      sourceRoot: migrationSourceRoot,
-      targetRoot: normalizedTargetRoot,
-    });
-
-    for (const category of migration.categories) {
-      for (const entry of category.entries) {
-        await moveEntryWithMerge(entry.sourcePath, entry.targetPath);
-        pathMappings.push({
-          from: entry.sourcePath,
-          to: entry.targetPath,
-        });
-      }
-    }
+  if (!migrationSourceRoot || pathsMatch(migrationSourceRoot, normalizedTargetRoot)) {
+    return persistManagedRoot(normalizedTargetRoot);
   }
 
-  return persistManagedRoot(normalizedTargetRoot, {
-    migrationSourceRoot,
-    pathMappings,
-  });
+  const realSource = await fs.realpath(migrationSourceRoot);
+  const realTarget = await fs.realpath(normalizedTargetRoot);
+  if (pathsMatch(realSource, realTarget)) throw new Error('Choose a different destination folder.');
+  assertNonOverlappingRoots(realSource, realTarget);
+
+  const migration = await inspectManagedDataMigration({ sourceRoot: migrationSourceRoot, targetRoot: normalizedTargetRoot });
+  const moves = [];
+  const mergedDirectories = [];
+  const pathMappings = [];
+  for (const category of migration.categories) {
+    for (const entry of category.entries) {
+      const sourceParent = await fs.realpath(path.dirname(entry.sourcePath));
+      const targetParent = await fs.realpath(path.dirname(entry.targetPath));
+      if (!isPathInside(realSource, sourceParent) || !isPathInside(realTarget, targetParent)) {
+        throw new Error('Storage migration stopped because a data folder points outside the selected location.');
+      }
+      await planMigrationMoves(entry.sourcePath, entry.targetPath, moves, mergedDirectories);
+      pathMappings.push({ from: entry.sourcePath, to: entry.targetPath });
+    }
+  }
+  const completed = [];
+  let config;
+  try {
+    for (const move of moves) {
+      await fs.move(move.source, move.target, { overwrite: false });
+      completed.push(move);
+    }
+    config = await persistManagedRoot(normalizedTargetRoot, { migrationSourceRoot, pathMappings });
+  } catch (error) {
+    // Uninstall metadata is written after config.json. Keep the moved files if the new root was committed.
+    if (!pathsMatch(paths.managedRoot, normalizedTargetRoot) && pathsMatch(getAppPaths().managedRoot, normalizedTargetRoot)) throw error;
+    let rollbackFailed = false;
+    for (const move of completed.reverse()) {
+      try { await fs.move(move.target, move.source, { overwrite: false }); }
+      catch { rollbackFailed = true; }
+    }
+    if (rollbackFailed) throw new Error('Storage migration stopped. Some files remain in each location. Check both folders before retrying.');
+    throw error;
+  }
+  for (const directory of mergedDirectories) {
+    // Only remove empty directories. Another process may have added files during migration.
+    await fs.rmdir(directory).catch(() => {});
+  }
+  return config;
 }
 
 async function dismissManagedDataMigration(sourceRoot) {

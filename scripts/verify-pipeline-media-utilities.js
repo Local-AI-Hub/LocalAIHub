@@ -56,8 +56,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
     }
     if (request === './configService') {
       return {
-        listGraphWorkflowPresets: async () => [],
-        listPromptStyles: async () => [],
+        readConfig: async () => ({ hardware: null, graphWorkflowPresets: [], promptStyles: [] }),
       };
     }
     if (request === './modelService') {

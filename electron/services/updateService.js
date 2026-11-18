@@ -269,7 +269,13 @@ function createUpdateService(dependencies = {}) {
     }
   }
 
+  function clearLaunchTimer() {
+    if (launchTimer !== null) clearTimeoutImpl(launchTimer);
+    launchTimer = null;
+  }
+
   async function checkForUpdates() {
+    clearLaunchTimer();
     activeController?.abort();
     const controller = new AbortController();
     const sequence = ++activeSequence;
@@ -327,6 +333,7 @@ function createUpdateService(dependencies = {}) {
       ...current,
       checkForUpdatesOnLaunch: Boolean(enabled),
     }));
+    if (!config.checkForUpdatesOnLaunch) clearLaunchTimer();
     return {
       checkForUpdatesOnLaunch: Boolean(config.checkForUpdatesOnLaunch),
       message: config.checkForUpdatesOnLaunch
@@ -380,10 +387,7 @@ function createUpdateService(dependencies = {}) {
 
   function dispose() {
     cancelUpdateCheck();
-    if (launchTimer) {
-      clearTimeoutImpl(launchTimer);
-      launchTimer = null;
-    }
+    clearLaunchTimer();
   }
 
   return {

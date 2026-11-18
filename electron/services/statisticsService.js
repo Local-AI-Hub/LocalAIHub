@@ -3,14 +3,14 @@ const fs = require('fs-extra');
 
 const { ensureStorage, getAppPaths, readConfig } = require('./configService');
 const { detectStorageSnapshot, findDiskForPath, getLiveResourceUsage } = require('./hardwareService');
-const { listDownloadedModels, supportsModelManager } = require('./modelService');
+const { getOllamaModelsRoot, listDownloadedModels, supportsModelManager } = require('./modelService');
 const { calculatePathSize } = require('./storageLocationService');
 const { createLogger } = require('./logService');
 
 const STATISTICS_FILE = 'statistics.json';
 const STATISTICS_INDEX_FILE = 'statistics-index.json';
 const STATISTICS_VERSION = 1;
-const STATISTICS_INDEX_SCHEMA_VERSION = 1;
+const STATISTICS_INDEX_SCHEMA_VERSION = 2;
 const MAX_VRAM_HISTORY_SAMPLES = 360;
 const STORAGE_INDEX_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const STORAGE_SECTION = 'storage';
@@ -31,15 +31,19 @@ function throwIfStatisticsCanceled(signal) {
   }
 }
 
-function recoverStatisticsScanError(error, fallbackValue) {
-  if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
-    throw createStatisticsAbortError();
-  }
-  return fallbackValue;
-}
-
 let statisticsQueue = Promise.resolve();
-let storageIndexRebuildPromise = null;
+let storageRebuildGeneration = 0;
+let storageInvalidationGeneration = 0;
+let pendingDiskSnapshot = null;
+
+function readStatisticsDisks() {
+  if (!pendingDiskSnapshot) {
+    pendingDiskSnapshot = detectStorageSnapshot().catch(() => []).finally(() => {
+      pendingDiskSnapshot = null;
+    });
+  }
+  return pendingDiskSnapshot;
+}
 
 function createDefaultStatistics() {
   return {
@@ -85,7 +89,7 @@ function normalizeStatisticsPayload(payload) {
     ...createDefaultStatistics(),
     ...(payload || {}),
     toolLaunchCounts: payload?.toolLaunchCounts && typeof payload.toolLaunchCounts === 'object' ? payload.toolLaunchCounts : {},
-    vramHistory: Array.isArray(payload?.vramHistory) ? payload.vramHistory.slice(-MAX_VRAM_HISTORY_SAMPLES) : [],
+    vramHistory: Array.isArray(payload?.vramHistory) ? payload.vramHistory.slice(-MAX_VRAM_HISTORY_SAMPLES).filter((entry) => Number.isFinite(entry?.vramUsedMb) && entry.vramUsedMb >= 0 && Number.isFinite(Date.parse(entry.timestamp))) : [],
   };
 }
 
@@ -132,10 +136,21 @@ async function readStatistics() {
   }
 }
 
+async function replaceStatisticsJson(filePath, payload) {
+  // Writes are serialized in this process. Rename only after the full JSON is on disk.
+  const temporaryPath = filePath + '.' + process.pid + '.tmp';
+  try {
+    await fs.writeJson(temporaryPath, payload, { spaces: 2 });
+    await fs.rename(temporaryPath, filePath);
+  } finally {
+    await fs.remove(temporaryPath);
+  }
+}
+
 async function writeStatistics(payload) {
   const filePath = await getStatisticsFilePath();
   const nextPayload = normalizeStatisticsPayload(payload);
-  await fs.writeJson(filePath, nextPayload, { spaces: 2 });
+  await replaceStatisticsJson(filePath, nextPayload);
   return nextPayload;
 }
 
@@ -192,7 +207,7 @@ async function writeStatisticsIndex(index) {
     ...index,
     indexedAt: new Date().toISOString(),
   });
-  await fs.writeJson(filePath, nextIndex, { spaces: 2 });
+  await replaceStatisticsJson(filePath, nextIndex);
   logger.info('Statistics index saved.', {
     filePath,
     totalMs: elapsedMs(startedAt),
@@ -217,8 +232,8 @@ async function updateStatistics(mutator) {
 async function updateStatisticsIndex(mutator) {
   return queueStatisticsOperation(async () => {
     const { index } = await readStatisticsIndex();
-    const next = (await mutator(index)) || index;
-    return writeStatisticsIndex(next);
+    const next = await mutator(index);
+    return next && next !== index ? writeStatisticsIndex(next) : index;
   });
 }
 
@@ -244,6 +259,7 @@ async function invalidateStatisticsIndexSections(sections = [STORAGE_SECTION], r
     return readStatisticsIndex();
   }
 
+  if (sectionList.includes(STORAGE_SECTION)) storageInvalidationGeneration += 1;
   const invalidatedAt = new Date().toISOString();
   const reasonEntry = {
     at: invalidatedAt,
@@ -304,8 +320,8 @@ async function recordVramSample(runningTools = []) {
     return readStatistics();
   }
 
-  const resources = await getLiveResourceUsage(getAppPaths().managedRoot).catch(() => null);
-  if (!resources) {
+  const resources = await getLiveResourceUsage(getAppPaths().managedRoot, { includeDisk: false }).catch(() => null);
+  if (!Number.isFinite(resources?.vramUsedMb) || resources.vramUsedMb < 0) {
     return readStatistics();
   }
 
@@ -327,9 +343,8 @@ function toRootKey(targetPath) {
 }
 
 function isNestedPath(parentPath, candidatePath) {
-  const normalizedParent = path.resolve(String(parentPath || ''));
-  const normalizedCandidate = path.resolve(String(candidatePath || ''));
-  return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+  const relative = path.relative(toRootKey(parentPath), toRootKey(candidatePath));
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function getUniqueTrackedRoots(rootCandidates = []) {
@@ -381,24 +396,45 @@ async function getToolInstallSize(tool, options = {}) {
     return 0;
   }
 
-  return calculatePathSize(tool.installDir, { signal: options.signal }).catch((error) => recoverStatisticsScanError(error, 0));
+  return calculatePathSize(tool.installDir, { signal: options.signal });
 }
 
 async function getToolModelSummary(tool, options = {}) {
   throwIfStatisticsCanceled(options.signal);
   if (!supportsModelManager(tool)) {
     return {
+      includedBytes: 0,
       modelBytes: 0,
       modelCount: 0,
     };
   }
 
-  const models = await listDownloadedModels(tool, { signal: options.signal }).catch((error) => recoverStatisticsScanError(error, []));
+  const models = await listDownloadedModels(tool, { signal: options.signal, forceRefresh: options.forceRefresh });
   throwIfStatisticsCanceled(options.signal);
-  return {
-    modelBytes: models.reduce((total, model) => total + Number(model.sizeBytes || 0), 0),
-    modelCount: models.length,
-  };
+  let modelBytes = 0;
+  let includedBytes = 0;
+  const seenPaths = new Set();
+  function addFile(filePath, sizeBytes) {
+    const size = Number(sizeBytes) || 0;
+    if (filePath && path.isAbsolute(filePath)) {
+      const key = toRootKey(filePath);
+      if (seenPaths.has(key)) return;
+      seenPaths.add(key);
+      if (tool.installDir && isNestedPath(tool.installDir, filePath)) includedBytes += size;
+    }
+    modelBytes += size;
+  }
+
+  if (tool.id === 'ollama') {
+    const modelsRoot = getOllamaModelsRoot(tool);
+    addFile(modelsRoot, await calculatePathSize(modelsRoot, { signal: options.signal }));
+  } else {
+    for (const model of models) {
+      addFile(model.path, model.sizeBytes);
+      if (model.indexPath) addFile(model.indexPath, model.indexSizeBytes);
+    }
+  }
+  return { includedBytes, modelBytes, modelCount: models.length };
 }
 
 async function getTrackedTools(tools = null) {
@@ -508,8 +544,9 @@ async function scanStorageSectionData(trackedTools, trackedRoots, timings, optio
       Promise.all(
         trackedTools.map(async (tool) => {
           throwIfStatisticsCanceled(options.signal);
-          const [installBytes, modelSummary] = await Promise.all([getToolInstallSize(tool, options), getToolModelSummary(tool, options)]);
+          const [directoryBytes, modelSummary] = await Promise.all([getToolInstallSize(tool, options), getToolModelSummary(tool, options)]);
           throwIfStatisticsCanceled(options.signal);
+          const installBytes = Math.max(0, directoryBytes - modelSummary.includedBytes);
           return {
             toolId: tool.id,
             toolName: tool.name,
@@ -528,7 +565,7 @@ async function scanStorageSectionData(trackedTools, trackedRoots, timings, optio
           throwIfStatisticsCanceled(options.signal);
           return {
             path: rootPath,
-            sizeBytes: await calculatePathSize(rootPath, { signal: options.signal }).catch((error) => recoverStatisticsScanError(error, 0)),
+            sizeBytes: await calculatePathSize(rootPath, { signal: options.signal }),
           };
         }),
       ),
@@ -553,59 +590,48 @@ async function scanStorageSectionData(trackedTools, trackedRoots, timings, optio
 }
 
 async function rebuildStorageIndexSection(trackedTools, trackedRoots, signature, options = {}) {
-  const rebuild = async () => {
-    throwIfStatisticsCanceled(options.signal);
-    const startedAt = process.hrtime.bigint();
-    const timings = {};
-    const indexedAt = new Date().toISOString();
-    const data = await scanStorageSectionData(trackedTools, trackedRoots, timings, options);
-    throwIfStatisticsCanceled(options.signal);
-    const section = {
-      data,
-      diagnostics: {
-        rebuildReason: options.reason || 'miss',
-        timings,
-      },
-      indexedAt,
-      invalidatedAt: null,
-      invalidationReasons: [],
-      signature,
-    };
+  const generation = ++storageRebuildGeneration;
+  const invalidationGeneration = storageInvalidationGeneration;
+  throwIfStatisticsCanceled(options.signal);
+  const startedAt = process.hrtime.bigint();
+  const timings = {};
+  const indexedAt = new Date().toISOString();
+  const data = await scanStorageSectionData(trackedTools, trackedRoots, timings, options);
+  throwIfStatisticsCanceled(options.signal);
+  const section = {
+    data,
+    diagnostics: {
+      rebuildReason: options.reason || 'miss',
+      timings,
+    },
+    indexedAt,
+    invalidatedAt: null,
+    invalidationReasons: [],
+    signature,
+  };
 
-    await updateStatisticsIndex((index) => ({
+  await updateStatisticsIndex((index) => {
+    throwIfStatisticsCanceled(options.signal);
+    if (generation !== storageRebuildGeneration || invalidationGeneration !== storageInvalidationGeneration) return index;
+    return {
       ...index,
       sections: {
         ...(index.sections || {}),
         [STORAGE_SECTION]: section,
       },
-    }));
-    throwIfStatisticsCanceled(options.signal);
+    };
+  });
+  throwIfStatisticsCanceled(options.signal);
 
-    logger.info('Statistics storage index rebuilt.', {
-      reason: options.reason || 'miss',
-      storageRootCount: data.storageRoots.length,
-      timings,
-      toolCount: trackedTools.length,
-      totalMs: elapsedMs(startedAt),
-    }).catch(() => null);
+  logger.info('Statistics storage index rebuilt.', {
+    reason: options.reason || 'miss',
+    storageRootCount: data.storageRoots.length,
+    timings,
+    toolCount: trackedTools.length,
+    totalMs: elapsedMs(startedAt),
+  }).catch(() => null);
 
-    return section;
-  };
-
-  if (options.signal) {
-    return rebuild();
-  }
-  if (storageIndexRebuildPromise && !options.forceRefresh) {
-    logger.info('Statistics storage index rebuild reused in-flight work.').catch(() => null);
-    return storageIndexRebuildPromise;
-  }
-
-  storageIndexRebuildPromise = rebuild();
-  try {
-    return await storageIndexRebuildPromise;
-  } finally {
-    storageIndexRebuildPromise = null;
-  }
+  return section;
 }
 async function getStatisticsCoreSnapshot(tools = null, options = {}) {
   throwIfStatisticsCanceled(options.signal);
@@ -615,7 +641,7 @@ async function getStatisticsCoreSnapshot(tools = null, options = {}) {
     Promise.all([readStatistics(), getTrackedTools(tools)]),
   );
   const paths = getAppPaths();
-  const disks = await measureStatisticsSection(timings, 'detectStorageMs', () => detectStorageSnapshot().catch(() => []));
+  const disks = await measureStatisticsSection(timings, 'detectStorageMs', readStatisticsDisks);
   const storageDrive = findDiskForPath(disks, paths.managedRoot) || findDiskForPath(disks, paths.appInstallDir);
   throwIfStatisticsCanceled(options.signal);
   const generatedAt = new Date().toISOString();
@@ -660,7 +686,7 @@ async function getStatisticsStorageSnapshot(tools = null, options = {}) {
   const paths = getAppPaths();
   const trackedRoots = getUniqueTrackedRoots([paths.configRoot, paths.localRoot, paths.managedRoot, paths.appInstallDir]);
   const signature = buildStorageSignature(trackedTools, trackedRoots);
-  const disks = await measureStatisticsSection(timings, 'detectStorageMs', () => detectStorageSnapshot().catch(() => []));
+  const disks = await measureStatisticsSection(timings, 'detectStorageMs', readStatisticsDisks);
   const storageDrive = findDiskForPath(disks, paths.managedRoot) || findDiskForPath(disks, paths.appInstallDir);
   const forceRefresh = Boolean(options.forceRefresh || options.refresh || options.rebuildIndex);
   const indexResult = await measureStatisticsSection(timings, 'indexLoadMs', () => readStatisticsIndex());

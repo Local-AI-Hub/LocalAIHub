@@ -1,6 +1,6 @@
 # Local AI Hub agent access
 
-Local AI Hub 0.58.0 provides a local MCP server and CLI backed by the same pipeline services as the app. Agent access is disabled by default. Keep the app open while using it.
+Local AI Hub 0.59.0 provides a local MCP server and CLI backed by the same pipeline services as the app. Agent access is disabled by default. Keep the app open while using it.
 
 ## Claude Desktop
 
@@ -63,7 +63,7 @@ Enabling access authorizes connected local clients to inspect tools, author/over
 
 The bridge uses a random Windows named pipe and a fresh 256-bit token. The descriptor is in the user's LocalAIHub roaming configuration directory and inherits its Windows permissions. This is a same-user trust boundary, not a sandbox against other programs running as that user. Do not share the descriptor. An optional `LOCALAIHUB_AGENT_CONNECTION` environment variable selects another descriptor for testing.
 
-Disabling access closes connections and removes the descriptor. It does not cancel a pipeline already accepted for execution. Cancel existing work separately. The bridge exposes no arbitrary shell execution, install/uninstall, provider credential retrieval, or file deletion operations. Pipeline content is still powerful; connect only trusted agent clients.
+Disabling access closes connections and removes the descriptor. It does not cancel a pipeline already accepted for execution. Cancel existing work separately. The bridge exposes model installation and removal through Model Manager. Arbitrary shell commands, tool installation and removal, provider credentials, and arbitrary file deletion remain outside the bridge. Pipeline content is still powerful; connect only trusted agent clients.
 
 ## Implementation and verification
 
@@ -115,3 +115,23 @@ Manual smoke checks after installing:
 4. Deliver a small WAV in audio mode and record whether the chat displays a player.
 5. Deliver an existing video in link mode; open playbackUrl on the Hub PC, seek, and download the original. Record whether the client exposes the link directly or requires copying it. Keep the Hub open.
 6. Disable agent access and confirm an existing local media link stops working.
+
+## Model Manager in 0.59.0
+
+Update the Hub and reconnect the MCP client. Claude Desktop users also need the updated MCPB. Enabling Agent access permits connected clients to download and permanently remove models through Model Manager.
+
+1. Call `hub_model_manager` to see the detected system specs, current drive space, installed targets, catalog sources, and filters.
+2. Call `hub_model_search` with a target's `toolId`, a query, and optionally a source, model type, task type, or sort order. For another page, repeat the filters with the returned cursor or page. The Hub retains the latest 256 catalog selections in memory.
+3. Pass a returned `selectionId` and optional `choiceIndex` to `hub_model_preflight`. This checks the selected artifact's destination and any staging space. Use the same selection for `hub_model_install` with a unique `requestId`. The Hub checks capacity again before transfer.
+4. Poll `hub_job_status` with the returned job ID for progress and the terminal status. Retry the same operation with the same request ID. To stop a transfer, call `hub_model_cancel_download` and poll until the job finishes.
+5. Call `hub_models` for a target's local inventory. Use `limit` and `offset` for large collections. To permanently remove a specific entry, pass its `toolId` and `removalId` to `hub_model_uninstall` with a unique request ID. The Hub resolves the entry against fresh inventory and applies the target's normal uninstall behavior.
+
+Catalog requests use the Hub's configured provider access. Selection IDs reference Hub-owned catalog records, so clients never supply a download URL, destination, package manifest, credential, or deletion path.
+
+## Configuring pipeline nodes through MCP
+
+Call `hub_node_types` with a node type to read its config fields, nested inference settings, defaults, and supported choices. Include a `config` object to preview the resulting sample node and ports. For Map Collection, choose a mapping and one of its execution modes. Use `hub_tools`, `hub_models`, and `hub_discovery` to resolve local tool, model, provider, preset, asset library, item, and project IDs.
+
+For example, an Ollama Model Step can set `ollamaOptions` to `{"temperature":0,"seed":42,"num_predict":256}`. An RVC audio transform can set `rvcInference` to `{"pitchChange":-3,"pitchMethod":"harvest","indexRate":0}`. Put settings for the Map Collection reviewer inside `perItemValidation`. Omitting inference overrides preserves the backend defaults.
+
+Use the configured values in the node's `config` in a draft or retrieved pipeline. Validate the complete definition with `hub_validate_pipeline`, then persist it with `hub_save_pipeline`. Previewing a node leaves the saved pipeline untouched.

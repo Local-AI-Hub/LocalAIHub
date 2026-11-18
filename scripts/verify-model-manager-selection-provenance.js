@@ -60,7 +60,7 @@ function verifySafeSourceLinks() {
   assert.strictEqual(sanitize('https://civitai.com/models/123?modelVersionId=456'), 'https://civitai.com/models/123?modelVersionId=456', 'Trusted CivitAI model pages should be allowed.');
   assert.strictEqual(sanitize('https://ollama.com/library/llama3'), 'https://ollama.com/library/llama3', 'Trusted Ollama library pages should be allowed.');
   assert.strictEqual(sanitize('javascript:alert(1)'), null, 'JavaScript URLs must be rejected.');
-  assert.strictEqual(sanitize('file:///C:/Users/Dell/model.safetensors'), null, 'Local file URLs must be rejected.');
+  assert.strictEqual(sanitize('file:///C:/Users/Dell/named-model.safetensors'), null, 'Local file URLs must be rejected.');
   assert.strictEqual(sanitize('http://huggingface.co/user/model'), null, 'Non-HTTPS provider links must be rejected.');
   assert.strictEqual(sanitize('https://evil.example/model'), null, 'Untrusted hosts must be rejected.');
 }
@@ -84,7 +84,7 @@ function tempTool(root) {
   };
 }
 
-function remotePayload(id, repositoryId, artifactPath, fileName = 'model.safetensors') {
+function remotePayload(id, repositoryId, artifactPath, fileName = 'named-model.safetensors') {
   return {
     id,
     catalogRepositoryId: repositoryId,
@@ -103,9 +103,9 @@ async function verifySelectionIdentityAndConflicts() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'local-ai-hub-mm-selection-'));
   try {
     const tool = tempTool(root);
-    const first = remotePayload('hf:first', 'publisher/first', 'fp16/model.safetensors');
-    const second = remotePayload('hf:second', 'publisher/second', 'fp16/model.safetensors');
-    const alternateArtifact = remotePayload('hf:first-alt', 'publisher/first', 'ema/model.safetensors');
+    const first = remotePayload('hf:first', 'publisher/first', 'fp16/named-model.safetensors');
+    const second = remotePayload('hf:second', 'publisher/second', 'fp16/named-model.safetensors');
+    const alternateArtifact = remotePayload('hf:first-alt', 'publisher/first', 'ema/named-model.safetensors');
 
     const firstDestination = resolveModelDestination(tool, first);
     const firstIdentity = buildExpectedDownloadIdentity(tool, first, firstDestination);
@@ -127,7 +127,7 @@ async function verifySelectionIdentityAndConflicts() {
 
     await assert.rejects(
       () => modelService.downloadModel(tool, second),
-      /different model named (?:model\.safetensors|<private-file>).*will not overwrite or relabel/i,
+      /different model named (?:named-model\.safetensors|<private-file>).*will not overwrite or relabel/i,
       'Same destination with a different source identity should produce the conflict message used by the UI.',
     );
   } finally {

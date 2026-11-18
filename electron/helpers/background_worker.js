@@ -441,7 +441,7 @@ async function calculatePathSizeLocal(targetPath, requestId) {
   while (pendingPaths.length) {
     throwIfRequestCanceled(requestId);
     const currentPath = pendingPaths.pop();
-    const stats = await fs.stat(currentPath).catch(() => null);
+    const stats = await fs.lstat(currentPath).catch(() => null);
     throwIfRequestCanceled(requestId);
     if (!stats) {
       continue;

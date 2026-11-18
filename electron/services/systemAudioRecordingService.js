@@ -199,9 +199,7 @@ function createSystemAudioRecordingService(dependencies = {}) {
     return recording.metadata;
   }
 
-  async function finalize(recording, result = {}) {
-    if (recording.finalized) return recording.metadata;
-    recording.finalized = true;
+  async function saveFinalMetadata(recording, result = {}) {
     let sizeBytes = 0;
     if (await fsApi.pathExists(recording.outputPath)) {
       sizeBytes = Number((await fsApi.stat(recording.outputPath)).size || 0);
@@ -234,10 +232,21 @@ function createSystemAudioRecordingService(dependencies = {}) {
       stopMethod: recording.stopMethod || result.stopMethod || 'capture-window-exit',
       errorSummary,
     });
+  }
 
+  async function finalize(recording, result = {}) {
+    if (recording.finalized) return recording.closePromise;
+    recording.finalized = true;
+    try {
+      await saveFinalMetadata(recording, result);
+    } catch {
+      recording.metadata.status = 'interrupted';
+      recording.metadata.errorSummary = 'Recording ended, but Local AI Hub could not save its final details. Check the recordings folder and available disk space.';
+    }
     if (activeRecording === recording) activeRecording = null;
-    emit(recording, status === 'completed' ? 'Recording saved.' : status === 'canceled' ? 'Recording canceled.' : errorSummary);
+    const { status, errorSummary } = recording.metadata;
     recording.resolveClose(recording.metadata);
+    emit(recording, status === 'completed' ? 'Recording saved.' : status === 'canceled' ? 'Recording canceled.' : errorSummary);
     return recording.metadata;
   }
 
@@ -318,10 +327,12 @@ function createSystemAudioRecordingService(dependencies = {}) {
       finalized: false,
       captureSession: null,
     };
+    let finishStartup;
+    recording.startup = new Promise(resolve => { finishStartup = resolve; });
     activeRecording = recording;
-    await writeJsonAtomic(fsApi, paths.sidecarPath, metadata);
 
     try {
+      await writeJsonAtomic(fsApi, paths.sidecarPath, metadata);
       const captureSession = await captureAdapter.start({
         outputPath: paths.outputPath,
         includeVideo: options.includeVideo,
@@ -338,27 +349,30 @@ function createSystemAudioRecordingService(dependencies = {}) {
       emit(recording, 'Recording started.');
       return serialize({ ...recording.metadata, outputPath: recording.outputPath });
     } catch (error) {
+      if (recording.captureSession) await recording.captureSession.cancel().catch(() => null);
       recording.stopMethod = 'capture-start-failed';
       await finalize(recording, { clean: false, error: sanitizeText(error?.message, 500), stopMethod: 'capture-start-failed' });
       throw new Error(sanitizeText(error?.message, 500) || 'Local AI Hub could not start Electron system-audio capture.');
+    } finally {
+      finishStartup();
     }
   }
 
   async function requestStop(cancelRequested) {
     const recording = activeRecording;
     if (!recording) throw new Error('There is no active recording to stop.');
+    await recording.startup;
+    if (recording.finalized) return recording.closePromise;
     if (recording.stopRequested) {
       if (cancelRequested && !recording.cancelRequested) {
         recording.cancelRequested = true;
         recording.stopMethod = 'media-recorder-cancel';
-        await updateMetadata(recording, { stopMethod: recording.stopMethod });
       }
       return recording.closePromise;
     }
     recording.stopRequested = true;
     recording.cancelRequested = cancelRequested;
     recording.stopMethod = cancelRequested ? 'media-recorder-cancel' : 'media-recorder-stop';
-    await updateMetadata(recording, { stopMethod: recording.stopMethod });
     try {
       if (cancelRequested) await recording.captureSession?.cancel();
       else await recording.captureSession?.stop();

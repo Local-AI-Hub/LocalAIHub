@@ -21,7 +21,12 @@ export default function ConnectionsPanel({
 
       <div className="mt-4 grid gap-3 xl:grid-cols-2 2xl:grid-cols-3">
         {(providers || []).map((provider) => (
-          <div key={provider.id} className="min-w-0 rounded-2xl border border-white/10 bg-slate-950/35 p-3">
+          <fieldset
+            key={provider.id}
+            aria-label={provider.name}
+            className="min-w-0 rounded-2xl border border-white/10 bg-slate-950/35 p-3"
+            disabled={busyMap[`provider-save:${provider.id}`] || busyMap[`provider-test:${provider.id}`] || busyMap[`provider-disconnect:${provider.id}`]}
+          >
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
@@ -59,10 +64,12 @@ export default function ConnectionsPanel({
 
             {provider.credentialStatusMessage || provider.statusMessage || provider.lastTestMessage ? (
               <div className="mt-3 max-h-24 overflow-y-auto rounded-2xl border border-white/10 bg-white/5 px-3 py-2 text-sm leading-6 text-slate-300">
-                {provider.credentialStatusMessage || provider.statusMessage || provider.lastTestMessage}
+                {[...new Set([provider.statusMessage, provider.lastTestMessage, provider.credentialStatusMessage].filter(Boolean))].map(message => (
+                  <p key={message}>{message}</p>
+                ))}
               </div>
             ) : null}
-          </div>
+          </fieldset>
         ))}
       </div>
     </section>

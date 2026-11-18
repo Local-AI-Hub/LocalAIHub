@@ -2,6 +2,7 @@ import React, { Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState 
 import pipelineShared from '../../electron/shared/pipelineSchema.cjs';
 import pipelineTemplatesShared from '../../electron/shared/pipelineTemplates.cjs';
 import toolAssetSelectionShared from '../../electron/shared/toolAssetSelection.cjs';
+import RvcInferenceControls from './RvcInferenceControls';
 import HoverRevealText from './HoverRevealText';
 import {
   AUDIO_WORKFLOW_TOOL_IDS,
@@ -3701,7 +3702,7 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
         ) : isLocalAudioTransformMode ? (
           <div className="mt-3 space-y-3">
             <p className="text-xs leading-5 text-slate-500">
-              Choose an RVC voice model from the local weights folder. Clean single-speaker source clips work best in this first pass, and advanced pitch or index controls stay on the full RVC surface for now.
+              Choose an RVC voice model from the local weights folder. A clean single-speaker source clip works best.
             </p>
             <div className="flex flex-wrap items-center gap-3">
               <button className="ghost-button" disabled={modelsBusy} onClick={() => onRefreshModels(node)} type="button">
@@ -3796,10 +3797,10 @@ function ModelTargetFields({ allowLocalTool = false, connectedProviders, localAu
     </>
   );
 }
-export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, initialFocus = '', manifests, moveDeletedPipelineOutputsToRecycleBin = true, navigationRequest = 0, onDeletePromptStyle, onSavePromptStyle, onToast, promptStyles = [], providers, tools }) {
+export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {}, graphWorkflowPresets: initialGraphWorkflowPresets = EMPTY_GRAPH_WORKFLOW_PRESETS, hardware, initialFocus = '', manifests, moveDeletedPipelineOutputsToRecycleBin = true, navigationRequest = 0, onDeletePromptStyle, onSavePromptStyle, onToast, promptStyles = [], providers, tools }) {
   const [pipelines, setPipelines] = useState([]);
-  const [draft, setDraft] = useState(() => createEmptyPipeline());
-  const [selectedNodeId, setSelectedNodeId] = useState('');
+  const [draft, setDraft] = useState(() => unsavedPipelineRef?.current?.draft || createEmptyPipeline());
+  const [selectedNodeId, setSelectedNodeId] = useState(() => unsavedPipelineRef?.current?.selectedNodeId || '');
   const [selectedEdgeId, setSelectedEdgeId] = useState('');
   const [pendingConnection, setPendingConnection] = useState(null);
   const [runState, setRunState] = useState(null);
@@ -3813,7 +3814,10 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   const [validationBusy, setValidationBusy] = useState(false);
   const [validationComment, setValidationComment] = useState('');
   const [validationRetryOverrides, setValidationRetryOverrides] = useState(null);
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirty] = useState(() => Boolean(unsavedPipelineRef?.current));
+  useLayoutEffect(() => {
+    if (unsavedPipelineRef) unsavedPipelineRef.current = dirty ? { draft, selectedNodeId } : null;
+  }, [dirty, draft, selectedNodeId, unsavedPipelineRef]);
   const [modelOptionsByNodeId, setModelOptionsByNodeId] = useState({});
   const [graphWorkflowPresets, setGraphWorkflowPresets] = useState(() => (Array.isArray(initialGraphWorkflowPresets) ? initialGraphWorkflowPresets : []));
   const [soundEffectLibraries, setSoundEffectLibraries] = useState([]);
@@ -3862,9 +3866,12 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   const graphSurfaceRef = useRef(null);
   const portMeasurementFrameRef = useRef(0);
   const wizardRequestIdRef = useRef(0);
+  const wizardModelsRequestRef = useRef(0);
   const dragRef = useRef(null);
   const notifiedRunStateRef = useRef('');
-  const outputRefreshKeyRef = useRef('');
+  const outputRefreshKeyRef = useRef(null);
+  const outputRequestRef = useRef(0);
+  const draftRevisionRef = useRef(0);
 
   const ollamaModelCapabilitiesByName = useMemo(() => collectOllamaModelCapabilities(modelOptionsByNodeId), [modelOptionsByNodeId]);
   const localToolModelsByToolId = useMemo(() => collectLocalToolModelsByToolId(modelOptionsByNodeId), [modelOptionsByNodeId]);
@@ -3890,8 +3897,9 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     [graphWorkflowPresets, hardware, manifests, pipelineTools, providers],
   );
   const analysis = useMemo(() => analyzePipelineDraft(draft, contextMaps), [draft, contextMaps]);
+  const showTemplateCards = activeSubview === 'get-started' && sectionVisibility.starterTemplates;
   const templateCards = useMemo(
-    () => BUILT_IN_PIPELINE_TEMPLATES.map((template) => ({
+    () => showTemplateCards ? BUILT_IN_PIPELINE_TEMPLATES.map((template) => ({
       ...template,
       readiness: getPipelineTemplateReadiness(template, {
         graphWorkflowPresets,
@@ -3901,8 +3909,8 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
         providers,
         tools: pipelineTools,
       }),
-    })),
-    [graphWorkflowPresets, hardware, manifests, pipelineTools, promptStyles, providers],
+    })) : [],
+    [graphWorkflowPresets, hardware, manifests, pipelineTools, promptStyles, providers, showTemplateCards],
   );
   const templateGroups = useMemo(() => {
     const query = templateSearch.trim().toLowerCase();
@@ -4240,6 +4248,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   const savePipelineLabel = saveBusy ? (currentPipelineSaved ? 'Updating...' : 'Saving...') : (currentPipelineSaved ? 'Update pipeline' : 'Save pipeline');
 
   function replaceDraft(nextPipeline, options = {}) {
+    draftRevisionRef.current += 1;
     setDraft(nextPipeline);
     setSelectedNodeId((current) => {
       if (options.selectedNodeId !== undefined) {
@@ -4292,6 +4301,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     }
   }
   function markDirty() {
+    draftRevisionRef.current += 1;
     setDirty(true);
   }
 
@@ -4679,12 +4689,14 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   }
 
   async function loadPipelineOutputs(options = {}) {
+    const requestId = ++outputRequestRef.current;
     if (!options.silent) {
       setOutputsLoading(true);
     }
 
     try {
       const result = await window.localAIHub.listPipelineOutputs();
+      if (requestId !== outputRequestRef.current) return [];
       if (!result?.ok) {
         if (!options.silent) {
           onToast(result?.message || 'Local AI Hub could not load the saved pipeline outputs.', 'error');
@@ -4696,12 +4708,12 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
       setPipelineOutputs(nextOutputs);
       return nextOutputs;
     } catch (error) {
-      if (!options.silent) {
+      if (requestId === outputRequestRef.current && !options.silent) {
         onToast(error?.message || 'Local AI Hub could not load the saved pipeline outputs.', 'error');
       }
       return [];
     } finally {
-      if (!options.silent) {
+      if (requestId === outputRequestRef.current) {
         setOutputsLoading(false);
       }
     }
@@ -4719,7 +4731,9 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
       }
     }
 
+    const revision = ++draftRevisionRef.current;
     const result = await window.localAIHub.getPipeline(pipelineId);
+    if (revision !== draftRevisionRef.current) return;
     if (!result?.ok) {
       onToast(result?.message || 'Local AI Hub could not load that pipeline.', 'error');
       return;
@@ -4796,11 +4810,13 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   }
   useEffect(() => {
     let disposed = false;
+    let receivedRunUpdate = false;
     const unsubscribe = window.localAIHub.onPipelineRunUpdate((payload) => {
       if (disposed || !payload?.run) {
         return;
       }
 
+      receivedRunUpdate = true;
       applyRunSnapshot(payload.run);
       if (payload.run.status !== 'running') {
         setRunBusy(false);
@@ -4813,31 +4829,21 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     });
 
     async function loadInitialState() {
-      setOutputsLoading(true);
-      const [savedPipelines, activeRunResult, pipelineOutputsResult] = await Promise.all([
+      const [savedPipelines, activeRunResult] = await Promise.all([
         refreshPipelineList(),
         window.localAIHub.getActivePipelineRun(),
-        window.localAIHub.listPipelineOutputs(),
       ]);
-      if (disposed) {
-        return;
-      }
-      if (pipelineOutputsResult?.ok) {
-        setPipelineOutputs(pipelineOutputsResult.data?.outputs || []);
-      } else if (pipelineOutputsResult?.message) {
-        onToast(pipelineOutputsResult.message, 'error');
-      }
-      setOutputsLoading(false);
+      if (disposed) return;
 
-      if (activeRunResult?.ok) {
+      if (activeRunResult?.ok && !receivedRunUpdate) {
         const historicalRun = activeRunResult.data?.run || null;
         rememberHistoricalRunNotification(historicalRun);
         applyRunSnapshot(historicalRun);
-      } else if (activeRunResult?.message) {
+      } else if (!activeRunResult?.ok && activeRunResult?.message) {
         onToast(activeRunResult.message, 'error');
       }
 
-      if (savedPipelines.length > 0) {
+      if (!dirty && savedPipelines.length > 0) {
         const pipelineResult = await window.localAIHub.getPipeline(savedPipelines[0].id);
         if (!disposed && pipelineResult?.ok) {
           replaceDraft(pipelineResult.data?.pipeline || createEmptyPipeline(), {
@@ -4845,16 +4851,17 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
           });
         }
       }
-
-      if (!disposed) {
-        setLoading(false);
-      }
     }
 
-    loadInitialState();
+    loadInitialState().catch(() => {
+      if (!disposed) onToast('Local AI Hub could not finish loading the Pipeline Builder.', 'error');
+    }).finally(() => {
+      if (!disposed) setLoading(false);
+    });
 
     return () => {
       disposed = true;
+      wizardRequestIdRef.current += 1;
       unsubscribe?.();
     };
   }, []);
@@ -4879,18 +4886,23 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   }, [onToast, runState]);
 
   useEffect(() => {
-    if (!runState?.runId || !['completed', 'failed', 'cancelled'].includes(runState.status)) {
+    if (loading || activeSubview !== 'outputs' || !sectionVisibility.pipelineOutputs) {
+      outputRefreshKeyRef.current = null;
       return;
     }
-
-    const refreshKey = `${runState.runId}:${runState.status}`;
-    if (outputRefreshKeyRef.current === refreshKey) {
-      return;
+    const terminal = ['completed', 'failed', 'cancelled'].includes(runState?.status);
+    const refreshKey = terminal ? `${runState.runId}:${runState.status}` : '';
+    const firstLoad = outputRefreshKeyRef.current === null;
+    if (firstLoad || (terminal && outputRefreshKeyRef.current !== refreshKey)) {
+      outputRefreshKeyRef.current = refreshKey;
+      loadPipelineOutputs({ silent: !firstLoad });
     }
+  }, [activeSubview, loading, sectionVisibility.pipelineOutputs, runState?.runId, runState?.status]);
 
-    outputRefreshKeyRef.current = refreshKey;
-    loadPipelineOutputs({ silent: true });
-  }, [runState?.runId, runState?.status]);
+  useLayoutEffect(() => {
+    setWizardModelsBusy(false);
+    return () => { wizardModelsRequestRef.current += 1; };
+  }, [wizardExecutionMode, wizardProviderId]);
 
   useEffect(() => {
     if (wizardExecutionMode !== 'cloud') {
@@ -5129,6 +5141,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     }
 
     const copiedPipeline = createPipelineDefinitionCopy(draft, pipelines);
+    const revision = ++draftRevisionRef.current;
     setCopyBusy(true);
     logRendererActionDiagnostic('pipeline-copy', 'start', { sourcePipelineId: String(draft.id || ''), targetPipelineId: String(copiedPipeline.id || '') });
     try {
@@ -5139,6 +5152,10 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
       }
 
       setPipelines(result.data?.pipelines || []);
+      if (revision !== draftRevisionRef.current) {
+        onToast(`${copiedPipeline.name} was saved to the pipeline list.`, 'success');
+        return;
+      }
       replaceDraft(result.data?.pipeline || copiedPipeline, {
         dirty: false,
         selectedNodeId: selectedNodeId && copiedPipeline.nodes.some((node) => node.id === selectedNodeId) ? selectedNodeId : copiedPipeline.nodes[0]?.id || '',
@@ -5322,6 +5339,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
   }
 
   async function handleSavePipeline() {
+    const revision = draftRevisionRef.current;
     setSaveBusy(true);
     logRendererActionDiagnostic('pipeline-save', 'start', { edgeCount: draft.edges.length, nodeCount: draft.nodes.length, pipelineId: String(draft.id || '') });
     try {
@@ -5333,9 +5351,9 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
 
       setPipelines(result.data?.pipelines || []);
       logRendererActionDiagnostic('pipeline-save', 'success', { pipelineId: String(result.data?.pipeline?.id || draft.id || '') });
-      replaceDraft(result.data?.pipeline || draft, {
-        dirty: false,
-      });
+      if (revision === draftRevisionRef.current) {
+        replaceDraft(result.data?.pipeline || draft, { dirty: false });
+      }
       onToast(result.data?.message || 'Pipeline saved.', 'success');
     } catch (error) {
       logRendererActionDiagnostic('pipeline-save', 'failure', { message: String(error?.message || ''), pipelineId: String(draft.id || '') }, 'warn');
@@ -5357,6 +5375,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
       return;
     }
 
+    const revision = ++draftRevisionRef.current;
     setDeleteBusy(true);
     try {
       const result = await window.localAIHub.deletePipeline(draft.id);
@@ -5369,6 +5388,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
       setPipelines(nextPipelines);
       onToast(result.data?.message || 'Pipeline deleted.', 'success');
 
+      if (revision !== draftRevisionRef.current) return;
       if (nextPipelines.length > 0) {
         await loadSavedPipeline(nextPipelines[0].id, {
           force: true,
@@ -5376,7 +5396,8 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
         return;
       }
 
-      createNewPipeline();
+      replaceDraft(createEmptyPipeline(), { dirty: false, selectedNodeId: '' });
+      setRunState((current) => (current?.status === 'running' || current?.status === 'paused' ? current : null));
     } catch (error) {
       onToast(error?.message || 'Local AI Hub could not delete that pipeline.', 'error');
     } finally {
@@ -5582,12 +5603,14 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
     setModelsBusyNodeId('');
   }
   async function refreshWizardModels() {
+    const requestId = ++wizardModelsRequestRef.current;
     setWizardModelsBusy(true);
     setWizardSummary(null);
     try {
       let result = null;
       if (wizardExecutionMode === 'ollama') {
         result = await window.localAIHub.listOllamaModels({ includeCapabilities: true, autoStart: true, launchContext: 'pipeline-wizard-model-refresh' });
+        if (requestId !== wizardModelsRequestRef.current) return;
         if (!result?.ok) {
           onToast(result?.message || 'Local AI Hub could not load Ollama models for the wizard.', 'error');
           return;
@@ -5603,9 +5626,10 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
           supportsImageInput: typeof model.supportsImageInput === 'boolean' ? model.supportsImageInput : undefined,
         })).filter((model) => model.id), hardware);
         setWizardModelOptions(models);
-        if ((!wizardModel || !models.some((model) => model.id === wizardModel)) && models[0]?.id) {
-          setWizardModel(models[0].id);
-        }
+        setWizardModel((current) => {
+          if (current !== wizardModel || models.some((model) => model.id === current)) return current;
+          return models[0]?.id || current;
+        });
         if (result.data?.stoppedAfterUse) {
           onToast('Local AI Hub started Ollama to inspect local models, then stopped it again.', 'info');
         }
@@ -5618,6 +5642,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
       }
 
       result = await window.localAIHub.listProviderModels({ providerId: wizardProviderId, operationId: PIPELINE_OPERATION_IDS.LLM_PROMPT });
+      if (requestId !== wizardModelsRequestRef.current) return;
       if (!result?.ok) {
         onToast(result?.message || 'Local AI Hub could not load wizard models for that provider.', 'error');
         return;
@@ -5626,12 +5651,12 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
       const models = (result.data?.models || []).map((model) => buildWizardModelOption(model)).filter((model) => model.id);
       setWizardModelOptions(models);
       if (!wizardModel && (result.data?.selectedModel || models[0]?.id)) {
-        setWizardModel(getWizardModelId(result.data?.selectedModel) || models[0].id);
+        setWizardModel((current) => current || getWizardModelId(result.data?.selectedModel) || models[0]?.id || '');
       }
     } catch (error) {
-      onToast(error?.message || 'Local AI Hub could not load wizard models.', 'error');
+      if (requestId === wizardModelsRequestRef.current) onToast(error?.message || 'Local AI Hub could not load wizard models.', 'error');
     } finally {
-      setWizardModelsBusy(false);
+      if (requestId === wizardModelsRequestRef.current) setWizardModelsBusy(false);
     }
   }
 
@@ -5660,6 +5685,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
       }
     }
 
+    const revision = draftRevisionRef.current;
     const requestId = wizardRequestIdRef.current + 1;
     wizardRequestIdRef.current = requestId;
     const isCurrentWizardRequest = () => wizardRequestIdRef.current === requestId;
@@ -5752,6 +5778,9 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
         return;
       }
 
+      if (revision !== draftRevisionRef.current && !window.confirm('The pipeline draft changed while the wizard was working. Replace those changes with the generated pipeline?')) {
+        return;
+      }
       const draftResult = lifecycleResult.draftResult;
       replaceDraft(draftResult.pipeline, {
         dirty: true,
@@ -6363,7 +6392,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                 <p className="mt-2 text-sm leading-6 text-slate-400">Templates stay visible when dependencies are missing, but Local AI Hub labels what is needed before the workflow can run.</p>
               </button>
               <div className="flex flex-wrap items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-400">
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">{templateCards.length} starters</span>
+                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">{BUILT_IN_PIPELINE_TEMPLATES.length} starters</span>
                 <button className="ghost-button px-3 py-1.5 text-xs" onClick={() => toggleSection('starterTemplates')} type="button">
                   {sectionVisibility.starterTemplates ? 'Collapse' : 'Expand'}
                 </button>
@@ -7138,9 +7167,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                           <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
                             This step converts one saved audio artifact into another with RVC. Connect a source audio clip, choose a voice model, and run the step when RVC is installed and ready.
                           </div>
-                          <p className="text-xs leading-5 text-slate-400">
-                            Keep source clips clean and single-speaker when possible. Advanced RVC controls such as pitch extraction, index rate, and protect tuning stay on the dedicated RVC surface for now.
-                          </p>
+                          <RvcInferenceControls node={selectedNode} updateNode={updateNode} />
                         </div>
                       ) : getSelectedModelStepOperationId(selectedNode) === PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM ? (
                         <div className="space-y-4">
@@ -7845,6 +7872,7 @@ export default function PipelineBuilderPanel({ busyMap = {}, graphWorkflowPreset
                         {showCollectionMapLocalModelField ? (
                           <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model-local">{getCollectionMapModelFieldLabel(collectionMapOperationId)}</label><input className="store-input mt-3" id="collection-map-model-local" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value, analysisMode: showCollectionMapImageAnalysisFields ? event.target.value || 'clip' : currentNode.config?.analysisMode } }))} placeholder={getCollectionMapModelPlaceholder(collectionMapOperationId)} value={selectedNode.config?.model || (showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || 'clip' : '')} /><div className="mt-3 flex flex-wrap items-center gap-3"><button className="ghost-button" disabled={modelsBusyNodeId === selectedNode.id} onClick={() => refreshNodeModels(selectedNode)} type="button">{modelsBusyNodeId === selectedNode.id ? 'Refreshing...' : getCollectionMapRefreshLabel(collectionMapOperationId)}</button><span className="text-xs text-slate-500">{showCollectionMapAudioGenerationFields ? 'Loads downloaded AudioCraft snapshots from the selected tool.' : showCollectionMapAudioTransformFields ? 'Loads local RVC voice models from the selected tool.' : showCollectionMapImageTransformFields ? 'Loads downloaded Upscayl model sets from the selected tool.' : showCollectionMapTranscriptionFields ? 'Shows local Whisper model size options.' : showCollectionMapImageAnalysisFields ? 'Shows WebUI interrogation modes.' : showCollectionMapVideoGenerationFields ? 'Loads local Wan model folders from the selected video backend.' : 'Loads local checkpoints from the selected image backend.'}</span></div>{collectionMapModelOptions.length ? <div className="mt-3 grid gap-2">{collectionMapModelOptions.slice(0, 8).map((model) => (<button className={'rounded-2xl border px-3 py-3 text-left transition ' + (String((showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || selectedNode.config?.model : selectedNode.config?.model) || '').trim().toLowerCase() === String(model.id || '').trim().toLowerCase() ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/20 hover:bg-white/10')} key={model.id} onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: showCollectionMapImageAnalysisFields ? model.id : currentNode.config?.analysisMode, model: model.id } }))} type="button"><p className="text-sm font-medium text-white">{model.label || model.id}</p>{buildModelOptionDetail(model) ? <p className="mt-1 text-xs leading-5 text-slate-400">{buildModelOptionDetail(model)}</p> : null}</button>))}</div> : null}</div>
                         ) : null}
+                        {showCollectionMapAudioTransformFields ? <RvcInferenceControls node={selectedNode} updateNode={updateNode} /> : null}
                         {showCollectionMapAudiocraftItemMode ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audiocraft-item-mode">AudioCraft item mode</label><select className="store-input mt-3" id="collection-map-audiocraft-item-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftItemMode: event.target.value === 'sequentialContinuation' ? 'sequentialContinuation' : 'independent' } }))} value={collectionMapAudiocraftItemMode}><option value="independent">Independent clips</option><option value="sequentialContinuation">Sequential continuation chain</option></select></div>{showCollectionMapAudiocraftChainFields ? <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-first">First item behavior</label><select className="store-input mt-3" id="collection-map-chain-first" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioChainFirstItemBehavior: 'scratch' } }))} value="scratch"><option value="scratch">Generate from scratch</option></select></div> : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div>}</div>{showCollectionMapAudiocraftChainFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-seed">Seed seconds</label><input className="store-input mt-3" id="collection-map-chain-seed" min="0.25" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, continuationSeedSeconds: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.continuationSeedSeconds || 12} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Segment duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chain-output">Output mode</label><select className="store-input mt-3" id="collection-map-chain-output" onChange={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioChainOutputMode: 'segments' } }))} value="segments"><option value="segments">Segments collection</option></select></div></div> : <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div>}<details className="rounded-[18px] border border-white/10 bg-white/5 px-4 py-3"><summary className="cursor-pointer text-xs uppercase tracking-[0.18em] text-slate-400">Advanced AudioCraft settings</summary><div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-temperature">Temperature</label><input className="store-input mt-3" id="collection-map-audio-temperature" min="0.01" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTemperature: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTemperature ?? 1} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-top-k">Top K</label><input className="store-input mt-3" id="collection-map-audio-top-k" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopK: Number(event.target.value || 0) || 0 } }))} step="1" type="number" value={selectedNode.config?.audiocraftTopK ?? 250} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-top-p">Top P</label><input className="store-input mt-3" id="collection-map-audio-top-p" max="1" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTopP: Number(event.target.value || 0) || 0 } }))} step="0.05" type="number" value={selectedNode.config?.audiocraftTopP ?? 0} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-cfg">CFG coefficient</label><input className="store-input mt-3" id="collection-map-audio-cfg" min="0" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftCfgCoef: Number(event.target.value || 0) || 0 } }))} step="0.25" type="number" value={selectedNode.config?.audiocraftCfgCoef ?? 3} /></div><label className="flex items-center gap-3 pt-7 text-sm font-medium text-slate-200" htmlFor="collection-map-audio-two-step"><input checked={Boolean(selectedNode.config?.audiocraftTwoStepCfg)} className="h-4 w-4 accent-cyan-300" id="collection-map-audio-two-step" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audiocraftTwoStepCfg: event.target.checked } }))} type="checkbox" />Two-step CFG</label></div></details></div> : showCollectionMapAudioGenerationFields && !showCollectionMapChatterboxReferenceVoiceFields ? <div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-audio-mode">Audio mode</label><select className="store-input mt-3" id="collection-map-audio-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, audioMode: event.target.value === 'sound' ? 'sound' : 'music' } }))} value={selectedNode.config?.audioMode === 'sound' ? 'sound' : 'music'}><option value="music">Music</option><option value="sound">Sound</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-duration">Duration</label><input className="store-input mt-3" id="collection-map-duration" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, durationSeconds: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.durationSeconds || 8} /></div></div> : null}
                         {showCollectionMapWanVideoItemMode ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-item-mode">Video item mode</label><select className="store-input mt-3" id="collection-map-video-item-mode" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoItemMode: event.target.value === 'sequentialLastFrame' ? 'sequentialLastFrame' : 'independent' } }))} value={collectionMapVideoItemMode}><option value="independent">Independent text-to-video clips</option><option value="sequentialLastFrame">Sequential previous-last-frame chain</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-size">Video size</label><select className="store-input mt-3" id="collection-map-video-size" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoSize: event.target.value } }))} value={selectedNode.config?.videoSize || '1280x720'}><option value="832x480">832 x 480</option><option value="1280x720">1280 x 720</option></select></div></div>{showCollectionMapVideoChainFields ? <div className="rounded-[18px] border border-cyan-300/20 bg-cyan-300/10 px-4 py-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-cyan-100/80" htmlFor="collection-map-video-first-behavior">First item</label><select className="store-input mt-3" id="collection-map-video-first-behavior" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoChainFirstItemBehavior: event.target.value === 'initialReferenceImage' ? 'initialReferenceImage' : 'textToVideo' } }))} value={selectedNode.config?.videoChainFirstItemBehavior === 'initialReferenceImage' ? 'initialReferenceImage' : 'textToVideo'}><option value="textToVideo">Start from text-to-video</option><option value="initialReferenceImage">Start from initial reference image</option></select></div><div><label className="text-xs uppercase tracking-[0.18em] text-cyan-100/80" htmlFor="collection-map-video-initial-reference">Initial reference image</label><div className="mt-3 flex gap-2"><input className="store-input" id="collection-map-video-initial-reference" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoInitialReferenceImagePath: event.target.value } }))} placeholder="Optional image path" value={selectedNode.config?.videoInitialReferenceImagePath || ''} /><button className="ghost-button" onClick={() => chooseCollectionMapInitialReferenceImage(selectedNode.id)} type="button">Choose</button></div></div></div><p className="mt-3 text-xs leading-5 text-cyan-100/80">Later accepted clips use the previous generated clip last frame as the next reference image. The current text item still becomes the prompt for each clip.</p></div> : null}</div> : null}
                         {showCollectionMapVideoGenerationFields ? <div className="grid gap-3 sm:grid-cols-3"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-fps">FPS</label><input className="store-input mt-3" id="collection-map-video-fps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, videoFps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.videoFps || 15} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-steps">Steps</label><input className="store-input mt-3" id="collection-map-video-steps" min="1" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, steps: Number(event.target.value || 0) || 0 } }))} type="number" value={selectedNode.config?.steps || 24} /></div><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-video-seed">Seed</label><input className="store-input mt-3" id="collection-map-video-seed" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, seed: Number(event.target.value || -1) } }))} type="number" value={selectedNode.config?.seed ?? -1} /></div></div> : null}

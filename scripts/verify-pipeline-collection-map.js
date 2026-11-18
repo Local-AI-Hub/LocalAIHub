@@ -200,6 +200,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
                   torchVersion: isChatterbox ? '2.6.0+cu124' : '',
                 } : undefined,
                 audioTransformation: request.operationId === 'audioTransform' ? {
+                  rvcInference: request.rvcInference,
                   operationId: request.operationId,
                   targetVoice: request.model || '',
                   toolLabel: _tool.name,
@@ -310,7 +311,7 @@ if (request === './localImageService') {
           fs.mkdirSync(TEST_STORAGE_ROOT, { recursive: true });
           const outputPath = path.join(TEST_STORAGE_ROOT, 'upscayl-' + Date.now() + '-' + Math.random().toString(16).slice(2) + '.png');
           fs.writeFileSync(outputPath, Buffer.from(ONE_PIXEL_PNG, 'base64'));
-          return { outputs: { image: { filePath: outputPath, fileName: path.basename(outputPath), imageTransformation: { operationId: request.operationId, toolLabel: _tool.name, transformSubtype: request.transformSubtype || 'upscale' }, kind: 'image', role: 'generated' } }, preview: 'image', message: 'Transformed image.' };
+          return { outputs: { image: { filePath: outputPath, fileName: path.basename(outputPath), imageTransformation: { scale: request.scale, operationId: request.operationId, toolLabel: _tool.name, transformSubtype: request.transformSubtype || 'upscale' }, kind: 'image', role: 'generated' } }, preview: 'image', message: 'Transformed image.' };
         },
       };
     }
@@ -1483,6 +1484,7 @@ async function main() {
       mappingId: 'imageToImage',
       operationId: PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM,
       toolId: 'upscayl',
+      scale: 3,
       transformSubtype: 'upscale',
     },
   });
@@ -1492,6 +1494,7 @@ async function main() {
   assert.strictEqual(imageToImageSnapshot.status, 'completed', imageToImageSnapshot.message);
   const imageToImageCollection = imageToImageSnapshot.nodeStates['map-collection'].outputs.collection;
   assert.strictEqual(imageToImageCollection.itemKind, 'image');
+  assert.equal(imageToImageCollection.items[0].artifact.imageTransformation.scale, 3);
   assert.strictEqual(imageToImageCollection.collectionMapping.mappingId, 'imageToImage');
   assert.strictEqual(imageToImageCollection.items[0].artifact.imageTransformation.operationId, PIPELINE_OPERATION_IDS.IMAGE_TRANSFORM, 'image-to-image item metadata should name image transformation.');
 
@@ -1522,6 +1525,7 @@ async function main() {
   assert(/source-a/.test(audioToTextCollection.items[0].artifact.text), 'audio-to-text should emit transcript text in order.');
 
   mockedInstalledTools = [createTool('rvc', 'RVC', { downloadedModels: [{ id: 'voice.pth', name: 'voice.pth', fileName: 'voice.pth', modelType: 'rvc-voice' }] })];
+  const rvcInference = { pitchChange: -7, pitchMethod: 'harvest', indexRate: 0, rmsMixRate: 1, protect: 0 };
   const audioToAudioPipeline = buildCollectionInputMapPipeline({
     itemType: 'audio',
     items: [
@@ -1532,6 +1536,7 @@ async function main() {
       executionMode: 'localTool',
       mappingId: 'audioToAudio',
       operationId: PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM,
+      rvcInference,
       toolId: 'rvc',
       model: 'voice.pth',
     },
@@ -1541,6 +1546,9 @@ async function main() {
   const audioToAudioSnapshot = await waitForRunToFinish();
   assert.strictEqual(audioToAudioSnapshot.status, 'completed', audioToAudioSnapshot.message);
   const audioToAudioCollection = audioToAudioSnapshot.nodeStates['map-collection'].outputs.collection;
+  for (const item of audioToAudioCollection.items) {
+    assert.deepStrictEqual(item.artifact.audioTransformation.rvcInference, rvcInference);
+  }
   assert.strictEqual(audioToAudioCollection.itemKind, 'audio');
   assert.strictEqual(audioToAudioCollection.collectionMapping.mappingId, 'audioToAudio');
   assert.strictEqual(audioToAudioCollection.items[0].artifact.audioTransformation.operationId, PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM, 'audio-to-audio item metadata should name RVC audio transform.');

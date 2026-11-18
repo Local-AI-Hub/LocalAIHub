@@ -1,4 +1,5 @@
 const path = require('path');
+const { normalizeRvcInference } = require('../shared/rvcInference.cjs');
 const fs = require('fs-extra');
 const { pathToFileURL } = require('url');
 
@@ -515,6 +516,7 @@ function serializeAudioTransformationForUi(transformation = null) {
     operationId: String(transformation.operationId || '').trim(),
     operationSubtype: String(transformation.operationSubtype || transformation.transformationType || '').trim(),
     sourceAudio: serializeAudioSourceReference(transformation.sourceAudio),
+    ...(transformation.rvcInference ? { rvcInference: normalizeRvcInference(transformation.rvcInference) } : {}),
     targetVoice: String(transformation.targetVoice || '').trim(),
     toolId: String(transformation.toolId || '').trim(),
     toolLabel: String(transformation.toolLabel || '').trim(),

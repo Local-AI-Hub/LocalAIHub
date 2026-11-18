@@ -736,6 +736,8 @@ function normalizeStructuredResponseFormat(value = {}) {
 
 function buildGoogleGenerationConfig(provider, payload = {}) {
   const config = {};
+  if (payload.temperature !== undefined) config.temperature = payload.temperature;
+  if (payload.topP !== undefined) config.topP = payload.topP;
   const maxOutputTokens = normalizeProviderMaxOutputTokens(payload.maxOutputTokens, provider.configuration?.maxOutputTokens);
   if (maxOutputTokens) {
     config.maxOutputTokens = maxOutputTokens;
@@ -900,6 +902,8 @@ async function sendOpenAICompatibleChat(provider, apiKey, payload) {
         content: toOpenAiCompatibleContent(message.content),
       })),
       stream: false,
+      temperature: payload.temperature,
+      top_p: payload.topP,
       ...(normalizeProviderMaxOutputTokens(payload.maxOutputTokens) ? { max_tokens: normalizeProviderMaxOutputTokens(payload.maxOutputTokens) } : {}),
       ...(structuredResponseFormat ? { response_format: structuredResponseFormat } : {}),
       ...(groqStructuredGptOss ? { include_reasoning: false, reasoning_effort: 'low' } : {}),
@@ -959,6 +963,8 @@ async function sendAnthropicChat(provider, apiKey, payload) {
     body: JSON.stringify({
       model: payload.model,
       max_tokens: normalizeProviderMaxOutputTokens(payload.maxOutputTokens, provider.configuration?.maxOutputTokens || 512),
+      temperature: payload.temperature,
+      top_p: payload.topP,
       messages: conversation,
       ...(systemMessages.length ? { system: systemMessages.join('\n\n') } : {}),
     }),
@@ -2500,7 +2506,9 @@ async function chatWithProvider(providerId, payload = {}) {
       model,
       timeoutMessage: payload.timeoutMessage,
       timeoutMs: payload.timeoutMs,
-      maxOutputTokens: payload.maxOutputTokens,
+      temperature: payload.cloudInference?.temperature,
+      topP: payload.cloudInference?.topP,
+      maxOutputTokens: payload.cloudInference?.maxOutputTokens ?? payload.maxOutputTokens,
       responseFormat: payload.responseFormat,
     };
     let result = null;
@@ -2544,7 +2552,7 @@ async function chatWithProvider(providerId, payload = {}) {
 
 async function runProviderOperation(providerId, payload = {}) {
   const operationId = normalizeProviderOperationId(payload.operationId);
-  if (!operationId || operationId === PIPELINE_OPERATION_IDS.LLM_PROMPT) {
+  if (!operationId || operationId === PIPELINE_OPERATION_IDS.LLM_PROMPT || operationId === PIPELINE_OPERATION_IDS.IMAGE_ANALYZE) {
     return chatWithProvider(providerId, payload);
   }
 

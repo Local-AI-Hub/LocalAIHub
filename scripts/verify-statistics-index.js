@@ -9,6 +9,9 @@ process.env.LOCALAPPDATA = path.join(TEST_STORAGE_ROOT, 'Local');
 process.env.LOCALAIHUB_TEST_SECRET = 'statistics-index-secret-do-not-write';
 
 let sizeCallCount = 0;
+let liveResources = null;
+let duringSizeRead = null;
+let inventoryOptions = null;
 const fakeSizes = new Map();
 function setFakeSize(targetPath, sizeBytes) {
   fakeSizes.set(path.resolve(targetPath).toLowerCase(), sizeBytes);
@@ -42,12 +45,19 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
       return {
         detectStorageSnapshot: async () => [{ mount: path.parse(TEST_STORAGE_ROOT).root, freeBytes: 9000, sizeBytes: 12000 }],
         findDiskForPath: (disks) => disks[0] || null,
-        getLiveResourceUsage: async () => null,
+        getLiveResourceUsage: async (_path, options) => {
+          assert.strictEqual(options.includeDisk, false);
+          return liveResources;
+        },
       };
     }
     if (request === './modelService') {
       return {
-        listDownloadedModels: async (tool) => tool.fakeModels || [],
+        getOllamaModelsRoot: (tool) => tool.modelsRoot,
+        listDownloadedModels: async (tool, options) => {
+          inventoryOptions = options;
+          return tool.fakeModels || [];
+        },
         supportsModelManager: (tool) => Boolean(tool.modelManager),
       };
     }
@@ -55,6 +65,11 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
       return {
         calculatePathSize: async (targetPath) => {
           sizeCallCount += 1;
+          if (duringSizeRead) {
+            const callback = duringSizeRead;
+            duringSizeRead = null;
+            await callback();
+          }
           return getFakeSize(targetPath);
         },
       };
@@ -66,6 +81,7 @@ Module._load = function patchedModuleLoad(request, parent, isMain) {
 
 const { ensureStorage, getAppPaths } = require('../electron/services/configService');
 const {
+  recordVramSample,
   getStatisticsStorageSnapshot,
   getStatisticsSnapshot,
   invalidateStatisticsIndexSections,
@@ -139,6 +155,31 @@ async function main() {
   const full = await getStatisticsSnapshot([tool]);
   assert(full.sectionFreshness.storage.updatedAt, 'Full compatibility endpoint should include storage freshness.');
   assert(Array.isArray(full.toolBreakdown), 'Full compatibility endpoint should still include tool breakdown.');
+
+  const nested = path.join(tool.installDir.toUpperCase(), 'weights', 'voice.pth');
+  tool.fakeModels = [
+    { path: nested, sizeBytes: 80, indexPath: nested + '.index', indexSizeBytes: 20 },
+    { path: nested.toLowerCase(), sizeBytes: 80 },
+    { path: path.join(tool.installDir + '-external', 'model.gguf'), sizeBytes: 150 },
+  ];
+  const mixed = await getStatisticsStorageSnapshot([tool], { forceRefresh: true });
+  assert.strictEqual(inventoryOptions.forceRefresh, true);
+  assert.strictEqual(mixed.toolBreakdown[0].modelBytes, 250);
+  assert.strictEqual(mixed.toolBreakdown[0].installBytes, 400);
+  assert.strictEqual(mixed.toolBreakdown[0].totalBytes, 650);
+  const ollama = { ...tool, id: 'ollama', modelsRoot: path.join(tool.installDir, 'models') };
+  setFakeSize(ollama.modelsRoot, 75);
+  const shared = await getStatisticsStorageSnapshot([ollama]);
+  assert.strictEqual(shared.toolBreakdown[0].modelBytes, 75);
+  assert.strictEqual(shared.toolBreakdown[0].totalBytes, 500);
+
+  duringSizeRead = () => invalidateStatisticsIndexSections(['storage'], 'changed-during-scan');
+  await getStatisticsStorageSnapshot([tool], { forceRefresh: true });
+  assert((await _test.readStatisticsIndex()).index.sections.storage.invalidatedAt);
+  liveResources = { vramUsedMb: null, vramTotalMb: 1024 };
+  assert.strictEqual((await recordVramSample([tool])).vramHistory.length, 0);
+  liveResources.vramUsedMb = 0;
+  assert.strictEqual((await recordVramSample([tool])).vramHistory.length, 1);
 
   const indexText = fs.readFileSync(indexPath, 'utf8');
   assert(!indexText.includes(process.env.LOCALAIHUB_TEST_SECRET), 'Statistics index must not write environment secrets.');

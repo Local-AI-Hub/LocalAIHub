@@ -33,6 +33,8 @@ function createSystemAudioHarness(recordingsRoot, options = {}) {
   const captureAdapter = {
     async start(config) {
       starts.push(config);
+      options.startEntered?.resolve();
+      await options.startGate?.promise;
       const closed = createDeferred();
       const capture = {
         closed,
@@ -62,6 +64,7 @@ function createSystemAudioHarness(recordingsRoot, options = {}) {
   };
   const service = createSystemAudioRecordingService({
     captureAdapter,
+    fs: options.fs,
     ensureStorage: async () => ({ recordingsRoot }),
     getAppPaths: () => ({ recordingsRoot }),
     now: (() => {
@@ -103,6 +106,7 @@ function createHarness(recordingsRoot, options = {}) {
   const fsProxy = Object.create(fs);
   fsProxy.writeJson = async (...args) => {
     if (currentChild) stopOrder.push('metadata-write');
+    if (options.failFinalWrite && args[1]?.stoppedAt) throw new Error('simulated disk full');
     return fs.writeJson(...args);
   };
   fsProxy.readdir = async (...args) => {
@@ -136,7 +140,7 @@ function createHarness(recordingsRoot, options = {}) {
           if (value === 'q\n' && options.closeOnQ !== false) {
             await fs.ensureDir(path.dirname(outputPath));
             await fs.writeFile(outputPath, options.outputContent || 'recording-data');
-            setImmediate(() => target.emit('close', options.gracefulExitCode ?? 0, null));
+            setImmediate(() => target.emit('close', options.exitSignal ? null : options.gracefulExitCode ?? 0, options.exitSignal || null));
           }
         },
       });
@@ -145,7 +149,7 @@ function createHarness(recordingsRoot, options = {}) {
     },
     terminateProcessTree: async (_pid, force) => {
       terminationCalls.push(force ? 'force' : 'graceful-tree');
-      if (force && currentChild) {
+      if (force && currentChild && !options.ignoreTermination) {
         const outputPath = spawnCalls[spawnCalls.length - 1].args.at(-1);
         await fs.ensureDir(path.dirname(outputPath));
         await fs.writeFile(outputPath, 'interrupted-data');
@@ -194,6 +198,13 @@ function verifyCommands() {
     if (config.webcam) { assert.strictEqual(args.at(-1), 'pipe:1'); assert.strictEqual(args.filter(arg => arg === 'video=USB Camera').length, 1); }
     assert(args.includes('-f'), `${mode} should select explicit input formats.`);
     if (mode !== 'microphone') assert(args.includes('libx264'), `${mode} should use software H.264 encoding.`);
+  }
+
+  for (const config of Object.values(modes).filter(entry => entry.microphone)) {
+    const named = { ...microphone, alternativeName: '@device_cm_selected', duplicateIndex: 1 };
+    assert(_test.buildRecordingCommand({ ...config, microphone: named }, output).includes('audio=@device_cm_selected'));
+    const fallback = _test.buildRecordingCommand({ ...config, microphone: { ...microphone, duplicateIndex: 1 } }, output);
+    assert.deepStrictEqual(fallback.slice(fallback.indexOf('-audio_device_number'), fallback.indexOf('-audio_device_number') + 2), ['-audio_device_number', '1']);
   }
 
   const desktopArgs = _test.buildRecordingCommand(modes.screen, output);
@@ -305,6 +316,25 @@ async function verifyLifecycle(tempRoot) {
   assert.strictEqual(Object.prototype.hasOwnProperty.call(completedSidecar, 'outputPath'), false, 'Sidecars should not persist absolute output paths.');
   assert.strictEqual(_test.buildRecordingFailureMessage('Access is denied'), 'Windows denied access to the selected recording device. Check privacy permissions and try again.', 'Raw FFmpeg permission errors should be converted to plain English.');
 
+  const signaled = createHarness(path.join(tempRoot, 'signal'), { exitSignal: 'SIGTERM' });
+  await signaled.service.startRecording({ mode: 'screen' });
+  const signaledResult = await signaled.service.stopRecording();
+  assert.strictEqual(signaledResult.status, 'interrupted');
+  assert.strictEqual(signaledResult.exitCode, null);
+
+  const diskFull = createHarness(path.join(tempRoot, 'disk-full'), { failFinalWrite: true });
+  await diskFull.service.startRecording({ mode: 'screen' });
+  assert.strictEqual((await diskFull.service.stopRecording()).status, 'interrupted');
+  assert.strictEqual(diskFull.service.getActiveRecording(), null);
+  assert.match(diskFull.events.at(-1).message, /disk space/);
+
+  const stillRunning = createHarness(path.join(tempRoot, 'stop-timeout'), { closeOnQ: false, ignoreTermination: true });
+  await stillRunning.service.startRecording({ mode: 'screen' });
+  await assert.rejects(stillRunning.service.stopRecording(), /not confirmed/);
+  assert(stillRunning.service.getActiveRecording(), 'A termination timeout must retain the active capture.');
+  stillRunning.getChild().emit('close', null, 'SIGTERM');
+  assert.strictEqual((await stillRunning.service.stopRecording()).status, 'interrupted');
+
   const regionHarness = createHarness(path.join(tempRoot, 'region-recordings'));
   await getDevices(regionHarness.service);
   const regionStarted = await regionHarness.service.startRecording({
@@ -369,6 +399,31 @@ async function verifySystemAudioLifecycle(tempRoot) {
   const sidecar = await fs.readJson(sidecarPath);
   assert.strictEqual(sidecar.backend, 'electron', 'Electron sidecars should persist backend metadata.');
   assert.strictEqual(Object.prototype.hasOwnProperty.call(sidecar, 'outputPath'), false, 'Electron sidecars must not persist absolute output paths.');
+
+  const config = { mode: 'systemAudio', systemAudio: true, displayId: 'display-primary' };
+  const startGate = createDeferred();
+  const startEntered = createDeferred();
+  const pending = createSystemAudioHarness(path.join(tempRoot, 'pending-start'), { startGate, startEntered });
+  const pendingStart = pending.service.startRecording(config, { displays });
+  await startEntered.promise;
+  const pendingStop = pending.service.stopRecording();
+  startGate.resolve();
+  await pendingStart;
+  assert.strictEqual((await pendingStop).status, 'completed', 'Stop during startup must reach the capture session.');
+
+  const failingFs = Object.create(fs);
+  let rejectWrite = true;
+  failingFs.writeJson = (...args) => rejectWrite ? Promise.reject(new Error('disk full')) : fs.writeJson(...args);
+  const diskFull = createSystemAudioHarness(path.join(tempRoot, 'system-audio-write-failure'), { fs: failingFs });
+  await assert.rejects(diskFull.service.startRecording(config, { displays }));
+  assert.strictEqual(diskFull.service.getActiveRecording(), null);
+  rejectWrite = false;
+  await diskFull.service.startRecording(config, { displays });
+  rejectWrite = true;
+  const diskResult = await diskFull.service.stopRecording();
+  assert.strictEqual(diskResult.status, 'interrupted');
+  assert.strictEqual(diskFull.service.getActiveRecording(), null);
+  assert.match(diskFull.events.at(-1).message, /disk space/);
 
   const listingService = createRecordingService({
     ensureStorage: async () => ({ recordingsRoot }),

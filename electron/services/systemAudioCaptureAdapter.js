@@ -14,6 +14,8 @@ function createDeferred() {
     resolve = resolvePromise;
     reject = rejectPromise;
   });
+  // A capture window can close before startup reaches this handshake.
+  promise.catch(() => {});
   return { promise, resolve, reject };
 }
 
@@ -45,20 +47,29 @@ function createSystemAudioCaptureAdapter(dependencies = {}) {
   async function closeOutput(capture) {
     if (capture.outputClosed) return;
     capture.outputClosed = true;
-    await capture.writeQueue.catch(() => null);
-    await capture.outputHandle?.sync().catch(() => null);
-    await capture.outputHandle?.close().catch(() => null);
+    try {
+      await capture.writeQueue;
+      await capture.outputHandle.sync();
+    } finally {
+      await capture.outputHandle.close();
+    }
   }
 
   async function finish(capture, result = {}) {
     if (!capture || capture.finished) return capture?.closed.promise;
     capture.finished = true;
-    const startupError = String(result.error || '').replace(/[\\r\\n\\0]+/g, ' ').trim().slice(0, 500);
     if (!capture.startedDone) {
       capture.startedDone = true;
-      capture.started.reject(new Error(startupError || 'Electron system-audio capture stopped before it became active.'));
+      const error = new Error(result.error || 'Electron system-audio capture stopped before it became active.');
+      capture.ready.reject(error);
+      capture.configured.reject(error);
+      capture.started.reject(error);
     }
-    await closeOutput(capture);
+    try {
+      await closeOutput(capture);
+    } catch {
+      result = { ...result, clean: false, error: 'Windows could not finish writing the recording. Check the recordings folder and available disk space.' };
+    }
     const payload = {
       clean: Boolean(result.clean),
       reason: result.reason || (result.clean ? 'media-recorder-stop' : 'capture-window-exit'),
@@ -114,7 +125,7 @@ function createSystemAudioCaptureAdapter(dependencies = {}) {
       if (bytes.length > MAX_CHUNK_BYTES) {
         throw new Error('Electron produced an unexpectedly large recording chunk.');
       }
-      capture.writeQueue = capture.writeQueue.then(() => capture.outputHandle.write(bytes));
+      capture.writeQueue = capture.writeQueue.then(() => capture.outputHandle.writeFile(bytes));
       await capture.writeQueue;
       return { ok: true };
     });

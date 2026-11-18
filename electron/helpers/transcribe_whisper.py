@@ -71,11 +71,11 @@ def build_failure_message(attempt_failures) -> str:
     return f'Whisper could not transcribe this file: {last_error}'
 
 
-def transcribe_once(audio_path: str, model_name: str, cache_dir: str, device: str, compute_type: str):
+def transcribe_once(audio_path: str, model_name: str, cache_dir: str, device: str, compute_type: str, options=None):
     from faster_whisper import WhisperModel
 
     model = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=cache_dir)
-    segments, info = model.transcribe(audio_path, vad_filter=True)
+    segments, info = model.transcribe(audio_path, **{"vad_filter": True, **(options or {})})
     collected_segments = []
     for segment in segments:
         collected_segments.append(
@@ -108,6 +108,7 @@ def main() -> None:
     if not os.path.exists(audio_path):
         fail('The selected audio file could not be found.')
 
+    options = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
     os.makedirs(cache_dir, exist_ok=True)
 
     attempt_failures = []
@@ -115,7 +116,7 @@ def main() -> None:
 
     for device, compute_type in TRANSCRIPTION_ATTEMPTS:
         try:
-            transcription = transcribe_once(audio_path, model_name, cache_dir, device, compute_type)
+            transcription = transcribe_once(audio_path, model_name, cache_dir, device, compute_type, options)
             if runtime_note:
                 transcription['runtimeNote'] = runtime_note
             print(json.dumps(transcription, ensure_ascii=False))

@@ -111,7 +111,7 @@ $env:PYTHONPATH = $stubsRoot
 $env:WHISPER_STUB_LOG_PATH = $attemptLogPath
 
 try {
-  $output = & $pythonCommand @pythonArgs $helperPath $audioPath 'tiny' $cacheDir 2>&1
+  $output = & $pythonCommand @pythonArgs $helperPath $audioPath 'tiny' $cacheDir '{"vad_filter":false}' 2>&1
   $exitCode = $LASTEXITCODE
 } finally {
   if ($null -ne $previousPythonPath) {
@@ -138,6 +138,7 @@ Assert-Condition ($payload.text -eq 'Hello from CPU fallback.') 'Expected the he
 Assert-Condition ($payload.runtimeNote -like '*CPU mode*') 'Expected the helper to report that it switched to CPU mode.'
 
 $attempts = Get-Content $attemptLogPath -Raw | ConvertFrom-Json
+Assert-Condition (@($attempts | Where-Object { $_.stage -eq 'transcribe' -and $_.vadFilter }).Count -eq 0) 'Whisper should preserve the VAD override on every attempt.'
 $attemptLabels = @($attempts | ForEach-Object { "$($_.stage):$($_.device):$($_.computeType)" })
 $expectedLabels = @(
   'init:cuda:float16',

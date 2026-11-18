@@ -525,6 +525,9 @@ function inferImageArtifact(artifact) {
   const explicitModelType = explicitType ? normalizeModelType(explicitType) : null;
   if ((!isPytorchWeight && (combined.includes('upscaler') || combined.includes('realesrgan') || combined.includes('esrgan'))) || (isPytorchWeight && hasExplicitUpscalerContext(artifact))) return { artifactKind: 'upscaler', artifactLabel: 'Upscaler', modelType: 'Upscaler' };
   if (combined.includes('inpaint')) return { artifactKind: 'inpainting', artifactLabel: 'Inpainting', modelType: 'Inpainting' };
+  if (/^diffusion_pytorch_model(?:[._-][a-z0-9]+)*\.(?:safetensors|bin)$/i.test(fileName)) {
+    return { rejected: true, artifactKind: 'support-file', artifactLabel: 'Diffusers weights', modelType: 'Support file', reason: 'These Diffusers weights do not identify a standalone checkpoint. Choose a model file labeled for this target.' };
+  }
   if (extension === '.safetensors' || extension === '.ckpt') return { artifactKind: 'checkpoint', artifactLabel: 'Checkpoint', modelType: 'Checkpoint' };
   if (isPytorchWeight && explicitModelType === 'Checkpoint') return { artifactKind: 'checkpoint', artifactLabel: 'Checkpoint', modelType: 'Checkpoint' };
   if (isPytorchWeight) return { rejected: true, artifactKind: 'generic-pytorch-weight', artifactLabel: 'Generic PyTorch weight', modelType: 'PyTorch weight', reason: (fileName || 'This .pt/.pth file') + ' is not clearly labeled as a supported image model type. Local AI Hub will not install arbitrary PyTorch weight files as upscalers.' };

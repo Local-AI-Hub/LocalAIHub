@@ -182,10 +182,7 @@ function verifySignedManifest(rawManifestText, rawSignatureText) {
 async function readManifestFile(manifestPath, signaturePath) {
   const rawManifestText = await readTextFile(manifestPath);
   if (!rawManifestText.trim()) {
-    return {
-      hash: null,
-      manifest: [],
-    };
+    throw new Error('The tool catalog file is missing or empty.');
   }
 
   const rawSignatureText = await readTextFile(signaturePath);
@@ -193,6 +190,8 @@ async function readManifestFile(manifestPath, signaturePath) {
   return {
     hash,
     manifest: normalizeManifest(JSON.parse(rawManifestText)),
+    rawManifestText,
+    rawSignatureText,
   };
 }
 
@@ -246,16 +245,8 @@ async function fetchRemoteManifest() {
   };
 }
 
-async function syncBundledManifestCache(logger) {
+async function syncBundledManifestCache({ rawManifestText, rawSignatureText }, logger) {
   try {
-    const bundledManifestPath = getBundledManifestPath();
-    const bundledSignaturePath = getBundledManifestSignaturePath();
-    const [rawManifestText, rawSignatureText] = await Promise.all([
-      readTextFile(bundledManifestPath),
-      readTextFile(bundledSignaturePath),
-    ]);
-
-    verifySignedManifest(rawManifestText, rawSignatureText);
     await writeCachedManifest(rawManifestText, rawSignatureText);
   } catch (error) {
     await logger.warn('The bundled tool manifest was loaded, but Local AI Hub could not refresh its local manifest cache.', {
@@ -281,7 +272,7 @@ async function ensureManifestSeed(logger) {
       verified: true,
       warning: null,
     };
-    await syncBundledManifestCache(logger);
+    await syncBundledManifestCache(bundledManifest, logger);
     return loadedManifest;
   } catch (error) {
     await logger.warn('The bundled tool manifest could not be loaded or verified.', {

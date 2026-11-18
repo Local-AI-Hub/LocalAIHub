@@ -27,7 +27,7 @@ export function evaluateCompatibility(manifest, hardware) {
 
   if (vramMb >= minimumVramMb && ramMb >= minimumRamMb) {
     return {
-      label: minimumVramMb >= 6144 ? 'Low VRAM mode' : 'Supported',
+      label: minimumVramMb >= 6144 && vramMb < recommendedVramMb ? 'Low VRAM mode' : 'Supported',
       tone: 'info',
       message:
         recommendedVramMb >= 16384
@@ -36,21 +36,13 @@ export function evaluateCompatibility(manifest, hardware) {
     };
   }
 
-  if (vramMb >= minimumVramMb || ramMb >= minimumRamMb) {
-    return {
-      label: 'Limited',
-      tone: 'warn',
-      message:
-        recommendedVramMb >= 16384
-          ? 'Local AI Hub can install it, but this workload is best on a high-VRAM GPU and may be heavily constrained here.'
-          : 'Local AI Hub can install it, but you will need conservative settings.',
-    };
-  }
-
+  const shortfalls = [];
+  if (vramMb < minimumVramMb) shortfalls.push(`${formatMemory(minimumVramMb)} VRAM`);
+  if (ramMb < minimumRamMb) shortfalls.push(`${formatMemory(minimumRamMb)} system RAM`);
   return {
     label: 'Below spec',
-    tone: 'danger',
-    message: 'Install is still possible, but this machine is below the normal target range.',
+    tone: 'warn',
+    message: `This tool lists a minimum of ${shortfalls.join(' and ')}. This machine falls below that requirement.`,
   };
 }
 
@@ -75,7 +67,7 @@ export function compatibilityClass(tone) {
 }
 
 export function toolSearchText(manifest) {
-  return [manifest.name, manifest.description, manifest.category].filter(Boolean).join(' ').toLowerCase();
+  return [manifest.id, manifest.name, manifest.description, manifest.category].filter(Boolean).join(' ').toLowerCase();
 }
 
 export function describeRequirements(manifest) {
@@ -95,3 +87,41 @@ export function describeRequirements(manifest) {
   return parts.join(' | ') || 'No hardware guidance available.';
 }
 
+
+export function getInstallCapabilities(manifest) {
+  return Array.isArray(manifest?.installCapabilities) && manifest.installCapabilities.length
+    ? manifest.installCapabilities
+    : [
+        {
+          id: 'default',
+          label: manifest?.installContract?.lifecycleMode === 'official-installer' ? 'Desktop App' : 'WebUI',
+          installLabel: manifest?.installContract?.lifecycleMode === 'official-installer' ? 'Install Desktop App' : 'Install',
+          installedLabel: 'Installed',
+        },
+      ];
+}
+
+export function capabilityIsInstalled(tool, capabilityId) {
+  if (!tool) {
+    return false;
+  }
+
+  const capability = String(capabilityId || 'webui').trim().toLowerCase();
+  if (capability === 'default') {
+    return Boolean(tool);
+  }
+
+  if (tool.installedCapabilities && Object.prototype.hasOwnProperty.call(tool.installedCapabilities, capability)) {
+    return Boolean(tool.installedCapabilities[capability]);
+  }
+
+  if (capability === 'desktop') {
+    return Boolean(tool.desktopCompanion?.installed || (tool.launchModes || []).some((mode) => mode.id === 'desktop'));
+  }
+
+  if (capability === 'webui') {
+    return Boolean(tool.source === 'managed' || (tool.launchModes || []).some((mode) => mode.id === 'webui'));
+  }
+
+  return true;
+}

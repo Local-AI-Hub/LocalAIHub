@@ -183,7 +183,7 @@ def main() -> None:
 
     try:
         model = ChatterboxTurboTTS.from_pretrained(device=device)
-        wav = model.generate(text, audio_prompt_path=str(reference_audio_path))
+        wav = model.generate(text, audio_prompt_path=str(reference_audio_path), **request.get("chatterboxOptions", {}))
         wav = normalize_waveform(wav)
         sample_rate = int(getattr(model, "sr", 0) or getattr(model, "sample_rate", 0) or 24000)
         torchaudio.save(str(output_path), wav, sample_rate)

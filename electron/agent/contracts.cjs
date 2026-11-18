@@ -6,15 +6,21 @@ function tool(name, description, properties = {}, required = [], mutating = fals
 }
 const TOOLS = [
   tool('hub_deliver_media', 'Deliver a saved audio/video file: link mode returns expiring playback/download URLs usable on the Hub PC, not uploaded attachments. Audio mode returns audio bytes up to 700 KB; playback depends on client support. Links expire after 30 minutes and are revoked when agent access stops.', { outputId: string, mode: { ...string, enum: ['link', 'audio'] } }, ['outputId']),
-  tool('hub_discovery', 'Discover configured provider capabilities, saved prompt/workflow presets and starter templates. Does not contact cloud providers.', { section: { ...string, enum: ['providers', 'presets', 'templates'] } }, ['section']),
+  tool('hub_discovery', 'Discover configured provider capabilities, saved prompt/workflow presets, starter templates, asset library item IDs and HyperFrames project IDs. Does not contact cloud providers.', { section: { ...string, enum: ['providers', 'presets', 'templates', 'assetLibraries', 'hyperframesProjects'] } }, ['section']),
   tool('hub_inspect_media', 'Inspect saved image, audio or video metadata. Optionally return a JPEG preview of an image or one video frame for visual inspection. No audio playback.', { outputId: string, preview: { type: 'boolean' }, timeSeconds: { type: 'number', minimum: 0, maximum: 86400 } }, ['outputId']),
   tool('hub_diagnostics', 'Get a bounded, redacted tool stdout/stderr tail and status. No arbitrary log paths.', { toolId: string, maxChars: { type: 'integer', minimum: 256, maximum: 16384 } }, ['toolId']),
   tool('hub_tool_action', 'Start or stop an installed tool as a background job. Blocked while a pipeline runs or another lifecycle action is pending. Launches are headless and may take minutes. Reuse requestId on retries. Poll hub_job_status.', { toolId: string, action: { ...string, enum: ['launch', 'stop'] }, requestId: string }, ['toolId', 'action', 'requestId'], true),
-  tool('hub_job_status', 'Read an agent tool lifecycle job. Job history lasts until the Hub exits.', { jobId: string }, ['jobId']),
+  tool('hub_model_manager', 'Discover installed Model Manager targets, supported sources and filters, system hardware and drive space.'),
+  tool('hub_model_search', 'Search a target catalog. Get selection IDs and artifact choices. Repeat the query with nextPage or nextCursor for more results.', { toolId: string, source: string, query: string, modelType: string, taskType: string, sort: { ...string, enum: ['most-downloaded', 'newest', 'highest-rated'] }, page: { type: 'integer', minimum: 1, maximum: 1000000 }, cursor: { ...string, maxLength: 8192 } }, ['toolId']),
+  tool('hub_model_preflight', 'Check space and destination for an exact catalog selection. Omit choiceIndex to use the recommended artifact.', { selectionId: string, choiceIndex: { type: 'integer', minimum: 0, maximum: 1000000 } }, ['selectionId']),
+  tool('hub_model_install', 'Install a catalog selection. Poll hub_job_status. Reuse requestId on retry. Set lowDiskConfirmed only after confirming the low-space warning.', { selectionId: string, choiceIndex: { type: 'integer', minimum: 0, maximum: 1000000 }, lowDiskConfirmed: { type: 'boolean' }, requestId: string }, ['selectionId', 'requestId'], true),
+  tool('hub_model_uninstall', 'Remove a local model and its owned files. Use the removalId from hub_models. Poll hub_job_status and reuse requestId on retry.', { toolId: string, removalId: string, requestId: string }, ['toolId', 'removalId', 'requestId'], true),
+  tool('hub_model_cancel_download', 'Request cancellation of an active agent model download by jobId. Poll hub_job_status for the outcome.', { jobId: string }, ['jobId'], true),
+  tool('hub_job_status', 'Read an agent model or tool lifecycle job. Job history lasts until the Hub exits.', { jobId: string }, ['jobId']),
   tool('hub_status', 'Inspect hardware, agent access, and the active pipeline run.'),
   tool('hub_tools', 'List installed tools with status. Does not launch them.'),
-  tool('hub_models', 'List downloaded models for an installed tool.', { toolId: string }, ['toolId']),
-  tool('hub_node_types', 'Discover pipeline node types. Supply type to get defaults, ports and a sample node.', { type: string }),
+  tool('hub_models', 'List downloaded models and removal IDs for an installed tool. Use offset and limit for large inventories.', { toolId: string, offset: { type: 'integer', minimum: 0, maximum: 1000000 }, limit: { type: 'integer', minimum: 1, maximum: 100 } }, ['toolId']),
+  tool('hub_node_types', 'Discover pipeline node types. Supply type for field schemas, inference options and backend choices. Optionally pass config to preview a configured node and ports.', { type: string, config: { type: 'object' } }),
   tool('hub_create_draft', 'Create an unsaved pipeline draft from node types, with real node IDs and default configurations.', { name: string, types: { type: 'array', items: string, minItems: 1, maxItems: 100 } }, ['name', 'types']),
   tool('hub_pipelines', 'List saved pipelines.'),
   tool('hub_get_pipeline', 'Get a saved pipeline definition.', { pipelineId: string }, ['pipelineId']),
@@ -37,7 +43,7 @@ function validateArguments(name, args) {
     const spec = properties[key];
     if (spec.enum && !spec.enum.includes(value)) throw new Error(key + ' must be one of: ' + spec.enum.join(', ') + '.');
     if (['number', 'integer'].includes(spec.type) && (typeof value !== 'number' || !Number.isFinite(value) || (spec.type === 'integer' && !Number.isInteger(value)) || value < spec.minimum || value > spec.maximum)) throw new Error(key + ' is outside the supported numeric range.');
-    if (spec.type === 'string' && (typeof value !== 'string' || !value.trim() || value.length > 200)) throw new Error(`${key} must be nonempty text of at most 200 characters.`);
+    if (spec.type === 'string' && (typeof value !== 'string' || !value.trim() || value.length > spec.maxLength)) throw new Error(`${key} must be nonempty text of at most ${spec.maxLength} characters.`);
     if (spec.type === 'boolean' && typeof value !== 'boolean') throw new Error(`${key} must be true or false.`);
     if (spec.type === 'object' && (!value || typeof value !== 'object' || Array.isArray(value))) throw new Error(`${key} must be an object.`);
     if (spec.type === 'array' && (!Array.isArray(value) || !value.length || value.length > 100 || value.some(v => typeof v !== 'string' || !v || v.length > 200))) throw new Error(`${key} must contain 1 to 100 node type names.`);

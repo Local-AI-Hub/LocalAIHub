@@ -1,6 +1,19 @@
 const { redactDiagnosticValue, redactSensitiveText } = require('./redactionService');
 const capabilities = require('../shared/pipelineCapabilities.cjs');
 async function discover(section) {
+  if (section === 'hyperframesProjects') {
+    const { projects } = await require('./hyperFramesProjectService').listHyperFramesProjects();
+    return projects.map(({ projectId, displayName }) => ({ projectId, displayName }));
+  }
+  if (section === 'assetLibraries') {
+    const { LIBRARY_TYPES, listAssetLibraries } = require('./assetLibraryService');
+    const result = {};
+    for (const type of Object.keys(LIBRARY_TYPES)) {
+      const libraries = await listAssetLibraries(type);
+      result[type] = libraries.map(({ id, name, items }) => ({ id, name, items: items.map(({ id, name }) => ({ id, name })) }));
+    }
+    return result;
+  }
   if (section === 'providers') {
     const providers = await require('./providerService').listProviderConnections();
     return providers.map(provider => ({ id: provider.id, name: provider.name, isConnected: provider.isConnected, selectedModel: provider.selectedModel, lastAvailableModelId: provider.lastAvailableModelId, capabilities: capabilities.getProviderPipelineCapabilities(provider.id) }));

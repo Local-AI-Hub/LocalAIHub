@@ -7,6 +7,7 @@ try {
   app = null;
 }
 
+const { normalizeRvcInference } = require('../shared/rvcInference.cjs');
 const { runCommand } = require('./commandService');
 const { prependManagedFfmpegBinToPath, resolveManagedFfmpegPaths } = require('./managedFfmpegService');
 const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
@@ -755,7 +756,9 @@ async function generateAudioWithRvcTool(tool, options = {}) {
   const nodeLabel = String(options.nodeLabel || options.displayName || 'Audio transform').trim() || 'Audio transform';
   const outputPath = buildAudioOutputPath(runDirectories, nodeLabel, 'wav');
   const requestPath = buildJsonRequestPath(runDirectories, nodeLabel, 'rvc-request');
+  const rvcInference = normalizeRvcInference(options.rvcInference);
   const response = await runLocalAudioTask(tool, {
+    rvcInference,
     instruction: String(options.instruction || '').trim(),
     model: voiceModel.model,
     nodeLabel,
@@ -781,6 +784,7 @@ async function generateAudioWithRvcTool(tool, options = {}) {
   const audioTransformation = {
     backend: 'rvc',
     backendLabel: 'RVC',
+    rvcInference,
     durationSeconds: Number(response?.durationSeconds || 0) || 0,
     instruction: String(options.instruction || '').trim(),
     model: String(response?.model || voiceModel.model || '').trim(),
@@ -841,6 +845,7 @@ async function generateAudioWithChatterboxTool(tool, options = {}) {
     outputPath,
     referenceAudioPath,
     requestPath,
+    chatterboxOptions: options.chatterboxOptions,
     text,
     toolRoot: resolveLocalAudioToolRoot(tool),
   }, options.reportProgress, {

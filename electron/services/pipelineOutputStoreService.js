@@ -152,6 +152,7 @@ function attachJsonArtifactDetails(artifact, filePath, stat) {
 async function buildDiscoveredTypedJsonArtifact(filePath, stat) {
   const normalizedFilePath = normalizePath(filePath);
   const normalizedLowerPath = normalizedFilePath.toLowerCase();
+  if (!/\.(packet|plan|preview|audit)\.json$/.test(normalizedLowerPath)) return null;
   const payload = await readJsonIfExists(normalizedFilePath);
   if (!payload || typeof payload !== 'object') {
     return null;

@@ -1,4 +1,4 @@
-const crypto = require('crypto');
+﻿const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs-extra');
 
@@ -6,7 +6,7 @@ const { chatWithOllama, inspectOllamaModel, inspectOllamaModelCapabilities } = r
 const { chatWithProvider, listProviderConnections, runProviderOperation } = require('./providerService');
 const { initializeProviderRegistry } = require('./providerRegistry');
 const { getToolCatalog } = require('./toolRegistry');
-const { readConfig, listGraphWorkflowPresets, listPromptStyles } = require('./configService');
+const { readConfig } = require('./configService');
 const { listAssetLibraries, resolveAssetLibraryPreviewFile } = require('./assetLibraryService');
 const { listDownloadedModels } = require('./modelService');
 const { buildMergedToolStateList, getResolvedToolState } = require('./toolStateService');
@@ -826,10 +826,11 @@ async function buildPipelineContext(definition = {}) {
     toolEntries = attachDownloadedToolModels(toolEntries, downloadedModelsByToolId);
   }
 
-  const promptStyles = typeof listPromptStyles === 'function' ? await listPromptStyles() : [];
+  const config = await readConfig();
+  const promptStyles = config.promptStyles || [];
   const context = buildContextMaps({
-    hardware: (await readConfig()).hardware || null,
-    graphWorkflowPresets: await listGraphWorkflowPresets(),
+    hardware: config.hardware || null,
+    graphWorkflowPresets: config.graphWorkflowPresets || [],
     providers: await listProviderConnections(),
     toolCatalog: getToolCatalog(),
     tools: toolEntries,
@@ -3608,6 +3609,7 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
         'Running ' + node.label + ' with Ollama...',
       );
       const result = await chatWithOllama(ollamaTool, {
+        options: node.config?.ollamaOptions,
         messages,
         model,
         ...(plannerResponseFormat ? { format: 'json' } : {}),
@@ -3620,6 +3622,7 @@ async function executePlannerNode(node, graph, run, contextMaps, reportProgress)
       'Running ' + node.label + ' with ' + providerLabel + '...',
     );
     const result = await chatWithProvider(providerId, {
+      cloudInference: node.config?.cloudInference,
       messages,
       model,
       timeoutMessage: providerLabel + ' took too long to answer this planner request. Try again or simplify the planning packet if the delay continues.',
@@ -3831,6 +3834,8 @@ function buildImageGenerationMetadata(node, executionTarget, promptRequest = {},
     backend: String(options.backend || executionTarget?.id || '').trim(),
     backendLabel: String(options.backendLabel || executionTarget?.name || '').trim(),
     cfgScale: node.config?.cfgScale,
+    samplerName: node.config?.samplerName,
+    scheduler: node.config?.scheduler,
     collectionMap: options.collectionMap && typeof options.collectionMap === 'object' ? serializeArtifactForUi(options.collectionMap) : null,
     extension: String(options.extension || '').trim(),
     height: Number(options.height || node.config?.height || 0) || 0,
@@ -4002,6 +4007,8 @@ async function generateMappedImageArtifact(node, inputArtifact, options = {}) {
     reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for image generation.', 'Running ' + node.label + '...');
     const generated = await generateImageWithWorkflowTool(tool, {
       cfgScale: node.config?.cfgScale,
+      samplerName: node.config?.samplerName,
+      scheduler: node.config?.scheduler,
       height: node.config?.height,
       model: String(node.config?.model || '').trim(),
       negativePrompt: promptRequest.negativePrompt,
@@ -4577,6 +4584,8 @@ function getCollectionMapPerItemValidationConfig(node) {
     mode: raw.mode === 'user' ? 'user' : 'llm',
     model: String(raw.model || '').trim(),
     providerId: String(raw.providerId || '').trim(),
+    cloudInference: raw.cloudInference,
+    ollamaOptions: raw.ollamaOptions,
     retryInstruction: String(raw.retryInstruction || '').trim(),
     ruleset: String(raw.ruleset || '').trim(),
     systemPrompt: String(raw.systemPrompt || '').trim(),
@@ -4608,6 +4617,8 @@ function buildCollectionMapValidationNode(node, validationConfig) {
       llmExecutionMode: validationConfig.llmExecutionMode,
       mode: 'llm',
       model: validationConfig.model,
+      cloudInference: validationConfig.cloudInference,
+      ollamaOptions: validationConfig.ollamaOptions,
       providerId: validationConfig.providerId,
       ruleset: validationConfig.ruleset,
       systemPrompt: validationConfig.systemPrompt,
@@ -5281,6 +5292,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
         promptStyle: audioRequest.promptStyle,
         referenceAudioArtifact: audioRequest.referenceAudioArtifact,
         referenceAudioPath: audioRequest.referenceAudioPath,
+        chatterboxOptions: node.config?.chatterboxOptions,
         reportProgress,
         runDirectories: run.directories,
         sourceAudioArtifact: audioRequest.sourceAudioArtifact,
@@ -5318,6 +5330,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
       const result = await transcribeWithWhisper(tool, {
         audioPath: inputArtifact.filePath,
         model: model || DEFAULT_WHISPER_MODEL,
+        whisperOptions: node.config?.whisperOptions,
       });
       const transcript = String(result?.text || '').trim();
       if (!transcript) {
@@ -5339,14 +5352,12 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
       reportProgress?.('Sending ' + itemLabel + ' to ' + tool.name + ' for local audio transformation.', 'Running ' + node.label + '...');
       const result = await generateAudioWithLocalAudioTool(tool, {
         displayName: node.label + ' item ' + String(itemIndex + 1),
-        instruction: audioRequest.instruction,
         model,
         nodeLabel: node.label,
         operationId,
         reportProgress,
         runDirectories: run.directories,
-        sourceAudioArtifact: audioRequest.sourceAudioArtifact,
-        sourceAudioPath: audioRequest.sourceAudioPath,
+        ...audioRequest,
         voiceModel: selectedVoiceModel,
       });
       return result?.outputs?.audio || null;
@@ -5397,6 +5408,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
         sourceImageArtifact: imageRequest.sourceImageArtifact,
         sourceImagePath: imageRequest.sourceImagePath,
         transformSubtype: imageRequest.transformSubtype,
+        scale: node.config?.scale,
       });
       return result?.outputs?.image || null;
     }
@@ -5462,6 +5474,7 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
     const messages = await buildLlmMessages(operationNode, inputArtifact);
     reportProgress?.('Sending ' + itemLabel + ' to ' + provider.name + ' for image analysis.', 'Running ' + node.label + '...');
     const result = await runProviderOperation(providerId, {
+      cloudInference: node.config?.cloudInference,
       messages,
       model,
       operationId,
@@ -5812,6 +5825,13 @@ async function buildVideoGenerationRequest(node, inputArtifact, contextMaps = {}
   const motionPrompt = String(node.config?.instruction || '').trim();
   const referenceImageArtifact = options.referenceImageArtifact || null;
   const enforceReferenceImageSize = node.config?.executionMode !== 'cloud';
+  const hasImage = inputArtifact.kind === PORT_KIND_IMAGE || Boolean(referenceImageArtifact);
+  if (node.config?.videoOperationMode === 'imageToVideo' && !hasImage) {
+    throw new Error('Connect an image to use image-to-video mode.');
+  }
+  if (node.config?.videoOperationMode === 'textToVideo' && hasImage) {
+    throw new Error('Connect a text prompt without a reference image to use text-to-video mode.');
+  }
 
   if (inputArtifact.kind === PORT_KIND_TEXT) {
     const promptText = String(inputArtifact.text || '').trim();
@@ -6000,6 +6020,7 @@ async function buildAudioTransformRequest(node, inputArtifact) {
 
   return {
     instruction: String(node.config?.instruction || '').trim(),
+    rvcInference: node.config?.rvcInference,
     sourceAudioArtifact: inputArtifact,
     sourceAudioPath,
   };
@@ -7184,6 +7205,7 @@ async function executeLlmValidationReview(node, artifact, contextMaps, reportPro
       await ensureOllamaImageModelSupport(contextMaps, ollamaTool, model);
     }
     const result = await chatWithOllama(ollamaTool, {
+      options: node.config?.ollamaOptions,
       messages,
       model,
     });
@@ -7201,6 +7223,7 @@ async function executeLlmValidationReview(node, artifact, contextMaps, reportPro
 
     reportProgress?.(options.progressMessage || `Sending the content to ${provider.name} for validation.`, options.progressTitle || `Running ${node.label} with ${provider.name}...`);
     const result = await chatWithProvider(providerId, {
+      cloudInference: node.config?.cloudInference,
       messages,
       model,
       providerId,
@@ -9596,6 +9619,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         await ensureOllamaImageModelSupport(contextMaps, ollamaTool, model);
       }
       const result = await chatWithOllama(ollamaTool, {
+        options: node.config?.ollamaOptions,
         messages,
         model,
       });
@@ -9644,6 +9668,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           promptStyle: audioRequest.promptStyle,
           referenceAudioArtifact: audioRequest.referenceAudioArtifact,
           referenceAudioPath: audioRequest.referenceAudioPath,
+          chatterboxOptions: node.config?.chatterboxOptions,
           cancelSignal: activeRunAbortController?.signal || null,
           reportProgress,
           runDirectories: run.directories,
@@ -9661,6 +9686,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         const result = await transcribeWithWhisper(tool, {
           audioPath: promptArtifact.filePath,
           model: model || DEFAULT_WHISPER_MODEL,
+          whisperOptions: node.config?.whisperOptions,
         });
         const transcript = String(result?.text || '').trim();
         if (!transcript) {
@@ -9690,14 +9716,12 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         reportProgress?.('Sending the source audio to ' + tool.name + ' for local audio transformation.', 'Running ' + node.label + ' with ' + tool.name + '...');
         return generateAudioWithLocalAudioTool(tool, {
           displayName: node.label,
-          instruction: audioRequest.instruction,
           model,
           nodeLabel: node.label,
           operationId,
           reportProgress,
           runDirectories: run.directories,
-          sourceAudioArtifact: audioRequest.sourceAudioArtifact,
-          sourceAudioPath: audioRequest.sourceAudioPath,
+          ...audioRequest,
           voiceModel: selectedVoiceModel,
         });
       }
@@ -9708,7 +9732,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         reportProgress?.('Sending the request to ' + tool.name + ' for local video generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
         return generateVideoWithLocalVideoTool(tool, {
           displayName: node.label,
-          fps: 15,
+          fps: node.config?.videoFps,
+          quality: node.config?.videoQuality,
           model,
           negativePrompt: videoRequest.negativePrompt,
           nodeLabel: node.label,
@@ -9771,6 +9796,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           sourceImageArtifact: imageRequest.sourceImageArtifact,
           sourceImagePath: imageRequest.sourceImagePath,
           transformSubtype: imageRequest.transformSubtype,
+          scale: node.config?.scale,
         });
       }
 
@@ -9790,6 +9816,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       reportProgress?.('Sending the prompt to ' + tool.name + ' for local image generation.', 'Running ' + node.label + ' with ' + tool.name + '...');
       const generated = await generateImageWithWorkflowTool(tool, {
         cfgScale: node.config?.cfgScale,
+        samplerName: node.config?.samplerName,
+        scheduler: node.config?.scheduler,
         height: node.config?.height,
         model: checkpointOverride,
         negativePrompt: promptRequest.negativePrompt,
@@ -10013,6 +10041,7 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
     const inputLabel = promptArtifact.kind === PORT_KIND_IMAGE ? 'image' : 'prompt';
     reportProgress?.('Sending the ' + inputLabel + ' to ' + provider.name + '.', 'Running ' + node.label + ' with ' + provider.name + '...');
     const result = await runProviderOperation(providerId, {
+      cloudInference: node.config?.cloudInference,
       messages,
       model,
       operationId,

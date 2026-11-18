@@ -1,6 +1,6 @@
 {
   "name": "local-ai-hub",
-  "version": "0.58.0",
+  "version": "0.59.0",
   "description": "Windows desktop manager for local AI tools",
   "author": "Local AI Hub",
   "private": true,
@@ -34,7 +34,7 @@
     "verify:wizard-live": "node scripts/verify-pipeline-wizard-live-validation.js --live-provider-validation",
     "verify:hyperframes-compose": "node scripts/verify-hyperframes-runtime-seeking.js && node scripts/verify-hyperframes-compose.js",
     "build:agent-extension": "node scripts/build-agent-extension.js",
-    "verify:agent-access": "node scripts/verify-agent-hosted-start.js && node scripts/verify-agent-access.js && node scripts/verify-agent-features.js"
+    "verify:agent-access": "node scripts/verify-agent-hosted-start.js && node scripts/verify-agent-access.js && node scripts/verify-agent-features.js && node scripts/verify-agent-model-manager.js"
   },
   "dependencies": {
     "7zip-bin": "^5.2.0",

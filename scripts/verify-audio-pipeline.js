@@ -334,6 +334,8 @@ function createAudiocraftContinuationPipeline(audioPath, overrides = {}) {
   };
 }
 
+const customRvcInference = { pitchChange: -7, pitchMethod: 'harvest', indexRate: 0, rmsMixRate: 1, protect: 0 };
+
 function createRvcVoiceConversionPipeline(sourceAudioPath, overrides = {}) {
   return {
     id: 'rvc-voice-conversion-pipeline',
@@ -349,6 +351,7 @@ function createRvcVoiceConversionPipeline(sourceAudioPath, overrides = {}) {
           operationId: pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM,
           toolId: 'rvc',
           instruction: 'Convert this clip into the selected voice while keeping it intelligible.',
+          rvcInference: overrides.rvcInference,
           model: Object.prototype.hasOwnProperty.call(overrides, 'model') ? overrides.model : 'voices/test-voice.pth',
         },
       },
@@ -1376,11 +1379,12 @@ async function verifyRvcPipelineRun(tempRoot, sourceAudioPath) {
     },
   });
 
-  const completedRun = await runPipelineToCompletion(service, createRvcVoiceConversionPipeline(sourceAudioPath));
+  const completedRun = await runPipelineToCompletion(service, createRvcVoiceConversionPipeline(sourceAudioPath, { rvcInference: customRvcInference }));
   assert.strictEqual(completedRun.status, 'completed', 'Expected the RVC voice conversion pipeline to complete successfully.');
   assert.strictEqual(audioCalls.length, 1, 'Expected the local audio adapter to run exactly once for the RVC pipeline.');
   assert.strictEqual(audioCalls[0].request.sourceAudioPath, sourceAudioPath, 'Expected the RVC run to retain the upstream audio file path.');
   assert.strictEqual(audioCalls[0].request.model, 'voices/test-voice.pth', 'Expected the RVC run to retain the selected voice model id.');
+  assert.deepStrictEqual(audioCalls[0].request.rvcInference, customRvcInference);
   assert.strictEqual(audioCalls[0].request.voiceModel.relativePath, 'voices/test-voice.pth', 'Expected the RVC run to pass the resolved voice model metadata to the adapter.');
   assert.strictEqual(audioCalls[0].request.voiceModel.path, voiceModel.path, 'Expected the RVC run to resolve the selected voice model to an existing .pth path.');
   assert.strictEqual(audioCalls[0].request.voiceModel.indexPath, indexPath, 'Expected the RVC run to retain optional index companion metadata.');
@@ -1444,6 +1448,7 @@ async function verifyRvcLocalAudioHelperContract(tempRoot, sourceAudioPath) {
         runCommand: async (command, args, options = {}) => {
           commandCalls.push({ args, command, options });
           const request = JSON.parse(await fsp.readFile(args[1], 'utf8'));
+          assert.deepStrictEqual(request.rvcInference, commandMode === 'success' ? customRvcInference : { pitchChange: 0, pitchMethod: 'rmvpe', indexRate: 0.75, rmsMixRate: 0.25, protect: 0.33 });
           assert.strictEqual(request.voiceModelIndexPath, indexPath, 'RVC helper request should preserve the optional .index path.');
           assert.strictEqual(request.voiceModelRelativePath, 'voices/test-voice.pth', 'RVC helper request should preserve the selected .pth relative path.');
           assert(String(options.env?.FFMPEG_BINARY || '').toLowerCase().endsWith('ffmpeg.exe'), 'RVC helper launch env should expose bundled FFmpeg.');
@@ -1505,6 +1510,7 @@ async function verifyRvcLocalAudioHelperContract(tempRoot, sourceAudioPath) {
 
   const result = await service.generateAudioWithLocalAudioTool(tool, {
     displayName: 'RVC Contract Output',
+    rvcInference: customRvcInference,
     instruction: 'Keep the source timing.',
     runDirectories,
     sourceAudioArtifact: { fileName: path.basename(sourceAudioPath), filePath: sourceAudioPath, kind: pipelineSchema.PORT_KIND_AUDIO },
@@ -1512,6 +1518,7 @@ async function verifyRvcLocalAudioHelperContract(tempRoot, sourceAudioPath) {
     voiceModel,
   });
   assert.strictEqual(result.outputs.audio.kind, pipelineSchema.PORT_KIND_AUDIO, 'RVC helper success should return a normal audio artifact.');
+  assert.deepStrictEqual(result.outputs.audio.audioTransformation.rvcInference, customRvcInference);
   assert.strictEqual(result.outputs.audio.audioTransformation.model, 'voices/test-voice.pth', 'RVC artifact metadata should preserve the selected model.');
   assert.strictEqual(result.outputs.audio.audioTransformation.operationId, pipelineSchema.PIPELINE_OPERATION_IDS.AUDIO_TRANSFORM, 'RVC artifact metadata should preserve the audio transform operation.');
   assert(result.outputs.audio.filePath && fs.existsSync(result.outputs.audio.filePath), 'RVC output capture should point to a real transformed audio file.');
@@ -1775,6 +1782,7 @@ async function verifyChatterboxLocalAudioHelperContract(tempRoot, referenceAudio
           const request = JSON.parse(await fsp.readFile(args[1], 'utf8'));
           assert.strictEqual(request.text, 'This is a short Local AI Hub voice test.', 'Chatterbox helper request should preserve exact text.');
           assert.strictEqual(request.referenceAudioPath, referenceAudioPath, 'Chatterbox helper request should preserve the reference audio path.');
+          if (commandMode !== 'oom') assert.deepStrictEqual(request.chatterboxOptions, { temperature: 0.7, norm_loudness: false });
           assert.strictEqual(request.devicePreference, 'cuda', 'Chatterbox helper request should prefer CUDA by default.');
           assert.strictEqual(request.allowCpu, false, 'Chatterbox helper request should not silently allow CPU fallback.');
           assert(request.maxTextLength <= 400, 'Chatterbox helper request should keep first-pass text bounded.');
@@ -1834,6 +1842,7 @@ async function verifyChatterboxLocalAudioHelperContract(tempRoot, referenceAudio
   const result = await service.generateAudioWithLocalAudioTool(tool, {
     cancelSignal: cancelController.signal,
     displayName: 'Chatterbox Contract Output',
+    chatterboxOptions: { temperature: 0.7, norm_loudness: false },
     prompt: 'This is a short Local AI Hub voice test.',
     referenceAudioArtifact: { fileName: path.basename(referenceAudioPath), filePath: referenceAudioPath, kind: pipelineSchema.PORT_KIND_AUDIO, mimeType: 'audio/wav', sizeBytes: fs.statSync(referenceAudioPath).size },
     referenceAudioPath,

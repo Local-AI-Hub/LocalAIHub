@@ -4,6 +4,7 @@ let sourceStream = null;
 let outputStream = null;
 let animationFrame = 0;
 let writeQueue = Promise.resolve();
+let writeFailed = false;
 let stopping = false;
 let starting = false;
 
@@ -90,10 +91,15 @@ async function startCapture() {
       : null;
 
     mediaRecorder.addEventListener('dataavailable', (event) => {
-      if (!event.data?.size) return;
+      if (writeFailed || !event.data?.size) return;
       writeQueue = writeQueue.then(async () => {
+        if (writeFailed) return;
         const bytes = await event.data.arrayBuffer();
         await window.systemAudioCapture.writeChunk(bytes);
+      }).catch(async () => {
+        writeFailed = true;
+        stopTracks();
+        await window.systemAudioCapture.fail({ message: 'Windows could not write the recording. Check the available disk space.' }).catch(() => null);
       });
     });
     mediaRecorder.addEventListener('error', (event) => {
@@ -102,6 +108,7 @@ async function startCapture() {
     mediaRecorder.addEventListener('stop', async () => {
       try {
         await writeQueue;
+        if (writeFailed) return;
         stopTracks();
         await window.systemAudioCapture.complete({ mimeType: mediaRecorder.mimeType });
       } catch (error) {

@@ -40,7 +40,7 @@ assert(paginationSource.includes('if (totalPages <= 1)'), 'Pagination controls s
 assert(paginationSource.includes('aria-label={`Previous ${normalizedLabel} page`}'), 'Previous button should keep focusable accessibility text.');
 assert(paginationSource.includes('aria-label={`Next ${normalizedLabel} page`}'), 'Next button should keep focusable accessibility text.');
 
-assert(cssSource.includes('@apply panel flex h-full min-h-0 flex-col overflow-hidden p-3;'), 'Library cards should have normalized height and overflow handling.');
+assert(cssSource.includes('@apply panel flex h-full min-h-0 flex-col overflow-y-auto p-3;'), 'Library cards should have normalized height and overflow handling.');
 assert(cssSource.includes('.library-card-expanded'), 'Expanded Library cards should keep settings and snapshots usable without growing the paginated page.');
 assert(librarySource.includes('library-card-expanded'), 'Library cards should opt into expanded overflow only when settings are open.');
 assert(cssSource.includes('@apply flex h-full min-h-0 flex-col overflow-hidden rounded-[24px]'), 'Store cards should have normalized height and overflow handling.');

@@ -136,7 +136,7 @@ const {
 const { getStatisticsCoreSnapshot, getStatisticsSnapshot, getStatisticsStorageSnapshot, invalidateStatisticsIndexSections, recordToolLaunch, recordVramSample } = require('./services/statisticsService');
 const { getToolUpdateSnapshot, refreshInstalledToolUpdates } = require('./services/toolUpdateService');
 const { transcribeWithWhisper } = require('./services/whisperService');
-const { buildMergedToolStateList } = require('./services/toolStateService');
+const { buildMergedToolStateList, getResolvedToolState } = require('./services/toolStateService');
 const { createUpdateService } = require('./services/updateService');
 const { disposeBackgroundTasks } = require('./services/backgroundTaskService');
 const {
@@ -198,7 +198,7 @@ const systemAudioCaptureAdapter = createSystemAudioCaptureAdapter({
   session,
 });
 const systemAudioRecordingService = createSystemAudioRecordingService({ captureAdapter: systemAudioCaptureAdapter });
-let recordingStartInProgress = false;
+let recordingStartInProgress = null;
 
 function isSystemAudioRecordingRequest(payload = {}) {
   return payload?.systemAudio === true || payload?.mode === 'systemAudio';
@@ -214,17 +214,17 @@ function setRecordingEventSink(sink) {
 }
 
 async function startRecording(payload = {}, context = {}) {
+  if (isQuitting) throw new Error('Local AI Hub is closing.');
   if (recordingStartInProgress || getActiveRecording()) {
     throw new Error('A recording is already active. Stop or cancel it before starting another one.');
   }
-  recordingStartInProgress = true;
+  recordingStartInProgress = isSystemAudioRecordingRequest(payload)
+    ? systemAudioRecordingService.startRecording(payload, context)
+    : startFfmpegRecording(payload, context);
   try {
-    if (isSystemAudioRecordingRequest(payload)) {
-      return await systemAudioRecordingService.startRecording(payload, context);
-    }
-    return await startFfmpegRecording(payload, context);
+    return await recordingStartInProgress;
   } finally {
-    recordingStartInProgress = false;
+    recordingStartInProgress = null;
   }
 }
 
@@ -434,6 +434,7 @@ async function shutdownOwnedResources() {
   }
 
   cancelRecordingRegionSelection();
+  await recordingStartInProgress?.catch(() => null);
   if (getActiveRecording()?.recordingContext === 'pipelineRun') {
     await cancelRecording().catch(() => null);
   } else {
@@ -738,7 +739,7 @@ async function buildAppState(options = {}) {
   const manifests = getToolCatalog();
   const tools = await buildMergedToolStateList({
     config: latestConfig,
-    includeSnapshots: true,
+    includeSnapshots: false,
     resolveStatuses: true,
     syncDiscovered: false,
   });
@@ -1163,6 +1164,11 @@ function toolLookup(toolId, tools) {
   return tool;
 }
 
+async function notifyModelChange(tool, reason) {
+  await invalidateStatisticsIndexSections(['storage'], reason, { toolId: tool.id }).catch(() => null);
+  sendAppStateUpdate({ downloadedModelCount: await getDownloadedModelCountSnapshot() });
+}
+
 function modelToolLookup(toolId, tools) {
   const tool = toolLookup(toolId, tools);
   if (!supportsModelManager(tool)) {
@@ -1396,8 +1402,17 @@ async function withPlainEnglishErrors(handler, fallbackMessage, options = {}) {
   }
 }
 
+function normalizeSettingsFolder(requestedPath) {
+  const root = path.parse(requestedPath).root;
+  if (!path.isAbsolute(requestedPath) || !root.replace(/[\\/]/g, '')) {
+    throw new Error('Enter a full folder path including its drive or network share.');
+  }
+  const normalized = path.resolve(requestedPath);
+  return normalized === path.parse(normalized).root ? path.join(normalized, 'LocalAIHub') : normalized;
+}
+
 function registerIpcHandlers() {
-  ipcMain.handle('agent:get-access', () => withPlainEnglishErrors(() => agentAccess.getAgentAccess(), 'Could not read agent access settings.'));
+  ipcMain.handle('agent:get-access', () => withPlainEnglishErrors(() => agentAccess.getAgentAccess(), 'Could not read agent access settings.', { refreshMode: 'none' }));
   ipcMain.handle('agent:set-access', (_event, enabled) => withPlainEnglishErrors(() => agentAccess.setAgentAccess(enabled), 'Could not change agent access settings.'));
   ipcMain.handle('agent:show-extension', () => withPlainEnglishErrors(async () => {
     const access = await agentAccess.getAgentAccess();
@@ -1606,13 +1621,13 @@ function registerIpcHandlers() {
     }, 'Local AI Hub could not cancel that recording.', { refreshMode: 'deferred' }),
   );
   ipcMain.handle('recordings:open', (_event, payload) =>
-    withPlainEnglishErrors(() => openRecording(payload?.id, (targetPath) => shell.openPath(targetPath)), 'Local AI Hub could not open that recording.'),
+    withPlainEnglishErrors(() => openRecording(payload?.id, (targetPath) => shell.openPath(targetPath)), 'Local AI Hub could not open that recording.', { refreshMode: 'none' }),
   );
   ipcMain.handle('recordings:reveal', (_event, payload) =>
-    withPlainEnglishErrors(() => revealRecording(payload?.id, (targetPath) => shell.showItemInFolder(targetPath)), 'Local AI Hub could not reveal that recording.'),
+    withPlainEnglishErrors(() => revealRecording(payload?.id, (targetPath) => shell.showItemInFolder(targetPath)), 'Local AI Hub could not reveal that recording.', { refreshMode: 'none' }),
   );
   ipcMain.handle('recordings:open-folder', () =>
-    withPlainEnglishErrors(() => openRecordingsFolder((targetPath) => shell.openPath(targetPath)), 'Local AI Hub could not open the recordings folder.'),
+    withPlainEnglishErrors(() => openRecordingsFolder((targetPath) => shell.openPath(targetPath)), 'Local AI Hub could not open the recordings folder.', { refreshMode: 'none' }),
   );
   ipcMain.handle('recordings:delete', (_event, payload) =>
     withPlainEnglishErrors(async () => {
@@ -2059,8 +2074,7 @@ function registerIpcHandlers() {
         throw new Error('Choose a storage folder before saving the new location.');
       }
 
-      const parsedPath = path.parse(requestedPath);
-      const normalizedTargetPath = requestedPath === parsedPath.root ? path.join(requestedPath, 'LocalAIHub') : requestedPath;
+      const normalizedTargetPath = normalizeSettingsFolder(requestedPath);
       await setManagedDataRoot(normalizedTargetPath, {
         migrateExistingData: Boolean(payload?.migrateExistingData),
         migrationSourceRoot: payload?.migrationSourceRoot || null,
@@ -2082,11 +2096,10 @@ function registerIpcHandlers() {
         throw new Error('Choose a default install folder before saving it.');
       }
 
-      const parsedPath = path.parse(requestedPath);
-      const normalizedTargetPath = requestedPath === parsedPath.root ? path.join(requestedPath, 'LocalAIHub') : requestedPath;
+      const normalizedTargetPath = normalizeSettingsFolder(requestedPath);
       await updateConfig((config) => ({
         ...config,
-        preferredInstallRoot: normalizedTargetPath,
+        preferredInstallRoot: path.relative(getAppPaths().managedRoot, normalizedTargetPath) ? normalizedTargetPath : null,
       }));
       invalidateDiscoveryCache();
       invalidateModelInventoryCache();
@@ -2177,12 +2190,13 @@ function registerIpcHandlers() {
   );
 
   ipcMain.handle('settings:get-cleanup-preview', () =>
-    withPlainEnglishErrors(() => inspectCleanupTargets(), 'Local AI Hub could not scan the approved cleanup folders right now.'),
+    withPlainEnglishErrors(() => inspectCleanupTargets(), 'Local AI Hub could not scan the approved cleanup folders right now.', { refreshMode: 'none' }),
   );
 
-  ipcMain.handle('settings:run-cleanup', () =>
+  ipcMain.handle('settings:run-cleanup', (_event, paths) =>
     withPlainEnglishErrors(async () => {
-      const cleanupSummary = await runCleanup();
+      if (!Array.isArray(paths) || !paths.length) throw new Error('Preview the cleanup items before deleting them.');
+      const cleanupSummary = await runCleanup(paths);
       invalidateModelInventoryCache();
       await invalidateStatisticsIndexSections(['storage'], 'storage-cleanup').catch(() => null);
       const removedCount = cleanupSummary.removedEntries?.length || 0;
@@ -2224,7 +2238,7 @@ function registerIpcHandlers() {
         runningToolCount: runningTools.length,
       }).catch(() => null);
       return snapshot;
-    }), 'Local AI Hub could not load the main statistics right now.', { allowCancellation: true }),
+    }), 'Local AI Hub could not load the main statistics right now.', { allowCancellation: true, refreshMode: 'none' }),
   );
 
   ipcMain.handle('settings:get-statistics-storage', (event, payload = {}) =>
@@ -2248,7 +2262,7 @@ function registerIpcHandlers() {
         toolCount: tools.length,
       }).catch(() => null);
       return snapshot;
-    }), 'Local AI Hub could not load storage statistics right now.', { allowCancellation: true }),
+    }), 'Local AI Hub could not load storage statistics right now.', { allowCancellation: true, refreshMode: 'none' }),
   );
 
   ipcMain.handle('settings:get-statistics', (event, payload = {}) =>
@@ -2280,7 +2294,7 @@ function registerIpcHandlers() {
         runningToolCount: runningTools.length,
       }).catch(() => null);
       return snapshot;
-    }), 'Local AI Hub could not load the statistics screen right now.', { allowCancellation: true }),
+    }), 'Local AI Hub could not load the statistics screen right now.', { allowCancellation: true, refreshMode: 'none' }),
   );
 
   ipcMain.handle('settings:cancel-statistics-request', (event, payload = {}) =>
@@ -2477,10 +2491,7 @@ function registerIpcHandlers() {
         }),
       });
       const localModels = await listDownloadedModels(tool);
-      await invalidateStatisticsIndexSections(['storage'], 'model-downloaded', { toolId: tool.id }).catch(() => null);
-      sendAppStateUpdate({
-        downloadedModelCount: await getDownloadedModelCountSnapshot(),
-      });
+      await notifyModelChange(tool, 'model-downloaded');
       return {
         message: result.message,
         localModels,
@@ -2503,10 +2514,7 @@ function registerIpcHandlers() {
       const tool = modelToolLookup(payload.toolId, state.tools);
       const result = await deleteModel(tool, payload);
       const localModels = await listDownloadedModels(tool);
-      await invalidateStatisticsIndexSections(['storage'], 'model-deleted', { toolId: tool.id }).catch(() => null);
-      sendAppStateUpdate({
-        downloadedModelCount: await getDownloadedModelCountSnapshot(),
-      });
+      await notifyModelChange(tool, 'model-deleted');
       return {
         message: result.message,
         localModels,
@@ -2735,30 +2743,27 @@ function registerIpcHandlers() {
   );
 
   ipcMain.handle('snapshots:list', (_event, toolId) =>
-    withPlainEnglishErrors(async () => listSnapshots(toolId), 'Local AI Hub could not load snapshots.'),
+    withPlainEnglishErrors(async () => listSnapshots(toolId), 'Local AI Hub could not load snapshots.', { refreshMode: 'none' }),
   );
 
   ipcMain.handle('snapshots:save', (_event, toolId) =>
     withPlainEnglishErrors(async () => {
-      const state = await buildAppState();
-      const tool = toolLookup(toolId, state.tools);
-      if (tool.lifecycleMode !== 'managed') {
+      const tool = await getResolvedToolState(toolId);
+      if (tool?.lifecycleMode !== 'managed') {
         throw new Error('Local AI Hub snapshots are only available for tools it manages directly. Official-installer and detected installs can stay in Library, but Local AI Hub will not snapshot them.');
       }
       const snapshot = await saveSnapshot(tool);
       await notify('Local AI Hub snapshot saved', `${tool.name} snapshot ${snapshot.fileName} is ready.`);
       return {
         message: `${tool.name} snapshot saved to ${snapshot.fileName}.`,
-        state: await buildAppState(),
       };
-    }, 'Local AI Hub could not save that snapshot.'),
+    }, 'Local AI Hub could not save that snapshot.', { refreshMode: 'none' }),
   );
 
   ipcMain.handle('snapshots:restore', (_event, payload) =>
     withPlainEnglishErrors(async () => {
-      const state = await buildAppState();
-      const tool = toolLookup(payload.toolId, state.tools);
-      if (tool.lifecycleMode !== 'managed') {
+      const tool = await getResolvedToolState(payload.toolId);
+      if (tool?.lifecycleMode !== 'managed') {
         throw new Error('Local AI Hub can only restore snapshots for tools it manages directly.');
       }
       await restoreSnapshot(tool, payload.snapshotFileName);
@@ -3024,7 +3029,7 @@ async function startApplication() {
       .catch(() => null);
   }, TOOL_UPDATE_CHECK_INTERVAL_MS);
   broadcastWindowActivity(true);
-  await agentAccess.startAgentAccess().catch(error => {
+  await agentAccess.startAgentAccess(notifyModelChange).catch(error => {
     console.error('Agent access could not start:', humanizeError(error));
   });
   appStartupComplete = true;

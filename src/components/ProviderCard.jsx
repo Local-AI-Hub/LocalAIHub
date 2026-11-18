@@ -1,11 +1,7 @@
 import { memo } from 'react';
 import HoverRevealText from './HoverRevealText';
 
-function isBusy(busyMap, key) {
-  return Boolean(busyMap?.[key]);
-}
-
-function ProviderCard({ provider, busyMap, onOpenChat, onOpenSettings }) {
+function ProviderCard({ provider, opening, onOpenChat, onOpenSettings }) {
   const providerDescription = `Messages sent here are processed by ${provider.name} and leave your machine. Use Settings to manage the API key stored in Windows Credential Manager.`;
   const statusTone =
     provider.libraryStatus === 'attention'
@@ -14,7 +10,7 @@ function ProviderCard({ provider, busyMap, onOpenChat, onOpenSettings }) {
 
   return (
     <article className="library-card h-full border border-cyan-400/15 bg-cyan-400/[0.04]">
-      <div className="flex min-h-0 flex-wrap items-start justify-between gap-2 overflow-hidden">
+      <div className="flex shrink-0 flex-wrap items-start justify-between gap-2">
         <div className="flex min-w-0 flex-1 items-start gap-3">
           <div className="tool-emblem bg-cyan-300/15 text-cyan-100">CL</div>
           <div className="min-w-0 flex-1">
@@ -47,8 +43,8 @@ function ProviderCard({ provider, busyMap, onOpenChat, onOpenSettings }) {
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
-          <button className="primary-button compact-card-button" disabled={busyMap[`provider-models:${provider.id}`]} onClick={() => onOpenChat(provider.id)} type="button">
-            {busyMap[`provider-models:${provider.id}`] ? 'Opening...' : 'Open chat'}
+          <button className="primary-button compact-card-button" disabled={opening} onClick={() => onOpenChat(provider.id)} type="button">
+            {opening ? 'Opening...' : 'Open chat'}
           </button>
           <button className="ghost-button compact-card-button" onClick={() => onOpenSettings()} type="button">
             Manage connection
@@ -60,10 +56,9 @@ function ProviderCard({ provider, busyMap, onOpenChat, onOpenSettings }) {
 }
 
 function areProviderCardPropsEqual(prevProps, nextProps) {
-  const providerId = prevProps.provider?.id;
   return (
     prevProps.provider === nextProps.provider &&
-    isBusy(prevProps.busyMap, `provider-models:${providerId}`) === isBusy(nextProps.busyMap, `provider-models:${providerId}`)
+    prevProps.opening === nextProps.opening
   );
 }
 
