@@ -36,6 +36,7 @@ const {
   DEFAULT_PLANNING_SCHEMA_ID,
   getPlanningSchemaDefinition,
   getPlanningSchemaOptions,
+  validateAuthoredPlan,
 } = require('./planningSchema.cjs');
 const {
   findRvcVoiceModelMatch,
@@ -438,6 +439,15 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       itemType: PORT_KIND_TEXT,
       items: [],
     },
+  }),
+  planInput: Object.freeze({
+    type: 'planInput',
+    label: 'Plan Input',
+    category: 'Planning',
+    description: 'Supply an authored scene, audio, or video plan directly without running a model.',
+    inputPorts: [],
+    outputPorts: [{ id: 'plan', kind: PORT_KIND_PLAN, label: 'Plan' }],
+    configDefaults: { plan: {} },
   }),
   planningPacket: Object.freeze({
     type: 'planningPacket',
@@ -5977,6 +5987,14 @@ function analyzePipeline(definition = {}, context = {}) {
           issues.push(buildNodeIssue(node, 'warn', summary.readiness.message));
         } else {
           issues.push(buildNodeIssue(node, 'info', summary.readiness.message));
+        }
+      }
+
+      if (node.type === 'planInput') {
+        const result = validateAuthoredPlan(node.config?.plan);
+        if (!result.ok) {
+          summary.readiness = { tone: 'error', message: result.errors[0] };
+          issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
         }
       }
 

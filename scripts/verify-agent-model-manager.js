@@ -47,7 +47,7 @@ async function main() {
       return { items: [card], pagination: { nextPage: 2 }, settings: { private: 'secret' } };
     } }, listTools, hardware: async () => ({ vramMb: 6144 }), storage: async () => [{ freeBytes: 1024 }],
     changed: async (_tool, reason) => changes.push(reason), withIdlePipeline: fn => fn() });
-    const { dispatch } = createOperations({ modelManager, listTools, listModels: models.listDownloadedModels, humanizeError: e => e.message });
+    const { dispatch } = createOperations({ modelManager, readConfig: async () => ({ hardware: { disks: [{ freeBytes: 3 }] } }), execution: { getActiveRunSnapshot: () => null }, listTools, listModels: models.listDownloadedModels, humanizeError: e => e.message });
     bridge = createBridge({ dispatch, descriptorPath, sanitizeError: error => error.message });
     await bridge.start();
     const call = (name, args) => callBridge(name, args, descriptorPath);
@@ -60,6 +60,7 @@ async function main() {
       throw Error('Model job timed out.');
     }
     const info = await call('hub_model_manager', {});
+    assert.deepEqual((await call('hub_status', {})).hardware, info.hardware);
     assert.equal(info.hardware.vramMb, 6144);
     assert.equal(info.disks[0].freeBytes, 1024);
     assert.equal(info.targets[0].toolId, tool.id);

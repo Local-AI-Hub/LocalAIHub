@@ -105,6 +105,12 @@ function describeNode(schema, entry, config) {
   if (entry.type === 'collectionMap') choices.mappings = schema.COLLECTION_MAP_MAPPING_OPTIONS;
   if (entry.type === 'recordInput') choices.recordingModes = schema.RECORD_INPUT_MODE_OPTIONS;
   if (properties.schemaId) choices.planningSchemas = schema.getPlanningSchemaOptions().map(({ id, label }) => ({ id, label }));
+  if (entry.type === 'planInput') {
+    properties.plan.description = 'Supply a plan object with schemaId and the fields shown in its example. Scene timing uses startSeconds/endSeconds or durationSeconds.';
+    properties.plan.examples = schema.getPlanningSchemaOptions().map(({ id }) => ({
+      schemaId: id, ...schema.getPlanningSchemaDefinition(id).responseShapeExample,
+    }));
+  }
   if (entry.type === 'mediaComposition') choices.transitions = schema.MEDIA_COMPOSITION_TRANSITION_CATEGORIES;
   if (entry.type === 'collectionInput') properties.items.description = 'Ordered objects. Set text for text items or filePath for media and files.';
   if (entry.type === 'recordInput') properties.captureTarget.examples = [{ type: 'desktop' }, { type: 'region', displayId: 'DISPLAY_ID', x: 0, y: 0, width: 640, height: 480 }];

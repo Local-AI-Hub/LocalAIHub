@@ -191,6 +191,13 @@ async function verifyModelAssetLifecyclePolicy() {
 }
 
 async function main() {
+  for (const tool of [forge, automatic1111, comfyui, { id: 'invokeai' }]) {
+    for (const file of ['models/image_encoder/model.safetensors', 'models/ip-adapter_sd15.safetensors']) {
+      const plan = createModelDownloadPlan({ tool, selectedType: 'all', source: 'huggingface',
+        artifacts: [{ rfilename: file, modelType: 'Checkpoint' }] });
+      assert.equal(plan.runnable, false, tool.id + ' must not install ' + file + ' as a checkpoint');
+    }
+  }
   await verifyModelAssetLifecyclePolicy();
 
   const manifestPath = path.resolve(__dirname, '..', 'electron', 'config', 'tools-manifest.json');
@@ -292,6 +299,19 @@ async function main() {
   assert.strictEqual(upscaylPlan.packageTargetMode, 'flat', 'Upscayl model sets should install into the discovered models folder, not a nested runtime-invisible folder.');
   assert.strictEqual(upscaylPlan.downloadFiles.length, 2, 'Upscayl should download the paired assets only.');
 
+  const ncnnPair = {
+    tool: upscayl,
+    catalogRepositoryId: 'example/ncnn-vits-piper',
+    artifacts: [artifact('decoder.ncnn.param', 12), artifact('decoder.ncnn.bin', 12)],
+  };
+  assert.match(createModelDownloadPlan(ncnnPair).blockingReason, /do not identify an image upscaling model/);
+  assert.strictEqual(createModelDownloadPlan({
+    ...ncnnPair,
+    catalogRepositoryId: 'example/custom-ncnn',
+    repositoryTags: ['super-resolution'],
+    artifacts: [artifact('custom.param', 12), artifact('custom.bin', 12)],
+  }).runnable, true);
+
   const paramOnlyUpscaylPlan = createModelDownloadPlan({
     tool: upscayl,
     source: 'huggingface',
@@ -312,13 +332,17 @@ async function main() {
     ['Wan-AI/Wan2.1-T2V-14B', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-T2V-14B', pipeline_tag: 'text-to-video', siblings: [artifact('diffusion_pytorch_model-00001-of-00002.safetensors', 12), artifact('diffusion_pytorch_model-00002-of-00002.safetensors', 12), artifact('models_t5_umt5-xxl-enc-bf16.pth', 12), artifact('Wan2.1_VAE.pth', 12)], tags: ['wan2.1'] }],
     ['Wan-AI/Wan2.1-I2V-14B-480P', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-I2V-14B-480P', pipeline_tag: 'image-to-video', siblings: [artifact('diffusion_pytorch_model.safetensors', 12), artifact('models_t5_umt5-xxl-enc-bf16.pth', 12), artifact('Wan2.1_VAE.pth', 12), artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 12)], tags: ['wan2.1'] }],
     ['Wan-AI/Wan2.1-I2V-14B-720P', { author: 'Wan-AI', id: 'Wan-AI/Wan2.1-I2V-14B-720P', pipeline_tag: 'image-to-video', siblings: [artifact('diffusion_pytorch_model.safetensors', 12), artifact('models_t5_umt5-xxl-enc-bf16.pth', 12), artifact('Wan2.1_VAE.pth', 12), artifact('models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth', 12)], tags: ['wan2.1'] }],
-    ['custom/upscayl-models', { author: 'custom', id: 'custom/upscayl-models', pipeline_tag: 'image-to-image', siblings: [artifact('ultrasharp.param', 12), artifact('ultrasharp.bin', 12), artifact('preview.png', 20_000)], tags: ['upscayl'] }],
+    ['custom/upscayl-models', { author: 'custom', id: 'custom/upscayl-models', pipeline_tag: 'image-to-image', siblings: [artifact('ultrasharp.param', 12), artifact('ultrasharp.bin', 12), { rfilename: 'zoom.param', size: 3 }, { rfilename: 'zoom.bin', size: 17 }, artifact('orphan.param', 9), artifact('preview.png', 20_000)], tags: ['upscayl'] }],
   ]);
   const originalPackageSearchFetch = global.fetch;
   global.fetch = async (url) => {
     const parsed = new URL(String(url));
     const urlText = String(url);
     if (parsed.pathname === '/api/models') {
+      if (parsed.searchParams.get('search') === 'upscayl') {
+        assert(!parsed.searchParams.has('pipeline_tag'));
+        return { ok: true, headers: { get: () => null }, json: async () => [{ id: 'custom/upscayl-models' }] };
+      }
       return {
         ok: true,
         headers: {
@@ -399,12 +423,17 @@ async function main() {
 
     const upscaylBroadSearch = await modelServiceTest.searchHuggingFaceModels(
       upscayl,
-      { cursor: null, limit: 12, modelType: 'upscaler', page: 1, query: 'upscayl custom models', sort: 'most-downloaded', source: 'huggingface', taskType: 'image-to-image' },
+      { cursor: null, limit: 12, modelType: 'upscaler', page: 1, query: 'upscayl', sort: 'most-downloaded', source: 'huggingface', taskType: 'image-to-image' },
       new Set(),
       { disks: [], hardware: { vramMb: 8192, ramMb: 32768 } },
       logger,
     );
-    assert.strictEqual(upscaylBroadSearch.items.length, 0, 'Upscayl broad remote searches should stay disabled until a safe paired-model source is explicitly supported.');
+    const choices = upscaylBroadSearch.items[0]?.artifactChoices;
+    assert.deepStrictEqual(choices.map((choice) => choice.label), ['ultrasharp', 'zoom']);
+    const selected = require('../electron/shared/modelArtifactSelection.cjs').buildSelectedCatalogItem(upscaylBroadSearch.items[0], choices[1].id);
+    assert.deepStrictEqual(selected.downloadPlan.requiredArtifacts, ['zoom.param', 'zoom.bin']);
+    assert.strictEqual(selected.sizeBytes, 20);
+    assert.notStrictEqual(selected.downloadIdentity, choices[0].payload.downloadIdentity);
 
     const upscaylExactSearch = await modelServiceTest.searchHuggingFaceModels(
       upscayl,

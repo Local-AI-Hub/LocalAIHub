@@ -44,6 +44,7 @@ const {
   buildPlanningSchemaStructuredOutputRequest,
   buildPlannerPrompt,
   getPlanningSchemaDefinition,
+  validateAuthoredPlan,
   validatePlanAgainstSchema,
   validatePlanningPacketShape,
 } = require('../shared/planningSchema.cjs');
@@ -985,7 +986,9 @@ function updateRunMessage(run, message) {
 }
 
 function createProgressReporter(run, nodeId = '') {
-  return (message, runMessage = '') => {
+  return (progress, runMessage = '') => {
+    const message = typeof progress === 'string' ? progress : progress?.message;
+    if (typeof message !== 'string') return;
     if (nodeId) {
       updateRunningNodeProgress(run, nodeId, message, runMessage);
       return;
@@ -9571,6 +9574,13 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
       },
       preview: summarizeArtifact(artifact),
     };
+  }
+
+  if (node.type === 'planInput') {
+    const result = validateAuthoredPlan(node.config?.plan);
+    if (!result.ok) throw new Error(result.errors[0]);
+    const plan = createPlanArtifact(result.value, { role: 'input' });
+    return { message: 'Prepared the authored plan.', outputs: { plan }, preview: summarizeArtifact(plan) };
   }
 
   if (node.type === 'planningPacket') {

@@ -1,6 +1,6 @@
 {
   "name": "local-ai-hub",
-  "version": "0.59.0",
+  "version": "0.60.0",
   "description": "Windows desktop manager for local AI tools",
   "author": "Local AI Hub",
   "private": true,
@@ -27,6 +27,7 @@
     "verify:media-composition": "node scripts/verify-pipeline-media-composition.js",
     "verify:recorder": "node scripts/verify-recorder.js",
     "verify:media-regressions": "node scripts/verify-pipeline-regression-coverage.js",
+    "verify:model-manager-release": "node scripts/verify-model-manager-release.js",
     "verify:model-download-plans": "node scripts/verify-model-download-plans.js",
     "verify:provider-credential-security": "node scripts/verify-provider-credential-security.js",
     "verify:aider-ollama-lifecycle": "node scripts/verify-aider-ollama-lifecycle.js",
@@ -47,7 +48,8 @@
     "python-shell": "^5.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "systeminformation": "^5.24.7"
+    "systeminformation": "^5.24.7",
+    "yauzl": "^2.10.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.3",

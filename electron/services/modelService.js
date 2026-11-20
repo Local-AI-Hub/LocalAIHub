@@ -22,7 +22,7 @@ const {
   isPathInside: isPathInsideSafe,
 } = require('./pathSafetyService');
 const { getToolManifest } = require('./toolRegistry');
-const { annotateArtifactsForDownloadPlan, artifactPath, createModelDownloadPlan, ollamaTagPlan } = require('./modelDownloadPlanService');
+const { annotateArtifactsForDownloadPlan, artifactPath, createModelDownloadPlan, createUpscaylPackagePlans, ollamaTagPlan } = require('./modelDownloadPlanService');
 const { listStableDiffusionApiCheckpoints } = require('./workflowToolService');
 const { isToolActive, isToolReady, launchToolFromUserAction, stopTool } = require('./processService');
 const { getResolvedToolState } = require('./toolStateService');
@@ -32,6 +32,12 @@ const {
   getRvcVoiceModels,
   getStableDiffusionCheckpointModels,
 } = require('../shared/toolAssetSelection.cjs');
+const { mergeArtifactChoice } = require('../shared/modelArtifactSelection.cjs');
+const { createCollectionIndex } = require('./modelCollectionIndex');
+const collectionIndex = createCollectionIndex(
+  () => path.join(getAppPaths().localRoot, 'model-manager', 'hf-collections-v1.jsonl'),
+  normalizeSearchSeparators,
+);
 const APP_USER_AGENT = `LocalAIHub/${APP_VERSION}`;
 const MODEL_BROWSE_CONTEXT = new AsyncLocalStorage();
 
@@ -74,6 +80,13 @@ function createExpiringCache(options = {}) {
       entries.delete(normalizedKey);
       entries.set(normalizedKey, entry);
       return cloneValues ? cloneCacheValue(entry.value) : entry.value;
+    },
+    matchingIds(predicate, now = Date.now()) {
+      const ids = [];
+      for (const entry of entries.values()) {
+        if ((!ttlMs || now - entry.createdAt < ttlMs) && predicate(entry.value)) ids.push(entry.value.id);
+      }
+      return ids;
     },
     keys() {
       return [...entries.keys()];
@@ -128,6 +141,7 @@ function buildProviderCacheKey(source, parts = {}) {
 
 function clearProviderCatalogCaches() {
   for (const cache of [
+    HF_CONTINUATIONS,
     HUGGING_FACE_FILE_SIZE_CACHE,
     HUGGING_FACE_PREVIEW_CACHE,
     HUGGING_FACE_TREE_CACHE,
@@ -242,7 +256,7 @@ const PACKAGE_TOOL_IDS = new Set(['audiocraft-webui', 'wan21-webui', 'upscayl'])
 const AUDIOCRAFT_PACKAGE_MODEL_IDS = ['facebook/musicgen-small', 'facebook/musicgen-medium', 'facebook/musicgen-large', 'facebook/musicgen-melody', 'facebook/audiogen-medium'];
 const WAN_PACKAGE_MODEL_IDS = ['Wan-AI/Wan2.1-T2V-1.3B', 'Wan-AI/Wan2.1-T2V-14B', 'Wan-AI/Wan2.1-I2V-14B-480P', 'Wan-AI/Wan2.1-I2V-14B-720P'];
 const PACKAGE_SUPPORT_FILE_PATTERN = /(?:^|\/)(?:config\.json|tokenizer\.model)$/i;
-const RVC_REMOTE_ARTIFACT_FILE_PATTERN = /\.(pth|pt|index)$/i;
+const RVC_REMOTE_ARTIFACT_FILE_PATTERN = /\.(pth|pt|index|zip|rar|7z|tgz|tar(?:\.gz)?)$/i;
 const RVC_INDEX_FILE_PATTERN = /\.index$/i;
 const IMAGE_FILE_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
 const MODEL_SCAN_MAX_DEPTH = 12;
@@ -415,7 +429,7 @@ function parseHumanSizeToBytes(value) {
   if (!Number.isFinite(amount) || unitIndex < 0) {
     return 0;
   }
-  return Math.round(amount * 1024 ** unitIndex);
+  return Math.round(amount * 1000 ** unitIndex);
 }
 function normalizeModelType(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -725,6 +739,7 @@ function normalizeBrowseOptions(options = {}, tool) {
   const requestedSource = String(options.source || defaultSource).trim();
   return {
     cursor: String(options.cursor || '').trim() || null,
+    includeIncompatible: options.includeIncompatible === true,
     limit: Number(options.limit) > 0 ? Math.min(REMOTE_PAGE_SIZE, Number(options.limit)) : REMOTE_PAGE_SIZE,
     modelType: coerceAllowedValue(normalizeModelTypeFilter(options.modelType || defaultModelType), allowedModelTypes, defaultModelType),
     page: Math.max(1, Number(options.page) || 1),
@@ -754,12 +769,21 @@ function formatBytes(bytes) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   let value = bytes;
   let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
+  while (value >= 1000 && unitIndex < units.length - 1) {
+    value /= 1000;
     unitIndex += 1;
   }
   const digits = value >= 10 || unitIndex === 0 ? 0 : 1;
   return `${value.toFixed(digits).replace(/\.0$/, '')} ${units[unitIndex]}`;
+}
+function isVoiceZip(tool, item) {
+  return tool.id === 'rvc' && /\.zip$/i.test(item.sourceArtifactPath || item.artifactPath || item.fileName);
+}
+function catalogDiskWarning(item, tool, disk) {
+  const warning = buildDiskWarning(item.sizeBytes, disk);
+  if (!isVoiceZip(tool, item)) return warning;
+  return { tone: warning?.tone === 'danger' ? 'danger' : 'warn',
+    message: (warning?.message || '') + ' The ZIP also needs temporary space for extraction.' };
 }
 function buildDiskWarning(sizeBytes, disk) {
   if (!disk) {
@@ -987,12 +1011,18 @@ function buildHardwareFit(itemOrSizeBytes, toolOrHardware, hardwareOrRequirement
   };
 }
 function attachHardwareHints(item, tool, hardwareContext) {
+  const artifactChoices = item.artifactChoices?.map(choice => {
+    const selected = mergeArtifactChoice(item, choice);
+    return { ...choice, payload: { ...choice.payload, ...catalogHardwareHints(selected, tool, hardwareContext) } };
+  });
+  return { ...item, ...catalogHardwareHints(item, tool, hardwareContext), ...(artifactChoices && { artifactChoices }) };
+}
+function catalogHardwareHints(item, tool, hardwareContext) {
   const targetDirectory = getTargetDirectory(tool, item.modelType, item);
   const disk = findDiskForPath(hardwareContext.disks, targetDirectory || tool.installDir || tool.appDir || getOllamaModelsRoot(tool));
   const requirements = item.catalogRequirements || null;
   return {
-    ...item,
-    diskWarning: buildDiskWarning(item.sizeBytes, disk),
+    diskWarning: catalogDiskWarning(item, tool, disk),
     downloadTarget: targetDirectory,
     hardwareFit: buildHardwareFit(item, tool, hardwareContext.hardware, requirements),
     targetToolId: tool?.id || item.toolId || null,
@@ -1115,8 +1145,9 @@ function buildOllamaModelPageUrl(libraryPathOrName) {
   if (/^https?:\/\//i.test(rawValue)) {
     return sanitizeModelSourceUrl(rawValue);
   }
-  const slug = rawValue.replace(/^\/+/, '').replace(/^library\//i, '').split(':')[0];
-  return slug ? sanitizeModelSourceUrl('https://ollama.com/library/' + encodeURIComponent(slug)) : null;
+  const name = rawValue.replace(/^\/+/, '').replace(/^library\//i, '').replace(/%3a/ig, ':');
+  if (!/^(?:[\w-][\w.-]*\/)?[\w-][\w.-]*(?::[\w.-]+)?$/.test(name)) return null;
+  return sanitizeModelSourceUrl('https://ollama.com/' + (name.includes('/') ? '' : 'library/') + name);
 }
 
 function buildHuggingFaceArtifactChoice(detail, file, tool, options = {}) {
@@ -1324,6 +1355,12 @@ function getModelInstallRelativePath(tool, payload = {}) {
   const sourcePath = normalizeRelativeInstallPath(payload.installRelativePath || payload.sourceArtifactPath || payload.fileName || payload.name || 'model.safetensors');
   const source = String(payload.source || '').trim().toLowerCase();
   const repositoryId = String(payload.catalogRepositoryId || '').trim();
+  if (tool?.id === 'rvc' && /\.zip$/i.test(payload.sourceArtifactPath || sourcePath)) {
+    const archive = payload.sourceArtifactPath || sourcePath;
+    const stem = sanitizePathSegment(path.parse(archive).name).slice(0, 90) || 'voice';
+    const suffix = crypto.createHash('sha256').update(JSON.stringify([repositoryId, archive])).digest('hex').slice(0, 12);
+    return stem + '-' + suffix + '.pth';
+  }
   // Packages and backend-managed models need their original internal filenames.
   if (source === 'ollama' || tool?.id === 'ollama' || tool?.id === 'invokeai' || isPackageDownloadPayload(payload) || getModelManagerTargetLayout(tool)?.repositoryScoped) return sourcePath;
   if (!/^(?:model|models|weight|weights|pytorch_model|diffusion_pytorch_model|checkpoint|ckpt|best|last)(?:[._-](?:fp16|fp32|bf16|f16|f32|pruned|ema|emaonly))?\.(?:pth|pt|safetensors|ckpt|gguf|bin)$/i.test(path.basename(sourcePath))) return sourcePath;
@@ -1877,6 +1914,7 @@ function getRvcCompanionPathTokens(indexEntry = {}) {
 
 function rvcIndexMatchesModel(indexEntry, model, modelCount, indexCount) {
   const primaryCompact = compactRvcCompanionToken(getRvcModelStem(model));
+  if (primaryCompact && !['model', 'weight', 'weights'].includes(primaryCompact) && compactRvcCompanionToken(path.parse(indexEntry.path || indexEntry.relativePath || '').name) === primaryCompact) return true;
   if (primaryCompact.length >= 3 && !['model', 'pytorchmodel', 'weight', 'weights'].includes(primaryCompact)) {
     if (getRvcCompanionPathTokens(indexEntry).some((token) => token.compact.includes(primaryCompact) || primaryCompact.includes(token.compact))) {
       return true;
@@ -2603,14 +2641,28 @@ function hasLikelyHuggingFaceRvcContext(detail, fileEntry) {
     .filter(Boolean)
     .join(' ')
     .toLowerCase();
-  return /(?:^|[^a-z0-9])(?:rvc|retrieval[-_\s]*based[-_\s]*voice[-_\s]*conversion|retrieval[-_\s]*voice[-_\s]*conversion|voice[-_\s]*conversion|voice[-_\s]*model)(?:[^a-z0-9]|$)/i.test(combined);
+  return /(?:^|[^a-z0-9])(?:rvc(?:[-_\s]*models?)?|retrieval[-_\s]*based[-_\s]*voice[-_\s]*conversion|retrieval[-_\s]*voice[-_\s]*conversion|voice[-_\s]*conversion|voice[-_\s]*model)(?:[^a-z0-9]|$)/i.test(combined);
 }
+const HF_LANGUAGE_TASK = /^(?:text-generation|text2text-generation|fill-mask|sentence-similarity|text-classification|token-classification|question-answering|summarization|translation)$/i;
 function inferHuggingFaceType(detail, fileEntry) {
+  const tasks = detail.pipeline_tag ? [detail.pipeline_tag] : detail.tags || [];
+  if (/\.(?:safetensors|bin|pt|pth|ckpt)$/i.test(fileEntry?.rfilename || '') && tasks.some(task => HF_LANGUAGE_TASK.test(task))) {
+    return 'Language model';
+  }
   const combined = [detail.pipeline_tag || '', ...(detail.tags || []), fileEntry?.rfilename || '']
     .join(' ')
     .toLowerCase();
-  if (/\.(?:pth|pt)$/i.test(fileEntry?.rfilename || '') && hasLikelyHuggingFaceRvcContext(detail, fileEntry)) {
+  if (/\.(?:pth|pt|zip)$/i.test(fileEntry?.rfilename || '') && hasLikelyHuggingFaceRvcContext(detail, fileEntry)) {
     return 'RVC Voice Model';
+  }
+  const name = path.posix.basename(fileEntry?.rfilename || '');
+  const weight = /\.(?:safetensors|ckpt|bin|pt|pth)$/i.test(name);
+  const imageEvidence = /(?:text-to-image|image-to-image|image-to-video|text-to-video|inpaint|stable[-_ ]?diffusion|sdxl|diffusers|controlnet|textual[-_ ]inversion|esrgan|swinir)/i;
+  const unrelatedTask = /^(?:image-classification|image-segmentation|object-detection|depth-estimation|automatic-speech-recognition|audio-classification|text-to-speech|audio-to-audio|image-to-text|feature-extraction|image-feature-extraction|visual-question-answering|zero-shot-image-classification)$/i;
+  const genericName = /^(?:(?:pytorch|adapter)[_-])?(?:model|weights?)(?:[._-].*)?\.(?:safetensors|ckpt|bin|pt|pth)$/i;
+  if (weight && (tasks.some(task => unrelatedTask.test(task)) ||
+      (genericName.test(name) && !imageEvidence.test([detail.id, combined].join(' '))))) {
+    return 'Unverified image weights';
   }
   return normalizeModelType(combined);
 }
@@ -2722,12 +2774,17 @@ async function fetchHuggingFaceRepositoryTree(detail, logger) {
   const treeUrl = HUGGING_FACE_MODEL_URL + '/' + modelId + '/tree/main?recursive=true&expand=true';
   try {
     await logger.info('Expanding Hugging Face repository file tree for artifact planning.', { modelId }).catch(() => null);
-    const { payload } = await fetchCachedJsonResponse(HUGGING_FACE_TREE_CACHE, treeCacheKey, treeUrl, {
-      headers: {
-        'User-Agent': APP_USER_AGENT,
-      },
-    });
-    const entries = Array.isArray(payload) ? payload.map(normalizeHuggingFaceTreeEntry).filter(Boolean) : [];
+    const entries = [];
+    const seen = new Set();
+    const url = new URL(treeUrl);
+    do {
+      const { response, payload } = await fetchJsonResponse(url.toString(), { headers: { 'User-Agent': APP_USER_AGENT } });
+      if (Array.isArray(payload)) entries.push(...payload.map(normalizeHuggingFaceTreeEntry).filter(Boolean));
+      const cursor = extractCursorFromLinkHeader(response.headers.get('link'), 'next');
+      if (!cursor || seen.has(cursor)) break;
+      seen.add(cursor);
+      url.searchParams.set('cursor', cursor);
+    } while (true);
     HUGGING_FACE_TREE_CACHE.set(treeCacheKey, entries);
     return entries;
   } catch (error) {
@@ -2741,8 +2798,7 @@ async function expandHuggingFaceDetailForPlanning(detail, selectedType, tool, lo
   if (!tool) {
     return detail;
   }
-  const existingCandidate = collectHuggingFaceDownloadFiles(detail, selectedType, tool)[0] || null;
-  if (existingCandidate) {
+  if (collectHuggingFaceDownloadFiles(detail, selectedType, tool).length) {
     return detail;
   }
   const expandedEntries = await fetchHuggingFaceRepositoryTree(detail, logger);
@@ -2838,6 +2894,10 @@ function matchesSearchQuery(query, values = []) {
     return queryTokens.length > 0 && queryTokens.every((queryToken) => valueTokens.some((valueToken) => valueToken.includes(queryToken)));
   });
 }
+function isExactCatalogFilename(value) {
+  const name = path.posix.basename(String(value || '').replace(/\\/g, '/'));
+  return /\S\.(?:pth?|ckpt|safetensors|bin|gguf|param|index|zip|rar|7z|tar|gz|onnx|json|ya?ml|md)$/i.test(name);
+}
 function isFileLikeSearchQuery(query) {
   const normalizedQuery = normalizeSearchQuery(query);
   if (!normalizedQuery) {
@@ -2851,7 +2911,7 @@ function isArtifactLevelSearchQuery(query) {
 }
 function isRepositoryIdSearchQuery(query) {
   const normalizedQuery = String(query || '').trim().replace(/\\+/g, '/');
-  return /^[^/\s]+\/[^/\s]+$/.test(normalizedQuery) && !MODEL_FILE_PATTERN.test(normalizedQuery);
+  return /^[\w.-]+\/[\w.-]+$/.test(normalizedQuery);
 }
 function collectHuggingFacePackageFiles(detail, selectedType, tool = null) {
   const artifacts = (detail.siblings || [])
@@ -2862,11 +2922,9 @@ function collectHuggingFacePackageFiles(detail, selectedType, tool = null) {
       sha256: getKnownHuggingFaceFileSha256(entry),
       sizeBytes: getKnownHuggingFaceFileSize(entry),
     }));
-  const plan = createModelDownloadPlan({ artifacts, catalogRepositoryId: detail.id, selectedType, source: 'huggingface', tool });
-  if (!plan?.runnable) {
-    return [];
-  }
-  return [{
+  const options = { artifacts, catalogRepositoryId: detail.id, repositoryTags: detail.tags, selectedType, source: 'huggingface', tool };
+  const plans = tool?.id === 'upscayl' ? createUpscaylPackagePlans(options, artifacts) : [createModelDownloadPlan(options)];
+  return plans.filter((plan) => plan?.runnable).map((plan) => ({
     artifactKind: plan.compatibleArtifacts?.[0]?.artifactKind || 'model-package',
     artifactLabel: plan.artifactLabel,
     downloadPlan: plan,
@@ -2874,7 +2932,7 @@ function collectHuggingFacePackageFiles(detail, selectedType, tool = null) {
     packageIdentity: plan.packageIdentity,
     rfilename: plan.packageRoot || plan.recommendedArtifactPath || detail.id,
     sizeBytes: Number(plan.sizeBytes || 0),
-  }];
+  }));
 }
 function collectHuggingFaceDownloadFiles(detail, selectedType, tool = null) {
   if (tool && PACKAGE_TOOL_IDS.has(String(tool.id || '').trim().toLowerCase())) {
@@ -2884,6 +2942,7 @@ function collectHuggingFaceDownloadFiles(detail, selectedType, tool = null) {
     .filter((entry) => isRemoteCatalogArtifactFile(tool, entry.rfilename || ''))
     .map((entry) => ({
       ...entry,
+      inspectVoiceZip: detail.inspectVoiceZip === true,
       modelType: inferHuggingFaceType(detail, entry),
       sha256: getKnownHuggingFaceFileSha256(entry),
       sizeBytes: getKnownHuggingFaceFileSize(entry),
@@ -3006,7 +3065,9 @@ async function fetchJsonResponse(url, options = {}) {
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
     const detail = String(payload?.error || payload?.message || '').trim();
-    throw new Error(detail ? `Request failed with status ${response.status}. ${detail}` : `Request failed with status ${response.status}.`);
+    const error = new Error(detail ? `Request failed with status ${response.status}. ${detail}` : `Request failed with status ${response.status}.`);
+    error.status = response.status;
+    throw error;
   }
   return {
     response,
@@ -3042,7 +3103,7 @@ async function fetchCachedText(cache, cacheKey, url, options = {}) {
   }
   const response = await fetch(url, withModelBrowseSignal(options));
   if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}.`);
+    throw Object.assign(new Error(`Request failed with status ${response.status}.`), { status: response.status });
   }
   const text = await response.text();
   cache.set(cacheKey, text);
@@ -3068,9 +3129,8 @@ function extractCursorFromLinkHeader(linkHeader, rel) {
 }
 async function fetchHuggingFaceDetail(result, logger) {
   const modelId = String(result?.id || '').trim();
-  if (!modelId || result?.private || result?.gated) {
-    return null;
-  }
+  if (!modelId || result?.private) return null;
+  if (result?.gated) return result;
   const cacheKey = buildProviderCacheKey('huggingface-detail', { modelId });
   const cachedDetail = HUGGING_FACE_DETAIL_CACHE.get(cacheKey);
   if (cachedDetail !== undefined) {
@@ -3083,6 +3143,9 @@ async function fetchHuggingFaceDetail(result, logger) {
       },
     });
     HUGGING_FACE_DETAIL_CACHE.set(cacheKey, payload);
+    if (payload?.id !== modelId && isRepositoryIdSearchQuery(payload?.id)) {
+      HUGGING_FACE_DETAIL_CACHE.set(buildProviderCacheKey('huggingface-detail', { modelId: payload.id }), payload);
+    }
     return payload;
   } catch (error) {
     rethrowModelBrowseCancellation(error);
@@ -3191,7 +3254,145 @@ async function resolveHuggingFaceDownloadPlan(detail, selectedType, logger, tool
       modelType: inferHuggingFaceType(planningDetail, entry),
       sizeBytes: getKnownHuggingFaceFileSize(entry),
     }));
-  return createModelDownloadPlan({ artifacts, catalogRepositoryId: planningDetail.id, selectedType, source: 'huggingface', tool });
+  return createModelDownloadPlan({ artifacts, catalogRepositoryId: planningDetail.id, repositoryTags: planningDetail.tags, selectedType, source: 'huggingface', tool });
+}
+async function findReadmeArtifacts(detail, query) {
+  const entry = (detail.siblings || []).find(file => /^readme\.md$/i.test(file.rfilename));
+  const paths = new Set();
+  if (!entry) return paths;
+  const url = buildHuggingFaceResolveUrl(detail.id, entry.rfilename);
+  let markdown;
+  try {
+    markdown = await fetchCachedText(HUGGING_FACE_PAGE_CACHE, 'readme:' + url, url, { headers: { 'User-Agent': APP_USER_AGENT } });
+  } catch (error) {
+    rethrowModelBrowseCancellation(error);
+    return paths;
+  }
+  const aliases = readmeArtifactLabels(detail, markdown);
+  await collectionIndex.remember(detail, aliases);
+  for (const row of aliases) {
+    if (matchesSearchQuery(query, [row.label])) paths.add(row.path);
+  }
+  return paths;
+}
+
+function readmeArtifactLabels(detail, markdown) {
+  const rows = [];
+  const files = new Set((detail.siblings || []).map(file => file.rfilename));
+  const base = buildHuggingFaceResolveUrl(detail.id, 'README.md');
+  const definitions = new Map();
+  const lines = [];
+  const prose = [];
+  const referenceKey = value => value.trim().replace(/\s+/g, ' ').toLowerCase();
+  let fence = '';
+  for (const line of markdown.split(/\r?\n/)) {
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (marker && !fence) { fence = marker[1]; prose.push(''); continue; }
+    if (fence) {
+      if (marker?.[1].startsWith(fence)) fence = '';
+      continue;
+    }
+    // An indented block starts after a blank line and continues through adjacent indented lines.
+    const indented = /^(?: {4}| {0,3}\t)/.test(line);
+    prose.push(indented && !prose.at(-1)?.trim() ? '' : line);
+  }
+  // Equal-length backtick runs can delimit code across consecutive prose lines.
+  const masked = prose.join('\n').split(/(\n[ \t]*\n)/).map(paragraph => {
+    const runs = [...paragraph.matchAll(/`+/g)];
+    const next = new Map();
+    for (let i = runs.length - 1; i >= 0; i--) {
+      runs[i].close = next.get(runs[i][0].length);
+      next.set(runs[i][0].length, i);
+    }
+    let cursor = 0;
+    const parts = [];
+    for (let i = 0; i < runs.length; i++) {
+      const close = runs[i].close;
+      if (close === undefined) continue;
+      const end = runs[close].index + runs[close][0].length;
+      const span = paragraph.slice(runs[i].index, end);
+      parts.push(paragraph.slice(cursor, runs[i].index), span.includes('[') ? span.replace(/[^\n]/g, ' ') : span.replace(/[|`]/g, ' '));
+      cursor = end;
+      i = close;
+    }
+    return parts.join('') + paragraph.slice(cursor);
+  }).join('');
+  for (const line of masked.split('\n')) {
+    const definition = line.match(/^ {0,3}\[([^\]]+)\]:\s*(?:<([^>]+)>|(\S+))/);
+    if (definition) {
+      const key = referenceKey(definition[1]);
+      if (!definitions.has(key)) definitions.set(key, definition[2] || definition[3]);
+    } else if (line.includes('[')) lines.push(line);
+  }
+  for (const line of lines) {
+    const links = [];
+    const contextParts = [];
+    let contextStart = 0;
+    const pattern = /\[([^\]\n]*)\]/g;
+    let link;
+    while ((link = pattern.exec(line))) {
+      let opener = link.index;
+      while (opener && line[opener - 1] === '\\') opener--;
+      const escaped = (link.index - opener) % 2 !== 0;
+      const start = pattern.lastIndex;
+      let end = start;
+      let destination;
+      if (line[start] === '(') {
+        // Balanced parentheses are legal in unquoted Markdown destinations.
+        let depth = 1;
+        let angle = line[start + 1] === '<';
+        for (end = start + 1; end < line.length; end++) {
+          const ch = line[end];
+          if (ch === '\\') { end++; continue; }
+          if (angle) { if (ch === '>') angle = false; continue; }
+          if (ch === '(') depth++;
+          if (ch === ')' && --depth === 0) break;
+        }
+        if (end >= line.length) break;
+        const raw = line.slice(start + 1, end++).trim();
+        destination = raw.match(/^(?:<([^>]+)>|((?:\\.|[^\s\\])+))(?:\s+["'][^\n]*["'])?$/);
+        destination = destination && (destination[1] || destination[2]);
+      } else {
+        const ref = line.slice(start).match(/^\[([^\]]*)\]/);
+        destination = definitions.get(referenceKey(ref?.[1] || link[1]));
+        if (ref) end += ref[0].length;
+      }
+      pattern.lastIndex = end;
+      if (escaped || line[link.index - 1] === '!') {
+        // Literal links and images cannot supply search terms to another link on this line.
+        contextParts.push(line.slice(contextStart, opener), ' '.repeat(end - opener));
+        contextStart = end;
+        continue;
+      }
+      if (!destination) continue;
+      links.push({ label: link[1], destination, start: link.index, end });
+    }
+    // Keep offsets aligned with the original line for table cells and adjacent prose.
+    const context = contextParts.length ? contextParts.join('') + line.slice(contextStart) : line;
+    let cellStart = 0;
+    for (const [index, link] of links.entries()) {
+      // A table may alternate a name cell and a download cell several times.
+      const precedingCell = context.lastIndexOf('|', link.start);
+      const delimiter = context.indexOf('|', link.end);
+      const cellEnd = delimiter < 0 ? line.length : delimiter;
+      const isolated = (!index || links[index - 1].end <= precedingCell) &&
+        (!links[index + 1] || links[index + 1].start >= cellEnd);
+      const tableLabel = isolated && precedingCell >= cellStart
+        ? context.slice(cellStart, link.start) + link.label + context.slice(link.end, cellEnd) : '';
+      cellStart = cellEnd + 1;
+      let target;
+      try { target = new URL(link.destination.replace(/\\([()\\])/g, '$1'), base); } catch { continue; }
+      if (target.origin !== 'https://huggingface.co') continue;
+      const prefix = ['resolve', 'blob', 'raw'].map(action => '/' + detail.id + '/' + action + '/main/').find(value => target.pathname.startsWith(value));
+      if (!prefix) continue;
+      let filename;
+      try { filename = decodeURIComponent(target.pathname.slice(prefix.length)); } catch { continue; }
+      if (!files.has(filename)) continue;
+      const label = links.length === 1 ? context.slice(0, link.start) + link.label + context.slice(link.end) : tableLabel || link.label;
+      rows.push({ path: filename, label: label.replace(/<[^>]*>/g, ' ').trim() });
+    }
+  }
+  return rows;
 }
 async function fetchHuggingFaceReadmePreview(detail, logger) {
   const readmeEntry = (detail.siblings || []).find((entry) => README_FILE_PATTERN.test(entry.rfilename || ''));
@@ -3208,6 +3409,7 @@ async function fetchHuggingFaceReadmePreview(detail, logger) {
       return null;
     }
     const markdown = await response.text();
+    await collectionIndex.remember(detail, readmeArtifactLabels(detail, markdown.slice(0, 256 * 1024)));
     for (const candidate of extractReadmeImageUrls(markdown)) {
       const normalizedPreview = normalizeHuggingFacePreviewCandidate(detail.id, candidate);
       if (normalizedPreview) {
@@ -3238,14 +3440,14 @@ async function resolveHuggingFacePreview(detail, logger) {
   HUGGING_FACE_PREVIEW_CACHE.set(previewCacheKey, previewUrl);
   return previewUrl;
 }
-function mergeUniqueDetailsById(details = []) {
-  const unique = new Map();
-  for (const detail of details.filter(Boolean)) {
-    if (!unique.has(detail.id)) {
-      unique.set(detail.id, detail);
-    }
+async function* catalogRepositoryDetails(seeds, candidates, batchSize, logger) {
+  yield* seeds;
+  const seededIds = new Set(seeds.map(detail => detail.id));
+  const remaining = mergeUniqueRemoteEntriesById(candidates).filter(entry => !seededIds.has(entry.id));
+  for (let offset = 0; offset < remaining.length; offset += batchSize) {
+    const batch = remaining.slice(offset, offset + batchSize);
+    yield* await fetchHuggingFaceDetails(batch, logger);
   }
-  return [...unique.values()];
 }
 function getPackageDefaultSeedModelIds(tool) {
   const toolId = String(tool?.id || '').trim().toLowerCase();
@@ -3348,19 +3550,34 @@ function mergeUniqueRemoteEntriesById(entries = []) {
   }
   return [...unique.values()];
 }
+const HF_CONTINUATIONS = createExpiringCache({ maxEntries: 400, ttlMs: 30 * 60 * 1000 });
+function saveCatalogContinuation(tool, options, state) {
+  const token = 'localaihub-results:' + crypto.randomUUID();
+  HF_CONTINUATIONS.set(token, { toolId: tool.id, query: options.query, modelType: options.modelType, taskType: options.taskType, ...state });
+  return token;
+}
+function readCatalogContinuation(tool, options) {
+  const state = HF_CONTINUATIONS.get(options.cursor);
+  if (!state || state.toolId !== tool.id || state.query !== options.query || state.modelType !== options.modelType || state.taskType !== options.taskType) {
+    throw new Error('This catalog search has expired. Repeat the search to continue.');
+  }
+  return state;
+}
 async function fetchHuggingFacePage(tool, browseOptions, logger) {
-  // A fallback query must retain its own cursor rather than reuse it with the original query.
-  const cursorPrefix = 'localaihub-hf-search:';
-  if (String(browseOptions.cursor || '').startsWith(cursorPrefix)) {
-    let continuation;
-    try { continuation = JSON.parse(String(browseOptions.cursor).slice(cursorPrefix.length)); } catch { throw new Error('That model search has expired. Search again to continue.'); }
-    if (typeof continuation.query !== 'string' || typeof continuation.cursor !== 'string') throw new Error('That model search has expired. Search again to continue.');
-    const page = await requestHuggingFacePage(tool, { ...browseOptions, cursor: continuation.cursor }, logger, '', continuation.query);
-    return { ...page, nextCursor: page.nextCursor ? cursorPrefix + JSON.stringify({ query: continuation.query, cursor: page.nextCursor }) : null };
+  if (browseOptions.cursor?.startsWith('localaihub-results:')) {
+    const state = readCatalogContinuation(tool, browseOptions);
+    if (state.pending) return { results: state.pending, nextCursor: state.nextCursor };
+    const [source, ...remaining] = state.streams;
+    const page = await requestHuggingFacePage(tool, { ...browseOptions, cursor: source.cursor }, logger, source.tag, source.query);
+    if (page.nextCursor && page.nextCursor !== source.cursor) remaining.push({ ...source, cursor: page.nextCursor });
+    const seen = new Set(state.seen);
+    const results = page.results.filter(entry => !seen.has(entry.id));
+    const nextCursor = remaining.length ? saveCatalogContinuation(tool, browseOptions, { streams: remaining, seen: [...seen, ...results.map(entry => entry.id)] }) : null;
+    return { results, nextCursor };
   }
   const pipelineTags = getEffectiveHuggingFacePipelineTags(browseOptions);
   const derivedSearchQuery = resolveHuggingFaceSearchQuery(tool, browseOptions);
-  const preferredPipelineTag = pipelineTags[0] || '';
+  const preferredPipelineTag = tool.id === 'upscayl' ? '' : pipelineTags[0] || '';
   const primaryPage = await requestHuggingFacePage(tool, browseOptions, logger, preferredPipelineTag);
   const isRvcSearch = isRvcBrowseTarget(tool, browseOptions);
   if (isRvcSearch && primaryPage.nextCursor && (primaryPage.results || []).length >= browseOptions.limit) {
@@ -3384,13 +3601,10 @@ async function fetchHuggingFacePage(tool, browseOptions, logger) {
     const page = await requestHuggingFacePage(tool, browseOptions, logger, '', variant);
     fallbackPages.push({ ...page, query: variant });
   }
-  return {
-    nextCursor: primaryPage.nextCursor || (() => {
-      const page = fallbackPages.find((entry) => entry.nextCursor);
-      return page ? cursorPrefix + JSON.stringify({ query: page.query, cursor: page.nextCursor }) : null;
-    })(),
-    results: mergeUniqueRemoteEntriesById([primaryPage, ...fallbackPages].flatMap((page) => page.results || [])),
-  };
+  const pages = [{ ...primaryPage, query: derivedSearchQuery, tag: preferredPipelineTag }, ...fallbackPages];
+  const results = mergeUniqueRemoteEntriesById(pages.flatMap(page => page.results));
+  const streams = pages.filter(page => page.nextCursor).map(page => ({ query: page.query, tag: page.tag || '', cursor: page.nextCursor }));
+  return { results, nextCursor: streams.length ? saveCatalogContinuation(tool, browseOptions, { streams, seen: results.map(entry => entry.id) }) : null };
 }
 async function resolveHuggingFaceArtifactFiles(detail, browseOptions, logger, tool = null) {
   const query = String(browseOptions.query || '').trim();
@@ -3441,7 +3655,7 @@ function getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch) {
   }
   return artifactItems.length ? [artifactItems] : [modelItems];
 }
-function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl, choiceFiles = []) {
+function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl, choiceFiles = [], includeRejected = true) {
   const plan = file.downloadPlan || null;
   const isPackagePlan = plan?.planType === 'package';
   const fileName = isPackagePlan ? (plan.packageName || path.basename(plan.packageRoot || detail.id)) : path.basename(file.rfilename || '');
@@ -3467,11 +3681,12 @@ function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, 
       source: 'huggingface',
       versionLabel: 'main',
     })),
-    ...buildRejectedArtifactChoices(plan, 'huggingface'),
+    ...(includeRejected ? buildRejectedArtifactChoices(plan, 'huggingface') : []),
   ]);
   return attachHardwareHints(
     attachDownloadPlanFields({
       id: 'huggingface:repository:' + detail.id,
+      artifactKind: file.artifactKind,
       artifactChoices,
       artifactUrl,
       author: detail.author || null,
@@ -3587,13 +3802,161 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
     hardwareContext,
   );
 }
+function parseHuggingFaceCatalogQuery(value) {
+  const raw = String(value || '').trim();
+  if (/^https?:\/\//i.test(raw)) {
+    const url = new URL(raw);
+    if (!['hf.co', 'huggingface.co', 'www.huggingface.co'].includes(url.hostname)) throw new Error('Enter a Hugging Face model or collection URL for this catalog.');
+    let parts;
+    try { parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent); }
+    catch { throw new Error('This Hugging Face URL contains an invalid encoded path.'); }
+    const collection = parts[0] === 'collections';
+    if (collection) parts.shift();
+    if (['datasets', 'spaces', 'buckets'].includes(parts[0])) throw new Error('This URL identifies a Hugging Face ' + parts[0] + ' resource. Model Manager searches the model catalog.');
+    if (!collection && /^[\w-][\w.-]*$/.test(parts[0]) && (parts.length === 1 || ['blob','raw','tree','resolve'].includes(parts[1]))) {
+      return { shortId: parts[0], url };
+    }
+    const [owner, repo, action, revision, ...file] = parts;
+    if (!owner || !repo || !/^[\w.-]+$/.test(owner) || !/^[\w.-]+$/.test(repo) || (action && !['tree', 'blob', 'resolve', 'raw'].includes(action))) throw new Error('Enter a complete Hugging Face repository or file URL.');
+    if (action && !revision || ['blob', 'resolve', 'raw'].includes(action) && !file.length) throw new Error('This Hugging Face file URL is missing its revision or file path.');
+    if (revision && revision !== 'main') throw new Error('This link requests revision ' + revision + '. Model Manager currently installs from main. Open that revision on Hugging Face or provide a main-branch link.');
+    return { query: owner + '/' + repo, url, collection, fileQuery: file.join('/'), exactPath: ['blob', 'resolve', 'raw'].includes(action), folder: action === 'tree' };
+  }
+  const scoped = raw.match(/^([\w.-]+[\\/][\w.-]+)\/?(?:\s+(.+))?$/);
+  if (scoped) return { query: scoped[1].replace('\\', '/'), fileQuery: scoped[2] || '', collection: false };
+  if (/^collections\/[\w.-]+\/[\w.-]+\/?$/i.test(raw)) return { query: raw.replace(/^collections\//i, '').replace(/\/$/, ''), collection: true };
+  return { query: raw, collection: false };
+}
+
+async function getHuggingFaceCollection(query) {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(query)) return null;
+  const url = 'https://huggingface.co/api/collections/' + query;
+  try {
+    const { payload } = await fetchCachedJsonResponse(HUGGING_FACE_PAGE_CACHE, url, url, { headers: { 'User-Agent': APP_USER_AGENT } });
+    return Array.isArray(payload?.items) ? payload : null;
+  } catch (error) {
+    if (![400, 401, 403, 404].includes(error.status)) throw error;
+  }
+  // Some API versions require the ID suffix even when the website accepts a short slug.
+  const [owner] = query.split('/');
+  const list = new URL('https://huggingface.co/api/collections');
+  list.searchParams.set('owner', owner);
+  list.searchParams.set('limit', '100');
+  const seen = new Set();
+  do {
+    const key = list.toString();
+    if (seen.has(key)) break;
+    seen.add(key);
+    const { payload, response } = await fetchCachedJsonResponse(HUGGING_FACE_PAGE_CACHE, key, list, { headers: { 'User-Agent': APP_USER_AGENT } });
+    const match = Array.isArray(payload) && payload.find(entry => String(entry.slug || '').replace(/-[0-9a-f]{24}$/i, '').toLowerCase() === query.toLowerCase());
+    if (match && /^[\w.-]+\/[\w.-]+$/.test(match.slug) && match.slug !== query) {
+      const fullUrl = 'https://huggingface.co/api/collections/' + match.slug;
+      const full = await fetchCachedJsonResponse(HUGGING_FACE_PAGE_CACHE, fullUrl, fullUrl, { headers: { 'User-Agent': APP_USER_AGENT } });
+      return Array.isArray(full.payload?.items) ? full.payload : null;
+    }
+    const cursor = extractCursorFromLinkHeader(response.headers.get('link'), 'next');
+    if (!cursor) break;
+    list.searchParams.set('cursor', cursor);
+  } while (true);
+  return null;
+}
+
+function fileKeywordMatches(query, name) {
+  if (isExactCatalogFilename(query)) return name.toLowerCase() === query.toLowerCase() || path.posix.basename(name).toLowerCase() === query.toLowerCase();
+  if (matchesSearchQuery(query, [name])) return true;
+  const tokens = searchTokens(query);
+  const words = searchTokens(name);
+  // A publisher may omit the final letter of a word (e.g. "Steve universe").
+  return tokens.length > 1 && tokens.every(token => words.some(word => word.includes(token) || word.length >= 5 && token.length === word.length + 1 && token.startsWith(word)));
+}
+
+async function searchHuggingFaceCatalog(tool, options, downloaded, hardware, logger) {
+  const parsed = parseHuggingFaceCatalogQuery(options.query);
+  if (parsed.url && !parsed.collection) {
+    const requestedId = parsed.shortId || parsed.query;
+    const detail = await fetchHuggingFaceDetail({ id: requestedId }, logger);
+    if (detail?.id !== requestedId && isRepositoryIdSearchQuery(detail?.id)) {
+      const segments = parsed.url.pathname.split('/').filter(Boolean).slice(parsed.shortId ? 1 : 2);
+      parsed.url.pathname = '/' + [detail.id, ...segments].join('/');
+      return searchHuggingFaceModels(tool, { ...options, query: parsed.url.href }, downloaded, hardware, logger);
+    }
+    if (parsed.shortId) throw new Error('This Hugging Face model link could not be resolved.');
+  }
+  const query = parsed.query;
+  if (!query || parsed.collection || isRepositoryIdSearchQuery(query) || !searchTokens(query).some(token => token.length >= 2 && !['rvc', 'pt', 'pth', 'zip', 'gguf', 'model', 'models'].includes(token))) {
+    return searchHuggingFaceModels(tool, options, downloaded, hardware, logger);
+  }
+  // Search both repository names and sibling filenames. Each continuation does bounded work.
+  const state = options.cursor?.startsWith('localaihub-discovery:')
+    ? readCatalogContinuation(tool, { ...options, cursor: options.cursor.replace('localaihub-discovery:', 'localaihub-results:') })
+    : { mode: 'files', names: options.cursor || null, files: null, phase: tool.id === 'rvc' ? 'rvc' : 'all', namesDone: false, seen: [], pending: [] };
+  const seen = new Set(state.seen);
+  const items = [];
+  if (state.mode === 'files') {
+    if (!state.pending.length && state.phase) {
+      const url = new URL(HUGGING_FACE_SEARCH_URL);
+      url.searchParams.set('expand', 'siblings');
+      url.searchParams.set('limit', '48');
+      url.searchParams.set('sort', 'downloads');
+      url.searchParams.set('direction', '-1');
+      if (state.phase === 'rvc') url.searchParams.set('search', 'rvc');
+      if (state.files) url.searchParams.set('cursor', state.files);
+      const candidates = [];
+      // Previously inspected repositories can satisfy a filename search immediately.
+      if (!options.cursor) {
+        candidates.push(...await collectionIndex.matchingIds(query, isExactCatalogFilename(query)));
+        if (!candidates.length) candidates.push(...HUGGING_FACE_DETAIL_CACHE.matchingIds(detail => detail?.siblings?.some(file => fileKeywordMatches(query, file.rfilename))));
+      }
+      if (!candidates.length) {
+        const { payload, response } = await fetchCachedJsonResponse(HUGGING_FACE_PAGE_CACHE, 'inventory:' + url, url, { headers: { 'User-Agent': APP_USER_AGENT } });
+        for (const entry of Array.isArray(payload) ? payload : []) {
+          if (entry.siblings?.some(file => fileKeywordMatches(query, file.rfilename))) candidates.push(entry.id);
+        }
+        state.files = extractCursorFromLinkHeader(response.headers.get('link'), 'next');
+        if (!state.files) state.phase = state.phase === 'rvc' ? 'all' : null;
+      }
+      state.pending = [...new Set(candidates)].filter(id => !seen.has(id));
+    }
+    let checked = 0;
+    while (state.pending.length && items.length < options.limit && checked++ < options.limit) {
+      const pending = state.pending.shift();
+      const id = typeof pending === 'string' ? pending : pending.id;
+      const found = await searchHuggingFaceModels(tool, { ...options, query: id + ' ' + query, cursor: pending.cursor || null, discoveryCandidate: true }, downloaded, hardware, logger);
+      if (found.pagination.nextCursor) state.pending.push({ id, cursor: found.pagination.nextCursor });
+      if (found.items.length) {
+        items.push(found.items[0]);
+        seen.add(id);
+      }
+    }
+    if (!state.namesDone) state.mode = 'names';
+  }
+  if (!items.length && state.mode === 'names' && !state.namesDone) {
+    const found = await searchHuggingFaceModels(tool, { ...options, cursor: state.names }, downloaded, hardware, logger);
+    for (const item of found.items) {
+      if (!seen.has(item.catalogRepositoryId)) items.push(item);
+      seen.add(item.catalogRepositoryId);
+    }
+    state.names = found.pagination.nextCursor;
+    state.namesDone = !state.names;
+    state.mode = state.phase || state.pending.length ? 'files' : 'names';
+  }
+  if (state.namesDone) state.mode = 'files';
+  state.seen = [...seen];
+  const more = !state.namesDone || Boolean(state.phase) || Boolean(state.pending.length);
+  const nextCursor = more ? saveCatalogContinuation(tool, options, state).replace('localaihub-results:', 'localaihub-discovery:') : null;
+  return { items, pagination: { hasMore: more, nextCursor, nextPage: null } };
+}
+
 async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, hardwareContext, logger) {
   const modelItems = [];
   const artifactItems = [];
   const blockedItems = [];
   const catalogRequirements = getCatalogRequirements(browseOptions);
-  const query = String(browseOptions.query || '').trim();
-  if (String(tool?.id || '').trim().toLowerCase() === 'upscayl' && !isRepositoryIdSearchQuery(query)) {
+  const parsedQuery = parseHuggingFaceCatalogQuery(browseOptions.query);
+  const rawQuery = parsedQuery.query;
+  const repositoryIdSearch = isRepositoryIdSearchQuery(rawQuery);
+  const query = repositoryIdSearch ? rawQuery.replace(/\\+/g, '/') : rawQuery;
+  if (String(tool?.id || '').trim().toLowerCase() === 'upscayl' && !query) {
     return {
       items: [],
       pagination: {
@@ -3608,8 +3971,17 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
     : []);
   let sawNonSeedCompatibleModel = false;
   const fileLevelSearch = Boolean(query) && isFileLikeSearchQuery(query);
-  const repositoryIdSearch = Boolean(query) && isRepositoryIdSearchQuery(query);
+  const filesCursor = 'localaihub-files:';
   let rawCursor = browseOptions.cursor;
+  let fileOffset = 0;
+  if (rawCursor?.startsWith(filesCursor)) {
+    fileOffset = Number(rawCursor.slice(filesCursor.length));
+    if (!repositoryIdSearch || !Number.isSafeInteger(fileOffset) || fileOffset < 0) throw new Error('Repeat the repository search to continue.');
+    rawCursor = null;
+  }
+  browseOptions = { ...browseOptions, query, cursor: rawCursor };
+  let collection = null;
+  const collectionCursor = 'localaihub-collection:';
   let nextCursor = null;
   for (let scanCount = 0; scanCount < 3; scanCount += 1) {
     throwIfModelBrowseCanceled();
@@ -3617,38 +3989,118 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
     if (existingItems.length >= browseOptions.limit) {
       break;
     }
-    const seedDetails = scanCount === 0 && !rawCursor ? await fetchHuggingFaceSeedDetails(browseOptions, logger, tool) : [];
+    const seedDetails = scanCount === 0 && !rawCursor && !parsedQuery.collection ? await fetchHuggingFaceSeedDetails(browseOptions, logger, tool) : [];
     const exactRepository = repositoryIdSearch && seedDetails.some((detail) => detail.id.toLowerCase() === query.toLowerCase());
-    const page = exactRepository ? { results: [], nextCursor: null } : await fetchHuggingFacePage(tool, { ...browseOptions, cursor: rawCursor }, logger);
-    const pageDetails = await fetchHuggingFaceDetails(page.results, logger);
-    let details = mergeUniqueDetailsById([...seedDetails, ...pageDetails]);
-    if (repositoryIdSearch) {
-      const exactDetails = details.filter((detail) => String(detail.id || '').toLowerCase() === query.toLowerCase());
-      if (exactDetails.length) {
-        details = exactDetails;
+    const tryCollection = !seedDetails.length && repositoryIdSearch && (!rawCursor || rawCursor.startsWith(collectionCursor));
+    if (!browseOptions.discoveryCandidate && !exactRepository && !collection && (parsedQuery.collection || tryCollection)) {
+      collection = await getHuggingFaceCollection(query);
+      if (!collection && (parsedQuery.collection || rawCursor?.startsWith(collectionCursor))) {
+        throw new Error('This Hugging Face collection could not be found or accessed.');
       }
     }
-    for (const detail of details) {
+    if (browseOptions.discoveryCandidate && !exactRepository) break;
+    if (parsedQuery.fileQuery && !exactRepository && !collection) throw new Error('The requested Hugging Face repository could not be resolved. Check its name and access settings.');
+    let page;
+    if (collection) {
+      const members = collection.items.filter(item => (item.type || item.itemType) === 'model');
+      const offset = rawCursor ? Number(rawCursor.slice(collectionCursor.length)) : 0;
+      if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Repeat the collection search to continue.');
+      const end = offset + browseOptions.limit;
+      page = { results: members.slice(offset, end).map(item => ({ id: item.id || item.itemId })), nextCursor: end < members.length ? collectionCursor + end : null };
+    } else {
+      page = exactRepository ? { results: [], nextCursor: null } : await fetchHuggingFacePage(tool, { ...browseOptions, cursor: rawCursor }, logger);
+    }
+    const exactCandidates = repositoryIdSearch ? page.results.filter(entry => String(entry.id).toLowerCase() === query.toLowerCase() && !entry.private && !entry.gated) : [];
+    const candidates = exactCandidates.length ? exactCandidates : page.results;
+    const room = Math.max(1, browseOptions.limit - existingItems.length - blockedItems.length);
+    const batchSize = Math.min(4, room);
+    const entries = mergeUniqueRemoteEntriesById([...seedDetails, ...candidates]);
+    if (entries.length > room && !exactRepository && !collection) {
+      page.nextCursor = saveCatalogContinuation(tool, browseOptions, { pending: entries.slice(room).map(entry => ({ id: entry.id, gated: entry.gated, private: entry.private })), nextCursor: page.nextCursor });
+    }
+    const pageEntries = entries.slice(0, room);
+    const seedsOnPage = seedDetails.filter(seed => pageEntries.some(entry => entry.id === seed.id));
+    for await (const detail of catalogRepositoryDetails(seedsOnPage, pageEntries, batchSize, logger)) {
       throwIfModelBrowseCanceled();
       const detailId = String(detail?.id || '').trim().toLowerCase();
       const isDefaultSeedDetail = defaultSeedModelIds.has(detailId);
-      const planningDetail = await expandHuggingFaceDetailForPlanning(detail, browseOptions.modelType, tool, logger);
+      if (detail.gated) {
+        if (collection || exactRepository || browseOptions.includeIncompatible) {
+          blockedItems.push(buildHuggingFaceBlockedRepositoryResult(detail, { runnable: false, blockingReason: 'Hugging Face restricts downloads from this repository. Review its access conditions on the model page.' }, tool, hardwareContext, catalogRequirements, null));
+        }
+        continue;
+      }
+      const memberDetail = { ...detail, inspectVoiceZip: Boolean(exactRepository || collection), tags: [...(detail.tags || []), ...(collection ? [collection.title || ''] : [])] };
+      let planningDetail = await expandHuggingFaceDetailForPlanning(memberDetail, browseOptions.modelType, tool, logger);
+      const knownAliases = parsedQuery.fileQuery && !parsedQuery.exactPath && !parsedQuery.folder && !isExactCatalogFilename(parsedQuery.fileQuery)
+        ? collectionIndex.aliasPaths(memberDetail, parsedQuery.fileQuery, matchesSearchQuery) : [];
+      if (parsedQuery.fileQuery && !knownAliases.length && !planningDetail.siblings?.some(file => fileKeywordMatches(parsedQuery.fileQuery, file.rfilename))) {
+        const tree = await fetchHuggingFaceRepositoryTree(memberDetail, logger);
+        if (tree.length) planningDetail = { ...planningDetail, siblings: mergeHuggingFaceSiblingEntries(planningDetail.siblings || [], tree) };
+      }
+      await collectionIndex.remember(planningDetail);
       let compatibleFiles = collectHuggingFaceDownloadFiles(planningDetail, browseOptions.modelType, tool);
+      if (parsedQuery.fileQuery) {
+        const requested = parsedQuery.fileQuery.replace(/\\/g, '/');
+        const isExact = parsedQuery.exactPath || (!parsedQuery.folder && /\.[a-z\d]{1,16}$/i.test(requested));
+        const filenames = file => [file.rfilename, ...(file.downloadPlan?.requiredArtifacts || [])];
+        const matchesPath = name => {
+          if (parsedQuery.folder) return name.startsWith(requested + '/');
+          if (parsedQuery.exactPath) return name === requested;
+          const normalized = name.toLowerCase();
+          return normalized === requested.toLowerCase() || (!requested.includes('/') && path.posix.basename(normalized) === requested.toLowerCase());
+        };
+        let matching = compatibleFiles.filter(file => filenames(file).some(matchesPath));
+        if (isExact && matching.length > 1) {
+          const precise = matching.filter(file => filenames(file).includes(requested));
+          if (precise.length === 1) matching = precise;
+          else {
+            const reason = 'Several artifacts match this filename. Search with the full repository-relative path.';
+            const plan = { runnable: false, blockingReason: reason, rejectedArtifacts: matching.map(file => ({ path: file.rfilename, reason })) };
+            blockedItems.push(buildHuggingFaceBlockedRepositoryResult(detail, plan, tool, hardwareContext, catalogRequirements, null));
+            continue;
+          }
+        }
+        if (isExact || parsedQuery.folder) compatibleFiles = matching;
+        else {
+          const aliases = knownAliases.length ? new Set(knownAliases) : await findReadmeArtifacts(planningDetail, requested);
+          compatibleFiles = compatibleFiles.filter(file => filenames(file).some(name => aliases.has(name) || fileKeywordMatches(requested, name)));
+        }
+        if (!compatibleFiles.length) {
+          const present = (planningDetail.siblings || []).filter(entry => matchesPath(entry.rfilename));
+          if (present.length) {
+            const artifacts = present.map(entry => ({ ...entry, modelType: inferHuggingFaceType(planningDetail, entry) }));
+            const plan = createModelDownloadPlan({ artifacts, tool, selectedType: browseOptions.modelType, source: 'huggingface' });
+            const reason = plan.blockingReason || 'This file exists but cannot be installed independently for this target.';
+            const blocked = buildHuggingFaceBlockedRepositoryResult(detail, { ...plan, runnable: false, blockingReason: reason }, tool, hardwareContext, catalogRequirements, null);
+            blocked.fileName = present[0].rfilename;
+            blockedItems.push(blocked);
+          }
+          continue;
+        }
+      }
+      if (exactRepository && (fileOffset || compatibleFiles.length > 128)) {
+        // Keep large repositories usable through both IPC and MCP.
+        const end = fileOffset + 128;
+        page.nextCursor = end < compatibleFiles.length ? filesCursor + end : null;
+        compatibleFiles = compatibleFiles.slice(fileOffset, end);
+      }
       const matchingArtifacts = Boolean(query)
-        ? compatibleFiles.filter((file) => matchesSearchQuery(query, [file.rfilename, path.basename(file.rfilename)]))
+        ? compatibleFiles.filter((file) => matchesSearchQuery(query, [file.rfilename, path.basename(file.rfilename), ...(file.downloadPlan?.requiredArtifacts || [])]))
         : [];
       const searchableQuery = isRvcBrowseTarget(tool, browseOptions) ? stripRvcArtifactSearchHints(query) : query;
       const repositoryMatches = matchesSearchQuery(searchableQuery, [
         [detail.id, ...(detail.tags || []), buildHuggingFaceDescription(detail)].join(' '),
       ]);
-      if (query && !repositoryMatches && !matchingArtifacts.length) continue;
+      if (query && !collection && !repositoryMatches && !matchingArtifacts.length) continue;
       const exactFile = matchingArtifacts.find((file) => path.basename(file.rfilename).toLowerCase() === query.toLowerCase());
+      if (!repositoryIdSearch && !collection && isExactCatalogFilename(query) && !exactFile) continue;
       const selectedFile = exactFile || matchingArtifacts[0] || compatibleFiles[0];
       if (selectedFile) {
         const selectedIndex = compatibleFiles.indexOf(selectedFile);
         compatibleFiles = await Promise.all(
           compatibleFiles.map(async (file) =>
-            file.sizeBytes > 0 || file.downloadPlan?.planType === 'package'
+            file.sizeBytes > 0 || (compatibleFiles.length > 32 && file !== selectedFile) || file.downloadPlan?.planType === 'package'
               ? file
               : {
                   ...file,
@@ -3661,12 +4113,12 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
         if (!isDefaultSeedDetail) {
           sawNonSeedCompatibleModel = true;
         }
-        modelItems.push(
-          buildHuggingFaceRepositoryResult(planningDetail, primaryFile, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl, compatibleFiles),
-        );
-      } else if (query) {
+        const item = buildHuggingFaceRepositoryResult(planningDetail, primaryFile, tool, downloadedLookup, hardwareContext, catalogRequirements, previewUrl, compatibleFiles, !parsedQuery.fileQuery && !fileOffset);
+        if (fileOffset) item.id += '-files-' + fileOffset;
+        modelItems.push(item);
+      } else if (query && (exactRepository || collection || browseOptions.includeIncompatible || !['rvc', 'upscayl'].includes(tool.id))) {
         const plan = await resolveHuggingFaceDownloadPlan(planningDetail, browseOptions.modelType, logger, tool);
-        if (plan && plan.runnable === false && plan.rejectedArtifacts?.length) {
+        if (plan && plan.runnable === false && (exactRepository || collection || plan.rejectedArtifacts?.length)) {
           if (!isDefaultSeedDetail) {
             sawNonSeedCompatibleModel = true;
           }
@@ -3681,13 +4133,13 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
     }
     nextCursor = page.nextCursor;
     const mergedItems = mergeCatalogSearchItems(getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), browseOptions.limit);
-    if (!nextCursor || mergedItems.length >= browseOptions.limit) {
+    if (collection || exactRepository || !nextCursor || mergedItems.length + blockedItems.length >= browseOptions.limit) {
       break;
     }
     rawCursor = nextCursor;
   }
   const items = mergeCatalogSearchItems([...getCatalogSearchGroups(modelItems, artifactItems, fileLevelSearch), blockedItems], browseOptions.limit);
-  const suppressSeedOnlyLoadMore = defaultSeedModelIds.size > 0 && items.length > 0 && !sawNonSeedCompatibleModel;
+  const suppressSeedOnlyLoadMore = defaultSeedModelIds.size > 0 && items.length > 0 && !sawNonSeedCompatibleModel && !nextCursor?.startsWith('localaihub-results:');
   return {
     items,
     pagination: {
@@ -3938,6 +4390,29 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
       },
     };
   }
+  const directUrl = /^https?:\/\//i.test(browseOptions.query || '') ? new URL(browseOptions.query) : null;
+  if (directUrl) {
+    const match = directUrl.pathname.match(/^\/models\/(\d+)(?:\/[^/]+)?\/?$/i);
+    const version = directUrl.searchParams.get('modelVersionId');
+    if (!['civitai.com', 'www.civitai.com', 'civitai.green', 'www.civitai.green'].includes(directUrl.hostname) ||
+        !match || (version !== null && !/^\d+$/.test(version))) throw new Error('Enter a CivitAI model page URL with a numeric model and version ID.');
+    const pagination = { hasMore: false, nextCursor: null, nextPage: null };
+    const url = CIVITAI_MODELS_URL + '/' + match[1];
+    let model;
+    try {
+      const key = buildProviderCacheKey('civitai-model', { url, hasApiKey: Boolean(settings.hasCivitaiApiKey) });
+      ({ payload: model } = await fetchCachedJsonResponse(CIVITAI_SEARCH_CACHE, key, url, { headers: buildCivitaiHeaders(settings) }));
+    } catch (error) {
+      if (error.status === 404) return { items: [], pagination };
+      throw error;
+    }
+    const scoped = version ? { ...model, modelVersions: (model.modelVersions || []).filter(entry => String(entry.id) === version) } : model;
+    const files = collectCivitaiVersionFiles(scoped, browseOptions.modelType, tool);
+    const motionOnly = ['video-generation', 'image-to-video'].includes(selectedTaskType);
+    const items = files.length && (!motionOnly || model.type === 'MotionModule')
+      ? [buildCivitaiModelResult(scoped, files[0], tool, downloadedLookup, hardwareContext, catalogRequirements, files)] : [];
+    return { items, pagination };
+  }
   const searchUrl = new URL(CIVITAI_MODELS_URL);
   searchUrl.searchParams.set('limit', String(browseOptions.limit));
   searchUrl.searchParams.set('sort', CIVITAI_SORT_MAP[browseOptions.sort] || CIVITAI_SORT_MAP['most-downloaded']);
@@ -3989,7 +4464,10 @@ async function searchCivitaiModels(tool, browseOptions, downloadedLookup, settin
           ]),
         )
       : [];
-    const primaryEntry = (fileLevelSearch && matchingFiles[0]) || candidateFiles[0] || null;
+    const primaryEntry = isExactCatalogFilename(derivedSearchQuery)
+      ? candidateFiles.find(entry => entry.file.name.toLowerCase() === path.basename(derivedSearchQuery).toLowerCase())
+      : (fileLevelSearch && matchingFiles[0]) || candidateFiles[0];
+    if (fileLevelSearch && !primaryEntry) continue;
     if (primaryEntry) {
       modelItems.push(buildCivitaiModelResult(model, primaryEntry, tool, downloadedLookup, hardwareContext, catalogRequirements, candidateFiles));
     }
@@ -4079,7 +4557,8 @@ async function browseRemoteModels(tool, options = {}, context = {}) {
         settings: publicSettings,
       };
     }
-    const result = await searchHuggingFaceModels(tool, browseOptions, downloadedLookup, hardwareContext, logger);
+    const result = await searchHuggingFaceCatalog(tool, browseOptions, downloadedLookup, hardwareContext, logger);
+    await collectionIndex.flush();
     return {
       items: result.items,
       localModels,
@@ -4191,9 +4670,10 @@ function parseOllamaFamilyVariants(html, familyName) {
   const sectionHtml = sectionMatch?.[0] || '';
   const rows = sectionHtml.split(/<div\b[^>]*class="hidden group[^"]*sm:grid[^"]*"[^>]*>/i).slice(1);
   for (const row of rows) {
-    const link = row.match(/<a\b[^>]*href="\/library\/([^"#?]+)"[^>]*>([^<]+)<\/a>/i);
+    const link = row.match(/<a\b[^>]*href="\/([^"#?]+)"[^>]*>([^<]+)<\/a>/i);
     if (!link) continue;
-    const variantName = stripHtml(link[2]);
+    const variantName = link[1].replace(/^library\//i, '').replace(/%3a/ig, ':');
+    if (variantName.split(':')[0].toLowerCase() !== familyName.toLowerCase()) continue;
     const rowBody = row.slice(link.index + link[0].length).split(/<a\b/i)[0];
     const fields = [...rowBody.matchAll(/<p\b[^>]*class="col-span-2 text-neutral-500"[^>]*>([\s\S]*?)<\/p>/gi)].map(field => stripHtml(field[1]));
     const sizeLabel = stripHtml(rowBody).match(/\b\d+(?:\.\d+)?\s*[KMGT]B\b/i)?.[0];
@@ -4207,7 +4687,7 @@ function parseOllamaFamilyVariants(html, familyName) {
       familyName,
       inputLabel: inputLabel || null,
       isLatestAlias: /:latest$/i.test(variantName),
-      libraryPath: `/library/${link[1]}`,
+      libraryPath: `/${link[1]}`,
       latest: /text-blue-600">latest<\/span>/i.test(rowBody),
       name: variantName,
       sizeBytes: parseHumanSizeToBytes(sizeLabel),
@@ -4217,7 +4697,7 @@ function parseOllamaFamilyVariants(html, familyName) {
   }
   if (!variants.length) {
     const seen = new Set();
-    const links = String(html || '').matchAll(/<a\b[^>]*?\shref=["'](?:https:\/\/ollama\.com)?\/library\/([\w.-]+)(?::|%3a)([\w.-]+)["'][^>]*>([\s\S]*?)<\/a>/gi);
+    const links = String(html || '').matchAll(/<a\b[^>]*?\shref=["'](?:https:\/\/ollama\.com)?\/(?:library\/)?([\w.-]+(?:\/[\w.-]+)?)(?::|%3a)([\w.-]+)["'][^>]*>([\s\S]*?)<\/a>/gi);
     for (const [, slug, tag, body] of links) {
       const name = slug + ':' + tag;
       if (slug.toLowerCase() !== familyName.toLowerCase() || seen.has(name)) continue;
@@ -4225,7 +4705,7 @@ function parseOllamaFamilyVariants(html, familyName) {
       const label = stripHtml(body);
       const sizeLabel = label.match(/\b\d+(?:\.\d+)?\s*[KMGT]B\b/i)?.[0];
       variants.push({
-        name, familyName, libraryPath: '/library/' + name, isLatestAlias: tag === 'latest',
+        name, familyName, libraryPath: (name.includes('/') ? '/' : '/library/') + name, isLatestAlias: tag === 'latest',
         latest: tag !== 'latest' && /\blatest\b/i.test(label),
         sizeLabel: sizeLabel || 'Unknown', sizeBytes: parseHumanSizeToBytes(sizeLabel),
         contextLabel: label.match(/\b\d+[KM]?\s+context window/i)?.[0] || null,
@@ -4287,9 +4767,9 @@ function getOllamaDefaultVariant(familyDetails) {
 }
 function buildOllamaArtifactChoices(entry, familyDetails, selectedName) {
   const variants = familyDetails?.variants || [];
-  const sourceUrl = buildOllamaModelPageUrl(entry.libraryPath || entry.name);
   const choices = (variants.length ? variants : [{ name: selectedName || entry.name, sizeBytes: entry.sizeBytes, sizeLabel: entry.sizeLabel }]).map((variant) => {
     const name = variant.name || selectedName || entry.name;
+    const sourceUrl = buildOllamaModelPageUrl(name);
     return {
       artifactLabel: 'Ollama tag',
       artifactPath: name,
@@ -4369,13 +4849,13 @@ function buildOllamaVariantCard(entry, familyDetails, variant) {
     libraryPath: variant.libraryPath,
     modelType: 'Model',
     name: variant.name,
-    modelPageUrl: buildOllamaModelPageUrl(variant.libraryPath || entry.libraryPath || entry.name),
+    modelPageUrl: buildOllamaModelPageUrl(variant.name),
     previewUrl: sanitizeModelPreviewUrl(familyDetails?.previewUrl || entry.previewUrl),
     sizeBytes: variant.sizeBytes,
     sizeLabel: variant.sizeLabel,
     source: 'ollama',
     sourceLabel: 'Ollama',
-    sourceUrl: buildOllamaModelPageUrl(variant.libraryPath || entry.libraryPath || entry.name),
+    sourceUrl: buildOllamaModelPageUrl(variant.name),
     toolId: 'ollama',
     versionLabel: variant.name,
     updatedLabel: variant.updatedLabel || entry.updatedLabel,
@@ -4483,7 +4963,10 @@ function normalizeOllamaSort(sort) {
 }
 async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwareContext, logger) {
   const searchUrl = new URL(OLLAMA_LIBRARY_URL);
-  const normalizedQuery = String(browseOptions.query || '').trim();
+  const input = String(browseOptions.query || '').trim().replace(/%3a/ig, ':');
+  const tagsPage = /^https?:\/\/(?:www\.)?ollama\.com\/(?:library\/)?([\w.-]+(?:\/[\w.-]+)?)\/tags\/?(?:[?#].*)?$/i.exec(input);
+  const modelUrl = tagsPage || input.match(/^https?:\/\/(?:www\.)?ollama\.com\/(?:library\/)?([\w.:-]+(?:\/[\w.:-]+)?)\/?(?:[?#].*)?$/i);
+  const normalizedQuery = modelUrl ? modelUrl[1] : input;
   const normalizedSort = normalizeOllamaSort(browseOptions.sort);
   searchUrl.searchParams.set('sort', normalizedSort);
   await logger.info('Loading Ollama library page.', {
@@ -4492,19 +4975,37 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
     sort: normalizedSort,
     url: searchUrl.toString(),
   });
-  let html = '';
-  try {
-    html = await fetchCachedText(OLLAMA_LIBRARY_CACHE, buildProviderCacheKey('ollama-library', { sort: normalizedSort, url: searchUrl.toString() }), searchUrl, {
-      headers: {
-        'User-Agent': APP_USER_AGENT,
-      },
-    });
-  } catch (error) {
-    rethrowModelBrowseCancellation(error);
-    throw new Error('Local AI Hub could not load the Ollama library list right now.');
+  const community = normalizedQuery.match(/^([\w-][\w.-]*\/[\w-][\w.-]*)(?::[\w.-]+)?$/);
+  let allFamilies;
+  if (community) {
+    const name = community[1];
+    const entry = { id: 'ollama:' + name, name, slug: name, fileName: name, libraryPath: '/' + name,
+      modelType: 'Model', source: 'ollama', toolId: 'ollama' };
+    const tagsUrl = buildOllamaAbsoluteUrl(entry.libraryPath + '/tags');
+    try {
+      const html = await fetchCachedText(OLLAMA_LIBRARY_CACHE, tagsUrl, tagsUrl, { headers: { 'User-Agent': APP_USER_AGENT } });
+      const variants = parseOllamaFamilyVariants(html, name);
+      allFamilies = variants.length ? [entry] : [];
+      if (variants.length) OLLAMA_FAMILY_CACHE.set(name.toLowerCase(), { variants, description: extractOllamaFamilyDescription(html, name) });
+    } catch (error) {
+      if (error.status !== 404) throw error;
+      allFamilies = [];
+    }
+  } else {
+    let html = '';
+    try {
+      html = await fetchCachedText(OLLAMA_LIBRARY_CACHE, buildProviderCacheKey('ollama-library', { sort: normalizedSort, url: searchUrl.toString() }), searchUrl, {
+        headers: {
+          'User-Agent': APP_USER_AGENT,
+        },
+      });
+    } catch (error) {
+      rethrowModelBrowseCancellation(error);
+      throw new Error('Local AI Hub could not load the Ollama library list right now.');
+    }
+    allFamilies = parseOllamaLibraryCards(html);
+    if (!allFamilies.length) throw new Error('Local AI Hub could not read the model list from the Ollama library.');
   }
-  const allFamilies = parseOllamaLibraryCards(html);
-  if (!allFamilies.length) throw new Error('Local AI Hub could not read the model list from the Ollama library.');
   const startIndex = (browseOptions.page - 1) * OLLAMA_PAGE_SIZE;
   const endIndex = startIndex + OLLAMA_PAGE_SIZE;
   if (!normalizedQuery) {
@@ -4540,9 +5041,10 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
     : normalizedQuery;
   const taggedFamily = variantQuery.includes(':') ? variantQuery.split(':')[0].trim().toLowerCase() : '';
   const familyQuery = normalizedQuery.replace(/\b\d+(?:\.\d+)?\s*[bmkt]\b/ig, '').trim();
-  const matchedFamilies = taggedFamily
-    ? allFamilies.filter((entry) => entry.name.toLowerCase() === taggedFamily)
-    : allFamilies.filter((entry) => matchesOllamaQuery(entry, familyQuery || normalizedQuery));
+  const exactFamily = modelUrl || community ? normalizedQuery.split(':')[0].toLowerCase() : taggedFamily;
+  const matchedFamilies = exactFamily
+    ? allFamilies.filter(entry => entry.name.toLowerCase() === exactFamily)
+    : allFamilies.filter(entry => matchesOllamaQuery(entry, familyQuery || normalizedQuery));
   const fullMatchCount = matchedFamilies.length;
   if (!matchedFamilies.length) {
     return {
@@ -4554,7 +5056,7 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
       },
     };
   }
-  if (isOllamaVariantQuery(variantQuery)) {
+  if (isOllamaVariantQuery(variantQuery) && !(community && !taggedFamily)) {
     const variantItems = [];
     for (const entry of matchedFamilies) {
       let familyDetails = await fetchOllamaFamilyDetails(entry, logger);
@@ -4568,7 +5070,7 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
       }
       for (const variant of familyDetails.variants || []) {
         const card = buildOllamaVariantCard(entry, familyDetails, variant);
-        if (!matchesOllamaVariantQuery(card, variantQuery)) {
+        if (taggedFamily ? variant.name.toLowerCase() !== variantQuery.toLowerCase() : !matchesOllamaVariantQuery(card, variantQuery)) {
           continue;
         }
         variantItems.push(
@@ -4601,7 +5103,14 @@ async function searchOllamaLibrary(tool, browseOptions, downloadedLookup, hardwa
   const pageFamilies = matchedFamilies.slice(startIndex, endIndex);
   const items = await Promise.all(
     pageFamilies.map(async (entry) => {
-      const familyDetails = await fetchOllamaFamilyDetails(entry, logger);
+      let familyDetails = await fetchOllamaFamilyDetails(entry, logger);
+      if (tagsPage) {
+        const tagsUrl = buildOllamaAbsoluteUrl(entry.libraryPath + '/tags');
+        const html = await fetchCachedText(OLLAMA_LIBRARY_CACHE, tagsUrl, tagsUrl, { headers: { 'User-Agent': APP_USER_AGENT } });
+        const tags = parseOllamaFamilyVariants(html, entry.name);
+        const existing = new Set(familyDetails.variants.map(variant => variant.name));
+        familyDetails = { ...familyDetails, variants: [...familyDetails.variants, ...tags.filter(tag => !existing.has(tag.name))] };
+      }
       const card = buildOllamaFamilyCard(entry, familyDetails);
       return attachHardwareHints(
         {
@@ -5054,6 +5563,9 @@ function getDownloadSizeBytes(payload = {}) {
 
 function buildModelDownloadPreflightRequirements(tool, payload = {}, options = {}) {
   const sizeBytes = getDownloadSizeBytes(payload);
+  if (tool.id === 'ollama' && payload.source === 'ollama') {
+    return [{ kind: 'model-target', label: 'Ollama model folder', path: getOllamaModelsRoot(tool), requiredBytes: sizeBytes }];
+  }
   if (isInvokeAiApiImportPayload(tool, payload)) {
     const stagePath = options.stagePath || getInvokeAiImportStagePath(tool, payload);
     const { targetDirectory } = resolveModelDestination(tool, payload);
@@ -5080,10 +5592,42 @@ function buildModelDownloadPreflightRequirements(tool, payload = {}, options = {
   return [{ kind: 'model-target', label: 'model folder', path: targetDirectory, requiredBytes: sizeBytes }];
 }
 
+async function getOllamaCatalogManifestBytes(name) {
+  const reference = /^(?:([\w-]+)\/)?([\w][\w.-]*)(?::([\w][\w.-]*))?$/.exec(name);
+  if (!reference) return 0;
+  const [, namespace = 'library', model, tag = 'latest'] = reference;
+  try {
+    const response = await fetch('https://registry.ollama.ai/v2/' + namespace + '/' + model + '/manifests/' + tag, {
+      headers: { Accept: 'application/vnd.docker.distribution.manifest.v2+json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!response.ok) return 0;
+    const manifest = await response.json();
+    if (!Array.isArray(manifest.layers) || !manifest.layers.length ||
+        ![manifest.config, ...manifest.layers].every(entry => Number.isSafeInteger(entry?.size) && entry.size >= 0)) return 0;
+    return sumOllamaManifestSize(manifest);
+  } catch { return 0; }
+}
+
 async function buildModelDownloadPreflight(tool, payload = {}, options = {}) {
   assertRunnableDownloadPlan(payload);
   const requirements = buildModelDownloadPreflightRequirements(tool, payload, options);
   const disks = Array.isArray(options.disks) ? options.disks : await detectStorageSnapshot();
+  let spaceNote;
+  if (tool.id === 'ollama' && payload.source === 'ollama') {
+    const manifestBytes = await getOllamaCatalogManifestBytes(payload.fileName || payload.name);
+    if (manifestBytes) requirements[0].requiredBytes = manifestBytes;
+    else spaceNote = requirements[0].requiredBytes ? 'The download size is an estimate from the Ollama catalog.' : 'The Ollama registry did not report a download size.';
+  }
+  if (!options.extractionOnly && isVoiceZip(tool, payload)) {
+    const archiveBytes = getDownloadSizeBytes(payload);
+    const url = payload.downloadUrl && assertSecureRemoteUrl(payload.downloadUrl, 'voice ZIP');
+    const info = await require('./rvcArchiveService').inspectVoiceZip(url, archiveBytes, payload.artifactKind === 'rvc-unverified-zip');
+    requirements[0].requiredBytes = archiveBytes + (info?.bytes || 0);
+    if (!info || info.nested) {
+      spaceNote = 'The ZIP needs additional temporary space. The amount shown is a lower bound. Local AI Hub checks the extracted size before unpacking.';
+    }
+  }
   const grouped = new Map();
   for (const requirement of requirements) {
     const disk = findDiskForPath(disks, requirement.path);
@@ -5107,6 +5651,7 @@ async function buildModelDownloadPreflight(tool, payload = {}, options = {}) {
     const assessment = assessDiskSpace(group.disk, group.requiredBytes);
     return {
       ...assessment,
+      ...(spaceNote && { sizeKnown: false, spaceNote }),
       disk: group.disk || null,
       kinds: group.kinds,
       label: uniqueLabels.join(' and ') || 'download folder',
@@ -5121,7 +5666,7 @@ async function buildModelDownloadPreflight(tool, payload = {}, options = {}) {
     checks,
     disk: primary.disk || null,
     modelName: String(payload.name || payload.fileName || 'This download').trim() || 'This download',
-    sizeKnown: requirements.some((requirement) => Number(requirement.requiredBytes || 0) > 0),
+    sizeKnown: !spaceNote && requirements.some((requirement) => Number(requirement.requiredBytes || 0) > 0),
     targetDirectory: requirements[0]?.path || '',
     toolId: tool.id,
     toolName: tool.name,
@@ -5150,13 +5695,14 @@ function buildDiskBlockedMessage(preflight) {
 function buildDiskConfirmationMessage(preflight) {
   const subject = preflight.modelName || 'This download';
   const check = getPrimaryDiskCheck(preflight, 'requiresConfirmation');
+  if (preflight.spaceNote) return subject + ': ' + preflight.spaceNote + ' Available space is low. Confirm the download to continue.';
   if (preflight.sizeKnown) {
     return `${subject} needs about ${formatBytes(check.requiredBytes)}. Only ${formatBytes(check.availableBytes)} is free for ${formatDiskCheckLocation(check)}, so this would leave less than 10% free. Confirm the download to continue.`;
   }
   return `Local AI Hub could not confirm the file size for ${subject}. ${formatDiskCheckLocation(check)} is already below 10% free space, so confirm the download before continuing.`;
 }
-async function ensureDiskHasCapacity(tool, payload) {
-  const preflight = await getModelDownloadPreflight(tool, payload);
+async function ensureDiskHasCapacity(tool, payload, options) {
+  const preflight = await buildModelDownloadPreflight(tool, payload, options);
   if (preflight.blocked) {
     throw new Error(buildDiskBlockedMessage(preflight));
   }
@@ -5605,6 +6151,64 @@ function assertExistingModelFileMatchesRequest(tool, payload, destination, exist
   }
   throw new Error(`A different model named ${fileName} is already in ${tool.name}. Local AI Hub will not overwrite or relabel it. Delete or rename the existing file, then try downloading ${requestedName} again.`);
 }
+async function installRvcZip(tool, payload, options, destination, headers) {
+  const { targetDirectory, destinationPath, fileName } = destination;
+  await assertSafeModelOperationPath(targetDirectory, destinationPath);
+  await fs.ensureDir(targetDirectory);
+  const stagingRoot = path.join(targetDirectory, '.tmp');
+  await assertSafeModelOperationPath(targetDirectory, stagingRoot);
+  await fs.ensureDir(stagingRoot);
+  const stage = await fs.mkdtemp(path.join(stagingRoot, 'rvc-'));
+  const published = [];
+  try {
+    const zipPath = path.join(stage, 'voice.zip');
+    await streamDownloadToFile(assertSecureRemoteUrl(payload.downloadUrl, 'voice ZIP'), zipPath, {
+      safeRoot: stage, downloadId: payload.id, displayName: payload.name, expectedBytes: payload.sizeBytes,
+      expectedSha256: payload.sha256, headers, cancelSignal: options.cancelSignal, onProgress: options.onProgress,
+      progressMessage: 'Downloading voice ZIP.', errorMessage: 'The voice ZIP could not be downloaded.',
+    });
+    const { extractRvcVoice } = require('./rvcArchiveService');
+    const { hasIndex, ambiguousIndex } = await extractRvcVoice(zipPath, stage, options.cancelSignal, bytes =>
+      ensureDiskHasCapacity(tool, { ...payload, sizeBytes: bytes }, { extractionOnly: true }), payload.artifactKind === 'rvc-unverified-zip');
+    const metadata = buildDownloadMetadata(tool, payload, destination);
+    metadata.archiveSha256 = metadata.sha256;
+    metadata.sha256 = null;
+    metadata.sizeBytes = (await fs.stat(path.join(stage, 'weight'))).size;
+    const artifacts = [];
+    if (hasIndex) {
+      const index = resolveRvcCompanionDestination(tool, payload, { fileName: path.parse(fileName).name + '.index' });
+      await assertSafeModelOperationPath(tool.appDir || tool.installDir, index.destinationPath);
+      await fs.ensureDir(index.targetDirectory);
+      artifacts.push([path.join(stage, 'index'), index.destinationPath]);
+      metadata.archiveIndex = true;
+    }
+    const metadataPath = getModelMetadataPath(destinationPath);
+    await assertSafeModelOperationPath(targetDirectory, metadataPath);
+    await fs.writeJson(path.join(stage, 'metadata'), metadata);
+    artifacts.push([path.join(stage, 'metadata'), metadataPath], [path.join(stage, 'weight'), destinationPath]);
+    for (const [stagedPath, finalPath] of artifacts) {
+      throwIfModelDownloadCancelled(options.cancelSignal);
+      try {
+        await fs.link(stagedPath, finalPath);
+      } catch (error) {
+        if (!['EXDEV', 'ENOTSUP', 'EPERM', 'ENOSYS'].includes(error.code)) throw error;
+        const staged = await fs.stat(stagedPath);
+        const { disk } = await getDiskSnapshotForPath(path.dirname(finalPath));
+        const check = assessDiskSpace(disk, staged.size);
+        if (check.blocked) throw new Error('There is insufficient space to copy the extracted file to its destination.');
+        await fs.copyFile(stagedPath, finalPath, fs.constants.COPYFILE_EXCL);
+      }
+      published.push(finalPath);
+    }
+    return { destinationPath, fileName, alreadyPresent: false, message: fileName + ' was installed.' +
+      (hasIndex ? ' Its retrieval index was installed too.' : ambiguousIndex ? ' Multiple indexes were present, so none was selected automatically.' : '') };
+  } catch (error) {
+    for (const finalPath of published.reverse()) await fs.unlink(finalPath);
+    throw error;
+  } finally {
+    await removeSafeModelPath(targetDirectory, stage);
+  }
+}
 async function downloadRemoteModel(tool, payload, options = {}) {
   if (isPackageDownloadPayload(payload)) {
     return downloadPackageModel(tool, payload, options);
@@ -5633,6 +6237,9 @@ async function downloadRemoteModel(tool, payload, options = {}) {
     };
   }
   await ensureDiskHasCapacity(tool, payload);
+  if (isVoiceZip(tool, payload)) {
+    return installRvcZip(tool, payload, options, { targetDirectory, destinationPath, fileName, installRelativePath }, headers);
+  }
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
@@ -6141,6 +6748,15 @@ async function deleteModelUncached(tool, payload) {
   if (stat && !stat.isFile()) {
     throw new Error('Local AI Hub can only delete individual model files or models with a package manifest.');
   }
+  if (tool.id === 'rvc') {
+    await assertSafeModelOperationPath(targetDirectory, getModelMetadataPath(resolvedPath));
+    const metadata = await readModelMetadata(resolvedPath);
+    if (metadata?.archiveIndex === true) {
+      const stem = path.parse(resolvedPath).name;
+      const root = tool.appDir || tool.installDir;
+      await removeSafeModelPath(root, path.join(root, 'logs', stem, stem + '.index'));
+    }
+  }
   await removeSafeModelPath(targetDirectory, resolvedPath, 'Local AI Hub refused to delete that model because its path crosses a symlink, junction, or leaves the approved model folder.');
   await removeSafeModelPath(targetDirectory, getModelMetadataPath(resolvedPath), 'Local AI Hub refused to delete model metadata through a symlink or junction.').catch(() => null);
   return {
@@ -6175,6 +6791,8 @@ module.exports = {
   sanitizeModelSourceUrl,
   supportsModelManager,
   _test: {
+    flushCollectionIndex: collectionIndex.flush,
+    normalizeSearchSeparators,
     assertSafeModelOperationPath,
     buildDiskBlockedMessage,
     buildDownloadedLookup,
@@ -6201,6 +6819,7 @@ module.exports = {
     matchesSearchQuery,
     resolveHuggingFaceDownloadFile,
     searchHuggingFaceModels,
+    searchHuggingFaceCatalog,
     searchOllamaLibrary,
     searchCivitaiModels,
     sanitizeModelPreviewUrl,

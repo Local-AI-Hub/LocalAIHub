@@ -487,6 +487,44 @@ function buildDeterministicPlanFromPacket(schemaId, packet, options = {}) {
   return adapter.buildDeterministicPlan(packet, options);
 }
 
+function validateAuthoredPlan(input) {
+  let plan = input;
+  if (typeof input === 'string') {
+    try {
+      plan = JSON.parse(input);
+    } catch {
+      return { ok: false, errors: ['Enter a plan as a valid JSON object.'] };
+    }
+  }
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
+    return { ok: false, errors: ['Enter a plan as a JSON object.'] };
+  }
+  const schemaId = plan.schemaId || DEFAULT_PLANNING_SCHEMA_ID;
+  if (schemaId === LONGFORM_SCENE_PLAN_SCHEMA_ID) {
+    let cursor = 0;
+    for (const [index, scene] of (Array.isArray(plan.scenes) ? plan.scenes : []).entries()) {
+      const start = scene?.startSeconds ?? scene?.start;
+      const end = scene?.endSeconds ?? scene?.end;
+      const duration = scene?.durationSeconds ?? scene?.duration;
+      const error = message => ({ ok: false, errors: ['Scene ' + (index + 1) + ' ' + message] });
+      if ((start == null) !== (end == null)) return error('needs both a start and an end time.');
+      if (duration != null && (!Number.isFinite(duration) || duration <= 0)) return error('needs a positive numeric duration.');
+      if (start != null) {
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < cursor - 0.001 || start < 0 || end <= start) {
+          return error('needs ordered, non-overlapping start and end times in seconds.');
+        }
+        if (duration != null && Math.abs(end - start - duration) > 0.001) return error('has a duration that disagrees with its start and end times.');
+        cursor = end;
+      } else if (duration != null) {
+        cursor += duration;
+      }
+    }
+    const timing = plan.timing || {};
+    plan = { ...plan, timing: { ...timing, timingMode: timing.timingMode || timing.mode || 'manual' } };
+  }
+  return validatePlanAgainstSchema(schemaId, plan, { repairMinimumCoverage: false });
+}
+
 function buildPlanPreviewDocument(planValue, options = {}) {
   const adapter = getPlanningSchemaAdapter(planValue?.schemaId || options.schemaId || DEFAULT_PLANNING_SCHEMA_ID, { allowDefault: false });
   if (!adapter?.buildPreviewDocument) {
@@ -589,6 +627,7 @@ module.exports = {
   summarizeHardware,
   summarizeSourceArtifact,
   trimPreviewText,
+  validateAuthoredPlan,
   validatePlanAgainstSchema,
   validatePlanningPacketShape,
 };

@@ -340,9 +340,39 @@ async function verifyHyperFramesComposeExecution() {
   const images = pipelineSchema.createNode('collectionInput', { id: 'hf-images', config: { itemType: 'image', items: [{ id: 'one', filePath: assets.imageOne }, { id: 'two', filePath: assets.imageTwo }] } });
   const narration = pipelineSchema.createNode('audioInput', { id: 'hf-narration', config: { filePath: assets.narration } });
   const captions = pipelineSchema.createNode('textInput', { id: 'hf-captions', config: { text: 'Pipeline captions' } });
+  const { createOperations } = require('../electron/agent/operations.cjs');
+  const agent = createOperations({ schema: pipelineSchema });
+  const description = await agent.dispatch('hub_node_types', { type: 'planInput' });
+  const { validateAuthoredPlan } = require('../electron/shared/planningSchema.cjs');
+  const examples = description.configSchema.properties.plan.examples;
+  for (const example of examples) assert(validateAuthoredPlan(example).ok);
+  assert(!validateAuthoredPlan('{').ok);
+  const { pipeline: draft } = await agent.dispatch('hub_create_draft', { name: 'Authored planning', types: ['planInput'] });
+  const planNode = draft.nodes[0];
+  const plan = structuredClone(examples[0]);
+  plan.title = 'Desk and lamp';
+  plan.timing = { timingMode: 'transcriptSegments', totalDurationSeconds: 4 };
+  const scene = plan.scenes[0];
+  plan.scenes = ['Desk', 'Lamp'].map((subject, index) => ({
+    ...scene, sceneId: subject, sceneConcept: subject, startSeconds: index * 2, endSeconds: index * 2 + 2, durationSeconds: 2,
+  }));
+  planNode.config.plan = plan;
+  const longScene = { ...plan, timing: { totalDurationSeconds: 30 }, scenes: [{ ...scene, startSeconds: 0, endSeconds: 30, durationSeconds: 30 }] };
+  assert.equal(validateAuthoredPlan(JSON.stringify(longScene)).value.timing.timingMode, 'manual');
+  for (const timingMode of ['transcriptSegments', 'estimated', 'untimed', 'manual']) {
+    longScene.timing.timingMode = timingMode;
+    const authored = validateAuthoredPlan(longScene).value;
+    assert.equal(authored.timing.timingMode, timingMode);
+    assert.equal(authored.scenes.length, 1);
+    const { buildPlanTextCollectionItems } = require('../electron/shared/planningSchema.cjs');
+    assert.equal(buildPlanTextCollectionItems(authored).length, 1);
+  }
+  const planOutput = pipelineSchema.createNode('planOutput', { id: 'hf-plan-output' });
   const compose = pipelineSchema.createNode('hyperframesCompose', { id: 'hf-compose' });
   const output = pipelineSchema.createNode('fileOutput', { id: 'hf-project-output' });
-  const pipeline = pipelineSchema.createEmptyPipeline({ name: 'HyperFrames execution verification', nodes: [images, narration, captions, compose, output], edges: [
+  const pipeline = pipelineSchema.createEmptyPipeline({ name: 'HyperFrames execution verification', nodes: [images, narration, captions, planNode, compose, output, planOutput], edges: [
+    pipelineSchema.createEdge(planNode.id, 'plan', planOutput.id, 'plan'),
+    pipelineSchema.createEdge(planNode.id, 'plan', compose.id, 'plan'),
     pipelineSchema.createEdge(images.id, 'collection', compose.id, 'visuals'),
     pipelineSchema.createEdge(narration.id, 'audio', compose.id, 'narration'),
     pipelineSchema.createEdge(captions.id, 'text', compose.id, 'captions'),
@@ -352,8 +382,10 @@ async function verifyHyperFramesComposeExecution() {
   const initial = await runPipeline(pipeline);
   const completed = await waitForCompletedRun(initial.runId, 'HyperFrames Compose');
   assert.strictEqual(completed.status, 'completed', completed.message);
+  const savedPlan = completed.terminalResults.find(result => result.nodeId === planOutput.id);
+  assert.equal(JSON.parse(fs.readFileSync(savedPlan.filePath, 'utf8')).timing.timingMode, 'transcriptSegments');
   const artifact = completed.resultsByNodeId[compose.id].outputs.project;
-  assert.strictEqual(artifact.hyperFramesComposition.scenes.length, 2);
+  assert.deepStrictEqual(artifact.hyperFramesComposition.scenes.map(({ sceneId, start, duration }) => [sceneId, start, duration]), [['Desk', 0, 2], ['Lamp', 2, 2]]);
   assert.strictEqual(artifact.hyperFramesComposition.durationSeconds, 4);
   assert.strictEqual(artifact.hyperFramesComposition.captionCount, 1);
   assert(fs.existsSync(artifact.filePath));

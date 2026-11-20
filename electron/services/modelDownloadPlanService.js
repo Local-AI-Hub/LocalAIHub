@@ -253,7 +253,7 @@ function createWanPackagePlan(options, artifacts) {
   };
 }
 
-function createUpscaylPackagePlan(options, artifacts) {
+function createUpscaylPackagePlans(options, artifacts) {
   const pairGroups = new Map();
   for (const artifact of artifacts || []) {
     const fileName = artifactName(artifact);
@@ -268,15 +268,27 @@ function createUpscaylPackagePlan(options, artifacts) {
   }
   const completePairs = [...pairGroups.values()].filter((group) => group.files['.param'] && group.files['.bin']);
   if (!completePairs.length) {
-    return buildBlockedPackagePlan(options.tool, normalizeRepositoryId(options && (options.catalogRepositoryId || options.repositoryId)), 'Upscayl custom models need a matching .param and .bin pair with the same file name stem. Local AI Hub will not install a one-sided Upscayl asset.', artifacts);
+    return [buildBlockedPackagePlan(options.tool, normalizeRepositoryId(options && (options.catalogRepositoryId || options.repositoryId)), 'Upscayl custom models need a matching .param and .bin pair with the same file name stem. Local AI Hub will not install a one-sided Upscayl asset.', artifacts)];
   }
-  completePairs.sort((left, right) => left.stem.localeCompare(right.stem));
-  const selected = completePairs[0];
+  // NCNN also stores speech, detection, and classification networks as .param/.bin pairs.
+  const repositoryId = normalizeRepositoryId(options.catalogRepositoryId || options.repositoryId);
+  const repositoryContext = [repositoryFolderName(repositoryId), ...(options.repositoryTags || [])].join(' ');
+  const upscalingPattern = /upscayl|upscal(?:e|er|ing)|super[ _-]?resolution|(?:real[ _-]?)?esrgan|waifu2x|realesrnet|ultrasharp|swinir|realcugan|srmd/i;
+  const upscalingPairs = completePairs.filter(({ stem }) =>
+    upscalingPattern.test(repositoryContext) || upscalingPattern.test(stem));
+  if (!upscalingPairs.length) {
+    return [buildBlockedPackagePlan(options.tool, repositoryId, 'These NCNN files form a pair, but the repository, tags, and filenames do not identify an image upscaling model.', artifacts)];
+  }
+  upscalingPairs.sort((left, right) => left.stem.localeCompare(right.stem));
+  return upscalingPairs.map((selected) => buildUpscaylPairPlan(options, selected));
+}
+
+function buildUpscaylPairPlan(options, selected) {
   const requiredFiles = [packageArtifactEntry(selected.files['.param'], true, artifactName(selected.files['.param'])), packageArtifactEntry(selected.files['.bin'], true, artifactName(selected.files['.bin']))];
   return {
     artifactLabel: 'Upscayl paired model set',
     blockingReason: null,
-    compatibleArtifacts: completePairs.map((group) => ({ artifactKind: 'upscayl-model-set', fileName: group.stem, modelType: 'Upscaler', path: group.stem, requiredArtifacts: [artifactPath(group.files['.param']), artifactPath(group.files['.bin'])] })),
+    compatibleArtifacts: [{ artifactKind: 'upscayl-model-set', fileName: selected.stem, modelType: 'Upscaler', path: selected.stem, requiredArtifacts: requiredFiles.map((file) => file.path) }],
     downloadFiles: requiredFiles,
     modelType: 'Upscaler',
     optionalArtifacts: [],
@@ -299,7 +311,7 @@ function createPackageDownloadPlan(options, artifacts) {
   const toolId = String(options && options.tool && options.tool.id || '').trim().toLowerCase();
   if (toolId === 'audiocraft-webui') return createAudioCraftPackagePlan(options, artifacts);
   if (toolId === 'wan21-webui') return createWanPackagePlan(options, artifacts);
-  if (toolId === 'upscayl') return createUpscaylPackagePlan(options, artifacts);
+  if (toolId === 'upscayl') return createUpscaylPackagePlans(options, artifacts)[0];
   return null;
 }
 
@@ -349,7 +361,7 @@ function pathSegments(artifact) {
 
 function hasDiffusersComponentPath(artifact) {
   const segments = pathSegments(artifact);
-  if (segments.some((segment) => DIFFUSERS_COMPONENT_SEGMENTS.has(segment))) {
+  if (segments.some((segment) => DIFFUSERS_COMPONENT_SEGMENTS.has(segment) || /^(?:(?:image|vision|text)[_-]encoders?|clip[_-]vision|ip[_-]?adapters?)(?:[._-]|$)/i.test(segment))) {
     return true;
   }
   return segments.includes('vae') && DIFFUSERS_GENERIC_COMPONENT_FILE_PATTERN.test(artifactName(artifact));
@@ -404,7 +416,7 @@ function hasLikelyRvcContext(artifact) {
 }
 
 function normalizeRvcMatchToken(value) {
-  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' ');
+  return String(value || '').normalize('NFKC').trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/g, ' ');
 }
 
 function compactRvcMatchToken(value) {
@@ -430,6 +442,7 @@ function rvcPathTokens(artifact) {
 function rvcIndexMatchesPrimary(indexArtifact, primaryArtifact, compatibleCount, indexCount) {
   const primaryStem = rvcStem(artifactPath(primaryArtifact));
   const primaryCompact = compactRvcMatchToken(primaryStem);
+  if (primaryCompact && !['model', 'weights', 'weight'].includes(primaryCompact) && compactRvcMatchToken(rvcStem(artifactPath(indexArtifact))) === primaryCompact) return true;
   if (primaryCompact.length >= 3 && !['model', 'pytorchmodel', 'weight', 'weights'].includes(primaryCompact)) {
     if (rvcPathTokens(indexArtifact).some((token) => token.compact.includes(primaryCompact) || primaryCompact.includes(token.compact))) {
       return true;
@@ -460,6 +473,11 @@ function getRvcOptionalCompanions(rejected, recommended, compatible) {
   };
 }
 
+function isRvcTrainingWeight(relativePath) {
+  return /(?:^|[\\/])(?:pretrained(?:_v2)?|embedders?|predictors?|feature[_-]extractors?|hubert|rmvpe)(?:[\\/]|\.pt[h]?$)/i.test(relativePath)
+    || /^(?:(?:f0)?[GD](?:32|40|48)k|[GD]_\d+|hubert_base|contentvec_base|rmvpe)\.pth?$/i.test(path.basename(relativePath));
+}
+
 function inferRvcArtifact(artifact) {
   const relativePath = artifactPath(artifact);
   const fileName = artifactName(artifact);
@@ -467,8 +485,18 @@ function inferRvcArtifact(artifact) {
   if (hasSupportPath(artifact) || DOCUMENTATION_FILE_PATTERN.test(relativePath) || CONFIG_ONLY_FILE_PATTERN.test(fileName) || IMAGE_FILE_PATTERN.test(fileName) || AUDIO_PREVIEW_FILE_PATTERN.test(fileName)) {
     return { rejected: true, artifactKind: 'support-file', artifactLabel: 'Support file', modelType: 'Support file', reason: 'Documentation, config, preview, and audio sample files are supporting files, not RVC voice model weights.' };
   }
+  if (isRvcTrainingWeight(relativePath)) {
+    return { rejected: true, artifactKind: 'support-file', artifactLabel: 'Training or support weight', modelType: 'Support file', reason: 'This weight belongs to RVC training or feature extraction. Choose an exported voice model.' };
+  }
+  if (ARCHIVE_FILE_PATTERN.test(fileName) && /(?:^|[^\p{L}\p{N}])(?:datasets?|training[ _-]?data|samples?)(?:[^\p{L}\p{N}]|$)/iu.test(relativePath)) {
+    return { rejected: true, artifactKind: 'support-file', artifactLabel: 'Dataset or samples', modelType: 'Support file', reason: 'This archive is labeled as training data or samples. Choose the exported voice package.' };
+  }
+  if (extension === '.zip' && (hasLikelyRvcContext(artifact) || artifact.inspectVoiceZip)) {
+    const known = hasLikelyRvcContext(artifact);
+    return { artifactKind: known ? 'rvc-voice-zip' : 'rvc-unverified-zip', artifactLabel: known ? 'RVC voice ZIP' : 'ZIP (voice contents checked at install)', modelType: 'RVC Voice Model', score: 80 };
+  }
   if (ARCHIVE_FILE_PATTERN.test(fileName)) {
-    return { rejected: true, artifactKind: 'unsupported-archive', artifactLabel: 'Archive', modelType: 'Archive', reason: 'This catalog downloader only installs single RVC voice weight files today, not archive bundles.' };
+    return { rejected: true, artifactKind: 'unsupported-archive', artifactLabel: 'Archive', modelType: 'Archive', reason: 'Choose a ZIP identified as an RVC voice bundle or a directly exposed voice weight.' };
   }
   if (RVC_INDEX_FILE_PATTERN.test(fileName)) {
     return { rejected: true, artifactKind: 'rvc-index', artifactLabel: 'RVC index', modelType: 'RVC index', reason: 'RVC index files are optional companions. Choose a .pth voice model weight as the primary download.' };
@@ -551,6 +579,14 @@ function classifyArtifact(tool, artifact, selectedType) {
     return Object.assign({}, inferred, { runnable: true });
   }
   if (family === 'sd-webui' || family === 'comfyui' || family === 'invokeai') {
+    if (artifact.modelType === 'Unverified image weights') {
+      return { artifactKind: 'target-mismatch', artifactLabel: 'Unverified weights', modelType: artifact.modelType,
+        runnable: false, reason: 'The repository does not identify these weights as a supported image-generation model.' };
+    }
+    if (artifact.modelType === 'Language model') {
+      return { artifactKind: 'target-mismatch', artifactLabel: 'Language model', modelType: 'Language model',
+        runnable: false, reason: 'This repository identifies these weights as a language model. Choose an image model for this target.' };
+    }
     if (extension === '.gguf' && (family === 'sd-webui' || family === 'invokeai')) {
       const targetLabel = family === 'invokeai' ? 'InvokeAI' : 'Forge and Automatic1111';
       return { artifactKind: 'target-mismatch', artifactLabel: 'GGUF LLM file', modelType: 'GGUF', runnable: false, reason: 'GGUF files are for LLM targets such as KoboldCpp or LM Studio. ' + targetLabel + ' need image checkpoint files such as .safetensors or .ckpt.' };
@@ -681,10 +717,24 @@ function annotateArtifactsForDownloadPlan(options) {
   const tool = options && options.tool;
   const groups = splitGroups(artifacts);
   const annotated = artifacts.map((artifact) => annotateArtifact(tool, artifact, selectedType, groups));
-  const plan = summarizePlan(tool, selectedType, annotated);
-  return annotated.map((artifact) => Object.assign({}, artifact, {
-    downloadPlan: Object.assign({}, plan, { recommendedArtifact: undefined }),
+  const voices = tool?.id === 'rvc' ? annotated.filter(entry => entry.artifactKind === 'rvc-voice-model' && entry.runnable) : [];
+  const rejected = annotated.filter(entry => !entry.runnable);
+  const indices = rejected.filter(entry => entry.artifactKind === 'rvc-index');
+  const rejectionSummary = rejected.slice(0, 8).map(file => ({
+    path: artifactPath(file), fileName: artifactName(file), modelType: file.modelType, reason: file.blockingReason,
   }));
+  return annotated.map(entry => {
+    const plan = summarizePlan(tool, selectedType, [entry]);
+    if (entry.runnable) {
+      plan.rejectedArtifacts = rejectionSummary;
+      if (entry.artifactKind === 'rvc-voice-model') {
+        const pairing = getRvcOptionalCompanions(indices, entry, voices);
+        plan.optionalArtifacts = pairing.companions;
+        if (pairing.ambiguous) plan.warning = 'The matching retrieval index could not be identified. Select the index manually.';
+      }
+    }
+    return { ...entry, downloadPlan: { ...plan, recommendedArtifact: undefined } };
+  });
 }
 
 function ollamaTagPlan(name) {
@@ -705,6 +755,8 @@ module.exports = {
   annotateArtifactsForDownloadPlan,
   artifactPath,
   classifyArtifact,
+  isRvcTrainingWeight,
   createModelDownloadPlan,
+  createUpscaylPackagePlans,
   ollamaTagPlan,
 };

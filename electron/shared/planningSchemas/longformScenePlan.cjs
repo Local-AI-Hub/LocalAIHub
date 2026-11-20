@@ -348,7 +348,9 @@ function validatePlan(value, options = {}) {
     scenes: (Array.isArray(value.scenes) ? value.scenes : []).map((scene, index) => normalizeScenePlanScene(scene, index)).filter(Boolean),
     openQuestions: normalizeStringList(value.openQuestions),
   };
-  repairScenePlanMinimumCoverage(normalized, options);
+  if (options.repairMinimumCoverage !== false && normalized.timing.timingMode !== 'manual') {
+    repairScenePlanMinimumCoverage(normalized, options);
+  }
 
   const errors = [];
   if (!normalized.overview.meaningIntent) {
@@ -388,7 +390,7 @@ function validatePlan(value, options = {}) {
 }
 
 function buildPreviewDocument(planValue, options = {}) {
-  const validation = validatePlan(planValue);
+  const validation = validatePlan(planValue, { repairMinimumCoverage: false });
   if (!validation.ok) {
     throw new Error(validation.errors[0] || 'Local AI Hub could not build a preview from this plan yet.');
   }
@@ -431,7 +433,7 @@ function buildPreviewDocument(planValue, options = {}) {
 }
 
 function buildReviewDocument(planValue, options = {}) {
-  const validation = validatePlan(planValue);
+  const validation = validatePlan(planValue, { repairMinimumCoverage: false });
   const plan = validation.ok ? validation.value : null;
   const previewDocument = isRecord(options.preview) ? options.preview : null;
   const constraints = normalizeStringList(options.sourcePacket?.constraints);
@@ -816,7 +818,7 @@ function buildSceneText(scene, index, plan) {
 
 function buildTextCollectionItems(planValue, options = {}) {
   const validation = validatePlan(planValue, {
-    sourcePacket: options.sourcePacket || options.sourcePlan?.sourcePacket || planValue?.sourcePacket || null,
+    repairMinimumCoverage: false,
   });
   if (!validation.ok) {
     throw new Error(validation.errors[0] || 'This plan does not match the longform scene-planning schema.');

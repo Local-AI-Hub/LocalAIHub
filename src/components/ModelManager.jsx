@@ -119,7 +119,7 @@ function getPackageNoResultsMessage(tool, query, sourceLabel) {
     return `${searchLabel} Try Wan2.1, Wan-AI, or a known folder repo such as Wan-AI/Wan2.1-T2V-1.3B.`;
   }
   if (toolId === 'upscayl') {
-    return `${searchLabel} Bundled and local Upscayl models appear under Downloaded Models. Remote Upscayl custom models need a matching .param and .bin pair and are limited to exact Hugging Face repository IDs for now; broad remote discovery is disabled so Local AI Hub does not offer incomplete model sets.`;
+    return `${searchLabel} Bundled and local Upscayl models appear under Downloaded Models. Search by model name or repository ID and select a matching .param and .bin pair.`;
   }
   return '';
 }
@@ -172,6 +172,7 @@ function buildLowDiskConfirmationMessage(subject, preflight) {
   if (!preflight?.mount) {
     return `${subject} may leave the target drive very low on free space. Continue?`;
   }
+  if (preflight?.spaceNote) return preflight.spaceNote + ' Available space is low. Continue?';
   if (preflight?.sizeKnown) {
     return `${subject} needs about ${formatBytes(preflight.requiredBytes)}. Only ${formatBytes(preflight.availableBytes)} is free on ${preflight.mount}, so this would leave less than 10% free. Continue?`;
   }
@@ -470,12 +471,13 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   const [remoteCatalogPage, setRemoteCatalogPage] = useState(1);
   const [modelType, setModelType] = useState(getToolDefaults(modelTools[0]).modelType);
   const [sort, setSort] = useState('most-downloaded');
+  const [includeIncompatible, setIncludeIncompatible] = useState(false);
   const [taskType, setTaskType] = useState(getToolDefaults(modelTools[0]).taskType);
   const [deleteBusyId, setDeleteBusyId] = useState(null);
   const activeRef = useRef(isActive);
   const viewRef = useRef(null);
   const refreshBrowseRef = useRef(null);
-  const viewKey = JSON.stringify([selectedToolId, selectedSource, modelType, sort, taskType]);
+  const viewKey = JSON.stringify([selectedToolId, selectedSource, modelType, sort, taskType, includeIncompatible]);
   viewRef.current = viewKey;
   const browseIpcRequestIdRef = useRef(null);
   const browseRequestIdRef = useRef(0);
@@ -630,6 +632,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
         sort,
         source,
         taskType: effectiveTaskType,
+        includeIncompatible,
         toolId,
         requestId: ipcRequestId,
       });
@@ -769,7 +772,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     setRemoteCatalogPage(1);
     setSelectedArtifactMap({});
     setConflictMap({});
-  }, [modelType, search, selectedSource, selectedToolId, sort, taskType]);
+  }, [modelType, search, selectedSource, selectedToolId, sort, taskType, includeIncompatible]);
 
   useEffect(() => {
     setRemoteCatalogPage((page) => clampPaginationPage(page, remoteCatalogTotalPages));
@@ -816,7 +819,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
     }
     setPagination(EMPTY_PAGINATION);
     browse({ page: 1, cursor: null });
-  }, [isActive, selectedTool, selectedToolId, selectedSource, modelType, sort, taskType]);
+  }, [isActive, selectedTool, selectedToolId, selectedSource, modelType, sort, taskType, includeIncompatible]);
   function handleArtifactChange(item, choiceId) {
     setSelectedArtifactMap((current) => ({
       ...current,
@@ -1084,6 +1087,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
   const packageNoResultsMessage = getPackageNoResultsMessage(selectedTool, emptyQuery, selectedSourceLabel);
   const emptyCatalogMessage = catalogState.error
     ? `${catalogState.error} Previous catalog results were cleared for this search.`
+    : pagination.hasMore && !remoteItems.length ? "No matches on the pages checked so far. Load more to continue searching."
     : packageNoResultsMessage
       ? packageNoResultsMessage
       : emptyQuery
@@ -1096,9 +1100,25 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
           <div>
             <p className="text-[10px] uppercase tracking-[0.22em] text-slate-500">Model Manager</p>
             <h3 className="mt-1 text-2xl font-semibold text-white">Browse live model catalogs with local fit checks</h3>
-            <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-300">
-              Search remote catalogs, check compatibility, and download the right artifacts for each local tool.
-            </p>
+            {selectedSource === 'huggingface' ? (
+              <details className="mt-1 max-w-md text-xs leading-5 text-slate-300">
+                <summary className="w-fit cursor-pointer rounded text-cyan-300 hover:text-cyan-200 focus-visible:outline focus-visible:outline-2">
+                  How Hugging Face keyword search works
+                </summary>
+                <p className="mt-2">
+                  As you or a connected agent browse repositories, the Hub remembers filenames and names linked to files
+                  in their READMEs. You can search those names later, even after restarting the Hub.
+                </p>
+                <p className="mt-1">
+                  Your Windows profile keeps up to 2 MiB of index data across up to 512 repositories.
+                  When either limit is reached, the oldest entries go first. Browsing a repository again can add it back.
+                </p>
+              </details>
+            ) : (
+              <p className="mt-1 max-w-3xl text-xs leading-5 text-slate-300">
+                Search remote catalogs, check compatibility, and download the right artifacts for each local tool.
+              </p>
+            )}
           </div>
           <div className="grid min-w-[280px] flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-4 2xl:grid-cols-6">
             <select className="store-input" onChange={(event) => applyToolDefaults(event.target.value)} value={selectedToolId}>
@@ -1115,6 +1135,12 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
                 </option>
               ))}
             </select>
+            {['rvc', 'upscayl'].includes(selectedToolId) && (
+              <label className="flex items-center gap-2 text-sm text-slate-300">
+                <input type="checkbox" checked={includeIncompatible} onChange={(event) => setIncludeIncompatible(event.target.checked)} />
+                Include incompatible repositories
+              </label>
+            )}
             {filterOptionsVisible ? (
               <select className="store-input" onChange={(event) => setModelType(event.target.value)} value={modelType}>
                 {modelTypeOptions.map((option) => (
@@ -1149,7 +1175,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
                     browse({ page: 1, cursor: null, query: event.currentTarget.value });
                   }
                 }}
-                placeholder={selectedSource === 'ollama' ? 'Search Ollama models' : 'Search remote catalogs'}
+                placeholder={selectedSource === 'ollama' ? 'Search Ollama models' : selectedSource === 'huggingface' ? 'Keyword, collection URL, or owner/repo filename' : 'Search remote catalogs'}
                 type="search"
                 value={search}
               />

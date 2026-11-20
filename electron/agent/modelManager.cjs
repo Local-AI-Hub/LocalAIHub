@@ -18,11 +18,16 @@ function createModelManager({ models, listTools, hardware, storage, changed, wit
     return tool;
   }
 
+  async function hardwareSnapshot() {
+    const [specs, disks] = await Promise.all([hardware(), storage()]);
+    return { ...specs, disks };
+  }
+
   async function discover() {
-    const [tools, specs, disks] = await Promise.all([listTools(), hardware(), storage()]);
-    return { hardware: { ...specs, disks }, disks, targets: tools.filter(models.supportsModelManager).map(tool => {
+    const [tools, specs] = await Promise.all([listTools(), hardwareSnapshot()]);
+    return { hardware: specs, disks: specs.disks, targets: tools.filter(models.supportsModelManager).map(tool => {
       const { sources = [{ id: 'huggingface', label: 'Hugging Face' }], allowedModelTypes, allowedTaskTypes } = models.getModelManagerConfig(tool);
-      const searchHint = tool.id === 'upscayl' ? 'Enter an exact Hugging Face repository ID (owner/repository) containing a matching .param and .bin pair.' : undefined;
+      const searchHint = tool.id === 'upscayl' ? 'Search by model name or Hugging Face repository ID. Each complete .param and .bin pair is a separate choice.' : sources.some(source => source.id === 'huggingface') ? 'Search by keyword, repository ID, or collection URL. Use owner/repo followed by a keyword to filter files inside a repository.' : undefined;
       return { toolId: tool.id, name: tool.name, sources, allowedModelTypes, allowedTaskTypes, searchHint, defaults: models.getModelManagerDefaults(tool) };
     }) };
   }
@@ -46,7 +51,8 @@ function createModelManager({ models, listTools, hardware, storage, changed, wit
         license: item.license, modelPageUrl: item.modelPageUrl, hardwareFit: item.hardwareFit, downloaded: item.downloaded, blockingReason: item.downloadPlan?.blockingReason,
         choices: getArtifactChoices(item).map((choice, index) => ({
           choiceIndex: index, label: choice.label, version: choice.versionLabel, sizeBytes: choice.sizeBytes,
-          recommended: choice.recommended, disabled: choice.disabled,
+          hardwareFit: choice.payload?.hardwareFit, diskWarning: choice.payload?.diskWarning,
+          recommended: choice.recommended, disabled: choice.disabled, reason: choice.reason || undefined,
         })) };
     }) };
   }
@@ -91,7 +97,7 @@ function createModelManager({ models, listTools, hardware, storage, changed, wit
     return models.getModelDownloadPreflight(tool, payload);
   }
 
-  return { discover, search, resolveSelection, target, preflight, install, uninstall,
+  return { hardwareSnapshot, discover, search, resolveSelection, target, preflight, install, uninstall,
     cancel: job => models.cancelModelDownload({ id: job.toolId }, { downloadId: job.jobId }) };
 }
 

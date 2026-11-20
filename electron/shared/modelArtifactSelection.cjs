@@ -18,11 +18,13 @@ function buildSelectedCatalogItem(item, selectedChoiceId = '') {
   if (!selectedChoice) {
     return item;
   }
+  return { ...mergeArtifactChoice(item, selectedChoice), artifactChoices: getArtifactChoices(item) };
+}
+function mergeArtifactChoice(item, selectedChoice) {
   const payload = selectedChoice.payload || {};
   return {
     ...item,
     ...payload,
-    artifactChoices: getArtifactChoices(item),
     artifactLabel: payload.artifactLabel || selectedChoice.artifactLabel || item.artifactLabel,
     artifactPath: payload.artifactPath || selectedChoice.artifactPath || item.artifactPath,
     artifactUrl: payload.artifactUrl || selectedChoice.artifactUrl || item.artifactUrl,
@@ -32,10 +34,11 @@ function buildSelectedCatalogItem(item, selectedChoiceId = '') {
     selectedArtifactChoice: selectedChoice,
     selectedArtifactChoiceId: selectedChoice.id,
     sizeBytes: Number(payload.sizeBytes ?? selectedChoice.sizeBytes ?? item.sizeBytes ?? 0),
+    sizeLabel: selectedChoice.sizeLabel || payload.sizeLabel || null,
     sourceLabel: selectedChoice.sourceLabel || item.sourceLabel,
     sourceUrl: payload.sourceUrl || selectedChoice.modelPageUrl || item.sourceUrl,
     versionId: payload.versionId || selectedChoice.versionId || item.versionId,
     versionLabel: payload.versionLabel || selectedChoice.versionLabel || item.versionLabel,
   };
 }
-module.exports = { getArtifactChoices, getSelectedArtifactChoice, buildSelectedCatalogItem };
+module.exports = { mergeArtifactChoice, getArtifactChoices, getSelectedArtifactChoice, buildSelectedCatalogItem };

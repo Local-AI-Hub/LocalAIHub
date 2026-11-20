@@ -7523,6 +7523,14 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
                     )}
                   </div>
                 ) : null}
+                {selectedNode.type === 'planInput' ? (
+                  <div>
+                    <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="authored-plan">Plan JSON</label>
+                    <textarea className="store-input mt-3 min-h-[240px] font-mono" id="authored-plan"
+                      value={typeof selectedNode.config.plan === 'string' ? selectedNode.config.plan : JSON.stringify(selectedNode.config.plan, null, 2)}
+                      onChange={(event) => updateNode(selectedNode.id, (node) => ({ ...node, config: { ...node.config, plan: event.target.value } }))} />
+                  </div>
+                ) : null}
                 {selectedNode.type === 'planningPacket' ? (
                   <div className="space-y-4">
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">

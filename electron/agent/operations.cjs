@@ -115,7 +115,7 @@ function createOperations(deps) {
         }).finally(() => { job.finishedAt = new Date().toISOString(); });
         return { ...job };
       }
-      case 'hub_status': return { version: deps.version, hardware: (await deps.readConfig()).hardware, run: deps.execution.getActiveRunSnapshot(), operations: TOOLS.map(t => t.name) };
+      case 'hub_status': return { version: deps.version, hardware: deps.modelManager ? await deps.modelManager.hardwareSnapshot() : (await deps.readConfig()).hardware, run: deps.execution.getActiveRunSnapshot(), operations: TOOLS.map(t => t.name) };
       case 'hub_tools': return (await deps.listTools()).map(t => ({ id: t.id, name: t.name, status: t.status, installed: true, availableModels: t.availableModels, capabilities: deps.toolCapabilities?.(t.id) }));
       case 'hub_models': {
         const tool = (await deps.listTools()).find(t => t.id === args.toolId);
