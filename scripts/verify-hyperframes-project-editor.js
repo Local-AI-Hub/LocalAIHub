@@ -98,7 +98,7 @@ async function main() {
   await assertRejects(() => service.deleteHyperFramesProjectFile(projectId, 'index.html', options), /entrypoint|index\.html/i, 'index deletion');
   await assertRejects(() => service.saveHyperFramesProjectTextFile(projectId, 'project.json', '{}', options), /project\.json|can edit/i, 'project manifest edit');
 
-  await fs.writeFile(path.join(projectDir, 'script.js'), 'const bad = "https://example.com/foo.png";\n', 'utf8');
+  await fs.writeFile(path.join(projectDir, 'script.js'), 'fetch("https://example.com/foo.png");\n', 'utf8');
   const unsafeHealth = await service.getHyperFramesProjectHealth(projectId, options);
   assert.strictEqual(unsafeHealth.runnable, false, 'health catches remote references without executing code');
   assert(unsafeHealth.damaged.includes('remote-or-data-reference'), 'health reports local-only failure without source contents');

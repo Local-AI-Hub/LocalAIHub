@@ -40,7 +40,7 @@ function serve({ input = process.stdin, output = process.stdout, call = callBrid
         if (audio) content.push({ type: 'audio', mimeType: audio.mimeType, data: audio.data });
         else content.push({ type: 'resource_link', uri: data.downloadUrl, name: data.name, mimeType: data.mimeType, size: data.sizeBytes, description: 'Temporary original media download on the Hub PC; not a cloud attachment.' });
         reply({ content, structuredContent: { result: metadata }, isError: false });
-      } else if (name === 'hub_inspect_media' && data?.preview?.mimeType === 'image/jpeg' && typeof data.preview.data === 'string') {
+      } else if ((name === 'hub_inspect_media' || name === 'hub_review_preview') && data?.preview?.mimeType === 'image/jpeg' && typeof data.preview.data === 'string') {
         const { preview, ...metadata } = data;
         reply({ content: [{ type: 'text', text: JSON.stringify(metadata) }, { type: 'image', mimeType: preview.mimeType, data: preview.data }], structuredContent: { result: metadata }, isError: false });
       } else {

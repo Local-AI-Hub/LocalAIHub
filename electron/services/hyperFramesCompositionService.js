@@ -101,10 +101,19 @@ function buildProject(timeline,captions,narration,settings) {
   const animation=['window.__timelines = window.__timelines || {};','var tl = gsap.timeline({ paused: true });'];
   timeline.scenes.forEach((scene,index)=>{
     const id='visual-'+index;
-    const common='id="'+id+'" class="clip visual" data-start="'+scene.start+'" data-duration="'+scene.duration+'" data-track-index="0"';
+    const design = settings.sceneDesigns?.[index] || {focusX:50, focusY:50, startScale:1, endScale:1.04, shapes:[]};
+    const illustrated = settings.sceneTemplate === 'illustrated';
+    const style = 'object-position:'+design.focusX+'% '+design.focusY+'%;transform-origin:'+design.focusX+'% '+design.focusY+'%;'+(illustrated?'width:57%;':'');
+    const common='style="'+style+'" id="'+id+'" class="clip visual" data-start="'+scene.start+'" data-duration="'+scene.duration+'" data-track-index="0"';
     nodes.push(scene.kind==='video' ? '<video '+common+' src="./'+scene.src+'" data-media-start="0" data-volume="0" muted playsinline preload="auto"></video>' : '<img '+common+' src="./'+scene.src+'" alt="">');
     animation.push('tl.set("#'+id+'", {opacity:1}, '+scene.start+');','tl.set("#'+id+'", {opacity:0}, '+(scene.start+scene.duration)+');');
-    if(settings.motion && scene.kind==='image') animation.push('tl.fromTo("#'+id+'", {scale:1}, {scale:1.04,duration:'+scene.duration+'}, '+scene.start+');');
+    if(scene.kind==='image') animation.push('tl.fromTo("#'+id+'", {scale:'+design.startScale+'}, {scale:'+(settings.motion?design.endScale:design.startScale)+',duration:'+scene.duration+'}, '+scene.start+');');
+    if (design.shapes.length) {
+      const overlayId = 'diagram-'+index;
+      const shapes = design.shapes.map(({type,attributes}) => '<'+type+' '+Object.entries(attributes).map(([key,value])=>key+'="'+value+'"').join(' ')+' />').join('');
+      nodes.push('<svg id="'+overlayId+'" class="clip diagram" style="position:absolute;left:'+(illustrated?'59%':'0')+';top:0;width:'+(illustrated?'39%':'100%')+';height:100%;opacity:0" viewBox="0 0 100 100" fill="none" stroke="#467b76" stroke-width="0.9" data-start="'+scene.start+'" data-duration="'+scene.duration+'" data-track-index="3">'+shapes+'</svg>');
+      animation.push('tl.set("#'+overlayId+'", {opacity:1}, '+scene.start+');','tl.set("#'+overlayId+'", {opacity:0}, '+(scene.start+scene.duration)+');');
+    }
   });
   captions.forEach((cue,index)=>{
     const id='caption-'+index;
@@ -115,7 +124,7 @@ function buildProject(timeline,captions,narration,settings) {
   animation.push('tl.to({}, {duration:'+timeline.duration+'}, 0);','window.__timelines["pipeline-scene"] = tl;');
   return {
     'index.html':'<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><title>'+escapeHtml(settings.title)+'</title><link rel="stylesheet" href="./styles.css"></head><body>\n<main id="composition" data-composition-id="pipeline-scene" data-start="0" data-duration="'+timeline.duration+'" data-width="'+settings.width+'" data-height="'+settings.height+'">\n'+nodes.join('\n')+'\n</main>\n<script src="./assets/vendor/localaihub-gsap-runtime.js"></script><script src="./script.js"></script></body></html>',
-    'styles.css':'*{box-sizing:border-box}body{margin:0;background:#101827;font-family:Arial,sans-serif}#composition{position:relative;overflow:hidden;width:'+settings.width+'px;height:'+settings.height+'px;background:#101827}.visual{position:absolute;inset:0;width:100%;height:100%;object-fit:'+settings.fitMode+';opacity:0}.caption{position:absolute;z-index:10;left:6%;right:6%;bottom:6%;padding:12px 20px;border-radius:10px;background:rgba(0,0,0,.75);color:white;text-align:center;white-space:pre-wrap;font-size:'+Math.round(settings.height*0.045)+'px;line-height:1.3;opacity:0}',
+    'styles.css':'*{box-sizing:border-box}body{margin:0;background:#101827;font-family:Arial,sans-serif}#composition{position:relative;overflow:hidden;width:'+settings.width+'px;height:'+settings.height+'px;background:'+(settings.sceneTemplate==='illustrated'?'#ebd4ac':'#101827')+'}.visual{position:absolute;inset:0;width:100%;height:100%;object-fit:'+settings.fitMode+';opacity:0}.caption{position:absolute;z-index:10;left:6%;right:6%;bottom:6%;padding:12px 20px;border-radius:10px;background:rgba(0,0,0,.75);color:white;text-align:center;white-space:pre-wrap;font-size:'+Math.round(settings.height*0.045)+'px;line-height:1.3;opacity:0}',
     'script.js':animation.join('\n')
   };
 }

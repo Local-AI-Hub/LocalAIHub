@@ -313,7 +313,24 @@ async function runHyperFramesCli(paths, runtime, args, options = {}) {
     env: options.env || null,
     ffmpegPaths: options.ffmpegPaths || null,
   });
-  return runCommand(runtime.nodePath, [cliPath, ...args], {
+  const renderCommand = args[0] === 'render' || args[0] === 'lint';
+  const helpers = __dirname.includes('app.asar') ? path.join(process.resourcesPath, 'helpers') : path.join(__dirname, '../helpers');
+  const nodeArgs = renderCommand ? ['--require', path.join(helpers, 'hyperframes_local_fonts.cjs'), cliPath, ...args] : [cliPath, ...args];
+  let lastFrame = 0;
+  let frameTail = '';
+  function frameAdvanced(chunk) {
+    const lines = frameTail + chunk;
+    frameTail = lines.slice(-80);
+    let latest = lastFrame;
+    for (const match of lines.matchAll(/Streaming frame\s+(\d+)\s*\//gi)) latest = Math.max(latest,Number(match[1]));
+    if (latest === lastFrame) return false;
+    lastFrame = latest;
+    return true;
+  }
+  return runCommand(runtime.nodePath, nodeArgs, {
+    outputTailLimit: args[0] === 'render' ? 65536 : undefined,
+    isTimeoutProgress: args[0] === 'render' ? frameAdvanced : undefined,
+    onStdout: options.onStdout, onStderr: options.onStderr,
     abortMessage: options.abortMessage || 'HyperFrames render was cancelled.',
     allowFailure: Boolean(options.allowFailure),
     cwd: options.cwd || paths.runtimeDir,

@@ -100,7 +100,7 @@ async function main() {
   assert(list.projects.every((project) => !project.projectPath && !project.filePath), 'list does not expose raw filesystem paths');
 
   const remote = await createHyperFramesProject({ templateId: 'lower-third-caption', displayName: 'Remote Fixture' }, options);
-  await fs.appendFile(path.join(projectsRoot, remote.project.projectId, 'script.js'), '\nconst bad = "https://example.invalid/asset.png";\n', 'utf8');
+  await fs.appendFile(path.join(projectsRoot, remote.project.projectId, 'script.js'), '\nfetch("https://example.invalid/asset.png");\n', 'utf8');
   const remoteInspection = await inspectHyperFramesProject(remote.project.projectId, options);
   assert.strictEqual(remoteInspection.health.runnable, false, 'remote reference fixture is not runnable');
   assert.strictEqual(remoteInspection.health.status, 'remote-references', 'remote reference fixture is rejected as remote');

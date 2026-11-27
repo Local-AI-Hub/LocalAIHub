@@ -1,6 +1,6 @@
 {
   "name": "local-ai-hub",
-  "version": "0.60.0",
+  "version": "0.65.0",
   "description": "Windows desktop manager for local AI tools",
   "author": "Local AI Hub",
   "private": true,
@@ -38,6 +38,7 @@
     "verify:agent-access": "node scripts/verify-agent-hosted-start.js && node scripts/verify-agent-access.js && node scripts/verify-agent-features.js && node scripts/verify-agent-model-manager.js"
   },
   "dependencies": {
+    "@babel/parser": "7.29.0",
     "7zip-bin": "^5.2.0",
     "archiver": "^7.0.1",
     "extract-zip": "^2.0.1",
@@ -49,7 +50,11 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "systeminformation": "^5.24.7",
-    "yauzl": "^2.10.0"
+    "yauzl": "^2.10.0",
+    "@babel/traverse": "7.29.0",
+    "sax": "1.5.0",
+    "postcss": "8.5.8",
+    "postcss-value-parser": "4.2.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.3",
@@ -58,7 +63,6 @@
     "cross-env": "^7.0.3",
     "electron": "^30.5.1",
     "electron-builder": "^24.13.3",
-    "postcss": "^8.4.49",
     "tailwindcss": "^3.4.16",
     "vite": "^5.4.11",
     "wait-on": "^8.0.1"
@@ -73,6 +77,7 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "!electron/**/__pycache__/**",
       "package.json",
       "!node_modules/ffmpeg-static/**/*",
       "!node_modules/ffmpeg-ffprobe-static/**/*",
@@ -111,7 +116,8 @@
     "extraResources": [
       {
         "filter": [
-          "**/*.py"
+          "**/*.py",
+          "hyperframes_local_fonts.cjs"
         ],
         "from": "electron/helpers",
         "to": "helpers"

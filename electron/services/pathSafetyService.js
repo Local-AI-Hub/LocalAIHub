@@ -23,7 +23,7 @@ function isPathInside(parentPath, candidatePath) {
   const candidateKey = normalizePathComparisonKey(resolvedCandidate);
   return (
     candidateKey === parentKey ||
-    candidateKey.startsWith(`${parentKey}${path.sep}`)
+    candidateKey.startsWith(parentKey.endsWith(path.sep) ? parentKey : `${parentKey}${path.sep}`)
   );
 }
 

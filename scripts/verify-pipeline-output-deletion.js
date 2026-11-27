@@ -87,6 +87,9 @@ async function createRun(runtimesRoot, runId) {
 async function main() {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'local-ai-hub-output-delete-'));
   const runtimesRoot = path.join(tempRoot, 'runtimes');
+  const folders = loadModuleWithStubs('electron/services/pipelineOutputFolders.js', {
+    '/electron/services/pipelineOutputFolders.js': {'./configService':createConfigServiceStub(runtimesRoot)},
+  });
   const service = loadModuleWithStubs('electron/services/pipelineOutputStoreService.js', {
     '/electron/services/pipelineOutputStoreService.js': {
       './configService': createConfigServiceStub(runtimesRoot),
@@ -106,6 +109,46 @@ async function main() {
   });
   assert.strictEqual(configService.createDefaultConfig().moveDeletedPipelineOutputsToRecycleBin, true, 'Pipeline output trash setting should default on.');
 
+  const projectOne = await createRun(runtimesRoot,'run-project-one');
+  const projectTwo = await createRun(runtimesRoot,'run-project-two');
+  const other = await createRun(runtimesRoot,'run-other-project');
+  for (const run of [projectOne, projectTwo, other]) {
+    await folders.assignRunFolder(run.root,run === other ? 'Other' : 'City');
+    await writeFile(path.join(run.outputs,'scene.png'));
+    await writeFile(path.join(run.outputs,'scene.image.json'),'{}');
+    await writeFile(path.join(run.artifacts,'intermediate.txt'));
+  }
+  assert.deepEqual(await folders.listOutputFolders(),['City','Other']);
+  assert.equal((await service.listPipelineOutputs()).filter(o=>o.outputFolder === 'City').length,2);
+  await assert.rejects(()=>folders.createOutputFolder('../other'));
+  await service.deleteOutputFolder('City',{deleteMode:'permanent'});
+  assert.deepEqual(await folders.listOutputFolders(),['Other']);
+  for (const run of [projectOne, projectTwo]) {
+    assert(!await fs.pathExists(run.outputs));
+    assert(await fs.pathExists(path.join(run.artifacts,'intermediate.txt')));
+  }
+  assert(await fs.pathExists(path.join(other.outputs,'scene.png')));
+  const legacy = await createRun(runtimesRoot,'run-before-folders');
+  const first = await writeFile(path.join(legacy.outputs,'first.txt'),'original');
+  const sibling = await writeFile(path.join(legacy.outputs,'sibling.txt'),'retained');
+  const collection = path.join(legacy.outputs,'collection');
+  await writeFile(path.join(collection,'manifest.json'),'{}');
+  await service.moveOutputToFolder(first,'Archive');
+  await service.moveOutputToFolder(collection,'Archive');
+  assert.equal((await service.listPipelineOutputs()).find(o=>o.outputPath === first).outputFolder,'Archive');
+  assert.equal((await service.listPipelineOutputs()).find(o=>o.outputPath === sibling).outputFolder,'');
+  await service.moveOutputToFolder(first,'');
+  assert.equal((await service.listPipelineOutputs()).find(o=>o.outputPath === first).outputFolder,'');
+  await service.moveOutputToFolder(first,'Archive');
+  const reassigned = path.join(other.outputs,'scene.png');
+  await service.moveOutputToFolder(reassigned,'Archive');
+  await service.deleteOutputFolder('Other',{deleteMode:'permanent'});
+  assert.equal(await fs.readFile(reassigned,'utf8'),'x');
+  await service.deleteOutputFolder('Archive',{deleteMode:'permanent'});
+  assert(!await fs.pathExists(first));
+  assert(!await fs.pathExists(collection));
+  assert(!await fs.pathExists(reassigned));
+  assert.equal(await fs.readFile(sibling,'utf8'),'retained');
   const defaultRun = await createRun(runtimesRoot, 'run-default-delete');
   const defaultOutput = await writeFile(path.join(defaultRun.outputs, 'final-image.png'), 'png');
   const defaultSidecars = [

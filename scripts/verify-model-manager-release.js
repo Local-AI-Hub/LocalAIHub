@@ -8,6 +8,7 @@ const checks = [
   'verify-model-manager-search-names',
   'verify-model-collection-index',
   'verify-agent-model-manager',
+  'verify-model-search-audit',
   'verify-model-manager-inventory-correctness',
   'verify-model-manager-selection-provenance',
   'verify-model-manager-review',

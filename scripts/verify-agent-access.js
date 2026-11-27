@@ -136,6 +136,7 @@ async function main() {
     configState.hardware = null;
     assert.equal((await call('hub_validate_pipeline', { definition: hardwareDraft })).nodeSummaries[modelNode.id].compatibility.label, 'Hardware unknown');
     configState.hardware = { vramMb: 6144, systemRamMb: 16312 };
+    draft.runSettings = {...draft.runSettings,outputFolder:'Bridge project'};
     await call('hub_save_pipeline', { definition: draft });
     await assert.rejects(() => call('hub_save_pipeline', { definition: draft }), /already exists/);
     assert.equal((await call('hub_get_pipeline', { pipelineId: draft.id })).name, draft.name);
@@ -144,6 +145,7 @@ async function main() {
     assert.equal((await waitRun(a.runId)).status, 'completed');
     await assert.rejects(()=>call('hub_run_pipeline',{pipelineId:'different',requestId:'once'}),/another pipeline/);
     const outputs = await call('hub_outputs', {runId:a.runId});
+    assert.equal(outputs[0].outputFolder,'Bridge project');
     assert(outputs.length>0);
     const content = await call('hub_read_output',{outputId:outputs[0].id});
     assert(content.text.includes('A real pipeline'));
@@ -167,8 +169,10 @@ async function main() {
     await assert.rejects(() => execution.withIdlePipelineForToolAction(async () => { lifecycleCalled = true; }), /active pipeline/);
     assert.equal(lifecycleCalled, false);
     await assert.rejects(()=>call('hub_cancel_run',{runId:'wrong-run'}),/could not find/);
-    await call('hub_cancel_run',{runId:reviewRun.runId});
-    assert.equal((await waitRun(reviewRun.runId)).status,'cancelled');
+    const pending = execution.getActiveRunSnapshot().pendingValidation;
+    await assert.rejects(()=>call('hub_review_decision',{runId:reviewRun.runId,requestId:'stale',decision:'pass'}),/pending validation/);
+    await call('hub_review_decision',{runId:reviewRun.runId,requestId:pending.requestId,decision:'pass'});
+    assert.equal((await waitRun(reviewRun.runId)).status,'completed');
     let releaseLifecycle;
     const lifecycle = execution.withIdlePipelineForToolAction(() => new Promise(resolve => { releaseLifecycle = resolve; }));
     await assert.rejects(() => execution.runPipeline(draft), /already running/);
@@ -226,6 +230,7 @@ async function main() {
   } finally {
     if(client) {client.child.kill(); await new Promise(resolve=>client.child.once('close',resolve));}
     await bridge.stop();
+    await require('../electron/services/backgroundTaskService').disposeBackgroundTasks();
     Module._load=originalLoad;
     await fs.remove(root);
   }

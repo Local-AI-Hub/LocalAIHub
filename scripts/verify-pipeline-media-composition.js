@@ -603,7 +603,7 @@ async function verifyVideoCompositionModes() {
     assert.strictEqual(outputProbe.videoPresent, true, 'Expected the generated MP4 to contain video.');
     assert.strictEqual(outputProbe.audioPresent, true, 'Expected the generated MP4 to contain the requested audio mix.');
     assert(Math.abs(outputProbe.durationSeconds - testCase.expectedDuration) <= 0.08, `Expected ${testCase.caseId} duration near ${testCase.expectedDuration}s, got ${outputProbe.durationSeconds}s.`);
-    assert.strictEqual(exported?.compositionExport?.audioMix?.outputDurationSeconds, testCase.expectedDuration, 'Expected video-mode audio duration metadata to follow the visual timeline.');
+    assert.strictEqual(exported?.compositionExport?.audioMix?.outputDurationSeconds, Number((Math.round(testCase.expectedDuration * 12) / 12).toFixed(3)), 'Expected video-mode audio duration metadata to follow the visual timeline.');
     assert(exported.metadataPaths?.[0] && fs.existsSync(exported.metadataPaths[0]), 'Expected video-mode export sidecar metadata.');
     const sidecar = JSON.parse(fs.readFileSync(exported.metadataPaths[0], 'utf8'));
     assert.strictEqual(sidecar.audioMix?.sourceVideoVolume, expectedSourceVolume, 'Expected sidecar metadata to preserve source video gain.');
@@ -617,6 +617,26 @@ async function verifyVideoCompositionModes() {
     await cleanupActiveRun();
   }
 }
+async function verifyFractionalClipDurations() {
+  const counts = [261, 219, 231, 282, 264, 243];
+  const sources = counts.map((frames, index) => {
+    const filePath = path.join(TEST_STORAGE_ROOT, 'fractional-' + index + '.mp4');
+    execFileSync(require('ffmpeg-static'), ['-v','error','-y','-f','lavfi','-i','color=s=128x72:r=24','-frames:v',String(frames),'-c:v','libx264',filePath]);
+    return { id: 'clip-' + index, filePath };
+  });
+  const visuals = createNode('collectionInput', { id:'clips', config:{itemType:'video', items:sources} });
+  const mix = createNode('mediaComposition', { id:'mix', config:{compositionMode:'videoSequence',sceneTransitionMode:'single',sceneTransitionName:'fade',sceneTransitionDurationSeconds:0.5} });
+  const encode = createNode('mediaExport', {id:'encode',config:{width:128,height:72,fps:24,stopMode:'visuals'}});
+  const out = createNode('videoOutput', {id:'final'});
+  const graph = createEmptyPipeline({nodes:[visuals,mix,encode,out], edges:[createEdge('clips','collection','mix','videos'),createEdge('mix','composition','encode','composition'),createEdge('encode','video','final','video')]});
+  const run = await runAndWaitForPipeline(graph);
+  verifyCompletedRun(run);
+  const video = run.resultsByNodeId.encode.outputs.video;
+  const probe = JSON.parse(execFileSync(require('../electron/services/mediaCompositionService').resolveFfprobePath(), ['-v','error','-show_streams','-of','json',video.filePath]));
+  assert.equal(probe.streams[0].nb_frames, '1440');
+  assert.equal(Number(probe.streams[0].duration), 60);
+}
+
 async function verifyVideoCompositionRetryControls() {
   const assets = await prepareVideoAssets();
   const basePipeline = buildVideoModePipeline(assets, 'singleVideoMix', {
@@ -1706,6 +1726,7 @@ async function verifySoundEffectsTrimNearEnd() {
     includeNarration: false,
     secondsPerItem: 1,
     stopMode: 'visuals',
+    includeThirdImage: true,
     title: 'Trimmed sound effects export',
     outputTitle: 'Trimmed sound effects final',
     soundEffectsConfig: {
@@ -1721,8 +1742,9 @@ async function verifySoundEffectsTrimNearEnd() {
   verifyCompletedRun(completedRun);
   const exportArtifact = getExportArtifact(completedRun);
   const events = exportArtifact?.compositionExport?.soundEffects?.scheduledEvents || [];
+  assert.equal(events.length, 2, 'The sole effect should cover both scene boundaries.');
   assert(events.some((event) => event.trimmed === true), 'Expected SFX near the end to be trimmed in export metadata.');
-  assert(events.every((event) => Number(event.timeSeconds || 0) + Number(event.durationSeconds || 0) <= 2.001), 'Expected trimmed SFX not to extend the visual duration.');
+  assert(events.every((event) => Number(event.timeSeconds || 0) + Number(event.durationSeconds || 0) <= 3.001), 'Expected trimmed SFX not to extend the visual duration.');
 }
 
 async function verifyMissingSoundEffectsLibrarySkipsClearly() {
@@ -1805,6 +1827,8 @@ async function main() {
   await verifyVideoCompositionModes();
   await cleanupActiveRun();
   await verifyVideoCompositionRetryControls();
+  await cleanupActiveRun();
+  await verifyFractionalClipDurations();
   await cleanupActiveRun();
   console.log('Pipeline media composition verification passed.');
 }

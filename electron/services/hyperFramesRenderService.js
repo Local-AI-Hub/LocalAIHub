@@ -1,3 +1,4 @@
+const { findReferences } = require('../shared/hyperFramesReferences.cjs');
 const crypto = require('crypto');
 const fs = require('fs-extra');
 const path = require('path');
@@ -22,8 +23,7 @@ const HYPERFRAMES_RENDER_NODE_TYPE = 'hyperframesRender';
 const HYPERFRAMES_RENDER_OPERATION_ID = 'hyperframesRender';
 const HYPERFRAMES_RENDER_WARNING = 'HyperFrames renders HTML/CSS/JavaScript in Chromium. Render only compositions you trust. This first version is intended for local projects with local assets.';
 const HYPERFRAMES_LOCAL_ASSETS_ERROR = 'This first HyperFrames integration supports local composition assets only. Remove remote references or use local copies.';
-const HYPERFRAMES_RENDER_FPS_VALUES = Object.freeze([24, 30, 60]);
-const HYPERFRAMES_RENDER_QUALITY_VALUES = Object.freeze(['draft', 'standard', 'high']);
+const { fpsValues: HYPERFRAMES_RENDER_FPS_VALUES, qualityValues: HYPERFRAMES_RENDER_QUALITY_VALUES } = require('../shared/hyperFramesRenderSettings.cjs');
 const HYPERFRAMES_RENDER_WORKERS = 1;
 const HYPERFRAMES_RENDER_BROWSER_GPU = false;
 const HYPERFRAMES_RENDER_FORMAT = 'mp4';
@@ -32,16 +32,16 @@ const DEFAULT_STAGING_LIMITS = Object.freeze({
   maxDepth: 12,
   maxFiles: 2500,
   maxTotalBytes: 512 * 1024 * 1024,
-  maxScannedTextBytesPerFile: 1024 * 1024,
+  maxScannedTextBytesPerFile: 16 * 1024 * 1024,
 });
-const TEXT_SCAN_EXTENSIONS = new Set(['.html', '.htm', '.css', '.js', '.mjs']);
+const TEXT_SCAN_EXTENSIONS = new Set(['.html', '.htm', '.css', '.js', '.mjs', '.cjs', '.svg', '.json', '.gltf', '.webmanifest']);
 const IGNORED_STAGE_NAMES = new Set(['.git', '.hg', '.svn', '.cache', '.hyperframes-cache', 'node_modules', 'tmp', 'temp']);
 
 function normalizeHyperFramesRenderSettings(config = {}) {
   const fps = Number(config.fps || 30);
   const quality = String(config.quality || 'draft').trim().toLowerCase();
   return {
-    browserGpu: HYPERFRAMES_RENDER_BROWSER_GPU,
+    browserGpu: config.browserGpu === true || HYPERFRAMES_RENDER_BROWSER_GPU,
     format: HYPERFRAMES_RENDER_FORMAT,
     fps: HYPERFRAMES_RENDER_FPS_VALUES.includes(fps) ? fps : 30,
     quality: HYPERFRAMES_RENDER_QUALITY_VALUES.includes(quality) ? quality : 'draft',
@@ -157,7 +157,7 @@ async function copyCompositionProjectSafely(sourceRoot, stagedRoot, limits = {},
     await fs.ensureDir(targetPath);
     const entries = await fs.readdir(sourcePath, { withFileTypes: true });
     for (const entry of entries) {
-      if (shouldIgnoreStageEntry(entry.name)) {
+      if (shouldIgnoreStageEntry(entry.name) || (!relativePath && entry.isDirectory() && entry.name.toLowerCase() === 'renders')) {
         currentState.ignoredEntries.push(path.join(relativePath, entry.name));
         continue;
       }
@@ -220,6 +220,29 @@ async function inlineLocalScriptsForHyperFramesLint(projectRoot) {
   const indexPath = path.join(projectRoot, 'index.html');
   if (!(await fs.pathExists(indexPath))) return { inlinedScripts: [] };
   let html = await fs.readFile(indexPath, 'utf8');
+  const originalHtml = html;
+  // HyperFrames 0.6 treats var(--family) as a literal family in lint.
+  // Resolve only unique static :root declarations in the lint view.
+  const styles = [...html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)].map(match => match[1]).join('\n');
+  const fontVariables = new Map();
+  for (const root of styles.matchAll(/:root\s*\{([^{}]*)\}/g)) {
+    for (const declaration of root[1].matchAll(/(--[\w-]+)\s*:\s*([^;{}]+)(?:;|$)/g)) {
+      const [, name, value] = declaration;
+      if (!/^[\w\s,'"-]+$/.test(value) || styles.split(name + ':').length !== 2) continue;
+      fontVariables.set(name, value.trim());
+    }
+  }
+  function resolveStyleFonts(keepVariable) {
+    return originalHtml.replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi, (_, tag, css, end) => tag + css.replace(/(font-family\s*:\s*)var\(\s*(--[\w-]+)\s*\)/gi, (original, prefix, name) => {
+      if (!fontVariables.has(name)) return original;
+      const literal = prefix + fontVariables.get(name);
+      // Give the compiler a concrete family for bundled font selection while
+      // retaining the authored custom property for the browser's cascade.
+      return keepVariable ? literal + '; ' + original : literal;
+    }) + end);
+  }
+  html = resolveStyleFonts(false);
+  const renderHtml = resolveStyleFonts(true);
   const inlinedScripts = [];
   const replacements = [];
   const scriptPattern = /<script\b[^>]*\bsrc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)[^>]*>\s*<\/script>/gi;
@@ -227,7 +250,9 @@ async function inlineLocalScriptsForHyperFramesLint(projectRoot) {
     const tag = match[0];
     const source = readHtmlAttribute(tag, 'src');
     const target = await readLocalInlineTarget(projectRoot, source);
-    if (!target) continue;
+    // The upstream linter reads inline timeline registrations. Keep independent
+    // libraries external so their implementation is not classified as scene code.
+    if (!target || !/\b__timelines\b/.test(target.content)) continue;
     const safeScript = target.content.replace(/<\/script/gi, '<\\/script');
     replacements.push({
       from: tag,
@@ -236,15 +261,16 @@ async function inlineLocalScriptsForHyperFramesLint(projectRoot) {
     inlinedScripts.push(target.relativePath);
   }
   for (const replacement of replacements) {
-    html = html.replace(replacement.from, replacement.to);
+    html = html.replace(replacement.from, () => replacement.to);
   }
-  if (replacements.length) await fs.writeFile(indexPath, html, 'utf8');
-  return { inlinedScripts };
+  if (originalHtml !== html) await fs.writeFile(indexPath, html, 'utf8');
+  return { inlinedScripts, renderHtml };
 }
-async function scanStagedCompositionForRemoteReferences(stagedRoot, limits = {}) {
-  const activeLimits = mergeStagingLimits(limits);
+async function scanStagedCompositionForRemoteReferences(stagedRoot, limits = {}, metadataFile = null) {
+  const { maxScannedTextBytesPerFile } = mergeStagingLimits(limits);
   const findings = [];
   const scannedFiles = [];
+  let projectFileCount = 0;
   async function visit(currentPath) {
     const stats = await fs.lstat(currentPath);
     if (isReparsePointStats(stats)) {
@@ -258,30 +284,29 @@ async function scanStagedCompositionForRemoteReferences(stagedRoot, limits = {})
       return;
     }
     if (!stats.isFile()) return;
+    const relative = path.relative(stagedRoot, currentPath);
+    const counted = relative.toLowerCase() !== metadataFile;
+    if (counted) projectFileCount++;
     const extension = path.extname(currentPath).toLowerCase();
     if (!TEXT_SCAN_EXTENSIONS.has(extension)) return;
-    const buffer = await fs.readFile(currentPath);
-    const text = buffer.slice(0, activeLimits.maxScannedTextBytesPerFile).toString('utf8');
-    const relative = path.relative(stagedRoot, currentPath);
-    scannedFiles.push({ extension, relative });
-    if (/https?:\/\//i.test(text)) {
-      findings.push({ category: 'remote-http-reference', extension });
-    }
-    if (/\bdata:/i.test(text)) {
-      findings.push({ category: 'data-url-reference', extension });
-    }
+    if (stats.size > maxScannedTextBytesPerFile) throw new Error('HyperFrames could not inspect ' + relative + ' because it exceeds the per-file text scan limit.');
+    const text = await fs.readFile(currentPath, 'utf8');
+    if (counted) scannedFiles.push({ extension, relative });
+    for (const finding of findReferences(text, relative)) findings.push(finding);
   }
 
   await visit(stagedRoot);
   if (findings.length) {
-    const error = new Error(HYPERFRAMES_LOCAL_ASSETS_ERROR);
+    const error = new Error(HYPERFRAMES_LOCAL_ASSETS_ERROR + ' ' + findings.map(f => f.reference + ' in ' + f.file + ' at line ' + f.line + ' (' + f.kind + ').').join(' '));
     error.code = 'HYPERFRAMES_REMOTE_REFERENCE';
     error.findings = findings;
     throw error;
   }
   return {
     localOnly: true,
+    projectFileCount,
     scannedFileCount: scannedFiles.length,
+    supportedTextExtensions: [...TEXT_SCAN_EXTENSIONS].sort(),
     scannedExtensions: [...new Set(scannedFiles.map((entry) => entry.extension))].sort(),
   };
 }
@@ -312,7 +337,14 @@ function sanitizeCliText(value, options = {}) {
 }
 
 function buildCliSummary(result, options = {}) {
+  let errors = [];
+  try {
+    const report = JSON.parse(result.stdout);
+    errors = (report.findings || []).filter(finding => finding.severity === 'error').slice(0, 6)
+      .map(finding => sanitizeCliText([finding.code, finding.message, finding.fixHint].filter(Boolean).join(' '), options).slice(0, 550));
+  } catch { /* Some CLI commands emit plain text. */ }
   return {
+    errors,
     code: Number(result?.code || 0) || 0,
     stderrTail: sanitizeCliText(result?.stderr || '', options),
     stdoutTail: sanitizeCliText(result?.stdout || '', options),
@@ -322,6 +354,7 @@ function buildCliSummary(result, options = {}) {
 function buildHyperFramesLintFailureMessage(lintSummary = {}) {
   const details = [];
   details.push('Lint phase: hyperframes lint --json.');
+  if (lintSummary.errors?.length) return 'HyperFrames lint found a problem. ' + details[0] + ' ' + lintSummary.errors.join(' ');
   const combinedTail = [lintSummary.stderrTail, lintSummary.stdoutTail]
     .map((entry) => String(entry || '').trim())
     .filter(Boolean)
@@ -384,7 +417,7 @@ async function probeRenderedMp4(outputPath, runtimeContext = {}) {
 
 function buildHyperFramesRenderMetadata(options = {}) {
   return {
-    browserGpu: false,
+    browserGpu: options.settings.browserGpu === true,
     cancel: Boolean(options.cancelled),
     ffmpegVersion: String(options.runtimeContext?.ffmpegReadiness?.ffmpegVersion || '').split(/\r?\n/)[0],
     ffprobeVersion: String(options.runtimeContext?.ffmpegReadiness?.ffprobeVersion || '').split(/\r?\n/)[0],
@@ -422,13 +455,25 @@ function buildRenderArgs(stagedProjectRoot, outputPath, settings) {
     '--quality', settings.quality,
     '--format', HYPERFRAMES_RENDER_FORMAT,
     '--workers', String(HYPERFRAMES_RENDER_WORKERS),
-    '--no-browser-gpu',
-    '--quiet',
+    settings.browserGpu ? '--browser-gpu' : '--no-browser-gpu',
     stagedProjectRoot,
   ];
 }
 
 async function renderHyperFramesComposition(input, options = {}) {
+  const live = require('./hyperFramesDiagnostics').startRender(options.nodeId);
+  try {
+    const result = await executeRender(input,{...options,live});
+    live.finish('completed');
+    return result;
+  } catch (error) {
+    live.finish('failed');
+    require('./hyperFramesDiagnostics').recordFailure(error, options.nodeId);
+    throw error;
+  }
+}
+
+async function executeRender(input, options) {
   const settings = assertSupportedHyperFramesRenderSettings(options.config || {});
   const runtimeContext = options.runtimeContext || await getManagedHyperFramesExecutionRuntime(options.toolState || {}, { logger: options.logger || null });
   const trustedInput = assertTrustedCompositionArtifact(input, {
@@ -464,10 +509,12 @@ async function renderHyperFramesComposition(input, options = {}) {
     const stagingSummary = await copyCompositionProjectSafely(projectRoot, stagedRoot, options.limits || {});
     await assertRealPathInside(workRoot, path.join(stagedRoot, 'index.html'), 'Local AI Hub refused to stage a HyperFrames project that crosses a symlink or junction.');
     const localScan = await scanStagedCompositionForRemoteReferences(stagedRoot, options.limits || {});
-    await inlineLocalScriptsForHyperFramesLint(stagedRoot);
+    const { renderHtml } = await inlineLocalScriptsForHyperFramesLint(stagedRoot);
 
+    options.live.stage('linting');
     options.reportProgress?.({ stage: 'linting', message: 'Checking the HyperFrames composition.' });
     const lintResult = await runHyperFramesCli(runtimeContext.paths, runtimeContext.runtime, ['lint', '--json', stagedRoot], {
+      onStdout: options.live.onStdout, onStderr: options.live.onStderr,
       allowFailure: true,
       browserExecutablePath: runtimeContext.browserExecutablePath,
       cwd: stagedRoot,
@@ -483,8 +530,11 @@ async function renderHyperFramesComposition(input, options = {}) {
       throw lintError;
     }
 
+    await fs.writeFile(path.join(stagedRoot, 'index.html'), renderHtml, 'utf8');
+    options.live.stage('rendering');
     options.reportProgress?.({ stage: 'rendering', message: 'Rendering the HyperFrames composition to MP4.' });
     const renderResult = await runHyperFramesCli(runtimeContext.paths, runtimeContext.runtime, buildRenderArgs(stagedRoot, outputPath, settings), {
+      onStdout: options.live.onStdout, onStderr: options.live.onStderr,
       browserExecutablePath: runtimeContext.browserExecutablePath,
       cwd: stagedRoot,
       errorMessage: 'Local AI Hub could not render the HyperFrames composition.',

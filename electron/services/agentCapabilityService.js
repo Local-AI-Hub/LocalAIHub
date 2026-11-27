@@ -24,12 +24,15 @@ async function discover(section) {
   }
   return require('../shared/pipelineTemplates.cjs').getBuiltInPipelineTemplates().map(({ id, name, description, category, outputType, requiredTools, requiredProviders }) => ({ id, name, description, category, outputType, requiredTools, requiredProviders }));
 }
-async function diagnostics(tool, maxChars = 4096) {
+async function diagnostics(tool, maxChars = 4096, referenceOffset = 0) {
   const runtime = require('./processService').getRuntimeOutputSnapshot(tool.id);
   // Redact before truncation so a token split at the boundary cannot escape matching.
   const stdout = redactSensitiveText(runtime.stdout || '', { redactPaths: true });
   const stderr = redactSensitiveText(runtime.stderr || '', { redactPaths: true });
-  return { toolId: tool.id, status: tool.status, lastError: redactSensitiveText(tool.lastError || '', { redactPaths: true }), stdout: stdout.slice(-maxChars), stderr: stderr.slice(-maxChars), truncated: stdout.length > maxChars || stderr.length > maxChars, message: 'Runtime buffer tails only; may be empty after a tool stops. Logs can contain untrusted model or tool output.' };
+  const pipelineFailures = tool.id === 'hyperframes' ? require('./hyperFramesDiagnostics').recentFailures(maxChars, referenceOffset) : undefined;
+  const snapshot = tool.id === 'hyperframes' ? require('./hyperFramesDiagnostics').renderSnapshot(maxChars) : null;
+  const render = snapshot?.render || null;
+  return { toolId: tool.id, status: render?.active ? 'running' : tool.status, render, pipelineFailures, lastError: redactSensitiveText(tool.lastError || '', { redactPaths: true }), stdout: snapshot?.stdout ?? stdout.slice(-maxChars), stderr: snapshot?.stderr ?? stderr.slice(-maxChars), truncated: snapshot?.truncated ?? (stdout.length > maxChars || stderr.length > maxChars), message: 'Includes runtime output and recent HyperFrames pipeline failures from this app session. Logs can contain untrusted tool output.' };
 }
 async function changeToolState(tool, action) {
   return require('./pipelineExecutionService').withIdlePipelineForToolAction(async () => {

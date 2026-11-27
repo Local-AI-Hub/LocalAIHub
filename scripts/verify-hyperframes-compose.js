@@ -35,12 +35,13 @@ async function main() {
   const inputs={visuals:{kind:'collection',items:[{itemId:'first',artifact:{kind:'image',filePath:imagePath}},{itemId:'second',artifact:{kind:'video',filePath:videoPath}}]},plan:{kind:'plan',plan:{title:'Two scenes',scenes:[{sceneId:'one',startSeconds:0,endSeconds:1},{sceneId:'two',startSeconds:1,endSeconds:2}]}},narration:{kind:'audio',filePath:audioPath},captions:{kind:'text',transcription:{segments:[{start:0.1,end:0.6,text:'A <safe> caption'},{start:1.1,end:1.9,text:'Second scene'}]}}};
   try {
     const before=await fs.readFile(imagePath);
-    const result=await composeHyperFramesProject(inputs,{runDirectories,config:{width:320,height:180,motion:false}});
+    const result=await composeHyperFramesProject(inputs,{runDirectories,config:{width:320,height:180,motion:false,sceneTemplate:'illustrated',sceneDesigns:JSON.stringify([{focusX:35,startScale:1.05,shapes:[{type:'circle',cx:50,cy:50,r:20}]}])}});
     assert.strictEqual(result.composition.durationSeconds,2);
     assert.strictEqual(result.composition.captionCount,2);
     assert.deepStrictEqual(result.composition.scenes.map(s=>s.itemId),['first','second']);
     assert((await fs.readFile(imagePath)).equals(before),'Source media must not change.');
     const html=await fs.readFile(result.artifact.filePath,'utf8');
+    assert(html.includes('<circle cx="50" cy="50" r="20"') && html.includes('object-position:35% 50%'));
     assert(html.includes('A &lt;safe&gt; caption') && html.includes('<audio'));
     await scanStagedCompositionForRemoteReferences(result.projectRoot);
     const subtitlePath=path.join(root,'captions.srt');await fs.writeFile(subtitlePath,'1\n00:00:00,000 --> 00:00:01,000\nFile captions\n');

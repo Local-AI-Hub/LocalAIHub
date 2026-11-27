@@ -579,6 +579,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       rvcInference: {},
       whisperOptions: {},
       chatterboxOptions: {},
+      narrationPauseSeconds: 0.22,
+      narrationTargetSeconds: 0,
       seed: -1,
       transformSubtype: '',
       analysisMode: 'clip',
@@ -928,6 +930,8 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       rvcInference: {},
       whisperOptions: {},
       chatterboxOptions: {},
+      narrationPauseSeconds: 0.22,
+      narrationTargetSeconds: 0,
       seed: -1,
       audioMode: 'music',
       audiocraftItemMode: 'independent',
@@ -1367,6 +1371,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       backgroundMusicVolume: DEFAULT_MEDIA_COMPOSITION_BACKGROUND_MUSIC_VOLUME,
       sourceVideoVolume: DEFAULT_MEDIA_COMPOSITION_SOURCE_VIDEO_VOLUME,
       soundEffectsEnabled: false,
+      soundEffectsReuseSoleEffect: true,
       soundEffectsLibraryId: '',
       soundEffectsSchedulingMode: MEDIA_COMPOSITION_SOUND_EFFECTS_SCHEDULING_MODES.RANDOM_INTERVAL,
       soundEffectsVolume: DEFAULT_MEDIA_COMPOSITION_SOUND_EFFECTS_VOLUME,
@@ -1423,7 +1428,7 @@ const PIPELINE_NODE_TYPES = Object.freeze({
       { id: 'captions', kind: PORT_KIND_ANY, allowedKinds: [PORT_KIND_TEXT, PORT_KIND_FILE], label: 'Transcript / Subtitles' },
     ],
     outputPorts: [{ id: 'project', kind: PORT_KIND_FILE, label: 'HyperFrames Project' }],
-    configDefaults: { title: 'Pipeline composition', width: 1280, height: 720, secondsPerScene: 4, fitMode: 'contain', motion: true },
+    configDefaults: { title: 'Pipeline composition', sceneTemplate: 'full', sceneDesigns: '', width: 1280, height: 720, secondsPerScene: 4, fitMode: 'contain', motion: true },
   }),
   hyperframesRender: Object.freeze({
     type: 'hyperframesRender',
@@ -1608,6 +1613,7 @@ function normalizePipelineRunSettings(value = {}) {
   const rawSeconds = Number(source.heavyStepCooldownSeconds);
   const seconds = Number.isFinite(rawSeconds) ? Math.floor(rawSeconds) : 0;
   return {
+    ...(String(source.outputFolder || '').trim() ? {outputFolder:String(source.outputFolder).trim()} : {}),
     enableHeavyStepCooldown: enabled,
     heavyStepCooldownSeconds: Math.max(0, Math.min(HEAVY_STEP_COOLDOWN_MAX_SECONDS, seconds)),
   };
@@ -2719,6 +2725,9 @@ function getPipelineNodePorts(nodeOrType, direction) {
   const node = isPipelineNodeLike(nodeOrType) ? nodeOrType : null;
   const nodeType = node ? node.type : nodeOrType;
   const definition = getNodeTypeDefinition(nodeType);
+  if (node?.type === 'llmPrompt' && direction === 'output' && node.config?.executionMode === 'localTool' && node.config?.operationId === 'audioGenerate' && node.config?.toolId === 'chatterbox-tts') {
+    return [...definition.outputPorts, { id: 'captions', kind: PORT_KIND_TEXT, label: 'Timed narration captions' }];
+  }
   if (node?.type === 'recordInput' && direction === 'output') {
     const outputKind = getRecordInputOutputKind(node);
     return (definition?.outputPorts || []).filter((port) => port.kind === outputKind);
@@ -4214,6 +4223,7 @@ function getConnectedOutputPortEntries(node, graph) {
 function getUnexpectedOutputConnectionMessage(node, supportedOutputKinds = [], graph) {
   const normalizedOutputKinds = uniqueKindList(supportedOutputKinds);
   const unsupportedEntry = getConnectedOutputPortEntries(node, graph).find((entry) => {
+    if (entry.port?.id === 'captions') return false;
     const portKind = normalizePortKind(entry.port?.kind);
     return portKind && !normalizedOutputKinds.includes(portKind);
   });
@@ -7031,13 +7041,13 @@ function analyzePipeline(definition = {}, context = {}) {
             message: 'Connect a File Input, HyperFrames Project Input, or HyperFrames Compose output that supplies a local index.html before running HyperFrames Render.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (![24, 30, 60].includes(fps)) {
+        } else if (!require('./hyperFramesRenderSettings.cjs').fpsValues.includes(fps)) {
           summary.readiness = {
             tone: 'error',
             message: 'HyperFrames Render supports 24, 30, or 60 FPS in this first version.',
           };
           issues.push(buildNodeIssue(node, 'error', summary.readiness.message));
-        } else if (!['draft', 'standard', 'high'].includes(quality)) {
+        } else if (!require('./hyperFramesRenderSettings.cjs').qualityValues.includes(quality)) {
           summary.readiness = {
             tone: 'error',
             message: 'Choose Draft, Standard, or High quality for HyperFrames Render.',

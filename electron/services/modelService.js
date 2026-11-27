@@ -822,13 +822,19 @@ function bytesToMb(bytes) {
   return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / 1024 / 1024) : 0;
 }
 function inferRuntimeModelFamily(item = {}) {
+  // The selected artifact's type takes precedence over incidental name keywords.
+  const modelType = normalizeModelType(item.modelType);
+  if (['LoRA', 'VAE', 'ControlNet', 'Upscaler', 'Embedding', 'Hypernetwork'].includes(modelType)) return 'accessory';
+  const baseModel = String(item.baseModel || '').toLowerCase();
+  if (/^sd[ _-]?1[ ._-]?5(?:\b|$)/.test(baseModel)) return 'sd15';
+  if (/sdxl|pony|illustrious/.test(baseModel)) return 'sdxl';
+  if (/flux|^sd[ _-]?3/.test(baseModel)) return 'flux-sd3';
   const text = [
     item.name,
     item.fileName,
     item.installRelativePath,
     item.catalogContext,
     item.catalogRepositoryId,
-    item.description,
     item.modelType,
     item.source,
   ]
@@ -850,14 +856,14 @@ function inferRuntimeModelFamily(item = {}) {
   if (/sd[-_\s]?1\.?5|stable[-_\s]?diffusion[-_\s]?v?1[-_\s]?5|\bv1[-_\s]?5\b|1[-_\s]?5[-_\s]?pruned/.test(text)) {
     return 'sd15';
   }
-  if (/lora|vae|controlnet|upscaler|embedding|hypernetwork/.test(text)) {
+  if (!['Checkpoint', 'Inpainting'].includes(modelType) && /lora|vae|controlnet|upscaler|embedding|hypernetwork/.test(text)) {
     return 'accessory';
   }
   if (/audio|speech|musicgen|bark|whisper|rvc|voice conversion/.test(text)) {
     return 'audio';
   }
   const sizeMb = bytesToMb(Number(item.sizeBytes || 0));
-  if (normalizeModelType(item.modelType) === 'Checkpoint') {
+  if (['Checkpoint', 'Inpainting'].includes(modelType)) {
     return sizeMb >= 6144 ? 'sdxl' : 'sd15';
   }
   return 'unknown';
@@ -1236,7 +1242,7 @@ function buildCivitaiArtifactChoice(model, entry, tool, options = {}) {
     downloadPlan: entry?.file?.downloadPlan,
   });
   const plan = entry?.file?.downloadPlan || null;
-  const modelType = entry?.file?.normalizedType || entry?.file?.modelType || plan?.modelType || 'Model';
+  const modelType = entry?.file?.modelType || plan?.modelType || entry?.file?.normalizedType || 'Model';
   const targetDirectory = getTargetDirectory(tool, modelType, entry?.file || {});
   const identity = buildSourceDownloadIdentity({
     source: 'civitai',
@@ -1265,6 +1271,7 @@ function buildCivitaiArtifactChoice(model, entry, tool, options = {}) {
       catalogModelId: model?.id ? String(model.id) : null,
       catalogVersionId: entry?.version?.id ? String(entry.version.id) : null,
       catalogVersionLabel: versionLabel,
+      baseModel: entry?.version?.baseModel || null,
       downloadIdentity: identity,
       downloadPlan: serializeDownloadPlan(plan, targetDirectory),
       downloadUrl: entry?.file?.downloadUrl || entry?.version?.downloadUrl || null,
@@ -2645,6 +2652,7 @@ function hasLikelyHuggingFaceRvcContext(detail, fileEntry) {
 }
 const HF_LANGUAGE_TASK = /^(?:text-generation|text2text-generation|fill-mask|sentence-similarity|text-classification|token-classification|question-answering|summarization|translation)$/i;
 function inferHuggingFaceType(detail, fileEntry) {
+  if (fileEntry?.verifiedModelType) return fileEntry.verifiedModelType;
   const tasks = detail.pipeline_tag ? [detail.pipeline_tag] : detail.tags || [];
   if (/\.(?:safetensors|bin|pt|pth|ckpt)$/i.test(fileEntry?.rfilename || '') && tasks.some(task => HF_LANGUAGE_TASK.test(task))) {
     return 'Language model';
@@ -2798,6 +2806,50 @@ async function expandHuggingFaceDetailForPlanning(detail, selectedType, tool, lo
   if (!tool) {
     return detail;
   }
+  const siblings = [...(detail.siblings || [])];
+  let headerIndex = 0;
+  const inspectHeader = async entry => {
+    const size = getKnownHuggingFaceFileSize(entry);
+    if (!['forge', 'automatic1111', 'comfyui', 'invokeai'].includes(tool.id) || entry.headerInspected || entry.verifiedModelType || !/\.safetensors$/i.test(entry.rfilename || '') || size < 1024 || size >= 1024 * 1024) return entry;
+    entry = { ...entry, headerInspected: true };
+    try {
+      const response = await fetch(buildHuggingFaceResolveUrl(detail.id, entry.rfilename), { headers: { Range: 'bytes=0-65535' }, signal: AbortSignal.any([AbortSignal.timeout(8000), getModelBrowseSignal()].filter(Boolean)) });
+      if (!response.ok) return entry;
+      const reader = response.body.getReader();
+      const chunks = []; let length = 0;
+      try {
+        while (length < 65536) {
+          const part = await reader.read(); if (part.done) break;
+          const bytes = Buffer.from(part.value).subarray(0, 65536 - length);
+          chunks.push(bytes); length += bytes.length;
+        }
+      } finally { await reader.cancel(); }
+      const data = Buffer.concat(chunks);
+      if (data.length < 8) return entry;
+      const headerLength = Number(data.readBigUInt64LE(0));
+      if (headerLength <= 0 || headerLength > data.length - 8) return entry;
+      const header = JSON.parse(data.subarray(8, 8 + headerLength).toString('utf8'));
+      const keys = Object.keys(header).filter(key => key !== '__metadata__');
+      if (keys.length && keys.every(key => {
+        const tensor = header[key];
+        return /^(?:emb_params|clip_l|clip_g|string_to_param(?:\..*)?)$/.test(key) &&
+          ['F16', 'F32', 'BF16'].includes(tensor?.dtype) &&
+          Array.isArray(tensor.shape) && tensor.shape.length > 0 && tensor.shape.every(n => Number.isInteger(n) && n > 0) &&
+          Array.isArray(tensor.data_offsets) && tensor.data_offsets.length === 2 &&
+          tensor.data_offsets.every(n => Number.isInteger(n) && n >= 0) &&
+          tensor.data_offsets[1] > tensor.data_offsets[0] && tensor.data_offsets[1] <= size - 8 - headerLength;
+      })) return { ...entry, verifiedModelType: 'Embedding' };
+      return entry;
+    } catch (error) { rethrowModelBrowseCancellation(error); return entry; }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, siblings.length) }, async () => {
+    while (headerIndex < siblings.length) {
+      const index = headerIndex++;
+      siblings[index] = await inspectHeader(siblings[index]);
+    }
+  }));
+  detail = { ...detail, siblings };
+  HUGGING_FACE_DETAIL_CACHE.set(buildProviderCacheKey('huggingface-detail', { modelId: detail.id }), detail);
   if (collectHuggingFaceDownloadFiles(detail, selectedType, tool).length) {
     return detail;
   }
@@ -3553,12 +3605,12 @@ function mergeUniqueRemoteEntriesById(entries = []) {
 const HF_CONTINUATIONS = createExpiringCache({ maxEntries: 400, ttlMs: 30 * 60 * 1000 });
 function saveCatalogContinuation(tool, options, state) {
   const token = 'localaihub-results:' + crypto.randomUUID();
-  HF_CONTINUATIONS.set(token, { toolId: tool.id, query: options.query, modelType: options.modelType, taskType: options.taskType, ...state });
+  HF_CONTINUATIONS.set(token, { toolId: tool.id, query: options.query, modelType: options.modelType, taskType: options.taskType, sort: options.sort, includeIncompatible: options.includeIncompatible, ...state });
   return token;
 }
 function readCatalogContinuation(tool, options) {
   const state = HF_CONTINUATIONS.get(options.cursor);
-  if (!state || state.toolId !== tool.id || state.query !== options.query || state.modelType !== options.modelType || state.taskType !== options.taskType) {
+  if (!state || state.toolId !== tool.id || state.query !== options.query || state.modelType !== options.modelType || state.taskType !== options.taskType || state.sort !== options.sort || state.includeIncompatible !== options.includeIncompatible) {
     throw new Error('This catalog search has expired. Repeat the search to continue.');
   }
   return state;
@@ -3599,7 +3651,10 @@ async function fetchHuggingFacePage(tool, browseOptions, logger) {
   for (const variant of fallbackQueries) {
     if (browseOptions.cursor) break;
     const page = await requestHuggingFacePage(tool, browseOptions, logger, '', variant);
-    fallbackPages.push({ ...page, query: variant });
+    // Broad RVC catalog samples can help discover filenames, but must not
+    // turn an unrelated user query into a full traversal of every RVC repo.
+    const broadSample = isRvcSearch && /^(?:rvc|rvc voice|rvc \.pth|rvc \.pt)$/i.test(variant.trim());
+    fallbackPages.push({ ...page, nextCursor: broadSample ? null : page.nextCursor, query: variant });
   }
   const pages = [{ ...primaryPage, query: derivedSearchQuery, tag: preferredPipelineTag }, ...fallbackPages];
   const results = mergeUniqueRemoteEntriesById(pages.flatMap(page => page.results));
@@ -3690,6 +3745,7 @@ function buildHuggingFaceRepositoryResult(detail, file, tool, downloadedLookup, 
       artifactChoices,
       artifactUrl,
       author: detail.author || null,
+      downloads: detail.downloads || 0, likes: detail.likes || 0, lastModified: detail.createdAt || detail.created_at || detail.lastModified || detail.last_modified || null,
       catalogEntityLabel: isPackagePlan ? 'Package' : 'Repository',
       catalogEntityType: isPackagePlan ? 'package' : 'repository',
       catalogContext: isPackagePlan ? (plan.artifactLabel + ': ' + (plan.packageRoot || fileName)) : (file.rfilename ? `Primary artifact: ${file.rfilename}` : null),
@@ -3731,6 +3787,7 @@ function buildHuggingFaceBlockedRepositoryResult(detail, plan, tool, hardwareCon
       id: 'huggingface:repository:' + detail.id + ':blocked',
       artifactChoices: buildRejectedArtifactChoices(plan, 'huggingface'),
       author: detail.author || null,
+      downloads: detail.downloads || 0, likes: detail.likes || 0, lastModified: detail.createdAt || detail.created_at || detail.lastModified || detail.last_modified || null,
       catalogEntityLabel: 'Repository',
       catalogEntityType: 'repository',
       catalogContext: 'No compatible primary artifact found for this target.',
@@ -3771,6 +3828,7 @@ function buildHuggingFaceArtifactResult(detail, file, tool, downloadedLookup, ha
       artifactChoices: [buildHuggingFaceArtifactChoice(detail, file, tool, { recommended: true, source: 'huggingface', versionLabel: 'main' })],
       artifactUrl: buildHuggingFaceArtifactPageUrl(detail.id, file.rfilename),
       author: detail.author || null,
+      downloads: detail.downloads || 0, likes: detail.likes || 0, lastModified: detail.createdAt || detail.created_at || detail.lastModified || detail.last_modified || null,
       catalogEntityLabel: 'Artifact',
       catalogEntityType: 'artifact',
       catalogParentLabel: detail.id,
@@ -3891,20 +3949,21 @@ async function searchHuggingFaceCatalog(tool, options, downloaded, hardware, log
     ? readCatalogContinuation(tool, { ...options, cursor: options.cursor.replace('localaihub-discovery:', 'localaihub-results:') })
     : { mode: 'files', names: options.cursor || null, files: null, phase: tool.id === 'rvc' ? 'rvc' : 'all', namesDone: false, seen: [], pending: [] };
   const seen = new Set(state.seen);
+  state.scanPages = state.scanPages || 0;
   const items = [];
   if (state.mode === 'files') {
     if (!state.pending.length && state.phase) {
       const url = new URL(HUGGING_FACE_SEARCH_URL);
       url.searchParams.set('expand', 'siblings');
       url.searchParams.set('limit', '48');
-      url.searchParams.set('sort', 'downloads');
+      url.searchParams.set('sort', HF_SORT_MAP[options.sort] || 'downloads');
       url.searchParams.set('direction', '-1');
       if (state.phase === 'rvc') url.searchParams.set('search', 'rvc');
       if (state.files) url.searchParams.set('cursor', state.files);
       const candidates = [];
       // Previously inspected repositories can satisfy a filename search immediately.
       if (!options.cursor) {
-        candidates.push(...await collectionIndex.matchingIds(query, isExactCatalogFilename(query)));
+        candidates.push(...await collectionIndex.matchingIds(query, isExactCatalogFilename(query), options.sort));
         if (!candidates.length) candidates.push(...HUGGING_FACE_DETAIL_CACHE.matchingIds(detail => detail?.siblings?.some(file => fileKeywordMatches(query, file.rfilename))));
       }
       if (!candidates.length) {
@@ -3912,8 +3971,9 @@ async function searchHuggingFaceCatalog(tool, options, downloaded, hardware, log
         for (const entry of Array.isArray(payload) ? payload : []) {
           if (entry.siblings?.some(file => fileKeywordMatches(query, file.rfilename))) candidates.push(entry.id);
         }
-        state.files = extractCursorFromLinkHeader(response.headers.get('link'), 'next');
-        if (!state.files) state.phase = state.phase === 'rvc' ? 'all' : null;
+        state.scanPages += 1;
+        state.files = state.scanPages < 3 ? extractCursorFromLinkHeader(response.headers.get('link'), 'next') : null;
+        if (!state.files) state.phase = state.phase === 'rvc' && state.scanPages < 3 ? 'all' : null;
       }
       state.pending = [...new Set(candidates)].filter(id => !seen.has(id));
     }
@@ -3941,10 +4001,12 @@ async function searchHuggingFaceCatalog(tool, options, downloaded, hardware, log
     state.mode = state.phase || state.pending.length ? 'files' : 'names';
   }
   if (state.namesDone) state.mode = 'files';
+  const rank = options.sort === 'newest' ? 'lastModified' : options.sort === 'highest-rated' ? 'likes' : 'downloads';
+  items.sort((a, b) => rank === 'lastModified' ? (Date.parse(b[rank]) || 0) - (Date.parse(a[rank]) || 0) : (Number(b[rank]) || 0) - (Number(a[rank]) || 0));
   state.seen = [...seen];
   const more = !state.namesDone || Boolean(state.phase) || Boolean(state.pending.length);
   const nextCursor = more ? saveCatalogContinuation(tool, options, state).replace('localaihub-results:', 'localaihub-discovery:') : null;
-  return { items, pagination: { hasMore: more, nextCursor, nextPage: null } };
+  return { items, pagination: { hasMore: more, nextCursor, nextPage: null, searchNotice: 'Filename discovery covers previously indexed repositories and a bounded catalog sample. Search a repository ID to inspect all of its files.' } };
 }
 
 async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, hardwareContext, logger) {
@@ -4034,7 +4096,7 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
       let planningDetail = await expandHuggingFaceDetailForPlanning(memberDetail, browseOptions.modelType, tool, logger);
       const knownAliases = parsedQuery.fileQuery && !parsedQuery.exactPath && !parsedQuery.folder && !isExactCatalogFilename(parsedQuery.fileQuery)
         ? collectionIndex.aliasPaths(memberDetail, parsedQuery.fileQuery, matchesSearchQuery) : [];
-      if (parsedQuery.fileQuery && !knownAliases.length && !planningDetail.siblings?.some(file => fileKeywordMatches(parsedQuery.fileQuery, file.rfilename))) {
+      if (parsedQuery.fileQuery && !planningDetail.siblings?.length && !knownAliases.length && !planningDetail.siblings?.some(file => fileKeywordMatches(parsedQuery.fileQuery, file.rfilename))) {
         const tree = await fetchHuggingFaceRepositoryTree(memberDetail, logger);
         if (tree.length) planningDetail = { ...planningDetail, siblings: mergeHuggingFaceSiblingEntries(planningDetail.siblings || [], tree) };
       }
@@ -4042,7 +4104,7 @@ async function searchHuggingFaceModels(tool, browseOptions, downloadedLookup, ha
       let compatibleFiles = collectHuggingFaceDownloadFiles(planningDetail, browseOptions.modelType, tool);
       if (parsedQuery.fileQuery) {
         const requested = parsedQuery.fileQuery.replace(/\\/g, '/');
-        const isExact = parsedQuery.exactPath || (!parsedQuery.folder && /\.[a-z\d]{1,16}$/i.test(requested));
+        const isExact = parsedQuery.exactPath || (!parsedQuery.folder && isExactCatalogFilename(requested));
         const filenames = file => [file.rfilename, ...(file.downloadPlan?.requiredArtifacts || [])];
         const matchesPath = name => {
           if (parsedQuery.folder) return name.startsWith(requested + '/');
@@ -4193,7 +4255,7 @@ function collectCivitaiVersionFiles(model, selectedType, tool = null) {
   const plannedPaths = tool
     ? new Set(
         annotateArtifactsForDownloadPlan({
-          artifacts: entries.map((entry) => ({ ...entry.file, modelType: entry.file.normalizedType, primary: entry.file.primary })),
+          artifacts: entries.map((entry) => ({ ...entry.file, modelType: entry.file.modelType || entry.file.normalizedType, primary: entry.file.primary })),
           selectedType,
           source: 'civitai',
           tool,
@@ -4281,6 +4343,7 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
       catalogRequirements,
       catalogVersionId: entry.version?.id ? String(entry.version.id) : null,
       catalogVersionLabel: versionLabel,
+      baseModel: entry.version?.baseModel || null,
       description: buildCivitaiDescription(model),
       downloaded: isDownloadedMatch(downloadedLookup, [identity]),
       downloadIdentity: identity,
@@ -4290,7 +4353,7 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
       installRelativePath,
       license: model.license || null,
       modelPageUrl,
-      modelType: entry.file.normalizedType,
+      modelType: entry.file.modelType || entry.file.normalizedType,
       name: model.name,
       previewUrl: sanitizeModelPreviewUrl(previewImage?.url),
       sizeBytes: entry.file.sizeBytes,
@@ -4303,7 +4366,7 @@ function buildCivitaiModelResult(model, entry, tool, downloadedLookup, hardwareC
       toolId: tool.id,
       versionId: entry.version?.id ? String(entry.version.id) : null,
       versionLabel,
-    }, entry.file.downloadPlan, getTargetDirectory(tool, entry.file.normalizedType, entry.file)),
+    }, entry.file.downloadPlan, getTargetDirectory(tool, entry.file.modelType || entry.file.normalizedType, entry.file)),
     tool,
     hardwareContext,
   );
@@ -4342,6 +4405,7 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
       catalogRequirements,
       catalogVersionId: entry.version?.id ? String(entry.version.id) : null,
       catalogVersionLabel: versionLabel,
+      baseModel: entry.version?.baseModel || null,
       description: `File from ${model.name} | Version ${versionLabel} | ${buildCivitaiDescription(model)}`,
       downloaded: isDownloadedMatch(downloadedLookup, [identity]),
       downloadIdentity: identity,
@@ -4351,7 +4415,7 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
       installRelativePath,
       license: model.license || null,
       modelPageUrl,
-      modelType: entry.file.normalizedType,
+      modelType: entry.file.modelType || entry.file.normalizedType,
       name: fileName,
       previewUrl: sanitizeModelPreviewUrl(previewImage?.url),
       sizeBytes: entry.file.sizeBytes,
@@ -4364,7 +4428,7 @@ function buildCivitaiArtifactResult(model, entry, tool, downloadedLookup, hardwa
       toolId: tool.id,
       versionId: entry.version?.id ? String(entry.version.id) : null,
       versionLabel,
-    }, entry.file.downloadPlan, getTargetDirectory(tool, entry.file.normalizedType, entry.file)),
+    }, entry.file.downloadPlan, getTargetDirectory(tool, entry.file.modelType || entry.file.normalizedType, entry.file)),
     tool,
     hardwareContext,
   );
@@ -5323,6 +5387,7 @@ async function searchTabbyRegistryModels(tool, browseOptions, downloadedLookup, 
         attachDownloadPlanFields({
           id: `tabby:repository:${detail.id}`,
           author: detail.author || null,
+      downloads: detail.downloads || 0, likes: detail.likes || 0, lastModified: detail.createdAt || detail.created_at || detail.lastModified || detail.last_modified || null,
           catalogContext: [categoryLabels ? `Tabby ${categoryLabels}` : 'Tabby registry', `Repository: ${detail.id}`, file.rfilename ? `Primary artifact: ${file.rfilename}` : null]
             .filter(Boolean)
             .join(' | '),

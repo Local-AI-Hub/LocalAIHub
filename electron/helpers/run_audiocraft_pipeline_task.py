@@ -328,7 +328,23 @@ def load_audiocraft_runtime():
     return torchaudio_module, audio_module.audio_write, models_module.AudioGen, models_module.MusicGen
 
 
+def report_model_progress(model, started):
+    device = str(model.device)
+    last = [0.0]
+
+    def update(step, total):
+        now = time.monotonic()
+        if now - last[0] >= 2 or step == total:
+            print(f'HUB_PROGRESS Generating audio on {device}: {step}/{total} steps ({int(now-started)}s elapsed).', flush=True)
+            last[0] = now
+
+    model.set_custom_progress_callback(update)
+    print(f'HUB_PROGRESS Model ready on {device}. Starting generation.', flush=True)
+
+
 def main():
+    started = time.monotonic()
+    print('HUB_PROGRESS Loading AudioCraft runtime and model.', flush=True)
     if len(sys.argv) < 2:
         fail('Local AI Hub did not receive an AudioCraft request file path.')
 
@@ -384,8 +400,9 @@ def main():
         if audio_mode == 'sound':
             model_name = requested_model or 'facebook/audiogen-medium'
             model = AudioGen.get_pretrained(model_name)
+            report_model_progress(model, started)
             model.set_generation_params(**generation_params)
-            wav_batch = model.generate([prompt or 'generated audio'])
+            wav_batch = model.generate([prompt or 'generated audio'], progress=True)
         elif audio_mode == 'continuation':
             try:
                 import torch
@@ -394,6 +411,7 @@ def main():
 
             model_name = requested_model or 'facebook/musicgen-small'
             model = MusicGen.get_pretrained(model_name)
+            report_model_progress(model, started)
             if not hasattr(model, 'generate_continuation'):
                 fail('The selected AudioCraft model does not expose continuation generation. Choose a MusicGen model or snapshot that supports continuation.')
             source_audio, source_sample_rate = load_audio_for_chroma(source_audio_path, torchaudio)
@@ -417,7 +435,7 @@ def main():
                 total_duration_seconds = actual_seed_seconds + duration_seconds
                 model.set_generation_params(**build_generation_params(request, total_duration_seconds))
                 try:
-                    repeat_batch = model.generate_continuation(seed_audio, current_sample_rate, descriptions=descriptions)
+                    repeat_batch = model.generate_continuation(seed_audio, current_sample_rate, descriptions=descriptions, progress=True)
                 except Exception as error:
                     fail('AudioCraft could not generate continuation repeat ' + str(repeat_index) + ' of ' + str(continuation_repeat_count) + '. ' + summarize_runtime_exception(error))
 
@@ -474,6 +492,7 @@ def main():
         else:
             model_name = requested_model or ('facebook/musicgen-melody' if source_audio_path else 'facebook/musicgen-medium')
             model = MusicGen.get_pretrained(model_name)
+            report_model_progress(model, started)
             model.set_generation_params(**generation_params)
             if source_audio_path:
                 melody, melody_sample_rate = load_audio_for_chroma(source_audio_path, torchaudio)
@@ -481,9 +500,9 @@ def main():
                     melody = melody.unsqueeze(0)
                 if melody.dim() == 2:
                     melody = melody.unsqueeze(0)
-                wav_batch = model.generate_with_chroma([prompt], melody, melody_sample_rate)
+                wav_batch = model.generate_with_chroma([prompt], melody, melody_sample_rate, progress=True)
             else:
-                wav_batch = model.generate([prompt or 'generated music'])
+                wav_batch = model.generate([prompt or 'generated music'], progress=True)
 
         if audio_mode != 'continuation':
             if wav_batch is None or len(wav_batch) == 0:
@@ -533,6 +552,7 @@ def main():
             'requestedGeneratedDurationSeconds': round(float(requested_generated_duration_seconds), 2),
             'message': message,
             'model': model_name,
+            'device': str(model.device),
             'outputPath': final_output_path,
             'prompt': prompt,
             'sampleRate': int(model.sample_rate),

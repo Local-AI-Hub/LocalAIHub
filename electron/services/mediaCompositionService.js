@@ -319,16 +319,19 @@ function buildXfadeFilterComplex(visualItems, exportProfile, transitionPlan, aud
   };
 }
 
-async function probeVisualMediaFile(ffmpegPath, filePath) {
-  const result = await runCommand(ffmpegPath, ['-hide_banner', '-i', filePath], { allowFailure: true, timeoutMs: 15000 });
-  const text = String(result.stderr || '') + '\n' + String(result.stdout || '');
-  const durationMatch = text.match(/Duration:\s*(\d+):(\d+):([0-9.]+)/i);
-  const durationSeconds = durationMatch
-    ? (Number(durationMatch[1]) * 3600) + (Number(durationMatch[2]) * 60) + Number(durationMatch[3])
-    : 0;
+async function probeVideoFile(sourcePath) {
+  const result = await runCommand(resolveFfprobePath(), ['-v','error','-show_entries','stream=codec_type,width,height,avg_frame_rate,duration,nb_frames:format=duration','-of','json', sourcePath], { timeoutMs: 30000 });
+  const metadata = JSON.parse(result.stdout);
+  const video = metadata.streams?.find(stream => stream.codec_type === 'video');
+  if (!video) throw new Error('The selected file has no readable video stream.');
+  const [numerator, denominator] = String(video.avg_frame_rate || '').split('/').map(Number);
   return {
-    audioPresent: /Audio:/i.test(text),
-    durationSeconds: Math.round(Math.max(0, durationSeconds) * 1000) / 1000,
+    audioPresent: metadata.streams.some(stream => stream.codec_type === 'audio'),
+    durationSeconds: Number(video.duration) || Number(metadata.format?.duration) || 0,
+    frameCount: Number(video.nb_frames) || null,
+    fps: denominator ? numerator / denominator : 0,
+    height: Number(video.height) || 0,
+    width: Number(video.width) || 0,
   };
 }
 
@@ -764,13 +767,14 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
 
   const outputPath = path.join(exportDirectoryPath, `${sanitizeSegment(title, 'composed-video')}.mp4`);
   const stopMode = String(options.stopMode || '').trim() === 'visuals' ? 'visuals' : 'shortest';
-  const visualDurationSeconds = calculateVisualDurationSeconds(visualTrack);
+  const fps = Math.max(1, Number(options.fps) || 30);
+  const visualDurationSeconds = Math.max(1, Math.round(calculateVisualDurationSeconds(visualTrack) * fps)) / fps;
   const audioMix = resolveCompositionAudioMix(compositionArtifact);
   const soundEffectsPlan = getCompositionSoundEffectsPlan(compositionArtifact);
   const soundEffectsExport = await resolveSoundEffectEventsForExport(soundEffectsPlan, visualDurationSeconds);
   const ffmpegPath = resolveFfmpegPath();
   const visualProbes = visualItemKind === 'video'
-    ? await Promise.all(visualItems.map((entry) => probeVisualMediaFile(ffmpegPath, entry.artifact.filePath)))
+    ? await Promise.all(visualItems.map((entry) => probeVideoFile(entry.artifact.filePath)))
     : [];
   const audioPlan = buildAudioPlan(
     getPrimaryAudioTrack(compositionArtifact),
@@ -904,12 +908,14 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     audioMapTarget = '[aout]';
   }
 
+  const targetFrames = Math.round(visualDurationSeconds * fps);
+  const conformFilter = 'fps=' + fps + ',tpad=stop_mode=clone:stop=-1,trim=end_frame=' + targetFrames;
   if (visualItemKind === 'video') {
-    const filterComplex = [videoSequenceFilter.filterComplex, ...audioFilters].filter(Boolean).join(';');
+    const filterComplex = [videoSequenceFilter.filterComplex, videoSequenceFilter.videoMapTarget + conformFilter + '[picture]', ...audioFilters].filter(Boolean).join(';');
     args.push('-filter_complex', filterComplex);
     args.push(
       '-map',
-      videoSequenceFilter.videoMapTarget,
+      '[picture]',
       '-r',
       String(exportProfile.fps),
       '-c:v',
@@ -921,10 +927,10 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     );
   } else if (shouldRenderSceneTransitions) {
     const xfadeFilter = buildXfadeFilterComplex(visualItems, exportProfile, sceneTransitions, audioFilters);
-    args.push('-filter_complex', xfadeFilter.filterComplex);
+    args.push('-filter_complex', xfadeFilter.filterComplex + ';' + xfadeFilter.videoMapTarget + conformFilter + '[picture]');
     args.push(
       '-map',
-      xfadeFilter.videoMapTarget,
+      '[picture]',
       '-r',
       String(exportProfile.fps),
       '-c:v',
@@ -940,7 +946,7 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     }
     args.push(
       '-vf',
-      buildVideoFilter(exportProfile.width, exportProfile.height, exportProfile.fitMode),
+      buildVideoFilter(exportProfile.width, exportProfile.height, exportProfile.fitMode) + ',' + conformFilter,
       '-r',
       String(exportProfile.fps),
       '-c:v',
@@ -972,7 +978,7 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     }
   } else {
     args.push('-an');
-    if (shouldRenderSceneTransitions && visualDurationSeconds > 0) {
+    if (visualDurationSeconds > 0) {
       args.push('-t', formatFfmpegSeconds(visualDurationSeconds));
     }
   }
@@ -1001,6 +1007,12 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
     throw new Error(buildFfmpegFailureMessage(commandResult));
   }
 
+  const encoded = await probeVideoFile(outputPath);
+  if ((!audioPlan.hasAnyAudio || audioPlan.outputDurationSeconds) && encoded.frameCount && encoded.frameCount !== targetFrames) {
+    throw new Error('Media Export expected ' + targetFrames + ' frames but encoded ' + encoded.frameCount + '. Check the source clips and transition durations.');
+  }
+  exportProfile.encodedFrames = encoded.frameCount;
+  exportProfile.encodedDurationSeconds = encoded.durationSeconds;
   await logger.info('Media Export ffmpeg render finished.', {
     outputPath,
     renderMode: shouldRenderSceneTransitions ? 'xfade-transitions' : visualItemKind === 'video' ? 'normalized-video-sequence' : 'concat-sequence',
@@ -1046,6 +1058,7 @@ async function exportCompositionArtifactToVideo(compositionArtifact, options = {
 
 module.exports = {
   exportCompositionArtifactToVideo,
+  probeVideoFile,
   resolveFfmpegPath,
   resolveFfprobePath,
 };

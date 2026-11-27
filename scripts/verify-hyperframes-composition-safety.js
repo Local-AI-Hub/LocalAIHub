@@ -23,12 +23,24 @@ function writeFile(filePath, text) {
 (async () => {
   const root = makeTempRoot('localaihub-hyperframes-safety');
   try {
+    const {findReferences} = require('../electron/shared/hyperFramesReferences.cjs');
+    assert.deepStrictEqual(findReferences('@import url("https://one.example/a"); p{background:url(https://two.example/b)}','style.css').map(hit=>hit.kind),['CSS @import','CSS url']);
+    const examples = [
+      ['library.js','/*! https://license.example */ console.warn("See https://docs.example"); document.createElementNS("http://www.w3.org/2000/svg","circle")',0],
+      ['script.js','const asset = "https://one.example/a"; fetch(asset); new Worker("//two.example/worker");',2],
+      ['script.js','export {x} from "https://one.example/lib"; import("https://two.example/lib");',2],
+      ['style.css','/* url(https://unused.example) */ @import "https://one.example/a.css"; p{background:url(https://two.example/a.jpg)}',2],
+      ['index.html','<script type="importmap">{"imports":{"three":"https://one.example/lib"}}</script><img srcset="a.png 1x, https://two.example/a 2x">',2],
+      ['art.svg','<svg xmlns="http://www.w3.org/2000/svg"><image href="https://three.example/image"/></svg>',1],
+      ['scene.gltf','{"buffers":[{"uri":"https://one.example/mesh.bin"}],"copyright":"https://docs.example"}',1],
+    ];
+    for (const [file,source,count] of examples) assert.strictEqual(findReferences(source,file).length,count,file);
     const sourceRoot = path.join(root, 'source');
     const stagedRoot = path.join(root, 'staged');
     const indexPath = path.join(sourceRoot, 'index.html');
     writeFile(indexPath, '<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body><h1>Local</h1><script src="app.js"></script></body></html>');
     writeFile(path.join(sourceRoot, 'style.css'), 'body { font-family: Segoe UI, Arial, sans-serif; }');
-    writeFile(path.join(sourceRoot, 'app.js'), 'window.__local = true;');
+    writeFile(path.join(sourceRoot, 'app.js'), '/*! License https://docs.example.invalid/license */ const item = {data: "nested"}; const ns = "http://www.w3.org/2000/svg"; document.createElementNS(ns, "circle");');
     writeFile(path.join(sourceRoot, '.cache', 'ignored.js'), 'https://ignored.example.invalid/cache.js');
 
     const beforeHash = hashFile(indexPath);
@@ -47,11 +59,11 @@ function writeFile(filePath, text) {
     writeFile(path.join(stagedRoot, 'remote.js'), 'fetch("https://example.invalid/data.json")');
     await assert.rejects(
       () => service.scanStagedCompositionForRemoteReferences(stagedRoot),
-      (error) => error.message === service.HYPERFRAMES_LOCAL_ASSETS_ERROR && error.code === 'HYPERFRAMES_REMOTE_REFERENCE',
+      (error) => error.message.includes('remote.js at line 1') && error.message.includes('example.invalid') && error.code === 'HYPERFRAMES_REMOTE_REFERENCE',
       'Remote references must fail with the required local-assets message.',
     );
     fs.rmSync(path.join(stagedRoot, 'remote.js'), { force: true });
-    writeFile(path.join(stagedRoot, 'data.js'), 'const img = "data:image/png;base64,AAAA";');
+    writeFile(path.join(stagedRoot, 'data.js'), 'image.src = "data:image/png;base64,AAAA";');
     await assert.rejects(
       () => service.scanStagedCompositionForRemoteReferences(stagedRoot),
       /local composition assets only/i,

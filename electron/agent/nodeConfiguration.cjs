@@ -53,6 +53,17 @@ function checkSettings(config, location) {
 
 function checkNodeConfig(type, config, location) {
   checkSettings(config, location);
+  if (type === 'hyperframesRender') {
+    const { qualityValues, fpsValues } = require('../shared/hyperFramesRenderSettings.cjs');
+    const message = config.quality !== undefined && !qualityValues.includes(String(config.quality).trim().toLowerCase())
+      ? 'HyperFrames Render quality must be one of ' + qualityValues.join(', ') + '.'
+      : config.fps !== undefined && !fpsValues.includes(Number(config.fps)) ? 'HyperFrames Render FPS must be 24, 30, or 60.' : '';
+    if (message) {
+      const error = fault('INVALID_PIPELINE', message);
+      require('../services/hyperFramesDiagnostics').recordFailure(error);
+      throw error;
+    }
+  }
   if (type === 'collectionMap' && Object.hasOwn(config, 'perItemValidation')) checkSettings(config.perItemValidation, location + '.perItemValidation');
 }
 
@@ -69,7 +80,7 @@ function getConfiguredPorts(schema, sampleNode) {
   }
   const ports = direction => schema.getPipelineNodePorts(sampleNode, direction).filter(port =>
     (!port.dynamicOnly || schema.getPortAllowedKinds(port, { direction, node: sampleNode }).length)
-    && (direction !== 'output' || !outputKinds || outputKinds.includes(port.kind))
+    && (direction !== 'output' || !outputKinds || port.id === 'captions' || outputKinds.includes(port.kind))
   );
   return { inputs: ports('input'), outputs: ports('output') };
 }
@@ -90,6 +101,11 @@ function describeNode(schema, entry, config) {
     itemType: ['text', 'image', 'audio', 'video', 'file'],
   };
   for (const [key, values] of Object.entries(enums)) if (properties[key]) properties[key].enum = values;
+  if (entry.type === 'hyperframesRender') {
+    const { qualityValues, fpsValues } = require('../shared/hyperFramesRenderSettings.cjs');
+    properties.quality.enum = qualityValues;
+    properties.fps.enum = fpsValues;
+  }
   const choices = {};
   if (properties.rvcInference) {
     const operationIds = new Set(schema.COLLECTION_MAP_MAPPING_OPTIONS.map(mapping => mapping.operationId));

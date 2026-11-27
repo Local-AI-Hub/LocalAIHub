@@ -1306,6 +1306,7 @@ export default function ModelManager({ isActive = true, tools, onToast }) {
               </div>
             )}
           </div>
+          {pagination.searchNotice ? <p className="mt-2 text-sm text-slate-400">{pagination.searchNotice}</p> : null}
           {pagination.hasMore ? (
             <div className="mt-3 flex flex-none justify-center">
               <button className="ghost-button" disabled={loadingMore} onClick={handleLoadMore} type="button">

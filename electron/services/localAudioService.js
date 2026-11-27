@@ -12,7 +12,7 @@ const { runCommand } = require('./commandService');
 const { prependManagedFfmpegBinToPath, resolveManagedFfmpegPaths } = require('./managedFfmpegService');
 const { buildLaunchRuntimeEnv, summarizeLaunchRuntimeEnv } = require('./processService');
 const { createLogger } = require('./logService');
-const { buildFileArtifact, summarizeArtifact } = require('./pipelineArtifactService');
+const { buildFileArtifact, summarizeArtifact, createTextArtifact } = require('./pipelineArtifactService');
 const { serializePromptStyleApplication } = require('../shared/promptStyles.cjs');
 const { PIPELINE_OPERATION_IDS, PORT_KIND_AUDIO } = require('../shared/pipelineSchema.cjs');
 
@@ -77,6 +77,11 @@ async function prepareLocalAudioRuntimeEnv(tool, toolId) {
     PYTHONUTF8: '1',
   }, { launchProfile: tool?.launchProfile || null });
 
+  if (['chatterbox-tts','audiocraft-webui'].includes(toolId) && !runtimeEnv.NUMBA_CACHE_DIR && runtimeEnv.LOCALAIHUB_TEMP_ROOT) {
+    const cache = path.join(runtimeEnv.LOCALAIHUB_TEMP_ROOT, 'numba-cache');
+    await fs.ensureDir(cache);
+    runtimeEnv = { ...runtimeEnv, NUMBA_CACHE_DIR: cache };
+  }
   if (String(toolId || '').trim().toLowerCase() === 'rvc') {
     runtimeEnv = prependExecutableDirectoryToPath(runtimeEnv, await resolveBundledFfmpegPath());
   }
@@ -502,7 +507,17 @@ async function runLocalAudioTask(tool, payload, reportProgress, progressMessages
   await logger.info?.('Local audio helper launch environment prepared.', {
     launchEnvironment: summarizeLaunchRuntimeEnv(runtimeEnv),
   });
+  let pendingLine = '';
   const commandResult = await runCommand(pythonPath, [helperScript, requestPath], {
+    onStdout(chunk) {
+      const lines = (pendingLine + chunk).split(/\r?\n/);
+      pendingLine = lines.pop().slice(-8192);
+      for (const line of lines) {
+        if (!line.startsWith('HUB_PROGRESS ')) continue;
+        const message = line.slice(13, 525);
+        reportProgress?.(message, message);
+      }
+    },
     allowFailure: true,
     abortMessage: commandOptions.abortMessage || (toolLabel + ' audio generation was cancelled.'),
     cwd: toolRoot,
@@ -649,6 +664,7 @@ async function generateAudioWithAudiocraftTool(tool, options = {}) {
     advancedSettings: response?.advancedSettings && typeof response.advancedSettings === 'object' ? response.advancedSettings : generationSettings,
     appendSource: Boolean(response?.appendSource),
     backend: 'audiocraft',
+    device: String(response.device || ''),
     backendLabel: 'AudioCraft',
     continuationRepeatCount,
     continuationRepeats: audioMode === 'continuation' && Array.isArray(response?.continuationRepeats) ? response.continuationRepeats : [],
@@ -840,6 +856,8 @@ async function generateAudioWithChatterboxTool(tool, options = {}) {
   const response = await runLocalAudioTask(tool, {
     allowCpu: Boolean(options.allowCpuFallback),
     devicePreference: String(options.chatterboxDevicePreference || options.devicePreference || 'cuda').trim() || 'cuda',
+    narrationTargetSeconds: options.narrationTargetSeconds ?? 0,
+    narrationPauseSeconds: options.narrationPauseSeconds ?? 0.22,
     maxTextLength: Math.max(80, Math.floor(Number(options.maxTextLength || 400) || 400)),
     nodeLabel,
     outputPath,
@@ -855,7 +873,7 @@ async function generateAudioWithChatterboxTool(tool, options = {}) {
     abortMessage: 'Chatterbox-Turbo reference voice TTS was cancelled.',
     signal: options.cancelSignal || null,
     timeoutMessage: 'Chatterbox-Turbo reference voice TTS took too long and was stopped.',
-    timeoutMs: Math.max(60000, Number(options.generationTimeoutMs || options.timeoutMs || 900000) || 900000),
+    timeoutMs: Math.max(60000, Number(options.generationTimeoutMs || options.timeoutMs) || Math.max(900000, text.length * 2000)),
   });
 
   const finalOutputPath = path.resolve(String(response?.outputPath || outputPath).trim());
@@ -914,6 +932,7 @@ async function generateAudioWithChatterboxTool(tool, options = {}) {
     metadata: response,
     outputs: {
       audio: artifact,
+      captions: createTextArtifact(text, { transcription: { segments: response.segments, durationSeconds: response.durationSeconds }, displayName: nodeLabel + ' captions' }),
     },
     preview: summarizeArtifact(artifact),
   };

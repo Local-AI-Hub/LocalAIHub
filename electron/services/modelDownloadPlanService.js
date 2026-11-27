@@ -1,4 +1,5 @@
 const path = require('path');
+const crypto = require('crypto');
 
 const IMAGE_FILE_PATTERN = /\.(png|jpe?g|webp|gif)$/i;
 const AUDIO_PREVIEW_FILE_PATTERN = /\.(wav|mp3|flac|ogg|m4a|aac)$/i;
@@ -258,10 +259,10 @@ function createUpscaylPackagePlans(options, artifacts) {
   for (const artifact of artifacts || []) {
     const fileName = artifactName(artifact);
     const extension = path.extname(fileName).toLowerCase();
-    if (!['.param', '.bin'].includes(extension) || artifactPath(artifact).includes('/')) {
+    if (!['.param', '.bin'].includes(extension)) {
       continue;
     }
-    const stem = fileName.slice(0, -extension.length);
+    const stem = artifactPath(artifact).slice(0, -extension.length);
     const group = pairGroups.get(stem.toLowerCase()) || { stem, files: {} };
     group.files[extension] = artifact;
     pairGroups.set(stem.toLowerCase(), group);
@@ -284,7 +285,8 @@ function createUpscaylPackagePlans(options, artifacts) {
 }
 
 function buildUpscaylPairPlan(options, selected) {
-  const requiredFiles = [packageArtifactEntry(selected.files['.param'], true, artifactName(selected.files['.param'])), packageArtifactEntry(selected.files['.bin'], true, artifactName(selected.files['.bin']))];
+  const installStem = selected.stem.includes('/') ? selected.stem.replace(/[\\/]/g, '--') + '-' + crypto.createHash('sha256').update(selected.stem).digest('hex').slice(0, 10) : selected.stem;
+  const requiredFiles = [packageArtifactEntry(selected.files['.param'], true, installStem + '.param'), packageArtifactEntry(selected.files['.bin'], true, installStem + '.bin')];
   return {
     artifactLabel: 'Upscayl paired model set',
     blockingReason: null,
@@ -293,8 +295,8 @@ function buildUpscaylPairPlan(options, selected) {
     modelType: 'Upscaler',
     optionalArtifacts: [],
     packageIdentity: 'hf:' + normalizeRepositoryId(options && (options.catalogRepositoryId || options.repositoryId)) + ':upscayl-model-set:' + selected.stem.toLowerCase(),
-    packageName: selected.stem,
-    packageRoot: selected.stem,
+    packageName: installStem,
+    packageRoot: installStem,
     packageTargetMode: 'flat',
     planType: 'package',
     recommendedArtifactPath: selected.stem,
@@ -537,13 +539,27 @@ function inferImageArtifact(artifact) {
   const fileName = artifactName(artifact);
   const combined = [relativePath, fileName, artifact && artifact.type, artifact && artifact.modelType].filter(Boolean).join(' ').toLowerCase();
   const extension = path.extname(fileName).toLowerCase();
+  if (!['.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.sft'].includes(extension)) {
+    return { rejected: true, modelType: 'Unsupported', reason: 'Choose a model weight file. Archives and training data cannot be installed as image models.' };
+  }
+  const knownSize = Number(artifact.sizeBytes || artifact.size || 0);
+  if (knownSize > 0 && knownSize < 1024) {
+    return { rejected: true, modelType: 'Invalid weights', reason: 'This file is too small to contain usable model weights. It may be a placeholder or an incomplete upload.' };
+  }
   if (hasDiffusersComponentPath(artifact)) {
     return { rejected: true, artifactKind: 'support-file', artifactLabel: 'Support file', modelType: 'Support file', reason: 'Diffusers component/support files are not runnable generation checkpoints by themselves.' };
   }
   if (hasSupportPath(artifact) || DOCUMENTATION_FILE_PATTERN.test(relativePath) || CONFIG_ONLY_FILE_PATTERN.test(fileName) || IMAGE_FILE_PATTERN.test(fileName)) {
     return { rejected: true, artifactKind: 'support-file', artifactLabel: 'Support file', modelType: 'Support file', reason: 'Documentation, config, and preview files are supporting files, not runnable models.' };
   }
+  if (/(?:baked[_ -]?vae|no[_ -]?vae|vae[_ -]?included|v\d+vae)/i.test(fileName)) {
+    return { artifactKind: /inpaint/i.test(fileName) ? 'inpainting' : 'checkpoint', artifactLabel: 'Checkpoint', modelType: /inpaint/i.test(fileName) ? 'Inpainting' : 'Checkpoint' };
+  }
   if (combined.includes('controlnet') || /(?:^|[\\/])control[_-]?/.test(relativePath.toLowerCase())) return { artifactKind: 'controlnet', artifactLabel: 'ControlNet', modelType: 'ControlNet' };
+  if (knownSize > 0 && knownSize < 1024 * 1024 && extension === '.safetensors' && !/embedding|textual[-_ ]?inversion/i.test(combined)) {
+    return { rejected: true, modelType: 'Unverified weights', reason: 'These small weights may be an embedding or another component. Their model type needs verification before installation.' };
+  }
+  if (/embedding|textual[-_ ]?inversion/i.test(combined)) return { artifactKind: 'embedding', artifactLabel: 'Embedding', modelType: 'Embedding' };
   if (combined.includes('lora') || combined.includes('locon')) return { artifactKind: 'lora', artifactLabel: 'LoRA', modelType: 'LoRA' };
   if (combined.includes('embedding') || combined.includes('textual inversion')) return { artifactKind: 'embedding', artifactLabel: 'Embedding', modelType: 'Embedding' };
   if (combined.includes('hypernetwork')) return { artifactKind: 'hypernetwork', artifactLabel: 'Hypernetwork', modelType: 'Hypernetwork' };

@@ -49,6 +49,7 @@ function createOperations(deps) {
   }
   async function execute(name, args) {
     switch (name) {
+      case 'hub_import_hyperframes_project': return deps.importHyperFramesProject(args);
       case 'hub_discovery': return deps.discover(args.section);
       case 'hub_deliver_media': {
         const output = (await deps.listOutputs()).find(o => o.id === args.outputId);
@@ -63,7 +64,7 @@ function createOperations(deps) {
       case 'hub_diagnostics': {
         const tool = (await deps.listTools()).find(t => t.id === args.toolId);
         if (!tool) throw fault('TOOL_NOT_FOUND', 'That tool is not installed.');
-        return deps.diagnostics(tool, args.maxChars);
+        return deps.diagnostics(tool, args.maxChars, args.referenceOffset);
       }
       case 'hub_job_status': {
         const job = jobs.get(args.jobId);
@@ -171,6 +172,18 @@ function createOperations(deps) {
         const run = runs.get(args.runId);
         if (!run) throw fault('RUN_NOT_FOUND', 'That run is not available in this app session. Check saved outputs for older runs.');
         return run;
+      }
+      case 'hub_review_preview':
+      case 'hub_review_decision': {
+        const run = deps.execution.getActiveRunSnapshot();
+        const review = run?.pendingValidation;
+        if (!Array.from(requests.values()).some(entry => entry.runId === args.runId) ||
+            run?.runId !== args.runId || run.status !== 'paused' || !review || review.requestId !== args.requestId) {
+          throw fault('REVIEW_EXPIRED', 'Read the current pending validation on an agent-started run.');
+        }
+        if (name === 'hub_review_decision') return deps.execution.resumePipelineValidation(run.runId, args);
+        if (review.artifact?.kind !== 'image') throw fault('NO_REVIEW_IMAGE', 'This validation is not reviewing an image.');
+        return deps.inspectMedia({ id: review.requestId, outputPath: review.artifact.filePath, kind: 'image' }, { preview: true });
       }
       case 'hub_cancel_run': return deps.execution.cancelPipelineRun(args.runId);
       case 'hub_outputs': return (await deps.listOutputs()).filter(o => !args.runId || o.runId === args.runId);

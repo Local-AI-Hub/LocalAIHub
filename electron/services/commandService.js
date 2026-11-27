@@ -159,10 +159,16 @@ function runCommand(command, args = [], options = {}) {
 
     child.stdout?.on('data', (chunk) => {
       stdout += chunk.toString();
+      if (options.outputTailLimit) stdout = stdout.slice(-options.outputTailLimit);
+      if (options.isTimeoutProgress?.(chunk.toString())) timeoutTimer?.refresh();
+      options.onStdout?.(chunk.toString());
     });
 
     child.stderr?.on('data', (chunk) => {
       stderr += chunk.toString();
+      if (options.outputTailLimit) stderr = stderr.slice(-options.outputTailLimit);
+      if (options.isTimeoutProgress?.(chunk.toString())) timeoutTimer?.refresh();
+      options.onStderr?.(chunk.toString());
     });
 
     child.on('error', (error) => {

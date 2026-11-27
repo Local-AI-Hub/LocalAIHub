@@ -131,11 +131,11 @@ function createCollectionIndex(getFile, normalize, budget = MAX_BYTES) {
     // Old rows still locate candidate repositories, but only freshly parsed
     // links may select files without rechecking the README.
     const labelFormat = labels === undefined ? (old?.labelFormat || 0) : LABEL_FORMAT;
-    const record = { id: detail.id, rev, names, labelFormat, labels: listedFileLabels(names, labels === undefined ? previousLabels : boundedLabels(labels)) };
+    const record = { id: detail.id, downloads: detail.downloads || 0, likes: detail.likes || 0, createdAt: detail.createdAt || detail.created_at || detail.lastModified || detail.last_modified, rev, names, labelFormat, labels: listedFileLabels(names, labels === undefined ? previousLabels : boundedLabels(labels)) };
     if (replace(record)) schedule();
   }
 
-  async function matchingIds(query, exactFilename = false) {
+  async function matchingIds(query, exactFilename = false, sort) {
     await (loading ||= load());
     const tokens = normalize(query).split(' ').filter(Boolean);
     if (!tokens.length) return [];
@@ -144,9 +144,13 @@ function createCollectionIndex(getFile, normalize, budget = MAX_BYTES) {
       const matched = exactFilename
         ? record.names.some(name => path.posix.basename(name).toLowerCase() === query.toLowerCase())
         : terms.some(term => tokens.every(token => term.includes(token)));
-      if (matched) result.push(record.id);
+      if (matched) result.push(record);
     }
-    return result.reverse();
+    if (sort) {
+      const value = row => sort === 'newest' ? (Date.parse(row.createdAt) || 0) : Number(row[sort === 'highest-rated' ? 'likes' : 'downloads']) || 0;
+      result.sort((a, b) => value(b) - value(a) || a.id.localeCompare(b.id));
+    } else result.reverse();
+    return result.map(row => row.id);
   }
 
   function aliasPaths(detail, query, matches) {

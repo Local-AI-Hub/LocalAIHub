@@ -185,7 +185,7 @@ async function verifyCollectionsAndVoiceBundles(root) {
     'author/vision': { pipeline_tag: 'image-classification', siblings: [{ rfilename: 'model.safetensors', size: 42 }] },
     'author/speech': { pipeline_tag: 'automatic-speech-recognition', siblings: [{ rfilename: 'model.safetensors', size: 42 }] },
     'author/unknown': { siblings: [{ rfilename: 'model.safetensors', size: 42 }] },
-    'author/image': { pipeline_tag: 'text-to-image', siblings: [{ rfilename: 'model.safetensors', size: 42 }, { rfilename: 'models/image_encoder/model.safetensors', size: 99 }] },
+    'author/image': { pipeline_tag: 'text-to-image', siblings: [{ rfilename: 'model.safetensors', size: 4200000 }, { rfilename: 'models/image_encoder/model.safetensors', size: 99 }] },
     'author/character': { siblings: [{ rfilename: 'Character.zip', size: 123 }] },
     'author/large-rvc': { siblings: Array.from({ length: 135 }, (_, i) => ({ rfilename: 'voices/speaker-' + String(i).padStart(3, '0') + '.zip', size: 123 })) },
     'author/gguf-only': { siblings: [{ rfilename: 'one.gguf', size: 8 }] },
@@ -430,7 +430,7 @@ async function verifyProviderResults() {
     assert.equal(page, '2');
     global.fetch = async url => {
       assert.equal(new URL(url).pathname, '/api/v1/models/4384');
-      const modelVersions = [7, 8].map(id => ({ id, files: [{ id, name: 'v' + id + '.safetensors', downloadUrl: 'https://civitai.com/api/download/models/' + id, sizeKB: 5 }] }));
+      const modelVersions = [7, 8].map(id => ({ id, files: [{ id, name: 'v' + id + '.safetensors', downloadUrl: 'https://civitai.com/api/download/models/' + id, sizeKB: 5000 }] }));
       return Response.json({ id: 4384, name: 'Fixture', type: 'Checkpoint', modelVersions });
     };
     const direct = query => t.searchCivitaiModels({ id: 'forge' }, { ...options, query }, new Set(), {}, hardware, logger);

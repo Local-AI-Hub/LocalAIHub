@@ -94,6 +94,7 @@ const {
   ASSET_FILE_EXTENSIONS,
   buildHyperFramesProjectPipelineDraft,
   createHyperFramesProject,
+  importHyperFramesProject,
   createHyperFramesProjectTextFile,
   deleteHyperFramesProject,
   deleteHyperFramesProjectAsset,
@@ -1797,6 +1798,14 @@ function registerIpcHandlers() {
   ipcMain.handle('hyperframes-projects:health', (_event, payload) =>
     withPlainEnglishErrors(async () => getHyperFramesProjectHealth(payload?.projectId || payload), 'Local AI Hub could not check that HyperFrames project health.'),
   );
+  ipcMain.handle('hyperframes-projects:import', () =>
+    withPlainEnglishErrors(async () => {
+      const selection = await dialog.showOpenDialog({ title: 'Import HyperFrames project folder', properties: ['openDirectory'] });
+      if (selection.canceled || !selection.filePaths.length) return { canceled: true };
+      return importHyperFramesProject({ folderPath: selection.filePaths[0] });
+    }, 'Local AI Hub could not import that HyperFrames project folder.'),
+  );
+
   ipcMain.handle('hyperframes-projects:create', (_event, payload) =>
     withPlainEnglishErrors(async () => createHyperFramesProject(payload || {}), 'Local AI Hub could not create that HyperFrames project.'),
   );
@@ -2912,6 +2921,23 @@ function registerIpcHandlers() {
     }), 'Local AI Hub could not continue that validation step.'),
   );
 
+  ipcMain.handle('pipelines:list-output-folders', () =>
+    withPlainEnglishErrors(() => require('./services/pipelineOutputFolders').listOutputFolders(), 'Could not list output folders.'));
+  ipcMain.handle('pipelines:create-output-folder', (_event, name) =>
+    withPlainEnglishErrors(() => require('./services/pipelineOutputFolders').createOutputFolder(name), 'Could not create that output folder.'));
+  ipcMain.handle('pipelines:move-output', (_event, payload) =>
+    withPlainEnglishErrors(() => require('./services/pipelineExecutionService').withIdlePipelineForToolAction(() =>
+      require('./services/pipelineOutputStoreService').moveOutputToFolder(payload?.path, payload?.folder)), 'Could not move that saved output.'));
+  ipcMain.handle('pipelines:delete-output-folder', (_event, name) =>
+    withPlainEnglishErrors(() => require('./services/pipelineExecutionService').withIdlePipelineForToolAction(async () => {
+      const config = await readConfig();
+      const result = await require('./services/pipelineOutputStoreService').deleteOutputFolder(name, {
+        deleteMode: config.moveDeletedPipelineOutputsToRecycleBin === false ? 'permanent' : 'trash',
+        trashItem: file => shell.trashItem(file),
+      });
+      await invalidateStatisticsIndexSections(['storage'], 'pipeline-output-deleted').catch(() => null);
+      return result;
+    }), 'Could not delete that output folder.'));
   ipcMain.handle('pipelines:list-outputs', () =>
     withPlainEnglishErrors(async () => ({
       outputs: await listPipelineOutputs(),

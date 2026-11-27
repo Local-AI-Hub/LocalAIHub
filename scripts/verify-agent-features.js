@@ -43,7 +43,8 @@ Module._load = function(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 const capability = require('../electron/services/agentCapabilityService');
-const operations = createOperations({ schema, listOutputs: async () => outputs, inspectMedia, deliverMedia: delivery.deliver, discover: capability.discover, diagnostics: capability.diagnostics, listTools: async () => [{ id: 'test', status: 'stopped' }], humanizeError: e => e.message, changeToolState: () => { actions++; return new Promise(resolve => { resolveAction = resolve; }); } });
+const pausedReview = {runId:'review-test',status:'paused',pendingValidation:{requestId:'review-item',artifact:{kind:'image',filePath:imagePath}}};
+const operations = createOperations({ schema, importHyperFramesProject: args => require('../electron/services/hyperFramesProjectService').importHyperFramesProject(args, { managedRoot: root }), store:{getPipeline:async()=>({})}, execution:{getActiveRunSnapshot:()=>pausedReview,runPipeline:async()=>pausedReview}, listOutputs: async () => outputs, inspectMedia, deliverMedia: delivery.deliver, discover: capability.discover, diagnostics: capability.diagnostics, listTools: async () => [{ id: 'test', status: 'stopped' }, { id: 'hyperframes', status: 'stopped' }], humanizeError: e => e.message, changeToolState: () => { actions++; return new Promise(resolve => { resolveAction = resolve; }); } });
 const descriptor = path.join(root, 'connection.json');
 const bridge = createBridge({ descriptorPath: descriptor, dispatch: operations.dispatch, sanitizeError: e => e.message });
 const call = (name, args) => callBridge(name, args, descriptor);
@@ -58,6 +59,38 @@ async function main() {
     assert(!JSON.stringify(providers).includes('private') && !JSON.stringify(providers).includes('must-not-leak'));
     assert(!JSON.stringify(await call('hub_discovery',{section:'presets'})).includes('"secret"'));
     assert((await call('hub_discovery',{section:'templates'})).length > 0);
+    const projectFolder = path.join(root, 'local-scene');
+    await fs.ensureDir(projectFolder);
+    await fs.writeFile(path.join(projectFolder, 'index.html'), '<html><body>Local scene</body></html>');
+    const imported = await call('hub_import_hyperframes_project', {folderPath: projectFolder});
+    assert.equal(imported.copiedFileCount,1);
+    assert.equal(imported.project.health.totalFileCount,imported.copiedFileCount);
+    assert.equal(imported.project.health.scannedFileCount,imported.checkedTextFileCount);
+    assert(imported.project.projectId && imported.project.health.runnable);
+    const renderType = await call('hub_node_types', {type:'hyperframesRender'});
+    assert.deepEqual(renderType.configSchema.properties.quality.enum, ['draft', 'standard', 'high']);
+    const invalid = {id:'invalid-quality', nodes:[{type:'hyperframesRender',id:'render',config:{quality:'looks'}}], edges:[]};
+    for (const method of ['hub_save_pipeline','hub_validate_pipeline']) {
+      await assert.rejects(() => call(method, {definition:invalid}), /quality must be one of draft, standard, high/);
+    }
+    const liveRender = require('../electron/services/hyperFramesDiagnostics').startRender('live-check');
+    liveRender.stage('rendering');
+    liveRender.onStdout('Trace before rendering\n');
+    for (let frame=1;frame<500;frame++) liveRender.onStdout('\r  \u2588\u2588\u2591  72%  Streaming frame '+frame+'/500');
+    liveRender.onStdout('\rStreaming fra');
+    liveRender.onStdout('me 500/500[Browser:WARN] retained warning\n');
+    liveRender.onStderr('Renderer warning');
+    const liveDiagnostic = await call('hub_diagnostics',{toolId:'hyperframes'});
+    assert.equal(liveDiagnostic.status,'running');
+    assert.equal(liveDiagnostic.render.stage,'rendering');
+    assert.match(liveDiagnostic.render.progress,/500\/500/);
+    assert.equal(liveDiagnostic.render.stdout,undefined);
+    assert.equal(liveDiagnostic.render.stderr,undefined);
+    assert.equal(liveDiagnostic.stdout,'Trace before rendering\n[Browser:WARN] retained warning\n');
+    assert.equal(liveDiagnostic.stderr,'Renderer warning');
+    liveRender.finish('completed');
+    const diagnostic = await call('hub_diagnostics',{toolId:'hyperframes', maxChars:512});
+    assert(diagnostic.pipelineFailures.some(failure => failure.message.includes('quality must be one of')));
     const logs = await call('hub_diagnostics',{toolId:'test',maxChars:256});
     assert(logs.truncated && logs.stdout.length <= 256);
     assert(!JSON.stringify(logs).includes('abcdefghijklmnopqrstuvwxyz'));
@@ -73,6 +106,9 @@ async function main() {
     await assert.rejects(()=>call('hub_inspect_media',{outputId:'audio',preview:true}),/no image/);
     assert.equal((await call('hub_inspect_media',{outputId:'jpeg'})).streams[0].width,194);
     assert((await call('hub_inspect_media',{outputId:'jpeg',preview:true})).preview.data.length > 0);
+    await assert.rejects(()=>call('hub_review_preview',{runId:'review-test',requestId:'review-item'}),/agent-started/);
+    await call('hub_run_pipeline',{pipelineId:'test',requestId:'begin-review'});
+    assert((await call('hub_review_preview',{runId:'review-test',requestId:'review-item'})).preview.data.length > 0);
     const preview = await call('hub_inspect_media',{outputId:'image',preview:true});
     assert.equal(preview.preview.mimeType,'image/jpeg');
     assert.equal(Buffer.from(preview.preview.data,'base64').subarray(0,2).toString('hex'),'ffd8');

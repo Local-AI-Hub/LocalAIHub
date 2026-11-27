@@ -4839,11 +4839,13 @@ async function executeMappedCollectionItemWithPerItemValidation(node, sourceArti
   const itemId = String(sourceEntry?.itemId || '').trim();
   const itemLabel = 'item ' + String(itemIndex + 1) + (itemCount ? ' of ' + itemCount : '') + (itemId ? ' (' + itemId + ')' : '');
 
+  let imageRetry = null;
   for (let attemptNumber = 1; attemptNumber <= validationConfig.maxAttempts; attemptNumber += 1) {
-    const attemptNode = buildCollectionMapAttemptNode(node, attemptNumber, validationConfig);
+    let attemptNode = buildCollectionMapAttemptNode(node, attemptNumber, validationConfig);
+    if (imageRetry?.seed !== undefined) attemptNode = { ...attemptNode, config: { ...attemptNode.config, seed: imageRetry.seed } };
     let mappedArtifact = null;
     try {
-      mappedArtifact = await executeMappedCollectionItemArtifact(attemptNode, sourceArtifact, options);
+      mappedArtifact = await executeMappedCollectionItemArtifact(attemptNode, imageRetry?.prompt ? createTextArtifact(imageRetry.prompt) : sourceArtifact, options);
       if (!mappedArtifact || mappedArtifact.kind !== outputKind) {
         throw new Error('The mapped operation finished, but it did not return a ' + outputKind + ' artifact.');
       }
@@ -4882,6 +4884,7 @@ async function executeMappedCollectionItemWithPerItemValidation(node, sourceArti
         maxAttempts: validationConfig.maxAttempts,
         message: 'Paused at ' + node.label + ' for ' + itemLabel + ' attempt ' + attemptNumber + ' of ' + validationConfig.maxAttempts + '. Local AI Hub is waiting for your decision.',
         nodeMessage: 'Waiting for your pass or fail decision for ' + itemLabel + ' attempt ' + attemptNumber + ' of ' + validationConfig.maxAttempts + '.',
+        retryControls: mappedArtifact.kind === 'image' && sourceArtifact.kind === 'text' && getCollectionMapOperationId(node) === PIPELINE_OPERATION_IDS.IMAGE_GENERATE ? { imageGeneration: { nodeId: node.id } } : null,
         pendingContext: {
           collectionMap: {
             attemptNumber,
@@ -4893,6 +4896,7 @@ async function executeMappedCollectionItemWithPerItemValidation(node, sourceArti
         },
         reviewContext,
       });
+      imageRetry = decision.retryOverrides?.imageGeneration || imageRetry;
       const validation = buildUserValidationResult(mappedArtifact, decision, reviewContext);
       review = {
         selectedBranch: validation.decision === 'pass' ? 'pass' : 'fail',
@@ -5296,6 +5300,8 @@ async function executeMappedCollectionItemArtifact(node, inputArtifact, options 
         referenceAudioArtifact: audioRequest.referenceAudioArtifact,
         referenceAudioPath: audioRequest.referenceAudioPath,
         chatterboxOptions: node.config?.chatterboxOptions,
+        narrationPauseSeconds: node.config?.narrationPauseSeconds,
+        narrationTargetSeconds: node.config?.narrationTargetSeconds,
         reportProgress,
         runDirectories: run.directories,
         sourceAudioArtifact: audioRequest.sourceAudioArtifact,
@@ -6832,7 +6838,10 @@ function applyRecordInputRetryOverride(run, pendingValidation, payload) {
 }
 
 function buildValidationRetryControls(graph, validationNode, run, artifact) {
+  const sourceId = graph.incomingEdgesByPortKey.get(validationNode.id + ':input')?.[0]?.source.nodeId;
+  const source = graph.nodeMap.get(sourceId);
   const controls = {
+    ...(artifact?.kind === 'image' && source?.type === 'llmPrompt' && source.config?.executionMode === 'localTool' && source.config?.operationId === 'imageGenerate' ? { imageGeneration: { nodeId: sourceId } } : {}),
     ...(buildMediaCompositionRetryControls(graph, validationNode, run, artifact) || {}),
     ...(buildBurnSubtitlesRetryControls(graph, validationNode, run, artifact) || {}),
     ...(buildRecordInputRetryControls(graph, validationNode, run, artifact) || {}),
@@ -6841,6 +6850,22 @@ function buildValidationRetryControls(graph, validationNode, run, artifact) {
 }
 
 function applyValidationRetryOverrides(run, pendingValidation, payload) {
+  const supplied = payload.retryOverrides?.imageGeneration;
+  let imageGeneration;
+  if (supplied !== undefined) {
+    const target = pendingValidation.retryControls?.imageGeneration;
+    if (!target || !supplied || typeof supplied !== 'object' || Array.isArray(supplied)) throw new Error('This review cannot change an image prompt or seed.');
+    imageGeneration = {};
+    if ('prompt' in supplied) {
+      if (typeof supplied.prompt !== 'string' || !supplied.prompt.trim() || supplied.prompt.length > 12000) throw new Error('Enter a revised image prompt of up to 12,000 characters.');
+      imageGeneration.prompt = supplied.prompt.trim();
+    }
+    if ('seed' in supplied) {
+      if (!Number.isInteger(supplied.seed) || supplied.seed < -1 || supplied.seed > 4294967295) throw new Error('Choose a whole image seed between -1 and 4294967295.');
+      imageGeneration.seed = supplied.seed;
+    }
+    if (!pendingValidation.collectionMap) run.retryOverridesByNodeId[target.nodeId] = { ...run.retryOverridesByNodeId[target.nodeId], imageGeneration };
+  }
   const mediaComposition = applyMediaCompositionRetryOverride(run, pendingValidation, payload);
   const burnSubtitles = applyBurnSubtitlesRetryOverride(run, pendingValidation, payload);
   const recordInput = applyRecordInputRetryOverride(run, pendingValidation, payload);
@@ -6848,6 +6873,7 @@ function applyValidationRetryOverrides(run, pendingValidation, payload) {
     ...(mediaComposition ? { mediaComposition } : {}),
     ...(burnSubtitles ? { burnSubtitles } : {}),
     ...(recordInput ? { recordInput } : {}),
+    ...(imageGeneration ? { imageGeneration } : {}),
   };
 }
 
@@ -8679,9 +8705,10 @@ async function resolveManagedSoundEffectItems(library, notes) {
   return resolvedItems;
 }
 
-async function buildSoundEffectsLayerSchedule(visualItems, timingPlan, layerConfig, librariesById) {
+async function buildSoundEffectsLayerSchedule(visualItems, timingPlan, layerConfig, librariesById, reuseSoleEffect) {
   const totalDurationSeconds = normalizeTimelineSeconds(timingPlan.totalVisualDurationSeconds) || 0;
   const layerPlan = {
+    requestedSceneAccents: ['sceneAligned','both'].includes(layerConfig.mode) ? getSceneBoundarySeconds(visualItems).length : 0,
     avoidRepeats: layerConfig.avoidRepeats,
     density: layerConfig.density,
     enabled: layerConfig.enabled !== false,
@@ -8740,7 +8767,13 @@ async function buildSoundEffectsLayerSchedule(visualItems, timingPlan, layerConf
       }
       const offsetSeconds = (deterministicFloat([seed, 'scene', index]) - 0.5) * Math.min(0.8, layerConfig.minSpacingSeconds * 0.25);
       const timeSeconds = Math.min(Math.max(0.1, boundary.boundarySeconds + offsetSeconds), Math.max(0.1, totalDurationSeconds - 0.1));
-      addDeterministicSoundEffectEvent(layerPlan.scheduledEvents, items, library, timeSeconds, 'sceneAligned', layerConfig, [seed, 'scene-item', index]);
+      const event = addDeterministicSoundEffectEvent(layerPlan.scheduledEvents, items, library, timeSeconds, 'sceneAligned', layerConfig, [seed, 'scene-item', index]);
+      if (!event && reuseSoleEffect && layerConfig.avoidRepeats && items.length === 1) {
+        const reused = addDeterministicSoundEffectEvent(layerPlan.scheduledEvents, items, library, timeSeconds, 'sceneAligned', { ...layerConfig, avoidRepeats: false }, [seed, 'scene-item', index]);
+        layerPlan.notes.push(reused ? 'Reused the only available effect at scene boundary ' + (index + 1) + '.' : 'Spacing or overlap rules skipped scene boundary ' + (index + 1) + '.');
+      } else if (!event) {
+        layerPlan.notes.push('Repeat, spacing or overlap rules skipped scene boundary ' + (index + 1) + '.');
+      }
     });
   }
 
@@ -8793,7 +8826,7 @@ async function buildSoundEffectsSchedule(visualItems, effectiveConfig, timingPla
   const libraries = await listAssetLibraries('soundEffects');
   const librariesById = new Map((libraries || []).map((library) => [library.id, library]));
   for (const layerConfig of config.layers) {
-    const layerPlan = await buildSoundEffectsLayerSchedule(visualItems, timingPlan, layerConfig, librariesById);
+    const layerPlan = await buildSoundEffectsLayerSchedule(visualItems, timingPlan, layerConfig, librariesById, effectiveConfig.soundEffectsReuseSoleEffect !== false);
     plan.layers.push(layerPlan);
     plan.notes.push(...(layerPlan.notes || []).map((note) => `${layerPlan.layerName}: ${note}`));
     plan.scheduledEvents.push(...(layerPlan.scheduledEvents || []));
@@ -8802,6 +8835,8 @@ async function buildSoundEffectsSchedule(visualItems, effectiveConfig, timingPla
   plan.scheduledEvents = guardedSchedule.events;
   plan.globalGuard = guardedSchedule.globalGuard;
   applyFinalSoundEffectsScheduleToLayers(plan.layers, plan.scheduledEvents);
+  plan.requestedSceneAccents = plan.layers.reduce((total, layer) => total + layer.requestedSceneAccents, 0);
+  plan.scheduledSceneAccents = plan.scheduledEvents.filter(event => event.reason === 'sceneAligned').length;
   plan.layerCount = plan.layers.length;
   plan.scheduledEventCount = plan.scheduledEvents.length;
   if (plan.globalGuard.enabled && (plan.globalGuard.movedEventCount || plan.globalGuard.skippedEventCount)) {
@@ -9089,12 +9124,12 @@ async function buildVideoTimingPlan(sourceEntries) {
       continue;
     }
     const probed = getVideoArtifactDurationCandidate(artifact) ? null : await probeVideoFile(filePath);
-    const durationSeconds = getVideoArtifactDurationCandidate(artifact) || normalizeTimelineSeconds(probed?.durationSeconds);
+    const durationSeconds = getVideoArtifactDurationCandidate(artifact) || Number(probed?.durationSeconds);
     if (!durationSeconds || durationSeconds <= 0) {
       throw new Error(`Media Composition could not read the duration of video clip ${index + 1}. Normalize or regenerate that clip, then try again.`);
     }
     const startSeconds = normalizeTimelineSeconds(cursorSeconds) || 0;
-    const endSeconds = normalizeTimelineSeconds(startSeconds + durationSeconds) || (startSeconds + durationSeconds);
+    const endSeconds = cursorSeconds + durationSeconds;
     visualItems.push({
       artifact,
       durationSeconds,
@@ -9286,7 +9321,7 @@ async function executeMediaCompositionNode(node, graph, run) {
   const fallbackMessage = timingPlan.fallbackReason ? ' Fallback reason: ' + timingPlan.fallbackReason : '';
   const soundEffectsLayerLabel = Number(soundEffectsPlan.layerCount || 0) === 1 ? '1 layer' : `${soundEffectsPlan.layerCount || 0} layers`;
   const soundEffectsMessage = soundEffectsPlan.enabled
-    ? ` Sound effects: ${soundEffectsPlan.scheduledEvents.length} scheduled across ${soundEffectsLayerLabel}.` + (soundEffectsPlan.notes?.length ? ' Note: ' + soundEffectsPlan.notes[0] : '')
+    ? ` Sound effects: ${soundEffectsPlan.scheduledEvents.length} scheduled across ${soundEffectsLayerLabel}.` + (soundEffectsPlan.requestedSceneAccents ? ' Scene accents: ' + soundEffectsPlan.scheduledSceneAccents + ' of ' + soundEffectsPlan.requestedSceneAccents + '.' : '') + (soundEffectsPlan.notes?.length ? ' Note: ' + soundEffectsPlan.notes[0] : '')
     : '';
   return {
     message: audioArtifact && backgroundMusicArtifact
@@ -9679,6 +9714,8 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
           referenceAudioArtifact: audioRequest.referenceAudioArtifact,
           referenceAudioPath: audioRequest.referenceAudioPath,
           chatterboxOptions: node.config?.chatterboxOptions,
+        narrationPauseSeconds: node.config?.narrationPauseSeconds,
+        narrationTargetSeconds: node.config?.narrationTargetSeconds,
           cancelSignal: activeRunAbortController?.signal || null,
           reportProgress,
           runDirectories: run.directories,
@@ -9814,7 +9851,9 @@ async function executeNode(node, graph, run, contextMaps, reportProgress) {
         throw new Error('Local AI Hub currently supports audio transcription, audio generation, audio transformation, image analysis, image generation, image transformation, and video generation for operation-driven local tools in the model step. Use the Graph Workflow step for ComfyUI-style graph-native workflows.');
       }
 
-      const basePrompt = buildImageGenerationPrompt(node, promptArtifact);
+      const revisedImage = run.retryOverridesByNodeId?.[node.id]?.imageGeneration;
+      if (revisedImage?.seed !== undefined) node = { ...node, config: { ...node.config, seed: revisedImage.seed } };
+      const basePrompt = revisedImage?.prompt || buildImageGenerationPrompt(node, promptArtifact);
       const tool = await getSelectedImageToolOrThrow(contextMaps, node, 'local image generation');
       const promptRequest = applyNodePromptStyle(contextMaps, node, basePrompt, 'image', {
         negativePrompt: node.config?.negativePrompt,
@@ -10410,11 +10449,16 @@ async function runPipeline(definition) {
   try {
     const { analysis, context } = await analyzeWithCurrentContext(definition);
     if (!analysis.executable) {
-      throw new Error(analysis.primaryIssue?.message || 'This pipeline is not ready to run yet.');
+      const error = new Error(analysis.primaryIssue?.message || 'This pipeline is not ready to run yet.');
+      if (analysis.pipeline.nodes.some(node => node.id === analysis.primaryIssue?.nodeId && node.type === 'hyperframesRender')) {
+        require('./hyperFramesDiagnostics').recordFailure(error, analysis.primaryIssue.nodeId);
+      }
+      throw error;
     }
     const graph = buildPipelineGraph(analysis.pipeline);
     const nextRun = createRunRecord(analysis, graph, null);
     nextRun.directories = await ensureRunDirectories(nextRun.runId);
+    await require('./pipelineOutputFolders').assignRunFolder(nextRun.directories.root, nextRun.runSettings.outputFolder);
     activeRun = nextRun;
     activeRunAbortController = new AbortController();
     emitPipelineEvent();

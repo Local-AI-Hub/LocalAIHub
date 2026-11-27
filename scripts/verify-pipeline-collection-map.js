@@ -1690,12 +1690,12 @@ async function main() {
   manualSnapshot = await waitForRunStatus('paused');
   assert.strictEqual(manualSnapshot.pendingValidation.collectionMap.itemIndex, 1, 'manual validation should next pause on item 2 without rerunning item 1.');
   assert.strictEqual(providerImageGenerationPrompts.filter((prompt) => /quiet mountain cabin/i.test(prompt)).length, 1, 'manual validation should not rerun accepted item 1 when item 2 is waiting.');
-  resumePendingValidation(manualSnapshot, 'fail', 'needs another try');
+  resumePipelineValidation(manualSnapshot.runId, {requestId:manualSnapshot.pendingValidation.requestId,decision:'fail',retryOverrides:{imageGeneration:{prompt:'An illuminated street at dusk'}}});
   manualSnapshot = await waitForRunStatus('paused');
   assert.strictEqual(manualSnapshot.pendingValidation.collectionMap.itemIndex, 1, 'manual fail should retry only item 2.');
   assert.strictEqual(manualSnapshot.pendingValidation.collectionMap.attemptNumber, 2, 'manual fail should advance item 2 to attempt 2.');
   assert.strictEqual(providerImageGenerationPrompts.filter((prompt) => /quiet mountain cabin/i.test(prompt)).length, 1, 'manual retry should still not rerun item 1.');
-  assert.strictEqual(providerImageGenerationPrompts.filter((prompt) => /city street at sunrise/i.test(prompt)).length, 2, 'manual retry should regenerate only item 2.');
+  assert.strictEqual(providerImageGenerationPrompts.filter((prompt) => /illuminated street at dusk/i.test(prompt)).length, 1, 'manual retry should use the revised prompt for item 2.');
   resumePendingValidation(manualSnapshot, 'pass', 'second try works');
   manualSnapshot = await waitForRunToFinish();
   assert.strictEqual(manualSnapshot.status, 'completed', manualSnapshot.message);

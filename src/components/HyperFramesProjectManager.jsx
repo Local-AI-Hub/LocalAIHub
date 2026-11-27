@@ -184,6 +184,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
     try {
       const result = await action(safeProjectId);
       if (!result?.ok) throw new Error(getResultMessage(result, 'Local AI Hub could not update that HyperFrames project.'));
+      if (result.data?.canceled) return null;
       await loadProjects();
       const message = getResultMessage(result, 'HyperFrames project updated.');
       setStatusMessage(message);
@@ -303,6 +304,7 @@ export default function HyperFramesProjectManager({ onProjectsChanged, onToast, 
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <button className="ghost-button px-3 py-1.5 text-xs" disabled={loading} onClick={loadProjects} type="button">Refresh</button>
+            <button className="ghost-button px-3 py-1.5 text-xs" disabled={Boolean(busyProjectId)} onClick={() => runProjectAction('', () => getApiMethod('importHyperFramesProject')())} type="button">Import Folder</button>
             <button className="primary-button px-3 py-1.5 text-xs" onClick={() => setCreateOpen((current) => !current)} type="button">Create Project</button>
           </div>
         </div>

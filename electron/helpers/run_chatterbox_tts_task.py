@@ -2,6 +2,10 @@
 
 import json
 import math
+import re
+import wave
+import subprocess
+import tempfile
 import os
 import sys
 import traceback
@@ -112,18 +116,70 @@ def get_package_version(name: str) -> str:
         return ""
 
 
+def narration_chunks(text, limit):
+    chunks = []
+    for sentence in re.split(r'(?<=[.!?])\s+|\n+', text):
+        sentence = sentence.strip()
+        while len(sentence) > limit:
+            punctuation = list(re.finditer(r'[,;:]\s+', sentence[:limit + 1]))
+            split = punctuation[-1].start() + 1 if punctuation and punctuation[-1].start() >= limit // 3 else sentence.rfind(' ', 0, limit + 1)
+            split = split if split > 0 else limit
+            chunks.append(sentence[:split])
+            sentence = sentence[split:].lstrip()
+        if sentence:
+            chunks.append(sentence)
+    return chunks
+
+
+def write_narration(model, text, reference_audio_path, output, request, limit):
+    sample_rate = int(getattr(model, 'sr', 24000))
+    pause = float(request.get('narrationPauseSeconds', 0.22))
+    target = float(request.get('narrationTargetSeconds', 0))
+    if not 0 <= pause <= 5 or not 0 <= target <= 3600:
+        raise ValueError('Choose a pause between 0 and 5 seconds and a target duration up to one hour.')
+    chunks = narration_chunks(text, min(limit, 90))
+    segments = []
+    cursor = 0
+    with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
+        raw = Path(temporary) / 'speech.wav'
+        with wave.open(str(raw), 'wb') as stream:
+            stream.setparams((1, 2, sample_rate, 0, 'NONE', ''))
+            for index, chunk in enumerate(chunks):
+                print(f'HUB_PROGRESS Narrating passage {index + 1} of {len(chunks)}.', flush=True)
+                wav = normalize_waveform(model.generate(chunk, audio_prompt_path=str(reference_audio_path) if index == 0 else None, **request.get('chatterboxOptions', {})))
+                samples = wav.mean(dim=0).clamp(-1, 1).mul(32767).short().numpy().astype('<i2')
+                if index:
+                    gap = round(pause * sample_rate)
+                    stream.writeframes(bytes(gap * 2))
+                    cursor += gap
+                start = cursor
+                stream.writeframes(samples.tobytes())
+                cursor += len(samples)
+                segments.append({'start': start / sample_rate, 'end': cursor / sample_rate, 'text': chunk})
+        if not cursor:
+            raise ValueError('Chatterbox returned an empty narration.')
+        if target:
+            rate = cursor / (sample_rate * target)
+            if not 0.5 <= rate <= 2:
+                raise ValueError('The narration target requires more than a twofold tempo change. Adjust the script or target duration.')
+            filters = f'atempo={rate},apad,atrim=end_sample={round(target*sample_rate)}'
+            subprocess.run([os.environ.get('FFMPEG_BINARY') or 'ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(raw), '-af', filters, str(output)], check=True)
+            for segment in segments:
+                segment['start'] /= rate
+                segment['end'] /= rate
+        else:
+            os.replace(raw, output)
+    return segments, sample_rate
+
+
 def main() -> None:
     request = load_request()
     text = str(request.get("text") or request.get("prompt") or "").strip()
     max_text_length = int(request.get("maxTextLength") or DEFAULT_MAX_TEXT_LENGTH)
     if not text:
         fail("Reference Voice TTS needs connected text to speak.", error_type="missing-text")
-    if len(text) > max_text_length:
-        fail(
-            "Reference Voice TTS text is too long for this first Chatterbox-Turbo pass. Keep it under " + str(max_text_length) + " characters.",
-            error_type="text-too-long",
-            details={"textLength": len(text), "maxTextLength": max_text_length},
-        )
+    if len(text) > 32000:
+        fail("Use up to 32,000 characters per narration step.", error_type="text-too-long")
 
     reference_audio_path = require_path(str(request.get("referenceAudioPath") or ""), "The reference voice audio", must_exist=True)
     try:
@@ -183,10 +239,7 @@ def main() -> None:
 
     try:
         model = ChatterboxTurboTTS.from_pretrained(device=device)
-        wav = model.generate(text, audio_prompt_path=str(reference_audio_path), **request.get("chatterboxOptions", {}))
-        wav = normalize_waveform(wav)
-        sample_rate = int(getattr(model, "sr", 0) or getattr(model, "sample_rate", 0) or 24000)
-        torchaudio.save(str(output_path), wav, sample_rate)
+        segments, sample_rate = write_narration(model, text, reference_audio_path, output_path, request, max_text_length)
     except Exception as exc:
         error_type, message = classify_exception(exc)
         fail(message, error_type=error_type)
@@ -198,12 +251,12 @@ def main() -> None:
         output_info = torchaudio.info(str(output_path))
         output_sample_rate = int(getattr(output_info, "sample_rate", 0) or sample_rate)
         output_frames = int(getattr(output_info, "num_frames", 0) or 0)
-        output_channels = int(getattr(output_info, "num_channels", 0) or (wav.shape[0] if wav.ndim > 1 else 1))
-        duration_seconds = output_frames / float(output_sample_rate) if output_frames and output_sample_rate else wav.shape[-1] / float(sample_rate)
+        output_channels = int(getattr(output_info, "num_channels", 0) or 1)
+        duration_seconds = output_frames / float(output_sample_rate) if output_frames and output_sample_rate else segments[-1]["end"]
     except Exception:
         output_sample_rate = sample_rate
-        output_channels = int(wav.shape[0] if wav.ndim > 1 else 1)
-        duration_seconds = wav.shape[-1] / float(sample_rate)
+        output_channels = 1
+        duration_seconds = segments[-1]["end"]
 
     peak_allocated_mb = 0.0
     peak_reserved_mb = 0.0
@@ -238,6 +291,7 @@ def main() -> None:
         "referenceSampleRate": reference_sample_rate,
         "textLength": len(text),
         "textPreview": text[:120],
+        "segments": segments,
     })
 
 

@@ -2,6 +2,13 @@ const crypto = require('crypto');
 const { fault } = require('./bridge.cjs');
 const { getArtifactChoices, buildSelectedCatalogItem } = require('../shared/modelArtifactSelection.cjs');
 
+function searchFilters(tool, config) {
+  return {
+    allowedModelTypes: config.allowedModelTypes || (tool.id === 'ollama' ? ['all'] : ['all', 'checkpoint', 'lora', 'vae', 'embedding', 'controlnet', 'hypernetwork', 'upscaler', 'gguf', 'rvc-voice', 'audio-speech', 'video', 'inpainting']),
+    allowedTaskTypes: config.allowedTaskTypes || (tool.id === 'ollama' ? ['all'] : ['all', 'image-generation', 'image-to-image', 'text-generation', 'video-generation', 'image-to-video', 'audio-speech', 'voice-conversion']),
+  };
+}
+
 function removalId(tool, model) {
   return crypto.createHash('sha256').update(JSON.stringify([
     tool.id, model.id, model.path, model.invokeAiModelKey, model.packageManifestPath,
@@ -11,6 +18,7 @@ function removalId(tool, model) {
 
 function createModelManager({ models, listTools, hardware, storage, changed, withIdlePipeline }) {
   const selections = new Map();
+  const pages = new Map();
 
   async function target(toolId) {
     const tool = (await listTools()).find(entry => entry.id === toolId);
@@ -26,7 +34,9 @@ function createModelManager({ models, listTools, hardware, storage, changed, wit
   async function discover() {
     const [tools, specs] = await Promise.all([listTools(), hardwareSnapshot()]);
     return { hardware: specs, disks: specs.disks, targets: tools.filter(models.supportsModelManager).map(tool => {
-      const { sources = [{ id: 'huggingface', label: 'Hugging Face' }], allowedModelTypes, allowedTaskTypes } = models.getModelManagerConfig(tool);
+      const config = models.getModelManagerConfig(tool);
+      const { sources = [{ id: 'huggingface', label: 'Hugging Face' }] } = config;
+      const { allowedModelTypes, allowedTaskTypes } = searchFilters(tool, config);
       const searchHint = tool.id === 'upscayl' ? 'Search by model name or Hugging Face repository ID. Each complete .param and .bin pair is a separate choice.' : sources.some(source => source.id === 'huggingface') ? 'Search by keyword, repository ID, or collection URL. Use owner/repo followed by a keyword to filter files inside a repository.' : undefined;
       return { toolId: tool.id, name: tool.name, sources, allowedModelTypes, allowedTaskTypes, searchHint, defaults: models.getModelManagerDefaults(tool) };
     }) };
@@ -38,10 +48,41 @@ function createModelManager({ models, listTools, hardware, storage, changed, wit
     if (args.source && !(config.sources || [{ id: 'huggingface' }]).some(source => source.id === args.source)) {
       throw fault('INVALID_SOURCE', 'Choose a catalog source listed for this target.');
     }
-    for (const [key, allowed] of [['modelType', config.allowedModelTypes], ['taskType', config.allowedTaskTypes]]) {
+    const filters = searchFilters(tool, config);
+    for (const [key, allowed] of [['modelType', filters.allowedModelTypes], ['taskType', filters.allowedTaskTypes]]) {
       if (args[key] && allowed?.length && !allowed.includes(args[key])) throw fault('INVALID_FILTER', 'Choose a supported ' + key + ' for this target.');
     }
-    const { items, pagination } = await models.browseRemoteModels(tool, args);
+    const signature = JSON.stringify(Object.fromEntries(Object.keys(args).filter(key => key !== 'cursor' && args[key] !== undefined).sort().map(key => [key, args[key]])));
+    let result;
+    if (args.cursor?.startsWith('agent-catalog:')) {
+      const saved = pages.get(args.cursor);
+      if (!saved || saved.signature !== signature) throw fault('SELECTION_EXPIRED', 'Repeat the same search to continue.');
+      result = saved.result;
+    } else result = await models.browseRemoteModels(tool, args);
+    const expanded = result.items.flatMap(item => {
+      const choices = getArtifactChoices(item);
+      if (choices.length <= 64) return [item];
+      const chunks = [];
+      for (let i = 0; i < choices.length; i += 64) {
+        const artifactChoices = choices.slice(i, i + 64);
+        chunks.push(buildSelectedCatalogItem({ ...item, artifactChoices }));
+      }
+      return chunks;
+    });
+    const items = [];
+    let size = 0;
+    for (const item of expanded) {
+      const count = Math.max(1, getArtifactChoices(item).length);
+      if (items.length && size + count > 128) break;
+      items.push(item); size += count;
+    }
+    let pagination = result.pagination;
+    if (items.length < expanded.length) {
+      const cursor = 'agent-catalog:' + crypto.randomUUID();
+      pages.set(cursor, { signature, result: { items: expanded.slice(items.length), pagination } });
+      if (pages.size > 128) pages.delete(pages.keys().next().value);
+      pagination = { ...pagination, hasMore: true, nextCursor: cursor, nextPage: null };
+    }
     return { pagination, items: items.map(item => {
       const selectionId = crypto.randomUUID();
       selections.set(selectionId, { toolId: tool.id, installDir: tool.installDir, item });

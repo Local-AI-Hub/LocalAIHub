@@ -296,12 +296,14 @@ async function copyHyperFramesAuthoringRuntimeToProject(projectDir) {
 }
 
 function getProjectSourceType(templateId, requestedSourceType = '') {
+  if (templateId === 'imported') return 'imported';
   if (templateId === BLANK_PROJECT.id) return BLANK_PROJECT.sourceType;
   if (BUILT_IN_TEMPLATE_BY_ID.has(templateId)) return 'starter-template';
   return String(requestedSourceType || '').trim() === 'blank-scaffold' ? 'blank-scaffold' : 'managed-project';
 }
 
 function getProjectTemplateLabel(templateId) {
+  if (templateId === 'imported') return 'Imported project';
   if (templateId === BLANK_PROJECT.id) return BLANK_PROJECT.label;
   return BUILT_IN_TEMPLATE_BY_ID.get(templateId)?.label || 'Unknown';
 }
@@ -539,11 +541,12 @@ async function inspectHyperFramesProject(projectId, options = {}) {
     assertPathInside(projectDir, entryPath, 'Local AI Hub refused to use a HyperFrames entry file outside the project folder.');
     await assertRealPathInside(projectDir, entryPath, 'Local AI Hub refused to use a HyperFrames entry file outside the project folder.');
     await inspectTreeSafety(projectDir, options.limits || PROJECT_TREE_LIMITS);
-    const scan = await scanStagedCompositionForRemoteReferences(projectDir, options.limits || PROJECT_TREE_LIMITS);
+    const scan = await scanStagedCompositionForRemoteReferences(projectDir, options.limits || PROJECT_TREE_LIMITS, PROJECT_MANIFEST_FILE);
     return {
       ...fallbackManifest,
       templateLabel: getProjectTemplateLabel(fallbackManifest.templateId),
-      health: buildHealth('healthy', 'This managed HyperFrames project is ready for the pipeline.', true, {
+      health: buildHealth('healthy', 'Project contains ' + scan.projectFileCount + ' project files. Checked ' + scan.scannedFileCount + ' text files for remote references.', true, {
+        totalFileCount: scan.projectFileCount, supportedTextExtensions: scan.supportedTextExtensions,
         scannedFileCount: scan.scannedFileCount,
         scannedExtensions: scan.scannedExtensions,
       }),
@@ -552,7 +555,7 @@ async function inspectHyperFramesProject(projectId, options = {}) {
     return {
       ...fallbackManifest,
       templateLabel: getProjectTemplateLabel(fallbackManifest.templateId),
-      health: buildHealth(error?.code === 'HYPERFRAMES_REMOTE_REFERENCE' ? 'remote-references' : 'unsafe-project', error?.message || HYPERFRAMES_LOCAL_ASSETS_ERROR),
+      health: buildHealth(error?.code === 'HYPERFRAMES_REMOTE_REFERENCE' ? 'remote-references' : 'unsafe-project', error?.message || HYPERFRAMES_LOCAL_ASSETS_ERROR, false, {references:error?.findings || []}),
     };
   }
 }
@@ -644,6 +647,35 @@ async function createHyperFramesProject(payload = {}, options = {}) {
       message: 'HyperFrames project created.',
       project: await inspectHyperFramesProject(projectId, options),
     };
+  });
+}
+
+async function importHyperFramesProject(payload = {}, options = {}) {
+  const input = String(payload.folderPath || '').trim();
+  if (!path.isAbsolute(input) || /^[\\/]{2}/.test(input)) throw new Error('Choose an absolute local project folder containing index.html.');
+  const source = path.resolve(input);
+  if (source === path.parse(source).root) throw new Error('Choose a project folder inside the drive.');
+  await assertNoReparsePointTraversal(path.parse(source).root, source, 'Project imports cannot cross a symlink or junction.');
+  if (!(await fs.stat(path.join(source, PROJECT_ENTRY_FILE)).catch(() => null))?.isFile()) throw new Error('Choose a folder containing index.html.');
+  return queueOperation(async () => {
+    if (!options.managedRoot) await ensureStorage();
+    const displayName = sanitizeDisplayName(payload.displayName, path.basename(source));
+    const projectId = createProjectId(displayName);
+    const { projectDir, projectsRoot } = resolveProjectDir(projectId, options);
+    if (isPathInside(source, projectsRoot)) throw new Error('The import source must not contain the managed project directory.');
+    await fs.ensureDir(projectsRoot);
+    const staging = await fs.mkdtemp(path.join(projectsRoot, '.import-'));
+    let checked;
+    try {
+      await copyCompositionProjectSafely(source, staging, PROJECT_TREE_LIMITS);
+      checked = await scanStagedCompositionForRemoteReferences(staging, PROJECT_TREE_LIMITS, PROJECT_MANIFEST_FILE);
+      const manifest = buildProjectManifest({ projectId, displayName, templateId: 'imported', sourceType: 'imported' });
+      await writeJsonAtomic(getManifestPath(staging), manifest);
+      await fs.move(staging, projectDir, { overwrite: false });
+    } finally {
+      await fs.remove(staging);
+    }
+    return { project: await inspectHyperFramesProject(projectId, options), copiedFileCount: checked.projectFileCount, checkedTextFileCount: checked.scannedFileCount, message: 'Copied ' + checked.projectFileCount + ' project files. Checked ' + checked.scannedFileCount + ' text files for remote references.' };
   });
 }
 
@@ -834,8 +866,7 @@ function hasBinaryBytes(buffer) {
 function validateLocalOnlyTextContent(content, relativePath = '') {
   const text = String(content || '');
   const findings = [];
-  if (/https?:\/\//i.test(text)) findings.push('remote http/https references');
-  if (/\bdata:/i.test(text)) findings.push('data URL references');
+  for (const ref of require('../shared/hyperFramesReferences.cjs').findReferences(text, relativePath)) findings.push(ref.reference + ' at line ' + ref.line + ' (' + ref.kind + ')');
   if (/\.\.[\\/]\.\.[\\/]/.test(text)) findings.push('path escape references such as ..\\..\\');
   if (findings.length) {
     throw new Error(`${LOCAL_ONLY_POLICY_MESSAGE} Remove ${findings.join(', ')} from ${relativePath || 'this file'} before saving.`);
@@ -1443,6 +1474,7 @@ module.exports = {
   getHyperFramesAuthoringScaffold,
   getHyperFramesProjectsRoot,
   getTemplateResourcesRoot,
+  importHyperFramesProject,
   importHyperFramesProjectAssets,
   inspectHyperFramesProject,
   listHyperFramesProjectAssets,

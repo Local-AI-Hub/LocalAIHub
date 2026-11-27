@@ -14,6 +14,7 @@ const {
   summarizeArtifact,
 } = require('./pipelineArtifactService');
 
+const folders = require('./pipelineOutputFolders');
 const TEXT_FILE_EXTENSIONS = new Set(['.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log', '.html', '.xml', '.ini', '.rtf']);
 const METADATA_SUFFIXES = ['.audio.json', '.image.json', '.transcription.json', '.composition-export.json', '.video.json', '.image-analysis.json', '.subtitle.json'];
 const TEXT_MIME_TYPES = {
@@ -108,6 +109,7 @@ function buildOutputRecord(recordPath, artifact, stat, context = {}) {
     outputKind: String(artifact?.outputKind || artifact?.kind || '').trim(),
     outputLabel: String(artifact?.outputLabel || artifact?.displayName || artifact?.fileName || path.basename(outputPath)).trim() || path.basename(outputPath),
     outputPath,
+    outputFolder: context.outputFolder || '',
     outputsDirectory: context.outputsDirectory || '',
     runDirectory: context.runDirectory || '',
     runId: context.runId || '',
@@ -380,6 +382,7 @@ async function listPipelineOutputs() {
       continue;
     }
 
+    const membership = await folders.readMembership(runDirectory);
     const outputEntries = await fs.readdir(outputsDirectory).catch(() => []);
     for (const outputEntry of outputEntries) {
       if (isMetadataSidecar(outputEntry)) {
@@ -410,6 +413,7 @@ async function listPipelineOutputs() {
       }
 
       records.push(buildOutputRecord(recordPath, artifact, stat, {
+        outputFolder: folders.folderFor(membership,outputEntry),
         outputsDirectory,
         runDirectory,
         runId: path.basename(runDirectory),
@@ -593,7 +597,7 @@ async function canDeleteWholeRun(context, deletionSet) {
 
   await assertPathHasNoLinks(path.dirname(context.runDirectory), context.runDirectory);
   const runEntries = await fs.readdir(context.runDirectory);
-  const allowedNames = new Set(['artifacts', 'outputs']);
+  const allowedNames = new Set(['artifacts', 'outputs', folders.marker]);
   return runEntries.every((entry) => allowedNames.has(String(entry || '').toLowerCase()));
 }
 
@@ -734,7 +738,75 @@ async function deletePipelineOutput(outputPath, options = {}) {
   };
 }
 
+async function moveOutputToFolder(outputPath, destination) {
+  if (typeof destination !== 'string') throw new Error('Choose a destination folder.');
+  const runtime = getAppPaths().runtimesRoot;
+  const target = normalizePath(outputPath);
+  const context = resolvePipelineOutputContext(target,path.join(runtime,'pipeline-runs'));
+  if (!context || path.dirname(target) !== context.outputsRoot || isMetadataSidecar(path.basename(target))) {
+    throw new Error('Choose a saved output to move.');
+  }
+  await assertPathHasNoLinks(runtime,target);
+  await fs.stat(target);
+  const record = await folders.readMembership(context.runDirectory);
+  const folder = destination ? await folders.createOutputFolder(destination) : '';
+  const key = path.basename(target).toLowerCase();
+  if (folder === record.folder) record.assignments.delete(key);
+  else record.assignments.set(key,folder);
+  await folders.saveMembership(context.runDirectory,record);
+  return {outputFolder:folder};
+}
+
+async function deleteOutputFolder(value, options) {
+  const name = folders.nameOf(value);
+  const folder = (await folders.listOutputFolders()).find(f => f.toLowerCase() === name.toLowerCase());
+  if (!folder) throw new Error('That output folder no longer exists.');
+  const runtime = getAppPaths().runtimesRoot;
+  const runs = path.join(runtime,'pipeline-runs');
+  const directory = path.join(folders.root(),folder);
+  await assertPathHasNoLinks(runtime,directory);
+  if ((await fs.readdir(directory)).length) throw new Error('Unexpected files were found in the folder index. Folder deletion was stopped.');
+  await assertPathHasNoLinks(runtime,runs);
+  const entries = await fs.pathExists(runs) ? await fs.readdir(runs,{withFileTypes:true}) : [];
+  const members = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    const run = path.join(runs,entry.name);
+    const record = await folders.readMembership(run);
+    const matches = name => name.toLowerCase() === folder.toLowerCase();
+    if (!matches(record.folder) && ![...record.assignments.values()].some(matches)) continue;
+    const outputs = path.join(run,'outputs');
+    const paths = new Set();
+    if (await fs.pathExists(outputs)) {
+      await assertPathHasNoLinks(runtime,outputs);
+      const files = (await fs.readdir(outputs)).filter(name => !isMetadataSidecar(name));
+      const retained = files.filter(name => !matches(folders.folderFor(record,name)));
+      if (!retained.length) paths.add(outputs);
+      else {
+        const retainedSidecars = new Set(retained.flatMap(name => getAdjacentMetadataSidecarPaths(path.join(outputs,name)).map(p => p.toLowerCase())));
+        for (const name of files.filter(name => matches(folders.folderFor(record,name)))) {
+          for (const file of await buildPipelineOutputDeletionSet(path.join(outputs,name),outputs,run)) {
+            if (!retainedSidecars.has(file.toLowerCase())) paths.add(file);
+          }
+        }
+      }
+      for (const file of paths) await inspectDeletionPath(file,runtime);
+    }
+    if (matches(record.folder)) record.folder = '';
+    for (const [key,name] of record.assignments) if (matches(name)) record.assignments.delete(key);
+    members.push({run,paths,record});
+  }
+  for (const {run,paths,record} of members) {
+    for (const file of paths) await removePipelineOutputPath(file,options);
+    await folders.saveMembership(run,record);
+  }
+  await fs.rmdir(directory);
+  return {message:'Deleted output folder ' + folder + '.', runCount:members.length};
+}
+
 module.exports = {
+  moveOutputToFolder,
+  deleteOutputFolder,
   buildPipelineOutputDeletionPreview,
   deletePipelineOutput,
   listPipelineOutputs,

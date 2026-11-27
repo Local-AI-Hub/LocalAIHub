@@ -2581,7 +2581,7 @@ function PipelineOutputDeletionDialog({ busy, dialog, onClose, onConfirm, onTogg
     </div>
   );
 }
-function PipelineOutputRow({ busy, onDelete, onOpenPath, onRevealPath, output }) {
+function PipelineOutputRow({ folders, onMove, busy, onDelete, onOpenPath, onRevealPath, output }) {
   const artifact = output?.artifact || null;
   const outputPath = output?.outputPath || getArtifactStoragePath(artifact);
   return (
@@ -2599,6 +2599,12 @@ function PipelineOutputRow({ busy, onDelete, onOpenPath, onRevealPath, output })
           {artifact?.kind ? <span className="rounded-full border border-white/10 bg-slate-950/40 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-slate-300">{formatArtifactKindLabel(artifact.kind, artifact.itemKind)}</span> : null}
         </div>
       </div>
+      <label className="mt-3 block text-sm">Output folder
+        <select className="store-input" disabled={busy} value={output.outputFolder || ''} onChange={event => onMove(output,event.target.value)}>
+          <option value="">Unfiled</option>
+          {folders.map(folder => <option key={folder} value={folder}>{folder}</option>)}
+        </select>
+      </label>
       <ArtifactFacts artifact={artifact} className="mt-4" />
       <div className="mt-4">
         <ArtifactPreview artifact={artifact} compact />
@@ -2620,8 +2626,12 @@ function PipelineOutputRow({ busy, onDelete, onOpenPath, onRevealPath, output })
   );
 }
 
-function PipelineOutputsPanel({ busyPath, className = '', expanded, loading, onDelete, onOpenPath, onRefresh, onRevealPath, onToggleExpanded, outputs }) {
-  const outputCount = Array.isArray(outputs) ? outputs.length : 0;
+function PipelineOutputsPanel({ folders, onMove, onCreateFolder, onDeleteFolder, busyPath, className = '', expanded, loading, onDelete, onOpenPath, onRefresh, onRevealPath, onToggleExpanded, outputs }) {
+  const [view, setView] = useState('*');
+  const [newName, setNewName] = useState('');
+  const selected = view.startsWith('folder:') ? view.slice(7) : '';
+  const visibleOutputs = outputs.filter(output => view === '*' || (output.outputFolder || '') === selected);
+  const outputCount = visibleOutputs.length;
   const outputCountLabel = `${outputCount} saved output${outputCount === 1 ? '' : 's'}`;
 
   return (
@@ -2649,9 +2659,25 @@ function PipelineOutputsPanel({ busyPath, className = '', expanded, loading, onD
       </div>
       {expanded ? (
         <div className="mt-4 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <label>Output folder <select className="store-input" value={view} onChange={event => setView(event.target.value)}>
+              <option value="*">All outputs</option><option value="">Unfiled</option>
+              {folders.map(name => <option key={name} value={'folder:' + name}>{name}</option>)}
+            </select></label>
+            <input aria-label="New output folder name" className="store-input" placeholder="New folder name" maxLength={80} value={newName} onChange={event => setNewName(event.target.value)} />
+            <button className="ghost-button" disabled={!newName.trim() || Boolean(busyPath)} onClick={async () => {
+              const name = await onCreateFolder(newName.trim());
+              if (name) setNewName('');
+            }}>Create folder</button>
+            {selected && <button className="ghost-button" disabled={Boolean(busyPath)} onClick={async () => {
+              if (window.confirm('Delete “' + selected + '” and all final outputs in it? This uses your pipeline deletion setting. Intermediate run files are retained.') && await onDeleteFolder(selected)) setView('*');
+            }}>Delete folder</button>}
+          </div>
           {outputCount ? (
-            outputs.map((output) => (
+            visibleOutputs.map((output) => (
               <PipelineOutputRow
+                folders={folders}
+                onMove={onMove}
                 busy={busyPath === output.outputPath}
                 key={output.id}
                 onDelete={onDelete}
@@ -2664,7 +2690,7 @@ function PipelineOutputsPanel({ busyPath, className = '', expanded, loading, onD
             <div className="rounded-2xl border border-dashed border-white/10 bg-white/5 px-4 py-6 text-sm leading-6 text-slate-400">
               {loading
                 ? 'Scanning saved pipeline outputs...'
-                : "No saved pipeline outputs were found in Local AI Hub's known output folders yet."}
+                : "No saved outputs in this view."}
             </div>
           )}
         </div>
@@ -3831,6 +3857,35 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
   const [graphWorkflowPresetStatus, setGraphWorkflowPresetStatus] = useState(null);
   const [graphWorkflowPresetBusy, setGraphWorkflowPresetBusy] = useState(false);
   const [modelsBusyNodeId, setModelsBusyNodeId] = useState('');
+  const [outputFolders, setOutputFolders] = useState([]);
+  async function refreshOutputFolders() {
+    const result = await window.localAIHub.listOutputFolders();
+    if (result?.ok) setOutputFolders(result.data);
+  }
+  useEffect(() => { refreshOutputFolders().catch(() => {}); }, []);
+  async function moveSavedOutput(output, folder) {
+    setOutputsBusyPath(output.outputPath);
+    try {
+      const result = await window.localAIHub.movePipelineOutput({path:output.outputPath,folder});
+      if (!result?.ok) throw new Error(result?.message || 'Could not move the output.');
+      setPipelineOutputs(current => current.map(item => item.id === output.id ? {...item,outputFolder:result.data.outputFolder} : item));
+    } catch (error) { onToast(error.message,'error'); }
+    finally { setOutputsBusyPath(''); }
+  }
+  async function changeOutputFolder(name, remove) {
+    setOutputsBusyPath('folder:' + name);
+    try {
+      const result = remove ? await window.localAIHub.deleteOutputFolder(name) : await window.localAIHub.createOutputFolder(name);
+      if (!result?.ok) throw new Error(result?.message || 'Could not update the output folder.');
+      return remove ? true : result.data;
+    } catch (error) {
+      onToast(error.message, 'error');
+      return null;
+    } finally {
+      await loadPipelineOutputs({silent:true});
+      setOutputsBusyPath('');
+    }
+  }
   const [pipelineOutputs, setPipelineOutputs] = useState([]);
   const [outputsLoading, setOutputsLoading] = useState(false);
   const [outputsBusyPath, setOutputsBusyPath] = useState('');
@@ -4706,6 +4761,7 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
 
       const nextOutputs = result.data?.outputs || [];
       setPipelineOutputs(nextOutputs);
+      await refreshOutputFolders();
       return nextOutputs;
     } catch (error) {
       if (requestId === outputRequestRef.current && !options.silent) {
@@ -6326,6 +6382,18 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
                       : 'Set the name and description before the first save so this pipeline is easy to find later.'}
                   </p>
                   <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 p-3">
+                    <label className="mb-3 block text-sm text-white">Output folder
+                      <input className="store-input mt-2" list="pipeline-output-folder-names" placeholder="Unfiled" maxLength={80}
+                        value={draft.runSettings?.outputFolder || ''}
+                        onFocus={() => refreshOutputFolders().catch(() => {})}
+                        onChange={event => {
+                          const outputFolder = event.target.value;
+                          setDraft(current => ({...current,runSettings:{...current.runSettings,outputFolder}}));
+                          markDirty();
+                        }} />
+                      <datalist id="pipeline-output-folder-names">{outputFolders.map(name => <option key={name} value={name} />)}</datalist>
+                      <span className="text-xs text-slate-400">Choose an existing folder or enter a new name for this pipeline’s outputs.</span>
+                    </label>
                     <label className="flex items-center gap-3 text-sm font-medium text-white" htmlFor="pipeline-heavy-step-cooldown">
                       <input
                         checked={Boolean((draft.runSettings || DEFAULT_PIPELINE_RUN_SETTINGS).enableHeavyStepCooldown)}
@@ -7141,6 +7209,7 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
                             </div>
                           </div>
                           {getModelStepLocalAudioModeForUi(selectedNode) === 'continuation' ? <label className="flex items-center gap-3 rounded-[18px] border border-white/10 bg-white/5 px-4 py-3 text-sm font-medium text-slate-200" htmlFor="llm-local-audio-append"><input checked={Boolean(selectedNode.config?.appendSource)} className="h-4 w-4 accent-cyan-300" id="llm-local-audio-append" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, appendSource: event.target.checked } }))} type="checkbox" />Append source audio to continuation</label> : null}
+                          {getModelStepLocalAudioModeForUi(selectedNode) === 'referenceVoiceTts' && <div className="grid gap-3 sm:grid-cols-2">{[['narrationTargetSeconds','Target seconds (0 uses natural duration)',0,3600,0],['narrationPauseSeconds','Pause between passages (seconds)',0,5,0.22]].map(([key,label,min,max,initial]) => <label className="block text-sm text-slate-300" key={key}>{label}<input className="store-input mt-2" type="number" step="0.01" min={min} max={max} value={selectedNode.config?.[key] ?? initial} onChange={event=>updateNode(selectedNode.id,current=>({...current,config:{...current.config,[key]:Number(event.target.value)}}))} /></label>)}</div>}
                           {getModelStepLocalAudioModeForUi(selectedNode) === 'referenceVoiceTts' ? <div className="rounded-[18px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-50/90">Only clone voices you have permission to use.</div> : null}
                           <p className="text-xs leading-5 text-slate-400">
                             {getModelStepLocalAudioModeForUi(selectedNode) === 'sound'
@@ -7876,7 +7945,7 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
                     ) : collectionMapExecutionMode === 'localTool' ? (
                       <div className="space-y-4">
                         <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-tool">Local backend</label><select className="store-input mt-3" id="collection-map-tool" onChange={(event) => updateNode(selectedNode.id, (currentNode) => { const nextToolId = event.target.value; const currentAudioMode = currentNode.config?.audioMode; return { ...currentNode, config: { ...currentNode.config, audioMode: nextToolId === 'chatterbox-tts' ? 'referenceVoiceTts' : currentAudioMode === 'referenceVoiceTts' ? 'music' : currentAudioMode, audiocraftItemMode: nextToolId === 'chatterbox-tts' ? 'independent' : currentNode.config?.audiocraftItemMode, model: '', toolId: nextToolId } }; })} value={selectedNode.config?.toolId || ''}><option value="">Auto / required local backend</option>{collectionMapLocalTools.map((tool) => <option key={tool.id} value={tool.id}>{tool.name}</option>)}</select></div>
-                        {showCollectionMapChatterboxReferenceVoiceFields ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chatterbox-mode">Audio mode</label><select className="store-input mt-3" disabled id="collection-map-chatterbox-mode" value="referenceVoiceTts"><option value="referenceVoiceTts">Reference Voice TTS</option></select></div><div className="rounded-[18px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-50/90">Only clone voices you have permission to use.</div></div><p className="text-xs leading-5 text-slate-400">Reference Voice TTS uses one shared Reference Audio input for the whole collection.</p></div> : null}
+                        {showCollectionMapChatterboxReferenceVoiceFields ? <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-2"><div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-chatterbox-mode">Audio mode</label><select className="store-input mt-3" disabled id="collection-map-chatterbox-mode" value="referenceVoiceTts"><option value="referenceVoiceTts">Reference Voice TTS</option></select></div><div className="rounded-[18px] border border-amber-300/25 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-50/90">Only clone voices you have permission to use.</div></div>{[['narrationTargetSeconds','Target seconds (0 uses natural duration)',0,3600,0],['narrationPauseSeconds','Pause between passages (seconds)',0,5,0.22]].map(([key,label,min,max,initial]) => <label className="block text-sm text-slate-300" key={key}>{label}<input className="store-input mt-2" type="number" step="0.01" min={min} max={max} value={selectedNode.config?.[key] ?? initial} onChange={event=>updateNode(selectedNode.id,current=>({...current,config:{...current.config,[key]:Number(event.target.value)}}))} /></label>)}<p className="text-xs leading-5 text-slate-400">Reference Voice TTS uses one shared Reference Audio input for the whole collection.</p></div> : null}
                         {showCollectionMapLocalModelField ? (
                           <div><label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="collection-map-model-local">{getCollectionMapModelFieldLabel(collectionMapOperationId)}</label><input className="store-input mt-3" id="collection-map-model-local" onChange={(event) => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, model: event.target.value, analysisMode: showCollectionMapImageAnalysisFields ? event.target.value || 'clip' : currentNode.config?.analysisMode } }))} placeholder={getCollectionMapModelPlaceholder(collectionMapOperationId)} value={selectedNode.config?.model || (showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || 'clip' : '')} /><div className="mt-3 flex flex-wrap items-center gap-3"><button className="ghost-button" disabled={modelsBusyNodeId === selectedNode.id} onClick={() => refreshNodeModels(selectedNode)} type="button">{modelsBusyNodeId === selectedNode.id ? 'Refreshing...' : getCollectionMapRefreshLabel(collectionMapOperationId)}</button><span className="text-xs text-slate-500">{showCollectionMapAudioGenerationFields ? 'Loads downloaded AudioCraft snapshots from the selected tool.' : showCollectionMapAudioTransformFields ? 'Loads local RVC voice models from the selected tool.' : showCollectionMapImageTransformFields ? 'Loads downloaded Upscayl model sets from the selected tool.' : showCollectionMapTranscriptionFields ? 'Shows local Whisper model size options.' : showCollectionMapImageAnalysisFields ? 'Shows WebUI interrogation modes.' : showCollectionMapVideoGenerationFields ? 'Loads local Wan model folders from the selected video backend.' : 'Loads local checkpoints from the selected image backend.'}</span></div>{collectionMapModelOptions.length ? <div className="mt-3 grid gap-2">{collectionMapModelOptions.slice(0, 8).map((model) => (<button className={'rounded-2xl border px-3 py-3 text-left transition ' + (String((showCollectionMapImageAnalysisFields ? selectedNode.config?.analysisMode || selectedNode.config?.model : selectedNode.config?.model) || '').trim().toLowerCase() === String(model.id || '').trim().toLowerCase() ? 'border-cyan-300/40 bg-cyan-300/10 text-cyan-50' : 'border-white/10 bg-white/[0.03] text-slate-200 hover:border-cyan-300/20 hover:bg-white/10')} key={model.id} onClick={() => updateNode(selectedNode.id, (currentNode) => ({ ...currentNode, config: { ...currentNode.config, analysisMode: showCollectionMapImageAnalysisFields ? model.id : currentNode.config?.analysisMode, model: model.id } }))} type="button"><p className="text-sm font-medium text-white">{model.label || model.id}</p>{buildModelOptionDetail(model) ? <p className="mt-1 text-xs leading-5 text-slate-400">{buildModelOptionDetail(model)}</p> : null}</button>))}</div> : null}</div>
                         ) : null}
@@ -8736,6 +8805,7 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
                           />
                           <span>Enable sound effects</span>
                         </label>
+                        {selectedNode.config?.soundEffectsEnabled && <label className="flex items-center gap-2 text-sm text-slate-300"><input type="checkbox" checked={selectedNode.config?.soundEffectsReuseSoleEffect !== false} onChange={event=>updateNode(selectedNode.id,current=>({...current,config:{...current.config,soundEffectsReuseSoleEffect:event.target.checked}}))}/>Reuse the only available effect at scene boundaries</label>}
                         {selectedNode.config?.soundEffectsEnabled === true ? (
                           <button
                             className="ghost-button px-3 py-1.5 text-xs"
@@ -8973,6 +9043,8 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
                 {selectedNode.type === 'hyperframesCompose' ? (
                   <div className="space-y-4">
                     <p className="text-sm leading-6 text-slate-300">Connect one image or video, or an ordered collection from generation steps. An optional Scene Plan supplies timing; its scenes must match the visuals in order and count. Connect the project output to HyperFrames Render.</p>
+                    <label className="block text-sm text-slate-300">Scene layout<select className="store-input mt-2" value={selectedNode.config?.sceneTemplate || 'full'} onChange={event=>updateNode(selectedNode.id,current=>({...current,config:{...current.config,sceneTemplate:event.target.value}}))}><option value="full">Full frame</option><option value="illustrated">Illustration and diagram</option></select></label>
+                    <label className="block text-sm text-slate-300">Per-scene framing and diagram shapes (JSON)<textarea className="store-input mt-2" placeholder={'[{"focusX":45,"focusY":50,"startScale":1,"endScale":1.1,"shapes":[{"type":"line","x1":20,"y1":50,"x2":80,"y2":50}]}]'} value={selectedNode.config?.sceneDesigns || ''} onChange={event=>updateNode(selectedNode.id,current=>({...current,config:{...current.config,sceneDesigns:event.target.value}}))} /></label>
                     <label className="block text-sm text-slate-300">Project title
                       <input className="store-input mt-2" value={selectedNode.config?.title || ''} onChange={event => updateNode(selectedNode.id, current => ({ ...current, config: { ...current.config, title: event.target.value } }))} />
                     </label>
@@ -9027,7 +9099,9 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
                       </div>
                       <div>
                         <label className="text-xs uppercase tracking-[0.18em] text-slate-500" htmlFor="hyperframes-render-browser-gpu">Browser GPU</label>
-                        <input className="store-input mt-3" id="hyperframes-render-browser-gpu" readOnly value="Disabled" />
+                        <select className="store-input mt-3" id="hyperframes-render-browser-gpu" value={selectedNode.config?.browserGpu ? 'enabled' : 'disabled'} onChange={event => updateNode(selectedNode.id, node => ({...node,config:{...node.config,browserGpu:event.target.value === 'enabled'}}))}>
+                          <option value="disabled">Software</option><option value="enabled">Use browser GPU</option>
+                        </select>
                       </div>
                     </div>
                     <div className="rounded-[24px] border border-white/10 bg-white/5 px-4 py-3 text-sm leading-6 text-slate-300">
@@ -9389,6 +9463,10 @@ export default function PipelineBuilderPanel({ unsavedPipelineRef, busyMap = {},
           {activeSubview === 'outputs' ? (
             <div className="col-span-full w-full" data-pipeline-home-target="outputs" data-pipeline-outputs-full-width="true">
               <PipelineOutputsPanel
+                folders={outputFolders}
+                onMove={moveSavedOutput}
+                onCreateFolder={name => changeOutputFolder(name,false)}
+                onDeleteFolder={name => changeOutputFolder(name,true)}
                 busyPath={outputsBusyPath}
                 expanded={sectionVisibility.pipelineOutputs}
                 loading={outputsLoading}
